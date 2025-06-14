@@ -1,1 +1,1 @@
-# usd-path-tracer
+# USD Path Tracer
