@@ -1,9 +1,11 @@
+#pragma once
+
 #include <OpenImageIO/imagebuf.h>
 #include <OpenImageIO/span.h>
 #include <OpenImageIO/imageio.h>
 using namespace OIIO;
 
-#include "color3.h"
+#include "float3.h"
 
 class FrameBuffer{
     public:
@@ -16,7 +18,8 @@ class FrameBuffer{
         }
 
         void setPixel(int row, int column, Color3 color) {
-            buffer.setpixel(row, column, cspan<float>(color.buffer));
+            Color3 clamped_color = color.clamp(0.0f, 1.0f);
+            buffer.setpixel(row, column, cspan<float>(clamped_color.buffer));
         }
 
         bool save(const char* file_path) {

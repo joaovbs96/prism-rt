@@ -1,5 +1,4 @@
-#ifndef FLOAT3_H
-#define FLOAT3_H
+#pragma once
 
 #include <cmath>
 #include <iostream>
@@ -16,6 +15,10 @@ class Float3 {
         float x() const { return buffer[0]; }
         float y() const { return buffer[1]; }
         float z() const { return buffer[2]; }
+
+        float r() const { return buffer[0]; }
+        float g() const { return buffer[1]; }
+        float b() const { return buffer[2]; }
 
         float operator[](int i) const {
             return buffer[i];
@@ -84,52 +87,32 @@ class Float3 {
         //////////////////////////////////////////////////////////
 
         Float3 operator+(const Float3& v) const {
-            Float3(x() + v.x(), y() + v.y(), z() + v.z());
+            return Float3(x() + v.x(), y() + v.y(), z() + v.z());
         }
 
         Float3 operator-(const Float3& v) const {
-            Float3(x() - v.x(), y() - v.y(), z() - v.z());
+            return Float3(x() - v.x(), y() - v.y(), z() - v.z());
         }
 
         Float3 operator*(const Float3& v) const {
-            Float3(x() * v.x(), y() * v.y(), z() * v.z());
+            return Float3(x() * v.x(), y() * v.y(), z() * v.z());
         }
 
         Float3 operator/(const Float3& v) const {
-            Float3(x() / v.x(), y() / v.y(), z() / v.z());
-        }
-
-        Float3 operator*(const float v) const {
-            Float3(x() * v, y() * v, z() * v);
-        }
-
-        Float3 operator/(const float v) const {
-            float factor = 1.0f / v;
-            Float3(x() * factor, y() * factor, z() * factor);
+            return Float3(x() / v.x(), y() / v.y(), z() / v.z());
         }
 
         //////////////////////////////////////////////////////////
         // other methods
         //////////////////////////////////////////////////////////
 
-        float dot(const Float3& v) const {
-            return x() * v.x() + y() * v.y()+  z() * v.z();
-        }
-        
         float length_squared() const {
             // length squared of a vector is the dot product of itself
-            return dot(*this);
+            return x() * x() + y() * y()+  z() * z();
         }
 
         float length() const {
             return std::sqrtf(length_squared());
-        }
-
-        Float3 cross(const Float3& v) const {
-            float _x =  y() * v.z() - z() * v.y();
-            float _y = -x() * v.z() + z() * v.x();
-            float _z =  x() * v.y() - y() * v.x();
-            Float3(_x, _y, _z);
         }
 
         Float3 sqrt() const {
@@ -157,11 +140,11 @@ class Float3 {
         }
 
         Float3 max(const Float3& v) const {
-            Float3(std::fmaxf(x(), v.x()), std::fmaxf(y(), v.y()), std::fmaxf(z(), v.z()));
+            return Float3(std::fmaxf(x(), v.x()), std::fmaxf(y(), v.y()), std::fmaxf(z(), v.z()));
         }
 
         Float3 min(const Float3& v) const {
-            Float3(std::fminf(x(), v.x()), std::fminf(y(), v.y()), std::fminf(z(), v.z()));
+            return Float3(std::fminf(x(), v.x()), std::fminf(y(), v.y()), std::fminf(z(), v.z()));
         }
 
         bool is_zero() const {
@@ -179,4 +162,24 @@ class Float3 {
         }
 };
 
-#endif
+inline Float3 operator*(const float t, const Float3& v) {
+  return Float3(v.x() * t, v.y() * t, v.z() * t);
+}
+
+inline Float3 operator/(const Float3& v, const float t) {
+  return Float3(v.x() / t, v.y() / t, v.z() / t);
+}
+
+inline float dot(const Float3& v1, const Float3& v2) {
+    return v1.x() * v2.x() + v1.y() * v2.y()+  v1.z() * v2.z();
+}
+
+Float3 cross(const Float3& v1, const Float3& v2) {
+    float _x =  v1.y() * v2.z() - v1.z() * v2.y();
+    float _y = -v1.x() * v2.z() + v1.z() * v2.x();
+    float _z =  v1.x() * v2.y() - v1.y() * v2.x();
+    return Float3(_x, _y, _z);
+}
+
+// Class alias
+using Color3 = Float3;
