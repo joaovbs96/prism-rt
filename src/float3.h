@@ -119,6 +119,18 @@ class Float3 {
             return Float3(std::sqrtf(x()), std::sqrtf(y()), std::sqrtf(z()));
         }
 
+        Float3 gamma_correct() const {
+            float temp_buffer[3] = {x(), y(), z()};
+            for (int i = 0; i < 3; i++) {
+                if (temp_buffer[i] > 0){
+                    temp_buffer[i] = std::sqrtf(temp_buffer[i]);
+                } else {
+                    temp_buffer[i] = 0;
+                }
+            }
+            return Float3(temp_buffer[0], temp_buffer[1], temp_buffer[2]);
+        }
+
         Float3 normalize() const {
             float t = 1.0f / length();
             return *this * t;
@@ -149,6 +161,11 @@ class Float3 {
 
         bool is_zero() const {
             return (x() == 0.0f) && (y() == 0.0f) && (z() == 0.0f);
+        }
+
+        bool is_near_zero() const {
+            auto s = 1e-8;
+            return (std::fabsf(x()) < s) && (std::fabsf(y()) < s) && (std::fabsf(z()) < s);
         }
 
         Float3 de_nan(const Float3& c) {
