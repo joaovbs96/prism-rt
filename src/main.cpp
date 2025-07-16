@@ -80,13 +80,14 @@ class SceneManager {
 
                 // retrieve material by geomid and sample the surface
                 Material* material = materials[ray_hit.hit.geomID];
-                Float3 wo = -ray_d;                                         // outgoing ray to the camera - this is the current/next ray
-                Float3 wi = material->sample_direction(hit_p, hit_n, wo);   // incoming ray from the light - this is the next ray
-                Color3 hit_color = material->evaluate_color(hit_p, hit_n, wo, wi);
+                Float3 wo = -ray_d; // outgoing ray to the camera - this is the current/next ray
+                
+                // BRDFSample: surface hit color + scattered light ray
+                BRDFSample s = material->sample(hit_p, hit_n, wo);
 
-                RTCRay new_ray = initialize_ray(hit_p, wi);
+                RTCRay new_ray = initialize_ray(hit_p, s.wi);
 
-                return hit_color * trace(new_ray, depth - 1);
+                return s.color * trace(new_ray, depth - 1);
             }
 
             // ray miss
@@ -126,7 +127,7 @@ int main()
 
     SceneManager scene_mgr(device);
     scene_mgr.add_sphere(Float3(0, -100.5, -1), 100.0f, new Diffuse(Color3(0.8, 0.8, 0.0)));
-    scene_mgr.add_sphere(Float3(0.0, 0.0, -1.2), 0.5f, new Diffuse(Color3(0.1, 0.2, 0.5)));
+    scene_mgr.add_sphere(Float3(0.0, 0.0, -1.2), 0.5f, new gltfPBR(Color3(0.1, 0.2, 0.5), 0.5, 0.0));
     scene_mgr.add_sphere(Float3(-1.0, 0.0, -1.0), 0.5f, new Metal(Color3(0.8, 0.8, 0.8), 0.3));
     scene_mgr.add_sphere(Float3(1.0, 0.0, -1.0), 0.5f, new Metal(Color3(0.8, 0.6, 0.2), 1.0));
     rtcCommitScene(scene_mgr.scene);

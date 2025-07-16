@@ -2,6 +2,12 @@
 
 #include "float3.h"
 #include "sampling.h"
+#include "rng.h"
+
+struct BRDFSample {
+    Float3 wi;
+    Color3 color;
+};
 
 class Material {
     public:
@@ -10,6 +16,13 @@ class Material {
         // All materials need to define:
         // 1) How to sample the ray direction for the next bounce
         // 2) The color that the material contributes to the ray
+
+        virtual BRDFSample sample(const Float3& p, const Float3& n, const Float3& wo) {
+            BRDFSample s;
+            s.wi = sample_direction(p, n, wo);
+            s.color = evaluate_color(p, n, wo, s.wi);
+            return s;
+        }
 
         virtual Float3 sample_direction(const Float3& p, const Float3& n, const Float3& wo) = 0;
 
@@ -65,4 +78,35 @@ class Metal : public Material {
 
         Color3 specular_color;
         float specular_roughness;
+};
+
+class gltfPBR : public Material {
+    public:
+        gltfPBR(const Color3&base_color_, const float metalness_, const float roughness_) {
+            base_color = base_color_;
+            metalness = metalness_;
+            roughness = roughness_;
+
+            diffuse_brdf = new Diffuse(base_color);
+            metal_brdf = new Metal(base_color, roughness);
+        }
+
+        BRDFSample sample(const Float3& p, const Float3& n, const Float3& wo) override {
+            float prob = rnd();
+            if (prob <= metalness){
+                return metal_brdf->sample(p, n, wo);
+            } else {
+                return diffuse_brdf->sample(p, n, wo);
+            }
+        }
+
+        // we won't need these: we will sample directly fomr the brdfs
+        Float3 sample_direction(const Float3& p, const Float3& n, const Float3& wo) override { return Float3(); }
+        Color3 evaluate_color(const Float3& p, const Float3& n, const Float3& wo, Float3& wi) override {  return Color3(); }
+
+    Color3 base_color;
+    float metalness;
+    float roughness;
+    Diffuse* diffuse_brdf;
+    Metal* metal_brdf;
 };
