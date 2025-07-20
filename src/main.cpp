@@ -31,8 +31,6 @@ class SceneManager {
     public:
         SceneManager(RTCDevice device) {
             scene = rtcNewScene(device);
-
-            // TODO: initialize material structure
         }
 
         unsigned int add_sphere(const Float3& pos, float r, Material* material) {
@@ -70,12 +68,12 @@ class SceneManager {
 
             // cast ray and get hit record
             RTCRayHit ray_hit = cast_ray(ray);
+            Float3 hit_n = Float3(ray_hit.hit.Ng_x, ray_hit.hit.Ng_y, ray_hit.hit.Ng_z).normalize();
+            Float3 ray_o = Float3(ray_hit.ray.org_x, ray_hit.ray.org_y, ray_hit.ray.org_z);
+            Float3 ray_d = Float3(ray_hit.ray.dir_x, ray_hit.ray.dir_y, ray_hit.ray.dir_z).normalize();
 
             // ray hit
             if (ray_hit.hit.geomID != RTC_INVALID_GEOMETRY_ID){
-                Float3 hit_n = Float3(ray_hit.hit.Ng_x, ray_hit.hit.Ng_y, ray_hit.hit.Ng_z).normalize();
-                Float3 ray_o(ray_hit.ray.org_x, ray_hit.ray.org_y, ray_hit.ray.org_z);
-                Float3 ray_d(ray_hit.ray.dir_x, ray_hit.ray.dir_y, ray_hit.ray.dir_z);
                 Float3 hit_p = ray_o + ray_hit.ray.tfar * ray_d; // p = o + t * d
 
                 // retrieve material by geomid and sample the surface
@@ -91,9 +89,7 @@ class SceneManager {
             }
 
             // ray miss
-            Float3 direction(ray_hit.ray.dir_x, ray_hit.ray.dir_y, ray_hit.ray.dir_z);
-            Float3 unit_direction = direction.normalize();
-            float a = 0.5 * (unit_direction.y() + 1.0f);
+            float a = 0.5 * (ray_d.y() + 1.0f);
             return (1.0-a) * Color3(1.0, 1.0, 1.0) + a * Color3(0.5, 0.7, 1.0);
         }
 
@@ -128,7 +124,8 @@ int main()
     SceneManager scene_mgr(device);
     scene_mgr.add_sphere(Float3(0, -100.5, -1), 100.0f, new Diffuse(Color3(0.8, 0.8, 0.0)));
     scene_mgr.add_sphere(Float3(0.0, 0.0, -1.2), 0.5f, new gltfPBR(Color3(0.1, 0.2, 0.5), 0.5, 0.0));
-    scene_mgr.add_sphere(Float3(-1.0, 0.0, -1.0), 0.5f, new Metal(Color3(0.8, 0.8, 0.8), 0.3));
+    scene_mgr.add_sphere(Float3(-1.0, 0.0, -1.0), 0.5f, new Glass(1.5f));
+    scene_mgr.add_sphere(Float3(-1.0, 0.0, -1.0), 0.4f, new Glass(1.0f / 1.5f));
     scene_mgr.add_sphere(Float3(1.0, 0.0, -1.0), 0.5f, new Metal(Color3(0.8, 0.6, 0.2), 1.0));
     rtcCommitScene(scene_mgr.scene);
 

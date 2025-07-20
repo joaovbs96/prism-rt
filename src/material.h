@@ -36,6 +36,23 @@ class Material {
         Float3 reflect(const Float3& i, const Float3& n) {
             return i - 2 * dot(i, n) * n;
         }
+
+        Float3 refract(const Float3& wi, const Float3& n, const float ior) {
+            float cost_theta = std::fminf(dot(-wi, n), 1.0f);
+            Float3 r_1 = ior * (wi + cost_theta * n);
+            Float3 r_2 = -std::sqrtf(std::fabsf(1.0f - r_1.length_squared())) * n;
+            return r_1 + r_2;
+        }
+
+        bool is_front_facing(const Float3& d, const Float3& n) {
+            return dot(d, n) > 0.0f;
+        }
+
+        float schlick(const float cos, float ior) {
+            float r0 = (1.0f - ior) / (1.0f + ior);
+            r0 = r0 * r0;
+            return r0 + (1.0f - r0) * std::powf(1.0f - cos, 5.0f);
+        }
 };
 
 class Diffuse : public Material {
@@ -78,6 +95,36 @@ class Metal : public Material {
 
         Color3 specular_color;
         float specular_roughness;
+};
+
+class Glass : public Material {
+    public:
+        Glass (const float ior) : ior(ior) {}
+
+        Float3 sample_direction(const Float3& p, const Float3& n, const Float3& wo) override {
+            Float3 direction = -wo;
+            bool is_front = is_front_facing(direction, n);
+            Float3 n_ = is_front ? n : -n;
+            float ior_ = is_front ? 1.0f / ior : ior;
+
+            Float3 unit_direction = direction.normalize();
+            float cos_theta = std::fminf(dot(-unit_direction, n_), 1.0f);
+            float sin_theta = std::sqrtf(1.0f - cos_theta * cos_theta);
+
+            // ray is exiting the object
+            if (ior_ * sin_theta > 1.0f || schlick(cos_theta, ior_) > rnd()) {
+                return reflect(unit_direction, n_);
+            } else { // ray is entering the object
+                return refract(unit_direction, n_, ior_);
+            }
+        }
+
+        Color3 evaluate_color(const Float3& p, const Float3& n, const Float3& wo, Float3& wi) override {
+            return Color3(1.0f);
+        }
+
+    private:
+        float ior;
 };
 
 class gltfPBR : public Material {
