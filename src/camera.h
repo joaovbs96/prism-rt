@@ -6,6 +6,7 @@
 #include "float3.h"
 #include "rng.h"
 #include "ray.h"
+#include "sampling.h"
 
 class Camera {
     public:
@@ -18,21 +19,22 @@ class Camera {
             const int image_width,
             const int image_height,
             const float aspect_ratio_,
-            const float vfov_)
+            const float vfov_,
+            const float defocus_angle_,
+            const float focus_dist_
+        )
         {
-            aspect_ratio = aspect_ratio_;
-            vfov = vfov_;
-
-            float theta = deg2rad(vfov);
-            float h = std::tanf(theta / 2);
-
-            float focal_length = (position_ - target_).length();
-            float viewport_height = 2.0f * h *  focal_length;
-            float viewport_width = viewport_height * aspect_ratio;
+            defocus_angle = defocus_angle_;
             camera_center = position_;
 
+            float theta = deg2rad(vfov_);
+            float h = std::tanf(theta / 2);
+
+            float viewport_height = 2.0f * h *  focus_dist_;
+            float viewport_width = viewport_height * aspect_ratio_;
+
             // calculate u,v,w unit basis vector for the camera frame
-            w = (position_ - target_).normalize();
+            w = (camera_center - target_).normalize();
             u = cross(up_, w).normalize();
             v = cross(w, u);
 
@@ -45,20 +47,32 @@ class Camera {
             pixel_delta_v = viewport_v / image_height;
 
             // Calculate the location of the upper left pixel.
-            auto viewport_upper_left = camera_center
-                                    - (focal_length * w) - viewport_u/2 - viewport_v/2;
+            auto viewport_upper_left = camera_center - (focus_dist_ * w) - viewport_u/2 - viewport_v/2;
             pixel00_loc = viewport_upper_left + 0.5 * (pixel_delta_u + pixel_delta_v);
+
+            // Calculate the camera defocus disk basis vectors
+            float defocus_radius = focus_dist_ * std::tanf(deg2rad(defocus_angle / 2));
+            defocus_disk_u = u * defocus_radius;
+            defocus_disk_v = v * defocus_radius;
         }
 
         Float3 sample_square() const {
             return Float3(rnd() - 0.5, rnd() - 0.5, 0);
         }
 
+        Float3 sample_disk() const {
+            // Returns a random point in the camera defocus disk.
+            Float3 p = random_in_unit_disk();
+            return camera_center + (p[0] * defocus_disk_u) + (p[1] * defocus_disk_v);
+        }
+
         RTCRay get_ray(float s, float t) {
-            auto pixel_offset = sample_square();
-            auto pixel_center = pixel00_loc + ((s + pixel_offset.x()) * pixel_delta_u) + ((t + pixel_offset.y()) * pixel_delta_v);
-            auto ray_origin = camera_center;
-            auto ray_direction = pixel_center - camera_center;
+            // Construct a camera ray originating from the defocus disk and directed at a randomly
+            // sampled point around the pixel location s, t.
+            Float3 pixel_offset = sample_square();
+            Float3 pixel_center = pixel00_loc + ((s + pixel_offset.x()) * pixel_delta_u) + ((t + pixel_offset.y()) * pixel_delta_v);
+            Float3 ray_origin = (defocus_angle <= 0) ? camera_center : sample_disk();
+            Float3 ray_direction = pixel_center - ray_origin;
             return initialize_ray(ray_origin, ray_direction);
         }
 
@@ -67,6 +81,6 @@ class Camera {
         Float3 pixel00_loc;
         Float3 pixel_delta_u, pixel_delta_v;
         Float3 u, v, w;
-        float vfov;
-        float aspect_ratio;
+        Float3 defocus_disk_u, defocus_disk_v;
+        float defocus_angle;
 };

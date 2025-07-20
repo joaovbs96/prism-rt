@@ -20,3 +20,9 @@ Float3 sample_hemisphere() {
   const float z = sqrtf(fmaxf(0.0f, 1.0f - (x * x) - (y * y)));
   return Float3(x, y, z);
 }
+
+Float3 random_in_unit_disk() {
+  const float a = rnd() * TWO_PI;
+  const Float3 xy = Float3(sinf(a), cosf(a), 0);
+  return xy * sqrtf(rnd());
+}
