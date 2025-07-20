@@ -5,16 +5,7 @@
 #include "math.h"
 #include "float3.h"
 #include "rng.h"
-
-RTCRay initialize_ray(Float3 o, Float3 d){
-    RTCRay ray;
-    ray.org_x  = o.x(); ray.org_y = o.y(); ray.org_z = o.z();
-    ray.dir_x  = d.x(); ray.dir_y = d.y(); ray.dir_z = d.z();
-    ray.tnear  = 0.f;
-    ray.tfar   = std::numeric_limits<float>::infinity();
-    ray.mask = -1;
-    return ray;
-}
+#include "ray.h"
 
 class Camera {
     public:
