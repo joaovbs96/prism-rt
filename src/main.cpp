@@ -113,6 +113,10 @@ int main()
     int height = 720;
     int samples = 10;
     int max_depth = 10;
+    float fov = 20.0f;
+    Float3 camera_pos(-2.0f, 2.0f, 1.0f);
+    Float3 camera_tgt(0.0, 0.0, -1.0);
+    Float3 camera_vup(0.0f, 1.0f, 0.0f);
 
     device = initialize_device(1);
 
@@ -133,7 +137,7 @@ int main()
 
     FrameBuffer frame(width, height);
 
-    Camera cam(width, height);
+    Camera cam(camera_pos, camera_tgt, camera_vup, width, height, float(width)/height, fov);
     for (int row = 0; row < height; row++) {
         for (int column = 0; column < width; column++) {
             Color3 pixel_color(0.0f);

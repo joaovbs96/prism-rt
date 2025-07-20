@@ -11,16 +11,34 @@ class Camera {
     public:
         Camera() {}
 
-        Camera(const int image_width, const int image_height)
+        Camera(
+            const Float3& position_,
+            const Float3& target_,
+            const Float3& up_,
+            const int image_width,
+            const int image_height,
+            const float aspect_ratio_,
+            const float vfov_)
         {
-            auto focal_length = 1.0;
-            auto viewport_height = 2.0;
-            auto viewport_width = viewport_height * (double(image_width)/image_height);
-            camera_center = Float3(0, 0, 0);
+            aspect_ratio = aspect_ratio_;
+            vfov = vfov_;
+
+            float theta = deg2rad(vfov);
+            float h = std::tanf(theta / 2);
+
+            float focal_length = (position_ - target_).length();
+            float viewport_height = 2.0f * h *  focal_length;
+            float viewport_width = viewport_height * aspect_ratio;
+            camera_center = position_;
+
+            // calculate u,v,w unit basis vector for the camera frame
+            w = (position_ - target_).normalize();
+            u = cross(up_, w).normalize();
+            v = cross(w, u);
 
             // Calculate the vectors across the horizontal and down the vertical viewport edges.
-            auto viewport_u = Float3(viewport_width, 0, 0);
-            auto viewport_v = Float3(0, -viewport_height, 0);
+            Float3 viewport_u = viewport_width * u;
+            Float3 viewport_v = viewport_height * -v;
 
             // Calculate the horizontal and vertical delta vectors from pixel to pixel.
             pixel_delta_u = viewport_u / image_width;
@@ -28,7 +46,7 @@ class Camera {
 
             // Calculate the location of the upper left pixel.
             auto viewport_upper_left = camera_center
-                                    - Float3(0, 0, focal_length) - viewport_u/2 - viewport_v/2;
+                                    - (focal_length * w) - viewport_u/2 - viewport_v/2;
             pixel00_loc = viewport_upper_left + 0.5 * (pixel_delta_u + pixel_delta_v);
         }
 
@@ -47,6 +65,8 @@ class Camera {
     private:
         Float3 camera_center;
         Float3 pixel00_loc;
-        Float3 pixel_delta_u;
-        Float3 pixel_delta_v;
+        Float3 pixel_delta_u, pixel_delta_v;
+        Float3 u, v, w;
+        float vfov;
+        float aspect_ratio;
 };
