@@ -3,3 +3,4 @@ vcpkg_installed
 .vscode
 vcpkg-configuration.json
 output*
+*_old.*

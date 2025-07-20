@@ -20,77 +20,12 @@
 #include "camera.h"
 #include "sampling.h"
 #include "material.h"
-
-RTCDevice device;
+#include "scene.h"
 
 void error_callback(void* user_ptr, enum RTCError error, const char* str)
 {
     printf("ERROR %d: %s\n", error, str);
 }
-
-class SceneManager {
-    public:
-        SceneManager(RTCDevice device) {
-            scene = rtcNewScene(device);
-        }
-
-        unsigned int add_sphere(const Float3& pos, float r, Material* material) {
-            RTCGeometry geom = rtcNewGeometry(device, RTC_GEOMETRY_TYPE_SPHERE_POINT);
-            float* vb = (float*) rtcSetNewGeometryBuffer(geom,RTC_BUFFER_TYPE_VERTEX, 0, RTC_FORMAT_FLOAT4, 4*sizeof(float), 1);
-            vb[0] = pos.x(); vb[1] = pos.y(); vb[2] = pos.z(); vb[3] = r;
-
-            // commit and release geom handle
-            rtcCommitGeometry(geom);
-            unsigned int geomID = rtcAttachGeometry(scene, geom);
-            rtcReleaseGeometry(geom);
-
-            // collect assigned material - we will gatter it from the geomid
-            materials[geomID] = material;
-
-            return geomID;
-        }
-
-        RayHit cast_ray(RTCRay ray) {
-            RTCRayHit e_rayhit;
-            e_rayhit.ray = ray;
-            e_rayhit.ray.tnear = 0.001f;
-            e_rayhit.hit.geomID = RTC_INVALID_GEOMETRY_ID;
-
-            // intersect a single ray with the scene
-            rtcIntersect1(scene, &e_rayhit);
-
-            return RayHit(e_rayhit);
-        }
-
-        Color3 trace(RTCRay ray, int depth) {
-            // reached maximum recursion
-            if (depth <= 0)
-                return Float3();
-
-            // cast ray and get hit record
-            RayHit ray_hit = cast_ray(ray);
-
-            // ray hit
-            if (ray_hit.geomid != RTC_INVALID_GEOMETRY_ID){
-                // retrieve material by geomid and sample the surface
-                Material* material = materials[ray_hit.geomid];
-                
-                // BRDFSample: surface hit color + scattered light ray
-                BRDFSample s = material->sample(ray_hit);
-
-                RTCRay new_ray = initialize_ray(ray_hit.p, s.wi);
-
-                return s.color * trace(new_ray, depth - 1);
-            }
-
-            // ray miss
-            float a = 0.5 * (ray_hit.d.y() + 1.0f);
-            return (1.0-a) * Color3(1.0, 1.0, 1.0) + a * Color3(0.5, 0.7, 1.0);
-        }
-
-        RTCScene scene;
-        std::unordered_map<int, Material*> materials;
-};
 
 RTCDevice initialize_device(int verbose)
 {
@@ -113,23 +48,10 @@ int main()
     int height = 720;
     int samples = 10;
     int max_depth = 50;
-    float fov = 20.0f;
-    Float3 camera_pos(-2,2,1);
-    Float3 camera_tgt(0.0, 0.0, -1.0);
-    Float3 camera_vup(0.0f, 1.0f, 0.0f);
-    float aspect_ratio = float(width) / height;
-    float defocus_angle = 10.0f;
-    float focus_dist = 3.4f;
-    float aperture = 2.0;
 
-    device = initialize_device(1);
+    RTCDevice device = initialize_device(1);
 
-    SceneManager scene_mgr(device);
-    scene_mgr.add_sphere(Float3(0, -100.5, -1), 100.0f, new Diffuse(Color3(0.8, 0.8, 0.0)));
-    scene_mgr.add_sphere(Float3(0.0, 0.0, -1.2), 0.5f, new Diffuse(Color3(0.1, 0.2, 0.5)));
-    scene_mgr.add_sphere(Float3(-1.0, 0.0, -1.0), 0.5f, new Glass(1.5f));
-    scene_mgr.add_sphere(Float3(-1.0, 0.0, -1.0), 0.4f, new Glass(1.0f / 1.5f));
-    scene_mgr.add_sphere(Float3(1.0, 0.0, -1.0), 0.5f, new Metal(Color3(0.8, 0.6, 0.2), 1.0));
+    InOneWeekendFinal scene_mgr = InOneWeekendFinal(device);
     rtcCommitScene(scene_mgr.scene);
 
     RTCRayQueryContext context;
@@ -141,7 +63,6 @@ int main()
 
     FrameBuffer frame(width, height);
 
-    Camera cam(camera_pos, camera_tgt, camera_vup, width, height, float(width)/height, fov, defocus_angle, focus_dist);
     // Camera cam(camera_pos, camera_tgt, camera_vup, aperture, aspect_ratio, fov, focus_dist);
     for (int row = 0; row < height; row++) {
         for (int column = 0; column < width; column++) {
@@ -149,7 +70,7 @@ int main()
             for (int spp = 0; spp < samples; spp++)
             {
                 // create new ray and trace it
-                RTCRay ray = cam.get_ray(column, row);
+                RTCRay ray = scene_mgr.cam.get_ray(column, row);
                 pixel_color += scene_mgr.trace(ray, max_depth);
             }
 
@@ -160,7 +81,7 @@ int main()
         }
     }
 
-    frame.save("output.png");
+    frame.save("output_2.png");
 
     // release scene and device resources
     rtcReleaseScene(scene_mgr.scene);
