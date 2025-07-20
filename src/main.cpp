@@ -16,6 +16,7 @@
 // project libraries
 #include "frame_buffer.h"
 #include "float3.h"
+#include "ray.h"
 #include "camera.h"
 #include "sampling.h"
 #include "material.h"
@@ -49,16 +50,16 @@ class SceneManager {
             return geomID;
         }
 
-        RTCRayHit cast_ray(RTCRay ray) {
-            RTCRayHit rayhit;
-            rayhit.ray = ray;
-            rayhit.ray.tnear = 0.001f;
-            rayhit.hit.geomID = RTC_INVALID_GEOMETRY_ID;
+        RayHit cast_ray(RTCRay ray) {
+            RTCRayHit e_rayhit;
+            e_rayhit.ray = ray;
+            e_rayhit.ray.tnear = 0.001f;
+            e_rayhit.hit.geomID = RTC_INVALID_GEOMETRY_ID;
 
             // intersect a single ray with the scene
-            rtcIntersect1(scene, &rayhit);
+            rtcIntersect1(scene, &e_rayhit);
 
-            return rayhit;
+            return RayHit(e_rayhit);
         }
 
         Color3 trace(RTCRay ray, int depth) {
@@ -67,29 +68,23 @@ class SceneManager {
                 return Float3();
 
             // cast ray and get hit record
-            RTCRayHit ray_hit = cast_ray(ray);
-            Float3 hit_n = Float3(ray_hit.hit.Ng_x, ray_hit.hit.Ng_y, ray_hit.hit.Ng_z).normalize();
-            Float3 ray_o = Float3(ray_hit.ray.org_x, ray_hit.ray.org_y, ray_hit.ray.org_z);
-            Float3 ray_d = Float3(ray_hit.ray.dir_x, ray_hit.ray.dir_y, ray_hit.ray.dir_z).normalize();
+            RayHit ray_hit = cast_ray(ray);
 
             // ray hit
-            if (ray_hit.hit.geomID != RTC_INVALID_GEOMETRY_ID){
-                Float3 hit_p = ray_o + ray_hit.ray.tfar * ray_d; // p = o + t * d
-
+            if (ray_hit.geomid != RTC_INVALID_GEOMETRY_ID){
                 // retrieve material by geomid and sample the surface
-                Material* material = materials[ray_hit.hit.geomID];
-                Float3 wo = -ray_d; // outgoing ray to the camera - this is the current/next ray
+                Material* material = materials[ray_hit.geomid];
                 
                 // BRDFSample: surface hit color + scattered light ray
-                BRDFSample s = material->sample(hit_p, hit_n, wo);
+                BRDFSample s = material->sample(ray_hit);
 
-                RTCRay new_ray = initialize_ray(hit_p, s.wi);
+                RTCRay new_ray = initialize_ray(ray_hit.p, s.wi);
 
                 return s.color * trace(new_ray, depth - 1);
             }
 
             // ray miss
-            float a = 0.5 * (ray_d.y() + 1.0f);
+            float a = 0.5 * (ray_hit.d.y() + 1.0f);
             return (1.0-a) * Color3(1.0, 1.0, 1.0) + a * Color3(0.5, 0.7, 1.0);
         }
 
@@ -123,7 +118,7 @@ int main()
 
     SceneManager scene_mgr(device);
     scene_mgr.add_sphere(Float3(0, -100.5, -1), 100.0f, new Diffuse(Color3(0.8, 0.8, 0.0)));
-    scene_mgr.add_sphere(Float3(0.0, 0.0, -1.2), 0.5f, new gltfPBR(Color3(0.1, 0.2, 0.5), 0.5, 0.0));
+    scene_mgr.add_sphere(Float3(0.0, 0.0, -1.2), 0.5f, new Diffuse(Color3(0.1, 0.2, 0.5)));
     scene_mgr.add_sphere(Float3(-1.0, 0.0, -1.0), 0.5f, new Glass(1.5f));
     scene_mgr.add_sphere(Float3(-1.0, 0.0, -1.0), 0.4f, new Glass(1.0f / 1.5f));
     scene_mgr.add_sphere(Float3(1.0, 0.0, -1.0), 0.5f, new Metal(Color3(0.8, 0.6, 0.2), 1.0));
