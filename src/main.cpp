@@ -1,7 +1,14 @@
 #include <iostream>
 #include <format>
 
+#include <iostream>
+#include <thread>
+
 // external libraries
+#include <tbb/parallel_for.h>
+#include <tbb/task_arena.h>
+#include <tbb/mutex.h>
+#include <tbb/tick_count.h>
 #include <embree4/rtcore.h>
 #include <xmmintrin.h>
 
@@ -38,6 +45,23 @@ RTCDevice initialize_device(int verbose)
     return device;
 }
 
+void print_progress(float progress) {
+    int barWidth = 70;
+
+    std::cout << "[";
+    int pos = barWidth * progress;
+    for (int i = 0; i < barWidth; ++i) {
+        if (i < pos) std::cout << "=";
+        else if (i == pos) std::cout << ">";
+        else std::cout << " ";
+    }
+    std::cout << "] " << float(progress * 100.0) << "%                        \r";
+    std::cout.flush();
+
+    if (progress == 1.0)
+        std::cout << std::endl;
+}
+
 int main()
 {
     // keeping these give a perf improvement
@@ -46,12 +70,13 @@ int main()
 
     int width = 1280;
     int height = 720;
-    int samples = 10;
-    int max_depth = 50;
+    int samples = 8;
+    int max_depth = 10;
 
     RTCDevice device = initialize_device(1);
 
-    InOneWeekendFinal scene_mgr = InOneWeekendFinal(device);
+    unsigned int main_seed = 0;
+    InOneWeekendFinal scene_mgr = InOneWeekendFinal(device, main_seed);
     rtcCommitScene(scene_mgr.scene);
 
     RTCRayQueryContext context;
@@ -63,25 +88,32 @@ int main()
 
     FrameBuffer frame(width, height);
 
-    // Camera cam(camera_pos, camera_tgt, camera_vup, aperture, aspect_ratio, fov, focus_dist);
-    for (int row = 0; row < height; row++) {
-        for (int column = 0; column < width; column++) {
+    auto start_time = tbb::tick_count::now();
+    tbb::parallel_for(0, height, [&](int row)
+    {
+        tbb::parallel_for(0, width, [&](int column)
+        {
+            unsigned int seed = tea<64>(row * width, column);
+
+            // render for N samples
             Color3 pixel_color(0.0f);
             for (int spp = 0; spp < samples; spp++)
             {
                 // create new ray and trace it
-                RTCRay ray = scene_mgr.cam.get_ray(column, row);
-                pixel_color += scene_mgr.trace(ray, max_depth);
+                RTCRay ray = scene_mgr.cam.get_ray(column, row, seed);
+                pixel_color += scene_mgr.trace(ray, max_depth, seed);
             }
 
-            // average samples out
+            // average samples out and put it in the frame buffer
             pixel_color /= samples;
-
             frame.setPixel(column, row, pixel_color.gamma_correct());
-        }
-    }
+        });
 
-    frame.save("output_2.png");
+    });
+    auto end_time = tbb::tick_count::now();
+    std::cout << "Rendering took " << (end_time - start_time).seconds() << " seconds." << std::endl;
+
+    frame.save("output.png");
 
     // release scene and device resources
     rtcReleaseScene(scene_mgr.scene);

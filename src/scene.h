@@ -45,7 +45,7 @@ class SceneManager {
             return RayHit(e_rayhit);
         }
 
-        Color3 trace(RTCRay ray, int depth) {
+        Color3 trace(RTCRay ray, int depth, unsigned int &seed) {
             // reached maximum recursion
             if (depth <= 0)
                 return Float3();
@@ -59,11 +59,11 @@ class SceneManager {
                 Material* material = materials[ray_hit.geomid];
                 
                 // BRDFSample: surface hit color + scattered light ray
-                BRDFSample s = material->sample(ray_hit);
+                BRDFSample s = material->sample(ray_hit, seed);
 
                 RTCRay new_ray = initialize_ray(ray_hit.p, s.wi);
 
-                return s.color * trace(new_ray, depth - 1);
+                return s.color * trace(new_ray, depth - 1, seed);
             }
 
             // ray miss
@@ -79,20 +79,20 @@ class SceneManager {
 
 class InOneWeekendFinal : public SceneManager {
     public:
-        InOneWeekendFinal(RTCDevice device_) : SceneManager(device_) {
+        InOneWeekendFinal(RTCDevice device_, unsigned int &seed) : SceneManager(device_) {
             std::cout << "Started scene initialization." << std::endl;
             add_sphere(Float3(0, -1000, 0), 1000, new Diffuse(Color3(0.5f)));
 
             for (int x = -11; x < 11; x++) {
                 for (int y = -11; y < 11; y++) {
-                    float rnd_ = rnd();
-                    Float3 center = Float3(x + 0.9 * rnd(), 0.2, y + 0.9 * rnd());
+                    float rnd_ = rnd(seed);
+                    Float3 center = Float3(x + 0.9 * rnd(seed), 0.2, y + 0.9 * rnd(seed));
 
                     if ((center - Float3(4.0, 0.2, 0.0)).length() > 0.9f) {
                         if (rnd_ < 0.8f) {
-                            add_sphere(center, 0.2f, new Diffuse(Color3(rnd(), rnd(), rnd())));
+                            add_sphere(center, 0.2f, new Diffuse(Color3(rnd(seed), rnd(seed), rnd(seed))));
                         } else if (rnd_ < 0.95f) {
-                            add_sphere(center, 0.2f, new Metal(Color3(rnd(), rnd(), rnd()), rnd()));
+                            add_sphere(center, 0.2f, new Metal(Color3(rnd(seed), rnd(seed), rnd(seed)), rnd(seed)));
                         } else {
                             add_sphere(center, 0.2f, new Glass(1.5f));
                         }

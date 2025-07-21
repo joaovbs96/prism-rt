@@ -18,20 +18,21 @@ class Material {
         // 1) How to sample the ray direction for the next bounce
         // 2) The color that the material contributes to the ray
 
-        virtual BRDFSample sample(const RayHit ray_hit) {
+        virtual BRDFSample sample(const RayHit ray_hit, unsigned int &seed) {
             BRDFSample s;
-            s.wi = sample_direction(ray_hit);
-            s.color = evaluate_color(ray_hit.p, ray_hit.n, -ray_hit.d, s.wi);
+            s.wi = sample_direction(ray_hit, seed);
+            s.color = evaluate_color(ray_hit.p, ray_hit.n, -ray_hit.d, s.wi, seed);
             return s;
         }
 
-        virtual Float3 sample_direction(const RayHit ray_hit) = 0;
+        virtual Float3 sample_direction(const RayHit ray_hit, unsigned int &seed) = 0;
 
         virtual Color3 evaluate_color(
             const Float3& p,    // surface hit point
             const Float3& n,    // surface normal vector
             const Float3& wo,   // ray outgoing towards the camera
-            Float3& wi    // ray incoming from the light
+            Float3& wi,    // ray incoming from the light
+            unsigned int &seed
         ) = 0;
 
         Float3 reflect(const Float3& i, const Float3& n) {
@@ -56,10 +57,10 @@ class Diffuse : public Material {
     public:
         Diffuse(const Color3&diffuse_color) : diffuse_color(diffuse_color) {}
 
-        Float3 sample_direction(const RayHit ray_hit) override {
+        Float3 sample_direction(const RayHit ray_hit, unsigned int &seed) override {
             // note that the ray incoming from the light (wi) is the next/scattered ray
             // don't forget that a ray tracer works "in reverse"
-            Float3 wi = ray_hit.n + random_unit_vector();
+            Float3 wi = ray_hit.n + random_unit_vector(seed);
 
             // if the incoming ray is near zero, we take the normal instead
             if (wi.is_near_zero())
@@ -68,7 +69,7 @@ class Diffuse : public Material {
             return wi;
         }
 
-        Color3 evaluate_color(const Float3& p, const Float3& n, const Float3& wo, Float3& wi) override {
+        Color3 evaluate_color(const Float3& p, const Float3& n, const Float3& wo, Float3& wi, unsigned int &seed) override {
             return diffuse_color;
         }
 
@@ -79,14 +80,14 @@ class Metal : public Material {
     public:
         Metal(const Color3&specular_color, const float specular_roughness) : specular_color(specular_color), specular_roughness(specular_roughness) {}
 
-        Float3 sample_direction(const RayHit ray_hit) override {
+        Float3 sample_direction(const RayHit ray_hit, unsigned int &seed) override {
             // note that the ray incoming from the light (wi) is the next/scattered ray
             // don't forget that a ray tracer works "in reverse"
-            Float3 wi = reflect(ray_hit.d, ray_hit.n).normalize() + specular_roughness * random_unit_vector();
+            Float3 wi = reflect(ray_hit.d, ray_hit.n).normalize() + specular_roughness * random_unit_vector(seed);
             return wi.normalize();
         }
 
-        Color3 evaluate_color(const Float3& p, const Float3& n, const Float3& wo, Float3& wi) override {
+        Color3 evaluate_color(const Float3& p, const Float3& n, const Float3& wo, Float3& wi, unsigned int &seed) override {
             return specular_color;
         }
 
@@ -98,7 +99,7 @@ class Glass : public Material {
     public:
         Glass (const float ior) : ior(ior) {}
 
-        Float3 sample_direction(const RayHit ray_hit) override {
+        Float3 sample_direction(const RayHit ray_hit, unsigned int &seed) override {
             float ior_ = ray_hit.front_face ? 1.0f / ior : ior;
 
             Float3 unit_direction = ray_hit.d.normalize();
@@ -107,14 +108,14 @@ class Glass : public Material {
 
             // ray is exiting the object
             // std::cout << "Test - " << "Front:" << is_front << "IOR:" << ior_ << "Theta:" << sin_theta << std::endl;
-            if (ior_ * sin_theta > 1.0f || schlick(cos_theta, ior_) > rnd()) {
+            if (ior_ * sin_theta > 1.0f || schlick(cos_theta, ior_) > rnd(seed)) {
                 return reflect(unit_direction, ray_hit.n);
             } else { // ray is entering the object
                 return refract(unit_direction, ray_hit.n, ior_);
             }
         }
 
-        Color3 evaluate_color(const Float3& p, const Float3& n, const Float3& wo, Float3& wi) override {
+        Color3 evaluate_color(const Float3& p, const Float3& n, const Float3& wo, Float3& wi, unsigned int &seed) override {
             return Color3(1.0f);
         }
 
@@ -133,18 +134,18 @@ class gltfPBR : public Material {
             metal_brdf = new Metal(base_color, roughness);
         }
 
-        BRDFSample sample(const RayHit ray_hit) override {
-            float prob = rnd();
+        BRDFSample sample(const RayHit ray_hit, unsigned int &seed) override {
+            float prob = rnd(seed);
             if (prob <= metalness){
-                return metal_brdf->sample(ray_hit);
+                return metal_brdf->sample(ray_hit, seed);
             } else {
-                return diffuse_brdf->sample(ray_hit);
+                return diffuse_brdf->sample(ray_hit, seed);
             }
         }
 
         // we won't need these: we will sample directly fomr the brdfs
-        Float3 sample_direction(const RayHit ray_hit) override { return Float3(); }
-        Color3 evaluate_color(const Float3& p, const Float3& n, const Float3& wo, Float3& wi) override {  return Color3(); }
+        Float3 sample_direction(const RayHit ray_hit, unsigned int &seed) override { return Float3(); }
+        Color3 evaluate_color(const Float3& p, const Float3& n, const Float3& wo, Float3& wi, unsigned int &seed) override {  return Color3(); }
 
     Color3 base_color;
     float metalness;

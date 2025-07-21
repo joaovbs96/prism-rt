@@ -56,22 +56,22 @@ class Camera {
             defocus_disk_v = v * defocus_radius;
         }
 
-        Float3 sample_square() const {
-            return Float3(rnd() - 0.5, rnd() - 0.5, 0);
+        Float3 sample_square(unsigned int &seed) const {
+            return Float3(rnd(seed) - 0.5, rnd(seed) - 0.5, 0);
         }
 
-        Float3 sample_disk() const {
+        Float3 sample_disk(unsigned int &seed) const {
             // Returns a random point in the camera defocus disk.
-            Float3 p = random_in_unit_disk();
+            Float3 p = random_in_unit_disk(seed);
             return camera_center + (p[0] * defocus_disk_u) + (p[1] * defocus_disk_v);
         }
 
-        RTCRay get_ray(float s, float t) {
+        RTCRay get_ray(float s, float t, unsigned int &seed) {
             // Construct a camera ray originating from the defocus disk and directed at a randomly
             // sampled point around the pixel location s, t.
-            Float3 pixel_offset = sample_square();
+            Float3 pixel_offset = sample_square(seed);
             Float3 pixel_center = pixel00_loc + ((s + pixel_offset.x()) * pixel_delta_u) + ((t + pixel_offset.y()) * pixel_delta_v);
-            Float3 ray_origin = (defocus_angle <= 0) ? camera_center : sample_disk();
+            Float3 ray_origin = (defocus_angle <= 0) ? camera_center : sample_disk(seed);
             Float3 ray_direction = pixel_center - ray_origin;
             return initialize_ray(ray_origin, ray_direction);
         }

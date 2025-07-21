@@ -57,13 +57,8 @@ static inline unsigned int lcg2(unsigned int &prev) {
 }
 
 // Generate random float in [0, 1)
-unsigned int __global_seed = 0;
-static inline float rnd() {
-  return ((float)lcg(__global_seed) / (float)0x01000000);
-}
-
-static inline void set_rnd_seed(unsigned int new_seed) {
-    __global_seed = new_seed;
+static inline float rnd(unsigned int &seed) {
+  return ((float)lcg(seed) / (float)0x01000000);
 }
 
 static inline unsigned int rot_seed(unsigned int seed, unsigned int frame) {
