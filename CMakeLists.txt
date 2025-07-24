@@ -4,6 +4,12 @@ project(USDPathTracer)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED YES)
 
+set(TINYGLTF_HEADER_ONLY ON CACHE INTERNAL "" FORCE)
+set(TINYGLTF_INSTALL OFF CACHE INTERNAL "" FORCE)
+add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/external/tinygltf")
+
+add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/external/tinyobj")
+
 add_executable(USDPathTracer src/main.cpp)
 
 find_package(OpenImageIO CONFIG REQUIRED)
@@ -14,6 +20,13 @@ target_link_libraries(USDPathTracer embree)
 
 find_package(TBB REQUIRED)
 target_link_libraries(USDPathTracer TBB::tbb)
+
+message(STATUS "${CMAKE_CURRENT_SOURCE_DIR}/external/tinygltf")
+message(STATUS "${CMAKE_CURRENT_SOURCE_DIR}/external/tinyobj")
+
+target_include_directories(USDPathTracer PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/external/tinygltf")
+
+target_include_directories(USDPathTracer PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/external/tinyobj")
 
 # Copies DLLs our executable depends on to the build folder automatically
 add_custom_command(TARGET USDPathTracer POST_BUILD
