@@ -240,20 +240,14 @@ class glTFMesh : public Mesh {
                                 }
                                 
                                 // Add vertex offset for this primitive
-                                index += static_cast<unsigned int>(vertexOffset);
-                                
-                                indices.push_back(index++);
-                                indices.push_back(index++);
-                                indices.push_back(index++);
+                                indices.push_back(index + vertexOffset);
                             }
                         }
                     } else {
-                        // Non-indexed geometry - create indices automatically
-                        int triangleCount = vertexCount / 3;
-                        for (int i = 0; i < triangleCount; ++i) {
-                            indices.push_back(static_cast<unsigned int>(vertexOffset + i * 3 + 0));
-                            indices.push_back(static_cast<unsigned int>(vertexOffset + i * 3 + 1));
-                            indices.push_back(static_cast<unsigned int>(vertexOffset + i * 3 + 2));
+                      // Non-indexed geometry - create indices automatically
+                        size_t currentVertexCount = vertices.size() - vertexOffset;
+                        for (size_t i = 0; i < currentVertexCount; ++i) {
+                            indices.push_back(static_cast<unsigned int>(vertexOffset + i));
                         }
                     }
                 }
