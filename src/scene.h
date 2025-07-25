@@ -12,6 +12,14 @@
 #include "material.h"
 #include "mesh_load.h"
 
+// TODO: for motion blur, we need to add a new copy of the vertexbuffer per timestep
+// so we need to have the vertexbuffer and apply some sort of transformation to the buffer
+// The easiest way would be to make all meshes be objects, like our mesh loaders, 
+// and add functions that operate on top of the buffers - e.g. rotating, translating, scaling.
+// We need to add these, regardless, so it's better to do the two things at once.
+// We can, then, add the transforms at a certain timestep, which will create the additional 
+// buffers, if the timestep is different than 0.
+
 class SceneManager {
     public:
         SceneManager(RTCDevice &device_) {
