@@ -130,9 +130,9 @@ class ObjMesh : public Mesh {
                     make_Float3<std::vector<tinyobj::real_t>>(normals, attrib.normals, idx2.normal_index);
 
                     // // get the vertex tex coordinates
-                    // make_Float2<std::vector<tinyobj::real_t>>(texcoords, attrib.texcoords, idx0.texcoord_index);
-                    // make_Float2<std::vector<tinyobj::real_t>>(texcoords, attrib.texcoords, idx1.texcoord_index);
-                    // make_Float2<std::vector<tinyobj::real_t>>(texcoords, attrib.texcoords, idx2.texcoord_index);
+                    make_Float2<std::vector<tinyobj::real_t>>(texcoords, attrib.texcoords, idx0.texcoord_index);
+                    make_Float2<std::vector<tinyobj::real_t>>(texcoords, attrib.texcoords, idx1.texcoord_index);
+                    make_Float2<std::vector<tinyobj::real_t>>(texcoords, attrib.texcoords, idx2.texcoord_index);
 
                     // set index vector
                     indices.push_back(index++);
@@ -207,7 +207,29 @@ class glTFMesh : public Mesh {
                     // Copy vertices
                     for (int i = 0; i < vertexCount; ++i)
                         make_Float3<const float*>(vertices, positions, i);
-                    
+
+                    // Extract normals
+                    auto normalIt = primitive.attributes.find("NORMAL");
+                    if (normalIt != primitive.attributes.end()) {
+                        const tinygltf::Accessor& normalAccessor = model.accessors[normalIt->second];
+                        const tinygltf::BufferView& normalBufferView = model.bufferViews[normalAccessor.bufferView];
+                        const tinygltf::Buffer& normalBuffer = model.buffers[normalBufferView.buffer];
+                        
+                        if (normalAccessor.componentType == TINYGLTF_COMPONENT_TYPE_FLOAT) {
+                            const float* normals_data = reinterpret_cast<const float*>(
+                                &normalBuffer.data[normalBufferView.byteOffset + normalAccessor.byteOffset]);
+                            
+                            for (size_t i = 0; i < normalAccessor.count; ++i)
+                                make_Float3<const float*>(normals, normals_data, i);
+                        }
+                    } else {
+                        // If no normals, fill with dummy values to match vertex count
+                        size_t currentVertexCount = vertices.size() - normals.size();
+                        for (size_t i = 0; i < currentVertexCount; ++i) {
+                            normals.push_back(Float3(0.0f, 1.0f, 0.0f)); // Default up normal
+                        }
+                    }
+
                     // Extract indices
                     if (primitive.indices >= 0) {
                         const tinygltf::Accessor& indexAccessor = model.accessors[primitive.indices];
