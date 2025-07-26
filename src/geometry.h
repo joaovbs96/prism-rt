@@ -26,6 +26,42 @@ class Geometry {
         unsigned int geomid;
 };
 
+class Quad : public Geometry {
+    public:
+        Quad(const Float3& q, const Float3& u, const Float3& v, Material* material_) {
+            c1 = q;
+            c2 = q + u;
+            c3 = q + v;
+            c4 = q + u + v;
+            material = material_;
+        }
+
+        unsigned int setupEmbree(RTCDevice &device, RTCScene &scene) override {
+            type = RTC_GEOMETRY_TYPE_QUAD;
+            geom = rtcNewGeometry(device, type);
+            float* vb = (float*) rtcSetNewGeometryBuffer(geom,RTC_BUFFER_TYPE_VERTEX, 0, RTC_FORMAT_FLOAT3, 3*sizeof(float), 4);
+            vb[0] = c1.x(); vb[1] = c1.y(); vb[2] = c1.z();
+            vb[3] = c2.x(); vb[4] = c2.y(); vb[5] = c2.z();
+            vb[6] = c3.x(); vb[7] = c3.y(); vb[8] = c3.z();
+            vb[9] = c4.x(); vb[10] = c4.y(); vb[11] = c4.z();
+
+            int* ib = (int*) rtcSetNewGeometryBuffer(geom, RTC_BUFFER_TYPE_INDEX, 0, RTC_FORMAT_UINT4, 4*sizeof(unsigned int), 1);
+            ib[0] = 0; ib[1] = 1; ib[2] = 3; ib[3] = 2;
+
+            // commit and release geom handle
+            rtcCommitGeometry(geom);
+            geomid = rtcAttachGeometry(scene, geom);
+            return geomid;
+        }
+
+        Material* getMaterial(unsigned int primid, unsigned int instid) override {
+            return material;
+        }
+
+        Float3 c1, c2, c3, c4;
+        Material* material;
+};
+
 class Sphere : public Geometry {
     public:
         Sphere(const Float3& pos, float r, Material* material) : material(material), pos(pos), r(r) {}
@@ -384,6 +420,7 @@ class glTFMesh : public Mesh {
             // for each material in the scene file
             for (int m = 0; m < model.materials.size(); m++) {
                 tinygltf::Material mp = model.materials[m];
+                gltfPBR* gltf_material = new gltfPBR();
 
                 // Create Texture from image file or color value
                 tinygltf::PbrMetallicRoughness pbr = mp.pbrMetallicRoughness;
@@ -400,10 +437,49 @@ class glTFMesh : public Mesh {
                 } else {
                     base_texture = new ColorTexture(base_factor);
                 }
+                gltf_material->setBaseColor(base_texture);
 
-                // Assign texture index to the Material's name
-                materials[m] = new Diffuse(base_texture);
+                Texture<Float3>* orm_texture;
+                Float3 orm_factor = Float3(0.0f, pbr.roughnessFactor, pbr.metallicFactor);
+                if (hasImage(model, pbr.metallicRoughnessTexture)) {
+                    tinygltf::Image image = getTextureImage(model, pbr.baseColorTexture);
+
+                    if (image.uri.length() > 0) {
+                        orm_texture = new ImageMixTexture<Float3>(file_path.parent_path().concat("/").concat(image.uri), orm_factor);
+                    } else {
+                        orm_texture = new ImageMixTexture<Float3>(&image.image, image.width, image.height, image.component, orm_factor);
+                    }
+                } else {
+                    orm_texture = new ValueTexture<Float3>(orm_factor);
+                }
+                gltf_material->setORM(orm_texture);
+
+                Texture<Float3>* normal_texture;               
+                if (hasImage(model, mp.normalTexture)) {
+                    tinygltf::Image image = getTextureImage(model, mp.normalTexture);
+
+                    if (image.uri.length() > 0) {
+                        normal_texture = new ImageMixTexture<Float3>(file_path.parent_path().concat("/").concat(image.uri), orm_factor);
+                    } else {
+                        normal_texture = new ImageMixTexture<Float3>(&image.image, image.width, image.height, image.component, orm_factor);
+                    }
+
+                    gltf_material->setNormalTexture(normal_texture);
+                }
+
+                // Assign material
+                materials[m] = gltf_material;
             }
+        }
+
+        bool hasImage(tinygltf::Model& model, tinygltf::NormalTextureInfo& texinfo) {
+            if (texinfo.index >= 0 && texinfo.index < model.textures.size()) {
+                tinygltf::Texture& normal_texture = model.textures[texinfo.index];
+                if (normal_texture.source >= 0 && normal_texture.source < model.images.size()) {
+                    return true;
+                }
+            }
+            return false;
         }
 
         bool hasImage(tinygltf::Model& model, tinygltf::TextureInfo& texinfo) {
@@ -414,6 +490,11 @@ class glTFMesh : public Mesh {
                 }
             }
             return false;
+        }
+
+        tinygltf::Image getTextureImage(tinygltf::Model& model, tinygltf::NormalTextureInfo& texinfo) {
+            tinygltf::Texture& texture = model.textures[texinfo.index];
+            return model.images[texture.source];
         }
 
         tinygltf::Image getTextureImage(tinygltf::Model& model, tinygltf::TextureInfo& texinfo) {

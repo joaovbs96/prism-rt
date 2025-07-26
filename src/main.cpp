@@ -68,15 +68,13 @@ int main()
     _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
     _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);
 
-    int width = 1280;
-    int height = 720;
     int samples = 8;
     int max_depth = 10;
 
     RTCDevice device = initialize_device(1);
 
     unsigned int main_seed = 0;
-    SceneManager* scene_mgr = new Duck(device, main_seed);
+    SceneManager* scene_mgr = new QuadTest(device, main_seed);
     rtcCommitScene(scene_mgr->scene);
 
     RTCRayQueryContext context;
@@ -86,17 +84,17 @@ int main()
     rtcInitIntersectArguments(&intersectArgs);
     intersectArgs.context = &context;
 
-    FrameBuffer frame(width, height);
+    FrameBuffer frame(scene_mgr->image_width, scene_mgr->image_height);
 
     // Debugging, if we want to print something during rendering.
     // tbb::global_control gc(tbb::global_control::max_allowed_parallelism, 1);
 
     auto start_time = tbb::tick_count::now();
-    tbb::parallel_for(0, height, [&](int row)
+    tbb::parallel_for(0, scene_mgr->image_height, [&](int row)
     {
-        tbb::parallel_for(0, width, [&](int column)
+        tbb::parallel_for(0, scene_mgr->image_width, [&](int column)
         {
-            unsigned int seed = tea<64>(row * width, column);
+            unsigned int seed = tea<64>(row * scene_mgr->image_width, column);
 
             // render for N samples
             Color3 pixel_color(0.0f);

@@ -51,6 +51,13 @@ class SceneManager {
             return geomID;
         }
 
+        unsigned int add_quad(const Float3& q, const Float3& u, const Float3& v, Material* material_) {
+            Quad* quad = new Quad(q, u, v, material_);
+            int geomID = quad->setupEmbree(*device, scene);
+            geometry[geomID] = quad;
+            return geomID;
+        }
+
         RayHit cast_ray(RTCRay ray) {
             RTCRayHit e_rayhit;
             e_rayhit.ray = ray;
@@ -80,6 +87,7 @@ class SceneManager {
             if (ray_hit.geomid != RTC_INVALID_GEOMETRY_ID){
                 // retrieve material by geomid and sample the surface
                 Material* material = geometry[ray_hit.geomid]->getMaterial(ray_hit.primid, ray_hit.instid);
+                // TODO: sample normal map and perturbate normal
                 
                 // BRDFSample: surface hit color + scattered light ray
                 BRDFSample s = material->sample(ray_hit, seed);
@@ -90,7 +98,7 @@ class SceneManager {
             }
 
             // ray miss
-            float a = 0.5 * (ray_hit.d.y() + 1.0f);
+            float a = 0.5 * (ray_hit.d.normalize().y() + 1.0f);
             return (1.0-a) * Color3(1.0, 1.0, 1.0) + a * Color3(0.5, 0.7, 1.0);
         }
 
@@ -98,6 +106,8 @@ class SceneManager {
         RTCScene scene;
         std::unordered_map<int, Geometry*> geometry;
         Camera cam;
+        int image_width = 1280;
+        int image_height = 720;
 };
 
 class Earth : public SceneManager {
@@ -202,5 +212,28 @@ class Duck2 : public SceneManager {
             Float3 up(0.0f, 1.0f, 0.0f);
             float vfov = 8;
             cam = Camera(position, target, up, 1280, 720, 16.0f / 9.0f, vfov, 0.0f, 10.0f);
+        }
+};
+
+class QuadTest : public SceneManager {
+    public:
+        QuadTest(RTCDevice device_, unsigned int &seed) : SceneManager(device_) {
+            std::cout << "Started scene initialization." << std::endl;
+            add_quad(Float3(-3,-2, 5), Float3(0, 0,-4), Float3(0, 4, 0), new Diffuse(new ColorTexture(Color3(0.2, 1.0, 0.2))));
+            add_quad(Float3(-2,-2, 0), Float3(4, 0, 0), Float3(0, 4, 0), new Diffuse(new ColorTexture(Color3(0.2, 1.0, 0.2))));
+            add_quad(Float3( 3,-2, 1), Float3(0, 0, 4), Float3(0, 4, 0), new Diffuse(new ColorTexture(Color3(0.2, 1.0, 0.2))));
+            add_quad(Float3(-2, 3, 1), Float3(4, 0, 0), Float3(0, 0, 4), new Diffuse(new ColorTexture(Color3(0.2, 1.0, 0.2))));
+            add_quad(Float3(-2,-3, 5), Float3(4, 0, 0), Float3(0, 0,-4), new Diffuse(new ColorTexture(Color3(0.2, 1.0, 0.2))));
+
+            std::cout << "Finished geometry creation." << std::endl;
+
+            // camera initialization
+            image_width = 1280;
+            image_height = 1280;
+            Float3 position(0.0, 0.0, 9.0);
+            Float3 target(0.0f);
+            Float3 up(0.0f, 1.0f, 0.0f);
+            float vfov = 80;
+            cam = Camera(position, target, up, image_width, image_height, float(image_width) / image_height, vfov, 0.0f, 10.0f);
         }
 };

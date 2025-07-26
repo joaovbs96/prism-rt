@@ -53,6 +53,19 @@ class Material {
             r0 = r0 * r0;
             return r0 + (1.0f - r0) * std::powf(1.0f - cos, 5.0f);
         }
+
+        void setNormalTexture(Texture<Float3>* normal_texture_){
+            normal_texture = normal_texture_;
+        }
+
+        Float3 getShadingNormal(const RayHit ray_hit){
+            if (normal_texture == nullptr)
+                return Float3(0.0f);
+
+            normal_texture->sample(ray_hit.u, ray_hit.v, ray_hit.p);
+        }
+
+        Texture<Float3>* normal_texture = nullptr;
 };
 
 class Diffuse : public Material {
@@ -97,6 +110,49 @@ class Metal : public Material {
         Texture<float>* specular_roughness;
 };
 
+class DiffuseGltf : public Material {
+    public:
+        DiffuseGltf(Texture<Color3>* base_color) : base_color(base_color) {}
+
+        Float3 sample_direction(const RayHit ray_hit, unsigned int &seed) override {
+            // note that the ray incoming from the light (wi) is the next/scattered ray
+            // don't forget that a ray tracer works "in reverse"
+            Float3 wi = ray_hit.n + random_unit_vector(seed);
+
+            // if the incoming ray is near zero, we take the normal instead
+            if (wi.is_near_zero())
+                wi = ray_hit.n;
+
+            return wi;
+        }
+
+        Color3 evaluate_color(const Float3& p, const Float3& n, const Float3& wo, Float3& wi, float u, float v, unsigned int &seed) override {
+            return base_color->sample(u, v, p);
+        }
+
+        Texture<Color3>* base_color;
+};
+
+class MetalGltf : public Material {
+    public:
+        MetalGltf(Texture<Float3>* base_color, Texture<Float3>* orm) : base_color(base_color), orm(orm) {}
+
+        Float3 sample_direction(const RayHit ray_hit, unsigned int &seed) override {
+            // note that the ray incoming from the light (wi) is the next/scattered ray
+            // don't forget that a ray tracer works "in reverse"
+            float roughness = orm->sample(ray_hit.u, ray_hit.v, ray_hit.p).y();
+            Float3 wi = reflect(ray_hit.d, ray_hit.n).normalize() + roughness * random_unit_vector(seed);
+            return wi.normalize();
+        }
+
+        Color3 evaluate_color(const Float3& p, const Float3& n, const Float3& wo, Float3& wi, float u, float v, unsigned int &seed) override {
+            return base_color->sample(u, v, p);
+        }
+
+        Texture<Float3>* base_color;
+        Texture<Float3>* orm;
+};
+
 class Glass : public Material {
     public:
         Glass (const float ior) : ior(ior) {}
@@ -127,18 +183,32 @@ class Glass : public Material {
 
 class gltfPBR : public Material {
     public:
-        gltfPBR(Texture<Float3>* base_color_, Texture<float>* metalness_, Texture<float>* roughness_) {
+        gltfPBR(){}
+
+        void setBaseColor(Texture<Float3>* base_color_){
             base_color = base_color_;
-            metalness = metalness_;
-            roughness = roughness_;
+        }
+
+        void setORM(Texture<Float3>* orm_){
+            orm = orm_;
+        }
+
+        void createBRDFs() {
+            if (base_color == nullptr)
+                base_color = new ColorTexture(Color3(1.0f));
+            if (orm == nullptr)
+                orm = new ValueTexture<Float3>(1.0f);
 
             diffuse_brdf = new Diffuse(base_color);
-            metal_brdf = new Metal(base_color, roughness);
+            metal_brdf = new MetalGltf(base_color, orm);
         }
 
         BRDFSample sample(const RayHit ray_hit, unsigned int &seed) override {
+            // TODO: add a function that checks all textures and create default ones as needed?
+            createBRDFs();
+
             float prob = rnd(seed);
-            if (prob <= metalness->sample(ray_hit.u, ray_hit.v, ray_hit.p)){
+            if (prob <= orm->sample(ray_hit.u, ray_hit.v, ray_hit.p).b()){
                 return metal_brdf->sample(ray_hit, seed);
             } else {
                 return diffuse_brdf->sample(ray_hit, seed);
@@ -149,9 +219,8 @@ class gltfPBR : public Material {
         Float3 sample_direction(const RayHit ray_hit, unsigned int &seed) override { return Float3(); }
         Color3 evaluate_color(const Float3& p, const Float3& n, const Float3& wo, Float3& wi, float u, float v, unsigned int &seed) override {  return Color3(); }
 
-    Texture<Float3>* base_color;
-    Texture<float>* metalness;
-    Texture<float>* roughness;
-    Diffuse* diffuse_brdf;
-    Metal* metal_brdf;
+    Texture<Color3>* base_color = nullptr;
+    Texture<Float3>* orm = nullptr;
+    Diffuse* diffuse_brdf = nullptr;
+    MetalGltf* metal_brdf = nullptr;
 };

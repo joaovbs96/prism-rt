@@ -52,6 +52,8 @@ class RayHit {
         Float3 o;
         Float3 d;
         Float3 n;
+        Float3 g_n;
+        Float3 s_n;
         float u, v;
         bool front_face;
         float t;
