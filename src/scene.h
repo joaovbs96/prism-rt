@@ -11,6 +11,7 @@
 #include "sampling.h"
 #include "material.h"
 #include "geometry.h"
+#include "environment.h"
 
 // TODO: for motion blur, we need to add a new copy of the vertexbuffer per timestep
 // so we need to have the vertexbuffer and apply some sort of transformation to the buffer
@@ -99,14 +100,14 @@ class SceneManager {
                 return s.emission + s.color * trace(new_ray, depth - 1, seed);
             }
 
-            // ray miss
-            float a = 0.5 * (ray_hit.d.normalize().y() + 1.0f);
-            return (1.0-a) * Color3(1.0, 1.0, 1.0) + a * Color3(0.5, 0.7, 1.0);
+            // ray miss: sample environment
+            return environment->sample(ray_hit);
         }
 
         RTCDevice* device;
         RTCScene scene;
         std::unordered_map<int, Geometry*> geometry;
+        Environment* environment;
         Camera cam;
         int image_width = 1280;
         int image_height = 720;
@@ -125,6 +126,9 @@ class Earth : public SceneManager {
             Float3 up(0.0f, 1.0f, 0.0f);
             float vfov = 20;
             cam = Camera(position, target, up, 1280, 720, 16.0f / 9.0f, vfov, 0.0f, 10.0f);
+
+            // environment map - for missed rays
+            environment = new GradientBackground(new ColorTexture(Color3(1.0, 1.0, 1.0)), new ColorTexture(Color3(0.5, 0.7, 1.0)));
     }
 };
 
@@ -163,6 +167,9 @@ class InOneWeekendFinal : public SceneManager {
             Float3 up(0.0f, 1.0f, 0.0f);
             float vfov = 20;
             cam = Camera(position, target, up, 1280, 720, 16.0f / 9.0f, vfov, 0.6f, 10.0f);
+
+            // environment map - for missed rays
+            environment = new GradientBackground(new ColorTexture(Color3(1.0, 1.0, 1.0)), new ColorTexture(Color3(0.5, 0.7, 1.0)));
         }
 };
 
@@ -170,7 +177,7 @@ class ABeautifulGame : public SceneManager {
     public:
         ABeautifulGame(RTCDevice device_, unsigned int &seed) : SceneManager(device_) {
             std::cout << "Started scene initialization." << std::endl;
-            add_mesh("C:/Users/joaov/Desktop/ABeautifulGame.glb", new Diffuse(new ImageTexture("C:/Users/joaov/Desktop/earthmap.jpg")));
+            add_mesh("C:/Users/joaov/Desktop/ABeautifulGame.glb");
 
             std::cout << "Finished geometry creation." << std::endl;
 
@@ -180,6 +187,9 @@ class ABeautifulGame : public SceneManager {
             Float3 up(0.0f, 1.0f, 0.0f);
             float vfov = 12;
             cam = Camera(position, target, up, 1280, 720, 16.0f / 9.0f, vfov, 0.0f, 10.0f);
+
+            // environment map - for missed rays
+            environment = new EnvironmentMap(new ImageTexture("C:/Users/joaov/Downloads/golden_gate_hills_4k.exr"));
         }
 };
 
@@ -197,6 +207,9 @@ class Duck : public SceneManager {
             Float3 up(0.0f, 1.0f, 0.0f);
             float vfov = 8;
             cam = Camera(position, target, up, 1280, 720, 16.0f / 9.0f, vfov, 0.0f, 10.0f);
+
+            // environment map - for missed rays
+            environment = new GradientBackground(new ColorTexture(Color3(1.0, 1.0, 1.0)), new ColorTexture(Color3(0.5, 0.7, 1.0)));
         }
 };
 
@@ -214,6 +227,9 @@ class Duck2 : public SceneManager {
             Float3 up(0.0f, 1.0f, 0.0f);
             float vfov = 8;
             cam = Camera(position, target, up, 1280, 720, 16.0f / 9.0f, vfov, 0.0f, 10.0f);
+
+            // environment map - for missed rays
+            environment = new GradientBackground(new ColorTexture(Color3(1.0, 1.0, 1.0)), new ColorTexture(Color3(0.5, 0.7, 1.0)));
         }
 };
 
@@ -237,5 +253,8 @@ class QuadTest : public SceneManager {
             Float3 up(0.0f, 1.0f, 0.0f);
             float vfov = 80;
             cam = Camera(position, target, up, image_width, image_height, float(image_width) / image_height, vfov, 0.0f, 10.0f);
+
+            // environment map - for missed rays
+            environment = new GradientBackground(new ColorTexture(Color3(1.0, 1.0, 1.0)), new ColorTexture(Color3(0.5, 0.7, 1.0)));
         }
 };

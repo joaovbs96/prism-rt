@@ -68,13 +68,13 @@ int main()
     _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
     _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);
 
-    int samples = 8;
+    int samples = 500;
     int max_depth = 10;
 
     RTCDevice device = initialize_device(1);
 
     unsigned int main_seed = 0;
-    SceneManager* scene_mgr = new QuadTest(device, main_seed);
+    SceneManager* scene_mgr = new ABeautifulGame(device, main_seed);
     rtcCommitScene(scene_mgr->scene);
 
     RTCRayQueryContext context;

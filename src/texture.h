@@ -77,8 +77,8 @@ class ImageTexture : public Texture<T> {
         }
 
         T sample(float u, float v, const Float3& p) const override {
-            auto i = int(std::fmodf(u, 1.0) * (width - 1));
-            auto j = int(std::fmodf(v, 1.0) * (height - 1));
+            auto i = int(std::fabsf(std::fmodf(u, 1.0)) * (width - 1));
+            auto j = int(std::fabsf(std::fmodf(v, 1.0)) * (height - 1));
             return pixels[j * width + i];
         }
 

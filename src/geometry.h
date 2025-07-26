@@ -442,7 +442,7 @@ class glTFMesh : public Mesh {
                 Texture<Float3>* orm_texture;
                 Float3 orm_factor = Float3(0.0f, pbr.roughnessFactor, pbr.metallicFactor);
                 if (hasImage(model, pbr.metallicRoughnessTexture)) {
-                    tinygltf::Image image = getTextureImage(model, pbr.baseColorTexture);
+                    tinygltf::Image image = getTextureImage(model, pbr.metallicRoughnessTexture);
 
                     if (image.uri.length() > 0) {
                         orm_texture = new ImageMixTexture<Float3>(file_path.parent_path().concat("/").concat(image.uri), orm_factor);
