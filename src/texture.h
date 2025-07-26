@@ -43,14 +43,10 @@ class ImageTexture : public Texture<T> {
             height = _height;
             channel_n = sizeof(T) / sizeof(float);
 
-            const ImageSpec char_spec(width, height, file_channel_n, TypeDesc::UCHAR);
-            ImageBuf char_oiio_buffer = ImageBuf(char_spec, buffer->data());
-            ImageBuf oiio_buffer = ImageBufAlgo::copy(char_oiio_buffer, TypeDesc::FLOAT);
-
-            // // handles type conversion with oiio buffers
-            // const ImageSpec spec(width, height, file_channel_n, TypeDesc::FLOAT);
-            // ImageBuf oiio_buffer = ImageBuf(spec);
-            // oiio_buffer.set_pixels(ROI(), TypeDesc::FLOAT, buffer->data());
+            // handles type conversion with oiio buffers
+            const ImageSpec spec(width, height, file_channel_n, TypeDesc::FLOAT);
+            ImageBuf oiio_buffer = ImageBuf(spec, InitializePixels::No);
+            oiio_buffer.set_pixels(ROI(), TypeDesc::UINT8, buffer->data());
 
             // adjust channel count
             if (file_channel_n != channel_n) {
