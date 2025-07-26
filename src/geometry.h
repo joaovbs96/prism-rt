@@ -467,8 +467,38 @@ class glTFMesh : public Mesh {
                     gltf_material->setNormalTexture(normal_texture);
                 }
 
+                if (mp.extensions.contains("KHR_materials_transmission")) {
+                    tinygltf::Value::Object transmission = mp.extensions["KHR_materials_transmission"].Get<tinygltf::Value::Object>();
+
+                    // Extract transmissionFactor (required parameter)
+                    float transmission_factor = getExtensionFactor(transmission, "transmissionFactor", 0.0f);
+                    Texture<float>* transmission_texture;         
+                    if (hasImage(model, transmission, "transmissionTexture")) {
+                        tinygltf::Image image = getTextureImage(model, transmission, "transmissionTexture");
+
+                        if (image.uri.length() > 0) {
+                            transmission_texture = new ImageMixTexture<float>(file_path.parent_path().concat("/").concat(image.uri), transmission_factor);
+                        } else {
+                            transmission_texture = new ImageMixTexture<float>(&image.image, image.width, image.height, image.component, transmission_factor);
+                        }
+                    } else {
+                        transmission_texture = new ValueTexture<float>(transmission_factor);
+                    }
+                    gltf_material->setTransmission(transmission_texture);
+                }
+
                 // Assign material
                 materials[m] = gltf_material;
+            }
+        }
+
+        float getExtensionFactor(tinygltf::Value::Object gltf_obj, const char* key, float default_value) {
+            // Extract transmissionFactor (required parameter)
+            auto iterator_ = gltf_obj.find(key);
+            if (iterator_ != gltf_obj.end() && iterator_->second.IsNumber()) {
+                return float(iterator_->second.Get<double>());
+            } else {
+                return default_value;
             }
         }
 
@@ -492,6 +522,24 @@ class glTFMesh : public Mesh {
             return false;
         }
 
+        bool hasImage(tinygltf::Model& model, tinygltf::Value::Object ext_obj, const char* key) {
+            // Extract transmissionFactor (required parameter)
+            auto iterator_ = ext_obj.find(key);
+            if (iterator_ != ext_obj.end() && iterator_->second.IsObject()) {
+                const tinygltf::Value::Object& texinfo = iterator_->second.Get<tinygltf::Value::Object>();
+                // Get texture index
+                auto index_it_ = texinfo.find("index");
+                if (index_it_ != texinfo.end() && index_it_->second.IsInt()) {
+                    int tex_index = index_it_->second.Get<int>();
+                    tinygltf::Texture& texture = model.textures[tex_index];
+                    if (texture.source >= 0 && texture.source < model.images.size()) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+
         tinygltf::Image getTextureImage(tinygltf::Model& model, tinygltf::NormalTextureInfo& texinfo) {
             tinygltf::Texture& texture = model.textures[texinfo.index];
             return model.images[texture.source];
@@ -499,6 +547,15 @@ class glTFMesh : public Mesh {
 
         tinygltf::Image getTextureImage(tinygltf::Model& model, tinygltf::TextureInfo& texinfo) {
             tinygltf::Texture& texture = model.textures[texinfo.index];
+            return model.images[texture.source];
+        }
+
+        tinygltf::Image getTextureImage(tinygltf::Model& model, tinygltf::Value::Object ext_obj, const char* key) {
+            auto iterator_ = ext_obj.find(key);
+            const tinygltf::Value::Object& texinfo = iterator_->second.Get<tinygltf::Value::Object>();
+            auto index_it_ = texinfo.find("index");
+            int tex_index = index_it_->second.Get<int>();
+            tinygltf::Texture& texture = model.textures[tex_index];
             return model.images[texture.source];
         }
 };

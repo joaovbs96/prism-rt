@@ -140,6 +140,38 @@ class Emissive : public Material {
         Texture<float>* emissive_multiplier;
 };
 
+class Glass : public Material {
+    public:
+        Glass (const float ior) : ior(ior) {}
+
+        Float3 sample_direction(const RayHit ray_hit, unsigned int &seed) override {
+            float ior_ = ray_hit.front_face ? 1.0f / ior : ior;
+
+            Float3 unit_direction = ray_hit.d.normalize();
+            float cos_theta = std::fminf(dot(-unit_direction, ray_hit.n), 1.0f);
+            float sin_theta = std::sqrtf(1.0f - cos_theta * cos_theta);
+
+            // ray is exiting the object
+            // std::cout << "Test - " << "Front:" << is_front << "IOR:" << ior_ << "Theta:" << sin_theta << std::endl;
+            if (ior_ * sin_theta > 1.0f || schlick(cos_theta, ior_) > rnd(seed)) {
+                return reflect(unit_direction, ray_hit.n);
+            } else { // ray is entering the object
+                return refract(unit_direction, ray_hit.n, ior_);
+            }
+        }
+
+        Color3 evaluate_color(const Float3& p, const Float3& n, const Float3& wo, Float3& wi, float u, float v, unsigned int &seed) override {
+            return Color3(1.0f);
+        }
+
+    private:
+        float ior;
+};
+
+////////////////////////////////////////////////////////////////////////////
+////////////////////////////// glTF PBR Lobes //////////////////////////////
+////////////////////////////////////////////////////////////////////////////
+
 class DiffuseGltf : public Material {
     public:
         DiffuseGltf(Texture<Color3>* base_color) : base_color(base_color) {}
@@ -171,7 +203,7 @@ class MetalGltf : public Material {
             // note that the ray incoming from the light (wi) is the next/scattered ray
             // don't forget that a ray tracer works "in reverse"
             float roughness = orm->sample(ray_hit.u, ray_hit.v, ray_hit.p).y();
-            Float3 wi = reflect(ray_hit.d, ray_hit.n).normalize() + roughness * random_unit_vector(seed);
+            Float3 wi = reflect(ray_hit.d, ray_hit.n).normalize() + (roughness * roughness) * random_unit_vector(seed);
             return wi.normalize();
         }
 
@@ -183,9 +215,9 @@ class MetalGltf : public Material {
         Texture<Float3>* orm;
 };
 
-class Glass : public Material {
+class SpecularBTDFglTF : public Material {
     public:
-        Glass (const float ior) : ior(ior) {}
+        SpecularBTDFglTF (Texture<Float3>* base_color, const float ior) : base_color(base_color), ior(ior) {}
 
         Float3 sample_direction(const RayHit ray_hit, unsigned int &seed) override {
             float ior_ = ray_hit.front_face ? 1.0f / ior : ior;
@@ -204,11 +236,11 @@ class Glass : public Material {
         }
 
         Color3 evaluate_color(const Float3& p, const Float3& n, const Float3& wo, Float3& wi, float u, float v, unsigned int &seed) override {
-            return Color3(1.0f);
+            return base_color->sample(u, v, p);
         }
 
-    private:
-        float ior;
+    Texture<Float3>* base_color;
+    float ior;
 };
 
 class gltfPBR : public Material {
@@ -223,13 +255,20 @@ class gltfPBR : public Material {
             orm = orm_;
         }
 
+        void setTransmission(Texture<float>* transmission_){
+            transmission = transmission_;
+        }
+
         void createBRDFs() {
             if (base_color == nullptr)
                 base_color = new ColorTexture(Color3(1.0f));
             if (orm == nullptr)
                 orm = new ValueTexture<Float3>(1.0f);
+            if (transmission == nullptr)
+                transmission = new ValueTexture<float>(0.0f);
 
             diffuse_brdf = new Diffuse(base_color);
+            specular_btdf = new SpecularBTDFglTF(base_color, 1.5f);
             metal_brdf = new MetalGltf(base_color, orm);
         }
 
@@ -241,7 +280,11 @@ class gltfPBR : public Material {
             if (prob <= orm->sample(ray_hit.u, ray_hit.v, ray_hit.p).b()){
                 return metal_brdf->sample(ray_hit, seed);
             } else {
-                return diffuse_brdf->sample(ray_hit, seed);
+                if (prob <= transmission->sample(ray_hit.u, ray_hit.v, ray_hit.p)){
+                    return specular_btdf->sample(ray_hit, seed);
+                } else {
+                    return diffuse_brdf->sample(ray_hit, seed);
+                }
             }
         }
 
@@ -251,6 +294,8 @@ class gltfPBR : public Material {
 
     Texture<Color3>* base_color = nullptr;
     Texture<Float3>* orm = nullptr;
+    Texture<float>* transmission = nullptr;
     Diffuse* diffuse_brdf = nullptr;
     MetalGltf* metal_brdf = nullptr;
+    SpecularBTDFglTF* specular_btdf = nullptr;
 };

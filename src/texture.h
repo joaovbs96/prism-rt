@@ -102,7 +102,7 @@ class ImageMixTexture : public Texture<T> {
             _value = new ValueTexture<T>(v);
         }
 
-        Color3 sample(float u, float v, const Float3& p) const override {
+        T sample(float u, float v, const Float3& p) const override {
             return _image->sample(u, v, p) * _value->sample(u, v, p);
         }
 
