@@ -87,6 +87,8 @@ class Mesh : public Geometry {
             if (material_override != nullptr)
                 return material_override;
 
+            // TODO: make materials on a per prim, per instance basis?
+            // we may need a two dimensional unordered map, with primid and instid as keys
             return materials[primid];
         }
 
@@ -273,6 +275,32 @@ class glTFMesh : public Mesh {
                         size_t currentVertexCount = vertices.size() - normals.size();
                         for (size_t i = 0; i < currentVertexCount; ++i) {
                             normals.push_back(Float3(0.0f, 1.0f, 0.0f)); // Default up normal
+                        }
+                    }
+
+                    // Extract texture coordinates
+                    auto texCoordIt = primitive.attributes.find("TEXCOORD_0");
+                    if (texCoordIt != primitive.attributes.end()) {
+                        const tinygltf::Accessor& texAccessor = model.accessors[texCoordIt->second];
+                        const tinygltf::BufferView& texBufferView = model.bufferViews[texAccessor.bufferView];
+                        const tinygltf::Buffer& texBuffer = model.buffers[texBufferView.buffer];
+                        
+                        if (texAccessor.componentType == TINYGLTF_COMPONENT_TYPE_FLOAT) {
+                            const float* texcoords_data = reinterpret_cast<const float*>(
+                                &texBuffer.data[texBufferView.byteOffset + texAccessor.byteOffset]);
+                            
+                            for (size_t i = 0; i < texAccessor.count; ++i) {
+                                texcoords.push_back(Float2(
+                                    texcoords_data[i * 2 + 0],
+                                    texcoords_data[i * 2 + 1]
+                                ));
+                            }
+                        }
+                    } else {
+                        // If no texture coordinates, fill with dummy values
+                        size_t currentVertexCount = vertices.size() - texcoords.size();
+                        for (size_t i = 0; i < currentVertexCount; ++i) {
+                            texcoords.push_back(Float2(0.0f, 0.0f)); // Default UV
                         }
                     }
 

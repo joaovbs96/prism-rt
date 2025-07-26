@@ -26,17 +26,19 @@ class RayHit {
             n = front_face ? n : -n;
 
             // geometry specific interpolation
+            Float3 m_normal;
+            Float2 m_uv;
             if (geomid != RTC_INVALID_GEOMETRY_ID){
                 switch (type) {
                     case RTC_GEOMETRY_TYPE_TRIANGLE:
                         rtcInterpolate0(*geom, primid, u, v, RTC_BUFFER_TYPE_VERTEX_ATTRIBUTE, 0, reinterpret_cast<float*>(&m_normal), 3);
-                        // rtcInterpolate0(*geom, primid, u, v, RTC_BUFFER_TYPE_VERTEX_ATTRIBUTE, 1, reinterpret_cast<float*>(&m_uv), 2);
+                        rtcInterpolate0(*geom, primid, u, v, RTC_BUFFER_TYPE_VERTEX_ATTRIBUTE, 1, reinterpret_cast<float*>(&m_uv), 2);
 
                         // use normal and uv parameters from the mesh
                         n = m_normal.normalize();
                         n = front_face ? n : -n;
-                        // u = m_uv.u();
-                        // v = m_uv.v();
+                        u = m_uv.u();
+                        v = m_uv.v();
                         break;
                     
                     default:
@@ -49,8 +51,6 @@ class RayHit {
         Float3 o;
         Float3 d;
         Float3 n;
-        Float3 m_normal;
-        Float2 m_uv;
         float u, v;
         bool front_face;
         float t;
