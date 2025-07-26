@@ -131,7 +131,7 @@ class InOneWeekendFinal : public SceneManager {
                         if (rnd_ < 0.8f) {
                             add_sphere(center, 0.2f, new Diffuse(new ColorTexture(Color3(rnd(seed), rnd(seed), rnd(seed)))));
                         } else if (rnd_ < 0.95f) {
-                            add_sphere(center, 0.2f, new Metal(new ColorTexture(Color3(rnd(seed), rnd(seed), rnd(seed))), rnd(seed)));
+                            add_sphere(center, 0.2f, new Metal(new ColorTexture(Color3(rnd(seed), rnd(seed), rnd(seed))), new ValueTexture<float>(rnd(seed))));
                         } else {
                             add_sphere(center, 0.2f, new Glass(1.5f));
                         }

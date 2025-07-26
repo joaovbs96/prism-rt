@@ -57,7 +57,7 @@ class Material {
 
 class Diffuse : public Material {
     public:
-        Diffuse(Texture* texture) : diffuse_color(texture) {}
+        Diffuse(Texture<Float3>* texture) : diffuse_color(texture) {}
 
         Float3 sample_direction(const RayHit ray_hit, unsigned int &seed) override {
             // note that the ray incoming from the light (wi) is the next/scattered ray
@@ -75,17 +75,17 @@ class Diffuse : public Material {
             return diffuse_color->sample(u, v, p);
         }
 
-        Texture* diffuse_color;
+        Texture<Float3>* diffuse_color;
 };
 
 class Metal : public Material {
     public:
-        Metal(Texture* specular_color, const float specular_roughness) : specular_color(specular_color), specular_roughness(specular_roughness) {}
+        Metal(Texture<Float3>* specular_color, Texture<float>* specular_roughness) : specular_color(specular_color), specular_roughness(specular_roughness) {}
 
         Float3 sample_direction(const RayHit ray_hit, unsigned int &seed) override {
             // note that the ray incoming from the light (wi) is the next/scattered ray
             // don't forget that a ray tracer works "in reverse"
-            Float3 wi = reflect(ray_hit.d, ray_hit.n).normalize() + specular_roughness * random_unit_vector(seed);
+            Float3 wi = reflect(ray_hit.d, ray_hit.n).normalize() + specular_roughness->sample(ray_hit.u, ray_hit.v, ray_hit.p) * random_unit_vector(seed);
             return wi.normalize();
         }
 
@@ -93,8 +93,8 @@ class Metal : public Material {
             return specular_color->sample(u, v, p);
         }
 
-        Texture* specular_color;
-        float specular_roughness;
+        Texture<Float3>* specular_color;
+        Texture<float>* specular_roughness;
 };
 
 class Glass : public Material {
@@ -127,7 +127,7 @@ class Glass : public Material {
 
 class gltfPBR : public Material {
     public:
-        gltfPBR(Texture* base_color_, const float metalness_, const float roughness_) {
+        gltfPBR(Texture<Float3>* base_color_, Texture<float>* metalness_, Texture<float>* roughness_) {
             base_color = base_color_;
             metalness = metalness_;
             roughness = roughness_;
@@ -138,7 +138,7 @@ class gltfPBR : public Material {
 
         BRDFSample sample(const RayHit ray_hit, unsigned int &seed) override {
             float prob = rnd(seed);
-            if (prob <= metalness){
+            if (prob <= metalness->sample(ray_hit.u, ray_hit.v, ray_hit.p)){
                 return metal_brdf->sample(ray_hit, seed);
             } else {
                 return diffuse_brdf->sample(ray_hit, seed);
@@ -149,9 +149,9 @@ class gltfPBR : public Material {
         Float3 sample_direction(const RayHit ray_hit, unsigned int &seed) override { return Float3(); }
         Color3 evaluate_color(const Float3& p, const Float3& n, const Float3& wo, Float3& wi, float u, float v, unsigned int &seed) override {  return Color3(); }
 
-    Texture* base_color;
-    float metalness;
-    float roughness;
+    Texture<Float3>* base_color;
+    Texture<float>* metalness;
+    Texture<float>* roughness;
     Diffuse* diffuse_brdf;
     Metal* metal_brdf;
 };

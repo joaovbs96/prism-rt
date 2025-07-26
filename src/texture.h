@@ -10,29 +10,31 @@
 #include <OpenImageIO/imageio.h>
 using namespace OIIO;
 
-class Texture {
-    public:
-        Texture() {}
-
-        virtual Color3 sample(float u, float v, const Float3& p) const = 0;
-};
-
-class ColorTexture : public Texture {
-    public:
-        ColorTexture(Color3 color) : color(color) {}
-
-        Color3 sample(float u, float v, const Float3& p) const override {
-            return color;
-        }
-
-    Color3 color;
-};
-
 template<typename T>
 concept TextureType = std::same_as<T, float> || std::same_as<T, Float3> || std::same_as<T, Float4>;
 
 template <TextureType T = Float3>
-class ImageTexture : public Texture {
+class Texture {
+    public:
+        Texture() {}
+
+        virtual T sample(float u, float v, const Float3& p) const = 0;
+};
+
+template <TextureType T = Float3>
+class ValueTexture : public Texture<T> {
+    public:
+        ValueTexture(const T& value) : value(value) {}
+
+        T sample(float u, float v, const Float3& p) const override {
+            return value;
+        }
+
+    T value;
+};
+
+template <TextureType T = Float3>
+class ImageTexture : public Texture<T> {
     public:
         ImageTexture(const std::filesystem::path &file_path) {
             std::cout << "Loading File: " << file_path << std::endl;
@@ -63,4 +65,29 @@ class ImageTexture : public Texture {
         int file_channel_n; // original channel count from file
         int channel_n;      // effective channel count in use, due to template
         std::vector<T> pixels;
+};
+
+template <TextureType T = Float3>
+class ImageMixTexture : public Texture<T> {
+    public:
+        ImageMixTexture(const std::filesystem::path &file_path, const T& v = T(1.0f)) {
+            _image = new ImageTexture<T>(file_path);
+            _value = new ValueTexture<T>(v);
+        }
+
+        Color3 sample(float u, float v, const Float3& p) const override {
+            return _image->sample(u, v, p) * _value->sample(u, v, p);
+        }
+
+    ImageTexture<T>* _image;
+    ValueTexture<T>* _value;
+};
+
+class ColorTexture : public ValueTexture<Float3> {
+    public:
+        ColorTexture(Color3 color) : ValueTexture<Float3>(color) {}
+
+        Color3 sample(float u, float v, const Float3& p) const override {
+            return value;
+        }
 };
