@@ -26,24 +26,25 @@ class RayHit {
             n = front_face ? n : -n;
 
             // geometry specific interpolation
-            Float3 m_normal;
-            Float2 m_uv;
             if (geomid != RTC_INVALID_GEOMETRY_ID){
-                switch (type) {
-                    case RTC_GEOMETRY_TYPE_TRIANGLE:
-                        rtcInterpolate0(*geom, primid, u, v, RTC_BUFFER_TYPE_VERTEX_ATTRIBUTE, 0, reinterpret_cast<float*>(&m_normal), 3);
-                        rtcInterpolate0(*geom, primid, u, v, RTC_BUFFER_TYPE_VERTEX_ATTRIBUTE, 1, reinterpret_cast<float*>(&m_uv), 2);
+                if (type == RTC_GEOMETRY_TYPE_TRIANGLE) {
+                    Float3 m_normal;
+                    Float2 m_uv;
+                    rtcInterpolate0(*geom, primid, u, v, RTC_BUFFER_TYPE_VERTEX_ATTRIBUTE, 0, reinterpret_cast<float*>(&m_normal), 3);
+                    rtcInterpolate0(*geom, primid, u, v, RTC_BUFFER_TYPE_VERTEX_ATTRIBUTE, 1, reinterpret_cast<float*>(&m_uv), 2);
 
-                        // use normal and uv parameters from the mesh
-                        n = m_normal.normalize();
-                        n = front_face ? n : -n;
-                        u = m_uv.u();
-                        v = m_uv.v();
-                        break;
+                    // use normal and uv parameters from the mesh
+                    n = m_normal.normalize();
+                    n = front_face ? n : -n;
+                    u = m_uv.u();
+                    v = m_uv.v();
+                } else if (type == RTC_GEOMETRY_TYPE_SPHERE_POINT) {
+                    float theta = std::atan2f(n.z(), n.x());
+                    float phi = std::acosf(n.y());
                     
-                    default:
-                        break;
-                };
+                    u = 1.0 - ((theta + PI) / (2.0f * PI));
+                    v = phi / PI;
+                }
             }
         }
 
