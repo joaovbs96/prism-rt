@@ -91,10 +91,12 @@ class SceneManager {
                 
                 // BRDFSample: surface hit color + scattered light ray
                 BRDFSample s = material->sample(ray_hit, seed);
+                if (!s.scattered)
+                    return s.emission;
 
                 RTCRay new_ray = initialize_ray(ray_hit.p, s.wi);
 
-                return s.color * trace(new_ray, depth - 1, seed);
+                return s.emission + s.color * trace(new_ray, depth - 1, seed);
             }
 
             // ray miss

@@ -9,6 +9,8 @@
 struct BRDFSample {
     Float3 wi;
     Color3 color;
+    Color3 emission;
+    bool scattered;
 };
 
 class Material {
@@ -23,6 +25,8 @@ class Material {
             BRDFSample s;
             s.wi = sample_direction(ray_hit, seed);
             s.color = evaluate_color(ray_hit.p, ray_hit.n, -ray_hit.d, s.wi, ray_hit.u, ray_hit.v, seed);
+            s.emission = evaluate_emission(ray_hit);
+            s.scattered = !s.wi.is_zero();
             return s;
         }
 
@@ -36,6 +40,10 @@ class Material {
             float u, float v,   // UV coordinates
             unsigned int &seed  // random number generator seed
         ) = 0;
+
+        virtual Color3 evaluate_emission(const RayHit ray_hit) {
+            return Color3(0.0f);
+        }
 
         Float3 reflect(const Float3& i, const Float3& n) {
             return i - 2 * dot(i, n) * n;
@@ -93,7 +101,8 @@ class Diffuse : public Material {
 
 class Metal : public Material {
     public:
-        Metal(Texture<Float3>* specular_color, Texture<float>* specular_roughness) : specular_color(specular_color), specular_roughness(specular_roughness) {}
+        Metal(Texture<Float3>* specular_color, Texture<float>* specular_roughness) 
+        : specular_color(specular_color), specular_roughness(specular_roughness) {}
 
         Float3 sample_direction(const RayHit ray_hit, unsigned int &seed) override {
             // note that the ray incoming from the light (wi) is the next/scattered ray
@@ -108,6 +117,27 @@ class Metal : public Material {
 
         Texture<Float3>* specular_color;
         Texture<float>* specular_roughness;
+};
+
+class Emissive : public Material {
+    public:
+        Emissive(Texture<Float3>* emissive_color, Texture<float>* emissive_multiplier) 
+        : emissive_color(emissive_color), emissive_multiplier(emissive_multiplier) {}
+
+        Float3 sample_direction(const RayHit ray_hit, unsigned int &seed) override {
+            return Float3(0.0f);
+        }
+
+        Color3 evaluate_color(const Float3& p, const Float3& n, const Float3& wo, Float3& wi, float u, float v, unsigned int &seed) override {
+            return Color3(0.0f);
+        }
+
+        Color3 evaluate_emission(const RayHit ray_hit) override {
+            return emissive_color->sample(ray_hit.u, ray_hit.v, ray_hit.p) * emissive_multiplier->sample(ray_hit.u, ray_hit.v, ray_hit.p);
+        }
+
+        Texture<Color3>* emissive_color;
+        Texture<float>* emissive_multiplier;
 };
 
 class DiffuseGltf : public Material {
