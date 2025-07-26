@@ -108,7 +108,7 @@ class Float3 {
 
         float length_squared() const {
             // length squared of a vector is the dot product of itself
-            return x() * x() + y() * y()+  z() * z();
+            return x() * x() + y() * y() + z() * z();
         }
 
         float length() const {
@@ -179,6 +179,10 @@ class Float3 {
         }
 };
 
+std::ostream& operator<<(std::ostream& os, const Float3& v) {
+    return os << "<" << v.x() << "," << v.y() << "," << v.z() << ">" << std::endl;
+}
+
 inline Float3 operator*(const float t, const Float3& v) {
   return Float3(v.x() * t, v.y() * t, v.z() * t);
 }
@@ -188,7 +192,7 @@ inline Float3 operator/(const Float3& v, const float t) {
 }
 
 inline float dot(const Float3& v1, const Float3& v2) {
-    return v1.x() * v2.x() + v1.y() * v2.y()+  v1.z() * v2.z();
+    return v1.x() * v2.x() + v1.y() * v2.y() + v1.z() * v2.z();
 }
 
 Float3 cross(const Float3& v1, const Float3& v2) {
