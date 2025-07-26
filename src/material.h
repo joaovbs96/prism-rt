@@ -4,6 +4,7 @@
 #include "sampling.h"
 #include "rng.h"
 #include "ray.h"
+#include "texture.h"
 
 struct BRDFSample {
     Float3 wi;
@@ -21,7 +22,7 @@ class Material {
         virtual BRDFSample sample(const RayHit ray_hit, unsigned int &seed) {
             BRDFSample s;
             s.wi = sample_direction(ray_hit, seed);
-            s.color = evaluate_color(ray_hit.p, ray_hit.n, -ray_hit.d, s.wi, seed);
+            s.color = evaluate_color(ray_hit.p, ray_hit.n, -ray_hit.d, s.wi, ray_hit.u, ray_hit.v, seed);
             return s;
         }
 
@@ -31,8 +32,9 @@ class Material {
             const Float3& p,    // surface hit point
             const Float3& n,    // surface normal vector
             const Float3& wo,   // ray outgoing towards the camera
-            Float3& wi,    // ray incoming from the light
-            unsigned int &seed
+            Float3& wi,         // ray incoming from the light
+            float u, float v,   // UV coordinates
+            unsigned int &seed  // random number generator seed
         ) = 0;
 
         Float3 reflect(const Float3& i, const Float3& n) {
@@ -55,7 +57,7 @@ class Material {
 
 class Diffuse : public Material {
     public:
-        Diffuse(const Color3&diffuse_color) : diffuse_color(diffuse_color) {}
+        Diffuse(Texture* texture) : diffuse_color(texture) {}
 
         Float3 sample_direction(const RayHit ray_hit, unsigned int &seed) override {
             // note that the ray incoming from the light (wi) is the next/scattered ray
@@ -69,16 +71,16 @@ class Diffuse : public Material {
             return wi;
         }
 
-        Color3 evaluate_color(const Float3& p, const Float3& n, const Float3& wo, Float3& wi, unsigned int &seed) override {
-            return diffuse_color;
+        Color3 evaluate_color(const Float3& p, const Float3& n, const Float3& wo, Float3& wi, float u, float v, unsigned int &seed) override {
+            return diffuse_color->sample(u, v, p);
         }
 
-        Color3 diffuse_color;
+        Texture* diffuse_color;
 };
 
 class Metal : public Material {
     public:
-        Metal(const Color3&specular_color, const float specular_roughness) : specular_color(specular_color), specular_roughness(specular_roughness) {}
+        Metal(Texture* specular_color, const float specular_roughness) : specular_color(specular_color), specular_roughness(specular_roughness) {}
 
         Float3 sample_direction(const RayHit ray_hit, unsigned int &seed) override {
             // note that the ray incoming from the light (wi) is the next/scattered ray
@@ -87,11 +89,11 @@ class Metal : public Material {
             return wi.normalize();
         }
 
-        Color3 evaluate_color(const Float3& p, const Float3& n, const Float3& wo, Float3& wi, unsigned int &seed) override {
-            return specular_color;
+        Color3 evaluate_color(const Float3& p, const Float3& n, const Float3& wo, Float3& wi, float u, float v, unsigned int &seed) override {
+            return specular_color->sample(u, v, p);
         }
 
-        Color3 specular_color;
+        Texture* specular_color;
         float specular_roughness;
 };
 
@@ -115,7 +117,7 @@ class Glass : public Material {
             }
         }
 
-        Color3 evaluate_color(const Float3& p, const Float3& n, const Float3& wo, Float3& wi, unsigned int &seed) override {
+        Color3 evaluate_color(const Float3& p, const Float3& n, const Float3& wo, Float3& wi, float u, float v, unsigned int &seed) override {
             return Color3(1.0f);
         }
 
@@ -125,7 +127,7 @@ class Glass : public Material {
 
 class gltfPBR : public Material {
     public:
-        gltfPBR(const Color3&base_color_, const float metalness_, const float roughness_) {
+        gltfPBR(Texture* base_color_, const float metalness_, const float roughness_) {
             base_color = base_color_;
             metalness = metalness_;
             roughness = roughness_;
@@ -145,9 +147,9 @@ class gltfPBR : public Material {
 
         // we won't need these: we will sample directly fomr the brdfs
         Float3 sample_direction(const RayHit ray_hit, unsigned int &seed) override { return Float3(); }
-        Color3 evaluate_color(const Float3& p, const Float3& n, const Float3& wo, Float3& wi, unsigned int &seed) override {  return Color3(); }
+        Color3 evaluate_color(const Float3& p, const Float3& n, const Float3& wo, Float3& wi, float u, float v, unsigned int &seed) override {  return Color3(); }
 
-    Color3 base_color;
+    Texture* base_color;
     float metalness;
     float roughness;
     Diffuse* diffuse_brdf;

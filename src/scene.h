@@ -100,11 +100,27 @@ class SceneManager {
         Camera cam;
 };
 
+class Earth : public SceneManager {
+    public:
+    Earth(RTCDevice device_, unsigned int &seed) : SceneManager(device_) {
+            add_sphere(Float3(0, 0, 0), 2.0f, new Diffuse(new ImageTexture("C:/Users/joaov/Desktop/earthmap.png")));
+
+            std::cout << "Finished geometry creation." << std::endl;
+
+            // camera initialization
+            Float3 position(0, 0, 12);
+            Float3 target(0.0f);
+            Float3 up(0.0f, 1.0f, 0.0f);
+            float vfov = 20;
+            cam = Camera(position, target, up, 1280, 720, 16.0f / 9.0f, vfov, 0.0f, 10.0f);
+    }
+};
+
 class InOneWeekendFinal : public SceneManager {
     public:
         InOneWeekendFinal(RTCDevice device_, unsigned int &seed) : SceneManager(device_) {
             std::cout << "Started scene initialization." << std::endl;
-            add_sphere(Float3(0, -1000, 0), 1000, new Diffuse(Color3(0.5f)));
+            add_sphere(Float3(0, -1000, 0), 1000, new Diffuse(new ColorTexture(Color3(0.5f))));
 
             for (int x = -11; x < 11; x++) {
                 for (int y = -11; y < 11; y++) {
@@ -113,9 +129,9 @@ class InOneWeekendFinal : public SceneManager {
 
                     if ((center - Float3(4.0, 0.2, 0.0)).length() > 0.9f) {
                         if (rnd_ < 0.8f) {
-                            add_sphere(center, 0.2f, new Diffuse(Color3(rnd(seed), rnd(seed), rnd(seed))));
+                            add_sphere(center, 0.2f, new Diffuse(new ColorTexture(Color3(rnd(seed), rnd(seed), rnd(seed)))));
                         } else if (rnd_ < 0.95f) {
-                            add_sphere(center, 0.2f, new Metal(Color3(rnd(seed), rnd(seed), rnd(seed)), rnd(seed)));
+                            add_sphere(center, 0.2f, new Metal(new ColorTexture(Color3(rnd(seed), rnd(seed), rnd(seed))), rnd(seed)));
                         } else {
                             add_sphere(center, 0.2f, new Glass(1.5f));
                         }
@@ -124,8 +140,8 @@ class InOneWeekendFinal : public SceneManager {
             }
 
             add_sphere(Float3(0, 1, 0), 1.0f, new Glass(1.5f));
-            add_sphere(Float3(-4, 1, 0), 1.0f, new Diffuse(Color3(0.4, 0.2, 0.1)));
-            add_sphere(Float3(4, 1, 0), 1.0f, new Metal(Color3(0.7, 0.6, 0.5), 0.0f));
+            add_sphere(Float3(-4, 1, 0), 1.0f, new Diffuse(new ColorTexture(Color3(0.4, 0.2, 0.1))));
+            add_sphere(Float3(4, 1, 0), 1.0f, new Diffuse(new ImageTexture("C:/Users/joaov/Desktop/earthmap.jpg")));
 
             std::cout << "Finished geometry creation." << std::endl;
 
@@ -142,7 +158,7 @@ class ABeautifulGame : public SceneManager {
     public:
         ABeautifulGame(RTCDevice device_, unsigned int &seed) : SceneManager(device_) {
             std::cout << "Started scene initialization." << std::endl;
-            add_mesh("C:/Users/joaov/Desktop/ABeautifulGame.glb", new Diffuse(Color3(0.5, 0.5, 0.5)));
+            add_mesh("C:/Users/joaov/Desktop/ABeautifulGame.glb", new Diffuse(new ImageTexture("C:/Users/joaov/Desktop/earthmap.jpg")));
 
             std::cout << "Finished geometry creation." << std::endl;
 
@@ -159,7 +175,7 @@ class Duck : public SceneManager {
     public:
         Duck(RTCDevice device_, unsigned int &seed) : SceneManager(device_) {
             std::cout << "Started scene initialization." << std::endl;
-            add_mesh("C:/Users/joaov/Desktop/duck_reset.glb", new Diffuse(Color3(0.5, 0.5, 0.5)));
+            add_mesh("C:/Users/joaov/Desktop/duck_reset.glb", new Diffuse(new ColorTexture(Color3(0.5, 0.5, 0.5))));
 
             std::cout << "Finished geometry creation." << std::endl;
 
@@ -176,7 +192,7 @@ class Duck2 : public SceneManager {
     public:
         Duck2(RTCDevice device_, unsigned int &seed) : SceneManager(device_) {
             std::cout << "Started scene initialization." << std::endl;
-            add_mesh("C:/Users/joaov/Desktop/duck.obj", new Diffuse(Color3(0.5, 0.5, 0.5)));
+            add_mesh("C:/Users/joaov/Desktop/duck.obj", new Diffuse(new ColorTexture(Color3(0.5, 0.5, 0.5))));
 
             std::cout << "Finished geometry creation." << std::endl;
 
