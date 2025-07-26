@@ -70,7 +70,7 @@ class Material {
             if (normal_texture == nullptr)
                 return Float3(0.0f);
 
-            normal_texture->sample(ray_hit.u, ray_hit.v, ray_hit.p);
+            return normal_texture->sample(ray_hit.u, ray_hit.v, ray_hit.p);
         }
 
         Texture<Float3>* normal_texture = nullptr;
@@ -259,6 +259,11 @@ class gltfPBR : public Material {
             transmission = transmission_;
         }
 
+        void setEmission(Texture<Float3>* emissive_color_, float emissive_multiplier_){
+            emissive_color = emissive_color_;
+            emissive_multiplier = emissive_multiplier_;
+        }
+
         void createBRDFs() {
             if (base_color == nullptr)
                 base_color = new ColorTexture(Color3(1.0f));
@@ -288,13 +293,22 @@ class gltfPBR : public Material {
             }
         }
 
+        Color3 evaluate_emission(const RayHit ray_hit) override {
+            return emissive_color->sample(ray_hit.u, ray_hit.v, ray_hit.p) * emissive_multiplier;
+        }
+
         // we won't need these: we will sample directly fomr the brdfs
         Float3 sample_direction(const RayHit ray_hit, unsigned int &seed) override { return Float3(); }
         Color3 evaluate_color(const Float3& p, const Float3& n, const Float3& wo, Float3& wi, float u, float v, unsigned int &seed) override {  return Color3(); }
 
+    // Textures and factors
     Texture<Color3>* base_color = nullptr;
     Texture<Float3>* orm = nullptr;
     Texture<float>* transmission = nullptr;
+    Texture<Color3>* emissive_color;
+    float emissive_multiplier;
+
+    // BRDF lobes
     Diffuse* diffuse_brdf = nullptr;
     MetalGltf* metal_brdf = nullptr;
     SpecularBTDFglTF* specular_btdf = nullptr;

@@ -439,6 +439,7 @@ class glTFMesh : public Mesh {
                 }
                 gltf_material->setBaseColor(base_texture);
 
+                // TODO: occlusion is currently ignored
                 Texture<Float3>* orm_texture;
                 Float3 orm_factor = Float3(0.0f, pbr.roughnessFactor, pbr.metallicFactor);
                 if (hasImage(model, pbr.metallicRoughnessTexture)) {
@@ -466,6 +467,26 @@ class glTFMesh : public Mesh {
 
                     gltf_material->setNormalTexture(normal_texture);
                 }
+
+                Texture<Color3>* emission_texture;               
+                Color3 emission_factor = Color3(mp.emissiveFactor[0], mp.emissiveFactor[1], mp.emissiveFactor[2]);
+                float emission_strength = 1.0;
+                if (mp.extensions.contains("KHR_materials_emissive_strength")) {
+                    tinygltf::Value::Object emission = mp.extensions["KHR_materials_emissive_strength"].Get<tinygltf::Value::Object>();
+                    emission_strength = getExtensionFactor(emission, "emissiveStrength", 1.0);
+                }
+                if (hasImage(model, mp.emissiveTexture)) {
+                    tinygltf::Image image = getTextureImage(model, mp.emissiveTexture);
+
+                    if (image.uri.length() > 0) {
+                        emission_texture = new ImageMixTexture<Float3>(file_path.parent_path().concat("/").concat(image.uri), emission_factor);
+                    } else {
+                        emission_texture = new ImageMixTexture<Float3>(&image.image, image.width, image.height, image.component, emission_factor);
+                    }
+                } else {
+                    emission_texture = new ValueTexture<Color3>(emission_factor);
+                }
+                gltf_material->setEmission(emission_texture, emission_strength);
 
                 if (mp.extensions.contains("KHR_materials_transmission")) {
                     tinygltf::Value::Object transmission = mp.extensions["KHR_materials_transmission"].Get<tinygltf::Value::Object>();
