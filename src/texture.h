@@ -42,13 +42,13 @@ class ImageTexture : public Texture {
             const ImageSpec& spec = inp->spec();
             width            = spec.width;
             height           = spec.height;
-            input_channel_n  = spec.nchannels;
+            file_channel_n   = spec.nchannels;
             pixels           = std::vector<T>(width * height);
 
             // This is derived from the template class, can be 1, 3 or 4
-            forced_channel_n = sizeof(T) / sizeof(float);
+            channel_n = sizeof(T) / sizeof(float);
 
-            inp->read_image(0, 0, 0, forced_channel_n, TypeDesc::FLOAT, &pixels[0]);
+            inp->read_image(0, 0, 0, channel_n, TypeDesc::FLOAT, &pixels[0]);
             inp->close();
         }
 
@@ -60,7 +60,7 @@ class ImageTexture : public Texture {
 
         int width;
         int height;
-        int input_channel_n;
-        int forced_channel_n;
+        int file_channel_n; // original channel count from file
+        int channel_n;      // effective channel count in use, due to template
         std::vector<T> pixels;
 };
