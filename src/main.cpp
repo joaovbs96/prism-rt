@@ -7,6 +7,7 @@
 #include <tbb/task_arena.h>
 #include <tbb/mutex.h>
 #include <tbb/tick_count.h>
+#include <tbb/tbb.h>
 #include <embree4/rtcore.h>
 #include <xmmintrin.h>
 
@@ -75,7 +76,7 @@ int main()
     RTCDevice device = initialize_device(1);
 
     unsigned int main_seed = 0;
-    SceneManager* scene_mgr = new ABeautifulGame(device, main_seed);
+    SceneManager* scene_mgr = new Duck(device, main_seed);
     rtcCommitScene(scene_mgr->scene);
 
     RTCRayQueryContext context;
@@ -86,6 +87,9 @@ int main()
     intersectArgs.context = &context;
 
     FrameBuffer frame(width, height);
+
+    // Debugging, if we want to print something during rendering.
+    // tbb::global_control gc(tbb::global_control::max_allowed_parallelism, 1);
 
     auto start_time = tbb::tick_count::now();
     tbb::parallel_for(0, height, [&](int row)

@@ -175,7 +175,7 @@ class Duck : public SceneManager {
     public:
         Duck(RTCDevice device_, unsigned int &seed) : SceneManager(device_) {
             std::cout << "Started scene initialization." << std::endl;
-            add_mesh("C:/Users/joaov/Desktop/duck_reset.glb", new Diffuse(new ColorTexture(Color3(0.5, 0.5, 0.5))));
+            add_mesh("C:/Users/joaov/Desktop/duck_reset.glb");
 
             std::cout << "Finished geometry creation." << std::endl;
 

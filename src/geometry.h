@@ -89,7 +89,7 @@ class Mesh : public Geometry {
 
             // TODO: make materials on a per prim, per instance basis?
             // we may need a two dimensional unordered map, with primid and instid as keys
-            return materials[primid];
+            return materials[material_mapping[primid]];
         }
 
         // Make a float3 vertex out of a vector and an index
@@ -111,8 +111,8 @@ class Mesh : public Geometry {
         {
             if (index >= 0)
             {
-                float x = attribs[3 * index + 0];
-                float y = attribs[3 * index + 1];
+                float x = attribs[2 * index + 0];
+                float y = attribs[2 * index + 1];
                 vertex_list.push_back(Float2(x, y));
             }
         }
@@ -122,6 +122,7 @@ class Mesh : public Geometry {
         std::vector<Float2> texcoords;
         std::vector<unsigned int> indices;
         std::unordered_map<int, Material*> materials;
+        std::unordered_map<int, int> material_mapping;
         Material* material_override = nullptr;
 };
 
@@ -153,7 +154,7 @@ class ObjMesh : public Mesh {
 
             const auto &attrib = reader.GetAttrib();
             const auto &shapes = reader.GetShapes();
-            const auto &materials = reader.GetMaterials();
+            const auto &obj_materials = reader.GetMaterials();
 
             int index = 0, n_faces = 0;
             for (size_t s = 0; s < shapes.size(); ++s)
@@ -184,12 +185,30 @@ class ObjMesh : public Mesh {
 
                     // set index vector
                     indices.push_back(index++);
-                    indices.push_back(index++);
-                    indices.push_back(index++);
+
+                    // per-face material
+                    material_mapping[n_faces++] = shapes[s].mesh.material_ids[f];
                 }
             }
             std::cout << "Finished creating mesh data. " << std::endl;
 
+            // Convert Materials from MTL file
+            // for each material in the MTL file
+            for (int m = 0; m < obj_materials.size(); m++) {
+                tinyobj::material_t mp = obj_materials[m];
+
+                // Create Texture from image file or color value
+                Texture<Color3>* texture;
+                std::cout << mp.diffuse_texname << std::endl;
+                if (mp.diffuse_texname.length() > 0) {
+                    std::cout << Color3(*mp.diffuse) << std::endl;
+                    texture = new ImageMixTexture<Color3>(file_path.parent_path().concat("/").concat(mp.diffuse_texname), Color3(*mp.diffuse));
+                } else
+                    texture = new ColorTexture(Color3(*mp.diffuse));
+
+                // Assign texture index to the Material's name
+                materials[m] = new Diffuse(texture);
+            }
         }
 };
 
@@ -221,6 +240,7 @@ class glTFMesh : public Mesh {
                 return;
             }
             
+            int n_faces = 0;
             for (size_t mesh_idx = 0; mesh_idx < model.meshes.size(); ++mesh_idx) {
                 const tinygltf::Mesh& mesh = model.meshes[mesh_idx];
                 std::cout << "Processing mesh: " << mesh.name << std::endl;
@@ -230,7 +250,7 @@ class glTFMesh : public Mesh {
                         std::cout << "Skipping non-triangle primitive" << std::endl;
                         continue;
                     }
-                    
+
                     // Extract vertex positions
                     auto posIt = primitive.attributes.find("POSITION");
                     if (posIt == primitive.attributes.end()) {
@@ -253,8 +273,9 @@ class glTFMesh : public Mesh {
                     int vertexCount = posAccessor.count;
                     
                     // Copy vertices
-                    for (int i = 0; i < vertexCount; ++i)
+                    for (int i = 0; i < vertexCount; ++i) {
                         make_Float3<const float*>(vertices, positions, i);
+                    }
 
                     // Extract normals
                     auto normalIt = primitive.attributes.find("NORMAL");
@@ -315,6 +336,9 @@ class glTFMesh : public Mesh {
                         int triangleCount = indexAccessor.count / 3;
                         
                         for (int i = 0; i < triangleCount; i++) {
+                            material_mapping[n_faces] = primitive.material;
+                            n_faces++;
+
                             // Handle different index component types
                             for (int j = 0; j < 3; ++j) {
                                 unsigned int index = 0;
@@ -344,11 +368,56 @@ class glTFMesh : public Mesh {
                         size_t currentVertexCount = vertices.size() - vertexOffset;
                         for (size_t i = 0; i < currentVertexCount; ++i) {
                             indices.push_back(static_cast<unsigned int>(vertexOffset + i));
+                            // TODO: this might be wrong? What would be an example of non-indexed geom?
+                            if (i % 3 == 0){
+                                material_mapping[n_faces] = primitive.material;
+                                n_faces++;
+                            }
                         }
                     }
                 }
                 
-                std::cout << "Mesh " << mesh_idx << ": " << vertices.size() << " vertices, " << indices.size() << " triangles" << std::endl;
+                std::cout << "Mesh " << mesh_idx << ": " << vertices.size() << " vertices, " << indices.size() / 3 << " triangles" << std::endl;
             }
+
+            // Convert Materials from gltf/glb file
+            // for each material in the scene file
+            for (int m = 0; m < model.materials.size(); m++) {
+                tinygltf::Material mp = model.materials[m];
+
+                // Create Texture from image file or color value
+                tinygltf::PbrMetallicRoughness pbr = mp.pbrMetallicRoughness;
+                Texture<Color3>* base_texture;
+                Color3 base_factor = Color3(pbr.baseColorFactor[0], pbr.baseColorFactor[1], pbr.baseColorFactor[2]);
+                if (hasImage(model, pbr.baseColorTexture)) {
+                    tinygltf::Image image = getTextureImage(model, pbr.baseColorTexture);
+
+                    if (image.uri.length() > 0) {
+                        base_texture = new ImageMixTexture<Color3>(file_path.parent_path().concat("/").concat(image.uri), base_factor);
+                    } else {
+                        base_texture = new ImageMixTexture<Color3>(&image.image, image.width, image.height, image.component, base_factor);
+                    }
+                } else {
+                    base_texture = new ColorTexture(base_factor);
+                }
+
+                // Assign texture index to the Material's name
+                materials[m] = new Diffuse(base_texture);
+            }
+        }
+
+        bool hasImage(tinygltf::Model& model, tinygltf::TextureInfo& texinfo) {
+            if (texinfo.index >= 0 && texinfo.index < model.textures.size()){
+                tinygltf::Texture& texture = model.textures[texinfo.index];
+                if (texture.source >= 0 && texture.source < model.images.size()) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        tinygltf::Image getTextureImage(tinygltf::Model& model, tinygltf::TextureInfo& texinfo) {
+            tinygltf::Texture& texture = model.textures[texinfo.index];
+            return model.images[texture.source];
         }
 };

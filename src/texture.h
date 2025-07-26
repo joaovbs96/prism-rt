@@ -6,6 +6,7 @@
 #include "float3.h"
 #include "float4.h"
 #include <OpenImageIO/imagebuf.h>
+#include <OpenImageIO/imagebufalgo.h>
 #include <OpenImageIO/span.h>
 #include <OpenImageIO/imageio.h>
 using namespace OIIO;
@@ -36,6 +37,31 @@ class ValueTexture : public Texture<T> {
 template <TextureType T = Float3>
 class ImageTexture : public Texture<T> {
     public:
+        ImageTexture(std::vector<unsigned char>* buffer, int _width, int _height, int file_channel_n) {
+            // This is derived from the template class, can be 1, 3 or 4
+            width = _width;
+            height = _height;
+            channel_n = sizeof(T) / sizeof(float);
+
+            const ImageSpec char_spec(width, height, file_channel_n, TypeDesc::UCHAR);
+            ImageBuf char_oiio_buffer = ImageBuf(char_spec, buffer->data());
+            ImageBuf oiio_buffer = ImageBufAlgo::copy(char_oiio_buffer, TypeDesc::FLOAT);
+
+            // // handles type conversion with oiio buffers
+            // const ImageSpec spec(width, height, file_channel_n, TypeDesc::FLOAT);
+            // ImageBuf oiio_buffer = ImageBuf(spec);
+            // oiio_buffer.set_pixels(ROI(), TypeDesc::FLOAT, buffer->data());
+
+            // adjust channel count
+            if (file_channel_n != channel_n) {
+                oiio_buffer = ImageBufAlgo::channels(oiio_buffer, channel_n, {});
+            }
+
+            // copy content of oiio buffer to vector buffer
+            pixels = std::vector<T>(width * height);
+            oiio_buffer.get_pixels(ROI(), TypeDesc::FLOAT, &pixels[0]);
+        }
+
         ImageTexture(const std::filesystem::path &file_path) {
             std::cout << "Loading File: " << file_path << std::endl;
             auto inp = ImageInput::open(file_path.string());
@@ -72,6 +98,11 @@ class ImageMixTexture : public Texture<T> {
     public:
         ImageMixTexture(const std::filesystem::path &file_path, const T& v = T(1.0f)) {
             _image = new ImageTexture<T>(file_path);
+            _value = new ValueTexture<T>(v);
+        }
+
+        ImageMixTexture(std::vector<unsigned char>* buffer, int _width, int _height, int file_channel_n, const T& v = T(1.0f)) {
+            _image = new ImageTexture<T>(buffer, _width, _height, file_channel_n);
             _value = new ValueTexture<T>(v);
         }
 
