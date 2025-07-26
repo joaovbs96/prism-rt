@@ -75,8 +75,8 @@ int main()
     RTCDevice device = initialize_device(1);
 
     unsigned int main_seed = 0;
-    InOneWeekendFinal scene_mgr = InOneWeekendFinal(device, main_seed);
-    rtcCommitScene(scene_mgr.scene);
+    SceneManager* scene_mgr = new ABeautifulGame(device, main_seed);
+    rtcCommitScene(scene_mgr->scene);
 
     RTCRayQueryContext context;
     rtcInitRayQueryContext(&context);
@@ -99,8 +99,8 @@ int main()
             for (int spp = 0; spp < samples; spp++)
             {
                 // create new ray and trace it
-                RTCRay ray = scene_mgr.cam.get_ray(column, row, seed);
-                pixel_color += scene_mgr.trace(ray, max_depth, seed);
+                RTCRay ray = scene_mgr->cam.get_ray(column, row, seed);
+                pixel_color += scene_mgr->trace(ray, max_depth, seed);
             }
 
             // average samples out and put it in the frame buffer
@@ -114,8 +114,10 @@ int main()
 
     frame.save("output.png");
 
+    // TODO: collect and release all geometry nodes from scene
+
     // release scene and device resources
-    rtcReleaseScene(scene_mgr.scene);
+    rtcReleaseScene(scene_mgr->scene);
     rtcReleaseDevice(device);
 
     return 0;

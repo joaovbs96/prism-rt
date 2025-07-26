@@ -10,7 +10,7 @@
 #include "camera.h"
 #include "sampling.h"
 #include "material.h"
-#include "mesh_load.h"
+#include "geometry.h"
 
 // TODO: for motion blur, we need to add a new copy of the vertexbuffer per timestep
 // so we need to have the vertexbuffer and apply some sort of transformation to the buffer
@@ -27,7 +27,7 @@ class SceneManager {
             scene = rtcNewScene(*device);
         }
 
-        unsigned int add_mesh(const std::filesystem::path &file_path, Material* material) {
+        unsigned int add_mesh(const std::filesystem::path &file_path, Material* material_override = nullptr) {
 
             Mesh* mesh;
             if (file_path.extension() == ".obj")
@@ -35,27 +35,19 @@ class SceneManager {
             else if ((file_path.extension() == ".gltf") || (file_path.extension() == ".glb"))
                 mesh = new glTFMesh(file_path);
 
+            if (material_override != nullptr) {
+                mesh->material_override = material_override;
+            }
+
             int geomID = mesh->setupEmbree(*device, scene);
-
-            // collect assigned material - we will gatter it from the geomid
-            materials[geomID] = material;
-
+            geometry[geomID] = mesh;
             return geomID;
         }
 
         unsigned int add_sphere(const Float3& pos, float r, Material* material) {
-            RTCGeometry geom = rtcNewGeometry(*device, RTC_GEOMETRY_TYPE_SPHERE_POINT);
-            float* vb = (float*) rtcSetNewGeometryBuffer(geom,RTC_BUFFER_TYPE_VERTEX, 0, RTC_FORMAT_FLOAT4, 4*sizeof(float), 1);
-            vb[0] = pos.x(); vb[1] = pos.y(); vb[2] = pos.z(); vb[3] = r;
-
-            // commit and release geom handle
-            rtcCommitGeometry(geom);
-            unsigned int geomID = rtcAttachGeometry(scene, geom);
-            rtcReleaseGeometry(geom);
-
-            // collect assigned material - we will gatter it from the geomid
-            materials[geomID] = material;
-
+            Sphere* sphere = new Sphere(pos, r, material);
+            int geomID = sphere->setupEmbree(*device, scene);
+            geometry[geomID] = sphere;
             return geomID;
         }
 
@@ -68,7 +60,12 @@ class SceneManager {
             // intersect a single ray with the scene
             rtcIntersect1(scene, &e_rayhit);
 
-            return RayHit(e_rayhit);
+            if (e_rayhit.hit.geomID == RTC_INVALID_GEOMETRY_ID)
+                return RayHit(e_rayhit);
+            else {
+                Geometry* geom = geometry[e_rayhit.hit.geomID];
+                return RayHit(e_rayhit, &geom->geom, geom->type);
+            }
         }
 
         Color3 trace(RTCRay ray, int depth, unsigned int &seed) {
@@ -82,7 +79,7 @@ class SceneManager {
             // ray hit
             if (ray_hit.geomid != RTC_INVALID_GEOMETRY_ID){
                 // retrieve material by geomid and sample the surface
-                Material* material = materials[ray_hit.geomid];
+                Material* material = geometry[ray_hit.geomid]->getMaterial(ray_hit.primid, ray_hit.instid);
                 
                 // BRDFSample: surface hit color + scattered light ray
                 BRDFSample s = material->sample(ray_hit, seed);
@@ -99,7 +96,7 @@ class SceneManager {
 
         RTCDevice* device;
         RTCScene scene;
-        std::unordered_map<int, Material*> materials;
+        std::unordered_map<int, Geometry*> geometry;
         Camera cam;
 };
 

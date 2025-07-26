@@ -11,37 +11,83 @@
 
 #include "float3.h"
 #include "float2.h"
+#include "material.h"
 
+class Geometry {
+    public:
+        Geometry () {}
 
-class Mesh {
+        virtual unsigned int setupEmbree(RTCDevice &device, RTCScene &scene) = 0;
+
+        virtual Material* getMaterial(unsigned int primid, unsigned int instid) = 0;
+
+        RTCGeometryType type;
+        RTCGeometry geom;
+        unsigned int geomid;
+};
+
+class Sphere : public Geometry {
+    public:
+        Sphere(const Float3& pos, float r, Material* material) : material(material), pos(pos), r(r) {}
+
+        unsigned int setupEmbree(RTCDevice &device, RTCScene &scene) override {
+            type = RTC_GEOMETRY_TYPE_SPHERE_POINT;
+            geom = rtcNewGeometry(device, type);
+            float* vb = (float*) rtcSetNewGeometryBuffer(geom,RTC_BUFFER_TYPE_VERTEX, 0, RTC_FORMAT_FLOAT4, 4*sizeof(float), 1);
+            vb[0] = pos.x(); vb[1] = pos.y(); vb[2] = pos.z(); vb[3] = r;
+
+            // commit and release geom handle
+            rtcCommitGeometry(geom);
+            geomid = rtcAttachGeometry(scene, geom);
+            return geomid;
+        }
+
+        Material* getMaterial(unsigned int primid, unsigned int instid) override {
+            return material;
+        }
+
+        Float3 pos;
+        float r;
+        Material* material;
+};
+
+class Mesh : public Geometry {
     public:
         Mesh() {}
 
-        int setupEmbree(RTCDevice &device, RTCScene &scene) {
+        unsigned int setupEmbree(RTCDevice &device, RTCScene &scene) override {
             // new geometry pointer
-            RTCGeometry mesh = rtcNewGeometry(device, RTC_GEOMETRY_TYPE_TRIANGLE);
+            type = RTC_GEOMETRY_TYPE_TRIANGLE;
+            geom = rtcNewGeometry(device, type);
 
             std::cout << "Finished creating mesh pointer. " << std::endl;
 
             // add new vertex buffer to geometry
-            // rtcSetSharedGeometryBuffer(mesh, RTC_BUFFER_TYPE_VERTEX, 0, RTC_FORMAT_FLOAT3, vertices.data(), 0, sizeof(Float3), vertices.size());
-            Float3* vtx = (Float3*)rtcSetNewGeometryBuffer(mesh, RTC_BUFFER_TYPE_VERTEX, 0, RTC_FORMAT_FLOAT3, sizeof(Float3), vertices.size());
+            // rtcSetSharedGeometryBuffer(geom, RTC_BUFFER_TYPE_VERTEX, 0, RTC_FORMAT_FLOAT3, vertices.data(), 0, sizeof(Float3), vertices.size());
+            Float3* vtx = (Float3*)rtcSetNewGeometryBuffer(geom, RTC_BUFFER_TYPE_VERTEX, 0, RTC_FORMAT_FLOAT3, sizeof(Float3), vertices.size());
             for (unsigned int i = 0; i < vertices.size(); i++) vtx[i] = vertices[i];
 
-            rtcSetSharedGeometryBuffer(mesh, RTC_BUFFER_TYPE_INDEX, 0, RTC_FORMAT_UINT3, indices.data(), 0, 3 * sizeof(unsigned int), int(indices.size() / 3));
+            rtcSetSharedGeometryBuffer(geom, RTC_BUFFER_TYPE_INDEX, 0, RTC_FORMAT_UINT3, indices.data(), 0, 3 * sizeof(unsigned int), int(indices.size() / 3));
 
-            rtcSetGeometryVertexAttributeCount(mesh, 2);
-            rtcSetSharedGeometryBuffer(mesh, RTC_BUFFER_TYPE_VERTEX_ATTRIBUTE, 0, RTC_FORMAT_FLOAT3, normals.data(), 0, sizeof(Float3), normals.size());
-            rtcSetSharedGeometryBuffer(mesh, RTC_BUFFER_TYPE_VERTEX_ATTRIBUTE, 1, RTC_FORMAT_FLOAT2, texcoords.data(), 0, sizeof(Float2), texcoords.size());
+            rtcSetGeometryVertexAttributeCount(geom, 2);
+            rtcSetSharedGeometryBuffer(geom, RTC_BUFFER_TYPE_VERTEX_ATTRIBUTE, 0, RTC_FORMAT_FLOAT3, normals.data(), 0, sizeof(Float3), normals.size());
+            rtcSetSharedGeometryBuffer(geom, RTC_BUFFER_TYPE_VERTEX_ATTRIBUTE, 1, RTC_FORMAT_FLOAT2, texcoords.data(), 0, sizeof(Float2), texcoords.size());
 
             std::cout << "Finished creating mesh buffers. " << std::endl;
 
             // commit and release geom handle
-            rtcCommitGeometry(mesh);
-            geomID = rtcAttachGeometry(scene, mesh);
-            rtcReleaseGeometry(mesh);
+            rtcCommitGeometry(geom);
+            geomid = rtcAttachGeometry(scene, geom);
+            // rtcReleaseGeometry(geom);
 
-            return geomID;
+            return geomid;
+        }
+
+        Material* getMaterial(unsigned int primid, unsigned int instid) override {
+            if (material_override != nullptr)
+                return material_override;
+
+            return materials[primid];
         }
 
         // Make a float3 vertex out of a vector and an index
@@ -73,8 +119,8 @@ class Mesh {
         std::vector<Float3> normals;
         std::vector<Float2> texcoords;
         std::vector<unsigned int> indices;
-        unsigned int geomID;
-        
+        std::unordered_map<int, Material*> materials;
+        Material* material_override = nullptr;
 };
 
 class ObjMesh : public Mesh {
