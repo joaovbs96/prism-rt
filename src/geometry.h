@@ -31,16 +31,16 @@ class Box : public Geometry {
         Box(const Float3& a, const Float3& b, Material* material_) {
             Float3 min = a.min(b);
             Float3 max = a.max(b);
-            Float3 dx(max.x() - min.x(), 0.0f, 0.0f);
-            Float3 dy(0.0f, max.y() - min.y(), 0.0f);
-            Float3 dz(0.0f, 0.0f, max.z() - min.z());
 
-            add_side(Float3(min.x(), min.y(), max.z()),  dx,  dy); // front
-            add_side(Float3(max.x(), min.y(), max.z()), -dz,  dy); // right
-            add_side(Float3(max.x(), min.y(), min.z()), -dx,  dy); // back
-            add_side(Float3(min.x(), min.y(), min.z()),  dz,  dy); // left
-            add_side(Float3(min.x(), max.y(), max.z()),  dx, -dz); // top
-            add_side(Float3(min.x(), min.y(), min.z()),  dx,  dz); // bottom
+            // Create the 8 unique vertices of the box
+            vertices.push_back(Float3(min.x(), min.y(), min.z())); // 0: min corner
+            vertices.push_back(Float3(max.x(), min.y(), min.z())); // 1: +X from min
+            vertices.push_back(Float3(max.x(), max.y(), min.z())); // 2: +X+Y from min
+            vertices.push_back(Float3(min.x(), max.y(), min.z())); // 3: +Y from min
+            vertices.push_back(Float3(min.x(), min.y(), max.z())); // 4: +Z from min
+            vertices.push_back(Float3(max.x(), min.y(), max.z())); // 5: +X+Z from min
+            vertices.push_back(Float3(max.x(), max.y(), max.z())); // 6: max corner
+            vertices.push_back(Float3(min.x(), max.y(), max.z())); // 7: +Y+Z from min
 
             material = material_;
         }
@@ -48,23 +48,32 @@ class Box : public Geometry {
         unsigned int setupEmbree(RTCDevice &device, RTCScene &scene) override {
             type = RTC_GEOMETRY_TYPE_QUAD;
             geom = rtcNewGeometry(device, type);
-            float* vb = (float*) rtcSetNewGeometryBuffer(geom,RTC_BUFFER_TYPE_VERTEX, 0, RTC_FORMAT_FLOAT3, 3*sizeof(float), 24);
+            float* vb = (float*) rtcSetNewGeometryBuffer(geom,RTC_BUFFER_TYPE_VERTEX, 0, RTC_FORMAT_FLOAT3, 3*sizeof(float), 8);
             int* ib = (int*) rtcSetNewGeometryBuffer(geom, RTC_BUFFER_TYPE_INDEX, 0, RTC_FORMAT_UINT4, 4*sizeof(unsigned int), 6);
 
-            // Fill vertex buffer
-            for (int i = 0; i < 24; i++) {
+            // Fill vertex buffer with the 8 unique vertices
+            for (int i = 0; i < 8; i++) {
                 vb[i * 3 + 0] = vertices[i].x();
                 vb[i * 3 + 1] = vertices[i].y();
                 vb[i * 3 + 2] = vertices[i].z();
             }
 
-            // Fill index buffer - each quad uses 4 consecutive vertices
-            for (int i = 0; i < 6; i++) {
-                int base_vertex = i * 4;  // Each face starts at vertex i*4
-                ib[i * 4 + 0] = base_vertex + 0;  // First vertex of quad
-                ib[i * 4 + 1] = base_vertex + 1;  // Second vertex of quad
-                ib[i * 4 + 2] = base_vertex + 3;  // Fourth vertex of quad
-                ib[i * 4 + 3] = base_vertex + 2;  // Third vertex of quad
+            // Define the 6 faces using indices to the 8 vertices
+            // Each face is defined as a quad with 4 vertex indices
+            unsigned int faces[6][4] = {
+                {4, 5, 6, 7}, // Front face (Z = max.z)
+                {1, 0, 3, 2}, // Back face (Z = min.z)
+                {5, 1, 2, 6}, // Right face (X = max.x)
+                {0, 4, 7, 3}, // Left face (X = min.x)
+                {3, 7, 6, 2}, // Top face (Y = max.y)
+                {0, 1, 5, 4}  // Bottom face (Y = min.y)
+            };
+
+            // Fill index buffer
+            for (int face = 0; face < 6; face++) {
+                for (int vertex = 0; vertex < 4; vertex++) {
+                    ib[face * 4 + vertex] = faces[face][vertex];
+                }
             }
 
             // commit and release geom handle
@@ -79,19 +88,6 @@ class Box : public Geometry {
 
         std::vector<Float3> vertices;
         Material* material;
-
-    private:
-        void add_side(const Float3& q, const Float3& u, const Float3& v) {
-            Float3 c1 = q;
-            Float3 c2 = q + u;
-            Float3 c3 = q + v;
-            Float3 c4 = q + u + v;
-
-            vertices.push_back(c1);
-            vertices.push_back(c2);
-            vertices.push_back(c3);
-            vertices.push_back(c4);
-        }
 };
 
 class Quad : public Geometry {
