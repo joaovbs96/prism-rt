@@ -121,7 +121,7 @@ class Metal : public Material {
 
 class Emissive : public Material {
     public:
-        Emissive(Texture<Float3>* emissive_color, Texture<float>* emissive_multiplier) 
+        Emissive(Texture<Float3>* emissive_color, float emissive_multiplier = 1.0f) 
         : emissive_color(emissive_color), emissive_multiplier(emissive_multiplier) {}
 
         Float3 sample_direction(const RayHit ray_hit, unsigned int &seed) override {
@@ -133,11 +133,11 @@ class Emissive : public Material {
         }
 
         Color3 evaluate_emission(const RayHit ray_hit) override {
-            return emissive_color->sample(ray_hit.u, ray_hit.v, ray_hit.p) * emissive_multiplier->sample(ray_hit.u, ray_hit.v, ray_hit.p);
+            return emissive_color->sample(ray_hit.u, ray_hit.v, ray_hit.p) * emissive_multiplier;
         }
 
         Texture<Color3>* emissive_color;
-        Texture<float>* emissive_multiplier;
+        float emissive_multiplier;
 };
 
 class Glass : public Material {

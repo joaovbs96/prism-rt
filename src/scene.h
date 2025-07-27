@@ -59,6 +59,23 @@ class SceneManager {
             return geomID;
         }
 
+        unsigned int add_box(const Float3& a, const Float3& b, Material* material_){
+            Float3 min = a.min(b);
+            Float3 max = a.max(b);
+            Float3 dx(max.x() - min.x(), 0.0f, 0.0f);
+            Float3 dy(0.0f, max.y() - min.y(), 0.0f);
+            Float3 dz(0.0f, 0.0f, max.z() - min.z());
+
+            add_quad(Float3(min.x(), min.y(), max.z()),  dx,  dy, material_); // front
+            add_quad(Float3(max.x(), min.y(), max.z()), -dz,  dy, material_); // right
+            add_quad(Float3(max.x(), min.y(), min.z()), -dx,  dy, material_); // back
+            add_quad(Float3(min.x(), min.y(), min.z()),  dz,  dy, material_); // left
+            add_quad(Float3(min.x(), max.y(), max.z()),  dx, -dz, material_); // top
+            add_quad(Float3(min.x(), min.y(), min.z()),  dx,  dz, material_); // bottom
+
+            return -1;
+        }
+
         RayHit cast_ray(RTCRay ray) {
             RTCRayHit e_rayhit;
             e_rayhit.ray = ray;
@@ -256,5 +273,40 @@ class QuadTest : public SceneManager {
 
             // environment map - for missed rays
             environment = new GradientBackground(new ColorTexture(Color3(1.0, 1.0, 1.0)), new ColorTexture(Color3(0.5, 0.7, 1.0)));
+        }
+};
+
+class CornellBox : public SceneManager {
+    public:
+        CornellBox(RTCDevice device_, unsigned int &seed) : SceneManager(device_) {
+            std::cout << "Started scene initialization." << std::endl;
+            Material* red = new Diffuse(new ColorTexture(Color3(.65, .05, .05)));
+            Material* white = new Diffuse(new ColorTexture(Color3(.73, .73, .73)));
+            Material* green = new Diffuse(new ColorTexture(Color3(.12, .45, .15)));
+            Material* light = new Emissive(new ColorTexture(Color3(1.0f)), 15.f);
+
+            add_quad(Float3(555,0,0),       Float3(0,555,0),    Float3(0,0,555),    green);
+            add_quad(Float3(0,0,0),         Float3(0,555,0),    Float3(0,0,555),    red);
+            add_quad(Float3(343, 554, 332), Float3(-130,0,0),   Float3(0,0,-105),   light);
+            add_quad(Float3(0,0,0),         Float3(555,0,0),    Float3(0,0,555),    white);
+            add_quad(Float3(555,555,555),   Float3(-555,0,0),   Float3(0,0,-555),   white);
+            add_quad(Float3(0,0,555),       Float3(555,0,0),    Float3(0,555,0),    white);
+
+            add_box(Float3(130, 0, 65),     Float3(295, 165, 230),  white);
+            add_box(Float3(265, 0, 295),    Float3(430, 330, 460),  white);
+
+            std::cout << "Finished geometry creation." << std::endl;
+
+            // camera initialization
+            image_width = 1280;
+            image_height = 1280;
+            Float3 position(278, 278, -800);
+            Float3 target(278, 278, 0);
+            Float3 up(0.0f, 1.0f, 0.0f);
+            float vfov = 40;
+            cam = Camera(position, target, up, image_width, image_height, float(image_width) / image_height, vfov, 0.0f, 10.0f);
+
+            // environment map - for missed rays
+            environment = new ConstantColorBackground(new ColorTexture(Color3(0.0f)));
         }
 };
