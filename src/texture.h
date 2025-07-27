@@ -20,6 +20,10 @@ class Texture {
         Texture() {}
 
         virtual T sample(float u, float v, const Float3& p) const = 0;
+
+        virtual T sampleInterp(float u, float v, const Float3& p) const = 0;
+
+        virtual void gammaCorrect(float gamma) {}
 };
 
 template <TextureType T = Float3>
@@ -31,62 +35,87 @@ class ValueTexture : public Texture<T> {
             return value;
         }
 
+        T sampleInterp(float u, float v, const Float3& p) const override {
+            return value;
+        }
+
     T value;
 };
+
+// templated getValue functions
+template<typename T> T getValue(float* ptr);
+template<> float getValue<float>(float* ptr) { return ptr[0]; }
+template<> Float3 getValue<Float3>(float* ptr) { return Float3(ptr[0], ptr[1], ptr[2]); }
+template<> Float4 getValue<Float4>(float* ptr) { return Float4(ptr[0], ptr[1], ptr[2], ptr[3]); }
 
 template <TextureType T = Float3>
 class ImageTexture : public Texture<T> {
     public:
-        ImageTexture(std::vector<unsigned char>* buffer, int _width, int _height, int file_channel_n) {
-            // This is derived from the template class, can be 1, 3 or 4
+        // TODO: make the pixel buffer be an ImageBuf and operate/sample from that with getPixel
+        ImageTexture(std::vector<unsigned char>* disk_buffer, int _width, int _height, int file_channel_n) {
             width = _width;
             height = _height;
-            channel_n = sizeof(T) / sizeof(float);
+            channel_n = sizeof(T) / sizeof(float); // This is derived from the template class, can be 1, 3 or 4
 
             // handles type conversion with oiio buffers
             const ImageSpec spec(width, height, file_channel_n, TypeDesc::FLOAT);
-            ImageBuf oiio_buffer = ImageBuf(spec, InitializePixels::No);
-            oiio_buffer.set_pixels(ROI(), TypeDesc::UINT8, buffer->data());
+            buffer = ImageBuf(spec, InitializePixels::No);
+            buffer.set_pixels(ROI(), TypeDesc::UINT8, disk_buffer->data());
 
             // adjust channel count
             if (file_channel_n != channel_n) {
-                oiio_buffer = ImageBufAlgo::channels(oiio_buffer, channel_n, {});
+                buffer = ImageBufAlgo::channels(buffer, channel_n, {});
             }
-
-            // copy content of oiio buffer to vector buffer
-            pixels = std::vector<T>(width * height);
-            oiio_buffer.get_pixels(ROI(), TypeDesc::FLOAT, &pixels[0]);
         }
 
         ImageTexture(const std::filesystem::path &file_path) {
+            channel_n = sizeof(T) / sizeof(float); // This is derived from the template class, can be 1, 3 or 4
+            
             std::cout << "Loading File: " << file_path << std::endl;
-            auto inp = ImageInput::open(file_path.string());
-            if (!inp)
-                return;
-            const ImageSpec& spec = inp->spec();
-            width            = spec.width;
-            height           = spec.height;
-            file_channel_n   = spec.nchannels;
-            pixels           = std::vector<T>(width * height);
+            buffer = ImageBuf(file_path.string());
+            buffer.read(0, 0, true, TypeDesc::FLOAT);
 
-            // This is derived from the template class, can be 1, 3 or 4
-            channel_n = sizeof(T) / sizeof(float);
+            width = buffer.spec().width;
+            height = buffer.spec().height;
+            file_channel_n = buffer.spec().nchannels;
 
-            inp->read_image(0, 0, 0, channel_n, TypeDesc::FLOAT, &pixels[0]);
-            inp->close();
+            // adjust channel count
+            if (file_channel_n != channel_n) {
+                buffer = ImageBufAlgo::channels(buffer, channel_n, {});
+            }
+        }
+
+        void blur(float kernel_size = 5.0f) {
+            ImageBuf K = ImageBufAlgo::make_kernel("gaussian", kernel_size, kernel_size);
+            buffer = ImageBufAlgo::convolve(buffer, K);
+        }
+
+        void gammaCorrect(float gamma) override {
+            const float g_ = 1.0 / gamma;
+            ImageBufAlgo::pow(buffer, buffer, {g_, g_, g_});
         }
 
         T sample(float u, float v, const Float3& p) const override {
             auto i = int(std::fabsf(std::fmodf(u, 1.0)) * (width - 1));
             auto j = int(std::fabsf(std::fmodf(v, 1.0)) * (height - 1));
-            return pixels[j * width + i];
+            float pixel[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            buffer.getpixel(i, j, pixel);
+            return getValue<T>(pixel);
+        }
+
+        T sampleInterp(float u, float v, const Float3& p) const override {
+            auto i = std::fabsf(std::fmodf(u, 1.0)) * (width - 1);
+            auto j = std::fabsf(std::fmodf(v, 1.0)) * (height - 1);
+            float pixel[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            buffer.interppixel(i, j, pixel);
+            return getValue<T>(pixel);
         }
 
         int width;
         int height;
         int file_channel_n; // original channel count from file
         int channel_n;      // effective channel count in use, due to template
-        std::vector<T> pixels;
+        ImageBuf buffer;
 };
 
 template <TextureType T = Float3>
@@ -106,6 +135,14 @@ class ImageMixTexture : public Texture<T> {
             return _image->sample(u, v, p) * _value->sample(u, v, p);
         }
 
+        T sampleInterp(float u, float v, const Float3& p) const override {
+            return _image->sampleInterp(u, v, p) * _value->sampleInterp(u, v, p);
+        }
+
+        void gammaCorrect(float gamma) override {
+            _image->gammaCorrect(gamma);
+        }
+
     ImageTexture<T>* _image;
     ValueTexture<T>* _value;
 };
@@ -115,6 +152,10 @@ class ColorTexture : public ValueTexture<Float3> {
         ColorTexture(Color3 color) : ValueTexture<Float3>(color) {}
 
         Color3 sample(float u, float v, const Float3& p) const override {
+            return value;
+        }
+
+        Color3 sampleInterp(float u, float v, const Float3& p) const override {
             return value;
         }
 };
