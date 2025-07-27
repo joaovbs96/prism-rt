@@ -278,9 +278,6 @@ class gltfPBR : public Material {
         }
 
         BRDFSample sample(const RayHit ray_hit, unsigned int &seed) override {
-            // TODO: add a function that checks all textures and create default ones as needed?
-            createBRDFs();
-
             float prob = rnd(seed);
             if (prob <= orm->sample(ray_hit.u, ray_hit.v, ray_hit.p).b()){
                 return metal_brdf->sample(ray_hit, seed);
