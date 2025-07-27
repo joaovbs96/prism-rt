@@ -26,6 +26,74 @@ class Geometry {
         unsigned int geomid;
 };
 
+class Box : public Geometry {
+    public:
+        Box(const Float3& a, const Float3& b, Material* material_) {
+            Float3 min = a.min(b);
+            Float3 max = a.max(b);
+            Float3 dx(max.x() - min.x(), 0.0f, 0.0f);
+            Float3 dy(0.0f, max.y() - min.y(), 0.0f);
+            Float3 dz(0.0f, 0.0f, max.z() - min.z());
+
+            add_side(Float3(min.x(), min.y(), max.z()),  dx,  dy); // front
+            add_side(Float3(max.x(), min.y(), max.z()), -dz,  dy); // right
+            add_side(Float3(max.x(), min.y(), min.z()), -dx,  dy); // back
+            add_side(Float3(min.x(), min.y(), min.z()),  dz,  dy); // left
+            add_side(Float3(min.x(), max.y(), max.z()),  dx, -dz); // top
+            add_side(Float3(min.x(), min.y(), min.z()),  dx,  dz); // bottom
+
+            material = material_;
+        }
+
+        unsigned int setupEmbree(RTCDevice &device, RTCScene &scene) override {
+            type = RTC_GEOMETRY_TYPE_QUAD;
+            geom = rtcNewGeometry(device, type);
+            float* vb = (float*) rtcSetNewGeometryBuffer(geom,RTC_BUFFER_TYPE_VERTEX, 0, RTC_FORMAT_FLOAT3, 3*sizeof(float), 24);
+            int* ib = (int*) rtcSetNewGeometryBuffer(geom, RTC_BUFFER_TYPE_INDEX, 0, RTC_FORMAT_UINT4, 4*sizeof(unsigned int), 6);
+
+            // Fill vertex buffer
+            for (int i = 0; i < 24; i++) {
+                vb[i * 3 + 0] = vertices[i].x();
+                vb[i * 3 + 1] = vertices[i].y();
+                vb[i * 3 + 2] = vertices[i].z();
+            }
+
+            // Fill index buffer - each quad uses 4 consecutive vertices
+            for (int i = 0; i < 6; i++) {
+                int base_vertex = i * 4;  // Each face starts at vertex i*4
+                ib[i * 4 + 0] = base_vertex + 0;  // First vertex of quad
+                ib[i * 4 + 1] = base_vertex + 1;  // Second vertex of quad
+                ib[i * 4 + 2] = base_vertex + 3;  // Fourth vertex of quad
+                ib[i * 4 + 3] = base_vertex + 2;  // Third vertex of quad
+            }
+
+            // commit and release geom handle
+            rtcCommitGeometry(geom);
+            geomid = rtcAttachGeometry(scene, geom);
+            return geomid;
+        }
+
+        Material* getMaterial(unsigned int primid, unsigned int instid) override {
+            return material;
+        }
+
+        std::vector<Float3> vertices;
+        Material* material;
+
+    private:
+        void add_side(const Float3& q, const Float3& u, const Float3& v) {
+            Float3 c1 = q;
+            Float3 c2 = q + u;
+            Float3 c3 = q + v;
+            Float3 c4 = q + u + v;
+
+            vertices.push_back(c1);
+            vertices.push_back(c2);
+            vertices.push_back(c3);
+            vertices.push_back(c4);
+        }
+};
+
 class Quad : public Geometry {
     public:
         Quad(const Float3& q, const Float3& u, const Float3& v, Material* material_) {

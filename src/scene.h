@@ -60,20 +60,10 @@ class SceneManager {
         }
 
         unsigned int add_box(const Float3& a, const Float3& b, Material* material_){
-            Float3 min = a.min(b);
-            Float3 max = a.max(b);
-            Float3 dx(max.x() - min.x(), 0.0f, 0.0f);
-            Float3 dy(0.0f, max.y() - min.y(), 0.0f);
-            Float3 dz(0.0f, 0.0f, max.z() - min.z());
-
-            add_quad(Float3(min.x(), min.y(), max.z()),  dx,  dy, material_); // front
-            add_quad(Float3(max.x(), min.y(), max.z()), -dz,  dy, material_); // right
-            add_quad(Float3(max.x(), min.y(), min.z()), -dx,  dy, material_); // back
-            add_quad(Float3(min.x(), min.y(), min.z()),  dz,  dy, material_); // left
-            add_quad(Float3(min.x(), max.y(), max.z()),  dx, -dz, material_); // top
-            add_quad(Float3(min.x(), min.y(), min.z()),  dx,  dz, material_); // bottom
-
-            return -1;
+            Box* box = new Box(a, b, material_);
+            int geomID = box->setupEmbree(*device, scene);
+            geometry[geomID] = box;
+            return geomID;
         }
 
         RayHit cast_ray(RTCRay ray) {
