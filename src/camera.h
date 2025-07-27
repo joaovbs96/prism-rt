@@ -56,12 +56,8 @@ class Camera {
             defocus_disk_v = v * defocus_radius;
         }
 
-        Float3 sample_square(int s_s, int s_t, int strat_factor, unsigned int &seed) const {
-            // Returns the vector to a random point in the square sub-pixel specified by grid
-            // indices s_i and s_j, for an idealized unit square pixel [-.5,-.5] to [+.5,+.5].
-            float x = (s_s + rnd(seed)) * strat_factor;
-            float y = (s_t + rnd(seed)) * strat_factor;
-            return Float3(x - 0.5, y - 0.5, 0);
+        Float3 sample_square(unsigned int &seed) const {
+            return Float3(rnd(seed) - 0.5, rnd(seed) - 0.5, 0);
         }
 
         Float3 sample_disk(unsigned int &seed) const {
@@ -70,10 +66,10 @@ class Camera {
             return camera_center + (p[0] * defocus_disk_u) + (p[1] * defocus_disk_v);
         }
 
-        RTCRay get_ray(int s, int t, int s_s, int s_t, int strat_factor, unsigned int &seed) {
+        RTCRay get_ray(float s, float t, unsigned int &seed) {
             // Construct a camera ray originating from the defocus disk and directed at a randomly
             // sampled point around the pixel location s, t.
-            Float3 pixel_offset = sample_square(s_s, s_t, strat_factor, seed);
+            Float3 pixel_offset = sample_square(seed);
             Float3 pixel_center = pixel00_loc + ((s + pixel_offset.x()) * pixel_delta_u) + ((t + pixel_offset.y()) * pixel_delta_v);
             Float3 ray_origin = (defocus_angle <= 0) ? camera_center : sample_disk(seed);
             Float3 ray_direction = pixel_center - ray_origin;
