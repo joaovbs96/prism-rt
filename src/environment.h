@@ -55,7 +55,7 @@ class EnvironmentMap : public Environment {
         float u = lon / (PI * 2.f);
         float v = lat / PI;
 
-        return 2.f * texture->sample(u, v, Float3(0.f));
+        return 2.f * texture->sampleInterp(u, v, Float3(0.f));
     }
 
     Texture<Color3>* texture;
@@ -78,7 +78,7 @@ class CylindricalEnvironmentMap : public Environment {
         float u = 1.f - (lon / (2.f * PI));
         float v = lat / PI;
 
-        return 2.f * texture->sample(u, v, Float3(0.f));
+        return 2.f * texture->sampleInterp(u, v, Float3(0.f));
     }
 
     Texture<Color3>* texture;
