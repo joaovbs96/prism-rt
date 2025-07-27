@@ -28,7 +28,7 @@ class SceneManager {
             scene = rtcNewScene(*device);
         }
 
-        unsigned int add_mesh(const std::filesystem::path &file_path, Material* material_override = nullptr) {
+        Geometry* add_mesh(const std::filesystem::path &file_path, Material* material_override = nullptr) {
 
             Mesh* mesh;
             if (file_path.extension() == ".obj")
@@ -42,28 +42,28 @@ class SceneManager {
 
             int geomID = mesh->setupEmbree(*device, scene);
             geometry[geomID] = mesh;
-            return geomID;
+            return mesh;
         }
 
-        unsigned int add_sphere(const Float3& pos, float r, Material* material) {
+        Geometry* add_sphere(const Float3& pos, float r, Material* material) {
             Sphere* sphere = new Sphere(pos, r, material);
             int geomID = sphere->setupEmbree(*device, scene);
             geometry[geomID] = sphere;
-            return geomID;
+            return sphere;
         }
 
-        unsigned int add_quad(const Float3& q, const Float3& u, const Float3& v, Material* material_) {
+        Geometry* add_quad(const Float3& q, const Float3& u, const Float3& v, Material* material_) {
             Quad* quad = new Quad(q, u, v, material_);
             int geomID = quad->setupEmbree(*device, scene);
             geometry[geomID] = quad;
-            return geomID;
+            return quad;
         }
 
-        unsigned int add_box(const Float3& a, const Float3& b, Material* material_){
+        Geometry* add_box(const Float3& a, const Float3& b, Material* material_){
             Box* box = new Box(a, b, material_);
             int geomID = box->setupEmbree(*device, scene);
             geometry[geomID] = box;
-            return geomID;
+            return box;
         }
 
         RayHit cast_ray(RTCRay ray) {
@@ -109,6 +109,18 @@ class SceneManager {
 
             // ray miss: sample environment
             return environment->sample(ray_hit);
+        }
+
+        void commitScene() {
+            // FIXME: commented out, transforms don't seem to be working atm
+            // // setup scene geometry transformation
+            // for (auto it = geometry.begin(); it != geometry.end(); it++) {
+            //     // TODO: we will need to turn the transforms into vectors, where each time entry will have its own transform
+            //     it->second->applyTransform();
+            // }
+
+            // finalize scene setup
+            rtcCommitScene(scene);
         }
 
         RTCDevice* device;
@@ -282,8 +294,14 @@ class CornellBox : public SceneManager {
             add_quad(Float3(555,555,555),   Float3(-555,0,0),   Float3(0,0,-555),   white);
             add_quad(Float3(0,0,555),       Float3(555,0,0),    Float3(0,555,0),    white);
 
-            add_box(Float3(130, 0, 65),     Float3(295, 165, 230),  white);
-            add_box(Float3(265, 0, 295),    Float3(430, 330, 460),  white);
+            Geometry* box1 = add_box(Float3(130, 0, 65),     Float3(295, 165, 230),  white);
+            // Geometry* box1 = add_box(Float3(0.f),     Float3(165, 330, 165),  white);
+            // box1->transform->translate(265,0,295);
+            // box1->transform->rotateY(15);
+
+            Geometry* box2 = add_box(Float3(265, 0, 295),    Float3(430, 330, 460),  white);
+            // Geometry* box2 = add_box(Float3(0.0f),    Float3(165,165,165),  white);
+            // box2->transform->translate(130, 0, 65);
 
             std::cout << "Finished geometry creation." << std::endl;
 

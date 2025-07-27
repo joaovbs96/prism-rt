@@ -11,6 +11,7 @@
 
 #include "float3.h"
 #include "float2.h"
+#include "transforms.h"
 #include "material.h"
 
 class Geometry {
@@ -21,9 +22,47 @@ class Geometry {
 
         virtual Material* getMaterial(unsigned int primid, unsigned int instid) = 0;
 
+        // Apply the current transform matrix to all vertices
+        virtual void applyTransform() {
+            if (!geom) {
+                std::cerr << "Error: Geometry not initialized" << std::endl;
+                return;
+            }
+
+            if (transform->isIdentity())
+                return;
+            
+            // Get the vertex buffer data
+            float* vb = (float*)rtcGetGeometryBufferData(geom, RTC_BUFFER_TYPE_VERTEX, 0);
+            if (!vb) {
+                std::cerr << "Error: Could not get vertex buffer data" << std::endl;
+                return;
+            }
+            
+            // Transform each vertex
+            for (int i = 0; i < vertex_count; i++) {
+                // Get current vertex position
+                Float3 vertex(vb[i * 3 + 0], vb[i * 3 + 1], vb[i * 3 + 2]);
+                
+                // Apply transform matrix
+                Float3 transformed_vertex = transform->transformPoint(vertex);
+
+                // Write back transformed vertex
+                vb[i * 3 + 0] = transformed_vertex.x();
+                vb[i * 3 + 1] = transformed_vertex.y();
+                vb[i * 3 + 2] = transformed_vertex.z();
+            }
+            
+            // Mark geometry as modified and recommit
+            rtcUpdateGeometryBuffer(geom, RTC_BUFFER_TYPE_VERTEX, 0);
+            rtcCommitGeometry(geom);
+        }
+
+        int vertex_count;
         RTCGeometryType type;
         RTCGeometry geom;
         unsigned int geomid;
+        TransformMatrix* transform = new TransformMatrix();
 };
 
 class Box : public Geometry {
@@ -50,6 +89,7 @@ class Box : public Geometry {
             geom = rtcNewGeometry(device, type);
             float* vb = (float*) rtcSetNewGeometryBuffer(geom,RTC_BUFFER_TYPE_VERTEX, 0, RTC_FORMAT_FLOAT3, 3*sizeof(float), 8);
             int* ib = (int*) rtcSetNewGeometryBuffer(geom, RTC_BUFFER_TYPE_INDEX, 0, RTC_FORMAT_UINT4, 4*sizeof(unsigned int), 6);
+            vertex_count = 8;
 
             // Fill vertex buffer with the 8 unique vertices
             for (int i = 0; i < 8; i++) {
@@ -108,6 +148,7 @@ class Quad : public Geometry {
             vb[3] = c2.x(); vb[4] = c2.y(); vb[5] = c2.z();
             vb[6] = c3.x(); vb[7] = c3.y(); vb[8] = c3.z();
             vb[9] = c4.x(); vb[10] = c4.y(); vb[11] = c4.z();
+            vertex_count = 4;
 
             int* ib = (int*) rtcSetNewGeometryBuffer(geom, RTC_BUFFER_TYPE_INDEX, 0, RTC_FORMAT_UINT4, 4*sizeof(unsigned int), 1);
             ib[0] = 0; ib[1] = 1; ib[2] = 3; ib[3] = 2;
@@ -135,11 +176,47 @@ class Sphere : public Geometry {
             geom = rtcNewGeometry(device, type);
             float* vb = (float*) rtcSetNewGeometryBuffer(geom,RTC_BUFFER_TYPE_VERTEX, 0, RTC_FORMAT_FLOAT4, 4*sizeof(float), 1);
             vb[0] = pos.x(); vb[1] = pos.y(); vb[2] = pos.z(); vb[3] = r;
+            vertex_count = 1; // ??
 
             // commit and release geom handle
             rtcCommitGeometry(geom);
             geomid = rtcAttachGeometry(scene, geom);
             return geomid;
+        }
+
+        // Apply the current transform matrix to all vertices
+        // TODO: this likely doesn't work for spheres?
+        void applyTransform() override {
+            if (!geom) {
+                std::cerr << "Error: Geometry not initialized" << std::endl;
+                return;
+            }
+            
+            // Get the vertex buffer data
+            float* vb = (float*)rtcGetGeometryBufferData(geom, RTC_BUFFER_TYPE_VERTEX, 0);
+            if (!vb) {
+                std::cerr << "Error: Could not get vertex buffer data" << std::endl;
+                return;
+            }
+            
+            // Transform each vertex
+            for (int i = 0; i < vertex_count; i++) {
+                // Get current vertex position
+                Float4 vertex(vb[i * 3 + 0], vb[i * 3 + 1], vb[i * 3 + 2], vb[i * 3 + 3]);
+                
+                // Apply transform matrix
+                Float4 transformed_vertex = transform->transformPoint(vertex);
+                
+                // Write back transformed vertex
+                vb[i * 3 + 0] = transformed_vertex.x();
+                vb[i * 3 + 1] = transformed_vertex.y();
+                vb[i * 3 + 2] = transformed_vertex.z();
+                vb[i * 3 + 3] = transformed_vertex.w();
+            }
+            
+            // Mark geometry as modified and recommit
+            rtcUpdateGeometryBuffer(geom, RTC_BUFFER_TYPE_VERTEX, 0);
+            rtcCommitGeometry(geom);
         }
 
         Material* getMaterial(unsigned int primid, unsigned int instid) override {
@@ -166,6 +243,7 @@ class Mesh : public Geometry {
             // rtcSetSharedGeometryBuffer(geom, RTC_BUFFER_TYPE_VERTEX, 0, RTC_FORMAT_FLOAT3, vertices.data(), 0, sizeof(Float3), vertices.size());
             Float3* vtx = (Float3*)rtcSetNewGeometryBuffer(geom, RTC_BUFFER_TYPE_VERTEX, 0, RTC_FORMAT_FLOAT3, sizeof(Float3), vertices.size());
             for (unsigned int i = 0; i < vertices.size(); i++) vtx[i] = vertices[i];
+            vertex_count = vertices.size();
 
             rtcSetSharedGeometryBuffer(geom, RTC_BUFFER_TYPE_INDEX, 0, RTC_FORMAT_UINT3, indices.data(), 0, 3 * sizeof(unsigned int), int(indices.size() / 3));
 

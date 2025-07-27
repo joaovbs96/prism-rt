@@ -75,7 +75,7 @@ int main()
 
     unsigned int main_seed = 0;
     SceneManager* scene_mgr = new CornellBox(device, main_seed);
-    rtcCommitScene(scene_mgr->scene);
+    scene_mgr->commitScene();
 
     RTCRayQueryContext context;
     rtcInitRayQueryContext(&context);
