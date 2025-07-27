@@ -434,6 +434,7 @@ class glTFMesh : public Mesh {
                     } else {
                         base_texture = new ImageMixTexture<Color3>(&image.image, image.width, image.height, image.component, base_factor);
                     }
+                    base_texture->gammaCorrect(1.0 / 2.2);
                 } else {
                     base_texture = new ColorTexture(base_factor);
                 }
@@ -483,6 +484,7 @@ class glTFMesh : public Mesh {
                     } else {
                         emission_texture = new ImageMixTexture<Float3>(&image.image, image.width, image.height, image.component, emission_factor);
                     }
+                    emission_texture->gammaCorrect(1.0 / 2.2);
                 } else {
                     emission_texture = new ValueTexture<Color3>(emission_factor);
                 }
@@ -507,6 +509,8 @@ class glTFMesh : public Mesh {
                     }
                     gltf_material->setTransmission(transmission_texture);
                 }
+
+                gltf_material->createBRDFs();
 
                 // Assign material
                 materials[m] = gltf_material;
