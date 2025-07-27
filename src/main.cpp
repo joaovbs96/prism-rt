@@ -69,6 +69,8 @@ int main()
     _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);
 
     int samples = 500;
+    int samples_sqrt = std::sqrtf(samples);
+    float strat_factor = 1.0f / samples_sqrt;
     int max_depth = 10;
 
     RTCDevice device = initialize_device(1);
@@ -96,17 +98,18 @@ int main()
         {
             unsigned int seed = tea<64>(row * scene_mgr->image_width, column);
 
-            // render for N samples
+            // stratified sampling: render for (samples_sqrt*samples_sqrt) samples
             Color3 pixel_color(0.0f);
-            for (int spp = 0; spp < samples; spp++)
-            {
-                // create new ray and trace it
-                RTCRay ray = scene_mgr->cam.get_ray(column, row, seed);
-                pixel_color += scene_mgr->trace(ray, max_depth, seed);
+            for (int spp_s = 0; spp_s < samples_sqrt; spp_s++) {
+                for (int spp_t = 0; spp_t < samples_sqrt; spp_t++) {
+                    // create new ray and trace it
+                    RTCRay ray = scene_mgr->cam.get_ray(column, row, spp_s, spp_t, strat_factor, seed);
+                    pixel_color += scene_mgr->trace(ray, max_depth, seed);
+                }
             }
 
             // average samples out and put it in the frame buffer
-            pixel_color /= samples;
+            pixel_color *= (strat_factor * strat_factor);
             frame.setPixel(column, row, pixel_color.gamma_correct());
         });
 
