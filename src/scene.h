@@ -95,7 +95,8 @@ class SceneManager {
             if (ray_hit.geomid != RTC_INVALID_GEOMETRY_ID){
                 // retrieve material by geomid and sample the surface
                 Material* material = geometry[ray_hit.geomid]->getMaterial(ray_hit.primid, ray_hit.instid);
-                // TODO: sample normal map and perturbate normal
+                // sample normal map and perturbate normal
+                material->perturbNormal(ray_hit);
                 
                 // BRDFSample: surface hit color + scattered light ray
                 BRDFSample s = material->sample(ray_hit, seed);
@@ -208,7 +209,29 @@ class ABeautifulGame : public SceneManager {
             cam = Camera(position, target, up, 1280, 720, 16.0f / 9.0f, vfov, 0.0f, 10.0f);
 
             // environment map - for missed rays
-            environment = new EnvironmentMap(new ImageTexture("C:/Users/joaov/Downloads/golden_gate_hills_4k.exr"));
+            ImageTexture<Float3>* texture = new ImageTexture<Float3>("C:/Users/joaov/Downloads/IndoorEnvironmentHDRI003_4K-HDR.exr");
+            texture->adjustExposure(0.5f);
+            environment = new EnvironmentMap(texture);
+        }
+};
+
+class NormalTangentTest : public SceneManager {
+    public:
+        NormalTangentTest(RTCDevice device_, unsigned int &seed) : SceneManager(device_) {
+            std::cout << "Started scene initialization." << std::endl;
+            add_mesh("C:/Users/joaov/Downloads/NormalTangentTest.glb");
+
+            std::cout << "Finished geometry creation." << std::endl;
+
+            // camera initialization
+            Float3 position(0.8, 0.15, 0.7);
+            Float3 target(0.0f, 0.05, 0.0);
+            Float3 up(0.0f, 1.0f, 0.0f);
+            float vfov = 12;
+            cam = Camera(position, target, up, 1280, 720, 16.0f / 9.0f, vfov, 0.0f, 10.0f);
+
+            // environment map - for missed rays
+            environment = new EnvironmentMap(new ImageTexture("C:/Users/joaov/Downloads/brown_photostudio_03_4k.exr"));
         }
 };
 

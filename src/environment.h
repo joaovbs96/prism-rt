@@ -59,6 +59,7 @@ class EnvironmentMap : public Environment {
     }
 
     Texture<Color3>* texture;
+    float exposure;
 };
 
 class CylindricalEnvironmentMap : public Environment {

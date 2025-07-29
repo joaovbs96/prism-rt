@@ -68,7 +68,7 @@ int main()
     _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
     _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);
 
-    int samples = 500;
+    int samples = 100;
     int max_depth = 10;
 
     RTCDevice device = initialize_device(1);

@@ -73,6 +73,27 @@ class Material {
             return normal_texture->sample(ray_hit.u, ray_hit.v, ray_hit.p);
         }
 
+        void perturbNormal(RayHit& ray_hit) {
+            ray_hit.n_g = ray_hit.n.normalize();
+            ray_hit.n_s = getShadingNormal(ray_hit);
+            if (ray_hit.n_s.is_zero())
+                return;
+
+            // Convert shading normal from [0,1] range to [-1,1] range
+            // (assuming n_s comes from a texture in [0,1] range)
+            Float3 tangent_n_s = ray_hit.n_s * 2.0f - 1.0f;
+
+            // Create tangent and bitangent vectors
+            // Choose an arbitrary vector that's not parallel to N
+            Float3 up = (std::fabsf(ray_hit.n_g.y()) < 0.999f) ? Float3(0, 1, 0) : Float3(1, 0, 0);
+            Float3 T = cross(up, ray_hit.n_g);  // Tangent
+            Float3 B = cross(ray_hit.n_g, T);   // Bitangent
+            
+            // Transform the tangent-space normal to world space
+            Float3 perturbed_n = T * tangent_n_s.x() + B * tangent_n_s.y() + ray_hit.n_g * tangent_n_s.z();
+            ray_hit.n = perturbed_n.normalize();
+        }
+
         Texture<Float3>* normal_texture = nullptr;
 };
 

@@ -95,6 +95,11 @@ class ImageTexture : public Texture<T> {
             ImageBufAlgo::pow(buffer, buffer, {g_, g_, g_});
         }
 
+        void adjustExposure(float exposure) {
+            float multiplier = std::pow(2.0f, exposure);
+            ImageBufAlgo::mul(buffer, buffer, multiplier);
+        }
+
         T sample(float u, float v, const Float3& p) const override {
             auto i = int(std::fabsf(std::fmodf(u, 1.0)) * (width - 1));
             auto j = int(std::fabsf(std::fmodf(v, 1.0)) * (height - 1));
