@@ -41,6 +41,10 @@ class Material {
             unsigned int &seed  // random number generator seed
         ) = 0;
 
+        virtual float pdf(const RayHit ray_hit, const Float3& wo, Float3& wi) const {
+            return 0;
+        }
+
         virtual Color3 evaluate_emission(const RayHit ray_hit) {
             return Color3(0.0f);
         }
@@ -115,6 +119,11 @@ class Diffuse : public Material {
 
         Color3 evaluate_color(const Float3& p, const Float3& n, const Float3& wo, Float3& wi, float u, float v, unsigned int &seed) override {
             return diffuse_color->sample(u, v, p);
+        }
+
+        float pdf(const RayHit ray_hit, const Float3& wo, Float3& wi) const override {
+            auto cos_theta = dot(ray_hit.n, wi);
+            return cos_theta < 0 ? 0 : cos_theta / PI;
         }
 
         Texture<Float3>* diffuse_color;
