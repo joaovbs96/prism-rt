@@ -1,0 +1,8 @@
+// resources.rc
+#include <windows.h>
+
+// Define your icon resource
+IDI_ICON1 ICON "PrismRT.ico"
+
+// Optional: Set as application icon
+1 ICON "PrismRT.ico"
