@@ -4,7 +4,7 @@
 👋 Introduction
 ---------------------------------------
 
-PrismRT is a CPU-based Path Tracer with support for rendering USD, glTF and OBJ files, powered by the Embree Ray Tracing framework and the oneTBB threading library.
+PrismRT is a CPU-based Path Tracer with support for rendering USD, glTF and OBJ files, powered by the Embree Ray Tracing framework, the oneTBB threading library and the OpenImageIO image processing library.
 
 Lorem ipsum dolor sit amet, consectetur adipiscing elit. Suspendisse congue ultricies sollicitudin. Aliquam erat volutpat. Quisque pellentesque velit vitae efficitur commodo. Sed tincidunt mollis tellus sit amet euismod. Maecenas blandit a nisl non rutrum. Integer pellentesque sem at dictum facilisis. Maecenas consequat porta justo, eu faucibus velit auctor in. Fusce mollis justo neque, aliquam bibendum urna accumsan at. In hac habitasse platea dictumst. Vivamus lorem dui, tempus vel diam eu, mollis hendrerit mi. Morbi euismod, tortor quis facilisis venenatis, diam massa pretium libero, sollicitudin placerat libero orci eget ex. Ut consectetur purus et sagittis sodales. Duis ut scelerisque mi, eget egestas tortor. Suspendisse a vehicula odio, id mollis felis. Nam elementum nisi at pellentesque iaculis.
 
