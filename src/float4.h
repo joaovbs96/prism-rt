@@ -200,7 +200,7 @@ class Float4 {
 };
 
 std::ostream& operator<<(std::ostream& os, const Float4& v) {
-    return os << "<" << v.x() << "," << v.y() << "," << v.z() << "," << v.w() << ">" << std::endl;
+    return os << "<" << v.x() << "," << v.y() << "," << v.z() << "," << v.w() << ">";
 }
 
 inline Float4 operator*(const float t, const Float4& v) {
