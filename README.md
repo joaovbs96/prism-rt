@@ -35,11 +35,11 @@ Lorem ipsum dolor sit amet, consectetur adipiscing elit. Suspendisse congue ultr
 2. cd into the repo folder.
 3. [Install the latest CMake release](https://cmake.org/download/).
 4. Install vcpkg:
-    4.1. Clone the vcpkg repo: `git clone https://github.com/microsoft/vcpkg.git`
-    4.2. Perform the initial vcpkg setup: `.\vcpkg\bootstrap-vcpkg.bat`
-    4.3. Install vcpkg dependencies: `.\vcpkg\vcpkg.exe install`
+    1. Clone the vcpkg repo: `git clone https://github.com/microsoft/vcpkg.git`
+    2. Perform the initial vcpkg setup: `.\vcpkg\bootstrap-vcpkg.bat`
+    3. Install vcpkg dependencies: `.\vcpkg\vcpkg.exe install`
 5. Download and extract the newest Embree v4.X release into `external\embree`
-    5.1. Note: if your version number is different than the one in the `.vscode\settings.json` file, you will need to update the path to the folder containing the `.cmake` files for Embree. For example, if your Embree version is v4.4.0, your cmake path will be: `${workspaceRoot}\external\embree\lib\cmake\embree-4.4.0`
+    1. Note: if your version number is different than the one in the `.vscode\settings.json` file, you will need to update the path to the folder containing the `.cmake` files for Embree. For example, if your Embree version is v4.4.0, your cmake path will be: `${workspaceRoot}\external\embree\lib\cmake\embree-4.4.0`
 6. Download and extract the newest oneTBB release into `external\tbb`
 
 Cras imperdiet eros nec risus tincidunt tristique. Quisque rutrum auctor odio, sit amet lacinia enim. Aenean vel viverra lectus. Maecenas et accumsan mi, non elementum ex. Suspendisse sed nibh ac felis porttitor imperdiet. Donec massa sem, lacinia a ligula non, hendrerit suscipit justo. Suspendisse dui nibh, fermentum quis iaculis sed, tempor eget magna.
