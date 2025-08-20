@@ -170,7 +170,7 @@ class Float2 {
 };
 
 std::ostream& operator<<(std::ostream& os, const Float2& v) {
-    return os << "<" << v.x() << "," << v.y() << ">" << std::endl;
+    return os << "<" << v.x() << "," << v.y() << ">";
 }
 
 inline Float2 operator*(const float t, const Float2& v) {

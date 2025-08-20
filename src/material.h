@@ -5,12 +5,14 @@
 #include "rng.h"
 #include "ray.h"
 #include "texture.h"
+#include "onb.h"
 
 struct BRDFSample {
-    Float3 wi;
-    Color3 color;
-    Color3 emission;
-    bool scattered;
+        Float3 wi;
+        Color3 color;
+        Color3 emission;
+        float pdf;
+        bool scattered;
 };
 
 class Material {
@@ -24,6 +26,7 @@ class Material {
         virtual BRDFSample sample(const RayHit ray_hit, unsigned int &seed) {
             BRDFSample s;
             s.wi = sample_direction(ray_hit, seed);
+            s.pdf = pdf(ray_hit, -ray_hit.d, s.wi);
             s.color = evaluate_color(ray_hit.p, ray_hit.n, -ray_hit.d, s.wi, ray_hit.u, ray_hit.v, seed);
             s.emission = evaluate_emission(ray_hit);
             s.scattered = !s.wi.is_zero();
@@ -31,6 +34,10 @@ class Material {
         }
 
         virtual Float3 sample_direction(const RayHit ray_hit, unsigned int &seed) = 0;
+
+        virtual float pdf(const RayHit ray_hit, const Float3& wo, Float3& wi) const {
+            return 0;
+        }
 
         virtual Color3 evaluate_color(
             const Float3& p,    // surface hit point
@@ -40,10 +47,6 @@ class Material {
             float u, float v,   // UV coordinates
             unsigned int &seed  // random number generator seed
         ) = 0;
-
-        virtual float pdf(const RayHit ray_hit, const Float3& wo, Float3& wi) const {
-            return 0;
-        }
 
         virtual Color3 evaluate_emission(const RayHit ray_hit) {
             return Color3(0.0f);
@@ -104,12 +107,12 @@ class Material {
 class Diffuse : public Material {
     public:
         Diffuse(Texture<Float3>* texture) : diffuse_color(texture) {}
-
         Float3 sample_direction(const RayHit ray_hit, unsigned int &seed) override {
+            ONB uvw(ray_hit.n);
+            Float3 wi = uvw.transform(random_cosine_direction(seed));
+
             // note that the ray incoming from the light (wi) is the next/scattered ray
             // don't forget that a ray tracer works "in reverse"
-            Float3 wi = ray_hit.n + random_unit_vector(seed);
-
             // if the incoming ray is near zero, we take the normal instead
             if (wi.is_near_zero())
                 wi = ray_hit.n;
@@ -117,13 +120,13 @@ class Diffuse : public Material {
             return wi;
         }
 
-        Color3 evaluate_color(const Float3& p, const Float3& n, const Float3& wo, Float3& wi, float u, float v, unsigned int &seed) override {
-            return diffuse_color->sample(u, v, p);
+        float pdf(const RayHit ray_hit, const Float3& wo, Float3& wi) const override {
+            auto cos_theta = dot(ray_hit.n, wi.normalize());
+            return cos_theta < 0 ? 0 : cos_theta / PI;
         }
 
-        float pdf(const RayHit ray_hit, const Float3& wo, Float3& wi) const override {
-            auto cos_theta = dot(ray_hit.n, wi);
-            return cos_theta < 0 ? 0 : cos_theta / PI;
+        Color3 evaluate_color(const Float3& p, const Float3& n, const Float3& wo, Float3& wi, float u, float v, unsigned int &seed) override {
+            return diffuse_color->sample(u, v, p);
         }
 
         Texture<Float3>* diffuse_color;
@@ -163,6 +166,8 @@ class Emissive : public Material {
         }
 
         Color3 evaluate_emission(const RayHit ray_hit) override {
+            if (!ray_hit.front_face)
+                return Color3(0.0f);
             return emissive_color->sample(ray_hit.u, ray_hit.v, ray_hit.p) * emissive_multiplier;
         }
 

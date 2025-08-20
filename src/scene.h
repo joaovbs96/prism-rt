@@ -103,9 +103,13 @@ class SceneManager {
                 if (!s.scattered)
                     return s.emission;
 
+                double pdf_value = s.pdf;
+
                 RTCRay new_ray = initialize_ray(ray_hit.p, s.wi);
 
-                return s.emission + s.color * trace(new_ray, depth - 1, seed);
+                Color3 indirect_light = (s.color * s.pdf * trace(new_ray, depth - 1, seed)) / pdf_value;
+                Color3 direct_light = s.emission;
+                return direct_light + indirect_light;
             }
 
             // ray miss: sample environment
