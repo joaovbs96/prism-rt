@@ -74,7 +74,7 @@ int main()
     RTCDevice device = initialize_device(1);
 
     unsigned int main_seed = 0;
-    SceneManager* scene_mgr = new ABeautifulGame(device, main_seed);
+    SceneManager* scene_mgr = new CornellBox(device, main_seed);
     scene_mgr->commitScene();
 
     RTCRayQueryContext context;
