@@ -12,20 +12,33 @@ add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/external/tinyobj")
 
 add_executable(PrismRT src/main.cpp)
 
+# OIIO
 find_package(OpenImageIO CONFIG REQUIRED)
 target_link_libraries(PrismRT OpenImageIO::OpenImageIO)
 
+# Embree
 find_package(embree 4 REQUIRED)
 target_link_libraries(PrismRT embree)
 
+# oneTBB
 find_package(TBB REQUIRED)
 target_link_libraries(PrismRT TBB::tbb)
 
-message(STATUS "${CMAKE_CURRENT_SOURCE_DIR}/external/tinygltf")
-message(STATUS "${CMAKE_CURRENT_SOURCE_DIR}/external/tinyobj")
+# OpenUSD Dependency
+# TODO: OpenGL shouldn't be needed and yet USD is requiring it?
+find_package(OpenGL REQUIRED)
 
+find_package(pxr REQUIRED)
+
+message(STATUS "PXR_LIBRARIES contains: ${PXR_LIBRARIES}")
+string(REPLACE ";" "|" PXR_LIBRARIES_DEBUG "${PXR_LIBRARIES}")
+message(STATUS "PXR_LIBRARIES debug: ${PXR_LIBRARIES_DEBUG}")
+
+target_link_libraries(PrismRT ${PXR_LIBRARIES})
+target_include_directories(PrismRT PRIVATE ${PXR_INCLUDE_DIR})
+
+# Other libraries
 target_include_directories(PrismRT PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/external/tinygltf")
-
 target_include_directories(PrismRT PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/external/tinyobj")
 
 # Copies DLLs our executable depends on to the build folder automatically

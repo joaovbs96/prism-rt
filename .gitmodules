@@ -4,6 +4,3 @@
 [submodule "external/tinyobj"]
 	path = external/tinyobj
 	url = https://github.com/tinyobjloader/tinyobjloader.git
-[submodule "external/OpenUSD"]
-	path = external/OpenUSD
-	url = https://github.com/PixarAnimationStudios/OpenUSD.git
