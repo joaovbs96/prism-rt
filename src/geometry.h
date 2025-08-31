@@ -726,3 +726,4 @@ class glTFMesh : public Mesh {
             return model.images[texture.source];
         }
 };
+

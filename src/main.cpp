@@ -11,6 +11,11 @@
 #include <embree4/rtcore.h>
 #include <xmmintrin.h>
 
+#include <pxr/pxr.h>
+#include <pxr/base/plug/registry.h>
+#include <pxr/base/plug/plugin.h>
+#include <pxr/usd/usd/stage.h>
+
 // needed for embree initialization
 #if !defined(_MM_SET_DENORMALS_ZERO_MODE)
 #define _MM_DENORMALS_ZERO_ON   (0x0040)
@@ -62,8 +67,43 @@ void print_progress(float progress) {
         std::cout << std::endl;
 }
 
+#include <pxr/base/plug/registry.h>
+
+void setupUSDPlugins() {
+    pxr::PlugRegistry& registry = pxr::PlugRegistry::GetInstance();
+
+    // Add plugin search paths
+    registry.RegisterPlugins("C:/Users/joaov/Desktop/Programming_Projects/external_deps/OpenUSD/install/plugin/usd");
+    registry.RegisterPlugins("C:/Users/joaov/Desktop/Programming_Projects/external_deps/OpenUSD/install/lib/usd");
+
+    // List all discovered plugins
+    auto plugins = registry.GetAllPlugins();
+
+    std::cout << "Found " << plugins.size() << " registered plugins:\n\n";
+
+    for (size_t i = 0; i < plugins.size(); ++i) {
+        pxr::PlugPluginPtr plugin = plugins[i];
+        if (plugin) {
+            std::cout << plugin->GetName() << std::endl;
+        }
+    }
+
+}
+
 int main()
 {
+    setupUSDPlugins();
+
+    std::filesystem::path file_path = "C:/Users/joaov/Desktop/Programming_Projects/prism-rt/assets/models/Kitchen_set/Kitchen_set_instanced.usd";
+    pxr::UsdStageRefPtr stage = pxr::UsdStage::Open(file_path.string());
+    if (!stage) {
+        std::cout << "Failed to open USD file: " << file_path << std::endl;
+        return 0;
+    } else {
+        std::cout << "Opened USD file: " << file_path << std::endl;
+        return 0;
+    }
+
     // keeping these give a perf improvement
     _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
     _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);

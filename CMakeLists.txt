@@ -4,10 +4,14 @@ project(PrismRT)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED YES)
 
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)  # This line is optional. It's just for certain IDEs to use
+
+# tiny gltf
 set(TINYGLTF_HEADER_ONLY ON CACHE INTERNAL "" FORCE)
 set(TINYGLTF_INSTALL OFF CACHE INTERNAL "" FORCE)
 add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/external/tinygltf")
 
+# tiny obj
 add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/external/tinyobj")
 
 add_executable(PrismRT src/main.cpp)
@@ -35,11 +39,11 @@ string(REPLACE ";" "|" PXR_LIBRARIES_DEBUG "${PXR_LIBRARIES}")
 message(STATUS "PXR_LIBRARIES debug: ${PXR_LIBRARIES_DEBUG}")
 
 target_link_libraries(PrismRT ${PXR_LIBRARIES})
-target_include_directories(PrismRT PRIVATE ${PXR_INCLUDE_DIR})
+target_include_directories(PrismRT PUBLIC ${PXR_INCLUDE_DIR})
 
 # Other libraries
-target_include_directories(PrismRT PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/external/tinygltf")
-target_include_directories(PrismRT PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/external/tinyobj")
+target_include_directories(PrismRT PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/external/tinygltf")
+target_include_directories(PrismRT PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/external/tinyobj")
 
 # Copies DLLs our executable depends on to the build folder automatically
 add_custom_command(TARGET PrismRT POST_BUILD
