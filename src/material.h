@@ -8,17 +8,17 @@
 #include "onb.h"
 
 struct BRDFSample {
-        Float3 wi;
-        Color3 color;
-        Color3 emission;
-        float pdf;
-        bool scattered;
+    Float3 wi;
+    Color3 color;
+    Color3 emission;
+    float pdf;
+    bool scattered;
 };
 
 class Material {
     public:
         Material() {}
-        
+
         // All materials need to define:
         // 1) How to sample the ray direction for the next bounce
         // 2) The color that the material contributes to the ray
@@ -95,7 +95,7 @@ class Material {
             Float3 up = (std::fabsf(ray_hit.n_g.y()) < 0.999f) ? Float3(0, 1, 0) : Float3(1, 0, 0);
             Float3 T = cross(up, ray_hit.n_g);  // Tangent
             Float3 B = cross(ray_hit.n_g, T);   // Bitangent
-            
+
             // Transform the tangent-space normal to world space
             Float3 perturbed_n = T * tangent_n_s.x() + B * tangent_n_s.y() + ray_hit.n_g * tangent_n_s.z();
             ray_hit.n = perturbed_n.normalize();
@@ -134,7 +134,7 @@ class Diffuse : public Material {
 
 class Metal : public Material {
     public:
-        Metal(Texture<Float3>* specular_color, Texture<float>* specular_roughness) 
+        Metal(Texture<Float3>* specular_color, Texture<float>* specular_roughness)
         : specular_color(specular_color), specular_roughness(specular_roughness) {}
 
         Float3 sample_direction(const RayHit ray_hit, unsigned int &seed) override {
@@ -154,7 +154,7 @@ class Metal : public Material {
 
 class Emissive : public Material {
     public:
-        Emissive(Texture<Float3>* emissive_color, float emissive_multiplier = 1.0f) 
+        Emissive(Texture<Float3>* emissive_color, float emissive_multiplier = 1.0f)
         : emissive_color(emissive_color), emissive_multiplier(emissive_multiplier) {}
 
         Float3 sample_direction(const RayHit ray_hit, unsigned int &seed) override {

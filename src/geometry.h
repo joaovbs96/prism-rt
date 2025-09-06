@@ -31,19 +31,19 @@ class Geometry {
 
             if (transform->isIdentity())
                 return;
-            
+
             // Get the vertex buffer data
             float* vb = (float*)rtcGetGeometryBufferData(geom, RTC_BUFFER_TYPE_VERTEX, 0);
             if (!vb) {
                 std::cerr << "Error: Could not get vertex buffer data" << std::endl;
                 return;
             }
-            
+
             // Transform each vertex
             for (int i = 0; i < vertex_count; i++) {
                 // Get current vertex position
                 Float3 vertex(vb[i * 3 + 0], vb[i * 3 + 1], vb[i * 3 + 2]);
-                
+
                 // Apply transform matrix
                 Float3 transformed_vertex = transform->transformPoint(vertex);
 
@@ -52,10 +52,16 @@ class Geometry {
                 vb[i * 3 + 1] = transformed_vertex.y();
                 vb[i * 3 + 2] = transformed_vertex.z();
             }
-            
+
             // Mark geometry as modified and recommit
             rtcUpdateGeometryBuffer(geom, RTC_BUFFER_TYPE_VERTEX, 0);
             rtcCommitGeometry(geom);
+        }
+
+        virtual Float3 sample_direction(const RayHit ray_hit, unsigned int &seed) = 0;
+
+        virtual float pdf(const RayHit ray_hit, const Float3& wo, Float3& wi) const {
+            return 0;
         }
 
         int vertex_count;
@@ -132,12 +138,13 @@ class Box : public Geometry {
 
 class Quad : public Geometry {
     public:
-        Quad(const Float3& q, const Float3& u, const Float3& v, Material* material_) {
+        Quad(const Float3& q, const Float3& u, const Float3& v, Material* material_) : q(q), u(u), v(v) {
             c1 = q;
             c2 = q + u;
             c3 = q + v;
             c4 = q + u + v;
             material = material_;
+            area = cross(u, v).length();
         }
 
         unsigned int setupEmbree(RTCDevice &device, RTCScene &scene) override {
@@ -163,7 +170,21 @@ class Quad : public Geometry {
             return material;
         }
 
+        Float3 sample_direction(const RayHit ray_hit, unsigned int &seed) override {
+            Float3 p = q + (rnd(seed) * u) + (rnd(seed) * v);
+            return p - ray_hit.p;
+        }
+
+        float pdf(const RayHit ray_hit, const Float3& wo, Float3& wi) const override {
+            float distance_squared = ray_hit.t * ray_hit.t * wi.length_squared();
+            auto cosine = std::fabsf(dot(wi, ray_hit.n) / wi.length());
+
+            return distance_squared / (cosine * area);
+        }
+
         Float3 c1, c2, c3, c4;
+        Float3 u, v, q;
+        float area;
         Material* material;
 };
 
@@ -191,29 +212,29 @@ class Sphere : public Geometry {
                 std::cerr << "Error: Geometry not initialized" << std::endl;
                 return;
             }
-            
+
             // Get the vertex buffer data
             float* vb = (float*)rtcGetGeometryBufferData(geom, RTC_BUFFER_TYPE_VERTEX, 0);
             if (!vb) {
                 std::cerr << "Error: Could not get vertex buffer data" << std::endl;
                 return;
             }
-            
+
             // Transform each vertex
             for (int i = 0; i < vertex_count; i++) {
                 // Get current vertex position
                 Float4 vertex(vb[i * 3 + 0], vb[i * 3 + 1], vb[i * 3 + 2], vb[i * 3 + 3]);
-                
+
                 // Apply transform matrix
                 Float4 transformed_vertex = transform->transformPoint(vertex);
-                
+
                 // Write back transformed vertex
                 vb[i * 3 + 0] = transformed_vertex.x();
                 vb[i * 3 + 1] = transformed_vertex.y();
                 vb[i * 3 + 2] = transformed_vertex.z();
                 vb[i * 3 + 3] = transformed_vertex.w();
             }
-            
+
             // Mark geometry as modified and recommit
             rtcUpdateGeometryBuffer(geom, RTC_BUFFER_TYPE_VERTEX, 0);
             rtcCommitGeometry(geom);
@@ -270,6 +291,43 @@ class Mesh : public Geometry {
             return materials[material_mapping[primid]];
         }
 
+        Float3 sample_direction(const RayHit ray_hit, unsigned int &seed) override {
+            // get triangle to sample from
+            // TODO: how to better choose a triangle/importance sampling?
+            const int tri_idx = int(rnd(seed) * indices.size());
+            const Float3 v0 = vertices[3 * tri_idx + 0];
+            const Float3 v1 = vertices[3 * tri_idx + 1];
+            const Float3 v2 = vertices[3 * tri_idx + 2];
+
+            // 2. Sample point uniformly within the selected triangle
+            float r2 = rnd(seed);
+            float r3 = rnd(seed);
+
+            // Ensure we stay within triangle using square-to-triangle mapping
+            if (r2 + r3 > 1.0f) {
+                r2 = 1.0f - r2;
+                r3 = 1.0f - r3;
+            }
+
+            // Calculate sampled point using barycentric coordinates
+            Float3 sampled = v0 * (1.0f - r2 - r3) + v1 * r2 + v2 * r3;
+
+            // Return normalized direction from hit point to sampledPoint
+            return (sampled - ray_hit.p).normalize();
+        }
+
+        float pdf(const RayHit ray_hit, const Float3& wo, Float3& wi) const override {
+            // TODO: better PDF using solid angle
+            return 1.0 / surface_area;
+        }
+
+        float get_tri_area(const Float3& v0, const Float3& v1, const Float3& v2) {
+            // Returns area of a triangle defined by three vertices.
+            Float3 edge1 = v1 - v0;
+            Float3 edge2 = v2 - v0;
+            return cross(edge1, edge2).length() * 0.5f;
+        }
+
         // Make a float3 vertex out of a vector and an index
         template <class T>
         void make_Float3(std::vector<Float3> &vertex_list, const T &attribs, int index)
@@ -295,6 +353,7 @@ class Mesh : public Geometry {
             }
         }
 
+        float surface_area = 0;
         std::vector<Float3> vertices;
         std::vector<Float3> normals;
         std::vector<Float2> texcoords;
@@ -350,6 +409,12 @@ class ObjMesh : public Mesh {
                     make_Float3<std::vector<tinyobj::real_t>>(vertices, attrib.vertices, idx0.vertex_index);
                     make_Float3<std::vector<tinyobj::real_t>>(vertices, attrib.vertices, idx1.vertex_index);
                     make_Float3<std::vector<tinyobj::real_t>>(vertices, attrib.vertices, idx2.vertex_index);
+
+                    int vertex_count = vertices.size();
+                    Float3 v0 =
+                    Float3 v1 =
+                    Float3 v2 =
+                    surface_area += get_tri_area(vertices)
 
                     // get the normal coordinates
                     make_Float3<std::vector<tinyobj::real_t>>(normals, attrib.normals, idx0.normal_index);
@@ -408,21 +473,21 @@ class glTFMesh : public Mesh {
             if (!warn.empty()) {
                 std::cout << "Warning: " << warn << std::endl;
             }
-        
+
             if (!err.empty()) {
                 std::cout << "Error: " << err << std::endl;
             }
-            
+
             if (!ret) {
                 std::cout << "Failed to parse glTF file" << std::endl;
                 return;
             }
-            
+
             int n_faces = 0;
             for (size_t mesh_idx = 0; mesh_idx < model.meshes.size(); ++mesh_idx) {
                 const tinygltf::Mesh& mesh = model.meshes[mesh_idx];
                 std::cout << "Processing mesh: " << mesh.name << std::endl;
-             
+
                 for (const auto& primitive : mesh.primitives) {
                     if (primitive.mode != TINYGLTF_MODE_TRIANGLES) {
                         std::cout << "Skipping non-triangle primitive" << std::endl;
@@ -435,21 +500,21 @@ class glTFMesh : public Mesh {
                         std::cout << "No POSITION attribute found" << std::endl;
                         continue;
                     }
-                    
+
                     const tinygltf::Accessor& posAccessor = model.accessors[posIt->second];
                     const tinygltf::BufferView& posBufferView = model.bufferViews[posAccessor.bufferView];
                     const tinygltf::Buffer& posBuffer = model.buffers[posBufferView.buffer];
-                    
+
                     if (posAccessor.componentType != TINYGLTF_COMPONENT_TYPE_FLOAT) {
                         std::cout << "Position data is not float type" << std::endl;
                         continue;
                     }
-                    
+
                     const float* positions = reinterpret_cast<const float*>(&posBuffer.data[posBufferView.byteOffset + posAccessor.byteOffset]);
-                    
+
                     size_t vertexOffset = vertices.size();
                     int vertexCount = posAccessor.count;
-                    
+
                     // Copy vertices
                     for (int i = 0; i < vertexCount; ++i) {
                         make_Float3<const float*>(vertices, positions, i);
@@ -461,11 +526,11 @@ class glTFMesh : public Mesh {
                         const tinygltf::Accessor& normalAccessor = model.accessors[normalIt->second];
                         const tinygltf::BufferView& normalBufferView = model.bufferViews[normalAccessor.bufferView];
                         const tinygltf::Buffer& normalBuffer = model.buffers[normalBufferView.buffer];
-                        
+
                         if (normalAccessor.componentType == TINYGLTF_COMPONENT_TYPE_FLOAT) {
                             const float* normals_data = reinterpret_cast<const float*>(
                                 &normalBuffer.data[normalBufferView.byteOffset + normalAccessor.byteOffset]);
-                            
+
                             for (size_t i = 0; i < normalAccessor.count; ++i)
                                 make_Float3<const float*>(normals, normals_data, i);
                         }
@@ -483,11 +548,11 @@ class glTFMesh : public Mesh {
                         const tinygltf::Accessor& texAccessor = model.accessors[texCoordIt->second];
                         const tinygltf::BufferView& texBufferView = model.bufferViews[texAccessor.bufferView];
                         const tinygltf::Buffer& texBuffer = model.buffers[texBufferView.buffer];
-                        
+
                         if (texAccessor.componentType == TINYGLTF_COMPONENT_TYPE_FLOAT) {
                             const float* texcoords_data = reinterpret_cast<const float*>(
                                 &texBuffer.data[texBufferView.byteOffset + texAccessor.byteOffset]);
-                            
+
                             for (size_t i = 0; i < texAccessor.count; ++i) {
                                 texcoords.push_back(Float2(
                                     texcoords_data[i * 2 + 0],
@@ -508,11 +573,11 @@ class glTFMesh : public Mesh {
                         const tinygltf::Accessor& indexAccessor = model.accessors[primitive.indices];
                         const tinygltf::BufferView& indexBufferView = model.bufferViews[indexAccessor.bufferView];
                         const tinygltf::Buffer& indexBuffer = model.buffers[indexBufferView.buffer];
-                        
+
                         const unsigned char* indexData = &indexBuffer.data[indexBufferView.byteOffset + indexAccessor.byteOffset];
-                        
+
                         int triangleCount = indexAccessor.count / 3;
-                        
+
                         for (int i = 0; i < triangleCount; i++) {
                             material_mapping[n_faces] = primitive.material;
                             n_faces++;
@@ -521,7 +586,7 @@ class glTFMesh : public Mesh {
                             for (int j = 0; j < 3; ++j) {
                                 unsigned int index = 0;
                                 int indexOffset = i * 3 + j;
-                                
+
                                 switch (indexAccessor.componentType) {
                                     case TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE:
                                         index = static_cast<unsigned int>(indexData[indexOffset]);
@@ -536,7 +601,7 @@ class glTFMesh : public Mesh {
                                         std::cout << "Unsupported index component type" << std::endl;
                                         continue;
                                 }
-                                
+
                                 // Add vertex offset for this primitive
                                 indices.push_back(index + vertexOffset);
                             }
@@ -554,7 +619,7 @@ class glTFMesh : public Mesh {
                         }
                     }
                 }
-                
+
                 std::cout << "Mesh " << mesh_idx << ": " << vertices.size() << " vertices, " << indices.size() / 3 << " triangles" << std::endl;
             }
 
@@ -598,7 +663,7 @@ class glTFMesh : public Mesh {
                 }
                 gltf_material->setORM(orm_texture);
 
-                Texture<Float3>* normal_texture;               
+                Texture<Float3>* normal_texture;
                 if (hasImage(model, mp.normalTexture)) {
                     tinygltf::Image image = getTextureImage(model, mp.normalTexture);
 
@@ -611,7 +676,7 @@ class glTFMesh : public Mesh {
                     gltf_material->setNormalTexture(normal_texture);
                 }
 
-                Texture<Color3>* emission_texture;               
+                Texture<Color3>* emission_texture;
                 Color3 emission_factor = Color3(mp.emissiveFactor[0], mp.emissiveFactor[1], mp.emissiveFactor[2]);
                 float emission_strength = 1.0;
                 if (mp.extensions.contains("KHR_materials_emissive_strength")) {
@@ -637,7 +702,7 @@ class glTFMesh : public Mesh {
 
                     // Extract transmissionFactor (required parameter)
                     float transmission_factor = getExtensionFactor(transmission, "transmissionFactor", 0.0f);
-                    Texture<float>* transmission_texture;         
+                    Texture<float>* transmission_texture;
                     if (hasImage(model, transmission, "transmissionTexture")) {
                         tinygltf::Image image = getTextureImage(model, transmission, "transmissionTexture");
 
