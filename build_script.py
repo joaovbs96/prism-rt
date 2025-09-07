@@ -3,11 +3,13 @@ import os
 import subprocess
 import tempfile
 
+PROJECT_ROOT = os.path.dirname(__file__)
+
 VS_SHELL = r"C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat".replace("\\", "/")
-EXTERNAL_DEPS = r"C:\Users\joaov\Desktop\Programming_Projects\external_deps".replace("\\", "/")
-EMBREE_PATH = r"C:\Users\joaov\Desktop\Programming_Projects\include\embree".replace("\\", "/")
-TBB_DIR = r"C:/Users/joaov/Desktop/Programming_Projects/include/tbb/lib/cmake/tbb".replace("\\", "/")
-TBB_INCLUDE_DIRS = r"C:\Users\joaov\Desktop\Programming_Projects\include\tbb\include\tbb".replace("\\", "/")
+EXTERNAL_DEPS = rf"{PROJECT_ROOT}\external".replace("\\", "/")
+EMBREE_PATH = rf"{EXTERNAL_DEPS}\embree".replace("\\", "/")
+TBB_DIR = rf"{EXTERNAL_DEPS}/tbb/lib/cmake/tbb".replace("\\", "/")
+TBB_INCLUDE_DIRS = rf"{EXTERNAL_DEPS}\tbb/include\tbb".replace("\\", "/")
 
 def run_vs_shell(cmd:str):
     temp_bat = os.path.join(os.path.dirname(__file__), "build_script.bat")
@@ -21,7 +23,9 @@ def run_vs_shell(cmd:str):
 osd_path = os.path.join(EXTERNAL_DEPS, "OpenSubdiv").replace("\\", "/")
 osd_cmake_path = os.path.join(osd_path, r"install\lib\cmake\OpenSubdiv").replace("\\", "/")
 osd_include_path = os.path.join(osd_path, r"install\include\opensubdiv").replace("\\", "/")
-run_vs_shell(fr'cd "{osd_path}" & cmake -B build -DCMAKE_INSTALL_PREFIX=install -G "Visual Studio 17 2022" -A x64 -S .')
+additional_options = f'-DTBB_DIR="{TBB_DIR}" -DTBB_INCLUDE_DIRS="{TBB_INCLUDE_DIRS}" '
+additional_options += "-DNO_TUTORIALS=1 -DNO_EXAMPLES=1 -DNO_REGRESSION=1 "
+run_vs_shell(fr'cd "{osd_path}" & cmake -B build {additional_options} -DCMAKE_INSTALL_PREFIX=install -G "Visual Studio 17 2022" -A x64 -S .')
 run_vs_shell(fr'cd "{osd_path}" & cmake --build build --target install --config Release')
 
 # configure and build OpenUSD
