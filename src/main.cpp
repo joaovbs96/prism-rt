@@ -73,8 +73,10 @@ void setupUSDPlugins() {
     pxr::PlugRegistry& registry = pxr::PlugRegistry::GetInstance();
 
     // Add plugin search paths
-    registry.RegisterPlugins("C:/Users/joaov/Desktop/Programming_Projects/external_deps/OpenUSD/install/plugin/usd");
-    registry.RegisterPlugins("C:/Users/joaov/Desktop/Programming_Projects/external_deps/OpenUSD/install/lib/usd");
+    registry.RegisterPlugins("C:/Users/joaov/prism-rt/external/OpenUSD/install/lib/usd");
+    registry.RegisterPlugins("C:/Users/joaov/prism-rt/external/OpenUSD/install/lib");
+    registry.RegisterPlugins("C:/Users/joaov/prism-rt/external/OpenUSD/install/plugin");
+    registry.RegisterPlugins("C:/Users/joaov/prism-rt/external/OpenUSD/install/plugin/usd");
 
     // List all discovered plugins
     auto plugins = registry.GetAllPlugins();
@@ -94,7 +96,7 @@ int main()
 {
     setupUSDPlugins();
 
-    std::filesystem::path file_path = "C:/Users/joaov/Desktop/Programming_Projects/prism-rt/assets/models/Kitchen_set/Kitchen_set_instanced.usd";
+    std::filesystem::path file_path = "C:/Users/joaov/Downloads/Kitchen_set/Kitchen_set.usd";
     pxr::UsdStageRefPtr stage = pxr::UsdStage::Open(file_path.string());
     if (!stage) {
         std::cout << "Failed to open USD file: " << file_path << std::endl;
