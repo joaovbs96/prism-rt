@@ -15,6 +15,7 @@
 #include <pxr/base/plug/registry.h>
 #include <pxr/base/plug/plugin.h>
 #include <pxr/usd/usd/stage.h>
+#include <pxr/usd/usd/primRange.h>
 
 // needed for embree initialization
 #if !defined(_MM_SET_DENORMALS_ZERO_MODE)
@@ -103,7 +104,11 @@ int main()
         return 0;
     } else {
         std::cout << "Opened USD file: " << file_path << std::endl;
-        return 0;
+    }
+
+    // Iterate over all prims using range-based for loop
+    for (const pxr::UsdPrim& prim : stage->TraverseAll()) {
+        std::cout << "Prim: " << prim.GetPath() << std::endl;
     }
 
     // keeping these give a perf improvement
