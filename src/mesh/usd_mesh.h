@@ -52,13 +52,22 @@ class USDMesh : public Mesh {
 
             std::cout << "Finished processing USD file" << std::endl;
             std::cout << "Total vertices: " << vertices.size() << std::endl;
+            std::cout << "Total triangles: " << globalTriangleCount << std::endl;
+            std::cout << "Total materials: " << materials.size() << std::endl;
+
+            // // Validation
+            // size_t expectedTriangles = indices.size() / 3;
+            // if (material_mapping.size() != expectedTriangles) {
+            //     std::cout << "ERROR: Material mapping size (" << material_mapping.size()
+            //             << ") doesn't match triangle count (" << expectedTriangles << ")" << std::endl;
+            // }
         }
 
     void processMesh(const pxr::UsdGeomMesh& mesh, pxr::UsdGeomXformCache& xformCache, bool applyTransforms) {
         std::string prim_name = mesh.GetPrim().GetPath().GetString();
         std::cout << "Processing mesh: " << prim_name << std::endl;
 
-        // Get the default time code (you might want to specify a specific time)
+        // Get the default time code
         pxr::UsdTimeCode timeCode = pxr::UsdTimeCode::Default();
 
         // Get the primvars API for the mesh
@@ -68,7 +77,7 @@ class USDMesh : public Mesh {
         pxr::UsdGeomPrimvar displayColorPrimvar = primvarsAPI.GetPrimvar(TfToken("displayColor"));
 
         // Check if the primvar exists and is valid
-        Color3 mesh_color;
+        Color3 mesh_color(0.7f, 0.7f, 0.7f); // Default color
         if (displayColorPrimvar) {
             // Get the values at a specific time
             pxr::VtValue displayColorValue;
@@ -76,16 +85,23 @@ class USDMesh : public Mesh {
                 // displayColor is typically a VtVec3fArray
                 if (displayColorValue.IsHolding<pxr::VtVec3fArray>()) {
                     pxr::VtVec3fArray colorArray = displayColorValue.Get<pxr::VtVec3fArray>();
-                    pxr::GfVec3f& color = colorArray[0];
-                    mesh_color = Color3(color[0], color[1], color[2]);
+                    if (colorArray.size() > 0) {
+                        pxr::GfVec3f& color = colorArray[0];
+                        mesh_color = Color3(color[0], color[1], color[2]);
+                    }
                 }
             }
         }
+
         // Create Texture from color value
-        Texture<Color3>* texture = new ColorTexture(mesh_color);
-        // Assign texture index to the prim name
+        ColorTexture* color_texture = new ColorTexture(mesh_color);
+        color_texture->gammaCorrect(1.0 / 2.2); // TODO: is this needed?
+        Texture<Color3>* texture = color_texture;
+        // Assign material ID
         int mat_id = materials.size();
         materials[mat_id] = new Diffuse(texture);
+
+        std::cout << "Created material " << mat_id << " with color (" << mesh_color << ")" << std::endl;
 
         // Get mesh attributes
         pxr::VtArray<pxr::GfVec3f> points;
@@ -138,16 +154,21 @@ class USDMesh : public Mesh {
 
         // Process faces and triangulate if necessary
         size_t faceIndexOffset = 0;
-        int n_faces = 0;
+        int meshTriangleCount = 0; // Local count for this mesh
+
         for (size_t faceIdx = 0; faceIdx < faceVertexCounts.size(); ++faceIdx) {
             int faceVertexCount = faceVertexCounts[faceIdx];
 
             if (faceVertexCount == 3) {
                 // Triangle - add directly
-                for (int i = 0; i < 3; ++i) {
-                    indices.push_back(static_cast<unsigned int>(vertexOffset + faceVertexIndices[faceIndexOffset + i]));
-                    material_mapping[material_mapping.size()] = mat_id;
-                }
+                indices.push_back(static_cast<unsigned int>(vertexOffset + faceVertexIndices[faceIndexOffset + 0]));
+                indices.push_back(static_cast<unsigned int>(vertexOffset + faceVertexIndices[faceIndexOffset + 1]));
+                indices.push_back(static_cast<unsigned int>(vertexOffset + faceVertexIndices[faceIndexOffset + 2]));
+
+                // Assign material to this triangle using GLOBAL triangle count
+                material_mapping[globalTriangleCount++] = mat_id;
+                meshTriangleCount++;
+
             } else if (faceVertexCount == 4) {
                 // Quad - triangulate (0,1,2) and (0,2,3)
                 unsigned int v0 = static_cast<unsigned int>(vertexOffset + faceVertexIndices[faceIndexOffset + 0]);
@@ -159,15 +180,16 @@ class USDMesh : public Mesh {
                 indices.push_back(v0);
                 indices.push_back(v1);
                 indices.push_back(v2);
+                material_mapping[globalTriangleCount++] = mat_id;
+                meshTriangleCount++;
 
                 // Second triangle
                 indices.push_back(v0);
                 indices.push_back(v2);
                 indices.push_back(v3);
+                material_mapping[globalTriangleCount++] = mat_id;
+                meshTriangleCount++;
 
-                // material mapping
-                material_mapping[material_mapping.size()] = mat_id;
-                material_mapping[material_mapping.size()] = mat_id;
             } else if (faceVertexCount > 4) {
                 // N-gon - fan triangulation from first vertex
                 unsigned int v0 = static_cast<unsigned int>(vertexOffset + faceVertexIndices[faceIndexOffset + 0]);
@@ -178,8 +200,8 @@ class USDMesh : public Mesh {
                     indices.push_back(v0);
                     indices.push_back(v1);
                     indices.push_back(v2);
-
-                    material_mapping[material_mapping.size()] = mat_id;
+                    material_mapping[globalTriangleCount++] = mat_id;
+                    meshTriangleCount++;
                 }
             }
 
@@ -192,8 +214,7 @@ class USDMesh : public Mesh {
         // Process texture coordinates
         processTextureCoordinates(mesh, timeCode, vertexOffset);
 
-        std::cout << "Processed mesh with " << points.size() << " vertices and "
-                  << faceVertexCounts.size() << " faces" << std::endl;
+        std::cout << "Prim: " << points.size() << " vertices, " << faceVertexCounts.size() << " faces, and " << meshTriangleCount << " triangles" << std::endl;
     }
 
     void processNormals(const pxr::UsdGeomMesh& mesh, pxr::UsdTimeCode timeCode,
@@ -307,4 +328,7 @@ class USDMesh : public Mesh {
             texcoords.push_back(Float2(0.0f, 0.0f)); // Default UV
         }
     }
+
+    private:
+    int globalTriangleCount = 0;
 };
