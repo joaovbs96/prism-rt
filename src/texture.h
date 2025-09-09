@@ -70,7 +70,7 @@ class ImageTexture : public Texture<T> {
 
         ImageTexture(const std::filesystem::path &file_path) {
             channel_n = sizeof(T) / sizeof(float); // This is derived from the template class, can be 1, 3 or 4
-            
+
             std::cout << "Loading File: " << file_path << std::endl;
             buffer = ImageBuf(file_path.string());
             buffer.read(0, 0, true, TypeDesc::FLOAT);
@@ -162,5 +162,9 @@ class ColorTexture : public ValueTexture<Float3> {
 
         Color3 sampleInterp(float u, float v, const Float3& p) const override {
             return value;
+        }
+
+        void gammaCorrect(float gamma) override {
+            value = value.gamma_correct(gamma);
         }
 };

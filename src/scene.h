@@ -11,14 +11,17 @@
 #include "sampling.h"
 #include "material.h"
 #include "geometry.h"
+#include "mesh/obj_mesh.h"
+#include "mesh/gltf_mesh.h"
+#include "mesh/usd_mesh.h"
 #include "environment.h"
 
 // TODO: for motion blur, we need to add a new copy of the vertexbuffer per timestep
 // so we need to have the vertexbuffer and apply some sort of transformation to the buffer
-// The easiest way would be to make all meshes be objects, like our mesh loaders, 
+// The easiest way would be to make all meshes be objects, like our mesh loaders,
 // and add functions that operate on top of the buffers - e.g. rotating, translating, scaling.
 // We need to add these, regardless, so it's better to do the two things at once.
-// We can, then, add the transforms at a certain timestep, which will create the additional 
+// We can, then, add the transforms at a certain timestep, which will create the additional
 // buffers, if the timestep is different than 0.
 
 class SceneManager {
@@ -35,6 +38,8 @@ class SceneManager {
                 mesh = new ObjMesh(file_path);
             else if ((file_path.extension() == ".gltf") || (file_path.extension() == ".glb"))
                 mesh = new glTFMesh(file_path);
+            else if ((file_path.extension() == ".usd") || (file_path.extension() == ".usda") || (file_path.extension() == ".usdz") || (file_path.extension() == ".usdc"))
+                mesh = new USDMesh(file_path);
 
             if (material_override != nullptr) {
                 mesh->material_override = material_override;
@@ -97,7 +102,7 @@ class SceneManager {
                 Material* material = geometry[ray_hit.geomid]->getMaterial(ray_hit.primid, ray_hit.instid);
                 // sample normal map and perturbate normal
                 material->perturbNormal(ray_hit);
-                
+
                 // BRDFSample: surface hit color + scattered light ray
                 BRDFSample s = material->sample(ray_hit, seed);
                 if (!s.scattered)
@@ -339,5 +344,46 @@ class CornellBox : public SceneManager {
 
             // environment map - for missed rays
             environment = new ConstantColorBackground(new ColorTexture(Color3(0.0f)));
+        }
+};
+
+class USDCube : public SceneManager {
+    public:
+        USDCube(RTCDevice device_, unsigned int &seed) : SceneManager(device_) {
+            std::cout << "Started scene initialization." << std::endl;
+            Material* white = new Diffuse(new ColorTexture(Color3(.73, .73, .73)));
+            add_mesh("C:/Users/joaov/OneDrive/Área de Trabalho/untitled.usdc", white);
+
+            std::cout << "Finished geometry creation." << std::endl;
+
+            // camera initialization
+            Float3 position(13, 2, 3);
+            Float3 target(0.0f);
+            Float3 up(0.0f, 1.0f, 0.0f);
+            float vfov = 20;
+            cam = Camera(position, target, up, 1280, 720, 16.0f / 9.0f, vfov, 0.6f, 10.0f);
+
+            // environment map - for missed rays
+            environment = new ConstantColorBackground(new ColorTexture(Color3(1.0f)));
+        }
+};
+
+class PixarKitchen : public SceneManager {
+    public:
+        PixarKitchen(RTCDevice device_, unsigned int &seed) : SceneManager(device_) {
+            std::cout << "Started scene initialization." << std::endl;
+            add_mesh("C:/Users/joaov/Downloads/Kitchen_set/Kitchen_set_applied.usd");
+
+            std::cout << "Finished geometry creation." << std::endl;
+
+            // camera initialization
+            Float3 position(75, -385, 120);
+            Float3 target(75, 0.0f, 120);
+            Float3 up(0.0f, 0.0f, 1.0f);
+            float vfov = 60;
+            cam = Camera(position, target, up, 1280, 720, 16.0f / 9.0f, vfov, 0.f, 10.0f);
+
+            // environment map - for missed rays
+            environment = new ConstantColorBackground(new ColorTexture(Color3(1.0f)));
         }
 };

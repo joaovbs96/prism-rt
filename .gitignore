@@ -5,3 +5,4 @@ vcpkg-configuration.json
 output*
 *_old.*
 vcpkg/
+build_script.bat

@@ -11,6 +11,12 @@
 #include <embree4/rtcore.h>
 #include <xmmintrin.h>
 
+#include <pxr/pxr.h>
+#include <pxr/base/plug/registry.h>
+#include <pxr/base/plug/plugin.h>
+#include <pxr/usd/usd/stage.h>
+#include <pxr/usd/usd/primRange.h>
+
 // needed for embree initialization
 #if !defined(_MM_SET_DENORMALS_ZERO_MODE)
 #define _MM_DENORMALS_ZERO_ON   (0x0040)
@@ -62,8 +68,34 @@ void print_progress(float progress) {
         std::cout << std::endl;
 }
 
+void setupUSDPlugins() {
+    pxr::PlugRegistry& registry = pxr::PlugRegistry::GetInstance();
+
+    // Add plugin search paths
+    registry.RegisterPlugins("C:/Users/joaov/prism-rt/external/OpenUSD/install/lib/usd");
+    registry.RegisterPlugins("C:/Users/joaov/prism-rt/external/OpenUSD/install/lib");
+    registry.RegisterPlugins("C:/Users/joaov/prism-rt/external/OpenUSD/install/plugin");
+    registry.RegisterPlugins("C:/Users/joaov/prism-rt/external/OpenUSD/install/plugin/usd");
+
+    // List all discovered plugins
+    auto plugins = registry.GetAllPlugins();
+
+    std::cout << "Found " << plugins.size() << " registered plugins:\n\n";
+
+    for (size_t i = 0; i < plugins.size(); ++i) {
+        pxr::PlugPluginPtr plugin = plugins[i];
+        if (plugin) {
+            std::cout << plugin->GetName() << std::endl;
+        }
+    }
+
+}
+
 int main()
 {
+    // required if any USD function is in use
+    setupUSDPlugins();
+
     // keeping these give a perf improvement
     _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
     _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);
@@ -74,8 +106,9 @@ int main()
     RTCDevice device = initialize_device(1);
 
     unsigned int main_seed = 0;
-    SceneManager* scene_mgr = new ABeautifulGame(device, main_seed);
+    SceneManager* scene_mgr = new PixarKitchen(device, main_seed);
     scene_mgr->commitScene();
+    std::cout << "Finished comitting scene." << std::endl;
 
     RTCRayQueryContext context;
     rtcInitRayQueryContext(&context);
@@ -85,6 +118,8 @@ int main()
     intersectArgs.context = &context;
 
     FrameBuffer frame(scene_mgr->image_width, scene_mgr->image_height);
+
+    std::cout << "Finished creating frame buffer." << std::endl;
 
     // Debugging, if we want to print something during rendering.
     // tbb::global_control gc(tbb::global_control::max_allowed_parallelism, 1);

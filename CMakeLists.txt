@@ -4,29 +4,50 @@ project(PrismRT)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED YES)
 
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)  # This line is optional. It's just for certain IDEs to use
+
+# tiny gltf
 set(TINYGLTF_HEADER_ONLY ON CACHE INTERNAL "" FORCE)
 set(TINYGLTF_INSTALL OFF CACHE INTERNAL "" FORCE)
 add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/external/tinygltf")
 
+# tiny obj
 add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/external/tinyobj")
 
 add_executable(PrismRT src/main.cpp)
 
+# OIIO
 find_package(OpenImageIO CONFIG REQUIRED)
 target_link_libraries(PrismRT OpenImageIO::OpenImageIO)
 
+# Embree
 find_package(embree 4 REQUIRED)
 target_link_libraries(PrismRT embree)
 
+# oneTBB
 find_package(TBB REQUIRED)
 target_link_libraries(PrismRT TBB::tbb)
 
-message(STATUS "${CMAKE_CURRENT_SOURCE_DIR}/external/tinygltf")
-message(STATUS "${CMAKE_CURRENT_SOURCE_DIR}/external/tinyobj")
+# OpenUSD Dependency
+# TODO: OpenGL shouldn't be needed and yet USD is requiring it?
+find_package(OpenGL REQUIRED)
 
-target_include_directories(PrismRT PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/external/tinygltf")
+find_package(pxr REQUIRED)
 
-target_include_directories(PrismRT PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/external/tinyobj")
+message(STATUS "PXR_LIBRARIES contains: ${PXR_LIBRARIES}")
+string(REPLACE ";" "|" PXR_LIBRARIES_DEBUG "${PXR_LIBRARIES}")
+message(STATUS "PXR_LIBRARIES debug: ${PXR_LIBRARIES_DEBUG}")
+
+target_link_libraries(PrismRT ${PXR_LIBRARIES})
+target_include_directories(PrismRT PUBLIC ${PXR_INCLUDE_DIR})
+
+# Other libraries
+target_include_directories(PrismRT PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/external/tinygltf")
+target_include_directories(PrismRT PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/external/tinyobj")
+
+if(MSVC)
+    target_compile_options(PrismRT PUBLIC "/Zc:preprocessor")
+endif()
 
 # Copies DLLs our executable depends on to the build folder automatically
 add_custom_command(TARGET PrismRT POST_BUILD
