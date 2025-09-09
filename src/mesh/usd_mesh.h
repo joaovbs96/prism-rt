@@ -54,16 +54,16 @@ class USDMesh : public Mesh {
                 }
             }
 
-            std::cout << "Finished processing USD file" << std::endl;
-            std::cout << "Total vertices: " << vertices.size() << std::endl;
-            std::cout << "Total triangles: " << globalTriangleCount << std::endl;
-            std::cout << "Total materials: " << materials.size() << std::endl;
+            std::cout << "Finished processing USD file:" << std::endl;
+            std::cout << "    Total vertices: " << vertices.size() << std::endl;
+            std::cout << "    Total triangles: " << globalTriangleCount << std::endl;
+            std::cout << "    Total materials: " << materials.size() << std::endl;
         }
 
     void processMesh(const pxr::UsdGeomMesh& mesh, pxr::UsdGeomXformCache& xformCache,
                      pxr::UsdTimeCode timeCode, bool applyTransforms) {
         std::string prim_name = mesh.GetPrim().GetPath().GetString();
-        std::cout << "Processing mesh: " << prim_name << std::endl;
+        // std::cout << "Processing mesh: " << prim_name << std::endl;
 
         // Get the primvars API for the mesh
         pxr::UsdGeomPrimvarsAPI primvarsAPI(mesh.GetPrim());
@@ -90,13 +90,12 @@ class USDMesh : public Mesh {
 
         // Create Texture from color value
         ColorTexture* color_texture = new ColorTexture(mesh_color);
-        color_texture->gammaCorrect(1.0 / 2.2); // TODO: is this needed?
         Texture<Color3>* texture = color_texture;
         // Assign material ID
         int mat_id = materials.size();
         materials[mat_id] = new Diffuse(texture);
 
-        std::cout << "Created material " << mat_id << " with color (" << mesh_color << ")" << std::endl;
+        // std::cout << "Created material " << mat_id << " with color (" << mesh_color << ")" << std::endl;
 
         // Get mesh attributes
         pxr::VtArray<pxr::GfVec3f> points;
@@ -127,6 +126,7 @@ class USDMesh : public Mesh {
         // Get transform matrices if needed
         pxr::GfMatrix4d transform(1.0);  // Identity matrix
         pxr::GfMatrix4d normalTransform(1.0);  // Identity matrix
+        bool flipNormals = false;
 
         if (applyTransforms) {
             // Get the full double precision transform
@@ -137,8 +137,11 @@ class USDMesh : public Mesh {
 
             // Check if transform flips normals (negative determinant)
             double det = transform.GetDeterminant();
-            bool flipNormals = det < 0.0;
+            flipNormals = det < 0.0;
+
+            // std::cout << "Transform determinant: " << det << " (flip normals: " << flipNormals << ")" << std::endl;
         }
+
         // Store the starting vertex offset for this mesh
         size_t vertexOffset = vertices.size();
 
@@ -213,16 +216,24 @@ class USDMesh : public Mesh {
         }
 
         // Process normals
-        processNormals(mesh, timeCode, normalTransform, applyTransforms, vertexOffset);
+        processNormals(mesh, timeCode, normalTransform, applyTransforms, vertexOffset, flipNormals);
 
         // Process texture coordinates
         processTextureCoordinates(mesh, timeCode, vertexOffset);
 
-        std::cout << "Prim: " << points.size() << " vertices, " << faceVertexCounts.size() << " faces, and " << meshTriangleCount << " triangles" << std::endl;
+        // std::cout << "Prim: " << points.size() << " vertices, " << faceVertexCounts.size() << " faces, and " << meshTriangleCount << " triangles" << std::endl;
     }
 
     void processNormals(const pxr::UsdGeomMesh& mesh, pxr::UsdTimeCode timeCode,
-                       const pxr::GfMatrix4d& normalTransform, bool applyTransforms, size_t vertexOffset) {
+                       const pxr::GfMatrix4d& normalTransform, bool applyTransforms,
+                       size_t vertexOffset, bool flipNormals) {
+
+        // std::cout << "=== Processing normals for mesh: " << mesh.GetPrim().GetPath().GetString() << " ===" << std::endl;
+
+        // Check if transform flips normals (negative determinant)
+        double det = normalTransform.GetDeterminant();
+        // std::cout << "Normal transform determinant: " << det << " (flip needed: " << flipNormals << ")" << std::endl;
+
         // Try to get normals from the mesh
         pxr::UsdAttribute normalsAttr = mesh.GetNormalsAttr();
         pxr::VtArray<pxr::GfVec3f> meshNormals;
@@ -239,61 +250,136 @@ class USDMesh : public Mesh {
             if (normalsInterpolation == pxr::UsdGeomTokens->vertex ||
                 normalsInterpolation == pxr::UsdGeomTokens->varying) {
                 // Per-vertex normals
-                for (const pxr::GfVec3f& normal : meshNormals) {
+
+                for (size_t i = 0; i < meshNormals.size(); ++i) {
+                    const pxr::GfVec3f& normal = meshNormals[i];
                     pxr::GfVec3f transformedNormal = normal;
 
                     if (applyTransforms) {
                         // Transform normal using double precision
                         pxr::GfVec3d normalDouble(normal[0], normal[1], normal[2]);
+
+                        // Use TransformDir for normals
                         pxr::GfVec3d transformedDouble = normalTransform.TransformDir(normalDouble);
 
+                        // Apply flip if needed
+                        if (flipNormals)
+                            transformedDouble = -transformedDouble;
+
                         // Normalize the result
-                        transformedDouble.Normalize();
+                        double length = transformedDouble.GetLength();
+                        if (length > 0.0)
+                            transformedDouble = transformedDouble / length;
+
                         transformedNormal = pxr::GfVec3f(transformedDouble[0], transformedDouble[1], transformedDouble[2]);
                     }
 
                     normals.push_back(Float3(transformedNormal[0], transformedNormal[1], transformedNormal[2]));
                 }
             } else if (normalsInterpolation == pxr::UsdGeomTokens->faceVarying) {
-                // Face-varying normals - expand to match vertex count
-                // This is a simplified approach; you might need more sophisticated handling
-                size_t currentVertexCount = vertices.size() - vertexOffset;
-                if (meshNormals.size() > 0) {
-                    // Use the first normal for all vertices (placeholder)
-                    pxr::GfVec3f defaultNormal = meshNormals[0];
-                    if (applyTransforms) {
-                        pxr::GfVec3d normalDouble(defaultNormal[0], defaultNormal[1], defaultNormal[2]);
-                        pxr::GfVec3d transformedDouble = normalTransform.TransformDir(normalDouble);
-                        transformedDouble.Normalize();
-                        defaultNormal = pxr::GfVec3f(transformedDouble[0], transformedDouble[1], transformedDouble[2]);
-                    }
+                // Face-varying normals detected, generating from geometry
+                // TODO: Face-varying normals need to be mapped to vertices properly
+                generateGeometricNormals(mesh, timeCode, normalTransform, applyTransforms, vertexOffset, flipNormals);
 
-                    for (size_t i = normals.size(); i < vertices.size(); ++i) {
-                        normals.push_back(Float3(defaultNormal[0], defaultNormal[1], defaultNormal[2]));
-                    }
-                }
+            } else {
+                // Unknown or invalidd normal interpolation, generate from geometry
+                generateGeometricNormals(mesh, timeCode, normalTransform, applyTransforms, vertexOffset, flipNormals);
             }
         } else {
-            // No normals found - generate default up normals
-            size_t currentVertexCount = vertices.size() - vertexOffset;
-            pxr::GfVec3f defaultNormal(0.0f, 1.0f, 0.0f);
-
-            if (applyTransforms) {
-                // Transform the default normal too
-                pxr::GfVec3d normalDouble(0.0, 1.0, 0.0);
-                pxr::GfVec3d transformedDouble = normalTransform.TransformDir(normalDouble);
-                transformedDouble.Normalize();
-                defaultNormal = pxr::GfVec3f(transformedDouble[0], transformedDouble[1], transformedDouble[2]);
-            }
-
-            for (size_t i = 0; i < currentVertexCount; ++i) {
-                normals.push_back(Float3(defaultNormal[0], defaultNormal[1], defaultNormal[2]));
-            }
+            // No normals found in mesh, generate from geometry
+            generateGeometricNormals(mesh, timeCode, normalTransform, applyTransforms, vertexOffset, flipNormals);
         }
 
         // Ensure normals array matches vertices array size
         while (normals.size() < vertices.size()) {
             normals.push_back(Float3(0.0f, 1.0f, 0.0f));
+        }
+    }
+
+    void generateGeometricNormals(const pxr::UsdGeomMesh& mesh, pxr::UsdTimeCode timeCode,
+                                 const pxr::GfMatrix4d& normalTransform, bool applyTransforms,
+                                 size_t vertexOffset, bool flipNormals) {
+
+        // Get mesh data
+        pxr::VtArray<pxr::GfVec3f> points;
+        pxr::VtArray<int> faceVertexIndices;
+        pxr::VtArray<int> faceVertexCounts;
+
+        mesh.GetPointsAttr().Get(&points, timeCode);
+        mesh.GetFaceVertexIndicesAttr().Get(&faceVertexIndices, timeCode);
+        mesh.GetFaceVertexCountsAttr().Get(&faceVertexCounts, timeCode);
+
+        // Initialize per-vertex normals to zero
+        std::vector<pxr::GfVec3f> vertexNormals(points.size(), pxr::GfVec3f(0.0f));
+
+        // Compute face normals and accumulate to vertices
+        size_t faceIndexOffset = 0;
+        for (size_t faceIdx = 0; faceIdx < faceVertexCounts.size(); ++faceIdx) {
+            int faceVertexCount = faceVertexCounts[faceIdx];
+
+            if (faceVertexCount >= 3) {
+                // Get first three vertices of the face
+                int i0 = faceVertexIndices[faceIndexOffset + 0];
+                int i1 = faceVertexIndices[faceIndexOffset + 1];
+                int i2 = faceVertexIndices[faceIndexOffset + 2];
+
+                pxr::GfVec3f v0 = points[i0];
+                pxr::GfVec3f v1 = points[i1];
+                pxr::GfVec3f v2 = points[i2];
+
+                // Compute face normal using cross product
+                pxr::GfVec3f edge1 = v1 - v0;
+                pxr::GfVec3f edge2 = v2 - v0;
+                pxr::GfVec3f faceNormal = edge1 ^ edge2; // Cross product
+
+                // Check if we need to flip based on winding order
+                // USD typically uses counter-clockwise winding
+                if (flipNormals) {
+                    faceNormal = -faceNormal;
+                }
+
+                float length = faceNormal.GetLength();
+                if (length > 0.0f) {
+                    faceNormal = faceNormal / length;
+                }
+
+                // Accumulate to all vertices of this face
+                for (int v = 0; v < faceVertexCount; ++v) {
+                    int vertexIndex = faceVertexIndices[faceIndexOffset + v];
+                    vertexNormals[vertexIndex] += faceNormal;
+                }
+            }
+
+            faceIndexOffset += faceVertexCount;
+        }
+
+        // Normalize accumulated normals and transform
+        for (size_t i = 0; i < vertexNormals.size(); ++i) {
+            pxr::GfVec3f normal = vertexNormals[i];
+
+            // Normalize
+            float length = normal.GetLength();
+            if (length > 0.0f) {
+                normal = normal / length;
+            } else {
+                normal = pxr::GfVec3f(0.0f, 1.0f, 0.0f); // Default up
+            }
+
+            if (applyTransforms) {
+                // Transform normal
+                pxr::GfVec3d normalDouble(normal[0], normal[1], normal[2]);
+                pxr::GfVec3d transformedDouble = normalTransform.TransformDir(normalDouble);
+
+                // Normalize after transform
+                double transformedLength = transformedDouble.GetLength();
+                if (transformedLength > 0.0) {
+                    transformedDouble = transformedDouble / transformedLength;
+                }
+
+                normal = pxr::GfVec3f(transformedDouble[0], transformedDouble[1], transformedDouble[2]);
+            }
+
+            normals.push_back(Float3(normal[0], normal[1], normal[2]));
         }
     }
 
