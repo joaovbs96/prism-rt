@@ -45,6 +45,10 @@ target_include_directories(PrismRT PUBLIC ${PXR_INCLUDE_DIR})
 target_include_directories(PrismRT PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/external/tinygltf")
 target_include_directories(PrismRT PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/external/tinyobj")
 
+if(MSVC)
+    target_compile_options(PrismRT PUBLIC "/Zc:preprocessor")
+endif()
+
 # Copies DLLs our executable depends on to the build folder automatically
 add_custom_command(TARGET PrismRT POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy -t $<TARGET_FILE_DIR:PrismRT> $<TARGET_RUNTIME_DLLS:PrismRT>
