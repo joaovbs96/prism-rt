@@ -11,6 +11,9 @@
 #include "sampling.h"
 #include "material.h"
 #include "geometry.h"
+#include "mesh/obj_mesh.h"
+#include "mesh/gltf_mesh.h"
+#include "mesh/usd_mesh.h"
 #include "environment.h"
 
 // TODO: for motion blur, we need to add a new copy of the vertexbuffer per timestep
@@ -369,8 +372,7 @@ class PixarKitchen : public SceneManager {
     public:
         PixarKitchen(RTCDevice device_, unsigned int &seed) : SceneManager(device_) {
             std::cout << "Started scene initialization." << std::endl;
-            Material* white = new Diffuse(new ColorTexture(Color3(.73, .73, .73)));
-            add_mesh("C:/Users/joaov/Downloads/Kitchen_set/Kitchen_set_applied.usd", white);
+            add_mesh("C:/Users/joaov/Downloads/Kitchen_set/Kitchen_set_applied.usd");
 
             std::cout << "Finished geometry creation." << std::endl;
 
