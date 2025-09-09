@@ -13,7 +13,6 @@
 #include <pxr/usd/usdGeom/xformCache.h>
 #include <pxr/base/gf/matrix4d.h>
 #include <pxr/base/gf/matrix4f.h>
-#include <pxr/base/gf/matrix3d.h>
 #include <pxr/base/gf/vec3f.h>
 #include <pxr/base/gf/vec2f.h>
 #include <pxr/base/vt/array.h>
@@ -36,11 +35,8 @@ class USDMesh : public Mesh {
 
             std::cout << "Successfully opened USD stage: " << file_path << std::endl;
 
-            // Use a specific time code (default time)
-            pxr::UsdTimeCode timeCode = pxr::UsdTimeCode::Default();
-
-            // Create transform cache for efficient transform computation with the correct time
-            pxr::UsdGeomXformCache xformCache(timeCode);
+            // Create transform cache for efficient transform computation
+            pxr::UsdGeomXformCache xformCache;
 
             // Traverse all prims in the stage
             pxr::UsdPrimRange range = stage->Traverse();
@@ -50,7 +46,7 @@ class USDMesh : public Mesh {
                 // Check if this prim is a mesh
                 if (prim.IsA<pxr::UsdGeomMesh>()) {
                     pxr::UsdGeomMesh mesh(prim);
-                    processMesh(mesh, xformCache, timeCode, true);
+                    processMesh(mesh, xformCache, true);
                 }
             }
 
@@ -58,12 +54,21 @@ class USDMesh : public Mesh {
             std::cout << "Total vertices: " << vertices.size() << std::endl;
             std::cout << "Total triangles: " << globalTriangleCount << std::endl;
             std::cout << "Total materials: " << materials.size() << std::endl;
+
+            // // Validation
+            // size_t expectedTriangles = indices.size() / 3;
+            // if (material_mapping.size() != expectedTriangles) {
+            //     std::cout << "ERROR: Material mapping size (" << material_mapping.size()
+            //             << ") doesn't match triangle count (" << expectedTriangles << ")" << std::endl;
+            // }
         }
 
-    void processMesh(const pxr::UsdGeomMesh& mesh, pxr::UsdGeomXformCache& xformCache,
-                     pxr::UsdTimeCode timeCode, bool applyTransforms) {
+    void processMesh(const pxr::UsdGeomMesh& mesh, pxr::UsdGeomXformCache& xformCache, bool applyTransforms) {
         std::string prim_name = mesh.GetPrim().GetPath().GetString();
         std::cout << "Processing mesh: " << prim_name << std::endl;
+
+        // Get the default time code
+        pxr::UsdTimeCode timeCode = pxr::UsdTimeCode::Default();
 
         // Get the primvars API for the mesh
         pxr::UsdGeomPrimvarsAPI primvarsAPI(mesh.GetPrim());
@@ -124,45 +129,27 @@ class USDMesh : public Mesh {
             return;
         }
 
-        // Get transform matrices - keep as double precision until final conversion
-        pxr::GfMatrix4d transformMatrix;
-        transformMatrix.SetIdentity();
-        pxr::GfMatrix3d normalTransformMatrix;
-        normalTransformMatrix.SetIdentity();
-
+        // Get transform matrix if needed
+        pxr::GfMatrix4f transform;
         if (applyTransforms) {
-            // Get the full world transform (double precision)
-            transformMatrix = xformCache.GetLocalToWorldTransform(mesh.GetPrim());
-
-            // For normals, we need the inverse transpose of the upper-left 3x3 matrix
-            // Extract the 3x3 portion (removing translation)
-            pxr::GfMatrix3d rotationScaleMatrix = transformMatrix.ExtractRotationMatrix();
-
-            // Get the inverse transpose for normal transformation
-            normalTransformMatrix = rotationScaleMatrix.GetInverse().GetTranspose();
+            transform = pxr::GfMatrix4f(xformCache.GetLocalToWorldTransform(mesh.GetPrim()));
         }
 
         // Store the starting vertex offset for this mesh
         size_t vertexOffset = vertices.size();
 
-        // Process vertices with double precision transforms
+        // Process vertices
         for (const pxr::GfVec3f& point : points) {
-            pxr::GfVec3d transformedPoint(point[0], point[1], point[2]);
+            pxr::GfVec3f transformedPoint = point;
 
             if (applyTransforms) {
-                // Apply transformation using double precision
-                // Convert to homogeneous coordinates and multiply
-                pxr::GfVec4d homogenousPoint(transformedPoint[0], transformedPoint[1], transformedPoint[2], 1.0);
-                pxr::GfVec4d transformedHomogenous = transformMatrix * homogenousPoint;
-                transformedPoint = pxr::GfVec3d(transformedHomogenous[0], transformedHomogenous[1], transformedHomogenous[2]);
+                // Apply transformation
+                pxr::GfVec4f homogenousPoint(point[0], point[1], point[2], 1.0f);
+                pxr::GfVec4f transformedHomogenous = transform * homogenousPoint;
+                transformedPoint = pxr::GfVec3f(transformedHomogenous[0], transformedHomogenous[1], transformedHomogenous[2]);
             }
 
-            // Convert to float for final storage
-            vertices.push_back(Float3(
-                static_cast<float>(transformedPoint[0]),
-                static_cast<float>(transformedPoint[1]),
-                static_cast<float>(transformedPoint[2])
-            ));
+            vertices.push_back(Float3(transformedPoint[0], transformedPoint[1], transformedPoint[2]));
         }
 
         // Process faces and triangulate if necessary
@@ -221,17 +208,17 @@ class USDMesh : public Mesh {
             faceIndexOffset += faceVertexCount;
         }
 
-        // Process normals with correct transform
-        processNormals(mesh, timeCode, normalTransformMatrix, applyTransforms, vertexOffset);
+        // Process normals
+        processNormals(mesh, timeCode, transform, applyTransforms, vertexOffset);
 
-        // Process texture coordinates (no transform needed)
+        // Process texture coordinates
         processTextureCoordinates(mesh, timeCode, vertexOffset);
 
         std::cout << "Prim: " << points.size() << " vertices, " << faceVertexCounts.size() << " faces, and " << meshTriangleCount << " triangles" << std::endl;
     }
 
     void processNormals(const pxr::UsdGeomMesh& mesh, pxr::UsdTimeCode timeCode,
-                       const pxr::GfMatrix3d& normalTransform, bool applyTransforms, size_t vertexOffset) {
+                       const pxr::GfMatrix4f& transform, bool applyTransforms, size_t vertexOffset) {
         // Try to get normals from the mesh
         pxr::UsdAttribute normalsAttr = mesh.GetNormalsAttr();
         pxr::VtArray<pxr::GfVec3f> meshNormals;
@@ -249,38 +236,36 @@ class USDMesh : public Mesh {
                 normalsInterpolation == pxr::UsdGeomTokens->varying) {
                 // Per-vertex normals
                 for (const pxr::GfVec3f& normal : meshNormals) {
-                    pxr::GfVec3d transformedNormal(normal[0], normal[1], normal[2]);
+                    pxr::GfVec3f transformedNormal = normal;
 
                     if (applyTransforms) {
-                        // Transform normal using the 3x3 normal transform matrix
-                        transformedNormal = normalTransform * transformedNormal;
+                        // Transform normal (use inverse transpose for proper normal transformation)
+                        pxr::GfMatrix4f normalTransform = pxr::GfMatrix4f(transform.GetInverse().GetTranspose());
+                        pxr::GfVec4f homogenousNormal(normal[0], normal[1], normal[2], 0.0f);
+                        pxr::GfVec4f transformedHomogenous = normalTransform * homogenousNormal;
+                        transformedNormal = pxr::GfVec3f(transformedHomogenous[0], transformedHomogenous[1], transformedHomogenous[2]);
                         transformedNormal.Normalize();
                     }
 
-                    normals.push_back(Float3(
-                        static_cast<float>(transformedNormal[0]),
-                        static_cast<float>(transformedNormal[1]),
-                        static_cast<float>(transformedNormal[2])
-                    ));
+                    normals.push_back(Float3(transformedNormal[0], transformedNormal[1], transformedNormal[2]));
                 }
             } else if (normalsInterpolation == pxr::UsdGeomTokens->faceVarying) {
                 // Face-varying normals - expand to match vertex count
+                // This is a simplified approach; you might need more sophisticated handling
                 size_t currentVertexCount = vertices.size() - vertexOffset;
                 if (meshNormals.size() > 0) {
                     // Use the first normal for all vertices (placeholder)
-                    pxr::GfVec3d defaultNormal(meshNormals[0][0], meshNormals[0][1], meshNormals[0][2]);
-
+                    pxr::GfVec3f defaultNormal = meshNormals[0];
                     if (applyTransforms) {
-                        defaultNormal = normalTransform * defaultNormal;
+                        pxr::GfMatrix4f normalTransform = pxr::GfMatrix4f(transform.GetInverse().GetTranspose());
+                        pxr::GfVec4f homogenousNormal(defaultNormal[0], defaultNormal[1], defaultNormal[2], 0.0f);
+                        pxr::GfVec4f transformedHomogenous = normalTransform * homogenousNormal;
+                        defaultNormal = pxr::GfVec3f(transformedHomogenous[0], transformedHomogenous[1], transformedHomogenous[2]);
                         defaultNormal.Normalize();
                     }
 
                     for (size_t i = normals.size(); i < vertices.size(); ++i) {
-                        normals.push_back(Float3(
-                            static_cast<float>(defaultNormal[0]),
-                            static_cast<float>(defaultNormal[1]),
-                            static_cast<float>(defaultNormal[2])
-                        ));
+                        normals.push_back(Float3(defaultNormal[0], defaultNormal[1], defaultNormal[2]));
                     }
                 }
             }
