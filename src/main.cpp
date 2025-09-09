@@ -68,8 +68,6 @@ void print_progress(float progress) {
         std::cout << std::endl;
 }
 
-#include <pxr/base/plug/registry.h>
-
 void setupUSDPlugins() {
     pxr::PlugRegistry& registry = pxr::PlugRegistry::GetInstance();
 
@@ -95,21 +93,8 @@ void setupUSDPlugins() {
 
 int main()
 {
+    // required if any USD function is in use
     setupUSDPlugins();
-
-    std::filesystem::path file_path = "C:/Users/joaov/Downloads/Kitchen_set/Kitchen_set.usd";
-    pxr::UsdStageRefPtr stage = pxr::UsdStage::Open(file_path.string());
-    if (!stage) {
-        std::cout << "Failed to open USD file: " << file_path << std::endl;
-        return 0;
-    } else {
-        std::cout << "Opened USD file: " << file_path << std::endl;
-    }
-
-    // Iterate over all prims using range-based for loop
-    for (const pxr::UsdPrim& prim : stage->TraverseAll()) {
-        std::cout << "Prim: " << prim.GetPath() << std::endl;
-    }
 
     // keeping these give a perf improvement
     _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
@@ -121,8 +106,9 @@ int main()
     RTCDevice device = initialize_device(1);
 
     unsigned int main_seed = 0;
-    SceneManager* scene_mgr = new ABeautifulGame(device, main_seed);
+    SceneManager* scene_mgr = new PixarKitchen(device, main_seed);
     scene_mgr->commitScene();
+    std::cout << "Finished comitting scene." << std::endl;
 
     RTCRayQueryContext context;
     rtcInitRayQueryContext(&context);
@@ -132,6 +118,8 @@ int main()
     intersectArgs.context = &context;
 
     FrameBuffer frame(scene_mgr->image_width, scene_mgr->image_height);
+
+    std::cout << "Finished creating frame buffer." << std::endl;
 
     // Debugging, if we want to print something during rendering.
     // tbb::global_control gc(tbb::global_control::max_allowed_parallelism, 1);

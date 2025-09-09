@@ -26,7 +26,7 @@ osd_include_path = os.path.join(osd_path, r"install\include\opensubdiv").replace
 additional_options = f'-DTBB_DIR="{TBB_DIR}" -DTBB_INCLUDE_DIRS="{TBB_INCLUDE_DIRS}" '
 additional_options += "-DNO_TUTORIALS=1 -DNO_EXAMPLES=1 -DNO_REGRESSION=1 "
 run_vs_shell(fr'cd "{osd_path}" & cmake -B build {additional_options} -DCMAKE_INSTALL_PREFIX=install -G "Visual Studio 17 2022" -A x64 -S .')
-run_vs_shell(fr'cd "{osd_path}" & cmake --build build --target install --config Release')
+run_vs_shell(fr'cd "{osd_path}" & cmake --build build --target install --config RelWithDebInfo')
 
 # configure and build OpenUSD
 usd_path = os.path.join(EXTERNAL_DEPS, "OpenUSD").replace("\\", "/")
@@ -36,4 +36,4 @@ additional_options += f'-DTBB_INCLUDE_DIRS="{TBB_INCLUDE_DIRS}" '
 additional_options += "-DPXR_BUILD_TESTS=OFF -DPXR_BUILD_EXAMPLES=OFF -DPXR_BUILD_TUTORIALS=OFF "
 additional_options += "-DPXR_BUILD_USD_TOOLS=OFF -DPXR_ENABLE_PYTHON_SUPPORT=OFF "
 run_vs_shell(fr'cd "{usd_path}" & cmake -B build {additional_options} -DCMAKE_INSTALL_PREFIX=install -G "Visual Studio 17 2022" -A x64 -S .')
-run_vs_shell(fr'cd "{usd_path}" & cmake --build build --target install --config Release')
+run_vs_shell(fr'cd "{usd_path}" & cmake --build build --target install --config RelWithDebInfo')
