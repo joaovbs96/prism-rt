@@ -11,7 +11,7 @@ class Float4 {
         Float4() : buffer{0.0f, 0.0f, 0.0f, 0.0f} {}
         Float4(float x)  : buffer{x, x, x, x} {}
         Float4(float x, float y, float z, float w)  : buffer{x, y, z, w} {}
-        
+
         float x() const { return buffer[0]; }
         float y() const { return buffer[1]; }
         float z() const { return buffer[2]; }
@@ -164,7 +164,7 @@ class Float4 {
             return Float4(
                 std::fmaxf(x(), v.x()),
                 std::fmaxf(y(), v.y()),
-                std::fmaxf(z(), v.z()), 
+                std::fmaxf(z(), v.z()),
                 std::fmaxf(w(), v.w())
             );
         }
@@ -200,7 +200,7 @@ class Float4 {
 };
 
 std::ostream& operator<<(std::ostream& os, const Float4& v) {
-    return os << "<" << v.x() << "," << v.y() << "," << v.z() << "," << v.w() << ">" << std::endl;
+    return os << "<" << v.x() << "," << v.y() << "," << v.z() << "," << v.w() << ">";
 }
 
 inline Float4 operator*(const float t, const Float4& v) {

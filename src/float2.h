@@ -11,7 +11,7 @@ class Float2 {
         Float2() : buffer{0.0f, 0.0f} {}
         Float2(float x)  : buffer{x, x} {}
         Float2(float x, float y)  : buffer{x, y} {}
-        
+
         float x() const { return buffer[0]; }
         float y() const { return buffer[1]; }
 
@@ -170,7 +170,7 @@ class Float2 {
 };
 
 std::ostream& operator<<(std::ostream& os, const Float2& v) {
-    return os << "<" << v.x() << "," << v.y() << ">" << std::endl;
+    return os << "<" << v.x() << "," << v.y() << ">";
 }
 
 inline Float2 operator*(const float t, const Float2& v) {

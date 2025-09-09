@@ -184,7 +184,7 @@ class Float3 {
 };
 
 std::ostream& operator<<(std::ostream& os, const Float3& v) {
-    return os << "<" << v.x() << "," << v.y() << "," << v.z() << ">" << std::endl;
+    return os << "<" << v.x() << "," << v.y() << "," << v.z() << ">";
 }
 
 inline Float3 operator*(const float t, const Float3& v) {
