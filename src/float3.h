@@ -11,7 +11,7 @@ class Float3 {
         Float3() : buffer{0.0f, 0.0f, 0.0f} {}
         Float3(float x)  : buffer{x, x, x} {}
         Float3(float x, float y, float z)  : buffer{x, y, z} {}
-        
+
         float x() const { return buffer[0]; }
         float y() const { return buffer[1]; }
         float z() const { return buffer[2]; }
@@ -129,6 +129,10 @@ class Float3 {
                 }
             }
             return Float3(temp_buffer[0], temp_buffer[1], temp_buffer[2]);
+        }
+
+        Float3 gamma_correct(float gamma) const {
+            return Float3(std::powf(x(), gamma), std::powf(y(), gamma), std::powf(z(), gamma));
         }
 
         Float3 normalize() const {

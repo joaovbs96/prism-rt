@@ -52,6 +52,15 @@ class USDMesh : public Mesh {
 
             std::cout << "Finished processing USD file" << std::endl;
             std::cout << "Total vertices: " << vertices.size() << std::endl;
+            std::cout << "Total triangles: " << globalTriangleCount << std::endl;
+            std::cout << "Total materials: " << materials.size() << std::endl;
+
+            // // Validation
+            // size_t expectedTriangles = indices.size() / 3;
+            // if (material_mapping.size() != expectedTriangles) {
+            //     std::cout << "ERROR: Material mapping size (" << material_mapping.size()
+            //             << ") doesn't match triangle count (" << expectedTriangles << ")" << std::endl;
+            // }
         }
 
     void processMesh(const pxr::UsdGeomMesh& mesh, pxr::UsdGeomXformCache& xformCache, bool applyTransforms) {
@@ -85,10 +94,14 @@ class USDMesh : public Mesh {
         }
 
         // Create Texture from color value
-        Texture<Color3>* texture = new ColorTexture(mesh_color);
-        // Assign texture index to the prim name
+        ColorTexture* color_texture = new ColorTexture(mesh_color);
+        color_texture->gammaCorrect(1.0 / 2.2); // TODO: is this needed?
+        Texture<Color3>* texture = color_texture;
+        // Assign material ID
         int mat_id = materials.size();
         materials[mat_id] = new Diffuse(texture);
+
+        std::cout << "Created material " << mat_id << " with color (" << mesh_color << ")" << std::endl;
 
         // Get mesh attributes
         pxr::VtArray<pxr::GfVec3f> points;
@@ -141,7 +154,7 @@ class USDMesh : public Mesh {
 
         // Process faces and triangulate if necessary
         size_t faceIndexOffset = 0;
-        int triangleCount = 0; // Track triangle count for material mapping
+        int meshTriangleCount = 0; // Local count for this mesh
 
         for (size_t faceIdx = 0; faceIdx < faceVertexCounts.size(); ++faceIdx) {
             int faceVertexCount = faceVertexCounts[faceIdx];
@@ -152,9 +165,10 @@ class USDMesh : public Mesh {
                 indices.push_back(static_cast<unsigned int>(vertexOffset + faceVertexIndices[faceIndexOffset + 1]));
                 indices.push_back(static_cast<unsigned int>(vertexOffset + faceVertexIndices[faceIndexOffset + 2]));
 
-                // Assign material to this triangle (ONE mapping per triangle)
-                material_mapping[triangleCount] = mat_id;
-                triangleCount++;
+                // Assign material to this triangle using GLOBAL triangle count
+                material_mapping[globalTriangleCount++] = mat_id;
+                meshTriangleCount++;
+
             } else if (faceVertexCount == 4) {
                 // Quad - triangulate (0,1,2) and (0,2,3)
                 unsigned int v0 = static_cast<unsigned int>(vertexOffset + faceVertexIndices[faceIndexOffset + 0]);
@@ -166,15 +180,15 @@ class USDMesh : public Mesh {
                 indices.push_back(v0);
                 indices.push_back(v1);
                 indices.push_back(v2);
-                material_mapping[triangleCount] = mat_id;
-                triangleCount++;
+                material_mapping[globalTriangleCount++] = mat_id;
+                meshTriangleCount++;
 
                 // Second triangle
                 indices.push_back(v0);
                 indices.push_back(v2);
                 indices.push_back(v3);
-                material_mapping[triangleCount] = mat_id;
-                triangleCount++;
+                material_mapping[globalTriangleCount++] = mat_id;
+                meshTriangleCount++;
 
             } else if (faceVertexCount > 4) {
                 // N-gon - fan triangulation from first vertex
@@ -186,8 +200,8 @@ class USDMesh : public Mesh {
                     indices.push_back(v0);
                     indices.push_back(v1);
                     indices.push_back(v2);
-                    material_mapping[triangleCount] = mat_id;
-                    triangleCount++;
+                    material_mapping[globalTriangleCount++] = mat_id;
+                    meshTriangleCount++;
                 }
             }
 
@@ -200,8 +214,7 @@ class USDMesh : public Mesh {
         // Process texture coordinates
         processTextureCoordinates(mesh, timeCode, vertexOffset);
 
-        std::cout << "Processed mesh with " << points.size() << " vertices, "
-                << faceVertexCounts.size() << " faces, and " << triangleCount << " triangles" << std::endl;
+        std::cout << "Prim: " << points.size() << " vertices, " << faceVertexCounts.size() << " faces, and " << meshTriangleCount << " triangles" << std::endl;
     }
 
     void processNormals(const pxr::UsdGeomMesh& mesh, pxr::UsdTimeCode timeCode,
@@ -315,4 +328,7 @@ class USDMesh : public Mesh {
             texcoords.push_back(Float2(0.0f, 0.0f)); // Default UV
         }
     }
+
+    private:
+    int globalTriangleCount = 0;
 };
