@@ -119,11 +119,11 @@ class SceneManager {
 
         void commitScene() {
             // FIXME: commented out, transforms don't seem to be working atm
-            // // setup scene geometry transformation
-            // for (auto it = geometry.begin(); it != geometry.end(); it++) {
-            //     // TODO: we will need to turn the transforms into vectors, where each time entry will have its own transform
-            //     it->second->applyTransform();
-            // }
+            // setup scene geometry transformation
+            for (auto it = geometry.begin(); it != geometry.end(); it++) {
+                // TODO: we will need to turn the transforms into vectors, where each time entry will have its own transform
+                it->second->applyTransform();
+            }
 
             // finalize scene setup
             rtcCommitScene(scene);
@@ -322,14 +322,13 @@ class CornellBox : public SceneManager {
             add_quad(Float3(555,555,555),   Float3(-555,0,0),   Float3(0,0,-555),   white);
             add_quad(Float3(0,0,555),       Float3(555,0,0),    Float3(0,555,0),    white);
 
-            Geometry* box1 = add_box(Float3(130, 0, 65),     Float3(295, 165, 230),  white);
-            // Geometry* box1 = add_box(Float3(0.f),     Float3(165, 330, 165),  white);
-            // box1->transform->translate(265,0,295);
-            // box1->transform->rotateY(15);
+            Geometry* box1 = add_box(Float3(0.f),     Float3(165, 330, 165),  white);
+            box1->transform->translate(265,0,295);
+            box1->transform->rotateY(15);
 
-            Geometry* box2 = add_box(Float3(265, 0, 295),    Float3(430, 330, 460),  white);
-            // Geometry* box2 = add_box(Float3(0.0f),    Float3(165,165,165),  white);
-            // box2->transform->translate(130, 0, 65);
+            Geometry* box2 = add_box(Float3(0.0f),    Float3(165,165,165),  white);
+            box2->transform->rotateY(-18);
+            box2->transform->translate(130, 0, 65);
 
             std::cout << "Finished geometry creation." << std::endl;
 
@@ -372,7 +371,7 @@ class PixarKitchen : public SceneManager {
     public:
         PixarKitchen(RTCDevice device_, unsigned int &seed) : SceneManager(device_) {
             std::cout << "Started scene initialization." << std::endl;
-            add_mesh("C:/Users/joaov/Downloads/Kitchen_set/Kitchen_set_applied.usd");
+            add_mesh("C:/Users/joaov/Downloads/Kitchen_set/Kitchen_set.usd");
 
             std::cout << "Finished geometry creation." << std::endl;
 

@@ -32,9 +32,9 @@ class TransformMatrix {
         }
 
         bool isIdentity() {
-            TransformMatrix* temp = new TransformMatrix();
-            for (int i = 0; i < 16; i ++){
-                if (matrix[i] != temp->matrix[i])
+            TransformMatrix temp;
+            for (int i = 0; i < 16; i++) {
+                if (matrix[i] != temp.matrix[i])
                     return false;
             }
             return true;
@@ -137,10 +137,10 @@ class TransformMatrix {
         }
 
         Float4 transformPoint(const Float4& p) {
-            float x_ = p.x() * matrix[0]  + p.y() * matrix[1]  + p.z() * matrix[2]  + p.w() * matrix[3];
-            float y_ = p.x() * matrix[4]  + p.y() * matrix[5]  + p.z() * matrix[6]  + p.w() * matrix[7];
-            float z_ = p.x() * matrix[8]  + p.y() * matrix[9]  + p.z() * matrix[10] + p.w() * matrix[11];
-            float w_ = p.x() * matrix[12] + p.y() * matrix[13] + p.z() * matrix[14] + p.w() * matrix[15];
+            float x_ = matrix[0] * p.x() + matrix[1] * p.y() + matrix[2] * p.z() + matrix[3] * p.w();
+            float y_ = matrix[4] * p.x() + matrix[5] * p.y() + matrix[6] * p.z() + matrix[7] * p.w();
+            float z_ = matrix[8] * p.x() + matrix[9] * p.y() + matrix[10] * p.z() + matrix[11] * p.w();
+            float w_ = matrix[12] * p.x() + matrix[13] * p.y() + matrix[14] * p.z() + matrix[15] * p.w();
             return Float4(x_, y_, z_, w_);
         }
 
