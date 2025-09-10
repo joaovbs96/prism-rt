@@ -15,7 +15,7 @@ class Float4 {
         float x() const { return buffer[0]; }
         float y() const { return buffer[1]; }
         float z() const { return buffer[2]; }
-        float w() const { return buffer[2]; }
+        float w() const { return buffer[3]; }
 
         float r() const { return buffer[0]; }
         float g() const { return buffer[1]; }
