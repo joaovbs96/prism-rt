@@ -202,7 +202,7 @@ class ABeautifulGame : public SceneManager {
     public:
         ABeautifulGame(RTCDevice device_, unsigned int &seed) : SceneManager(device_) {
             std::cout << "Started scene initialization." << std::endl;
-            add_mesh("C:/Users/joaov/Desktop/ABeautifulGame.glb");
+            add_mesh("C:/Users/joaov/prism-rt/assets/models/ABeautifulGame/ABeautifulGame.gltf");
 
             std::cout << "Finished geometry creation." << std::endl;
 
@@ -214,7 +214,7 @@ class ABeautifulGame : public SceneManager {
             cam = Camera(position, target, up, 1280, 720, 16.0f / 9.0f, vfov, 0.0f, 10.0f);
 
             // environment map - for missed rays
-            ImageTexture<Float3>* texture = new ImageTexture<Float3>("C:/Users/joaov/Downloads/IndoorEnvironmentHDRI003_4K-HDR.exr");
+            ImageTexture<Float3>* texture = new ImageTexture<Float3>("C:/Users/joaov/prism-rt/assets/environment/IndoorEnvironmentHDRI003_4K-HDR.exr");
             texture->adjustExposure(0.5f);
             environment = new EnvironmentMap(texture);
         }
