@@ -17,8 +17,22 @@ class TransformMatrix {
             identity();
         }
 
+        // Copy constructor
+        TransformMatrix(const TransformMatrix& other) {
+            matrix = new float[16];
+            std::memcpy(matrix, other.matrix, 16 * sizeof(float));
+        }
+
         ~TransformMatrix() {
             delete[] matrix;
+        }
+
+        // Copy assignment operator
+        TransformMatrix& operator=(const TransformMatrix& other) {
+            if (this != &other) {
+                std::memcpy(matrix, other.matrix, 16 * sizeof(float));
+            }
+            return *this;
         }
 
         // Get the raw float pointer
