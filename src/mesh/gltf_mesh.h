@@ -15,6 +15,315 @@
 #include "material.h"
 
 class glTFMesh : public Mesh {
+    private:
+        std::vector<TransformMatrix> nodeTransforms;  // Store transforms for each node
+
+        void processSceneNodes(const tinygltf::Model& model) {
+            // Initialize transforms for all nodes
+            nodeTransforms.resize(model.nodes.size());
+            for (size_t i = 0; i < model.nodes.size(); ++i) {
+                nodeTransforms[i].identity();
+            }
+
+            std::cout << "Scene info: " << model.scenes.size() << " scenes, " << model.nodes.size() << " nodes" << std::endl;
+
+            // Process default scene (or first scene if no default)
+            int sceneIndex = model.defaultScene >= 0 ? model.defaultScene : 0;
+            if (sceneIndex < model.scenes.size()) {
+                const tinygltf::Scene& scene = model.scenes[sceneIndex];
+                std::cout << "Processing scene " << sceneIndex << " with " << scene.nodes.size() << " root nodes" << std::endl;
+
+                // Process root nodes
+                for (int nodeIndex : scene.nodes) {
+                    TransformMatrix parentTransform;  // Identity for root nodes
+                    processNode(model, nodeIndex, parentTransform);
+                }
+            } else {
+                std::cout << "Warning: No valid scene found!" << std::endl;
+            }
+        }
+
+        void processNode(const tinygltf::Model& model, int nodeIndex, const TransformMatrix& parentTransform) {
+            if (nodeIndex < 0 || nodeIndex >= model.nodes.size()) return;
+
+            const tinygltf::Node& node = model.nodes[nodeIndex];
+
+            // Calculate local transform for this node
+            TransformMatrix localTransform;
+            getNodeTransform(node, localTransform);
+
+            // Debug output for non-identity transforms
+            if (!localTransform.isIdentity()) {
+                std::cout << "Node " << nodeIndex << " has local transform:" << std::endl;
+                if (node.translation.size() == 3) {
+                    std::cout << "  Translation: (" << node.translation[0] << ", " << node.translation[1] << ", " << node.translation[2] << ")" << std::endl;
+                }
+                if (node.rotation.size() == 4) {
+                    std::cout << "  Rotation: (" << node.rotation[0] << ", " << node.rotation[1] << ", " << node.rotation[2] << ", " << node.rotation[3] << ")" << std::endl;
+                }
+                if (node.scale.size() == 3) {
+                    std::cout << "  Scale: (" << node.scale[0] << ", " << node.scale[1] << ", " << node.scale[2] << ")" << std::endl;
+                }
+                if (node.matrix.size() == 16) {
+                    std::cout << "  Has 4x4 matrix" << std::endl;
+                }
+            }
+
+            // Calculate world transform (parent * local)
+            nodeTransforms[nodeIndex] = parentTransform;
+            nodeTransforms[nodeIndex].multiply(localTransform);
+
+            // Process child nodes recursively
+            for (int childIndex : node.children) {
+                processNode(model, childIndex, nodeTransforms[nodeIndex]);
+            }
+        }
+
+        void getNodeTransform(const tinygltf::Node& node, TransformMatrix& transform) {
+            transform.identity();
+
+            if (node.matrix.size() == 16) {
+                // Node has a transformation matrix (glTF uses column-major, we need row-major)
+                float* m = transform.getMatrix();
+                for (int row = 0; row < 4; ++row) {
+                    for (int col = 0; col < 4; ++col) {
+                        m[row * 4 + col] = static_cast<float>(node.matrix[col * 4 + row]);
+                    }
+                }
+            } else {
+                // Node has TRS (Translation, Rotation, Scale) components
+                // glTF specifies T * R * S order, so we apply in reverse: S, then R, then T
+
+                // Apply translation first
+                if (node.translation.size() == 3) {
+                    transform.translate(
+                        static_cast<float>(node.translation[0]),
+                        static_cast<float>(node.translation[1]),
+                        static_cast<float>(node.translation[2])
+                    );
+                }
+
+                // Apply rotation second (quaternion)
+                if (node.rotation.size() == 4) {
+                    applyQuaternionRotation(transform,
+                        static_cast<float>(node.rotation[0]), // x
+                        static_cast<float>(node.rotation[1]), // y
+                        static_cast<float>(node.rotation[2]), // z
+                        static_cast<float>(node.rotation[3])  // w
+                    );
+                }
+
+                // Apply scale last
+                if (node.scale.size() == 3) {
+                    transform.scale(
+                        static_cast<float>(node.scale[0]),
+                        static_cast<float>(node.scale[1]),
+                        static_cast<float>(node.scale[2])
+                    );
+                }
+
+            }
+        }
+
+        void applyQuaternionRotation(TransformMatrix& transform, float x, float y, float z, float w) {
+            // Convert quaternion to rotation matrix
+            TransformMatrix rotMatrix;
+            float* m = rotMatrix.getMatrix();
+
+            float xx = x * x, yy = y * y, zz = z * z;
+            float xy = x * y, xz = x * z, yz = y * z;
+            float wx = w * x, wy = w * y, wz = w * z;
+
+            m[0] = 1 - 2 * (yy + zz);   m[1] = 2 * (xy - wz);       m[2] = 2 * (xz + wy);       m[3] = 0;
+            m[4] = 2 * (xy + wz);       m[5] = 1 - 2 * (xx + zz);   m[6] = 2 * (yz - wx);       m[7] = 0;
+            m[8] = 2 * (xz - wy);       m[9] = 2 * (yz + wx);       m[10] = 1 - 2 * (xx + yy);  m[11] = 0;
+            m[12] = 0;                  m[13] = 0;                  m[14] = 0;                  m[15] = 1;
+
+            transform.multiply(rotMatrix);
+        }
+
+        void processMeshPrimitives(const tinygltf::Model& model, const tinygltf::Mesh& mesh,
+                                  TransformMatrix& nodeTransform, int& n_faces) {
+            for (const auto& primitive : mesh.primitives) {
+                if (primitive.mode != TINYGLTF_MODE_TRIANGLES) {
+                    std::cout << "Skipping non-triangle primitive" << std::endl;
+                    continue;
+                }
+
+                // Extract vertex positions
+                auto posIt = primitive.attributes.find("POSITION");
+                if (posIt == primitive.attributes.end()) {
+                    std::cout << "No POSITION attribute found" << std::endl;
+                    continue;
+                }
+
+                const tinygltf::Accessor& posAccessor = model.accessors[posIt->second];
+                const tinygltf::BufferView& posBufferView = model.bufferViews[posAccessor.bufferView];
+                const tinygltf::Buffer& posBuffer = model.buffers[posBufferView.buffer];
+
+                if (posAccessor.componentType != TINYGLTF_COMPONENT_TYPE_FLOAT) {
+                    std::cout << "Position data is not float type" << std::endl;
+                    continue;
+                }
+
+                const float* positions = reinterpret_cast<const float*>(&posBuffer.data[posBufferView.byteOffset + posAccessor.byteOffset]);
+
+                size_t vertexOffset = vertices.size();
+                int vertexCount = posAccessor.count;
+
+                // Copy and transform vertices
+                std::cout << "  Processing " << vertexCount << " vertices..." << std::endl;
+                std::cout << "  Node transform isIdentity: " << (nodeTransform.isIdentity() ? "YES" : "NO") << std::endl;
+
+                for (int i = 0; i < vertexCount; ++i) {
+                    Float3 vertex(positions[i * 3 + 0], positions[i * 3 + 1], positions[i * 3 + 2]);
+
+                    // Apply node transformation
+                    if (true) {
+                    // if (!nodeTransform.isIdentity()) {
+                        Float3 originalVertex = vertex;
+                        vertex = nodeTransform.transformPoint(vertex);
+
+                        // Debug output for first few vertex transformations
+                        if (i < 3) {
+                            std::cout << "    Vertex " << i << ": (" << originalVertex.x() << ", " << originalVertex.y() << ", " << originalVertex.z()
+                                      << ") -> (" << vertex.x() << ", " << vertex.y() << ", " << vertex.z() << ")" << std::endl;
+                        }
+                    } else {
+                        // Double-check: if it's supposed to be identity, verify no transformation occurs
+                        if (i < 3) {
+                            Float3 testTransformed = nodeTransform.transformPoint(vertex);
+                            bool actuallyIdentity = (testTransformed.x() == vertex.x() &&
+                                                   testTransformed.y() == vertex.y() &&
+                                                   testTransformed.z() == vertex.z());
+
+                            std::cout << "    Vertex " << i << ": (" << vertex.x() << ", " << vertex.y() << ", " << vertex.z()
+                                      << ") (no transform applied)" << std::endl;
+
+                            if (!actuallyIdentity) {
+                                std::cout << "    ERROR: Identity transform actually transforms to ("
+                                          << testTransformed.x() << ", " << testTransformed.y() << ", " << testTransformed.z() << ")" << std::endl;
+                                std::cout << "    Matrix marked as identity but isn't:" << std::endl;
+                                nodeTransform.print();
+                            }
+                        }
+                    }
+
+                    vertices.push_back(vertex);
+                }
+
+                // Extract normals
+                auto normalIt = primitive.attributes.find("NORMAL");
+                if (normalIt != primitive.attributes.end()) {
+                    const tinygltf::Accessor& normalAccessor = model.accessors[normalIt->second];
+                    const tinygltf::BufferView& normalBufferView = model.bufferViews[normalAccessor.bufferView];
+                    const tinygltf::Buffer& normalBuffer = model.buffers[normalBufferView.buffer];
+
+                    if (normalAccessor.componentType == TINYGLTF_COMPONENT_TYPE_FLOAT) {
+                        const float* normals_data = reinterpret_cast<const float*>(
+                            &normalBuffer.data[normalBufferView.byteOffset + normalAccessor.byteOffset]);
+
+                        for (size_t i = 0; i < normalAccessor.count; ++i) {
+                            Float3 normal(normals_data[i * 3 + 0], normals_data[i * 3 + 1], normals_data[i * 3 + 2]);
+
+                            // Transform normal (using vector transformation)
+                            if (!nodeTransform.isIdentity()) {
+                                // Transform normal as a vector (w=0)
+                                Float4 normalH = Float4(normal.x(), normal.y(), normal.z(), 0.0f);
+                                Float4 transformedNormal = nodeTransform.transformPoint(normalH);
+                                normal = Float3(transformedNormal.x(), transformedNormal.y(), transformedNormal.z()).normalize();
+                            }
+
+                            normals.push_back(normal);
+                        }
+                    }
+                } else {
+                    // If no normals, fill with dummy values to match vertex count
+                    size_t currentVertexCount = vertices.size() - normals.size();
+                    for (size_t i = 0; i < currentVertexCount; ++i) {
+                        normals.push_back(Float3(0.0f, 1.0f, 0.0f)); // Default up normal
+                    }
+                }
+
+                // Extract texture coordinates
+                auto texCoordIt = primitive.attributes.find("TEXCOORD_0");
+                if (texCoordIt != primitive.attributes.end()) {
+                    const tinygltf::Accessor& texAccessor = model.accessors[texCoordIt->second];
+                    const tinygltf::BufferView& texBufferView = model.bufferViews[texAccessor.bufferView];
+                    const tinygltf::Buffer& texBuffer = model.buffers[texBufferView.buffer];
+
+                    if (texAccessor.componentType == TINYGLTF_COMPONENT_TYPE_FLOAT) {
+                        const float* texcoords_data = reinterpret_cast<const float*>(
+                            &texBuffer.data[texBufferView.byteOffset + texAccessor.byteOffset]);
+
+                        for (size_t i = 0; i < texAccessor.count; ++i) {
+                            texcoords.push_back(Float2(
+                                texcoords_data[i * 2 + 0],
+                                texcoords_data[i * 2 + 1]
+                            ));
+                        }
+                    }
+                } else {
+                    // If no texture coordinates, fill with dummy values
+                    size_t currentVertexCount = vertices.size() - texcoords.size();
+                    for (size_t i = 0; i < currentVertexCount; ++i) {
+                        texcoords.push_back(Float2(0.0f, 0.0f)); // Default UV
+                    }
+                }
+
+                // Extract indices
+                if (primitive.indices >= 0) {
+                    const tinygltf::Accessor& indexAccessor = model.accessors[primitive.indices];
+                    const tinygltf::BufferView& indexBufferView = model.bufferViews[indexAccessor.bufferView];
+                    const tinygltf::Buffer& indexBuffer = model.buffers[indexBufferView.buffer];
+
+                    const unsigned char* indexData = &indexBuffer.data[indexBufferView.byteOffset + indexAccessor.byteOffset];
+
+                    int triangleCount = indexAccessor.count / 3;
+
+                    for (int i = 0; i < triangleCount; i++) {
+                        material_mapping[n_faces] = primitive.material;
+                        n_faces++;
+
+                        // Handle different index component types
+                        for (int j = 0; j < 3; ++j) {
+                            unsigned int index = 0;
+                            int indexOffset = i * 3 + j;
+
+                            switch (indexAccessor.componentType) {
+                                case TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE:
+                                    index = static_cast<unsigned int>(indexData[indexOffset]);
+                                    break;
+                                case TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT:
+                                    index = static_cast<unsigned int>(reinterpret_cast<const unsigned short*>(indexData)[indexOffset]);
+                                    break;
+                                case TINYGLTF_COMPONENT_TYPE_UNSIGNED_INT:
+                                    index = reinterpret_cast<const unsigned int*>(indexData)[indexOffset];
+                                    break;
+                                default:
+                                    std::cout << "Unsupported index component type" << std::endl;
+                                    continue;
+                            }
+
+                            // Add vertex offset for this primitive
+                            indices.push_back(index + vertexOffset);
+                        }
+                    }
+                } else {
+                  // Non-indexed geometry - create indices automatically
+                    size_t currentVertexCount = vertices.size() - vertexOffset;
+                    for (size_t i = 0; i < currentVertexCount; ++i) {
+                        indices.push_back(static_cast<unsigned int>(vertexOffset + i));
+                        // TODO: this might be wrong? What would be an example of non-indexed geom?
+                        if (i % 3 == 0){
+                            material_mapping[n_faces] = primitive.material;
+                            n_faces++;
+                        }
+                    }
+                }
+            }
+        }
+
     public:
         glTFMesh(const std::filesystem::path &file_path) {
             tinygltf::TinyGLTF loader;
@@ -42,144 +351,24 @@ class glTFMesh : public Mesh {
                 return;
             }
 
+            // Process scene hierarchy and calculate node transforms
+            processSceneNodes(model);
+
             int n_faces = 0;
-            for (size_t mesh_idx = 0; mesh_idx < model.meshes.size(); ++mesh_idx) {
-                const tinygltf::Mesh& mesh = model.meshes[mesh_idx];
-                std::cout << "Processing mesh: " << mesh.name << std::endl;
 
-                for (const auto& primitive : mesh.primitives) {
-                    if (primitive.mode != TINYGLTF_MODE_TRIANGLES) {
-                        std::cout << "Skipping non-triangle primitive" << std::endl;
-                        continue;
-                    }
+            // Process meshes through their node references
+            for (size_t node_idx = 0; node_idx < model.nodes.size(); ++node_idx) {
+                const tinygltf::Node& node = model.nodes[node_idx];
 
-                    // Extract vertex positions
-                    auto posIt = primitive.attributes.find("POSITION");
-                    if (posIt == primitive.attributes.end()) {
-                        std::cout << "No POSITION attribute found" << std::endl;
-                        continue;
-                    }
+                if (node.mesh >= 0 && node.mesh < model.meshes.size()) {
+                    const tinygltf::Mesh& mesh = model.meshes[node.mesh];
+                    std::cout << "Processing mesh: " << mesh.name << " (Node: " << node_idx << ")" << std::endl;
 
-                    const tinygltf::Accessor& posAccessor = model.accessors[posIt->second];
-                    const tinygltf::BufferView& posBufferView = model.bufferViews[posAccessor.bufferView];
-                    const tinygltf::Buffer& posBuffer = model.buffers[posBufferView.buffer];
+                    processMeshPrimitives(model, mesh, nodeTransforms[node_idx], n_faces);
 
-                    if (posAccessor.componentType != TINYGLTF_COMPONENT_TYPE_FLOAT) {
-                        std::cout << "Position data is not float type" << std::endl;
-                        continue;
-                    }
-
-                    const float* positions = reinterpret_cast<const float*>(&posBuffer.data[posBufferView.byteOffset + posAccessor.byteOffset]);
-
-                    size_t vertexOffset = vertices.size();
-                    int vertexCount = posAccessor.count;
-
-                    // Copy vertices
-                    for (int i = 0; i < vertexCount; ++i) {
-                        make_Float3<const float*>(vertices, positions, i);
-                    }
-
-                    // Extract normals
-                    auto normalIt = primitive.attributes.find("NORMAL");
-                    if (normalIt != primitive.attributes.end()) {
-                        const tinygltf::Accessor& normalAccessor = model.accessors[normalIt->second];
-                        const tinygltf::BufferView& normalBufferView = model.bufferViews[normalAccessor.bufferView];
-                        const tinygltf::Buffer& normalBuffer = model.buffers[normalBufferView.buffer];
-
-                        if (normalAccessor.componentType == TINYGLTF_COMPONENT_TYPE_FLOAT) {
-                            const float* normals_data = reinterpret_cast<const float*>(
-                                &normalBuffer.data[normalBufferView.byteOffset + normalAccessor.byteOffset]);
-
-                            for (size_t i = 0; i < normalAccessor.count; ++i)
-                                make_Float3<const float*>(normals, normals_data, i);
-                        }
-                    } else {
-                        // If no normals, fill with dummy values to match vertex count
-                        size_t currentVertexCount = vertices.size() - normals.size();
-                        for (size_t i = 0; i < currentVertexCount; ++i) {
-                            normals.push_back(Float3(0.0f, 1.0f, 0.0f)); // Default up normal
-                        }
-                    }
-
-                    // Extract texture coordinates
-                    auto texCoordIt = primitive.attributes.find("TEXCOORD_0");
-                    if (texCoordIt != primitive.attributes.end()) {
-                        const tinygltf::Accessor& texAccessor = model.accessors[texCoordIt->second];
-                        const tinygltf::BufferView& texBufferView = model.bufferViews[texAccessor.bufferView];
-                        const tinygltf::Buffer& texBuffer = model.buffers[texBufferView.buffer];
-
-                        if (texAccessor.componentType == TINYGLTF_COMPONENT_TYPE_FLOAT) {
-                            const float* texcoords_data = reinterpret_cast<const float*>(
-                                &texBuffer.data[texBufferView.byteOffset + texAccessor.byteOffset]);
-
-                            for (size_t i = 0; i < texAccessor.count; ++i) {
-                                texcoords.push_back(Float2(
-                                    texcoords_data[i * 2 + 0],
-                                    texcoords_data[i * 2 + 1]
-                                ));
-                            }
-                        }
-                    } else {
-                        // If no texture coordinates, fill with dummy values
-                        size_t currentVertexCount = vertices.size() - texcoords.size();
-                        for (size_t i = 0; i < currentVertexCount; ++i) {
-                            texcoords.push_back(Float2(0.0f, 0.0f)); // Default UV
-                        }
-                    }
-
-                    // Extract indices
-                    if (primitive.indices >= 0) {
-                        const tinygltf::Accessor& indexAccessor = model.accessors[primitive.indices];
-                        const tinygltf::BufferView& indexBufferView = model.bufferViews[indexAccessor.bufferView];
-                        const tinygltf::Buffer& indexBuffer = model.buffers[indexBufferView.buffer];
-
-                        const unsigned char* indexData = &indexBuffer.data[indexBufferView.byteOffset + indexAccessor.byteOffset];
-
-                        int triangleCount = indexAccessor.count / 3;
-
-                        for (int i = 0; i < triangleCount; i++) {
-                            material_mapping[n_faces] = primitive.material;
-                            n_faces++;
-
-                            // Handle different index component types
-                            for (int j = 0; j < 3; ++j) {
-                                unsigned int index = 0;
-                                int indexOffset = i * 3 + j;
-
-                                switch (indexAccessor.componentType) {
-                                    case TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE:
-                                        index = static_cast<unsigned int>(indexData[indexOffset]);
-                                        break;
-                                    case TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT:
-                                        index = static_cast<unsigned int>(reinterpret_cast<const unsigned short*>(indexData)[indexOffset]);
-                                        break;
-                                    case TINYGLTF_COMPONENT_TYPE_UNSIGNED_INT:
-                                        index = reinterpret_cast<const unsigned int*>(indexData)[indexOffset];
-                                        break;
-                                    default:
-                                        std::cout << "Unsupported index component type" << std::endl;
-                                        continue;
-                                }
-
-                                // Add vertex offset for this primitive
-                                indices.push_back(index + vertexOffset);
-                            }
-                        }
-                    } else {
-                      // Non-indexed geometry - create indices automatically
-                        size_t currentVertexCount = vertices.size() - vertexOffset;
-                        for (size_t i = 0; i < currentVertexCount; ++i) {
-                            indices.push_back(static_cast<unsigned int>(vertexOffset + i));
-                            // TODO: this might be wrong? What would be an example of non-indexed geom?
-                            if (i % 3 == 0){
-                                material_mapping[n_faces] = primitive.material;
-                                n_faces++;
-                            }
-                        }
-                    }
+                    std::cout << "Mesh " << node.mesh << " at node " << node_idx << ": "
+                              << vertices.size() << " total vertices, " << indices.size() / 3 << " total triangles" << std::endl;
                 }
-
-                std::cout << "Mesh " << mesh_idx << ": " << vertices.size() << " vertices, " << indices.size() / 3 << " triangles" << std::endl;
             }
 
             // Convert Materials from gltf/glb file
