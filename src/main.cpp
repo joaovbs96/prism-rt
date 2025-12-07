@@ -33,7 +33,6 @@
 #include "sampling.h"
 #include "material.h"
 #include "scene.h"
-#include "load_gltf.h"
 
 void error_callback(void* user_ptr, enum RTCError error, const char* str)
 {
