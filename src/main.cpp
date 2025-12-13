@@ -1,6 +1,7 @@
 #include <iostream>
 #include <format>
 #include <thread>
+#include <cstdlib>
 
 // external libraries
 #include <tbb/parallel_for.h>
@@ -71,10 +72,11 @@ void setupUSDPlugins() {
     pxr::PlugRegistry& registry = pxr::PlugRegistry::GetInstance();
 
     // Add plugin search paths
-    registry.RegisterPlugins("C:/Users/joaov/prism-rt/external/OpenUSD/install/lib/usd");
-    registry.RegisterPlugins("C:/Users/joaov/prism-rt/external/OpenUSD/install/lib");
-    registry.RegisterPlugins("C:/Users/joaov/prism-rt/external/OpenUSD/install/plugin");
-    registry.RegisterPlugins("C:/Users/joaov/prism-rt/external/OpenUSD/install/plugin/usd");
+    std::filesystem::path install_path(std::getenv("USD_INSTALL_DIR"));
+    registry.RegisterPlugins((install_path / "install" / "lib" / "usd").string());
+    registry.RegisterPlugins((install_path / "install" / "lib").string());
+    registry.RegisterPlugins((install_path / "install" / "plugin").string());
+    registry.RegisterPlugins((install_path / "install" / "plugin" / "usd").string());
 
     // List all discovered plugins
     auto plugins = registry.GetAllPlugins();
@@ -92,6 +94,8 @@ void setupUSDPlugins() {
 
 int main()
 {
+    std::cout << "Started PrismRT..." << std::endl;
+
     // required if any USD function is in use
     setupUSDPlugins();
 
