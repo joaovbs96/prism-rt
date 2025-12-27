@@ -16,7 +16,7 @@ struct BRDFSample {
 class Material {
     public:
         Material() {}
-        
+
         // All materials need to define:
         // 1) How to sample the ray direction for the next bounce
         // 2) The color that the material contributes to the ray
@@ -88,7 +88,7 @@ class Material {
             Float3 up = (std::fabsf(ray_hit.n_g.y()) < 0.999f) ? Float3(0, 1, 0) : Float3(1, 0, 0);
             Float3 T = cross(up, ray_hit.n_g);  // Tangent
             Float3 B = cross(ray_hit.n_g, T);   // Bitangent
-            
+
             // Transform the tangent-space normal to world space
             Float3 perturbed_n = T * tangent_n_s.x() + B * tangent_n_s.y() + ray_hit.n_g * tangent_n_s.z();
             ray_hit.n = perturbed_n.normalize();
@@ -122,7 +122,7 @@ class Diffuse : public Material {
 
 class Metal : public Material {
     public:
-        Metal(Texture<Float3>* specular_color, Texture<float>* specular_roughness) 
+        Metal(Texture<Float3>* specular_color, Texture<float>* specular_roughness)
         : specular_color(specular_color), specular_roughness(specular_roughness) {}
 
         Float3 sample_direction(const RayHit ray_hit, unsigned int &seed) override {
@@ -142,7 +142,7 @@ class Metal : public Material {
 
 class Emissive : public Material {
     public:
-        Emissive(Texture<Float3>* emissive_color, float emissive_multiplier = 1.0f) 
+        Emissive(Texture<Float3>* emissive_color, float emissive_multiplier = 1.0f)
         : emissive_color(emissive_color), emissive_multiplier(emissive_multiplier) {}
 
         Float3 sample_direction(const RayHit ray_hit, unsigned int &seed) override {
@@ -187,6 +187,75 @@ class Glass : public Material {
 
     private:
         float ior;
+};
+
+class Dispersive : public Glass {
+public:
+    Dispersive(float ior, float abbe_number = 60.0f)
+        : Glass(ior),  // Use provided IOR as base (d-line, 587nm yellow)
+          n_d(ior),
+          V_d(abbe_number) {
+
+        // Calculate IORs for red (C-line, 656nm) and blue (F-line, 486nm)
+        // using the Abbe number definition: V_d = (n_d - 1) / (n_F - n_C)
+        // Rearranging: (n_F - n_C) = (n_d - 1) / V_d
+
+        float delta_nFC = (n_d - 1.0f) / V_d;
+
+        // For typical glass, the relationship is approximately:
+        // n_d is midway between n_F and n_C
+        // So: n_F = n_d + 0.5 * delta_nFC
+        //     n_C = n_d - 0.5 * delta_nFC
+
+        n_F = n_d + 0.5f * delta_nFC;  // Blue wavelength (higher IOR)
+        n_C = n_d - 0.5f * delta_nFC;  // Red wavelength (lower IOR)
+    }
+
+    BRDFSample sample(const RayHit ray_hit, unsigned int &seed) override {
+        BRDFSample s;
+
+        // Randomly select which wavelength to trace (R, G, or B)
+        float wavelength_choice = rnd(seed);
+        float selected_ior;
+
+        if (wavelength_choice < 0.333f) {
+            // Red wavelength (C-line, 656nm)
+            selected_ior = n_C;
+            s.color = Color3(1.0f, 0.0f, 0.0f);
+        } else if (wavelength_choice < 0.666f) {
+            // Yellow/Green wavelength (d-line, 587nm)
+            selected_ior = n_d;
+            s.color = Color3(0.0f, 1.0f, 0.0f);
+        } else {
+            // Blue wavelength (F-line, 486nm)
+            selected_ior = n_F;
+            s.color = Color3(0.0f, 0.0f, 1.0f);
+        }
+
+        // Refract/reflect using the selected wavelength's IOR
+        float ior_ = ray_hit.front_face ? 1.0f / selected_ior : selected_ior;
+
+        Float3 unit_direction = ray_hit.d.normalize();
+        float cos_theta = std::fminf(dot(-unit_direction, ray_hit.n), 1.0f);
+        float sin_theta = std::sqrtf(1.0f - cos_theta * cos_theta);
+
+        if (ior_ * sin_theta > 1.0f || schlick(cos_theta, ior_) > rnd(seed)) {
+            s.wi = reflect(unit_direction, ray_hit.n);
+        } else {
+            s.wi = refract(unit_direction, ray_hit.n, ior_);
+        }
+
+        s.emission = Color3(0.0f);
+        s.scattered = true;
+
+        return s;
+    }
+
+private:
+    float n_d;  // IOR at d-line (587nm, yellow - reference)
+    float n_F;  // IOR at F-line (486nm, blue)
+    float n_C;  // IOR at C-line (656nm, red)
+    float V_d;  // Abbe number
 };
 
 ////////////////////////////////////////////////////////////////////////////

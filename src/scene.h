@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdlib>
+
 #include <embree4/rtcore.h>
 #include <embree4/rtcore_common.h>
 
@@ -29,6 +31,12 @@ class SceneManager {
         SceneManager(RTCDevice &device_) {
             device = &device_;
             scene = rtcNewScene(*device);
+
+            assets_path = std::filesystem::path(std::getenv("PRISM_ASSETS_DIR"));
+
+            MODELS = assets_path / "models";
+            TEXTURES = assets_path / "textures";
+            ENVIRONMENT = assets_path / "environment";
         }
 
         Geometry* add_mesh(const std::filesystem::path &file_path, Material* material_override = nullptr) {
@@ -136,12 +144,16 @@ class SceneManager {
         Camera cam;
         int image_width = 1280;
         int image_height = 720;
+        std::filesystem::path assets_path;
+        std::filesystem::path MODELS;
+        std::filesystem::path TEXTURES;
+        std::filesystem::path ENVIRONMENT;
 };
 
 class Earth : public SceneManager {
     public:
     Earth(RTCDevice device_, unsigned int &seed) : SceneManager(device_) {
-            add_sphere(Float3(0, 0, 0), 2.0f, new Diffuse(new ImageTexture("C:/Users/joaov/Desktop/earthmap.png")));
+            add_sphere(Float3(0, 0, 0), 2.0f, new Diffuse(new ImageTexture(TEXTURES / "earthmap.jpg")));
 
             std::cout << "Finished geometry creation." << std::endl;
 
@@ -174,7 +186,7 @@ class InOneWeekendFinal : public SceneManager {
                         } else if (rnd_ < 0.95f) {
                             add_sphere(center, 0.2f, new Metal(new ColorTexture(Color3(rnd(seed), rnd(seed), rnd(seed))), new ValueTexture<float>(rnd(seed))));
                         } else {
-                            add_sphere(center, 0.2f, new Glass(1.5f));
+                            add_sphere(center, 0.2f, new Dispersive(2.417f, 55.0f));
                         }
                     }
                 }
@@ -182,7 +194,7 @@ class InOneWeekendFinal : public SceneManager {
 
             add_sphere(Float3(0, 1, 0), 1.0f, new Glass(1.5f));
             add_sphere(Float3(-4, 1, 0), 1.0f, new Diffuse(new ColorTexture(Color3(0.4, 0.2, 0.1))));
-            add_sphere(Float3(4, 1, 0), 1.0f, new Diffuse(new ImageTexture("C:/Users/joaov/Desktop/earthmap.jpg")));
+            add_sphere(Float3(4, 1, 0), 1.0f, new Diffuse(new ImageTexture(TEXTURES / "earthmap.jpg")));
 
             std::cout << "Finished geometry creation." << std::endl;
 
@@ -202,7 +214,7 @@ class ABeautifulGame : public SceneManager {
     public:
         ABeautifulGame(RTCDevice device_, unsigned int &seed) : SceneManager(device_) {
             std::cout << "Started scene initialization." << std::endl;
-            add_mesh("C:/Users/joaov/prism-rt/assets/models/ABeautifulGame/ABeautifulGame.gltf");
+            add_mesh(MODELS / "ABeautifulGame" / "ABeautifulGame.gltf");
 
             std::cout << "Finished geometry creation." << std::endl;
 
@@ -214,7 +226,7 @@ class ABeautifulGame : public SceneManager {
             cam = Camera(position, target, up, 1280, 720, 16.0f / 9.0f, vfov, 0.0f, 10.0f);
 
             // environment map - for missed rays
-            ImageTexture<Float3>* texture = new ImageTexture<Float3>("C:/Users/joaov/prism-rt/assets/environment/IndoorEnvironmentHDRI003_4K-HDR.exr");
+            ImageTexture<Float3>* texture = new ImageTexture<Float3>(ENVIRONMENT / "IndoorEnvironmentHDRI003_4K-HDR.exr");
             texture->adjustExposure(0.5f);
             environment = new EnvironmentMap(texture);
         }
@@ -224,7 +236,7 @@ class NormalTangentTest : public SceneManager {
     public:
         NormalTangentTest(RTCDevice device_, unsigned int &seed) : SceneManager(device_) {
             std::cout << "Started scene initialization." << std::endl;
-            add_mesh("C:/Users/joaov/Downloads/NormalTangentTest.glb");
+            add_mesh(MODELS / "NormalTangentTest.glb");
 
             std::cout << "Finished geometry creation." << std::endl;
 
@@ -236,7 +248,7 @@ class NormalTangentTest : public SceneManager {
             cam = Camera(position, target, up, 1280, 720, 16.0f / 9.0f, vfov, 0.0f, 10.0f);
 
             // environment map - for missed rays
-            environment = new EnvironmentMap(new ImageTexture("C:/Users/joaov/Downloads/brown_photostudio_03_4k.exr"));
+            environment = new EnvironmentMap(new ImageTexture(ENVIRONMENT / "brown_photostudio_03_4k.exr"));
         }
 };
 
@@ -244,27 +256,7 @@ class Duck : public SceneManager {
     public:
         Duck(RTCDevice device_, unsigned int &seed) : SceneManager(device_) {
             std::cout << "Started scene initialization." << std::endl;
-            add_mesh("C:/Users/joaov/Desktop/duck_reset.glb");
-
-            std::cout << "Finished geometry creation." << std::endl;
-
-            // camera initialization
-            Float3 position(11, 2, 7.5);
-            Float3 target(0.0f, 0.85, 0.0);
-            Float3 up(0.0f, 1.0f, 0.0f);
-            float vfov = 8;
-            cam = Camera(position, target, up, 1280, 720, 16.0f / 9.0f, vfov, 0.0f, 10.0f);
-
-            // environment map - for missed rays
-            environment = new GradientBackground(new ColorTexture(Color3(1.0, 1.0, 1.0)), new ColorTexture(Color3(0.5, 0.7, 1.0)));
-        }
-};
-
-class Duck2 : public SceneManager {
-    public:
-        Duck2(RTCDevice device_, unsigned int &seed) : SceneManager(device_) {
-            std::cout << "Started scene initialization." << std::endl;
-            add_mesh("C:/Users/joaov/Desktop/duck.obj", new Diffuse(new ColorTexture(Color3(0.5, 0.5, 0.5))));
+            add_mesh(MODELS / "Duck" / "duck.glb");
 
             std::cout << "Finished geometry creation." << std::endl;
 
@@ -351,7 +343,7 @@ class USDCube : public SceneManager {
         USDCube(RTCDevice device_, unsigned int &seed) : SceneManager(device_) {
             std::cout << "Started scene initialization." << std::endl;
             Material* white = new Diffuse(new ColorTexture(Color3(.73, .73, .73)));
-            add_mesh("C:/Users/joaov/OneDrive/Área de Trabalho/untitled.usdc", white);
+            add_mesh(MODELS / "cube.usdc", white);
 
             std::cout << "Finished geometry creation." << std::endl;
 
@@ -371,7 +363,7 @@ class PixarKitchen : public SceneManager {
     public:
         PixarKitchen(RTCDevice device_, unsigned int &seed) : SceneManager(device_) {
             std::cout << "Started scene initialization." << std::endl;
-            add_mesh("C:/Users/joaov/Downloads/Kitchen_set/Kitchen_set.usd");
+            add_mesh(MODELS / "Kitchen_set" / "Kitchen_set.usd");
 
             std::cout << "Finished geometry creation." << std::endl;
 
