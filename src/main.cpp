@@ -71,25 +71,56 @@ void print_progress(float progress) {
 void setupUSDPlugins() {
     pxr::PlugRegistry& registry = pxr::PlugRegistry::GetInstance();
 
-    // Add plugin search paths
-    std::filesystem::path install_path(std::getenv("USD_INSTALL_DIR"));
-    registry.RegisterPlugins((install_path / "install" / "lib" / "usd").string());
-    registry.RegisterPlugins((install_path / "install" / "lib").string());
-    registry.RegisterPlugins((install_path / "install" / "plugin").string());
-    registry.RegisterPlugins((install_path / "install" / "plugin" / "usd").string());
+    // Check if USD_INSTALL_DIR is set
+    const char* usd_dir_env = std::getenv("USD_INSTALL_DIR");
+    if (!usd_dir_env) {
+        std::cerr << "ERROR: USD_INSTALL_DIR environment variable not set!" << std::endl;
+        std::cerr << "Please set it to your USD installation directory." << std::endl;
+        return;
+    }
 
-    // List all discovered plugins
-    auto plugins = registry.GetAllPlugins();
+    std::filesystem::path install_path(usd_dir_env);
 
-    std::cout << "Found " << plugins.size() << " registered plugins:\n\n";
+    // Check if the path exists
+    if (!std::filesystem::exists(install_path)) {
+        std::cerr << "ERROR: USD_INSTALL_DIR path does not exist: " << install_path << std::endl;
+        return;
+    }
 
-    for (size_t i = 0; i < plugins.size(); ++i) {
-        pxr::PlugPluginPtr plugin = plugins[i];
-        if (plugin) {
-            std::cout << plugin->GetName() << std::endl;
+    // Common USD plugin paths - adjust based on your installation
+    std::vector<std::filesystem::path> plugin_paths = {
+        install_path / "plugin" / "usd",
+        install_path / "lib" / "usd",
+        install_path / "share" / "usd" / "plugins",
+    };
+
+    // Register each path that exists
+    for (const auto& path : plugin_paths) {
+        if (std::filesystem::exists(path)) {
+            std::cout << "Registering plugin path: " << path << std::endl;
+            registry.RegisterPlugins(path.string());
+        } else {
+            std::cout << "Skipping non-existent path: " << path << std::endl;
         }
     }
 
+    // List all discovered plugins
+    auto plugins = registry.GetAllPlugins();
+    std::cout << "\nFound " << plugins.size() << " registered plugins:\n";
+
+    if (plugins.empty()) {
+        std::cerr << "WARNING: No USD plugins found! Check your USD installation and paths." << std::endl;
+    }
+
+    for (const auto& plugin : plugins) {
+        if (plugin) {
+            std::cout << "  - " << plugin->GetName();
+            if (plugin->IsLoaded()) {
+                std::cout << " [LOADED]";
+            }
+            std::cout << std::endl;
+        }
+    }
 }
 
 int main()
@@ -109,7 +140,7 @@ int main()
     RTCDevice device = initialize_device(1);
 
     unsigned int main_seed = 0;
-    SceneManager* scene_mgr = new ABeautifulGame(device, main_seed);
+    SceneManager* scene_mgr = new PixarKitchen(device, main_seed);
     scene_mgr->commitScene();
     std::cout << "Finished comitting scene." << std::endl;
 
