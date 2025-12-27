@@ -183,7 +183,9 @@ int main()
     auto end_time = tbb::tick_count::now();
     std::cout << "Rendering took " << (end_time - start_time).seconds() << " seconds." << std::endl;
 
-    frame.save("output.png");
+    std::filesystem::path output_path = std::filesystem::current_path() / "output.png";
+    std::cout << "Saving Image to File: " << output_path;
+    frame.save(output_path);
 
     // TODO: collect and release all geometry nodes from scene
 
