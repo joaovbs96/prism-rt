@@ -221,15 +221,15 @@ public:
         if (wavelength_choice < 0.333f) {
             // Red wavelength (C-line, 656nm)
             selected_ior = n_C;
-            s.color = Color3(1.0f, 0.0f, 0.0f);
+            s.color = Color3(3.0f, 0.0f, 0.0f);
         } else if (wavelength_choice < 0.666f) {
             // Yellow/Green wavelength (d-line, 587nm)
             selected_ior = n_d;
-            s.color = Color3(0.0f, 1.0f, 0.0f);
+            s.color = Color3(0.0f, 3.0f, 0.0f);
         } else {
             // Blue wavelength (F-line, 486nm)
             selected_ior = n_F;
-            s.color = Color3(0.0f, 0.0f, 1.0f);
+            s.color = Color3(0.0f, 0.0f, 3.0f);
         }
 
         // Refract/reflect using the selected wavelength's IOR
