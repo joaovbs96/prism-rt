@@ -1,6 +1,9 @@
 #include <iostream>
 #include <format>
 #include <thread>
+#include <cstdlib>
+#include <atomic>
+#include <chrono>
 
 // external libraries
 #include <tbb/parallel_for.h>
@@ -10,6 +13,12 @@
 #include <tbb/tbb.h>
 #include <embree4/rtcore.h>
 #include <xmmintrin.h>
+
+#include <pxr/pxr.h>
+#include <pxr/base/plug/registry.h>
+#include <pxr/base/plug/plugin.h>
+#include <pxr/usd/usd/stage.h>
+#include <pxr/usd/usd/primRange.h>
 
 // needed for embree initialization
 #if !defined(_MM_SET_DENORMALS_ZERO_MODE)
@@ -27,23 +36,9 @@
 #include "sampling.h"
 #include "material.h"
 #include "scene.h"
-#include "load_gltf.h"
 
-void error_callback(void* user_ptr, enum RTCError error, const char* str)
-{
-    printf("ERROR %d: %s\n", error, str);
-}
-
-RTCDevice initialize_device(int verbose)
-{
-    RTCDevice device = rtcNewDevice(std::format("verbose={}", verbose).c_str());
-
-    if (!device)
-        printf("ERROR %d: cannot create device\n", rtcGetDeviceError(NULL));
-
-    rtcSetDeviceErrorFunction(device, error_callback, NULL);
-    return device;
-}
+std::atomic<int> completed_rows{0};
+std::atomic<bool> rendering_complete{false};
 
 void print_progress(float progress) {
     int barWidth = 70;
@@ -62,13 +57,100 @@ void print_progress(float progress) {
         std::cout << std::endl;
 }
 
+// Progress monitoring thread
+void progress_monitor(int total_rows) {
+    while (!rendering_complete.load(std::memory_order_relaxed)) {
+        float progress = static_cast<float>(completed_rows.load(std::memory_order_relaxed)) / total_rows;
+        print_progress(progress);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100)); // Update every 100ms
+    }
+    print_progress(1.0f); // Final update
+}
+
+
+void error_callback(void* user_ptr, enum RTCError error, const char* str)
+{
+    printf("ERROR %d: %s\n", error, str);
+}
+
+RTCDevice initialize_device(int verbose)
+{
+    RTCDevice device = rtcNewDevice(std::format("verbose={}", verbose).c_str());
+
+    if (!device)
+        printf("ERROR %d: cannot create device\n", rtcGetDeviceError(NULL));
+
+    rtcSetDeviceErrorFunction(device, error_callback, NULL);
+    return device;
+}
+
+void setupUSDPlugins() {
+    pxr::PlugRegistry& registry = pxr::PlugRegistry::GetInstance();
+
+    // Check if USD_INSTALL_DIR is set
+    const char* usd_dir_env = std::getenv("USD_INSTALL_DIR");
+    if (!usd_dir_env) {
+        std::cerr << "ERROR: USD_INSTALL_DIR environment variable not set!" << std::endl;
+        std::cerr << "Please set it to your USD installation directory." << std::endl;
+        return;
+    }
+
+    std::filesystem::path install_path(usd_dir_env);
+
+    // Check if the path exists
+    if (!std::filesystem::exists(install_path)) {
+        std::cerr << "ERROR: USD_INSTALL_DIR path does not exist: " << install_path << std::endl;
+        return;
+    }
+
+    // Common USD plugin paths - adjust based on your installation
+    std::vector<std::filesystem::path> plugin_paths = {
+        install_path / "plugin" / "usd",
+        install_path / "lib" / "usd",
+        install_path / "share" / "usd" / "plugins",
+    };
+
+    // Register each path that exists
+    for (const auto& path : plugin_paths) {
+        if (std::filesystem::exists(path)) {
+            std::cout << "Registering plugin path: " << path << std::endl;
+            registry.RegisterPlugins(path.string());
+        } else {
+            std::cout << "Skipping non-existent path: " << path << std::endl;
+        }
+    }
+
+    // List all discovered plugins
+    auto plugins = registry.GetAllPlugins();
+    std::cout << "\nFound " << plugins.size() << " registered plugins:\n";
+
+    if (plugins.empty()) {
+        std::cerr << "WARNING: No USD plugins found! Check your USD installation and paths." << std::endl;
+    }
+
+    for (const auto& plugin : plugins) {
+        if (plugin) {
+            std::cout << "  - " << plugin->GetName();
+            if (plugin->IsLoaded()) {
+                std::cout << " [LOADED]";
+            }
+            std::cout << std::endl;
+        }
+    }
+}
+
 int main()
 {
+    std::cout << "Started PrismRT..." << std::endl;
+
+    // required if any USD function is in use
+    setupUSDPlugins();
+
     // keeping these give a perf improvement
     _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
     _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);
 
-    int samples = 100;
+    int samples = 1000;
     int max_depth = 10;
 
     RTCDevice device = initialize_device(1);
@@ -76,6 +158,7 @@ int main()
     unsigned int main_seed = 0;
     SceneManager* scene_mgr = new CornellBox(device, main_seed);
     scene_mgr->commitScene();
+    std::cout << "Finished comitting scene." << std::endl;
 
     RTCRayQueryContext context;
     rtcInitRayQueryContext(&context);
@@ -86,8 +169,18 @@ int main()
 
     FrameBuffer frame(scene_mgr->image_width, scene_mgr->image_height);
 
+    std::cout << "Finished creating frame buffer." << std::endl;
+
     // Debugging, if we want to print something during rendering.
     // tbb::global_control gc(tbb::global_control::max_allowed_parallelism, 1);
+
+    completed_rows = 0;
+    rendering_complete = false;
+
+    std::cout << "Starded rendering..." << std::endl;
+
+    // Start progress monitoring thread
+    std::thread progress_thread(progress_monitor, scene_mgr->image_height);
 
     auto start_time = tbb::tick_count::now();
     tbb::parallel_for(0, scene_mgr->image_height, [&](int row)
@@ -110,11 +203,19 @@ int main()
             frame.setPixel(column, row, pixel_color.gamma_correct());
         });
 
+        // Increment completed rows (lock-free)
+        completed_rows.fetch_add(1, std::memory_order_relaxed);
     });
+
+    rendering_complete = true;
+    progress_thread.join();
+
     auto end_time = tbb::tick_count::now();
     std::cout << "Rendering took " << (end_time - start_time).seconds() << " seconds." << std::endl;
 
-    frame.save("output.png");
+    std::filesystem::path output_path = std::filesystem::current_path() / "output.png";
+    std::cout << "Saving Image to File: " << output_path;
+    frame.save(output_path);
 
     // TODO: collect and release all geometry nodes from scene
 

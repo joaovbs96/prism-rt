@@ -5,6 +5,8 @@
 #include <OpenImageIO/imageio.h>
 using namespace OIIO;
 
+#include <filesystem>
+
 #include "float3.h"
 
 class FrameBuffer{
@@ -22,7 +24,7 @@ class FrameBuffer{
             buffer.setpixel(row, column, cspan<float>(clamped_color.buffer));
         }
 
-        bool save(const char* file_path) {
-            return buffer.write(file_path);
+        bool save(std::filesystem::path file_path) {
+            return buffer.write(file_path.string().c_str());
         }
 };

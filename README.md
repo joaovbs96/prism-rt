@@ -4,7 +4,7 @@
 👋 Introduction
 ---------------------------------------
 
-PrismRT is a CPU-based Path Tracer with support for rendering USD, glTF and OBJ files, powered by the Embree Ray Tracing framework, the oneTBB threading library and the OpenImageIO image processing library.
+PrismRT is a CPU-based Path Tracer with support for rendering OpenUSD, glTF and OBJ files, powered by the Embree Ray Tracing framework, the oneTBB threading library and the OpenImageIO image processing library.
 
 Lorem ipsum dolor sit amet, consectetur adipiscing elit. Suspendisse congue ultricies sollicitudin. Aliquam erat volutpat. Quisque pellentesque velit vitae efficitur commodo. Sed tincidunt mollis tellus sit amet euismod. Maecenas blandit a nisl non rutrum. Integer pellentesque sem at dictum facilisis. Maecenas consequat porta justo, eu faucibus velit auctor in. Fusce mollis justo neque, aliquam bibendum urna accumsan at. In hac habitasse platea dictumst. Vivamus lorem dui, tempus vel diam eu, mollis hendrerit mi. Morbi euismod, tortor quis facilisis venenatis, diam massa pretium libero, sollicitudin placerat libero orci eget ex. Ut consectetur purus et sagittis sodales. Duis ut scelerisque mi, eget egestas tortor. Suspendisse a vehicula odio, id mollis felis. Nam elementum nisi at pellentesque iaculis.
 
@@ -12,11 +12,16 @@ Lorem ipsum dolor sit amet, consectetur adipiscing elit. Suspendisse congue ultr
 ✅ Feature List
 ---------------------------------------
 
-* Lorem ipsum dolor sit amet, consectetur adipiscing elit.
-* Donec eu turpis eget metus egestas vulputate nec et purus.
-* Vestibulum aliquet eros quis augue malesuada scelerisque.
-* In dignissim elit vitae tempor tincidunt.
-* Nulla ac neque convallis, scelerisque quam in, aliquam sapien.
+* Intel Embree BVH & Ray Tracing kernels.
+* 3D Model Mesh importer:
+    * OpenUSD (.usd, .usdz, .usda, .usdc) files
+    * glTF (.gltf, .glb) files
+    * .obj files
+* Analytical Geometry:
+    * Spheres
+    * Quads
+* Parallelism with oneTBB support.
+* OpenImageIO image loading and saving.
 
 
 ⚠️ System Requirements
@@ -28,7 +33,7 @@ Lorem ipsum dolor sit amet, consectetur adipiscing elit. Suspendisse congue ultr
 * Aenean eget dui vel nibh vulputate facilisis.
 
 
-🛠️ Build Instructions
+🛠️ Build Instructions (WIP)
 ---------------------------------------
 
 1. Clone this repo. Make sure to use the recursive flag: `git clone https://github.com/joaovbs96/prism-rt.git --recursive`

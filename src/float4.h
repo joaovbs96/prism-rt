@@ -11,11 +11,11 @@ class Float4 {
         Float4() : buffer{0.0f, 0.0f, 0.0f, 0.0f} {}
         Float4(float x)  : buffer{x, x, x, x} {}
         Float4(float x, float y, float z, float w)  : buffer{x, y, z, w} {}
-        
+
         float x() const { return buffer[0]; }
         float y() const { return buffer[1]; }
         float z() const { return buffer[2]; }
-        float w() const { return buffer[2]; }
+        float w() const { return buffer[3]; }
 
         float r() const { return buffer[0]; }
         float g() const { return buffer[1]; }
@@ -164,7 +164,7 @@ class Float4 {
             return Float4(
                 std::fmaxf(x(), v.x()),
                 std::fmaxf(y(), v.y()),
-                std::fmaxf(z(), v.z()), 
+                std::fmaxf(z(), v.z()),
                 std::fmaxf(w(), v.w())
             );
         }
