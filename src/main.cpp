@@ -2,6 +2,8 @@
 #include <format>
 #include <thread>
 #include <cstdlib>
+#include <atomic>
+#include <chrono>
 
 // external libraries
 #include <tbb/parallel_for.h>
@@ -35,21 +37,8 @@
 #include "material.h"
 #include "scene.h"
 
-void error_callback(void* user_ptr, enum RTCError error, const char* str)
-{
-    printf("ERROR %d: %s\n", error, str);
-}
-
-RTCDevice initialize_device(int verbose)
-{
-    RTCDevice device = rtcNewDevice(std::format("verbose={}", verbose).c_str());
-
-    if (!device)
-        printf("ERROR %d: cannot create device\n", rtcGetDeviceError(NULL));
-
-    rtcSetDeviceErrorFunction(device, error_callback, NULL);
-    return device;
-}
+std::atomic<int> completed_rows{0};
+std::atomic<bool> rendering_complete{false};
 
 void print_progress(float progress) {
     int barWidth = 70;
@@ -66,6 +55,33 @@ void print_progress(float progress) {
 
     if (progress == 1.0)
         std::cout << std::endl;
+}
+
+// Progress monitoring thread
+void progress_monitor(int total_rows) {
+    while (!rendering_complete.load(std::memory_order_relaxed)) {
+        float progress = static_cast<float>(completed_rows.load(std::memory_order_relaxed)) / total_rows;
+        print_progress(progress);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100)); // Update every 100ms
+    }
+    print_progress(1.0f); // Final update
+}
+
+
+void error_callback(void* user_ptr, enum RTCError error, const char* str)
+{
+    printf("ERROR %d: %s\n", error, str);
+}
+
+RTCDevice initialize_device(int verbose)
+{
+    RTCDevice device = rtcNewDevice(std::format("verbose={}", verbose).c_str());
+
+    if (!device)
+        printf("ERROR %d: cannot create device\n", rtcGetDeviceError(NULL));
+
+    rtcSetDeviceErrorFunction(device, error_callback, NULL);
+    return device;
 }
 
 void setupUSDPlugins() {
@@ -134,7 +150,7 @@ int main()
     _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
     _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);
 
-    int samples = 100;
+    int samples = 1000;
     int max_depth = 10;
 
     RTCDevice device = initialize_device(1);
@@ -158,6 +174,14 @@ int main()
     // Debugging, if we want to print something during rendering.
     // tbb::global_control gc(tbb::global_control::max_allowed_parallelism, 1);
 
+    completed_rows = 0;
+    rendering_complete = false;
+
+    std::cout << "Starded rendering..." << std::endl;
+
+    // Start progress monitoring thread
+    std::thread progress_thread(progress_monitor, scene_mgr->image_height);
+
     auto start_time = tbb::tick_count::now();
     tbb::parallel_for(0, scene_mgr->image_height, [&](int row)
     {
@@ -179,7 +203,13 @@ int main()
             frame.setPixel(column, row, pixel_color.gamma_correct());
         });
 
+        // Increment completed rows (lock-free)
+        completed_rows.fetch_add(1, std::memory_order_relaxed);
     });
+
+    rendering_complete = true;
+    progress_thread.join();
+
     auto end_time = tbb::tick_count::now();
     std::cout << "Rendering took " << (end_time - start_time).seconds() << " seconds." << std::endl;
 
