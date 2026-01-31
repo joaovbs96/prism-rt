@@ -5,6 +5,9 @@
 #include <OpenImageIO/imageio.h>
 using namespace OIIO;
 
+#include <filesystem>
+#include <string>
+
 #include "float3.h"
 
 class FrameBuffer{
@@ -24,5 +27,13 @@ class FrameBuffer{
 
         bool save(const char* file_path) {
             return buffer.write(file_path);
+        }
+
+        bool save(std::string file_path) {
+            return save(file_path.c_str());
+        }
+
+        bool save(std::filesystem::path file_path) {
+            return save(file_path.string().c_str());
         }
 };

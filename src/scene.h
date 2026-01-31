@@ -368,3 +368,34 @@ public:
         environment = new ConstantColorBackground(new ColorTexture(Color3(1.0f)));
     }
 };
+
+class InOneWeekendFinalDispersion : public SceneManager {
+    public:
+        InOneWeekendFinalDispersion(RTCDevice device_, unsigned int &seed) : SceneManager(device_) {
+            std::cout << "Started scene initialization." << std::endl;
+            add_sphere(Float3(0, -1000, 0), 1000, new Diffuse(new ColorTexture(Color3(0.5f))));
+
+            auto diffuse_light = new Emissive(new ColorTexture(Color3(4.0f)));
+            add_sphere(Float3(0, 7, 0), 2.0f, diffuse_light);
+            add_quad(Float3(3,1,-2), Float3(2,0,0), Float3(0,2,0), diffuse_light);
+
+            // add_sphere(Float3(4, 1, 0), 1.0f, new Dispersive(2.417f, 55.0f));
+            auto mesh = add_mesh(getAssetsPath() / "models" / "diamond" / "diamond.glb", new Dispersive(2.417f, 55.0f));
+            // mesh->setPosition(Float3(4, 2, 0));
+            mesh->transform->translate(0, 0.6, 0);
+            mesh->transform->scale(100, 100, 100);
+
+            std::cout << "Finished geometry creation." << std::endl;
+
+            // camera initialization
+            Float3 position(13, 2, 3);
+            Float3 target(0.0f);
+            Float3 up(0.0f, 1.0f, 0.0f);
+            float vfov = 20;
+            cam = Camera(position, target, up, 1280, 720, 16.0f / 9.0f, vfov, 0.6f, 10.0f);
+
+            // environment map - for missed rays
+            environment = new ConstantColorBackground(new ColorTexture(Color3(0.0, 0.0, 0.0)));
+            // environment = new GradientBackground(new ColorTexture(Color3(1.0, 1.0, 1.0)), new ColorTexture(Color3(0.5, 0.7, 1.0)));
+        }
+};

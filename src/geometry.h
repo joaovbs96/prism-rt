@@ -14,6 +14,7 @@
 #include "float2.h"
 #include "transforms.h"
 #include "material.h"
+#include "aabb.h"
 
 class Geometry {
     public:
@@ -59,11 +60,50 @@ class Geometry {
             rtcCommitGeometry(geom);
         }
 
+        // Update the AABB based on current vertices
+        virtual void updateAABB() = 0;
+
+        // Get the bounding box center
+        Float3 getBoundingBoxCenter() const {
+            return bounding_box.getCenter();
+        }
+
+        // Get the minimum point (bottom corner) of the bounding box
+        Float3 getBoundingBoxMin() const {
+            return bounding_box.getMin();
+        }
+
+        // Get the maximum point (top corner) of the bounding box
+        Float3 getBoundingBoxMax() const {
+            return bounding_box.getMax();
+        }
+
+        // Set position by translating mesh so the bottom of its bounding box is at the specified position
+        void setPosition(const Float3& target_position) {
+            Float3 current_min = bounding_box.getMin();
+            Float3 translation = target_position - current_min;
+
+            // TODO: save temporary transform variable for current transform if it's diff than identify
+
+            // Apply translation to the transform matrix
+            transform->translate(translation.x(), translation.y(), translation.z());
+
+            // Apply the transform to update the vertices
+            applyTransform();
+
+            // Update AABB after transformation
+            updateAABB();
+
+            // Reset transform matrix to identity after applying
+            transform->identity();
+        }
+
         int vertex_count;
         RTCGeometryType type;
         RTCGeometry geom;
         unsigned int geomid;
         TransformMatrix* transform = new TransformMatrix();
+        AABB bounding_box;
 };
 
 class Box : public Geometry {
@@ -117,6 +157,9 @@ class Box : public Geometry {
                 }
             }
 
+            // Initialize AABB with current vertices
+            updateAABB();
+
             // commit and release geom handle
             rtcCommitGeometry(geom);
             geomid = rtcAttachGeometry(scene, geom);
@@ -125,6 +168,10 @@ class Box : public Geometry {
 
         Material* getMaterial(unsigned int primid, unsigned int instid) override {
             return material;
+        }
+
+        void updateAABB() override {
+            bounding_box.update(vertices);
         }
 
         std::vector<Float3> vertices;
@@ -154,6 +201,9 @@ class Quad : public Geometry {
             int* ib = (int*) rtcSetNewGeometryBuffer(geom, RTC_BUFFER_TYPE_INDEX, 0, RTC_FORMAT_UINT4, 4*sizeof(unsigned int), 1);
             ib[0] = 0; ib[1] = 1; ib[2] = 3; ib[3] = 2;
 
+            // Initialize AABB with current vertices
+            updateAABB();
+
             // commit and release geom handle
             rtcCommitGeometry(geom);
             geomid = rtcAttachGeometry(scene, geom);
@@ -162,6 +212,10 @@ class Quad : public Geometry {
 
         Material* getMaterial(unsigned int primid, unsigned int instid) override {
             return material;
+        }
+
+        void updateAABB() override {
+            bounding_box.update({c1, c2, c3, c4});
         }
 
         Float3 c1, c2, c3, c4;
@@ -179,19 +233,24 @@ class Sphere : public Geometry {
             vb[0] = pos.x(); vb[1] = pos.y(); vb[2] = pos.z(); vb[3] = r;
             vertex_count = 1; // ??
 
+            // Initialize AABB with current vertices
+            updateAABB();
+
             // commit and release geom handle
             rtcCommitGeometry(geom);
             geomid = rtcAttachGeometry(scene, geom);
             return geomid;
         }
 
-        // Apply the current transform matrix to all vertices
-        // TODO: this likely doesn't work for spheres?
+        // Apply the current transform matrix to sphere
         void applyTransform() override {
             if (!geom) {
                 std::cerr << "Error: Geometry not initialized" << std::endl;
                 return;
             }
+
+            if (transform->isIdentity())
+                return;
 
             // Get the vertex buffer data
             float* vb = (float*)rtcGetGeometryBufferData(geom, RTC_BUFFER_TYPE_VERTEX, 0);
@@ -200,20 +259,21 @@ class Sphere : public Geometry {
                 return;
             }
 
-            // Transform each vertex
-            for (int i = 0; i < vertex_count; i++) {
-                // Get current vertex position
-                Float4 vertex(vb[i * 3 + 0], vb[i * 3 + 1], vb[i * 3 + 2], vb[i * 3 + 3]);
+            // Transform sphere position (note: Float4 format with stride 4)
+            Float4 vertex(vb[0], vb[1], vb[2], vb[3]);
+            Float4 transformed_vertex = transform->transformPoint(vertex);
 
-                // Apply transform matrix
-                Float4 transformed_vertex = transform->transformPoint(vertex);
+            // Write back transformed vertex
+            vb[0] = transformed_vertex.x();
+            vb[1] = transformed_vertex.y();
+            vb[2] = transformed_vertex.z();
+            vb[3] = transformed_vertex.w();
 
-                // Write back transformed vertex
-                vb[i * 3 + 0] = transformed_vertex.x();
-                vb[i * 3 + 1] = transformed_vertex.y();
-                vb[i * 3 + 2] = transformed_vertex.z();
-                vb[i * 3 + 3] = transformed_vertex.w();
-            }
+            // Update pos member variable
+            pos = Float3(vb[0], vb[1], vb[2]);
+
+            // Update AABB after transformation
+            updateAABB();
 
             // Mark geometry as modified and recommit
             rtcUpdateGeometryBuffer(geom, RTC_BUFFER_TYPE_VERTEX, 0);
@@ -222,6 +282,10 @@ class Sphere : public Geometry {
 
         Material* getMaterial(unsigned int primid, unsigned int instid) override {
             return material;
+        }
+
+        void updateAABB() override {
+            bounding_box.update({pos - Float3(r, r, r), pos + Float3(r, r, r)});
         }
 
         Float3 pos;
@@ -253,6 +317,9 @@ class Mesh : public Geometry {
             rtcSetSharedGeometryBuffer(geom, RTC_BUFFER_TYPE_VERTEX_ATTRIBUTE, 1, RTC_FORMAT_FLOAT2, texcoords.data(), 0, sizeof(Float2), texcoords.size());
 
             std::cout << "Finished creating mesh buffers. " << std::endl;
+
+            // Initialize AABB with current vertices
+            updateAABB();
 
             // commit and release geom handle
             rtcCommitGeometry(geom);
@@ -294,6 +361,10 @@ class Mesh : public Geometry {
                 float y = attribs[2 * index + 1];
                 vertex_list.push_back(Float2(x, y));
             }
+        }
+
+        void updateAABB() override {
+            bounding_box.update(vertices);
         }
 
         std::vector<Float3> vertices;
