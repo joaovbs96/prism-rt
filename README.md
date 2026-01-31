@@ -53,6 +53,7 @@ Lorem ipsum dolor sit amet, consectetur adipiscing elit. Suspendisse congue ultr
 ---------------------------------------
 
 * Currently, no error check is performed to check if files are present or not. A file not being present will cause the application to crash.
+* The setPosition method of AABBs doesn't set correctly the position, if it's not initially in zero.
 
 
 ⚖️ Licensing
