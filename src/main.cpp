@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <atomic>
 #include <chrono>
+#include <iomanip>
 
 // external libraries
 #include <tbb/parallel_for.h>
@@ -40,8 +41,8 @@
 std::atomic<int> completed_rows{0};
 std::atomic<bool> rendering_complete{false};
 
-void print_progress(float progress) {
-    int barWidth = 70;
+void print_progress(float progress, double eta_seconds) {
+    int barWidth = 50;  // Reduced to make room for ETA
 
     std::cout << "[";
     int pos = barWidth * progress;
@@ -50,21 +51,49 @@ void print_progress(float progress) {
         else if (i == pos) std::cout << ">";
         else std::cout << " ";
     }
-    std::cout << "] " << float(progress * 100.0) << "%                        \r";
+    
+    // Format ETA as HH:MM:SS or MM:SS
+    int eta_h = static_cast<int>(eta_seconds) / 3600;
+    int eta_m = (static_cast<int>(eta_seconds) % 3600) / 60;
+    int eta_s = static_cast<int>(eta_seconds) % 60;
+    
+    std::cout << "] " << std::fixed << std::setprecision(1) << (progress * 100.0f) << "%";
+    
+    if (progress >= 1.0f) {
+        std::cout << " | Done!";
+    } else if (progress > 0.001f) {
+        std::cout << std::format(" | ETA: {:02}:{:02}:{:02}", eta_h, eta_m, eta_s);
+    }
+    
+    std::cout << "                    \r";  // Padding to clear previous longer output
     std::cout.flush();
 
-    if (progress == 1.0)
+    if (progress >= 1.0f)
         std::cout << std::endl;
 }
 
 // Progress monitoring thread
 void progress_monitor(int total_rows) {
+    auto start_time = std::chrono::steady_clock::now();
+    
     while (!rendering_complete.load(std::memory_order_relaxed)) {
-        float progress = static_cast<float>(completed_rows.load(std::memory_order_relaxed)) / total_rows;
-        print_progress(progress);
-        std::this_thread::sleep_for(std::chrono::milliseconds(100)); // Update every 100ms
+        int completed = completed_rows.load(std::memory_order_relaxed);
+        float progress = static_cast<float>(completed) / total_rows;
+        
+        // Calculate ETA
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration<double>(now - start_time).count();
+        
+        double eta_seconds = 0.0;
+        if (progress > 0.001f) {  // Avoid division by very small numbers
+            double total_estimated = elapsed / progress;
+            eta_seconds = total_estimated - elapsed;
+        }
+        
+        print_progress(progress, eta_seconds);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
-    print_progress(1.0f); // Final update
+    print_progress(1.0f, 0.0);  // Final update
 }
 
 void error_callback(void* user_ptr, enum RTCError error, const char* str)
