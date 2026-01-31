@@ -46,17 +46,13 @@ Lorem ipsum dolor sit amet, consectetur adipiscing elit. Suspendisse congue ultr
 5. Download and extract the newest Embree v4.X release into `external\embree`
     * Note: if your version number is different than the one in the `.vscode\settings.json` file, you will need to update the path to the folder containing the `.cmake` files for Embree. For example, if your Embree version is v4.4.0, your cmake path will be: `${workspaceRoot}\external\embree\lib\cmake\embree-4.4.0`
 6. Download and extract the newest oneTBB release into `external\tbb`
-
-Cras imperdiet eros nec risus tincidunt tristique. Quisque rutrum auctor odio, sit amet lacinia enim. Aenean vel viverra lectus. Maecenas et accumsan mi, non elementum ex. Suspendisse sed nibh ac felis porttitor imperdiet. Donec massa sem, lacinia a ligula non, hendrerit suscipit justo. Suspendisse dui nibh, fermentum quis iaculis sed, tempor eget magna.
+7. Build USD. Make sure to put its /bin and /lib subfolders into the PATH variable before running PrismRT.
 
 
 🐛 Known Issues & Limitations
 ---------------------------------------
 
-* Sed vitae dui porta, tempus augue sed, fringilla leo.
-* Quisque sit amet mauris sodales neque lobortis bibendum.
-* Suspendisse malesuada justo et consequat pretium.
-* Pellentesque fermentum neque tincidunt nulla commodo lobortis.
+* Currently, no error check is performed to check if files are present or not. A file not being present will cause the application to crash.
 
 
 ⚖️ Licensing

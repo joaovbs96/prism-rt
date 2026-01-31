@@ -68,36 +68,9 @@ void print_progress(float progress) {
         std::cout << std::endl;
 }
 
-void setupUSDPlugins() {
-    pxr::PlugRegistry& registry = pxr::PlugRegistry::GetInstance();
-
-    // Add plugin search paths
-    std::filesystem::path install_path(std::getenv("USD_INSTALL_DIR"));
-    registry.RegisterPlugins((install_path / "install" / "lib" / "usd").string());
-    registry.RegisterPlugins((install_path / "install" / "lib").string());
-    registry.RegisterPlugins((install_path / "install" / "plugin").string());
-    registry.RegisterPlugins((install_path / "install" / "plugin" / "usd").string());
-
-    // List all discovered plugins
-    auto plugins = registry.GetAllPlugins();
-
-    std::cout << "Found " << plugins.size() << " registered plugins:\n\n";
-
-    for (size_t i = 0; i < plugins.size(); ++i) {
-        pxr::PlugPluginPtr plugin = plugins[i];
-        if (plugin) {
-            std::cout << plugin->GetName() << std::endl;
-        }
-    }
-
-}
-
 int main()
 {
     std::cout << "Started PrismRT..." << std::endl;
-
-    // required if any USD function is in use
-    setupUSDPlugins();
 
     // keeping these give a perf improvement
     _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
@@ -109,6 +82,7 @@ int main()
     RTCDevice device = initialize_device(1);
 
     unsigned int main_seed = 0;
+
     SceneManager* scene_mgr = new ABeautifulGame(device, main_seed);
     scene_mgr->commitScene();
     std::cout << "Finished comitting scene." << std::endl;
@@ -151,7 +125,7 @@ int main()
     });
     auto end_time = tbb::tick_count::now();
     std::cout << "Rendering took " << (end_time - start_time).seconds() << " seconds." << std::endl;
-
+    
     frame.save("output.png");
 
     // TODO: collect and release all geometry nodes from scene
