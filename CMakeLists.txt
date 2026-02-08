@@ -18,10 +18,12 @@ add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/external/tinyobj")
 
 # Automatically collect all source files from src/ and subdirectories
 file(GLOB_RECURSE PRISM_SOURCES 
+    CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp"
 )
 
 file(GLOB_RECURSE PRISM_HEADERS 
+    CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/*.h"
 )
 
