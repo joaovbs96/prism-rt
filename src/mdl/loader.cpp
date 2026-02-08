@@ -5,18 +5,18 @@
 
 namespace mdl {
 
-MDLLoader::MDLLoader(bool auto_load) {
+Loader::Loader(bool auto_load) {
     if (auto_load) {
         load();
     }
 }
 
-MDLLoader::~MDLLoader() {
+Loader::~Loader() {
     unload();
 }
 
 // Move constructor
-MDLLoader::MDLLoader(MDLLoader&& other) noexcept
+Loader::Loader(Loader&& other) noexcept
     : m_library_handle(other.m_library_handle)
     , m_neuray(other.m_neuray)
 {
@@ -25,7 +25,7 @@ MDLLoader::MDLLoader(MDLLoader&& other) noexcept
 }
 
 // Move assignment
-MDLLoader& MDLLoader::operator=(MDLLoader&& other) noexcept {
+Loader& Loader::operator=(Loader&& other) noexcept {
     if (this != &other) {
         unload();
         m_library_handle = other.m_library_handle;
@@ -37,7 +37,7 @@ MDLLoader& MDLLoader::operator=(MDLLoader&& other) noexcept {
 }
 
 // Load with C-string path
-mi::neuraylib::INeuray* MDLLoader::load(const char* library_path) {
+mi::neuraylib::INeuray* Loader::load(const char* library_path) {
     // Already loaded?
     if (is_loaded()) {
         std::cerr << "Warning: MDL SDK already loaded. Call unload() first to reload.\n";
@@ -89,12 +89,12 @@ mi::neuraylib::INeuray* MDLLoader::load(const char* library_path) {
 }
 
 // Load with std::string path
-mi::neuraylib::INeuray* MDLLoader::load(const std::string& library_path) {
+mi::neuraylib::INeuray* Loader::load(const std::string& library_path) {
     return load(library_path.c_str());
 }
 
 // Unload the library
-void MDLLoader::unload() {
+void Loader::unload() {
     // Release INeuray interface first
     if (m_neuray) {
         m_neuray->release();
@@ -117,7 +117,7 @@ void MDLLoader::unload() {
 }
 
 // Load plugin with C-string
-mi::Sint32 MDLLoader::load_plugin(const char* plugin_name) {
+mi::Sint32 Loader::load_plugin(const char* plugin_name) {
     if (!is_loaded()) {
         std::cerr << "Error: MDL SDK not loaded. Call load() first.\n";
         return -1;
@@ -172,18 +172,18 @@ mi::Sint32 MDLLoader::load_plugin(const char* plugin_name) {
 }
 
 // Load plugin with std::string
-mi::Sint32 MDLLoader::load_plugin(const std::string& plugin_name) {
+mi::Sint32 Loader::load_plugin(const std::string& plugin_name) {
     return load_plugin(plugin_name.c_str());
 }
 
 // Private: Try to load library from specific path
-bool MDLLoader::try_load_library(const std::string& path) {
+bool Loader::try_load_library(const std::string& path) {
     m_library_handle = LOAD_LIBRARY(path.c_str());
     return m_library_handle != nullptr;
 }
 
 // Private: Get factory function
-void* MDLLoader::get_factory_function() {
+void* Loader::get_factory_function() {
     if (!m_library_handle) {
         return nullptr;
     }
@@ -192,7 +192,7 @@ void* MDLLoader::get_factory_function() {
 }
 
 // Private: Create INeuray from factory
-mi::neuraylib::INeuray* MDLLoader::create_neuray(void* factory_symbol) {
+mi::neuraylib::INeuray* Loader::create_neuray(void* factory_symbol) {
     if (!factory_symbol) {
         return nullptr;
     }
@@ -221,7 +221,7 @@ mi::neuraylib::INeuray* MDLLoader::create_neuray(void* factory_symbol) {
 }
 
 // Private: Print platform-specific error
-void MDLLoader::print_error(const char* operation) {
+void Loader::print_error(const char* operation) {
 #ifdef _WIN32
     DWORD error_code = GetLastError();
     LPSTR buffer = nullptr;
@@ -253,8 +253,8 @@ void MDLLoader::print_error(const char* operation) {
 
 // Helper function for simple usage
 mi::neuraylib::INeuray* load_mdl_sdk(const char* library_path) {
-    static MDLLoader loader;  // Static to keep library loaded
+    static Loader loader;  // Static to keep library loaded
     return loader.load(library_path);
 }
 
-} // namespace mdl
+} // namespace Loader

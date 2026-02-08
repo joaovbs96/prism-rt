@@ -29,18 +29,18 @@
 namespace mdl {
 
 // RAII wrapper for MDL SDK dynamic library loading
-class MDLLoader {
+class Loader {
 public:
-    explicit MDLLoader(bool auto_load = false);
-    ~MDLLoader();
+    explicit Loader(bool auto_load = false);
+    ~Loader();
     
     // Disable copying
-    MDLLoader(const MDLLoader&) = delete;
-    MDLLoader& operator=(const MDLLoader&) = delete;
+    Loader(const Loader&) = delete;
+    Loader& operator=(const Loader&) = delete;
     
     // Enable moving
-    MDLLoader(MDLLoader&& other) noexcept;
-    MDLLoader& operator=(MDLLoader&& other) noexcept;
+    Loader(Loader&& other) noexcept;
+    Loader& operator=(Loader&& other) noexcept;
     
     // Load the MDL SDK library and create INeuray interface
     mi::neuraylib::INeuray* load(const char* library_path = nullptr);
