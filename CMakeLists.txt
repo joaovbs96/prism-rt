@@ -3,18 +3,36 @@ project(PrismRT)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED YES)
-
-set(CMAKE_EXPORT_COMPILE_COMMANDS ON)  # This line is optional. It's just for certain IDEs to use
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # tiny gltf
 set(TINYGLTF_HEADER_ONLY ON CACHE INTERNAL "" FORCE)
 set(TINYGLTF_INSTALL OFF CACHE INTERNAL "" FORCE)
+set(TINYGLTF_BUILD_LOADER_EXAMPLE OFF CACHE INTERNAL "" FORCE)
 add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/external/tinygltf")
 
 # tiny obj
+set(TINYOBJLOADER_BUILD_OBJ_STITCH OFF CACHE INTERNAL "" FORCE)
+set(TINYOBJLOADER_BUILD_TEST_LOADER OFF CACHE INTERNAL "" FORCE)
 add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/external/tinyobj")
 
-add_executable(PrismRT src/main.cpp)
+# Automatically collect all source files from src/ and subdirectories
+file(GLOB_RECURSE PRISM_SOURCES 
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp"
+)
+
+file(GLOB_RECURSE PRISM_HEADERS 
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/*.h"
+)
+
+# Print found files for debugging
+message(STATUS "Found source files:")
+foreach(SOURCE_FILE ${PRISM_SOURCES})
+    message(STATUS "  ${SOURCE_FILE}")
+endforeach()
+
+# Create executable with all found sources
+add_executable(PrismRT ${PRISM_SOURCES} ${PRISM_HEADERS})
 
 # OIIO
 find_package(OpenImageIO CONFIG REQUIRED)
@@ -44,6 +62,9 @@ target_include_directories(PrismRT PUBLIC ${PXR_INCLUDE_DIR})
 # Other libraries
 target_include_directories(PrismRT PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/external/tinygltf")
 target_include_directories(PrismRT PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/external/tinyobj")
+
+# MDL includes - there's no linking, DLLs are loaded via code (see src/mdl/loader.h)
+target_include_directories(PrismRT PUBLIC ${MDL_SDK_DIR}/include)
 
 if(MSVC)
     target_compile_options(PrismRT PUBLIC "/Zc:preprocessor")

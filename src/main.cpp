@@ -14,6 +14,7 @@
 #include <tbb/tbb.h>
 #include <embree4/rtcore.h>
 #include <xmmintrin.h>
+#include <mi/mdl_sdk.h>
 
 #include <pxr/pxr.h>
 #include <pxr/base/plug/registry.h>
@@ -37,6 +38,7 @@
 #include "sampling.h"
 #include "material.h"
 #include "scene.h"
+#include "mdl/loader.h"
 
 std::atomic<int> completed_rows{0};
 std::atomic<bool> rendering_complete{false};
@@ -112,9 +114,29 @@ RTCDevice initialize_device(int verbose)
     return device;
 }
 
+
+
 int main()
 {
     std::cout << "Started PrismRT..." << std::endl;
+
+    // load MDL SDK
+    mi::neuraylib::INeuray* neuray = mdl::load_mdl_sdk();
+    if (!neuray) {
+        std::cerr << "Failed to load MDL SDK\n";
+        return 1;
+    }
+    
+    std::cout << "MDL SDK loaded successfully.\n";
+    std::cout << "Version: " << neuray->get_version() << "\n";
+    
+    // Start the SDK
+    if (neuray->start() != 0) {
+        std::cerr << "Failed to start MDL SDK\n";
+        return 1;
+    }
+    
+    std::cout << "MDL SDK started successfully.\n";
 
     // keeping these give a perf improvement
     _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
@@ -189,10 +211,12 @@ int main()
     frame.save(output_path);
 
     // TODO: collect and release all geometry nodes from scene
-
+    
     // release scene and device resources
     rtcReleaseScene(scene_mgr->scene);
     rtcReleaseDevice(device);
 
+    neuray->shutdown();
+    
     return 0;
 }
