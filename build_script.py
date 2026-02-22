@@ -1,15 +1,12 @@
 import sys
 import os
 import subprocess
-import tempfile
-
-PROJECT_ROOT = os.path.dirname(__file__)
 
 # Visual Studio paths
-VS_SHELL = r"C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat".replace("\\", "/")
+VS_SHELL = r"C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
 
 # Environment variables
-VCPKG_ROOT = os.environ.get("VCPKG_ROOT", "").replace("\\", "/")
+VCPKG_ROOT = os.environ.get("VCPKG_ROOT", "")
 
 # Base directories
 PROGRAMMING_PROJECTS = "C:/Users/joaov/Desktop/Programming_Projects"
@@ -44,34 +41,67 @@ OSL_DIR = "C:/osl_install/lib/cmake/OSL"
 MDL_SDK_ROOT = f"{PROGRAMMING_PROJECTS}/mdl-sdk"
 MDL_SDK_DIR = MDL_SDK_ROOT
 
-def run_vs_shell(cmd:str):
-    temp_bat = os.path.join(os.path.dirname(__file__), "build_script.bat")
-    with open(temp_bat, "w") as temp_bat_obj:
-        temp_bat_obj.write(f"call \"{VS_SHELL}\"\n{cmd}")
-    print(f"call \"{temp_bat}\"")
-    return subprocess.check_call(f"call \"{temp_bat}\"", shell=True)
+def run_vs_shell(cmd: str):
+    """Run command in Visual Studio developer command prompt environment"""
+    temp_bat = os.path.join(os.path.dirname(__file__), "build_script_temp.bat")
+    
+    # Write batch file
+    with open(temp_bat, "w") as f:
+        f.write('@echo off\n')
+        f.write(f'call "{VS_SHELL}"\n')
+        f.write('if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%\n')
+        f.write(f'{cmd}\n')
+        f.write('if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%\n')
+    
+    print(f"Running: {cmd}")
+    
+    try:
+        # Run the batch file
+        result = subprocess.run(
+            temp_bat,
+            shell=True,
+            check=True
+        )
+        return result.returncode
+    except subprocess.CalledProcessError as e:
+        print(f"[ERROR] Command failed with exit code {e.returncode}")
+        raise
+    finally:
+        # Cleanup
+        if os.path.exists(temp_bat):
+            try:
+                os.remove(temp_bat)
+            except:
+                pass
 
 # Configure and build OpenSubdiv
-print("\n=== Building OpenSubdiv ===")
+print("\n" + "="*60)
+print("Building OpenSubdiv")
+print("="*60)
 additional_options = f'-DCMAKE_TOOLCHAIN_FILE="{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake" '
 additional_options += f'-DTBB_DIR="{TBB_DIR}" -DTBB_INCLUDE_DIRS="{TBB_INCLUDE_DIRS}" '
 additional_options += "-DNO_TUTORIALS=1 -DNO_EXAMPLES=1 -DNO_REGRESSION=1 "
-run_vs_shell(fr'cd "{OSD_ROOT}" & cmake -B build {additional_options} -DCMAKE_INSTALL_PREFIX=install -G "Visual Studio 17 2022" -A x64 -S .')
-run_vs_shell(fr'cd "{OSD_ROOT}" & cmake --build build --target install --config RelWithDebInfo')
+run_vs_shell(f'cd /d "{OSD_ROOT}" && cmake -B build {additional_options} -DCMAKE_INSTALL_PREFIX=install -G "Visual Studio 17 2022" -A x64 -S .')
+run_vs_shell(f'cd /d "{OSD_ROOT}" && cmake --build build --target install --config RelWithDebInfo')
 
 # Configure and build MaterialX
-print("\n=== Building MaterialX ===")
+print("\n" + "="*60)
+print("Building MaterialX")
+print("="*60)
 additional_options = f'-DCMAKE_TOOLCHAIN_FILE="{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake" '
-additional_options += "-DMATERIALX_BUILD_GEN_MDL=ON -DMATERIALX_BUILD_GEN_GLSL=OFF "
-additional_options += "-DMATERIALX_BUILD_GEN_MSL=OFF -DMATERIALX_BUILD_GEN_OSL=OFF "
+additional_options += "-DMATERIALX_BUILD_GEN_MDL=ON "
+additional_options += "-DMATERIALX_BUILD_GEN_GLSL=ON -DMATERIALX_BUILD_GEN_OSL=ON "
+additional_options += "-DMATERIALX_BUILD_GEN_ESSL=ON -DMATERIALX_BUILD_GEN_MSL=ON "
 additional_options += "-DMATERIALX_BUILD_PYTHON=OFF -DMATERIALX_BUILD_VIEWER=OFF "
-additional_options += "-DMATERIALX_BUILD_GRAPH_EDITOR=OFF -DMATERIALX_BUILD_RENDER=OFF "
+additional_options += "-DMATERIALX_BUILD_GRAPH_EDITOR=OFF -DMATERIALX_BUILD_RENDER=ON "
 additional_options += "-DMATERIALX_BUILD_TESTS=OFF -DMATERIALX_INSTALL_PYTHON=OFF "
-run_vs_shell(fr'cd "{MTLX_ROOT}" & cmake -B build {additional_options} -DCMAKE_INSTALL_PREFIX=install -G "Visual Studio 17 2022" -A x64 -S .')
-run_vs_shell(fr'cd "{MTLX_ROOT}" & cmake --build build --target install --config RelWithDebInfo')
+run_vs_shell(f'cd /d "{MTLX_ROOT}" && cmake -B build {additional_options} -DCMAKE_INSTALL_PREFIX=install -G "Visual Studio 17 2022" -A x64 -S .')
+run_vs_shell(f'cd /d "{MTLX_ROOT}" && cmake --build build --target install --config RelWithDebInfo')
 
 # Configure and build OpenUSD
-print("\n=== Building OpenUSD ===")
+print("\n" + "="*60)
+print("Building OpenUSD")
+print("="*60)
 additional_options = f'-DCMAKE_TOOLCHAIN_FILE="{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake" '
 additional_options += f'-DTBB_DIR="{TBB_DIR}" -DTBB_INCLUDE_DIRS="{TBB_INCLUDE_DIRS}" '
 additional_options += f'-DOpenSubdiv_DIR="{OSD_CMAKE_PATH}" -DOPENSUBDIV_INCLUDE_DIR="{OSD_INCLUDE_PATH}" '
@@ -79,7 +109,9 @@ additional_options += f'-DMaterialX_DIR="{MTLX_CMAKE_PATH}" '
 additional_options += "-DPXR_BUILD_TESTS=OFF -DPXR_BUILD_EXAMPLES=OFF -DPXR_BUILD_TUTORIALS=OFF "
 additional_options += "-DPXR_BUILD_USD_TOOLS=OFF -DPXR_ENABLE_PYTHON_SUPPORT=OFF "
 additional_options += "-DPXR_ENABLE_MATERIALX_SUPPORT=ON "
-run_vs_shell(fr'cd "{USD_ROOT}" & cmake -B build {additional_options} -DCMAKE_INSTALL_PREFIX=install -G "Visual Studio 17 2022" -A x64 -S .')
-run_vs_shell(fr'cd "{USD_ROOT}" & cmake --build build --target install --config RelWithDebInfo')
+run_vs_shell(f'cd /d "{USD_ROOT}" && cmake -B build {additional_options} -DCMAKE_INSTALL_PREFIX=install -G "Visual Studio 17 2022" -A x64 -S .')
+run_vs_shell(f'cd /d "{USD_ROOT}" && cmake --build build --target install --config RelWithDebInfo')
 
-print("\n=== All dependencies built successfully ===")
+print("\n" + "="*60)
+print("All dependencies built successfully!")
+print("="*60)
