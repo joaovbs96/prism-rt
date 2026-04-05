@@ -1,0 +1,33 @@
+<?xml version='1.0' encoding='utf-8'?>
+<!--
+THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE
+-->
+<materialx version="1.38">
+  <standard_surface name="SR_Plastic_Acryl" type="surfaceshader">
+    <input name="base" type="float" value="1" />
+    <input name="base_color" type="color3" value="0.0822734, 0.8, 0" />
+    <input name="diffuse_roughness" type="float" value="0.5" />
+    <input name="metalness" type="float" value="0" />
+    <input name="specular" type="float" value="0.5" />
+    <input name="specular_color" type="color3" value="1, 1, 1" />
+    <input name="specular_roughness" type="float" value="0.15" />
+    <input name="specular_IOR" type="float" value="1.45" />
+    <input name="specular_anisotropy" type="float" value="0" />
+    <input name="specular_rotation" type="float" value="0" />
+    <input name="transmission" type="float" value="0.75" />
+    <input name="transmission_color" type="color3" value="0.0822827, 0.799103, 0" />
+    <input name="transmission_depth" type="float" value="10" />
+    <input name="transmission_scatter" type="color3" value="0.0592647, 0.233013, 0" />
+    <input name="transmission_scatter_anisotropy" type="float" value="0" />
+    <input name="transmission_dispersion" type="float" value="0" />
+    <input name="transmission_extra_roughness" type="float" value="0" />
+    <input name="subsurface" type="float" value="1" />
+    <input name="subsurface_color" type="color3" value="0.516101, 1, 0.0283813" />
+    <input name="subsurface_radius" type="color3" value="1, 1, 1" />
+    <input name="subsurface_scale" type="float" value="1" />
+    <input name="subsurface_anisotropy" type="float" value="0" />
+  </standard_surface>
+  <surfacematerial name="Acryl_Plastic" type="material">
+    <input name="surfaceshader" type="surfaceshader" nodename="SR_Plastic_Acryl" />
+  </surfacematerial>
+</materialx>
