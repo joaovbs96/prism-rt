@@ -1,12 +1,13 @@
 #include "context.h"
 
 #include <format>
+#include <iostream>
 
 #include <mi/base/plugin.h>
 
 namespace mdl {
 
-Context::Context(const char* library_path)
+Context::Context(const char* library_path, const std::vector<std::string>& plugins)
     : m_is_valid(false)
 {
     // Load MDL SDK library using our Loader
@@ -18,6 +19,13 @@ Context::Context(const char* library_path)
             m_error_message += std::format(" from: {}", library_path);
         }
         return;
+    }
+    
+    // Load plugins BEFORE starting the SDK — this is required by the MDL SDK.
+    // Plugins registered after neuray->start() will be rejected.
+    if (!load_plugins(plugins)) {
+        // Non-fatal: we warn but continue. Textures may not work.
+        std::cerr << "[WARN] Some plugins failed to load (textures may not work)\n";
     }
     
     // Start the SDK
@@ -52,6 +60,27 @@ Context::~Context() {
         
         // Loader destructor will handle unloading and INeuray release
     }
+}
+
+bool Context::load_plugins(const std::vector<std::string>& plugins) {
+    bool all_ok = true;
+
+    for (const auto& name : plugins) {
+        std::string plugin_name = name + MI_BASE_DLL_FILE_EXT;
+        mi::Sint32 result = m_loader.load_plugin(plugin_name);
+
+        if (result == 0) {
+            std::cout << "[OK] Plugin loaded: " << plugin_name << "\n";
+        } else if (result == 1) {
+            std::cout << "[OK] Plugin already loaded: " << plugin_name << "\n";
+        } else {
+            std::cerr << "[WARN] Failed to load plugin: " << plugin_name
+                      << " (code: " << result << ")\n";
+            all_ok = false;
+        }
+    }
+
+    return all_ok;
 }
 
 bool Context::start_sdk() {
@@ -120,16 +149,6 @@ bool Context::add_resource_path(const std::string& path) {
     
     mi::Sint32 result = m_mdl_config->add_resource_path(path.c_str());
     return result == 0;
-}
-
-bool Context::load_plugin(const std::string& name) {
-    if (!m_is_valid) return false;
-    
-    std::string plugin_name = name + MI_BASE_DLL_FILE_EXT;
-    mi::Sint32 result = m_loader.load_plugin(plugin_name);
-    
-    // 0 = success, 1 = already loaded (both are OK)
-    return result == 0 || result == 1;
 }
 
 std::vector<std::string> Context::get_mdl_paths() const {

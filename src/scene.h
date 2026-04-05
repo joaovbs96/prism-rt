@@ -399,3 +399,64 @@ class InOneWeekendFinalDispersion : public SceneManager {
             // environment = new GradientBackground(new ColorTexture(Color3(1.0, 1.0, 1.0)), new ColorTexture(Color3(0.5, 0.7, 1.0)));
         }
 };
+
+// ============================================================
+// MaterialX Test Scene
+// ============================================================
+// Loads a .mtlx file from the assets path and renders it on a sphere.
+// The MDL SDK context must be initialized before constructing this scene.
+
+#include "mdl_material.h"
+
+class MaterialXTest : public SceneManager
+{
+public:
+    MaterialXTest(RTCDevice device_, unsigned int& seed,
+                  mdl::Context& mdl_context,
+                  const std::string& mx_libraries_path,
+                  const std::string& mx_mdl_path,
+                  const std::string& mtlx_filename = "test_material.mtlx",
+                  const std::string& material_name = "test_material")
+        : SceneManager(device_)
+    {
+        std::cout << "Started MaterialX test scene initialization." << std::endl;
+
+        // Build the full path: assets/materials/<filename>
+        std::string mtlx_path = (getAssetsPath() / "materials" / mtlx_filename).string();
+
+        // Create MDL material — self-contained compilation pipeline
+        MDLMaterial* mdl_mat = new MDLMaterial(
+            mtlx_path, material_name,
+            mdl_context, mx_libraries_path, mx_mdl_path);
+
+        if (!mdl_mat->is_valid()) {
+            std::cerr << "[MaterialXTest] WARNING: MDL material failed, using fallback magenta diffuse\n";
+        }
+
+        // Ground plane
+        add_sphere(Float3(0, -1000, 0), 1000, new Diffuse(new ColorTexture(Color3(0.5f))));
+
+        // Main sphere with the MaterialX material
+        add_sphere(Float3(0, 1, 0), 1.0f, mdl_mat);
+
+        // // Reference spheres for comparison
+        // add_sphere(Float3(-3, 1, 0), 1.0f, new Diffuse(new ColorTexture(Color3(0.8, 0.2, 0.1))));
+        // add_sphere(Float3(3, 1, 0), 1.0f, new Metal(
+        //     new ColorTexture(Color3(0.9, 0.9, 0.9)),
+        //     new ValueTexture<float>(0.1f)));
+
+        std::cout << "Finished geometry creation." << std::endl;
+
+        // Camera — looking at the center sphere
+        Float3 position(0, 2, 8);
+        Float3 target(0, 1, 0);
+        Float3 up(0.0f, 1.0f, 0.0f);
+        float vfov = 30;
+        cam = Camera(position, target, up, 1280, 720, 16.0f / 9.0f, vfov, 0.0f, 10.0f);
+
+        // Environment — gradient sky
+        environment = new GradientBackground(
+            new ColorTexture(Color3(1.0, 1.0, 1.0)),
+            new ColorTexture(Color3(0.5, 0.7, 1.0)));
+    }
+};

@@ -10,8 +10,11 @@ namespace mdl {
 // Wrapper for MDL SDK initialization and core interfaces
 class Context {
 public:
-    // Initialize MDL SDK with optional library path
-    explicit Context(const char* library_path = nullptr);
+    // Initialize MDL SDK with optional library path and plugins to load.
+    // Plugins MUST be loaded before neuray->start(), so they are passed
+    // to the constructor and loaded during initialization.
+    explicit Context(const char* library_path = nullptr,
+                     const std::vector<std::string>& plugins = { "nv_openimageio" });
     
     // Destructor handles cleanup
     ~Context();
@@ -33,18 +36,16 @@ public:
     mi::neuraylib::IMdl_impexp_api* get_impexp() const { return m_mdl_impexp.get(); }
     mi::neuraylib::IMdl_factory* get_factory() const { return m_mdl_factory.get(); }
     
-    // Convenience: Configure search paths
+    // Convenience: Configure search paths (can be called after construction)
     bool add_mdl_path(const std::string& path);
     bool add_resource_path(const std::string& path);
-    
-    // Convenience: Load plugins
-    bool load_plugin(const std::string& name);
 
     // Get configured paths
     std::vector<std::string> get_mdl_paths() const;
     std::vector<std::string> get_resource_paths() const;
 
 private:
+    bool load_plugins(const std::vector<std::string>& plugins);
     bool start_sdk();
     bool acquire_interfaces();
     

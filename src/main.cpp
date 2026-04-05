@@ -31,14 +31,8 @@
 #endif
 
 // project libraries
-#include "frame_buffer.h"
-#include "float3.h"
-#include "ray.h"
-#include "camera.h"
-#include "sampling.h"
-#include "material.h"
+#include "mdl/context.h"
 #include "scene.h"
-#include "mdl/loader.h"
 
 std::atomic<int> completed_rows{0};
 std::atomic<bool> rendering_complete{false};
@@ -118,61 +112,122 @@ RTCDevice initialize_device(int verbose)
 
 int main()
 {
-    std::cout << "Started PrismRT..." << std::endl;
-
-    // load MDL SDK
-    mi::neuraylib::INeuray* neuray = mdl::load_mdl_sdk();
-    if (!neuray) {
-        std::cerr << "Failed to load MDL SDK\n";
+    // ============================================================
+    // Phase 2: MDL SDK Initialization
+    // ============================================================
+    std::cout << "=== Phase 2: MDL SDK Initialization ===\n\n";
+    
+    // The Context constructor now:
+    //   1. Loads libmdl_sdk.dll
+    //   2. Loads plugins (nv_openimageio by default) BEFORE neuray->start()
+    //   3. Starts the SDK
+    //   4. Acquires all core interfaces
+    mdl::Context mdl_context;
+    
+    if (!mdl_context.is_valid()) {
+        std::cerr << "[ERROR] Failed to initialize MDL SDK\n";
+        std::cerr << "Error: " << mdl_context.get_error() << "\n";
         return 1;
     }
     
-    std::cout << "MDL SDK loaded successfully.\n";
-    std::cout << "Version: " << neuray->get_version() << "\n";
+    std::cout << "[OK] MDL SDK initialized\n";
+    std::cout << "Version: " << mdl_context.get_neuray()->get_version() << "\n\n";
     
-    // Start the SDK
-    if (neuray->start() != 0) {
-        std::cerr << "Failed to start MDL SDK\n";
+    // Verify core interfaces
+    std::cout << "=== Verifying Core Interfaces ===\n";
+    
+    if (mdl_context.get_database())
+        std::cout << "[OK] IDatabase interface acquired\n";
+    if (mdl_context.get_config())
+        std::cout << "[OK] IMdl_configuration interface acquired\n";
+    if (mdl_context.get_impexp())
+        std::cout << "[OK] IMdl_impexp_api interface acquired\n";
+    if (mdl_context.get_factory())
+        std::cout << "[OK] IMdl_factory interface acquired\n";
+    
+    // Test database/transaction system
+    std::cout << "\n=== Testing Database System ===\n";
+    
+    mi::base::Handle<mi::neuraylib::IScope> scope(
+        mdl_context.get_database()->get_global_scope());
+    
+    if (!scope) {
+        std::cerr << "[ERROR] Failed to get global scope\n";
         return 1;
     }
+    std::cout << "[OK] Global scope acquired\n";
     
-    std::cout << "MDL SDK started successfully.\n";
+    mi::base::Handle<mi::neuraylib::ITransaction> transaction(
+        scope->create_transaction());
+    
+    if (!transaction) {
+        std::cerr << "[ERROR] Failed to create transaction\n";
+        return 1;
+    }
+    std::cout << "[OK] Transaction created\n";
+    
+    transaction->commit();
+    std::cout << "[OK] Transaction committed\n";
+    
+    // Test backend API
+    std::cout << "\n=== Testing Compilation Backend ===\n";
+    
+    mi::base::Handle<mi::neuraylib::IMdl_backend_api> backend_api(
+        mdl_context.get_neuray()->get_api_component<mi::neuraylib::IMdl_backend_api>());
+    
+    if (!backend_api) {
+        std::cerr << "[ERROR] Failed to get backend API\n";
+        return 1;
+    }
+    std::cout << "[OK] Backend API acquired\n";
+    
+    mi::base::Handle<mi::neuraylib::IMdl_backend> cpu_backend(
+        backend_api->get_backend(mi::neuraylib::IMdl_backend_api::MB_NATIVE));
+    
+    if (!cpu_backend) {
+        std::cerr << "[ERROR] Failed to get native backend\n";
+        return 1;
+    }
+    std::cout << "[OK] Native backend (CPU) available\n";
+    
+    std::cout << "\n" << std::string(60, '=') << "\n";
+    std::cout << "PHASE 2 COMPLETE - SDK Ready\n";
+    std::cout << std::string(60, '=') << "\n";
+    
+    // ============================================================
+    // Phase 9: Render with MaterialX Material
+    // ============================================================
+    std::cout << "\n=== Phase 9: Rendering with MaterialX Material ===\n\n";
 
-    // keeping these give a perf improvement
+    // MaterialX config paths
+    std::string mx_libraries_path = "C:/Users/joaov/Desktop/Programming_Projects/external_deps/MaterialX/install/libraries";
+    std::string mx_mdl_path = mx_libraries_path + "/mdl";
+
     _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
     _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);
 
-    int samples = 1000;
+    int samples = 256;
     int max_depth = 10;
 
-    RTCDevice device = initialize_device(1);
-
+    RTCDevice device = initialize_device(0);
     unsigned int main_seed = 0;
 
-    SceneManager* scene_mgr = new ABeautifulGame(device, main_seed);
+    // Create the scene — MDLMaterial compiles the .mtlx internally
+    SceneManager* scene_mgr = new MaterialXTest(
+        device, main_seed,
+        mdl_context, mx_libraries_path, mx_mdl_path,
+        "C:/Users/joaov/Downloads/Rock058_1K-JPG/Rock058_1K-JPG.mtlx", "Rock058_1K_JPG");
+
     scene_mgr->commitScene();
-    std::cout << "Finished comitting scene." << std::endl;
-
-    RTCRayQueryContext context;
-    rtcInitRayQueryContext(&context);
-
-    RTCIntersectArguments intersectArgs;
-    rtcInitIntersectArguments(&intersectArgs);
-    intersectArgs.context = &context;
+    std::cout << "Finished committing scene." << std::endl;
 
     FrameBuffer frame(scene_mgr->image_width, scene_mgr->image_height);
-
-    std::cout << "Finished creating frame buffer." << std::endl;
-
-    // Debugging, if we want to print something during rendering.
-    // tbb::global_control gc(tbb::global_control::max_allowed_parallelism, 1);
+    std::cout << "Rendering " << scene_mgr->image_width << "x" << scene_mgr->image_height
+              << " @ " << samples << " spp, max depth " << max_depth << std::endl;
 
     completed_rows = 0;
     rendering_complete = false;
 
-    std::cout << "Starded rendering..." << std::endl;
-
-    // Start progress monitoring thread
     std::thread progress_thread(progress_monitor, scene_mgr->image_height);
 
     auto start_time = tbb::tick_count::now();
@@ -182,21 +237,17 @@ int main()
         {
             unsigned int seed = tea<64>(row * scene_mgr->image_width, column);
 
-            // render for N samples
             Color3 pixel_color(0.0f);
             for (int spp = 0; spp < samples; spp++)
             {
-                // create new ray and trace it
                 RTCRay ray = scene_mgr->cam.get_ray(column, row, seed);
                 pixel_color += scene_mgr->trace(ray, max_depth, seed);
             }
 
-            // average samples out and put it in the frame buffer
             pixel_color /= samples;
             frame.setPixel(column, row, pixel_color.gamma_correct());
         });
 
-        // Increment completed rows (lock-free)
         completed_rows.fetch_add(1, std::memory_order_relaxed);
     });
 
@@ -207,16 +258,13 @@ int main()
     std::cout << "Rendering took " << (end_time - start_time).seconds() << " seconds." << std::endl;
 
     std::filesystem::path output_path = std::filesystem::current_path() / "output.png";
-    std::cout << "Saving Image to File: " << output_path;
+    std::cout << "Saving Image to File: " << output_path << std::endl;
     frame.save(output_path);
 
-    // TODO: collect and release all geometry nodes from scene
-    
-    // release scene and device resources
+    // Cleanup
     rtcReleaseScene(scene_mgr->scene);
     rtcReleaseDevice(device);
+    delete scene_mgr;
 
-    neuray->shutdown();
-    
     return 0;
 }
