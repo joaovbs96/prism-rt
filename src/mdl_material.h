@@ -23,11 +23,12 @@ public:
     //   mdl_context:       initialized MDL SDK context (from main)
     //   mx_libraries_path: path to MaterialX install libraries/
     //   mx_mdl_path:       path to MaterialX install libraries/mdl/
+    //   material_name:     name of the material node (empty = use first material found)
     MDLMaterial(const std::string& mtlx_path,
-                const std::string& material_name,
                 mdl::Context& mdl_context,
                 const std::string& mx_libraries_path,
-                const std::string& mx_mdl_path)
+                const std::string& mx_mdl_path,
+                const std::string& material_name = "")
     {
         std::cout << "[MDLMaterial] Compiling: " << mtlx_path << "\n";
 
@@ -42,7 +43,20 @@ public:
             return;
         }
 
-        GeneratedMDL gen = generator.generate(doc, material_name);
+        // Resolve material name — use provided name or find the first material node
+        std::string mat_name = material_name;
+        if (mat_name.empty()) {
+            auto materials = doc->getMaterialNodes();
+            if (materials.empty()) {
+                std::cerr << "[MDLMaterial] ERROR: No material nodes found in " << mtlx_path << "\n";
+                m_valid = false;
+                return;
+            }
+            mat_name = materials[0]->getName();
+            std::cout << "[MDLMaterial] Auto-detected material: " << mat_name << "\n";
+        }
+
+        GeneratedMDL gen = generator.generate(doc, mat_name);
         if (!gen.success) {
             std::cerr << "[MDLMaterial] ERROR: MDL generation failed: " << gen.error_message << "\n";
             m_valid = false;
