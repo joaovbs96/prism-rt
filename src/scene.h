@@ -408,26 +408,25 @@ class InOneWeekendFinalDispersion : public SceneManager {
 
 #include "mdl_material.h"
 
+// TODO: copy the libraries to the executable folder and get it from the appropriate path
+// MaterialX config paths
+std::string mx_libraries_path = "C:/Users/joaov/Desktop/Programming_Projects/external_deps/MaterialX/install/libraries";
+std::string mx_mdl_path = mx_libraries_path + "/mdl";
+
 class MaterialXTest : public SceneManager
 {
 public:
-    MaterialXTest(RTCDevice device_, unsigned int& seed,
-                  mdl::Context& mdl_context,
-                  const std::string& mx_libraries_path,
-                  const std::string& mx_mdl_path,
-                  const std::string& mtlx_filename = "test_material.mtlx",
-                  const std::string& material_name = "test_material")
+    MaterialXTest(RTCDevice device_, unsigned int& seed, mdl::Context& mdl_context)
         : SceneManager(device_)
     {
         std::cout << "Started MaterialX test scene initialization." << std::endl;
 
         // Build the full path: assets/materials/<filename>
-        std::string mtlx_path = (getAssetsPath() / "materials" / mtlx_filename).string();
+        std::string mtlx_path = (getAssetsPath() / "materials" / "Carrot_Knitted_Fabric_1k_8b_sdsrBMH" / "Carrot_Knitted_Fabric.mtlx").string();
 
         // Create MDL material — self-contained compilation pipeline
-        MDLMaterial* mdl_mat = new MDLMaterial(
-            mtlx_path, material_name,
-            mdl_context, mx_libraries_path, mx_mdl_path);
+        // Empty material_name = auto-detect first material in file
+        MDLMaterial* mdl_mat = new MDLMaterial(mtlx_path, mdl_context, mx_libraries_path, mx_mdl_path);
 
         if (!mdl_mat->is_valid()) {
             std::cerr << "[MaterialXTest] WARNING: MDL material failed, using fallback magenta diffuse\n";
@@ -438,12 +437,6 @@ public:
 
         // Main sphere with the MaterialX material
         add_sphere(Float3(0, 1, 0), 1.0f, mdl_mat);
-
-        // // Reference spheres for comparison
-        // add_sphere(Float3(-3, 1, 0), 1.0f, new Diffuse(new ColorTexture(Color3(0.8, 0.2, 0.1))));
-        // add_sphere(Float3(3, 1, 0), 1.0f, new Metal(
-        //     new ColorTexture(Color3(0.9, 0.9, 0.9)),
-        //     new ValueTexture<float>(0.1f)));
 
         std::cout << "Finished geometry creation." << std::endl;
 

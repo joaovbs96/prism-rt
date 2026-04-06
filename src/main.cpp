@@ -199,10 +199,6 @@ int main()
     // ============================================================
     std::cout << "\n=== Phase 9: Rendering with MaterialX Material ===\n\n";
 
-    // MaterialX config paths
-    std::string mx_libraries_path = "C:/Users/joaov/Desktop/Programming_Projects/external_deps/MaterialX/install/libraries";
-    std::string mx_mdl_path = mx_libraries_path + "/mdl";
-
     _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
     _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);
 
@@ -213,10 +209,7 @@ int main()
     unsigned int main_seed = 0;
 
     // Create the scene — MDLMaterial compiles the .mtlx internally
-    SceneManager* scene_mgr = new MaterialXTest(
-        device, main_seed,
-        mdl_context, mx_libraries_path, mx_mdl_path,
-        "C:/Users/joaov/Downloads/Rock058_1K-JPG/Rock058_1K-JPG.mtlx", "Rock058_1K_JPG");
+    SceneManager* scene_mgr = new MaterialXTest(device, main_seed, mdl_context);
 
     scene_mgr->commitScene();
     std::cout << "Finished committing scene." << std::endl;
