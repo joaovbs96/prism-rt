@@ -289,6 +289,12 @@ CompiledMaterial MaterialCompiler::compile(const GeneratedMDL& generated_mdl,
         return result;
     }
 
+    // Tell the SDK that the scene/rendering colorspace is linear Rec.709.
+    // This matches the colorspace="lin_rec709" declaration in the .mtlx document
+    // and ensures sRGB->linear conversion is correctly applied for textures
+    // tagged with colorspace="srgb_texture" when the native backend compiles them.
+    context->set_option("target_color_space", "lin_rec709");
+
     // Create a transaction for this compilation
     mi::base::Handle<mi::neuraylib::IScope> scope(
         m_ctx.get_database()->get_global_scope());
@@ -355,17 +361,44 @@ CompiledMaterial MaterialCompiler::compile(const GeneratedMDL& generated_mdl,
     // Sanitize texture paths in the generated MDL source.
     // MaterialX fileprefix="./" produces paths like "./texture.jpg" in the MDL code,
     // but the MDL SDK rejects strict relative paths ("./") in string-based modules.
-    // Replace them with root-relative paths ("/texture.jpg") which the SDK resolves
-    // via the configured resource search paths.
+    //
+    // We resolve them to absolute paths using the .mtlx document directory.
+    // This is more robust than converting to root-relative paths ("/texture.jpg")
+    // because it doesn't depend on the SDK's resource search path ordering --
+    // the texture location is unambiguous regardless of when paths were registered.
     std::string mdl_source = generated_mdl.mdl_source;
     {
-        // Replace all occurrences of "./ in texture paths with "/
-        std::string search = "\"./";
-        std::string replace = "\"/";
-        size_t pos = 0;
-        while ((pos = mdl_source.find(search, pos)) != std::string::npos) {
-            mdl_source.replace(pos, search.length(), replace);
-            pos += replace.length();
+        std::string doc_dir_prefix;
+        if (!mtlx_path.empty()) {
+            std::filesystem::path doc_dir = std::filesystem::path(mtlx_path).parent_path();
+            if (!doc_dir.empty()) {
+                // Normalize to forward slashes so the MDL SDK accepts it on all platforms
+                std::string doc_dir_str = doc_dir.string();
+                std::replace(doc_dir_str.begin(), doc_dir_str.end(), '\\', '/');
+                doc_dir_prefix = doc_dir_str + "/";
+            }
+        }
+
+        if (!doc_dir_prefix.empty()) {
+            // Replace "./ with "<absolute_doc_dir>/ so paths become fully qualified
+            std::string search = "\"./";
+            std::string replace = "\"" + doc_dir_prefix;
+            size_t pos = 0;
+            while ((pos = mdl_source.find(search, pos)) != std::string::npos) {
+                mdl_source.replace(pos, search.length(), replace);
+                pos += replace.length();
+            }
+            std::cout << "[OK] Resolved relative texture paths to: " << doc_dir_prefix << "\n";
+        } else {
+            // Fallback: no .mtlx path available, use root-relative resolution
+            std::cout << "[WARN] No .mtlx path provided; falling back to root-relative texture paths\n";
+            std::string search = "\"./";
+            std::string replace = "\"/";
+            size_t pos = 0;
+            while ((pos = mdl_source.find(search, pos)) != std::string::npos) {
+                mdl_source.replace(pos, search.length(), replace);
+                pos += replace.length();
+            }
         }
     }
 

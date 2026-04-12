@@ -1,6 +1,7 @@
 #pragma once
 
 #include <filesystem>
+#include <stdexcept>
 
 #include <embree4/rtcore.h>
 #include <embree4/rtcore_common.h>
@@ -41,8 +42,16 @@ public:
         return getExecutableFolder() / "assets";
     }
 
-    Geometry *add_mesh(const std::filesystem::path &file_path, Material *material_override = nullptr)
+    Geometry *add_mesh(
+        const std::filesystem::path &file_path,
+        Material *material_override = nullptr,
+        mdl::Context* mdl_context = nullptr,
+        const std::string& mx_libraries_path = "",
+        const std::string& mx_mdl_path = ""
+    )
     {
+        if (!std::filesystem::exists(file_path))
+            throw std::runtime_error("File not found: " + file_path.string());
 
         Mesh *mesh;
         if (file_path.extension() == ".obj")
@@ -50,7 +59,7 @@ public:
         else if ((file_path.extension() == ".gltf") || (file_path.extension() == ".glb"))
             mesh = new glTFMesh(file_path);
         else if ((file_path.extension() == ".usd") || (file_path.extension() == ".usda") || (file_path.extension() == ".usdz") || (file_path.extension() == ".usdc"))
-            mesh = new USDMesh(file_path);
+            mesh = new USDMesh(file_path, mdl_context, mx_libraries_path, mx_mdl_path);
 
         if (material_override != nullptr)
         {
@@ -422,7 +431,7 @@ public:
         std::cout << "Started MaterialX test scene initialization." << std::endl;
 
         // Build the full path: assets/materials/<filename>
-        std::string mtlx_path = (getAssetsPath() / "materials" / "Carrot_Knitted_Fabric_1k_8b_sdsrBMH" / "Carrot_Knitted_Fabric.mtlx").string();
+        std::string mtlx_path = "C:/Users/joaov/Downloads/Gold.mtlx";
 
         // Create MDL material — self-contained compilation pipeline
         // Empty material_name = auto-detect first material in file
@@ -451,5 +460,33 @@ public:
         environment = new GradientBackground(
             new ColorTexture(Color3(1.0, 1.0, 1.0)),
             new ColorTexture(Color3(0.5, 0.7, 1.0)));
+    }
+};
+
+class ABeautifulGameMtlX : public SceneManager
+{
+public:
+    ABeautifulGameMtlX(RTCDevice device_, unsigned int &seed, mdl::Context& mdl_context) : SceneManager(device_)
+    {
+        std::cout << "Started scene initialization." << std::endl;
+        add_mesh(getAssetsPath() / "models" / "OpenChessSet" / "chess_set.usda", nullptr, &mdl_context, mx_libraries_path, mx_mdl_path);
+
+        std::cout << "Finished geometry creation." << std::endl;
+
+        // camera initialization
+        Float3 position(0.8, 0.15, 0.7);
+        Float3 target(0.0f, 0.05, 0.0);
+        Float3 up(0.0f, 1.0f, 0.0f);
+        float vfov = 12;
+        cam = Camera(position, target, up, 1280, 720, 16.0f / 9.0f, vfov, 0.0f, 10.0f);
+
+        // // environment map - for missed rays
+        ImageTexture<Float3> *texture = new ImageTexture<Float3>(getAssetsPath() / "environment" / "IndoorEnvironmentHDRI003_4K-HDR.exr");
+        texture->adjustExposure(-0.5f);
+        environment = new EnvironmentMap(texture);
+        // Environment — gradient sky
+        // environment = new GradientBackground(
+        //     new ColorTexture(Color3(1.0, 1.0, 1.0)),
+        //     new ColorTexture(Color3(0.5, 0.7, 1.0)));
     }
 };
