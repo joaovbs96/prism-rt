@@ -130,12 +130,6 @@ if(MSVC)
     target_compile_options(PrismRT PUBLIC "/Zc:preprocessor")
 endif()
 
-# Copies DLLs our executable depends on to the build folder automatically
-add_custom_command(TARGET PrismRT POST_BUILD
-  COMMAND ${CMAKE_COMMAND} -E copy -t $<TARGET_FILE_DIR:PrismRT> $<TARGET_RUNTIME_DLLS:PrismRT>
-  COMMAND_EXPAND_LISTS
-)
-
 add_custom_target(copy_assets ALL
     COMMAND ${CMAKE_COMMAND} -E copy_directory
         ${CMAKE_SOURCE_DIR}/assets
