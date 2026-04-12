@@ -120,22 +120,22 @@ public:
             m_target.functions.init_function_index,
             ss.state, nullptr, nullptr);
 
-        // Cutout opacity
-        float opacity = 1.0f;
-        {
-            mi::Float32 opacity_result = 1.0f;
-            m_target.target_code->execute(
-                m_target.functions.cutout_opacity_function_index,
-                ss.state, nullptr, nullptr, &opacity_result);
-            opacity = opacity_result;
-        }
-        if (opacity < rnd(seed)) {
-            s.scattered = true;
-            s.color = Color3(1.0f);
-            s.emission = Color3(0.0f);
-            s.wi = ray_hit.d;
-            return s;
-        }
+        // // Cutout opacity
+        // float opacity = 1.0f;
+        // {
+        //     mi::Float32 opacity_result = 1.0f;
+        //     m_target.target_code->execute(
+        //         m_target.functions.cutout_opacity_function_index,
+        //         ss.state, nullptr, nullptr, &opacity_result);
+        //     opacity = opacity_result;
+        // }
+        // if (opacity < rnd(seed)) {
+        //     s.scattered = true;
+        //     s.color = Color3(1.0f);
+        //     s.emission = Color3(0.0f);
+        //     s.wi = ray_hit.d;
+        //     return s;
+        // }
 
         // BSDF sample
         mi::neuraylib::Bsdf_sample_data sd;
