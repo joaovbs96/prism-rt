@@ -63,7 +63,7 @@ TargetCode BackendCompiler::generate_target_code(const CompiledMaterial& compile
 
     // Configure backend options
     backend->set_option("num_texture_spaces", "1");
-    backend->set_option("num_texture_results", "16");
+    backend->set_option("num_texture_results", "128");
     backend->set_option("enable_auxiliary", "on");
 
     std::cout << "[OK] Native backend acquired and configured\n";

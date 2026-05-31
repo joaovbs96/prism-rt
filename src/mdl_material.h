@@ -34,7 +34,7 @@ public:
 
         // Phase 3: MaterialX -> MDL code generation
         MDLGenerator generator(mx_libraries_path);
-        DocumentLoader doc_loader(generator.get_stdlib());
+        DocumentLoader doc_loader(generator.get_stdlib(), true);
 
         MaterialX::DocumentPtr doc = doc_loader.load(mtlx_path);
         if (!doc) {
@@ -114,7 +114,8 @@ public:
             return s;
         }
 
-        ShadingStateData ss = build_shading_state(ray_hit);
+        ShadingStateData ss;
+        build_shading_state(ray_hit, ss);
 
         m_target.target_code->execute_init(
             m_target.functions.init_function_index,
@@ -140,7 +141,8 @@ public:
         // BSDF sample
         mi::neuraylib::Bsdf_sample_data sd;
         memset(&sd, 0, sizeof(sd));
-        sd.k1 = mi::Float32_3(-ray_hit.d.x(), -ray_hit.d.y(), -ray_hit.d.z());
+        Float3 d_normalized = ray_hit.d.normalize();
+        sd.k1 = mi::Float32_3(-d_normalized.x(), -d_normalized.y(), -d_normalized.z());
         sd.ior1 = mi::Float32_3(1.0f, 1.0f, 1.0f);
         sd.ior2 = mi::Float32_3(MI_NEURAYLIB_BSDF_USE_MATERIAL_IOR);
         sd.xi.x = rnd(seed);
@@ -163,6 +165,8 @@ public:
         s.scattered = true;
         s.wi = Float3(sd.k2.x, sd.k2.y, sd.k2.z);
         s.color = Color3(sd.bsdf_over_pdf.x, sd.bsdf_over_pdf.y, sd.bsdf_over_pdf.z);
+        // std::cout << "===================================================" << std::endl;
+        // std::cout << "SAMPLED COLOR:" << s.color << std::endl;
         s.emission = get_emission(ss.state);
         return s;
     }
@@ -179,7 +183,8 @@ public:
 
     Color3 evaluate_emission(const RayHit ray_hit) override {
         if (!m_valid) return Color3(0.0f);
-        ShadingStateData ss = build_shading_state(ray_hit);
+        ShadingStateData ss;
+        build_shading_state(ray_hit, ss);
         m_target.target_code->execute_init(
             m_target.functions.init_function_index,
             ss.state, nullptr, nullptr);
@@ -193,12 +198,11 @@ private:
         mi::Float32_3 tangent_u;
         mi::Float32_3 tangent_v;
         mi::neuraylib::tct_float4 identity[4];
-        mi::Float32_4 text_results[16];
+        mi::neuraylib::tct_float4 text_results[128];
     };
 
-    ShadingStateData build_shading_state(const RayHit& hit) const
+    void build_shading_state(const RayHit& hit, ShadingStateData& ss) const
     {
-        ShadingStateData ss;
         memset(&ss, 0, sizeof(ss));
 
         // UV
@@ -238,8 +242,6 @@ private:
         ss.state.object_to_world = ss.identity;
         ss.state.object_id       = 0;
         ss.state.meters_per_scene_unit = 1.0f;
-
-        return ss;
     }
 
     Color3 get_emission(mi::neuraylib::Shading_state_material& state) const

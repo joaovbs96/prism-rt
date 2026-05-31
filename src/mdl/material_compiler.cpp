@@ -2,6 +2,7 @@
 
 #include <format>
 #include <filesystem>
+#include <fstream>
 #include <set>
 
 namespace mdl {
@@ -193,6 +194,24 @@ MaterialCompiler::compile_instance(
     if (!mat_instance) {
         std::cerr << std::format("[ERROR] Material instance '{}' not found in DB\n", instance_name);
         return {};
+    }
+
+    // Set target type to SID_MATERIAL so MaterialX's material output is converted to MDL's
+    // standard material struct. Required for conductor Fresnel to work with F0 > 1.0:
+    // without this, the F0->IOR formula (1+sqrt(F0))/(1-sqrt(F0)) is singular for F0>=1.
+    mi::base::Handle<mi::neuraylib::IType_factory> tf(
+        m_ctx.get_factory()->create_type_factory(transaction));
+    mi::base::Handle<const mi::neuraylib::IType> standard_material_type(
+        tf->get_predefined_struct(mi::neuraylib::IType_struct::SID_MATERIAL));
+    mi::Sint32 opt_result = context->set_option("target_type", standard_material_type.get());
+    if (opt_result != 0) {
+        std::cerr << std::format("[WARN] set_option(target_type) failed (code: {})\n", opt_result);
+        std::cerr << "       Conductor Fresnel for F0 > 1 may not work correctly\n";
+    }
+    if (context->get_messages_count() > 0) {
+        std::cout << "  Messages after set_option(target_type):\n";
+        print_context_messages(context);
+        context->clear_messages();
     }
 
     // Compile the material instance
@@ -399,6 +418,29 @@ CompiledMaterial MaterialCompiler::compile(const GeneratedMDL& generated_mdl,
                 mdl_source.replace(pos, search.length(), replace);
                 pos += replace.length();
             }
+        }
+    }
+
+    // Dump the final MDL source next to the .mtlx file for inspection
+    {
+        std::string dump_name = module_name;
+        if (dump_name.size() >= 2 && dump_name[0] == ':' && dump_name[1] == ':')
+            dump_name = dump_name.substr(2);
+        std::replace(dump_name.begin(), dump_name.end(), ':', '_');
+        dump_name += ".mdl";
+
+        std::filesystem::path dump_path;
+        if (!mtlx_path.empty())
+            dump_path = std::filesystem::path(mtlx_path).parent_path() / dump_name;
+        else
+            dump_path = std::filesystem::current_path() / dump_name;
+
+        std::ofstream f(dump_path);
+        if (f) {
+            f << mdl_source;
+            std::cout << "[DEBUG] Dumped generated MDL to: " << dump_path.string() << "\n";
+        } else {
+            std::cerr << "[WARN] Could not write MDL dump to: " << dump_path.string() << "\n";
         }
     }
 
