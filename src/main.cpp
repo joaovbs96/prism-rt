@@ -30,6 +30,9 @@
 #define _MM_SET_DENORMALS_ZERO_MODE(x) (_mm_setcsr((_mm_getcsr() & ~_MM_DENORMALS_ZERO_MASK) | (x)))
 #endif
 
+// #include <tbb/global_control.h>
+// tbb::global_control gc(tbb::global_control::max_allowed_parallelism, 1);
+
 // project libraries
 #include "mdl/context.h"
 #include "scene.h"
@@ -238,7 +241,7 @@ int main()
             }
 
             pixel_color /= samples;
-            frame.setPixel(column, row, pixel_color.gamma_correct());
+            frame.setPixel(column, row, pixel_color);
         });
 
         completed_rows.fetch_add(1, std::memory_order_relaxed);
@@ -249,6 +252,8 @@ int main()
 
     auto end_time = tbb::tick_count::now();
     std::cout << "Rendering took " << (end_time - start_time).seconds() << " seconds." << std::endl;
+
+    frame.applyGammaCorrection();
 
     std::filesystem::path output_path = std::filesystem::current_path() / "output.png";
     std::cout << "Saving Image to File: " << output_path << std::endl;

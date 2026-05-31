@@ -133,6 +133,10 @@ public:
 
             // BRDFSample: surface hit color + scattered light ray
             BRDFSample s = material->sample(ray_hit, seed);
+            // MDLMaterial* d = dynamic_cast<MDLMaterial*>(material);
+            // if (d != nullptr) {
+            //     std::cout << "Color:" << s.color << std::endl;
+            // }
             if (!s.scattered)
                 return s.emission;
 
