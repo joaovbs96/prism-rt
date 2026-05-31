@@ -7,7 +7,7 @@ class DocumentLoader
 {
 public:
     // Takes the stdlib from MDLGenerator so both share the same instance
-    explicit DocumentLoader(MaterialX::DocumentPtr stdlib);
+    explicit DocumentLoader(MaterialX::DocumentPtr stdlib, bool clamp = false);
 
     MaterialX::DocumentPtr load(const std::string& filepath);
     MaterialX::DocumentPtr create_empty();
@@ -15,4 +15,5 @@ public:
 
 private:
     MaterialX::DocumentPtr m_stdlib;
+    bool m_clamp;
 };
