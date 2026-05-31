@@ -1,6 +1,7 @@
 #pragma once
 
 #include <OpenImageIO/imagebuf.h>
+#include <OpenImageIO/imagebufalgo.h>
 #include <OpenImageIO/span.h>
 #include <OpenImageIO/imageio.h>
 using namespace OIIO;
@@ -20,9 +21,9 @@ class FrameBuffer{
             buffer = ImageBuf(spec);
         }
 
-        void setPixel(int row, int column, Color3 color) {
+        void setPixel(int column, int row, Color3 color) {
             Color3 clamped_color = color.clamp(0.0f, 1.0f);
-            buffer.setpixel(row, column, cspan<float>(clamped_color.buffer));
+            buffer.setpixel(column, row, cspan<float>(clamped_color.buffer));
         }
 
         bool save(const char* file_path) {
@@ -35,5 +36,9 @@ class FrameBuffer{
 
         bool save(std::filesystem::path file_path) {
             return save(file_path.string().c_str());
+        }
+
+        void applyGammaCorrection(float gamma = 2.2f) {
+            ImageBufAlgo::pow(buffer, buffer, 1.0f / gamma);
         }
 };
