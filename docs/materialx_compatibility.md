@@ -115,6 +115,22 @@ standard-library document. The MaterialX libraries are therefore loaded once per
 process rather than once per material. Generation through the shared instance is
 serialized with a mutex because its `GenContext` is shared state.
 
+## MDL module naming
+
+The generator names a module after its material alone (`::materialx::Gold`).
+The MDL database is global, and `load_module_from_string` reports a duplicate
+name as success while keeping the *first* definition, so two documents defining
+the same material name would silently share one shader. `MaterialCompiler`
+therefore suffixes the module name with a 64-bit FNV-1a hash of the weakly
+canonical document path plus the material name, e.g.
+`::materialx::M_Pawn_Top_B_6343e2a651b69193`. FNV-1a rather than `std::hash`
+keeps names, and the MDL dump filenames derived from them, stable across runs.
+A remaining duplicate is logged as `[WARN] Module ... was already loaded`.
+
+Recovered UsdShade documents are written to a temp file named after the full
+prim path rather than the leaf name, so same-named materials in different
+scopes get distinct files and hence distinct modules.
+
 The loading summary reports compiled, reused, and bound counts separately.
 This improves material-loading work, not path-tracing convergence. Camera rays
 already use independent uniform subpixel jitter in `Camera::sample_square`, called

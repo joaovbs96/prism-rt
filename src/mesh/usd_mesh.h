@@ -35,6 +35,7 @@
 #include <pxr/base/vt/array.h>
 #include <pxr/usd/usdGeom/tokens.h>
 #include <pxr/base/tf/token.h>
+#include <pxr/base/tf/stringUtils.h>
 
 // Hydra / hdMtlx deps for UsdShade -> MaterialX recovery
 #include <pxr/imaging/hd/material.h>
@@ -283,7 +284,10 @@ CompileMtlxMaterial(const ResolvedMtlxMaterial& resolved,
     }
 
     std::filesystem::path tempDir  = std::filesystem::temp_directory_path();
-    std::filesystem::path tempMtlx = tempDir / (resolved.materialPath.GetName() + "_recovered.mtlx");
+    // Full prim path, not just the leaf: same-named materials in different
+    // scopes must not share a temp file (and thus an MDL module name).
+    std::filesystem::path tempMtlx = tempDir /
+        (TfMakeValidIdentifier(resolved.materialPath.GetString()) + "_recovered.mtlx");
 
     try {
         mx::writeToXmlFile(resolved.document, tempMtlx.string());

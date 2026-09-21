@@ -1,11 +1,44 @@
 #include "material_compiler.h"
 
+#include <cstdint>
 #include <format>
 #include <filesystem>
 #include <fstream>
 #include <set>
 
 namespace mdl {
+
+namespace {
+
+// Stable 64-bit FNV-1a, so module names (and MDL dump filenames) do not change
+// between runs or standard-library implementations the way std::hash may.
+std::string fnv1a_hex(const std::string& text) {
+    std::uint64_t hash = 14695981039346656037ull;
+    for (unsigned char c : text) {
+        hash ^= c;
+        hash *= 1099511628211ull;
+    }
+    return std::format("{:016x}", hash);
+}
+
+// The generator names modules after the material alone, so two documents that
+// both define e.g. "Gold" would collide in the MDL database -- and the SDK
+// reports a duplicate module as success, silently reusing the first shader.
+// Suffix the name with a hash of the source document path + material name.
+std::string make_unique_module_name(const std::string& module_name,
+                                    const std::string& mtlx_path) {
+    if (mtlx_path.empty())
+        return module_name;
+
+    std::error_code error;
+    std::filesystem::path canonical = std::filesystem::weakly_canonical(mtlx_path, error);
+    const std::string path_key = error ? mtlx_path : canonical.generic_string();
+
+    const std::string simple_name = module_name.substr(module_name.rfind("::") + 2);
+    return module_name + "_" + fnv1a_hex(path_key + "\n" + simple_name);
+}
+
+} // namespace
 
 MaterialCompiler::MaterialCompiler(Context& ctx, const std::string& mx_mdl_path)
     : m_ctx(ctx)
@@ -79,6 +112,10 @@ bool MaterialCompiler::load_module_from_string(
         std::cerr << std::format("[ERROR] load_module_from_string failed (code: {})\n", result);
         return false;
     }
+    // 1 = a module of this name already exists; the SDK keeps the old one and
+    // ignores the new source.
+    if (result == 1)
+        std::cerr << std::format("[WARN] Module '{}' was already loaded; reusing the existing definition\n", module_name);
 
     return true;
 }
@@ -372,8 +409,9 @@ CompiledMaterial MaterialCompiler::compile(const GeneratedMDL& generated_mdl,
     // --- Step 4.2: Load MDL from string ---
     std::cout << "\n--- Step 4.2: Loading MDL into SDK ---\n";
 
-    // The module_name from GeneratedMDL is like "::materialx::test_material"
-    std::string module_name = generated_mdl.module_name;
+    // The module_name from GeneratedMDL is like "::materialx::test_material";
+    // make it unique per source document.
+    std::string module_name = make_unique_module_name(generated_mdl.module_name, mtlx_path);
 
     // Sanitize texture paths in the generated MDL source.
     // MaterialX fileprefix="./" produces paths like "./texture.jpg" in the MDL code,
