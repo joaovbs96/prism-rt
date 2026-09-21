@@ -2,6 +2,7 @@
 
 #include <MaterialXCore/Document.h>
 #include <MaterialXCore/Node.h>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -17,6 +18,12 @@ class MDLGenerator {
 public:
     explicit MDLGenerator(const std::string& mx_libraries_path);
     ~MDLGenerator();
+
+    // Process-wide generator for a libraries path, created on first use.
+    // Loading the MaterialX standard library is by far the most expensive part
+    // of construction, so materials should share one instance instead of
+    // building their own. generate() is serialized internally.
+    static std::shared_ptr<MDLGenerator> shared(const std::string& mx_libraries_path);
 
     GeneratedMDL generate(MaterialX::DocumentPtr doc,
                           const std::string& material_name);

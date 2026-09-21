@@ -8,6 +8,8 @@
 #include <MaterialXGenShader/Util.h>
 #include <MaterialXGenMdl/MdlShaderGenerator.h>
 #include <iostream>
+#include <map>
+#include <mutex>
 
 class MDLGenerator::Impl {
 public:
@@ -178,6 +180,10 @@ GeneratedMDL generate(MaterialX::DocumentPtr doc, const std::string& material_na
         }
     }
 
+    // The GenContext is shared state, so a shared generator must not run
+    // two generations at once.
+    std::mutex generate_mutex;
+
 private:
     MaterialX::ShaderGeneratorPtr m_generator;
     MaterialX::GenContext         m_context;
@@ -194,12 +200,25 @@ MaterialX::DocumentPtr MDLGenerator::get_stdlib() const {
     return m_impl->get_stdlib();
 }
 
+std::shared_ptr<MDLGenerator> MDLGenerator::shared(const std::string& mx_libraries_path) {
+    static std::mutex mutex;
+    static std::map<std::string, std::shared_ptr<MDLGenerator>> generators;
+
+    std::lock_guard<std::mutex> lock(mutex);
+    auto& generator = generators[mx_libraries_path];
+    if (!generator)
+        generator = std::make_shared<MDLGenerator>(mx_libraries_path);
+    return generator;
+}
+
 GeneratedMDL MDLGenerator::generate(MaterialX::DocumentPtr doc,
                                     const std::string& material_name) {
+    std::lock_guard<std::mutex> lock(m_impl->generate_mutex);
     return m_impl->generate(doc, material_name);
 }
 
 GeneratedMDL MDLGenerator::generate(MaterialX::OutputPtr output) {
+    std::lock_guard<std::mutex> lock(m_impl->generate_mutex);
     std::string name = output->getName();
     return m_impl->generate_from_output(output, name);
 }

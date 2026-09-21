@@ -34,7 +34,9 @@ public:
         std::cout << "[MDLMaterial] Compiling: " << mtlx_path << "\n";
 
         // Phase 3: MaterialX -> MDL code generation
-        MDLGenerator generator(mx_libraries_path);
+        // Shared across materials: constructing a generator loads the whole
+        // MaterialX standard library.
+        MDLGenerator& generator = *MDLGenerator::shared(mx_libraries_path);
         DocumentLoader doc_loader(generator.get_stdlib(), true);
 
         MaterialX::DocumentPtr doc = doc_loader.load(mtlx_path);

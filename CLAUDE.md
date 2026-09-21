@@ -75,7 +75,7 @@ Most of the renderer is header-only (`src/*.h`); only the MDL/MaterialX pipeline
 **Materials (`src/material.h`, `src/mdl_material.h`)** — `Material::sample()` is the entry point; the default implementation composes `sample_direction()`, `evaluate_color()`, `evaluate_emission()`. `MDLMaterial` overrides `sample()` wholesale and executes MDL-generated native code (init → BSDF sample → EDF evaluate). `RayHit` normals arrive already flipped toward the ray, with the side recorded in `front_face` — MDL code relies on this; don't re-flip. An invalid `MDLMaterial` renders as emissive magenta rather than failing.
 
 **MaterialX → MDL pipeline (`src/materialx/`, `src/mdl/`)**, run inside the `MDLMaterial` constructor:
-1. `MDLGenerator` (owns the MaterialX stdlib) + `DocumentLoader::load()` — loads the `.mtlx`, applies in-memory compatibility preprocessing, imports the stdlib, validates
+1. `MDLGenerator` (owns the MaterialX stdlib; obtain it via `MDLGenerator::shared(path)` — constructing one reloads the whole library) + `DocumentLoader::load()` — loads the `.mtlx`, applies in-memory compatibility preprocessing, imports the stdlib, validates
 2. `MDLGenerator::generate()` — MaterialX → MDL source
 3. `mdl::MaterialCompiler` — loads the MDL module into the SDK and compiles it (also resolves texture paths relative to the `.mtlx`)
 4. `mdl::BackendCompiler` — native CPU target code

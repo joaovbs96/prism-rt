@@ -199,12 +199,8 @@ CollectMaterialXMaterials(const UsdStageRefPtr& stage,
 {
     std::map<SdfPath, ResolvedMtlxMaterial> result;
 
-    mx::DocumentPtr mtlxStdLibraries = mx::createDocument();
-    {
-        mx::FileSearchPath searchPath;
-        searchPath.append(mx::FilePath(mx_libraries_path));
-        mx::loadLibraries({}, searchPath, mtlxStdLibraries);
-    }
+    // Same stdlib instance the material compilations below will use.
+    mx::DocumentPtr mtlxStdLibraries = MDLGenerator::shared(mx_libraries_path)->get_stdlib();
 
     for (const UsdPrim& prim : stage->Traverse()) {
         if (!prim.IsA<UsdShadeMaterial>())

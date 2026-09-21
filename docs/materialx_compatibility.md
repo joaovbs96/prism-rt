@@ -109,6 +109,12 @@ whose composed parameters might differ. Failed path canonicalization simply
 skips caching. This optimization preserves the current referenced-file import
 semantics; it does not address the separate USD material-override limitation.
 
+Independently of that cache, all materials share one `MDLGenerator` per
+libraries path (`MDLGenerator::shared`), and USD material collection reuses its
+standard-library document. The MaterialX libraries are therefore loaded once per
+process rather than once per material. Generation through the shared instance is
+serialized with a mutex because its `GenContext` is shared state.
+
 The loading summary reports compiled, reused, and bound counts separately.
 This improves material-loading work, not path-tracing convergence. Camera rays
 already use independent uniform subpixel jitter in `Camera::sample_square`, called
