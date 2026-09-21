@@ -212,7 +212,7 @@ int main()
     unsigned int main_seed = 0;
 
     // Create the scene — MDLMaterial compiles the .mtlx internally
-    SceneManager* scene_mgr = new MaterialXTest(device, main_seed, mdl_context);
+    SceneManager* scene_mgr = new ABeautifulGameMtlX(device, main_seed, mdl_context);
 
     scene_mgr->commitScene();
     std::cout << "Finished committing scene." << std::endl;
