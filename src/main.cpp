@@ -206,7 +206,7 @@ int main()
     _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);
 
     int samples = 256;
-    int max_depth = 10;
+    float max_sample_radiance = 10.0f; // firefly clamp; set very high to disable
 
     RTCDevice device = initialize_device(0);
     unsigned int main_seed = 0;
@@ -219,7 +219,7 @@ int main()
 
     FrameBuffer frame(scene_mgr->image_width, scene_mgr->image_height);
     std::cout << "Rendering " << scene_mgr->image_width << "x" << scene_mgr->image_height
-              << " @ " << samples << " spp, max depth " << max_depth << std::endl;
+              << " @ " << samples << " spp, max depth " << scene_mgr->max_depth << std::endl;
 
     completed_rows = 0;
     rendering_complete = false;
@@ -237,7 +237,17 @@ int main()
             for (int spp = 0; spp < samples; spp++)
             {
                 RTCRay ray = scene_mgr->cam.get_ray(column, row, seed);
-                pixel_color += scene_mgr->trace(ray, max_depth, seed);
+                Color3 radiance = scene_mgr->trace(ray, 0, Float3(1.0f), seed);
+
+                // Firefly clamp: a rare path that finds a very bright part of
+                // the environment through a glossy bounce would otherwise
+                // dominate the pixel average. Scale (not clip) so hue is kept.
+                // Biased: slightly darkens strong highlights and caustics.
+                float peak = std::max(radiance.x(), std::max(radiance.y(), radiance.z()));
+                if (peak > max_sample_radiance)
+                    radiance = radiance * (max_sample_radiance / peak);
+
+                pixel_color += radiance;
             }
 
             pixel_color /= samples;

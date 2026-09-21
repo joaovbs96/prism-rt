@@ -114,10 +114,10 @@ public:
         }
     }
 
-    Color3 trace(RTCRay ray, int depth, unsigned int &seed)
+    Color3 trace(RTCRay ray, int depth, Color3 throughput, unsigned int &seed)
     {
         // reached maximum recursion
-        if (depth <= 0)
+        if (depth >= max_depth)
             return Float3();
 
         // cast ray and get hit record
@@ -140,9 +140,24 @@ public:
             if (!s.scattered)
                 return s.emission;
 
+            throughput *= s.color;
+
+            float rr_weight = 1.0f;
+            if (depth >= rr_min_depth)
+            {
+                float q = std::clamp<float>(throughput.max_component(), 0.05f, 0.95f);
+                
+                if (rnd(seed) >= q)
+                    return s.emission;
+
+                rr_weight = 1.0f / q;
+            }
+
             RTCRay new_ray = initialize_ray(ray_hit.p, s.wi);
 
-            return s.emission + s.color * trace(new_ray, depth - 1, seed);
+            throughput *= rr_weight;
+
+            return s.emission + s.color * rr_weight * trace(new_ray, depth + 1, throughput, seed);
         }
 
         // ray miss: sample environment
@@ -170,6 +185,8 @@ public:
     Camera cam;
     int image_width = 1280;
     int image_height = 720;
+    int rr_min_depth = 4;
+    int max_depth = 32;
 };
 
 class Earth : public SceneManager
