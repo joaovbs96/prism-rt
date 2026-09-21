@@ -355,7 +355,31 @@ public:
 
             auto mtlxMaterials = CollectMaterialXMaterials(stage, mx_libraries_path);
 
+            // Cache only within this mesh load: SDK context, libraries and loader
+            // options are identical here. USD prim paths remain separate bindings.
+            // Recovered UsdShade documents may contain different composed values,
+            // so they must not be merged merely because their names match.
+            using MaterialKey = std::pair<std::string, std::string>;
+            std::map<MaterialKey, int> compiled_files;
+            size_t reused_materials = 0;
+
             for (auto& [matPath, resolved] : mtlxMaterials) {
+                std::optional<MaterialKey> cache_key;
+                if (resolved.sourceKind == MtlxSourceKind::ReferencedFile) {
+                    std::error_code error;
+                    auto path = std::filesystem::weakly_canonical(resolved.mtlxFilePath, error);
+                    if (!error) {
+                        cache_key = MaterialKey(path.generic_string(), resolved.materialName);
+                        auto cached = compiled_files.find(*cache_key);
+                        if (cached != compiled_files.end()) {
+                            m_mdl_material_lookup[matPath] = cached->second;
+                            ++reused_materials;
+                            std::cout << "[USDMesh] Reused MaterialX material '"
+                                      << matPath << "' -> mat_id " << cached->second << "\n";
+                            continue;
+                        }
+                    }
+                }
                 auto mdlMat = CompileMtlxMaterial(
                     resolved, *mdl_context, mx_libraries_path, mx_mdl_path);
 
@@ -364,6 +388,9 @@ public:
                     m_mdl_material_lookup[matPath] = mat_id;
                     materials[mat_id] = mdlMat.get();
                     m_owned_mdl_materials.push_back(std::move(mdlMat));
+                    // Never cache failures; ownership remains in the vector and
+                    // all reused bindings resolve to the same stable material ID.
+                    if (cache_key) compiled_files.emplace(*cache_key, mat_id);
 
                     std::cout << "[USDMesh] Compiled MaterialX material '"
                               << matPath << "' -> mat_id " << mat_id << "\n";
@@ -373,8 +400,9 @@ public:
                 }
             }
 
-            std::cout << "[USDMesh] Compiled " << m_mdl_material_lookup.size()
-                      << " MaterialX material(s)\n";
+            std::cout << "[USDMesh] Compiled " << m_owned_mdl_materials.size()
+                      << " MaterialX material(s), reused " << reused_materials
+                      << ", bound " << m_mdl_material_lookup.size() << " USD material(s)\n";
         }
 
         // ── Phase 2: Process geometry ──────────────────────────────────────
