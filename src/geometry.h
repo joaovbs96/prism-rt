@@ -34,6 +34,10 @@ class Geometry {
             if (transform->isIdentity())
                 return;
 
+            // TODO: this only transforms positions. If a rotation/scale ever
+            // goes through here, normals (inverse-transpose) and tangents
+            // (linear part) must be transformed as well.
+
             // Get the vertex buffer data
             float* vb = (float*)rtcGetGeometryBufferData(geom, RTC_BUFFER_TYPE_VERTEX, 0);
             if (!vb) {
@@ -312,9 +316,16 @@ class Mesh : public Geometry {
 
             rtcSetSharedGeometryBuffer(geom, RTC_BUFFER_TYPE_INDEX, 0, RTC_FORMAT_UINT3, indices.data(), 0, 3 * sizeof(unsigned int), int(indices.size() / 3));
 
-            rtcSetGeometryVertexAttributeCount(geom, 2);
+            // Tangents: keep loader-provided ones (e.g. glTF TANGENT),
+            // otherwise derive them from the UV layout. RayHit reads
+            // slot 2 unconditionally, so this must always be registered.
+            if (tangents.empty())
+                computeTangents();
+
+            rtcSetGeometryVertexAttributeCount(geom, 3);
             rtcSetSharedGeometryBuffer(geom, RTC_BUFFER_TYPE_VERTEX_ATTRIBUTE, 0, RTC_FORMAT_FLOAT3, normals.data(), 0, sizeof(Float3), normals.size());
             rtcSetSharedGeometryBuffer(geom, RTC_BUFFER_TYPE_VERTEX_ATTRIBUTE, 1, RTC_FORMAT_FLOAT2, texcoords.data(), 0, sizeof(Float2), texcoords.size());
+            rtcSetSharedGeometryBuffer(geom, RTC_BUFFER_TYPE_VERTEX_ATTRIBUTE, 2, RTC_FORMAT_FLOAT4, tangents.data(), 0, 4 * sizeof(float), vertices.size());
 
             std::cout << "Finished creating mesh buffers. " << std::endl;
 
@@ -371,7 +382,61 @@ class Mesh : public Geometry {
         std::vector<Float3> normals;
         std::vector<Float2> texcoords;
         std::vector<unsigned int> indices;
+        // Per-vertex float4 tangents (xyz = dP/du, w = uv handedness) for
+        // vertex attribute slot 2. Layout matches glTF TANGENT, so loaders
+        // with authored tangents can fill this directly.
+        std::vector<float> tangents;
         std::unordered_map<int, Material*> materials;
         std::unordered_map<int, int> material_mapping;
         Material* material_override = nullptr;
+
+    private:
+        // Smooth per-vertex tangents derived from the UV layout, built the
+        // same way smooth normals are: solve dP/du per triangle
+        //   [e1 e2] = [du1 dv1; du2 dv2] * [T; B]
+        // then accumulate into vertices and normalize. Meshes without
+        // usable UVs get a zero-filled buffer, which shading treats as
+        // "no tangent" and falls back to a derived frame.
+        void computeTangents() {
+            const size_t vcount = vertices.size();
+            tangents.assign(vcount * 4, 0.0f);
+
+            if (texcoords.size() != vcount)
+                return; // no per-vertex UVs -> zero tangents (fallback)
+
+            std::vector<Float3> accum(vcount, Float3(0.0f));
+            std::vector<float> sign(vcount, 0.0f);
+
+            for (size_t i = 0; i + 2 < indices.size(); i += 3) {
+                const unsigned int i0 = indices[i], i1 = indices[i + 1], i2 = indices[i + 2];
+
+                const Float3 e1 = vertices[i1] - vertices[i0];
+                const Float3 e2 = vertices[i2] - vertices[i0];
+                const float du1 = texcoords[i1].u() - texcoords[i0].u();
+                const float dv1 = texcoords[i1].v() - texcoords[i0].v();
+                const float du2 = texcoords[i2].u() - texcoords[i0].u();
+                const float dv2 = texcoords[i2].v() - texcoords[i0].v();
+
+                const float det = du1 * dv2 - du2 * dv1;
+                if (std::abs(det) < 1e-12f)
+                    continue; // degenerate uvs -> skip triangle
+
+                const Float3 t = (1.0f / det) * (dv2 * e1 - dv1 * e2); // dP/du
+                const Float3 b = (1.0f / det) * (du1 * e2 - du2 * e1); // dP/dv
+                const float s = dot(cross(cross(e1, e2), t), b) < 0.0f ? -1.0f : 1.0f;
+
+                accum[i0] = accum[i0] + t;  accum[i1] = accum[i1] + t;  accum[i2] = accum[i2] + t;
+                sign[i0] += s;              sign[i1] += s;              sign[i2] += s;
+            }
+
+            for (size_t i = 0; i < vcount; ++i) {
+                if (dot(accum[i], accum[i]) > 1e-12f) {
+                    const Float3 t = accum[i].normalize();
+                    tangents[i * 4 + 0] = t.x();
+                    tangents[i * 4 + 1] = t.y();
+                    tangents[i * 4 + 2] = t.z();
+                }
+                tangents[i * 4 + 3] = sign[i] < 0.0f ? -1.0f : 1.0f;
+            }
+        }
 };

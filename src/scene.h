@@ -442,7 +442,7 @@ public:
         MDLMaterial* mdl_mat = new MDLMaterial(mtlx_path, mdl_context, mx_libraries_path, mx_mdl_path);
 
         if (!mdl_mat->is_valid()) {
-            std::cerr << "[MaterialXTest] WARNING: MDL material failed, using fallback magenta diffuse\n";
+            std::cerr << "[MaterialXTest] WARNING: MDL material failed, using magenta error shading\n";
         }
 
         // Ground plane
