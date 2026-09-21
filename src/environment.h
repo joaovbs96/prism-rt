@@ -52,6 +52,11 @@ class EnvironmentMap : public Environment {
         float lon = std::atan2f(d.z(), d.x());
         float lat = std::acosf(d.y() / d.length());
 
+        // atan2 returns (-pi, pi]; wrap to [0, 2pi) so u covers the whole
+        // image. The texture lookup takes fabs(u), which would otherwise
+        // mirror the negative half onto the positive one.
+        lon = lon < 0.f ? lon + (2.f * PI) : lon;
+
         float u = lon / (PI * 2.f);
         float v = lat / PI;
 
