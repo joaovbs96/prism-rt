@@ -308,11 +308,8 @@ CompiledMaterial MaterialCompiler::compile(const GeneratedMDL& generated_mdl,
         return result;
     }
 
-    // Tell the SDK that the scene/rendering colorspace is linear Rec.709.
-    // This matches the colorspace="lin_rec709" declaration in the .mtlx document
-    // and ensures sRGB->linear conversion is correctly applied for textures
-    // tagged with colorspace="srgb_texture" when the native backend compiles them.
-    context->set_option("target_color_space", "lin_rec709");
+    // MDLGenerator inserts authored color-space conversions into the graph
+    // before MDL compilation, targeting linear Rec.709.
 
     // Create a transaction for this compilation
     mi::base::Handle<mi::neuraylib::IScope> scope(
@@ -350,6 +347,7 @@ CompiledMaterial MaterialCompiler::compile(const GeneratedMDL& generated_mdl,
     if (!generated_mdl.texture_paths.empty()) {
         std::set<std::string> registered_dirs;
         for (const auto& tex_path : generated_mdl.texture_paths) {
+            if (tex_path.empty()) continue;
             std::filesystem::path p(tex_path);
 
             // Skip root-relative paths like "/textures/foo.png" —

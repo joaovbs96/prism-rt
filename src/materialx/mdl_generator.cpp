@@ -2,6 +2,7 @@
 #include <MaterialXFormat/XmlIo.h>
 #include <MaterialXFormat/Util.h>
 #include <MaterialXGenShader/GenContext.h>
+#include <MaterialXGenShader/DefaultColorManagementSystem.h>
 #include <MaterialXGenShader/Shader.h>
 #include <MaterialXGenShader/ShaderStage.h>
 #include <MaterialXGenShader/Util.h>
@@ -24,6 +25,14 @@ public:
 
         m_stdlib = MaterialX::createDocument();
         MaterialX::loadLibraries({}, librariesSearchPath, m_stdlib);
+
+        // Decode authored color spaces in the graph, leaving scalar/vector data
+        // textures (roughness, metallic, normals) in their original linear form.
+        auto color_management = MaterialX::DefaultColorManagementSystem::create(
+            m_generator->getTarget());
+        color_management->loadLibrary(m_stdlib);
+        m_generator->setColorManagementSystem(color_management);
+        m_context.getOptions().targetColorSpaceOverride = "lin_rec709";
 
         std::cout << "[DEBUG] stdlib elements loaded: "
                 << m_stdlib->getChildren().size() << "\n";
