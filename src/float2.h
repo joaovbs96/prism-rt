@@ -169,7 +169,7 @@ class Float2 {
         }
 };
 
-std::ostream& operator<<(std::ostream& os, const Float2& v) {
+inline std::ostream& operator<<(std::ostream& os, const Float2& v) {
     return os << "<" << v.x() << "," << v.y() << ">";
 }
 
@@ -185,6 +185,6 @@ inline float dot(const Float2& v1, const Float2& v2) {
     return v1.x() * v2.x() + v1.y() * v2.y();
 }
 
-float cross(const Float2& v1, const Float2& v2) {
+inline float cross(const Float2& v1, const Float2& v2) {
     return v1.x() * v2.y() - v1.y() * v2.x();
 }

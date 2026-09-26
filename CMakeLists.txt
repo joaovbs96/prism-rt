@@ -1,142 +1,174 @@
 cmake_minimum_required(VERSION 3.20)
-project(PrismRT)
+project(PrismRT LANGUAGES CXX)
+
+option(PRISM_BUILD_HYDRA "Build the optional Hydra renderer delegate" OFF)
+option(PRISM_COPY_ASSETS "Copy the standalone renderer's runtime assets next to its executable" ON)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED YES)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# fixes "IMPORTED_IMPLIB not set for imported target" issues
-# needs to be set before anything else
-set(CMAKE_MAP_IMPORTED_CONFIG_MINSIZEREL RelWithDebInfo Release)
-set(CMAKE_MAP_IMPORTED_CONFIG_RELEASE RelWithDebInfo Release)
-set(CMAKE_MAP_IMPORTED_CONFIG_DEBUG RelWithDebInfo Release)
+# Keep multi-config consumers aligned with the installed RelWithDebInfo
+# dependency builds while allowing their Release libraries as a fallback.
+set(CMAKE_MAP_IMPORTED_CONFIG_MINSIZEREL "RelWithDebInfo;Release")
+set(CMAKE_MAP_IMPORTED_CONFIG_RELEASE "RelWithDebInfo;Release")
+set(CMAKE_MAP_IMPORTED_CONFIG_DEBUG "Debug;RelWithDebInfo;Release")
 
-# ── Path configuration ───────────────────────────────────────────────────────
-# Pin these BEFORE any find_package() calls so CMake doesn't discover stale
-# installs elsewhere on the system (e.g. an old OpenUSD at
-# C:/.../Programming_Projects/OpenUSD instead of external_deps/OpenUSD).
-#
-# These can be overridden from the command line:
-#   cmake -DTBB_DIR="..." -Dpxr_DIR="..." ...
 set(PROGRAMMING_PROJECTS "C:/Users/joaov/Desktop/Programming_Projects")
 set(EXTERNAL_DEPS "${PROGRAMMING_PROJECTS}/external_deps")
 
-# oneTBB — point at TBBConfig.cmake so find_package(TBB) finds oneTBB,
-# NOT any legacy TBB headers that might be bundled in the USD install.
 if(NOT DEFINED CACHE{TBB_DIR})
     set(TBB_DIR "${PROGRAMMING_PROJECTS}/include/tbb/lib/cmake/tbb"
-        CACHE PATH "Path to TBBConfig.cmake (oneTBB)" FORCE)
+        CACHE PATH "Path to oneTBB's CMake package" FORCE)
 endif()
-
-# OpenUSD — point at the correct install under external_deps
 if(NOT DEFINED CACHE{pxr_DIR})
     set(pxr_DIR "${EXTERNAL_DEPS}/OpenUSD/install"
-        CACHE PATH "Path to pxrConfig.cmake" FORCE)
+        CACHE PATH "Path to the OpenUSD installation" FORCE)
 endif()
-
-# MaterialX
 if(NOT DEFINED CACHE{MaterialX_DIR})
     set(MaterialX_DIR "${EXTERNAL_DEPS}/MaterialX/install/lib/cmake/MaterialX"
-        CACHE PATH "Path to MaterialXConfig.cmake" FORCE)
+        CACHE PATH "Path to MaterialX's CMake package" FORCE)
 endif()
-
-# MDL SDK (header-only, loaded via code)
 if(NOT DEFINED CACHE{MDL_SDK_DIR})
     set(MDL_SDK_DIR "${PROGRAMMING_PROJECTS}/mdl-sdk"
-        CACHE PATH "Path to MDL SDK root" FORCE)
+        CACHE PATH "Path to the NVIDIA MDL SDK" FORCE)
 endif()
 
-# ── Third-party subprojects ──────────────────────────────────────────────────
-
-# tiny gltf
 set(TINYGLTF_HEADER_ONLY ON CACHE INTERNAL "" FORCE)
 set(TINYGLTF_INSTALL OFF CACHE INTERNAL "" FORCE)
 set(TINYGLTF_BUILD_LOADER_EXAMPLE OFF CACHE INTERNAL "" FORCE)
-add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/external/tinygltf")
+add_subdirectory(external/tinygltf)
 
-# tiny obj
 set(TINYOBJLOADER_BUILD_OBJ_STITCH OFF CACHE INTERNAL "" FORCE)
 set(TINYOBJLOADER_BUILD_TEST_LOADER OFF CACHE INTERNAL "" FORCE)
-add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/external/tinyobj")
+add_subdirectory(external/tinyobj)
 
-# ── Source files ─────────────────────────────────────────────────────────────
-file(GLOB_RECURSE PRISM_SOURCES 
-    CONFIGURE_DEPENDS
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp"
-)
-
-file(GLOB_RECURSE PRISM_HEADERS 
-    CONFIGURE_DEPENDS
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/*.h"
-)
-
-# Print found files for debugging
-message(STATUS "Found source files:")
-foreach(SOURCE_FILE ${PRISM_SOURCES})
-    message(STATUS "  ${SOURCE_FILE}")
-endforeach()
-
-# Create executable with all found sources
-add_executable(PrismRT ${PRISM_SOURCES} ${PRISM_HEADERS})
-
-# ── Dependencies ─────────────────────────────────────────────────────────────
-
-# OIIO
 find_package(OpenImageIO CONFIG REQUIRED)
-target_link_libraries(PrismRT OpenImageIO::OpenImageIO)
-
-# Embree
 find_package(embree 4 REQUIRED)
-target_link_libraries(PrismRT embree)
-
-# oneTBB — TBB_DIR was pinned above so this finds the correct oneTBB
 find_package(TBB REQUIRED CONFIG)
-target_link_libraries(PrismRT TBB::tbb)
-
-# OpenUSD — pxr_DIR was pinned above so this finds external_deps/OpenUSD
 find_package(OpenGL REQUIRED)
 find_package(pxr REQUIRED)
-
-message(STATUS "PXR_LIBRARIES contains: ${PXR_LIBRARIES}")
-string(REPLACE ";" "|" PXR_LIBRARIES_DEBUG "${PXR_LIBRARIES}")
-message(STATUS "PXR_LIBRARIES debug: ${PXR_LIBRARIES_DEBUG}")
-
-target_link_libraries(PrismRT ${PXR_LIBRARIES})
-
-# IMPORTANT: Add oneTBB includes BEFORE USD includes so that if USD installed
-# any legacy TBB headers under its include dir, the compiler finds oneTBB's
-# headers first. The BEFORE keyword prepends to the include search path.
-get_target_property(TBB_INCLUDE_DIRS TBB::tbb INTERFACE_INCLUDE_DIRECTORIES)
-target_include_directories(PrismRT BEFORE PUBLIC ${TBB_INCLUDE_DIRS})
-target_include_directories(PrismRT PUBLIC ${PXR_INCLUDE_DIR})
-
-# MaterialX
 find_package(MaterialX REQUIRED)
-target_link_libraries(PrismRT 
+find_package(Python3 COMPONENTS Development REQUIRED)
+
+# OpenUSD exports Python3::Python for its bindings. On Windows FindPython3
+# may expose only the active RelWithDebInfo configuration, while Visual Studio
+# generators validate every configuration during generation. Map the missing
+# configurations to the same Python installation used to build OpenUSD.
+if(TARGET Python3::Python)
+    foreach(_config DEBUG RELEASE MINSIZEREL RELWITHDEBINFO)
+        set_property(TARGET Python3::Python PROPERTY
+            IMPORTED_IMPLIB_${_config} "${Python3_LIBRARY_RELEASE}")
+        set_property(TARGET Python3::Python PROPERTY
+            IMPORTED_LOCATION_${_config} "${Python3_RUNTIME_LIBRARY_RELEASE}")
+    endforeach()
+endif()
+
+file(GLOB_RECURSE PRISM_CORE_SOURCES CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp")
+list(FILTER PRISM_CORE_SOURCES EXCLUDE REGEX "/(main|standalone_cli)\\.cpp$")
+list(FILTER PRISM_CORE_SOURCES EXCLUDE REGEX "/hydra/")
+
+add_library(prism_core STATIC ${PRISM_CORE_SOURCES})
+add_library(PrismRT::core ALIAS prism_core)
+target_include_directories(prism_core PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/external/tinygltf"
+    "${CMAKE_CURRENT_SOURCE_DIR}/external/tinyobj"
+    "${MDL_SDK_DIR}/include")
+get_target_property(PRISM_TBB_INCLUDE_DIRS TBB::tbb INTERFACE_INCLUDE_DIRECTORIES)
+target_include_directories(prism_core BEFORE PUBLIC ${PRISM_TBB_INCLUDE_DIRS})
+target_include_directories(prism_core PUBLIC ${PXR_INCLUDE_DIRS})
+target_include_directories(prism_core PUBLIC ${Python3_INCLUDE_DIRS})
+target_link_libraries(prism_core PUBLIC
+    OpenImageIO::OpenImageIO
+    embree
+    TBB::tbb
+    ${PXR_LIBRARIES}
     MaterialXCore
     MaterialXFormat
     MaterialXGenShader
-    MaterialXGenMdl
-)
-
-# Other libraries
-target_include_directories(PrismRT PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/external/tinygltf")
-target_include_directories(PrismRT PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/external/tinyobj")
-
-# MDL includes - there's no linking, DLLs are loaded via code (see src/mdl/loader.h)
-target_include_directories(PrismRT PUBLIC ${MDL_SDK_DIR}/include)
-
+    MaterialXGenMdl)
 if(MSVC)
-    target_compile_options(PrismRT PUBLIC "/Zc:preprocessor")
+    target_compile_options(prism_core PUBLIC "/Zc:preprocessor")
 endif()
 
-add_custom_target(copy_assets ALL
-    COMMAND ${CMAKE_COMMAND} -E copy_directory
-        ${CMAKE_SOURCE_DIR}/assets
-        $<TARGET_FILE_DIR:PrismRT>/assets
-    COMMAND ${CMAKE_COMMAND} -E rm -rf $<TARGET_FILE_DIR:PrismRT>/assets/logo
-    COMMAND ${CMAKE_COMMAND} -E rm -rf $<TARGET_FILE_DIR:PrismRT>/assets/.gitignore
-    COMMENT "Copying runtime assets to executable directory..."
-)
+add_executable(PrismRT src/main.cpp src/standalone_cli.cpp)
+target_link_libraries(PrismRT PRIVATE PrismRT::core)
 
-add_dependencies(PrismRT copy_assets)
+if(PRISM_COPY_ASSETS)
+    add_custom_target(copy_assets ALL
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${CMAKE_SOURCE_DIR}/assets"
+            "$<TARGET_FILE_DIR:PrismRT>/assets"
+        COMMAND ${CMAKE_COMMAND} -E rm -rf "$<TARGET_FILE_DIR:PrismRT>/assets/logo"
+        COMMAND ${CMAKE_COMMAND} -E rm -rf "$<TARGET_FILE_DIR:PrismRT>/assets/.gitignore"
+        COMMENT "Copying runtime assets to executable directory...")
+    add_dependencies(PrismRT copy_assets)
+endif()
+
+if(PRISM_BUILD_HYDRA)
+    add_subdirectory(src/hydra)
+    enable_testing()
+
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/compare_images.cpp")
+        add_executable(prism_compare_images tests/hydra/compare_images.cpp)
+        target_link_libraries(prism_compare_images PRIVATE OpenImageIO::OpenImageIO)
+        set_target_properties(prism_compare_images PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY "$<1:${CMAKE_BINARY_DIR}/hydra/plugin>")
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/render.cpp")
+        add_executable(prism_hydra_render tests/hydra/render.cpp)
+        target_include_directories(prism_hydra_render PRIVATE ${PXR_INCLUDE_DIRS})
+        target_link_libraries(prism_hydra_render PRIVATE
+            PrismRT::core usdImagingGL hd ${PXR_LIBRARIES} OpenImageIO::OpenImageIO)
+        set_target_properties(prism_hydra_render PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY "$<1:${CMAKE_BINARY_DIR}/hydra/plugin>")
+        if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/parity.usda")
+            add_test(NAME prism_hydra_render_exercise
+                COMMAND prism_hydra_render
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/parity.usda"
+                    "/World/Camera"
+                    "${CMAKE_BINARY_DIR}/hydra/parity_hydra.exr"
+                    128 128 16 --exercise)
+            set_tests_properties(prism_hydra_render_exercise PROPERTIES ENVIRONMENT
+                "PXR_PLUGINPATH_NAME=${CMAKE_BINARY_DIR}/hydra/resources;PRISM_MATERIALX_LIBRARY_PATH=${EXTERNAL_DEPS}/MaterialX/install/libraries;PRISM_MATERIALX_MDL=${EXTERNAL_DEPS}/MaterialX/install/libraries/mdl;MDL_SDK_ROOT=${MDL_SDK_DIR}")
+        endif()
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/materials_test.cpp")
+        add_executable(prism_hydra_materials_test
+            tests/hydra/materials_test.cpp
+            src/hydra/materials.cpp)
+        target_link_libraries(prism_hydra_materials_test PRIVATE PrismRT::core ${PXR_LIBRARIES})
+        set_target_properties(prism_hydra_materials_test PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY "$<1:${CMAKE_BINARY_DIR}/hydra/plugin>")
+        add_test(NAME prism_hydra_materials_test COMMAND prism_hydra_materials_test)
+        set_tests_properties(prism_hydra_materials_test PROPERTIES ENVIRONMENT
+            "PRISM_MATERIALX_LIBRARY_PATH=${EXTERNAL_DEPS}/MaterialX/install/libraries;PRISM_MATERIALX_MDL=${EXTERNAL_DEPS}/MaterialX/install/libraries/mdl;MDL_SDK_ROOT=${MDL_SDK_DIR}")
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/selection_filter_test.cpp")
+        add_executable(prism_hydra_selection_filter_test
+            tests/hydra/selection_filter_test.cpp
+            src/hydra/transport_filter.cpp)
+        target_include_directories(prism_hydra_selection_filter_test PRIVATE ${PXR_INCLUDE_DIRS})
+        target_link_libraries(prism_hydra_selection_filter_test PRIVATE
+            PrismRT::core hd hdx ${PXR_LIBRARIES})
+        set_target_properties(prism_hydra_selection_filter_test PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY "$<1:${CMAKE_BINARY_DIR}/hydra/plugin>")
+        add_test(NAME prism_hydra_selection_filter_test COMMAND prism_hydra_selection_filter_test)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/scene_bridge_test.cpp")
+        add_executable(prism_hydra_scene_bridge_test
+            tests/hydra/scene_bridge_test.cpp
+            src/hydra/scene_bridge.cpp
+            src/hydra/materials.cpp
+            src/hydra/render_buffer.cpp)
+        target_include_directories(prism_hydra_scene_bridge_test PRIVATE ${PXR_INCLUDE_DIRS})
+        target_link_libraries(prism_hydra_scene_bridge_test PRIVATE
+            PrismRT::core hd ${PXR_LIBRARIES})
+        set_target_properties(prism_hydra_scene_bridge_test PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY "$<1:${CMAKE_BINARY_DIR}/hydra/plugin>")
+        add_test(NAME prism_hydra_scene_bridge_test COMMAND prism_hydra_scene_bridge_test)
+        set_tests_properties(prism_hydra_scene_bridge_test PROPERTIES ENVIRONMENT
+            "PRISM_MATERIALX_LIBRARY_PATH=${EXTERNAL_DEPS}/MaterialX/install/libraries;PRISM_MATERIALX_MDL=${EXTERNAL_DEPS}/MaterialX/install/libraries/mdl;MDL_SDK_ROOT=${MDL_SDK_DIR}")
+    endif()
+endif()

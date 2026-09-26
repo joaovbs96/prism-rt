@@ -1,0 +1,14 @@
+{
+    "Plugins": [{
+        "Type": "python",
+        "Name": "prismUsdview",
+        "Info": {
+            "Types": {
+                "prismUsdview.PrismContainer": {
+                    "bases": ["pxr.Usdviewq.plugin.PluginContainer"],
+                    "displayName": "PrismRT instance selection"
+                }
+            }
+        }
+    }]
+}

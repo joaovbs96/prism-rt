@@ -7,6 +7,7 @@
 class Environment {
     public:
     Environment() {}
+    virtual ~Environment() = default;
 
     virtual Color3 sample(const RayHit& ray_hit) = 0;
 };

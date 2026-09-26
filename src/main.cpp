@@ -36,6 +36,7 @@
 // project libraries
 #include "mdl/context.h"
 #include "scene.h"
+#include "standalone_cli.h"
 
 std::atomic<int> completed_rows{0};
 std::atomic<bool> rendering_complete{false};
@@ -113,8 +114,10 @@ RTCDevice initialize_device(int verbose)
 
 
 
-int main()
+int main(int argc, char** argv)
 {
+    if (argc > 1)
+        return runStandaloneCli(argc, argv);
     // ============================================================
     // Phase 2: MDL SDK Initialization
     // ============================================================

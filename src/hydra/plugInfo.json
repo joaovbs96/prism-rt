@@ -1,0 +1,20 @@
+{
+  "Plugins": [
+    {
+      "Type": "library",
+      "Name": "hdPrism",
+      "Root": "..",
+      "LibraryPath": "plugin/hdPrism.dll",
+      "ResourcePath": "resources",
+      "Info": {
+        "Types": {
+          "HdPrismRendererPlugin": {
+            "bases": ["HdRendererPlugin"],
+            "displayName": "PrismRT",
+            "priority": 0
+          }
+        }
+      }
+    }
+  ]
+}

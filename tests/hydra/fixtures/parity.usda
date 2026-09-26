@@ -1,0 +1,61 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    upAxis = "Y"
+    metersPerUnit = 1
+)
+
+def Xform "World"
+{
+    def Camera "Camera"
+    {
+        float focalLength = 35
+        float horizontalAperture = 20
+        float verticalAperture = 20
+        float fStop = 0
+        float focusDistance = 4
+        float2 clippingRange = (0.1, 100)
+        double3 xformOp:translate = (0, 0, 4)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+
+    def Mesh "Panel" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        # Asymmetric silhouette makes vertical/horizontal image flips visible.
+        point3f[] points = [(-1,-1,0), (1,-1,0), (1,0.65,0), (-1,1,0)]
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0,1,2,3]
+        normal3f[] normals = [(0,0,1)] (interpolation = "constant")
+        texCoord2f[] primvars:st = [(0,0), (1,0), (1,1), (0,1)] (interpolation = "vertex")
+        color3f[] primvars:displayColor = [(0.5,0.2,0.1)]
+        uniform token subdivisionScheme = "none"
+        rel material:binding = </World/Mat>
+    }
+
+    def Material "Mat"
+    {
+        token outputs:mtlx:surface.connect = </World/Mat/Surface.outputs:out>
+        def Shader "Surface"
+        {
+            uniform token info:id = "ND_standard_surface_surfaceshader"
+            float inputs:base = 1
+            color3f inputs:base_color = (0.5,0.2,0.1)
+            float inputs:diffuse_roughness = 0
+            float inputs:specular = 0
+            float inputs:specular_roughness = 0.5
+            float inputs:metalness = 0
+            token outputs:out
+        }
+    }
+
+    def DomeLight "Environment"
+    {
+        asset inputs:texture:file = @environment.ppm@
+        token inputs:texture:format = "latlong"
+        color3f inputs:color = (1,1,1)
+        float inputs:intensity = 2
+        float inputs:exposure = 0
+    }
+}

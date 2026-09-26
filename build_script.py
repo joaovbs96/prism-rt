@@ -2,6 +2,7 @@ import sys
 import os
 import subprocess
 import shutil
+import argparse
 
 # Visual Studio paths
 VS_SHELL = r"C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
@@ -26,6 +27,10 @@ TBB_INCLUDE_DIRS = f"{TBB_ROOT}/include"
 # The actual .lib file lives here - needed so USD's FindTBB doesn't pick up
 # the wrong one from a system path or the USD-bundled legacy TBB.
 TBB_LIB_DIR = f"{TBB_ROOT}/lib"
+
+parser = argparse.ArgumentParser(description="Build PrismRT dependencies using the existing dependency installations.")
+parser.add_argument("--usd-only", action="store_true", help="Skip OpenSubdiv and MaterialX; rebuild OpenUSD in its current build/install tree.")
+args = parser.parse_args()
 
 # OpenSubdiv
 OSD_ROOT = f"{EXTERNAL_DEPS}/OpenSubdiv"
@@ -181,32 +186,34 @@ def run_vs_shell(cmd: str):
 
 
 # ── OpenSubdiv ────────────────────────────────────────────────────────────────
-print("\n" + "="*60)
-print("Building OpenSubdiv")
-print("="*60)
+if not args.usd_only:
+    print("\n" + "="*60)
+    print("Building OpenSubdiv")
+    print("="*60)
 
-osd_options = COMMON_TBB_OPTIONS
-osd_options += "-DNO_TUTORIALS=1 -DNO_EXAMPLES=1 -DNO_REGRESSION=1 "
+    osd_options = COMMON_TBB_OPTIONS
+    osd_options += "-DNO_TUTORIALS=1 -DNO_EXAMPLES=1 -DNO_REGRESSION=1 "
 
-run_vs_shell(f'cd /d "{OSD_ROOT}" && cmake -B build {osd_options} -DCMAKE_INSTALL_PREFIX=install -G "Visual Studio 17 2022" -A x64 -S .')
-run_vs_shell(f'cd /d "{OSD_ROOT}" && cmake --build build --target install --config RelWithDebInfo')
+    run_vs_shell(f'cd /d "{OSD_ROOT}" && cmake -B build {osd_options} -DCMAKE_INSTALL_PREFIX=install -G "Visual Studio 17 2022" -A x64 -S .')
+    run_vs_shell(f'cd /d "{OSD_ROOT}" && cmake --build build --target install --config RelWithDebInfo')
 
 
 # ── MaterialX ─────────────────────────────────────────────────────────────────
-print("\n" + "="*60)
-print("Building MaterialX")
-print("="*60)
+if not args.usd_only:
+    print("\n" + "="*60)
+    print("Building MaterialX")
+    print("="*60)
 
-mtlx_options = COMMON_TBB_OPTIONS
-mtlx_options += "-DMATERIALX_BUILD_GEN_MDL=ON "
-mtlx_options += "-DMATERIALX_BUILD_GEN_GLSL=ON -DMATERIALX_BUILD_GEN_OSL=ON "
-mtlx_options += "-DMATERIALX_BUILD_GEN_ESSL=ON -DMATERIALX_BUILD_GEN_MSL=ON "
-mtlx_options += "-DMATERIALX_BUILD_PYTHON=OFF -DMATERIALX_BUILD_VIEWER=OFF "
-mtlx_options += "-DMATERIALX_BUILD_GRAPH_EDITOR=OFF -DMATERIALX_BUILD_RENDER=ON "
-mtlx_options += "-DMATERIALX_BUILD_TESTS=OFF -DMATERIALX_INSTALL_PYTHON=OFF "
+    mtlx_options = COMMON_TBB_OPTIONS
+    mtlx_options += "-DMATERIALX_BUILD_GEN_MDL=ON "
+    mtlx_options += "-DMATERIALX_BUILD_GEN_GLSL=ON -DMATERIALX_BUILD_GEN_OSL=ON "
+    mtlx_options += "-DMATERIALX_BUILD_GEN_ESSL=ON -DMATERIALX_BUILD_GEN_MSL=ON "
+    mtlx_options += "-DMATERIALX_BUILD_PYTHON=OFF -DMATERIALX_BUILD_VIEWER=OFF "
+    mtlx_options += "-DMATERIALX_BUILD_GRAPH_EDITOR=OFF -DMATERIALX_BUILD_RENDER=ON "
+    mtlx_options += "-DMATERIALX_BUILD_TESTS=OFF -DMATERIALX_INSTALL_PYTHON=OFF "
 
-run_vs_shell(f'cd /d "{MTLX_ROOT}" && cmake -B build {mtlx_options} -DCMAKE_INSTALL_PREFIX=install -G "Visual Studio 17 2022" -A x64 -S .')
-run_vs_shell(f'cd /d "{MTLX_ROOT}" && cmake --build build --target install --config RelWithDebInfo')
+    run_vs_shell(f'cd /d "{MTLX_ROOT}" && cmake -B build {mtlx_options} -DCMAKE_INSTALL_PREFIX=install -G "Visual Studio 17 2022" -A x64 -S .')
+    run_vs_shell(f'cd /d "{MTLX_ROOT}" && cmake --build build --target install --config RelWithDebInfo')
 
 
 # ── OpenUSD ───────────────────────────────────────────────────────────────────
@@ -216,17 +223,34 @@ print("="*60)
 
 usd_options = USD_TBB_OPTIONS  # Uses PXR_FIND_TBB_IN_CONFIG=ON for oneTBB
 usd_options += CONFIG_MAP_OPTIONS
+usd_options += "-DPXR_BUILD_IMAGING=ON -DPXR_BUILD_USDVIEW=ON "
+usd_options += "-DPXR_BUILD_GPU_SUPPORT=ON -DPXR_ENABLE_GL_SUPPORT=ON "
+usd_options += "-DPXR_BUILD_USD_TOOLS=ON -DPXR_ENABLE_PYTHON_SUPPORT=ON "
+# CMake's Windows multi-config OpenGL::GL import target resolves to a bare
+# opengl32 name. Tell MSVC to link the SDK's system OpenGL import library
+# explicitly so the GL-enabled garch target resolves its WGL entry points.
+usd_options += "-DCMAKE_SHARED_LINKER_FLAGS=/DEFAULTLIB:OpenGL32 "
 usd_options += f'-DOpenSubdiv_DIR="{OSD_CMAKE_PATH}" -DOPENSUBDIV_INCLUDE_DIR="{OSD_INCLUDE_PATH}" '
 usd_options += f'-DMaterialX_DIR="{MTLX_CMAKE_PATH}" '
 usd_options += "-DPXR_BUILD_TESTS=OFF -DPXR_BUILD_EXAMPLES=OFF -DPXR_BUILD_TUTORIALS=OFF "
-usd_options += "-DPXR_BUILD_GPU_SUPPORT=OFF "
-usd_options += "-DPXR_ENABLE_GL_SUPPORT=OFF "
-usd_options += "-DPXR_BUILD_USD_TOOLS=OFF -DPXR_ENABLE_PYTHON_SUPPORT=OFF "
 usd_options += "-DPXR_ENABLE_MATERIALX_SUPPORT=ON "
 usd_options += "-DPXR_ENABLE_OPENVDB_SUPPORT=OFF "
+python_exe = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Python", "Python311", "python.exe")
+if os.path.isfile(python_exe):
+    usd_options += f'-DPython3_EXECUTABLE="{python_exe}" '
+    python_lib = os.path.join(os.path.dirname(python_exe), "libs", "python311.lib")
+    python_dll = os.path.join(os.path.dirname(python_exe), "python311.dll")
+    if os.path.isfile(python_lib) and os.path.isfile(python_dll):
+        # Standard Windows Python distributions have no separate debug build.
+        # Reuse their release import/runtime libraries to satisfy VS's Debug
+        # imported-target configuration checks during USD generation.
+        usd_options += f'-DPython3_LIBRARY_DEBUG="{python_lib}" -DPython3_LIBRARY_RELEASE="{python_lib}" '
+        usd_options += f'-DPython3_RUNTIME_LIBRARY_DEBUG="{python_dll}" '
+        usd_options += f'-D_Python3_LIBRARY_DEBUG="{python_lib}" '
+        usd_options += f'-D_Python3_RUNTIME_LIBRARY_DEBUG="{python_dll}" '
 
 run_vs_shell(f'cd /d "{USD_ROOT}" && cmake -B build {usd_options} -DCMAKE_INSTALL_PREFIX=install -G "Visual Studio 17 2022" -A x64 -S .')
-run_vs_shell(f'cd /d "{USD_ROOT}" && cmake --build build --target install --config RelWithDebInfo')
+run_vs_shell(f'cd /d "{USD_ROOT}" && cmake --build build --target install --config RelWithDebInfo -- /m:4 /p:CL_MPCount=1 /p:BuildInParallel=false')
 
 
 # ── Post-build: remove legacy TBB headers from USD install if present ─────────

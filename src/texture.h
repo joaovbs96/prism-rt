@@ -18,6 +18,7 @@ template <TextureType T = Float3>
 class Texture {
     public:
         Texture() {}
+        virtual ~Texture() = default;
 
         virtual T sample(float u, float v, const Float3& p) const = 0;
 
@@ -44,9 +45,9 @@ class ValueTexture : public Texture<T> {
 
 // templated getValue functions
 template<typename T> T getValue(float* ptr);
-template<> float getValue<float>(float* ptr) { return ptr[0]; }
-template<> Float3 getValue<Float3>(float* ptr) { return Float3(ptr[0], ptr[1], ptr[2]); }
-template<> Float4 getValue<Float4>(float* ptr) { return Float4(ptr[0], ptr[1], ptr[2], ptr[3]); }
+template<> inline float getValue<float>(float* ptr) { return ptr[0]; }
+template<> inline Float3 getValue<Float3>(float* ptr) { return Float3(ptr[0], ptr[1], ptr[2]); }
+template<> inline Float4 getValue<Float4>(float* ptr) { return Float4(ptr[0], ptr[1], ptr[2], ptr[3]); }
 
 template <TextureType T = Float3>
 class ImageTexture : public Texture<T> {

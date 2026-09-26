@@ -16,6 +16,7 @@ struct BRDFSample {
 class Material {
     public:
         Material() {}
+        virtual ~Material() = default;
 
         // All materials need to define:
         // 1) How to sample the ray direction for the next bounce

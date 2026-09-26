@@ -1,0 +1,69 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 21,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "prism-base",
+      "hidden": true,
+      "generator": "Visual Studio 17 2022",
+      "architecture": "x64",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "VCPKG_MANIFEST_INSTALL": "OFF"
+      }
+    },
+    {
+      "name": "prism-standalone",
+      "displayName": "PrismRT standalone",
+      "inherits": "prism-base",
+      "cacheVariables": {
+        "PRISM_BUILD_HYDRA": "OFF",
+        "PRISM_COPY_ASSETS": "ON"
+      }
+    },
+    {
+      "name": "prism-hydra",
+      "displayName": "PrismRT Hydra delegate",
+      "inherits": "prism-base",
+      "cacheVariables": {
+        "PRISM_BUILD_HYDRA": "ON",
+        "PRISM_COPY_ASSETS": "OFF"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "prism-standalone",
+      "configurePreset": "prism-standalone",
+      "configuration": "RelWithDebInfo",
+      "jobs": 8,
+      "targets": ["PrismRT"]
+    },
+    {
+      "name": "prism-hydra",
+      "configurePreset": "prism-hydra",
+      "configuration": "RelWithDebInfo",
+      "jobs": 8
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "prism-hydra",
+      "configurePreset": "prism-hydra",
+      "configuration": "RelWithDebInfo",
+      "environment": {
+        "PXR_PLUGINPATH_NAME": "${sourceDir}/build/hydra/resources",
+        "PXR_USD_WINDOWS_DLL_PATH": "${sourceDir}/build/hydra/plugin;${sourceDir}/build/vcpkg_installed/x64-windows/bin;C:/Users/joaov/Desktop/Programming_Projects/external_deps/OpenUSD/install/bin;C:/Users/joaov/Desktop/Programming_Projects/external_deps/OpenUSD/install/lib;C:/Users/joaov/Desktop/Programming_Projects/external_deps/MaterialX/install/lib;C:/Users/joaov/Desktop/Programming_Projects/include/tbb/redist/intel64/vc14;C:/Users/joaov/Desktop/Programming_Projects/include/Embree/bin;C:/Users/joaov/Desktop/Programming_Projects/mdl-sdk/bin;C:/Users/joaov/Desktop/Programming_Projects/mdl-sdk/nt-x86-64/lib",
+        "PATH": "${sourceDir}/build/hydra/plugin;${sourceDir}/build/vcpkg_installed/x64-windows/bin;C:/Users/joaov/Desktop/Programming_Projects/external_deps/OpenUSD/install/bin;C:/Users/joaov/Desktop/Programming_Projects/external_deps/OpenUSD/install/lib;C:/Users/joaov/Desktop/Programming_Projects/external_deps/MaterialX/install/lib;C:/Users/joaov/Desktop/Programming_Projects/include/tbb/redist/intel64/vc14;C:/Users/joaov/Desktop/Programming_Projects/include/Embree/bin;C:/Users/joaov/Desktop/Programming_Projects/mdl-sdk/bin;C:/Users/joaov/Desktop/Programming_Projects/mdl-sdk/nt-x86-64/lib;$penv{PATH}",
+        "PRISM_MATERIALX_LIBRARY_PATH": "C:/Users/joaov/Desktop/Programming_Projects/external_deps/MaterialX/install/libraries",
+        "PRISM_MATERIALX_MDL": "C:/Users/joaov/Desktop/Programming_Projects/external_deps/MaterialX/install/libraries/mdl",
+        "MDL_SDK_ROOT": "C:/Users/joaov/Desktop/Programming_Projects/mdl-sdk"
+      },
+      "output": { "outputOnFailure": true }
+    }
+  ]
+}

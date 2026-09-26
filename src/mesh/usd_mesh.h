@@ -13,6 +13,7 @@
 #include <pxr/pxr.h>
 #include <pxr/usd/usd/stage.h>
 #include <pxr/usd/usd/prim.h>
+#include <pxr/usd/usd/primRange.h>
 #include <pxr/usd/usdGeom/mesh.h>
 #include <pxr/usd/usdGeom/primvarsAPI.h>
 #include <pxr/usd/usdGeom/xformCache.h>
@@ -151,10 +152,13 @@ RecoverMtlxDocumentFromUsdShade(const UsdPrim& materialPrim,
     const TfTokenVector shaderSourceTypes = { mtlxContext };
 
     SdfPath materialPath = materialPrim.GetPath();
+    const UsdShadeShader surface = UsdShadeMaterial(materialPrim).ComputeSurfaceSource(contextVector);
+    if (!surface)
+        return nullptr;
 
     HdMaterialNetworkMap networkMap;
     UsdImagingBuildHdMaterialNetworkFromTerminal(
-        materialPrim,
+        surface.GetPrim(),
         HdMaterialTerminalTokens->surface,
         shaderSourceTypes,
         contextVector,

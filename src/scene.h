@@ -97,10 +97,14 @@ public:
 
     RayHit cast_ray(RTCRay ray)
     {
-        RTCRayHit e_rayhit;
+        RTCRayHit e_rayhit{};
         e_rayhit.ray = ray;
-        e_rayhit.ray.tnear = 0.001f;
+        // initialize_ray supplies the normal transport epsilon. Preserve an
+        // explicit primary clipping interval, including a near plane of zero.
         e_rayhit.hit.geomID = RTC_INVALID_GEOMETRY_ID;
+        e_rayhit.hit.primID = RTC_INVALID_GEOMETRY_ID;
+        for (auto& id : e_rayhit.hit.instID)
+            id = RTC_INVALID_GEOMETRY_ID;
 
         // intersect a single ray with the scene
         rtcIntersect1(scene, &e_rayhit);
@@ -109,7 +113,7 @@ public:
             return RayHit(e_rayhit);
         else
         {
-            Geometry *geom = geometry[e_rayhit.hit.geomID];
+            Geometry *geom = geometry.at(e_rayhit.hit.geomID);
             return RayHit(e_rayhit, &geom->geom, geom->type);
         }
     }
@@ -127,7 +131,7 @@ public:
         if (ray_hit.geomid != RTC_INVALID_GEOMETRY_ID)
         {
             // retrieve material by geomid and sample the surface
-            Material *material = geometry[ray_hit.geomid]->getMaterial(ray_hit.primid, ray_hit.instid);
+            Material *material = geometry.at(ray_hit.geomid)->getMaterial(ray_hit.primid, ray_hit.instid);
             // sample normal map and perturbate normal
             material->perturbNormal(ray_hit);
 
@@ -440,8 +444,8 @@ class InOneWeekendFinalDispersion : public SceneManager {
 
 // TODO: copy the libraries to the executable folder and get it from the appropriate path
 // MaterialX config paths
-std::string mx_libraries_path = "C:/Users/joaov/Desktop/Programming_Projects/external_deps/MaterialX/install/libraries";
-std::string mx_mdl_path = mx_libraries_path + "/mdl";
+inline std::string mx_libraries_path = "C:/Users/joaov/Desktop/Programming_Projects/external_deps/MaterialX/install/libraries";
+inline std::string mx_mdl_path = mx_libraries_path + "/mdl";
 
 class MaterialXTest : public SceneManager
 {

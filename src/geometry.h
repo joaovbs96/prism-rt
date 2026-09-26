@@ -1,6 +1,5 @@
 #pragma once
 
-#define TINYOBJLOADER_IMPLEMENTATION // define this in only *one* .cc
 
 // STD Lib deps
 #include <iostream>
@@ -306,7 +305,6 @@ class Mesh : public Geometry {
             type = RTC_GEOMETRY_TYPE_TRIANGLE;
             geom = rtcNewGeometry(device, type);
 
-            std::cout << "Finished creating mesh pointer. " << std::endl;
 
             // add new vertex buffer to geometry
             // rtcSetSharedGeometryBuffer(geom, RTC_BUFFER_TYPE_VERTEX, 0, RTC_FORMAT_FLOAT3, vertices.data(), 0, sizeof(Float3), vertices.size());
@@ -327,7 +325,6 @@ class Mesh : public Geometry {
             rtcSetSharedGeometryBuffer(geom, RTC_BUFFER_TYPE_VERTEX_ATTRIBUTE, 1, RTC_FORMAT_FLOAT2, texcoords.data(), 0, sizeof(Float2), texcoords.size());
             rtcSetSharedGeometryBuffer(geom, RTC_BUFFER_TYPE_VERTEX_ATTRIBUTE, 2, RTC_FORMAT_FLOAT4, tangents.data(), 0, 4 * sizeof(float), vertices.size());
 
-            std::cout << "Finished creating mesh buffers. " << std::endl;
 
             // Initialize AABB with current vertices
             updateAABB();
@@ -346,7 +343,7 @@ class Mesh : public Geometry {
 
             // TODO: make materials on a per prim, per instance basis?
             // we may need a two dimensional unordered map, with primid and instid as keys
-            return materials[material_mapping[primid]];
+            return materials.at(material_mapping.at(primid));
         }
 
         // Make a float3 vertex out of a vector and an index
