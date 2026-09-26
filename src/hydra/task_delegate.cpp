@@ -29,6 +29,10 @@ TfToken const _maxDepth("prism:maxDepth");
 TfToken const _rouletteDepth("prism:rrMinDepth");
 TfToken const _seed("prism:seed");
 TfToken const _sampleClamp("prism:maxSampleRadiance");
+TfToken const _previewMaxDimension("prism:previewMaxDimension");
+TfToken const _refinementDelayMs("prism:refinementDelayMs");
+TfToken const _environmentSampling("prism:environmentSampling");
+TfToken const _resourceRevision("prism:resourceRevision");
 TfToken const _selectionOutline("prism:selectionOutline");
 TfToken const _selectionOutlineRadius("prism:selectionOutlineRadius");
 TfToken const _selectionUseHostSettings("prism:selectionUseHostSettings");
@@ -151,6 +155,10 @@ HdRenderSettingDescriptorList PrismTaskDelegate::GetRenderSettingDescriptors() c
             {"Roulette depth", _rouletteDepth, VtValue(4)},
             {"Seed", _seed, VtValue(0)},
             {"Sample clamp", _sampleClamp, VtValue(10.0f)},
+            {"Preview maximum dimension", _previewMaxDimension, VtValue(96)},
+            {"Refinement delay (ms)", _refinementDelayMs, VtValue(100)},
+            {"Environment sampling", _environmentSampling, VtValue(std::string("mis"))},
+            {"Resource revision", _resourceRevision, VtValue(0)},
             {"Selection outline", _selectionOutline, VtValue(true)},
             {"Selection outline radius", _selectionOutlineRadius, VtValue(2)},
             {"Use host selection settings", _selectionUseHostSettings, VtValue(false)}};
@@ -165,6 +173,12 @@ VtValue PrismTaskDelegate::GetRenderSetting(TfToken const &key) const
     if (key == _rouletteDepth) return VtValue(s.rouletteDepth);
     if (key == _seed) return VtValue(s.seed);
     if (key == _sampleClamp) return VtValue(s.sampleClamp);
+    if (key == _previewMaxDimension) return VtValue(s.previewMaxDimension);
+    if (key == _refinementDelayMs) return VtValue(s.refinementDelayMs);
+    if (key == _environmentSampling) return VtValue(std::string(
+        s.environmentSampling == prism::hydra::RenderSettings::EnvironmentSampling::Mis
+            ? "mis" : "bsdf"));
+    if (key == _resourceRevision) return VtValue(s.resourceRevision);
     if (key == _selectionOutline)
         return VtValue(_selectionSettings->enableOutline.load());
     if (key == _selectionOutlineRadius)
@@ -240,6 +254,23 @@ void PrismTaskDelegate::SetRenderSetting(TfToken const &key, VtValue const &valu
     else if (key == _rouletteDepth) s.rouletteDepth = std::max(0, _Get(value, s.rouletteDepth));
     else if (key == _seed) s.seed = _Get(value, s.seed);
     else if (key == _sampleClamp) s.sampleClamp = std::max(0.0f, _Get(value, s.sampleClamp));
+    else if (key == _previewMaxDimension)
+        s.previewMaxDimension = std::clamp(_Get(value, s.previewMaxDimension), 16, 1024);
+    else if (key == _refinementDelayMs)
+        s.refinementDelayMs = std::clamp(_Get(value, s.refinementDelayMs), 0, 2000);
+    else if (key == _environmentSampling &&
+             (value.IsHolding<std::string>() || value.IsHolding<TfToken>())) {
+        const std::string mode = value.IsHolding<std::string>()
+            ? value.UncheckedGet<std::string>()
+            : value.UncheckedGet<TfToken>().GetString();
+        if (mode == "mis")
+            s.environmentSampling = prism::hydra::RenderSettings::EnvironmentSampling::Mis;
+        else if (mode == "bsdf")
+            s.environmentSampling = prism::hydra::RenderSettings::EnvironmentSampling::Bsdf;
+        else return;
+    }
+    else if (key == _resourceRevision)
+        s.resourceRevision = _Get(value, s.resourceRevision);
     else return;
     if (_bridge) _bridge->SetSettings(s);
 }
@@ -314,7 +345,8 @@ void PrismTaskDelegate::PrimsAdded(HdSceneIndexBase const &sender,
         if (_NeedsSceneRebuild(sender.GetPrim(entry.primPath)))
             sceneChanged = true;
     }
-    if (sceneChanged && _bridge) _bridge->MarkSceneDirty();
+    if (sceneChanged && _bridge)
+        _bridge->MarkSceneDirty(prism::hydra::SceneDirtyKind::Structure);
 }
 
 void PrismTaskDelegate::PrimsRemoved(HdSceneIndexBase const &,
@@ -323,7 +355,7 @@ void PrismTaskDelegate::PrimsRemoved(HdSceneIndexBase const &,
     for (const auto& entry : entries)
         for (const auto& path : _renderSettingsPaths)
             if (path.HasPrefix(entry.primPath)) _authoredSettingsDirty = true;
-    if (_bridge) _bridge->MarkSceneDirty();
+    if (_bridge) _bridge->MarkSceneDirty(prism::hydra::SceneDirtyKind::Structure);
 }
 
 void PrismTaskDelegate::PrimsDirtied(HdSceneIndexBase const &sender,
@@ -355,16 +387,43 @@ void PrismTaskDelegate::PrimsDirtied(HdSceneIndexBase const &sender,
             }
             if (!currentFrameChanged) continue;
         }
-        if (_NeedsSceneRebuild(prim)) sceneChanged = true;
+        if (_NeedsSceneRebuild(prim)) {
+            sceneChanged = true;
+            if (_bridge) {
+                bool marked = false;
+                for (const HdDataSourceLocator &locator : entry.dirtyLocators) {
+                    prism::hydra::SceneDirtyKind kind =
+                        prism::hydra::SceneDirtyKind::Unknown;
+                    const std::string text = locator.GetString();
+                    if (prim.primType == HdPrimTypeTokens->domeLight)
+                        kind = prism::hydra::SceneDirtyKind::Environment;
+                    else if (prim.primType == HdPrimTypeTokens->material)
+                        kind = prism::hydra::SceneDirtyKind::Material;
+                    else if (text.rfind("xform", 0) == 0 ||
+                        text.rfind("visibility", 0) == 0 ||
+                        text.rfind("instancerTopology", 0) == 0)
+                        kind = prism::hydra::SceneDirtyKind::Placement;
+                    else if (text.rfind("mesh", 0) == 0 ||
+                             text.rfind("primvars", 0) == 0)
+                        kind = prism::hydra::SceneDirtyKind::Prototype;
+                    else if (text.rfind("materialBindings", 0) == 0)
+                        kind = prism::hydra::SceneDirtyKind::Material;
+                    _bridge->MarkSceneDirty(kind, entry.primPath);
+                    marked = true;
+                }
+                if (!marked) _bridge->MarkSceneDirty(
+                    prism::hydra::SceneDirtyKind::Unknown, entry.primPath);
+            }
+        }
     }
-    if (sceneChanged && _bridge) _bridge->MarkSceneDirty();
+    if (sceneChanged && _bridge && entries.empty()) _bridge->MarkSceneDirty();
 }
 
 void PrismTaskDelegate::PrimsRenamed(HdSceneIndexBase const &,
                                      RenamedPrimEntries const &)
 {
     _authoredSettingsDirty = true;
-    if (_bridge) _bridge->MarkSceneDirty();
+    if (_bridge) _bridge->MarkSceneDirty(prism::hydra::SceneDirtyKind::Structure);
 }
 
 PXR_NAMESPACE_CLOSE_SCOPE

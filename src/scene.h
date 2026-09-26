@@ -2,6 +2,7 @@
 
 #include <filesystem>
 #include <stdexcept>
+#include <array>
 
 #include <embree4/rtcore.h>
 #include <embree4/rtcore_common.h>
@@ -53,13 +54,16 @@ public:
         if (!std::filesystem::exists(file_path))
             throw std::runtime_error("File not found: " + file_path.string());
 
-        Mesh *mesh;
+        Mesh *mesh = nullptr;
         if (file_path.extension() == ".obj")
             mesh = new ObjMesh(file_path);
         else if ((file_path.extension() == ".gltf") || (file_path.extension() == ".glb"))
             mesh = new glTFMesh(file_path);
         else if ((file_path.extension() == ".usd") || (file_path.extension() == ".usda") || (file_path.extension() == ".usdz") || (file_path.extension() == ".usdc"))
             mesh = new USDMesh(file_path, mdl_context, mx_libraries_path, mx_mdl_path);
+        else
+            throw std::runtime_error("Unsupported scene format: " +
+                                     file_path.extension().string());
 
         if (material_override != nullptr)
         {
@@ -113,13 +117,60 @@ public:
             return RayHit(e_rayhit);
         else
         {
-            Geometry *geom = geometry.at(e_rayhit.hit.geomID);
-            return RayHit(e_rayhit, &geom->geom, geom->type);
+            const unsigned int placementId =
+                e_rayhit.hit.instID[0] != RTC_INVALID_GEOMETRY_ID
+                    ? e_rayhit.hit.instID[0] : e_rayhit.hit.geomID;
+            Geometry *geom = geometry.at(placementId);
+            RTCGeometry interpolation = geom->geom;
+            auto leaf = intersection_geometry.find(placementId);
+            if (leaf != intersection_geometry.end()) interpolation = leaf->second;
+            auto placement = placement_transforms.find(placementId);
+            if (placement != placement_transforms.end()) {
+                Float3 ng(e_rayhit.hit.Ng_x, e_rayhit.hit.Ng_y,
+                          e_rayhit.hit.Ng_z);
+                auto const &m = placement->second.normal;
+                ng = Float3(ng.x()*m[0] + ng.y()*m[3] + ng.z()*m[6],
+                            ng.x()*m[1] + ng.y()*m[4] + ng.z()*m[7],
+                            ng.x()*m[2] + ng.y()*m[5] + ng.z()*m[8]);
+                // Match the flattened baseline's transformed-edge winding.
+                if (placement->second.mirrored) ng = -ng;
+                e_rayhit.hit.Ng_x = ng.x(); e_rayhit.hit.Ng_y = ng.y();
+                e_rayhit.hit.Ng_z = ng.z();
+            }
+            RayHit hit(e_rayhit, &interpolation, geom->type);
+            hit.geomid = static_cast<int>(placementId);
+            if (placement != placement_transforms.end()) {
+                auto transformDirection = [](Float3 const &v,
+                                             std::array<float, 9> const &m) {
+                    return Float3(v.x()*m[0] + v.y()*m[3] + v.z()*m[6],
+                                  v.x()*m[1] + v.y()*m[4] + v.z()*m[7],
+                                  v.x()*m[2] + v.y()*m[5] + v.z()*m[8]);
+                };
+                hit.n = transformDirection(hit.n, placement->second.normal).normalize();
+                if (!hit.tangent.is_zero())
+                    hit.tangent = transformDirection(
+                        hit.tangent, placement->second.tangent).normalize();
+                // Ng was transformed before constructing RayHit so its
+                // front-face decision and the interpolated normal agree.
+                if (placement->second.mirrored) {
+                    // Authored normals in the flattened path receive the same
+                    // orientation parity correction before face forwarding.
+                    hit.n = -hit.n;
+                    hit.bitangent_sign *= -1.0f;
+                }
+            }
+            return hit;
         }
     }
 
     Material *getMaterial(RayHit const &hit)
     {
+        auto binding = placement_materials.find(hit.geomid);
+        if (binding != placement_materials.end()) {
+            auto triangle = binding->second.triangles.find(hit.primid);
+            if (triangle != binding->second.triangles.end()) return triangle->second;
+            if (binding->second.fallback) return binding->second.fallback;
+        }
         return geometry.at(hit.geomid)->getMaterial(hit.primid, hit.instid);
     }
 
@@ -260,6 +311,20 @@ public:
     RTCDevice *device;
     RTCScene scene;
     std::unordered_map<int, Geometry *> geometry;
+    // Top-level placement id -> leaf geometry used for interpolation.  For
+    // ordinary geometry the Geometry::geom handle is used directly.
+    std::unordered_map<int, RTCGeometry> intersection_geometry;
+    struct PlacementTransform {
+        std::array<float, 9> normal{};
+        std::array<float, 9> tangent{};
+        bool mirrored = false;
+    };
+    std::unordered_map<int, PlacementTransform> placement_transforms;
+    struct PlacementMaterialBinding {
+        Material *fallback = nullptr;
+        std::unordered_map<int, Material *> triangles;
+    };
+    std::unordered_map<int, PlacementMaterialBinding> placement_materials;
     Environment *environment;
     Camera cam;
     int image_width = 1280;
@@ -268,6 +333,8 @@ public:
     int max_depth = 32;
     bool environmentSampling = true;
 };
+
+
 
 class Earth : public SceneManager
 {

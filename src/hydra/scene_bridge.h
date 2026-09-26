@@ -25,6 +25,21 @@ struct RenderSettings {
     int rouletteDepth = 4;
     int seed = 0;
     float sampleClamp = 10.0f;
+    int previewMaxDimension = 96;
+    int refinementDelayMs = 100;
+    int resourceRevision = 0;
+    enum class EnvironmentSampling { Mis, Bsdf } environmentSampling =
+        EnvironmentSampling::Mis;
+};
+
+enum class SceneDirtyKind : unsigned int {
+    None = 0,
+    Placement = 1u << 0,
+    Prototype = 1u << 1,
+    Material = 1u << 2,
+    Environment = 1u << 3,
+    Structure = 1u << 4,
+    Unknown = 1u << 5
 };
 
 struct CameraState {
@@ -49,6 +64,7 @@ public:
     SceneBridge &operator=(const SceneBridge &) = delete;
 
     void MarkSceneDirty();
+    void MarkSceneDirty(SceneDirtyKind kind, pxr::SdfPath const &path = {});
     void SetSettings(RenderSettings const &settings);
     RenderSettings GetSettings() const;
     bool Prepare(CameraState const &camera,

@@ -51,6 +51,16 @@ public:
                   size_t components);
     void SetConverged(bool value) { _converged.store(value); }
     void ResetSamples();
+    uint64_t GetWriteNanoseconds() const { return _writeNanoseconds.load(); }
+    // Rendering workers measure a complete tile locally and update this
+    // counter once per tile.  This keeps profiling out of the per-pixel fast
+    // path and avoids making the counter a shared cache-line bottleneck.
+    void RecordWriteNanoseconds(uint64_t value)
+    {
+        _writeNanoseconds.fetch_add(value, std::memory_order_relaxed);
+    }
+    uint64_t GetPublishNanoseconds() const { return _publishNanoseconds.load(); }
+    uint64_t GetMapWaitNanoseconds() const { return _mapWaitNanoseconds.load(); }
 
 protected:
     void _Deallocate() override;
@@ -70,6 +80,9 @@ private:
     mutable std::recursive_mutex _mutex;
     std::atomic<int> _mappers{0};
     std::atomic<bool> _converged{false};
+    std::atomic<uint64_t> _writeNanoseconds{0};
+    std::atomic<uint64_t> _publishNanoseconds{0};
+    std::atomic<uint64_t> _mapWaitNanoseconds{0};
     bool _hasPublished = false;
     HdRenderThread *_renderThread;
 };

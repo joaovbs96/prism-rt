@@ -1,5 +1,6 @@
 """Run with the rebuilt USD's testusdview --testScript option and parity.usda."""
 import os
+import json
 import time
 from pathlib import Path
 
@@ -20,17 +21,32 @@ def testUsdviewInputFunction(appController):
     view.SetPhysicalWindowSize(256, 256)
     view.makeCurrent()
     assert view.SetRendererPlugin("HdPrismRendererPlugin"), "PrismRT plugin unavailable"
+    for name, default, low, high in [
+        ("prism:previewMaxDimension", 96, 16, 1024),
+        ("prism:refinementDelayMs", 100, 0, 2000),
+    ]:
+        assert view.GetRendererSetting(name) == default
+        view.SetRendererSetting(name, low - 1)
+        assert view.GetRendererSetting(name) == low
+        view.SetRendererSetting(name, high + 1)
+        assert view.GetRendererSetting(name) == high
+        view.SetRendererSetting(name, default)
+    assert view.GetRendererSetting("prism:environmentSampling") == "mis"
+    view.SetRendererSetting("prism:environmentSampling", "bsdf")
+    assert view.GetRendererSetting("prism:environmentSampling") == "bsdf"
+    view.SetRendererSetting("prism:environmentSampling", "mis")
     view.SetRendererSetting("prism:samplesPerPixel", 16)
+    timings = {}
 
     def settle():
-        view.updateView()
         start = time.monotonic()
+        view.updateView()
         # Process at least one frame even if the previous render converged.
         while True:
             view.updateGL()
             QtWidgets.QApplication.processEvents()
             if view.IsRendererConverged():
-                break
+                return time.monotonic() - start
             if time.monotonic() - start > 180:
                 raise AssertionError("usdview renderer failed to converge")
             time.sleep(0.01)
@@ -115,7 +131,7 @@ def testUsdviewInputFunction(appController):
     settle()
     frame_one = shot("02-time-1.png")
     model.currentFrame = Usd.TimeCode(2)
-    settle()
+    timings["geometryEditToConvergedSeconds"] = settle()
     assert shot("02-time-2.png") != frame_one, "Time change did not update geometry"
     points.ClearAtTime(Usd.TimeCode(1))
     points.ClearAtTime(Usd.TimeCode(2))
@@ -124,14 +140,14 @@ def testUsdviewInputFunction(appController):
 
     base_color = model.stage.GetPrimAtPath("/World/Mat/Surface").GetAttribute("inputs:base_color")
     base_color.Set(Gf.Vec3f(0.1, 0.6, 0.2))
-    settle()
+    timings["materialEditToConvergedSeconds"] = settle()
     assert shot("02-material-edited.png") != original, "Material edit reused stale compiled code"
     base_color.Set(Gf.Vec3f(0.5, 0.2, 0.1))
     settle()
 
     panel = UsdGeom.Imageable(model.stage.GetPrimAtPath("/World/Panel"))
     panel.MakeInvisible()
-    settle()
+    timings["visibilityEditToConvergedSeconds"] = settle()
     hidden = shot("03-hidden.png")
     assert hidden != original, "Visibility edit did not update the viewport"
     panel.MakeVisible()
@@ -142,7 +158,7 @@ def testUsdviewInputFunction(appController):
     shot("04-depth.png")
     assert view.SetRendererAov("color")
     view.SetPhysicalWindowSize(320, 240)
-    settle()
+    timings["resizeToConvergedSeconds"] = settle()
     shot("05-resized.png")
 
     # Destroy and recreate the Prism renderer while the USD stage stays alive.
@@ -161,4 +177,5 @@ def testUsdviewInputFunction(appController):
     view.SetRendererSetting("prism:samplesPerPixel", 8)
     settle()
     shot("06-recreated.png")
+    (output / "interaction-timings.json").write_text(json.dumps(timings, indent=2))
     print("PrismRT usdview smoke checks passed; screenshots:", output.resolve())

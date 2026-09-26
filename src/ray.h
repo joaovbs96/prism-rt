@@ -15,6 +15,7 @@ class RayHit {
             o = Float3(e_rayhit.ray.org_x, e_rayhit.ray.org_y, e_rayhit.ray.org_z);
             d = Float3(e_rayhit.ray.dir_x, e_rayhit.ray.dir_y, e_rayhit.ray.dir_z);
             geomid = e_rayhit.hit.geomID;
+            prototypeid = e_rayhit.hit.geomID;
             instid = e_rayhit.hit.instID[0];
             t = e_rayhit.ray.tfar;
             if (geomid == RTC_INVALID_GEOMETRY_ID) {
@@ -94,6 +95,7 @@ class RayHit {
         bool front_face;
         float t;
         int geomid, primid, instid;
+        int prototypeid = RTC_INVALID_GEOMETRY_ID;
 };
 
 inline RTCRay initialize_ray(Float3 o, Float3 d){

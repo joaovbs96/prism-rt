@@ -388,6 +388,14 @@ class Mesh : public Geometry {
         std::unordered_map<int, int> material_mapping;
         Material* material_override = nullptr;
 
+        // Finalize the vertex tangent stream before geometry fingerprinting.
+        // setupEmbree() performs the same operation, but scene synchronization
+        // needs stable derived data before deciding whether prototypes share
+        // storage.
+        void ensureTangents() {
+            if (tangents.empty()) computeTangents();
+        }
+
     private:
         // Smooth per-vertex tangents derived from the UV layout, built the
         // same way smooth normals are: solve dP/du per triangle

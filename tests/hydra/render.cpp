@@ -83,13 +83,29 @@ void checkFixtureAovs(UsdImagingGLEngine& engine) {
 
 int main(int argc, char** argv) {
     try {
-        if (argc < 4 || argc > 8) {
-            std::cerr << "usage: prism_hydra_render scene.usda /Camera output.exr [width height spp [--exercise]]\n";
+        if (argc < 4) {
+            std::cerr << "usage: prism_hydra_render scene.usda /Camera output.exr [width height spp [--exercise] [--environment-sampling mis|bsdf] [--sample-clamp N] [--seed N]]\n";
             return 2;
         }
         const int width = argc > 4 ? std::stoi(argv[4]) : 128;
         const int height = argc > 5 ? std::stoi(argv[5]) : 128;
         const int spp = argc > 6 ? std::stoi(argv[6]) : 64;
+        bool exercise = false;
+        std::string sampling = "mis";
+        float sampleClamp = 10.0f;
+        int seed = 0;
+        for (int i = 7; i < argc; ++i) {
+            const std::string option(argv[i]);
+            if (option == "--exercise") { exercise = true; continue; }
+            if (++i >= argc) throw std::runtime_error("Missing option value: " + option);
+            if (option == "--environment-sampling") sampling = argv[i];
+            else if (option == "--sample-clamp") sampleClamp = std::stof(argv[i]);
+            else if (option == "--seed") seed = std::stoi(argv[i]);
+            else throw std::runtime_error("Unknown option: " + option);
+        }
+        if ((sampling != "mis" && sampling != "bsdf") ||
+            !std::isfinite(sampleClamp) || sampleClamp < 0)
+            throw std::runtime_error("Invalid sampling mode or sample clamp");
         if (width <= 0 || height <= 0 || spp <= 0)
             throw std::runtime_error("Dimensions and spp must be positive");
         auto stage = UsdStage::Open(argv[1]);
@@ -107,8 +123,9 @@ int main(int argc, char** argv) {
         engine.SetRendererSetting(TfToken("prism:samplesPerPixel"), VtValue(spp));
         engine.SetRendererSetting(TfToken("prism:maxDepth"), VtValue(32));
         engine.SetRendererSetting(TfToken("prism:rrMinDepth"), VtValue(4));
-        engine.SetRendererSetting(TfToken("prism:maxSampleRadiance"), VtValue(10.0f));
-        engine.SetRendererSetting(TfToken("prism:seed"), VtValue(0));
+        engine.SetRendererSetting(TfToken("prism:maxSampleRadiance"), VtValue(sampleClamp));
+        engine.SetRendererSetting(TfToken("prism:environmentSampling"), VtValue(TfToken(sampling)));
+        engine.SetRendererSetting(TfToken("prism:seed"), VtValue(seed));
         engine.SetRendererAovs({HdAovTokens->color, HdAovTokens->depth,
             HdAovTokens->cameraDepth, HdAovTokens->normal, HdAovTokens->Neye,
             HdAovTokens->primId, HdAovTokens->instanceId, HdAovTokens->elementId});
@@ -116,11 +133,20 @@ int main(int argc, char** argv) {
         render(engine, stage);
         for (const auto& [name,value] : engine.GetRenderStats())
             std::cout << "Render stat " << name << ": " << value << '\n';
+        // Some SDK/plugin shutdown paths terminate the process without
+        // flushing fully buffered redirected stdout.  Publish the structured
+        // statistics before image encoding so automated validators can rely
+        // on them even in those runtimes.
+        std::cout.flush();
         const auto initial = pixels(engine, width, height);
+        std::cout << "Center normal: "
+                  << center<GfVec3f>(engine, HdAovTokens->normal, HdFormatFloat32Vec3)
+                  << "; camera depth: "
+                  << center<float>(engine, HdAovTokens->cameraDepth, HdFormatFloat32) << '\n';
         OIIO::ImageBuf image(OIIO::ImageSpec(width, height, 4, OIIO::TypeDesc::FLOAT));
         image.set_pixels(OIIO::ROI(), OIIO::TypeDesc::FLOAT, initial.data());
         if (!image.write(argv[3])) throw std::runtime_error(image.geterror());
-        if (argc == 8 && std::string(argv[7]) == "--exercise") {
+        if (exercise) {
             checkFixtureAovs(engine);
             // Same scene + seed must remain stable when asked to render again.
             render(engine, stage);

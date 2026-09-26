@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <chrono>
 
 PXR_NAMESPACE_OPEN_SCOPE
 
@@ -59,7 +60,11 @@ void PrismRenderBuffer::_Deallocate()
 
 void *PrismRenderBuffer::Map()
 {
+    const auto start = std::chrono::steady_clock::now();
     _mutex.lock();
+    _mapWaitNanoseconds.fetch_add(static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - start).count()));
     ++_mappers;
     return _pixels.empty() ? nullptr : _pixels.data();
 }
@@ -208,14 +213,12 @@ void PrismRenderBuffer::_Write(unsigned int x, unsigned int y,
 void PrismRenderBuffer::WriteFloat(unsigned int x, unsigned int y,
                                    const float *value, size_t n, bool accumulate)
 {
-    std::lock_guard lock(_mutex);
     _Write(x, y, value, n, accumulate);
 }
 
 void PrismRenderBuffer::WriteInt(unsigned int x, unsigned int y,
                                  const int *value, size_t n)
 {
-    std::lock_guard lock(_mutex);
     if (x >= _width || y >= _height) return;
     const size_t arity = HdGetComponentCount(_format);
     uint8_t *dst = _workingPixels.data() +
@@ -304,9 +307,14 @@ void PrismRenderBuffer::BeginFrame(VtValue const &value)
 
 void PrismRenderBuffer::Publish()
 {
+    const auto start = std::chrono::steady_clock::now();
     std::lock_guard lock(_mutex);
-    _pixels = _workingPixels;
+    _pixels.swap(_workingPixels);
     _hasPublished = true;
+    _publishNanoseconds.fetch_add(static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - start).count()),
+        std::memory_order_relaxed);
 }
 
 PXR_NAMESPACE_CLOSE_SCOPE
