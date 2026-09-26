@@ -17,8 +17,8 @@ struct CompiledMaterial {
 
     // The transaction that owns the compiled material's data.
     // MUST stay alive as long as compiled_material is in use.
-    // Call commit() on this only after you're done with the compiled material
-    // (i.e. after Phase 5 backend compilation produces the target code).
+    // Generated target code can retain references to module database elements,
+    // so the transaction is committed when compilation finishes.
     mi::base::Handle<mi::neuraylib::ITransaction> transaction;
 
     // Database names for cleanup/reference
@@ -27,6 +27,7 @@ struct CompiledMaterial {
     std::string instance_db_name;    // e.g. "material_instance_test_material"
 
     bool success = false;
+    bool allowTargetCodeReuse = false;
     std::string error_message;
 
     // Call this when you're done with the compiled material
@@ -80,7 +81,8 @@ public:
     mi::base::Handle<const mi::neuraylib::ICompiled_material> compile_instance(
         mi::neuraylib::ITransaction* transaction,
         const std::string& instance_name,
-        mi::neuraylib::IMdl_execution_context* context);
+        mi::neuraylib::IMdl_execution_context* context,
+        bool classCompilation = true);
 
 private:
     // Helper: print all messages from the execution context

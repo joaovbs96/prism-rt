@@ -176,6 +176,16 @@ int main()
         std::cerr << "Identical material graph did not reuse cached MDL material\n";
         return 5;
     }
+    const auto cachedStats = service.GetStats();
+    if (service.Resolve(MakeMaterial(false, relativeTexture, texture.string(), 0.1f),
+                        materialPath) != first ||
+        service.GetStats().conversionSeconds != cachedStats.conversionSeconds ||
+        service.GetStats().resourceReadSeconds != cachedStats.resourceReadSeconds ||
+        service.GetStats().pathCacheHits != cachedStats.pathCacheHits + 1) {
+        std::cerr << "Fresh data-source wrapper repeated material conversion/resource reads\n";
+        return 15;
+    }
+    service.Invalidate(materialPath);
     const auto changed = service.Resolve(
         MakeMaterial(false, relativeTexture, texture.string(), 0.47f), materialPath);
     if (!changed || changed == first) {
@@ -192,6 +202,7 @@ int main()
         std::ofstream image(texture, std::ios::binary | std::ios::trunc);
         image << "P3\n1 1\n255\n190 70 25\n";
     }
+    service.Invalidate(materialPath);
     const auto changedTexture = service.Resolve(
         MakeMaterial(false, relativeTexture, texture.string(), 0.1f), materialPath);
     if (!changedTexture || changedTexture == first) {
@@ -199,6 +210,7 @@ int main()
         return 11;
     }
 
+    service.Invalidate(materialPath);
     const auto mtlx = service.Resolve(
         MakeMaterial(true, relativeTexture, texture.string(), 0.1f), materialPath);
     if (!mtlx) {

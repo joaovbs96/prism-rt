@@ -24,6 +24,9 @@ public:
     // of construction, so materials should share one instance instead of
     // building their own. generate() is serialized internally.
     static std::shared_ptr<MDLGenerator> shared(const std::string& mx_libraries_path);
+    // One generator per worker avoids serializing GenContext while retaining
+    // standard-library reuse for all jobs executed by that worker.
+    static std::shared_ptr<MDLGenerator> workerLocal(const std::string& mx_libraries_path);
 
     GeneratedMDL generate(MaterialX::DocumentPtr doc,
                           const std::string& material_name);

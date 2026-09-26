@@ -11,6 +11,16 @@ struct BRDFSample {
     Color3 color;
     Color3 emission;
     bool scattered;
+    float pdf = 0.0f;
+    bool delta = false;
+    bool null_event = false;
+    bool nee_compatible = false;
+};
+
+struct BRDFEvaluation {
+    Color3 value = Color3(0.0f); // BSDF times abs(n.wi), in solid-angle measure
+    float pdf = 0.0f;
+    bool valid = false;
 };
 
 class Material {
@@ -30,6 +40,10 @@ class Material {
             s.scattered = !s.wi.is_zero();
             return s;
         }
+
+        virtual BRDFEvaluation evaluate(const RayHit&, const Float3&) { return {}; }
+        virtual bool supportsNee(const RayHit&) const { return false; }
+        virtual float cutoutOpacity(const RayHit&) { return 1.0f; }
 
         virtual Float3 sample_direction(const RayHit ray_hit, unsigned int &seed) = 0;
 
@@ -118,6 +132,21 @@ class Diffuse : public Material {
             return diffuse_color->sample(u, v, p);
         }
 
+        BRDFSample sample(const RayHit ray_hit, unsigned int &seed) override {
+            BRDFSample s = Material::sample(ray_hit, seed);
+            const Float3 wi = s.wi.normalize();
+            s.pdf = std::max(0.0f, dot(ray_hit.n, wi)) / PI;
+            s.nee_compatible = s.pdf > 0.0f;
+            return s;
+        }
+        BRDFEvaluation evaluate(const RayHit& hit, const Float3& wi) override {
+            const float cosine = std::max(0.0f, dot(hit.n, wi.normalize()));
+            BRDFEvaluation e;
+            e.value = diffuse_color->sample(hit.u, hit.v, hit.p) * (cosine / PI);
+            e.pdf = cosine / PI; e.valid = cosine > 0.0f; return e;
+        }
+        bool supportsNee(const RayHit&) const override { return true; }
+
         Texture<Float3>* diffuse_color;
 };
 
@@ -186,6 +215,11 @@ class Glass : public Material {
             return Color3(1.0f);
         }
 
+        BRDFSample sample(const RayHit ray_hit, unsigned int &seed) override {
+            BRDFSample s = Material::sample(ray_hit, seed); s.delta = true; return s;
+        }
+        float getIor() const { return ior; }
+
     private:
         float ior;
 };
@@ -248,6 +282,7 @@ public:
 
         s.emission = Color3(0.0f);
         s.scattered = true;
+        s.delta = true;
 
         return s;
     }

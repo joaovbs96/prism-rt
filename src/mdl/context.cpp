@@ -1,11 +1,52 @@
 #include "context.h"
+#include "backend_compiler.h"
 
 #include <format>
 #include <iostream>
+#include <cstdlib>
+#include <string_view>
 
 #include <mi/base/plugin.h>
+#include <mi/base/ilogger.h>
+#include <mi/neuraylib/ilogging_configuration.h>
 
 namespace mdl {
+
+namespace {
+bool VerboseMdl()
+{
+    const char* value = std::getenv("PRISM_MDL_VERBOSE");
+    return value && *value && std::string_view(value) != "0";
+}
+
+class PrismReceivingLogger final
+    : public mi::base::Interface_implement<mi::base::ILogger>
+{
+public:
+    void message(mi::base::Message_severity level, const char* category,
+                 const mi::base::Message_details&, const char* message) override
+    {
+        emit(level, category, message);
+    }
+
+    void message(mi::base::Message_severity level, const char* category,
+                 const char* message) override
+    {
+        emit(level, category, message);
+    }
+
+private:
+    static void emit(mi::base::Message_severity level, const char*, const char* message)
+    {
+        const std::string_view text = message ? message : "";
+        if (!VerboseMdl()) {
+            if (level > mi::base::MESSAGE_SEVERITY_WARNING) return;
+            if (text.find("C183 unused parameter") != std::string_view::npos) return;
+        }
+        std::cerr << text << '\n';
+    }
+};
+}
 
 Context::Context(const char* library_path, const std::vector<std::string>& plugins)
     : m_is_valid(false)
@@ -23,11 +64,12 @@ Context::Context(const char* library_path, const std::vector<std::string>& plugi
     
     // Load plugins BEFORE starting the SDK — this is required by the MDL SDK.
     // Plugins registered after neuray->start() will be rejected.
+    configure_logging();
     if (!load_plugins(plugins)) {
         // Non-fatal: we warn but continue. Textures may not work.
         std::cerr << "[WARN] Some plugins failed to load (textures may not work)\n";
     }
-    
+
     // Start the SDK
     if (!start_sdk()) {
         m_loader.unload();
@@ -40,17 +82,23 @@ Context::Context(const char* library_path, const std::vector<std::string>& plugi
         m_loader.unload();
         return;
     }
-    
+
     m_is_valid = true;
 }
 
 Context::~Context() {
     if (m_is_valid) {
+        ClearTargetCodeCache();
         // Release interface handles (automatic via mi::base::Handle)
         m_mdl_factory.reset();
         m_mdl_impexp.reset();
         m_mdl_config.reset();
         m_database.reset();
+
+        mi::base::Handle<mi::neuraylib::ILogging_configuration> logging(
+            m_loader.get_neuray()->get_api_component<mi::neuraylib::ILogging_configuration>());
+        if (logging) logging->set_receiving_logger(nullptr);
+        m_receiving_logger.reset();
         
         // Shutdown SDK
         mi::neuraylib::INeuray* neuray = m_loader.get_neuray();
@@ -62,6 +110,19 @@ Context::~Context() {
     }
 }
 
+void Context::configure_logging()
+{
+    mi::base::Handle<mi::neuraylib::ILogging_configuration> logging(
+        m_loader.get_neuray()->get_api_component<mi::neuraylib::ILogging_configuration>());
+    if (!logging) return;
+    m_receiving_logger = mi::base::make_handle(new PrismReceivingLogger());
+    logging->set_receiving_logger(m_receiving_logger.get());
+    if (!VerboseMdl()) {
+        logging->set_log_level(mi::base::MESSAGE_SEVERITY_WARNING);
+        logging->set_log_level_by_category("ALL", mi::base::MESSAGE_SEVERITY_WARNING);
+    }
+}
+
 bool Context::load_plugins(const std::vector<std::string>& plugins) {
     bool all_ok = true;
 
@@ -70,9 +131,9 @@ bool Context::load_plugins(const std::vector<std::string>& plugins) {
         mi::Sint32 result = m_loader.load_plugin(plugin_name);
 
         if (result == 0) {
-            std::cout << "[OK] Plugin loaded: " << plugin_name << "\n";
+            if (VerboseMdl()) std::cout << "[OK] Plugin loaded: " << plugin_name << "\n";
         } else if (result == 1) {
-            std::cout << "[OK] Plugin already loaded: " << plugin_name << "\n";
+            if (VerboseMdl()) std::cout << "[OK] Plugin already loaded: " << plugin_name << "\n";
         } else {
             std::cerr << "[WARN] Failed to load plugin: " << plugin_name
                       << " (code: " << result << ")\n";
@@ -139,15 +200,21 @@ bool Context::acquire_interfaces() {
 
 bool Context::add_mdl_path(const std::string& path) {
     if (!m_is_valid) return false;
+    std::lock_guard<std::mutex> lock(m_configuration_mutex);
+    if (m_registered_mdl_paths.count(path)) return true;
     
     mi::Sint32 result = m_mdl_config->add_mdl_path(path.c_str());
+    if (result == 0) m_registered_mdl_paths.insert(path);
     return result == 0;
 }
 
 bool Context::add_resource_path(const std::string& path) {
     if (!m_is_valid) return false;
+    std::lock_guard<std::mutex> lock(m_configuration_mutex);
+    if (m_registered_resource_paths.count(path)) return true;
     
     mi::Sint32 result = m_mdl_config->add_resource_path(path.c_str());
+    if (result == 0) m_registered_resource_paths.insert(path);
     return result == 0;
 }
 
@@ -155,6 +222,7 @@ std::vector<std::string> Context::get_mdl_paths() const {
     std::vector<std::string> paths;
     
     if (!m_is_valid) return paths;
+    std::lock_guard<std::mutex> lock(m_configuration_mutex);
     
     mi::Size count = m_mdl_config->get_mdl_paths_length();
     for (mi::Size i = 0; i < count; ++i) {
@@ -171,6 +239,7 @@ std::vector<std::string> Context::get_resource_paths() const {
     std::vector<std::string> paths;
     
     if (!m_is_valid) return paths;
+    std::lock_guard<std::mutex> lock(m_configuration_mutex);
     
     mi::Size count = m_mdl_config->get_resource_paths_length();
     for (mi::Size i = 0; i < count; ++i) {

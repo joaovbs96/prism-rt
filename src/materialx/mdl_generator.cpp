@@ -9,6 +9,14 @@
 #include <MaterialXGenMdl/MdlShaderGenerator.h>
 #include <iostream>
 #include <map>
+#include <cstdlib>
+
+namespace {
+bool VerboseMdl() {
+    const char* value = std::getenv("PRISM_MDL_VERBOSE");
+    return value && *value && std::string(value) != "0";
+}
+}
 #include <mutex>
 
 class MDLGenerator::Impl {
@@ -36,7 +44,7 @@ public:
         m_generator->setColorManagementSystem(color_management);
         m_context.getOptions().targetColorSpaceOverride = "lin_rec709";
 
-        std::cout << "[DEBUG] stdlib elements loaded: "
+        if (VerboseMdl()) std::cout << "[DEBUG] stdlib elements loaded: "
                 << m_stdlib->getChildren().size() << "\n";
 
         // registerSourceCodeSearchPath needs the libraries folder itself
@@ -47,7 +55,7 @@ public:
         sourceSearchPath.append(librariesPath / MaterialX::FilePath("mdl/materialx"));
         m_context.registerSourceCodeSearchPath(sourceSearchPath);
 
-        std::cout << "[DEBUG] Source search root: " << installRoot.asString() << "\n";
+        if (VerboseMdl()) std::cout << "[DEBUG] Source search root: " << installRoot.asString() << "\n";
     }
 
     MaterialX::DocumentPtr get_stdlib() const { return m_stdlib; }
@@ -62,7 +70,7 @@ GeneratedMDL generate(MaterialX::DocumentPtr doc, const std::string& material_na
     }
 
     // Debug: print all nodes in the document
-    std::cout << "[DEBUG] All nodes in document:\n";
+    if (VerboseMdl()) { std::cout << "[DEBUG] All nodes in document:\n";
     for (auto& node : doc->getNodes()) {
         std::cout << "  node: '" << node->getName()
                   << "' category: '" << node->getCategory()
@@ -72,7 +80,7 @@ GeneratedMDL generate(MaterialX::DocumentPtr doc, const std::string& material_na
                       << "' type: '" << input->getType()
                       << "' nodename: '" << input->getNodeName() << "'\n";
         }
-    }
+    } }
 
     // 1. Try a top-level output directly
     MaterialX::OutputPtr output = doc->getOutput(material_name);
@@ -124,7 +132,7 @@ GeneratedMDL generate(MaterialX::DocumentPtr doc, const std::string& material_na
         try {
             // Debug: check nodedef resolution before generating
             MaterialX::NodeDefPtr nodedef = node->getNodeDef();
-            if (!nodedef) {
+            if (!nodedef && VerboseMdl()) {
                 std::cout << "[DEBUG] getNodeDef() returned null for '"
                         << node->getName() << "' (category: '"
                         << node->getCategory() << "')\n";
@@ -138,7 +146,7 @@ GeneratedMDL generate(MaterialX::DocumentPtr doc, const std::string& material_na
                             << "' node: '" << nd->getNodeString() << "'\n";
                     if (++count >= 5) { std::cout << "  ...\n"; break; }
                 }
-            } else {
+            } else if (VerboseMdl()) {
                 std::cout << "[DEBUG] nodedef found: '" << nodedef->getName() << "'\n";
             }
 
@@ -205,6 +213,15 @@ std::shared_ptr<MDLGenerator> MDLGenerator::shared(const std::string& mx_librari
     static std::map<std::string, std::shared_ptr<MDLGenerator>> generators;
 
     std::lock_guard<std::mutex> lock(mutex);
+    auto& generator = generators[mx_libraries_path];
+    if (!generator)
+        generator = std::make_shared<MDLGenerator>(mx_libraries_path);
+    return generator;
+}
+
+std::shared_ptr<MDLGenerator> MDLGenerator::workerLocal(
+    const std::string& mx_libraries_path) {
+    thread_local std::map<std::string, std::shared_ptr<MDLGenerator>> generators;
     auto& generator = generators[mx_libraries_path];
     if (!generator)
         generator = std::make_shared<MDLGenerator>(mx_libraries_path);

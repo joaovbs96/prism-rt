@@ -1,14 +1,23 @@
 #include "material_compiler.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <format>
 #include <filesystem>
 #include <fstream>
 #include <set>
+#include <array>
+#include <mutex>
+#include <string_view>
 
 namespace mdl {
 
 namespace {
+
+bool verbose_mdl() {
+    const char* value = std::getenv("PRISM_MDL_VERBOSE");
+    return value && *value && std::string(value) != "0";
+}
 
 // Stable 64-bit FNV-1a, so module names (and MDL dump filenames) do not change
 // between runs or standard-library implementations the way std::hash may.
@@ -38,6 +47,74 @@ std::string make_unique_module_name(const std::string& module_name,
     return module_name + "_" + fnv1a_hex(path_key + "\n" + simple_name);
 }
 
+// Produces a structural identity for a generated material module by replacing
+// only top-level material parameter default expressions. The complete body,
+// annotations, imports, parameter order and types remain byte-for-byte in the
+// key. Parentheses and strings inside defaults are handled explicitly.
+std::string canonical_parameter_key(const std::string& source) {
+    const size_t material = source.find("export material ");
+    if (material == std::string::npos) return {};
+    const size_t open = source.find('(', material);
+    if (open == std::string::npos) return {};
+    std::string key = source;
+    size_t i = open + 1;
+    int paren = 1, brace = 0, bracket = 0;
+    bool quoted = false, escaped = false;
+    while (i < key.size() && paren > 0) {
+        const char c = key[i];
+        if (quoted) {
+            if (escaped) escaped = false;
+            else if (c == '\\') escaped = true;
+            else if (c == '"') quoted = false;
+            ++i; continue;
+        }
+        if (c == '"') { quoted = true; ++i; continue; }
+        if (c == '(') ++paren;
+        else if (c == ')') { --paren; if (paren == 0) break; }
+        else if (c == '{') ++brace;
+        else if (c == '}') --brace;
+        else if (c == '[') ++bracket;
+        else if (c == ']') --bracket;
+        else if (c == '=' && paren == 1 && brace == 0 && bracket == 0) {
+            const size_t valueStart = i + 1;
+            size_t j = valueStart;
+            int vp = 0, vb = 0, vs = 0;
+            bool vq = false, ve = false;
+            for (; j < key.size(); ++j) {
+                const char d = key[j];
+                if (vq) {
+                    if (ve) ve = false;
+                    else if (d == '\\') ve = true;
+                    else if (d == '"') vq = false;
+                    continue;
+                }
+                if (d == '"') { vq = true; continue; }
+                if (d == '(') ++vp;
+                else if (d == ')') { if (vp == 0 && vb == 0 && vs == 0) break; --vp; }
+                else if (d == '{') ++vb;
+                else if (d == '}') --vb;
+                else if (d == '[') {
+                    if (vp == 0 && vb == 0 && vs == 0 && j + 1 < key.size() && key[j + 1] == '[')
+                        break;
+                    ++vs;
+                } else if (d == ']') --vs;
+                else if (d == ',' && vp == 0 && vb == 0 && vs == 0) break;
+            }
+            key.replace(valueStart, j - valueStart, " <parameter-default> ");
+            i = valueStart + sizeof(" <parameter-default> ") - 1;
+            continue;
+        }
+        ++i;
+    }
+    return key;
+}
+
+std::array<std::mutex, 64> gCanonicalModuleMutexes;
+
+std::string canonical_module_name(const std::string& structuralKey) {
+    return "::prism_material_classes::m_" + fnv1a_hex(structuralKey);
+}
+
 } // namespace
 
 MaterialCompiler::MaterialCompiler(Context& ctx, const std::string& mx_mdl_path)
@@ -51,7 +128,7 @@ MaterialCompiler::MaterialCompiler(Context& ctx, const std::string& mx_mdl_path)
     // so we add the parent ("libraries/mdl") as a search path.
     if (!mx_mdl_path.empty() && ctx.is_valid()) {
         if (ctx.add_mdl_path(mx_mdl_path)) {
-            std::cout << "[OK] Registered MaterialX MDL path: " << mx_mdl_path << "\n";
+            if (verbose_mdl()) std::cout << "[OK] Registered MaterialX MDL path: " << mx_mdl_path << "\n";
         } else {
             std::cerr << "[WARN] Failed to register MaterialX MDL path: " << mx_mdl_path << "\n";
         }
@@ -64,6 +141,11 @@ MaterialCompiler::MaterialCompiler(Context& ctx, const std::string& mx_mdl_path)
 void MaterialCompiler::print_context_messages(mi::neuraylib::IMdl_execution_context* context) {
     for (mi::Size i = 0; i < context->get_messages_count(); ++i) {
         mi::base::Handle<const mi::neuraylib::IMessage> msg(context->get_message(i));
+        const std::string_view text = msg->get_string() ? msg->get_string() : "";
+        if (!verbose_mdl()) {
+            if (msg->get_severity() > mi::base::MESSAGE_SEVERITY_WARNING) continue;
+            if (text.find("C183 unused parameter") != std::string_view::npos) continue;
+        }
         
         const char* severity_str = "INFO";
         switch (msg->get_severity()) {
@@ -75,7 +157,7 @@ void MaterialCompiler::print_context_messages(mi::neuraylib::IMdl_execution_cont
             default: break;
         }
         
-        std::cout << std::format("  [MDL {}] {}\n", severity_str, msg->get_string());
+        std::cerr << std::format("  [MDL {}] {}\n", severity_str, msg->get_string());
     }
 }
 
@@ -104,7 +186,7 @@ bool MaterialCompiler::load_module_from_string(
         context);
 
     if (context->get_messages_count() > 0) {
-        std::cout << "  Messages from load_module_from_string:\n";
+        if (verbose_mdl()) std::cout << "  Messages from load_module_from_string:\n";
         print_context_messages(context);
     }
 
@@ -140,17 +222,17 @@ bool MaterialCompiler::create_material_instance(
 
     // Enumerate material definitions in the module
     mi::Size mat_count = module->get_material_count();
-    std::cout << std::format("  Module has {} material definition(s)\n", mat_count);
+    if (verbose_mdl()) std::cout << std::format("  Module has {} material definition(s)\n", mat_count);
 
     if (mat_count == 0) {
         // Fall back to function definitions (MaterialX sometimes generates
         // materials as functions returning material type)
         mi::Size func_count = module->get_function_count();
-        std::cout << std::format("  Module has {} function definition(s)\n", func_count);
+        if (verbose_mdl()) std::cout << std::format("  Module has {} function definition(s)\n", func_count);
 
         for (mi::Size i = 0; i < func_count; ++i) {
             const char* func_db_name = module->get_function(i);
-            std::cout << std::format("    function[{}]: {}\n", i, func_db_name);
+            if (verbose_mdl()) std::cout << std::format("    function[{}]: {}\n", i, func_db_name);
         }
 
         if (func_count == 0) {
@@ -180,14 +262,14 @@ bool MaterialCompiler::create_material_instance(
 
         // Store the instance in the database
         transaction->store(func_call.get(), instance_name.c_str());
-        std::cout << std::format("  Stored function instance as '{}'\n", instance_name);
+        if (verbose_mdl()) std::cout << std::format("  Stored function instance as '{}'\n", instance_name);
         return true;
     }
 
     // Use the first material definition
     for (mi::Size i = 0; i < mat_count; ++i) {
         const char* mat_db_name = module->get_material(i);
-        std::cout << std::format("    material[{}]: {}\n", i, mat_db_name);
+        if (verbose_mdl()) std::cout << std::format("    material[{}]: {}\n", i, mat_db_name);
     }
 
     const char* mat_def_db_name = module->get_material(0);
@@ -211,7 +293,7 @@ bool MaterialCompiler::create_material_instance(
 
     // Store the instance in the database
     transaction->store(mat_instance.get(), instance_name.c_str());
-    std::cout << std::format("  Stored material instance as '{}'\n", instance_name);
+    if (verbose_mdl()) std::cout << std::format("  Stored material instance as '{}'\n", instance_name);
     return true;
 }
 
@@ -222,7 +304,8 @@ mi::base::Handle<const mi::neuraylib::ICompiled_material>
 MaterialCompiler::compile_instance(
     mi::neuraylib::ITransaction* transaction,
     const std::string& instance_name,
-    mi::neuraylib::IMdl_execution_context* context)
+    mi::neuraylib::IMdl_execution_context* context,
+    bool classCompilation)
 {
     // Access the stored material instance
     mi::base::Handle<const mi::neuraylib::IFunction_call> mat_instance(
@@ -246,7 +329,7 @@ MaterialCompiler::compile_instance(
         std::cerr << "       Conductor Fresnel for F0 > 1 may not work correctly\n";
     }
     if (context->get_messages_count() > 0) {
-        std::cout << "  Messages after set_option(target_type):\n";
+        if (verbose_mdl()) std::cout << "  Messages after set_option(target_type):\n";
         print_context_messages(context);
         context->clear_messages();
     }
@@ -254,7 +337,9 @@ MaterialCompiler::compile_instance(
     // Compile the material instance
     // Instance compilation mode bakes all parameters into the compiled material
     // (which is what we want for path tracing — no runtime parameter changes)
-    mi::Uint32 flags = mi::neuraylib::IMaterial_instance::DEFAULT_OPTIONS;
+    const mi::Uint32 flags = classCompilation
+        ? mi::neuraylib::IMaterial_instance::CLASS_COMPILATION
+        : mi::neuraylib::IMaterial_instance::DEFAULT_OPTIONS;
 
     // We need to cast to IMaterial_instance to call create_compiled_material
     mi::base::Handle<const mi::neuraylib::IMaterial_instance> mi_instance(
@@ -348,17 +433,11 @@ CompiledMaterial MaterialCompiler::compile(const GeneratedMDL& generated_mdl,
     // MDLGenerator inserts authored color-space conversions into the graph
     // before MDL compilation, targeting linear Rec.709.
 
-    // Create a transaction for this compilation
+    // Resolve the global scope now. The per-material transaction is created
+    // after the canonical module is committed so it observes that definition.
     mi::base::Handle<mi::neuraylib::IScope> scope(
         m_ctx.get_database()->get_global_scope());
-
-    mi::base::Handle<mi::neuraylib::ITransaction> transaction(
-        scope->create_transaction());
-
-    if (!transaction) {
-        result.error_message = "Failed to create transaction";
-        return result;
-    }
+    if (!scope) { result.error_message = "Failed to get global scope"; return result; }
 
     // --- Register texture resource paths ---
     // MaterialX generates texture paths in the MDL code that can be:
@@ -375,7 +454,7 @@ CompiledMaterial MaterialCompiler::compile(const GeneratedMDL& generated_mdl,
         std::filesystem::path doc_dir = std::filesystem::path(mtlx_path).parent_path();
         if (!doc_dir.empty() && std::filesystem::exists(doc_dir)) {
             if (m_ctx.add_resource_path(doc_dir.string())) {
-                std::cout << "[OK] Added document resource path: " << doc_dir.string() << "\n";
+                if (verbose_mdl()) std::cout << "[OK] Added document resource path: " << doc_dir.string() << "\n";
             }
         }
     }
@@ -398,7 +477,7 @@ CompiledMaterial MaterialCompiler::compile(const GeneratedMDL& generated_mdl,
                 std::string parent = p.parent_path().string();
                 if (!parent.empty() && registered_dirs.find(parent) == registered_dirs.end()) {
                     if (m_ctx.add_resource_path(parent)) {
-                        std::cout << "[OK] Added texture resource path: " << parent << "\n";
+                        if (verbose_mdl()) std::cout << "[OK] Added texture resource path: " << parent << "\n";
                         registered_dirs.insert(parent);
                     }
                 }
@@ -407,7 +486,7 @@ CompiledMaterial MaterialCompiler::compile(const GeneratedMDL& generated_mdl,
     }
 
     // --- Step 4.2: Load MDL from string ---
-    std::cout << "\n--- Step 4.2: Loading MDL into SDK ---\n";
+    if (verbose_mdl()) std::cout << "\n--- Step 4.2: Loading MDL into SDK ---\n";
 
     // The module_name from GeneratedMDL is like "::materialx::test_material";
     // make it unique per source document.
@@ -422,39 +501,70 @@ CompiledMaterial MaterialCompiler::compile(const GeneratedMDL& generated_mdl,
     // because it doesn't depend on the SDK's resource search path ordering --
     // the texture location is unambiguous regardless of when paths were registered.
     std::string mdl_source = generated_mdl.mdl_source;
-    {
-        std::string doc_dir_prefix;
-        if (!mtlx_path.empty()) {
-            std::filesystem::path doc_dir = std::filesystem::path(mtlx_path).parent_path();
-            if (!doc_dir.empty()) {
-                // Normalize to forward slashes so the MDL SDK accepts it on all platforms
-                std::string doc_dir_str = doc_dir.string();
-                std::replace(doc_dir_str.begin(), doc_dir_str.end(), '\\', '/');
-                doc_dir_prefix = doc_dir_str + "/";
-            }
+    std::string doc_dir_prefix;
+    if (!mtlx_path.empty()) {
+        std::filesystem::path doc_dir = std::filesystem::path(mtlx_path).parent_path();
+        if (!doc_dir.empty()) {
+            std::string doc_dir_str = doc_dir.string();
+            std::replace(doc_dir_str.begin(), doc_dir_str.end(), '\\', '/');
+            doc_dir_prefix = doc_dir_str + "/";
         }
+    }
 
-        if (!doc_dir_prefix.empty()) {
-            // Replace "./ with "<absolute_doc_dir>/ so paths become fully qualified
-            std::string search = "\"./";
-            std::string replace = "\"" + doc_dir_prefix;
-            size_t pos = 0;
-            while ((pos = mdl_source.find(search, pos)) != std::string::npos) {
-                mdl_source.replace(pos, search.length(), replace);
-                pos += replace.length();
-            }
-            std::cout << "[OK] Resolved relative texture paths to: " << doc_dir_prefix << "\n";
-        } else {
-            // Fallback: no .mtlx path available, use root-relative resolution
-            std::cout << "[WARN] No .mtlx path provided; falling back to root-relative texture paths\n";
-            std::string search = "\"./";
-            std::string replace = "\"/";
-            size_t pos = 0;
-            while ((pos = mdl_source.find(search, pos)) != std::string::npos) {
-                mdl_source.replace(pos, search.length(), replace);
-                pos += replace.length();
-            }
+    {
+        std::string search = "\"./";
+        std::string replace = doc_dir_prefix.empty() ? "\"/" : "\"" + doc_dir_prefix;
+        size_t pos = 0;
+        while ((pos = mdl_source.find(search, pos)) != std::string::npos) {
+            mdl_source.replace(pos, search.length(), replace);
+            pos += replace.length();
         }
+        if (verbose_mdl() && !doc_dir_prefix.empty())
+            std::cout << "[OK] Resolved relative texture paths to: " << doc_dir_prefix << "\n";
+    }
+
+    // Resource-free variants of the same generated graph share one committed
+    // module definition. Each variant module is still loaded below solely to
+    // obtain its authored defaults; its call is then recreated against this
+    // canonical definition. The SDK consequently produces the same genuine
+    // compiled-material hash with different argument values.
+    std::string canonicalModuleName;
+    const std::string structuralKey = generated_mdl.texture_paths.empty()
+        ? canonical_parameter_key(mdl_source) : std::string{};
+    if (!structuralKey.empty()) {
+        canonicalModuleName = canonical_module_name(structuralKey);
+        std::mutex& keyMutex = gCanonicalModuleMutexes[
+            std::hash<std::string>{}(canonicalModuleName) % gCanonicalModuleMutexes.size()];
+        std::lock_guard<std::mutex> keyLock(keyMutex);
+        mi::base::Handle<mi::neuraylib::ITransaction> canonicalTransaction(
+            scope->create_transaction());
+        mi::base::Handle<mi::neuraylib::IMdl_execution_context> canonicalContext(
+            m_ctx.get_factory()->create_execution_context());
+        mi::base::Handle<const mi::IString> canonicalDbName(
+            m_ctx.get_factory()->get_db_module_name(canonicalModuleName.c_str()));
+        mi::base::Handle<const mi::neuraylib::IModule> existing(
+            canonicalTransaction && canonicalDbName
+                ? canonicalTransaction->access<mi::neuraylib::IModule>(
+                    canonicalDbName->get_c_str()) : nullptr);
+        if (!canonicalTransaction || !canonicalContext ||
+            (!existing && !load_module_from_string(
+                canonicalTransaction.get(), canonicalModuleName,
+                mdl_source, canonicalContext.get()))) {
+            if (canonicalTransaction) canonicalTransaction->abort();
+            canonicalModuleName.clear();
+        } else {
+            existing.reset();
+            canonicalDbName.reset();
+            canonicalContext.reset();
+            canonicalTransaction->commit();
+        }
+    }
+
+    mi::base::Handle<mi::neuraylib::ITransaction> transaction(
+        scope->create_transaction());
+    if (!transaction) {
+        result.error_message = "Failed to create transaction";
+        return result;
     }
 
     // Dump the final MDL source next to the .mtlx file for inspection
@@ -474,7 +584,7 @@ CompiledMaterial MaterialCompiler::compile(const GeneratedMDL& generated_mdl,
         std::ofstream f(dump_path);
         if (f) {
             f << mdl_source;
-            std::cout << "[DEBUG] Dumped generated MDL to: " << dump_path.string() << "\n";
+            if (verbose_mdl()) std::cout << "[DEBUG] Dumped generated MDL to: " << dump_path.string() << "\n";
         } else {
             std::cerr << "[WARN] Could not write MDL dump to: " << dump_path.string() << "\n";
         }
@@ -498,30 +608,74 @@ CompiledMaterial MaterialCompiler::compile(const GeneratedMDL& generated_mdl,
     }
 
     result.module_db_name = module_db_name_str->get_c_str();
-    std::cout << std::format("[OK] Module loaded as '{}'\n", result.module_db_name);
+    if (verbose_mdl()) std::cout << std::format("[OK] Module loaded as '{}'\n", result.module_db_name);
 
     // --- Step 4.3: Create material instance ---
-    std::cout << "\n--- Step 4.3: Creating Material Instance ---\n";
+    if (verbose_mdl()) std::cout << "\n--- Step 4.3: Creating Material Instance ---\n";
 
     result.instance_db_name = "material_instance_" +
         module_name.substr(module_name.rfind("::") + 2);  // extract simple name
 
     context->clear_messages();
-    if (!create_material_instance(
+    bool instanceCreated = false;
+    if (!canonicalModuleName.empty()) {
+        mi::base::Handle<const mi::IString> canonicalDbName(
+            m_ctx.get_factory()->get_db_module_name(canonicalModuleName.c_str()));
+        mi::base::Handle<const mi::neuraylib::IModule> variantModule(
+            transaction->access<mi::neuraylib::IModule>(result.module_db_name.c_str()));
+        mi::base::Handle<const mi::neuraylib::IModule> canonicalModule(
+            canonicalDbName ? transaction->access<mi::neuraylib::IModule>(
+                canonicalDbName->get_c_str()) : nullptr);
+        if (variantModule && canonicalModule && variantModule->get_material_count() > 0 &&
+            canonicalModule->get_material_count() > 0) {
+            mi::base::Handle<const mi::neuraylib::IFunction_definition> variantDefinition(
+                transaction->access<mi::neuraylib::IFunction_definition>(
+                    variantModule->get_material(0)));
+            mi::base::Handle<const mi::neuraylib::IFunction_definition> canonicalDefinition(
+                transaction->access<mi::neuraylib::IFunction_definition>(
+                    canonicalModule->get_material(0)));
+            mi::base::Handle<mi::neuraylib::IExpression_factory> expressions(
+                m_ctx.get_factory()->create_expression_factory(transaction.get()));
+            mi::base::Handle<const mi::neuraylib::IExpression_list> variantDefaults(
+                variantDefinition ? variantDefinition->get_defaults() : nullptr);
+            mi::base::Handle<mi::neuraylib::IExpression_list> arguments(
+                expressions && variantDefaults
+                    ? expressions->clone(variantDefaults.get()) : nullptr);
+            mi::Sint32 callResult = -1;
+            mi::base::Handle<mi::neuraylib::IFunction_call> call(
+                canonicalDefinition && arguments
+                    ? canonicalDefinition->create_function_call(arguments.get(), &callResult)
+                    : nullptr);
+            if (call && callResult == 0 &&
+                transaction->store(call.get(), result.instance_db_name.c_str()) == 0) {
+                instanceCreated = true;
+                result.module_db_name = canonicalDbName->get_c_str();
+                result.definition_db_name = canonicalModule->get_material(0);
+            }
+        }
+    }
+    if (!instanceCreated)
+        instanceCreated = create_material_instance(
             transaction.get(), result.module_db_name,
-            result.instance_db_name, context.get())) {
+            result.instance_db_name, context.get());
+    if (!instanceCreated) {
         result.error_message = "Failed to create material instance";
         transaction->commit();
         return result;
     }
-    std::cout << "[OK] Material instance created\n";
+    if (verbose_mdl()) std::cout << "[OK] Material instance created\n";
 
     // --- Step 4.4: Compile the material ---
-    std::cout << "\n--- Step 4.4: Compiling Material ---\n";
+    if (verbose_mdl()) std::cout << "\n--- Step 4.4: Compiling Material ---\n";
 
     context->clear_messages();
     result.compiled_material = compile_instance(
-        transaction.get(), result.instance_db_name, context.get());
+        transaction.get(), result.instance_db_name, context.get(), true);
+    if (!result.compiled_material) {
+        context->clear_messages();
+        result.compiled_material = compile_instance(
+            transaction.get(), result.instance_db_name, context.get(), false);
+    }
 
     if (!result.compiled_material) {
         result.error_message = "Failed to compile material instance";
@@ -529,22 +683,25 @@ CompiledMaterial MaterialCompiler::compile(const GeneratedMDL& generated_mdl,
         return result;
     }
 
-    std::cout << "[OK] Material compiled successfully\n";
+    if (verbose_mdl()) std::cout << "[OK] Material compiled successfully\n";
 
     // Print compiled material info
     mi::base::Uuid hash = result.compiled_material->get_hash();
-    std::cout << std::format("  Hash: {:08x} {:08x} {:08x} {:08x}\n",
-        hash.m_id1, hash.m_id2, hash.m_id3, hash.m_id4);
-    std::cout << std::format("  Parameters: {}\n",
-        result.compiled_material->get_parameter_count());
-    std::cout << std::format("  Temporaries: {}\n",
-        result.compiled_material->get_temporary_count());
+    if (verbose_mdl()) {
+        std::cout << std::format("  Hash: {:08x} {:08x} {:08x} {:08x}\n",
+            hash.m_id1, hash.m_id2, hash.m_id3, hash.m_id4);
+        std::cout << std::format("  Parameters: {}\n",
+            result.compiled_material->get_parameter_count());
+        std::cout << std::format("  Temporaries: {}\n",
+            result.compiled_material->get_temporary_count());
+    }
 
     // Keep the transaction alive — the compiled material references DB data.
     // The caller must call result.release() when done (after Phase 5).
     result.transaction = transaction;
 
     result.success = true;
+    result.allowTargetCodeReuse = generated_mdl.texture_paths.empty();
     return result;
 }
 

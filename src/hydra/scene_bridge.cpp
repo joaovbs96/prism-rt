@@ -774,6 +774,21 @@ void _Walk(HdSceneIndexBaseRefPtr const &scene, SdfPath const &path,
         _Walk(scene, child, materials, snapshot, renderTags);
 }
 
+void _CollectMaterialRequests(HdSceneIndexBaseRefPtr const &scene,
+                              SdfPath const &path,
+                              std::unordered_set<SdfPath, SdfPath::Hash> *seen,
+                              std::vector<MaterialService::Request> *requests)
+{
+    HdSceneIndexPrim const prim = scene->GetPrim(path);
+    const SdfPath materialPath = _MaterialPath(prim.dataSource);
+    if (!materialPath.IsEmpty() && seen->insert(materialPath).second) {
+        requests->push_back({scene->GetPrim(materialPath).dataSource,
+                             materialPath});
+    }
+    for (SdfPath const &child : scene->GetChildPrimPaths(path))
+        _CollectMaterialRequests(scene, child, seen, requests);
+}
+
 std::shared_ptr<Snapshot> _BuildSnapshot(HdSceneIndexBaseRefPtr const &scene,
                                          MaterialService *materials,
                                          RenderSettings const &settings,
@@ -792,6 +807,13 @@ std::shared_ptr<Snapshot> _BuildSnapshot(HdSceneIndexBaseRefPtr const &scene,
         blackEnvironment.get());
     result->environmentTexture = std::move(blackEnvironment);
     result->scene->environment = result->environment.get();
+    if (materials) {
+        std::unordered_set<SdfPath, SdfPath::Hash> seen;
+        std::vector<MaterialService::Request> requests;
+        _CollectMaterialRequests(scene, SdfPath::AbsoluteRootPath(),
+                                 &seen, &requests);
+        materials->Prefetch(requests);
+    }
     _Walk(scene, SdfPath::AbsoluteRootPath(), materials, result.get(), renderTags);
     result->scene->commitScene();
     return result;
@@ -1066,6 +1088,7 @@ void SceneBridge::MarkSceneDirty()
     _impl->renderThread->StopRender();
     std::lock_guard lock(_impl->mutex);
     _impl->sceneDirty = true;
+    if (_impl->materialService) _impl->materialService->InvalidateAll();
     _converged.store(false);
 }
 
@@ -1389,6 +1412,25 @@ VtDictionary SceneBridge::GetStats() const
         _impl->snapshot ? _impl->snapshot->instanceCount : 0));
     result["estimatedGeometryBytes"] = VtValue(static_cast<int64_t>(
         _impl->snapshot ? _impl->snapshot->estimatedGeometryBytes : 0));
+    if (_impl->materialService) {
+        const auto stats = _impl->materialService->GetStats();
+        result["materialRequests"] = VtValue(static_cast<int64_t>(stats.requests));
+        result["materialPathCacheHits"] = VtValue(static_cast<int64_t>(stats.pathCacheHits));
+        result["materialContentCacheHits"] = VtValue(static_cast<int64_t>(stats.contentCacheHits));
+        result["materialCompilations"] = VtValue(static_cast<int64_t>(stats.compilations));
+        result["materialNativeJits"] = VtValue(static_cast<int64_t>(stats.nativeJits));
+        result["materialFailures"] = VtValue(static_cast<int64_t>(stats.failures));
+        result["materialConversionSeconds"] = VtValue(stats.conversionSeconds);
+        result["materialCompilationSeconds"] = VtValue(stats.compilationSeconds);
+        result["materialXGenerationSeconds"] = VtValue(stats.generationSeconds);
+        result["materialClassCompilationSeconds"] = VtValue(
+            stats.classCompilationSeconds);
+        result["materialNativeJitSeconds"] = VtValue(stats.nativeJitSeconds);
+        result["materialResourceBytes"] = VtValue(static_cast<int64_t>(stats.textureBytes));
+        result["materialResourceReadSeconds"] = VtValue(stats.resourceReadSeconds);
+        result["materialBatchWallSeconds"] = VtValue(stats.batchWallSeconds);
+        result["materialWorkerCpuSeconds"] = VtValue(stats.workerCpuSeconds);
+    }
     return result;
 }
 

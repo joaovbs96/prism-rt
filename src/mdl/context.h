@@ -3,6 +3,8 @@
 #include "loader.h"
 #include <mi/mdl_sdk.h>
 #include <string>
+#include <mutex>
+#include <unordered_set>
 #include <vector>
 
 namespace mdl {
@@ -48,6 +50,7 @@ private:
     bool load_plugins(const std::vector<std::string>& plugins);
     bool start_sdk();
     bool acquire_interfaces();
+    void configure_logging();
     
     // Loader handles library loading and INeuray lifetime
     Loader m_loader;
@@ -57,9 +60,13 @@ private:
     mi::base::Handle<mi::neuraylib::IMdl_configuration> m_mdl_config;
     mi::base::Handle<mi::neuraylib::IMdl_impexp_api> m_mdl_impexp;
     mi::base::Handle<mi::neuraylib::IMdl_factory> m_mdl_factory;
+    mi::base::Handle<mi::base::ILogger> m_receiving_logger;
     
     bool m_is_valid;
     std::string m_error_message;
+    mutable std::mutex m_configuration_mutex;
+    std::unordered_set<std::string> m_registered_mdl_paths;
+    std::unordered_set<std::string> m_registered_resource_paths;
 };
 
 } // namespace mdl

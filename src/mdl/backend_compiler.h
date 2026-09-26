@@ -10,6 +10,9 @@
 
 namespace mdl {
 
+// Releases process cache entries before an MDL SDK context shuts down.
+void ClearTargetCodeCache();
+
 // Stores the function indices for the generated target code.
 // These indices are used with ITarget_code::execute_*() methods.
 //
@@ -71,10 +74,17 @@ struct TargetCode {
     const char* ro_data_segment = nullptr;
     mi::Size ro_data_segment_size = 0;
 
-    // Argument block (for class-compiled materials; nullptr for instance compilation)
-    const char* argument_block = nullptr;
+    // Per-material values for class compilation. Target code is shared by
+    // materials with the same compiled class hash; this block is instance data.
+    mi::base::Handle<const mi::neuraylib::ITarget_argument_block> argument_block;
+    const mi::neuraylib::ITarget_argument_block* argument_data() const {
+        return argument_block.get();
+    }
 
     bool success = false;
+    bool cacheHit = false;
+    // Wall time spent inside the SDK's native translate call. Cache hits are 0.
+    double nativeJitSeconds = 0.0;
     std::string error_message;
 };
 

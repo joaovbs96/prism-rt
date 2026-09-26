@@ -18,6 +18,7 @@
 class Geometry {
     public:
         Geometry () {}
+        virtual ~Geometry() = default;
 
         virtual unsigned int setupEmbree(RTCDevice &device, RTCScene &scene) = 0;
 

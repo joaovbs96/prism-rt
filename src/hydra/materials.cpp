@@ -22,14 +22,27 @@
 #include <MaterialXFormat/XmlIo.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
 
 PXR_NAMESPACE_USING_DIRECTIVE
 namespace mx = MaterialX;
@@ -37,14 +50,44 @@ namespace mx = MaterialX;
 namespace prism::hydra {
 namespace {
 
+std::atomic<uint64_t> gResourcePublicationId{0};
+
 // The MDL SDK has process-wide runtime state; separate renderer instances must
 // not enter module loading/backend compilation concurrently.
-std::mutex gMdlRuntimeMutex;
+std::mutex gMaterialCacheMutex;
+std::condition_variable gMaterialCacheCondition;
+std::unordered_set<std::string> gMaterialCompiling;
 struct SharedCacheEntry {
     std::string xml;
     std::shared_ptr<Material> material;
 };
-std::unordered_map<std::string, SharedCacheEntry> gMaterialCache;
+// Target-code/material handles are owned by the process-lifetime MDL runtime.
+// Retain this warm cache deliberately: destroying it from DLL/process teardown
+// can release SDK interfaces after the runtime has detached under loader lock.
+auto& gMaterialCache = *new std::unordered_map<std::string, SharedCacheEntry>();
+
+double CurrentThreadCpuSeconds()
+{
+#ifdef _WIN32
+    FILETIME created{}, exited{}, kernel{}, user{};
+    if (GetThreadTimes(GetCurrentThread(), &created, &exited, &kernel, &user)) {
+        ULARGE_INTEGER k{}, u{};
+        k.LowPart = kernel.dwLowDateTime; k.HighPart = kernel.dwHighDateTime;
+        u.LowPart = user.dwLowDateTime; u.HighPart = user.dwHighDateTime;
+        return static_cast<double>(k.QuadPart + u.QuadPart) * 1.0e-7;
+    }
+#endif
+    return 0.0;
+}
+
+uint64_t CurrentProcessIdValue()
+{
+#ifdef _WIN32
+    return static_cast<uint64_t>(GetCurrentProcessId());
+#else
+    return static_cast<uint64_t>(getpid());
+#endif
+}
 
 std::string EnvOr(const char* name, std::string value)
 {
@@ -175,7 +218,8 @@ bool RewritePreviewSurfaceNetwork(HdMaterialNetworkInterface& net)
 }
 
 std::string ResolveTextureAssets(HdMaterialNetworkInterface& net,
-                                 const std::filesystem::path& cacheDir)
+                                 const std::filesystem::path& cacheDir,
+                                 uint64_t* bytesRead)
 {
     ArResolver& resolver = ArGetResolver();
     std::string dependencyFingerprint;
@@ -228,6 +272,7 @@ std::string ResolveTextureAssets(HdMaterialNetworkInterface& net,
             const auto bytes = asset->GetBuffer();
             if (!bytes) continue;
             const size_t size = asset->GetSize();
+            if (bytesRead) *bytesRead += static_cast<uint64_t>(size);
             std::string content(bytes.get(), size);
             const std::string contentHash = HashText(content);
             dependencyFingerprint += contentHash;
@@ -239,9 +284,24 @@ std::string ResolveTextureAssets(HdMaterialNetworkInterface& net,
             if (extension.empty()) extension = ".bin";
             const std::filesystem::path materialized = cacheDir / (contentHash + extension);
             if (!std::filesystem::exists(materialized, ec)) {
-                std::ofstream output(materialized, std::ios::binary | std::ios::trunc);
-                if (!output || !output.write(content.data(), static_cast<std::streamsize>(content.size())))
+                const std::filesystem::path temporary = materialized.string() + "." +
+                    std::to_string(gResourcePublicationId.fetch_add(1)) + ".tmp";
+                std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+                if (!output || !output.write(content.data(), static_cast<std::streamsize>(content.size()))) {
+                    output.close();
+                    std::filesystem::remove(temporary, ec);
                     continue;
+                }
+                output.close();
+                std::filesystem::rename(temporary, materialized, ec);
+                if (ec) {
+                    // Another service may have published the same content first.
+                    std::error_code existsError;
+                    const bool published = std::filesystem::exists(materialized, existsError);
+                    std::filesystem::remove(temporary, existsError);
+                    if (!published) continue;
+                    ec.clear();
+                }
             }
             // Keep resource URIs relative to the generated .mtlx file. The
             // MDL SDK rejects Windows drive prefixes in resource literals;
@@ -281,9 +341,29 @@ void FixPreviewSurfaceNormalOutput(const mx::DocumentPtr& doc)
     }
 }
 
-std::string SerializeDocument(const mx::DocumentPtr& doc)
+std::string SerializeDocument(const mx::DocumentPtr& doc,
+                              const std::string& installedLibraries)
 {
-    return mx::writeToXmlString(doc);
+    mx::XmlWriteOptions options;
+    std::string root = std::filesystem::path(installedLibraries).generic_string();
+#ifdef _WIN32
+    std::transform(root.begin(), root.end(), root.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+#endif
+    if (!root.empty() && root.back() != '/') root.push_back('/');
+    options.elementPredicate = [root](mx::ConstElementPtr element) {
+        if (root.empty()) return true;
+        std::string source = std::filesystem::path(
+            element->getSourceUri()).generic_string();
+#ifdef _WIN32
+        std::transform(source.begin(), source.end(), source.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+#endif
+        // Worker-local generators already own this immutable standard library.
+        // Keep user and hdMtlx includes whose source URIs are outside it.
+        return source.empty() || source.rfind(root, 0) != 0;
+    };
+    return mx::writeToXmlString(doc, &options);
 }
 
 } // namespace
@@ -298,6 +378,14 @@ mdl::Context& SharedMdlContext()
 
 class MaterialService::Impl {
 public:
+    struct Prepared {
+        HdContainerDataSourceHandle source;
+        SdfPath path;
+        std::string xml, key, materialName;
+        std::filesystem::path mtlxPath;
+        std::shared_ptr<Material> cached;
+        bool valid = false;
+    };
     Impl(mdl::Context* context, std::string libraries, std::string mdlPath)
         : context(context)
         , libraries(EnvOr("PRISM_MATERIALX_LIBRARY_PATH", std::move(libraries)))
@@ -305,20 +393,38 @@ public:
     {
         if (this->mdlPath.empty() && !this->libraries.empty())
             this->mdlPath = (std::filesystem::path(this->libraries) / "mdl").string();
-        cacheDir = std::filesystem::temp_directory_path() / "prism-rt" / "hydra-materials";
+        cacheDir = std::filesystem::temp_directory_path() / "prism-rt" /
+            "hydra-materials" / std::to_string(CurrentProcessIdValue());
     }
 
-    std::shared_ptr<Material> Resolve(
+    Prepared Prepare(
         const HdContainerDataSourceHandle& primDataSource,
         const SdfPath& materialPath)
     {
-        std::lock_guard<std::mutex> runtimeLock(gMdlRuntimeMutex);
-        std::lock_guard<std::mutex> lock(mutex);
+        Prepared result;
+        result.source = primDataSource;
+        result.path = materialPath;
+        ++requests;
         if (!context || !context->is_valid() || libraries.empty() || !primDataSource)
-            return nullptr;
+            return result;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            auto found = pathCache.find(materialPath);
+            // Scene-index wrappers need not preserve data-source identity.
+            // Hydra dirty notices explicitly invalidate this path; comparing
+            // wrapper pointers here defeats the cache after every GetPrim().
+            if (found != pathCache.end()) {
+                ++pathCacheHits;
+                result.cached = found->second.material;
+                result.valid = true;
+                return result;
+            }
+        }
+
+        const auto conversionStart = std::chrono::steady_clock::now();
 
         HdMaterialSchema material = HdMaterialSchema::GetFromParent(primDataSource);
-        if (!material) return nullptr;
+        if (!material) return result;
 
         TfToken contextName("mtlx");
         HdMaterialNetworkSchema network = material.GetMaterialNetwork(contextName);
@@ -326,27 +432,32 @@ public:
             contextName = HdMaterialSchemaTokens->universalRenderContext;
             network = material.GetMaterialNetwork(contextName);
         }
-        if (!network) return nullptr;
+        if (!network) return result;
 
         HdDataSourceMaterialNetworkInterface netInterface(
             materialPath, network.GetContainer(), primDataSource);
         const TfToken terminalName = SurfaceTerminalName(netInterface);
-        if (terminalName.IsEmpty()) return nullptr;
+        if (terminalName.IsEmpty()) return result;
         const auto terminal = netInterface.GetTerminalConnection(terminalName);
-        if (!terminal.first) return nullptr;
+        if (!terminal.first) return result;
 
         const bool previewSurface = IsPreviewSurfaceNetwork(netInterface);
         if (contextName == HdMaterialSchemaTokens->universalRenderContext &&
             !previewSurface) {
             std::cerr << "[Hydra Material] Unsupported universal material network at "
                       << materialPath << "\n";
-            return nullptr;
+            return result;
         }
 
         if (previewSurface && !RewritePreviewSurfaceNetwork(netInterface))
-            return nullptr;
+            return result;
+        uint64_t resolvedTextureBytes = 0;
+        const auto resourceStart = std::chrono::steady_clock::now();
         const std::string resourceFingerprint =
-            ResolveTextureAssets(netInterface, cacheDir);
+            ResolveTextureAssets(netInterface, cacheDir, &resolvedTextureBytes);
+        resourceNanoseconds += std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - resourceStart).count();
+        textureBytes += resolvedTextureBytes;
         HdMtlxTexturePrimvarData mtlxData;
         mx::DocumentPtr doc = HdMtlxCreateMtlxDocumentFromHdMaterialNetworkInterface(
             &netInterface,
@@ -356,61 +467,197 @@ public:
         if (!doc) {
             std::cerr << "[Hydra Material] MaterialX conversion failed at "
                       << materialPath << "\n";
-            return nullptr;
+            return result;
         }
         if (previewSurface) FixPreviewSurfaceNormalOutput(doc);
+
+        // hdMtlx derives the terminal material name from the USD prim path.
+        // That makes otherwise identical M0/M1 graphs generate different MDL
+        // wrapper and temporary names, defeating the SDK's class hash. The
+        // terminal material has no downstream references, so canonicalize it
+        // before serialization/generation while preserving all graph nodes.
+        const auto materialNodes = doc->getMaterialNodes();
+        if (!materialNodes.empty()) materialNodes.front()->setName("PrismMaterial");
 
         // Import MaterialX USD definitions from the same installation used by
         // the native generator. hdMtlx's definitions are also imported for
         // Hydra's texture/primvar node aliases.
         doc->importLibrary(HdMtlxStdLibraries());
-        const std::string xml = SerializeDocument(doc);
-        const std::string baseKey = HashText(libraries + "\n" + mdlPath + "\n" +
-                                              resourceFingerprint + "\n" + xml);
-        std::string key = baseKey;
-        auto found = gMaterialCache.find(key);
-        unsigned collision = 0;
-        while (found != gMaterialCache.end() && found->second.xml != xml) {
-            key = baseKey + "-" + std::to_string(++collision);
-            found = gMaterialCache.find(key);
+        result.xml = SerializeDocument(doc, libraries);
+        conversionNanoseconds += std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - conversionStart).count();
+        // Native target-code handles are owned by one MDL runtime. Keep the
+        // process cache partitioned when tests or standalone clients create a
+        // second Context with otherwise identical material inputs.
+        const std::string baseKey = HashText(
+            std::to_string(reinterpret_cast<std::uintptr_t>(context)) + "\n" +
+            libraries + "\n" + mdlPath + "\n" + resourceFingerprint + "\n" +
+            result.xml);
+        result.key = baseKey;
+        {
+            std::unique_lock<std::mutex> cacheLock(gMaterialCacheMutex);
+            gMaterialCacheCondition.wait(cacheLock, [&] {
+                return !gMaterialCompiling.count(result.key);
+            });
+            auto found = gMaterialCache.find(result.key);
+            unsigned collision = 0;
+            while (found != gMaterialCache.end() && found->second.xml != result.xml) {
+                result.key = baseKey + "-" + std::to_string(++collision);
+                found = gMaterialCache.find(result.key);
+            }
+            if (found != gMaterialCache.end()) {
+                ++contentCacheHits;
+                std::lock_guard<std::mutex> lock(mutex);
+                pathCache[materialPath] = {primDataSource, found->second.material};
+                result.cached = found->second.material;
+                result.valid = true;
+                return result;
+            }
         }
-        if (found != gMaterialCache.end()) return found->second.material;
 
         std::error_code ec;
         std::filesystem::create_directories(cacheDir, ec);
         if (ec) {
             std::cerr << "[Hydra Material] Cannot create material cache '"
                       << cacheDir.string() << "': " << ec.message() << "\n";
-            return nullptr;
+            return result;
         }
-        const std::filesystem::path mtlxPath = cacheDir / (key + ".mtlx");
+        result.mtlxPath = cacheDir / (result.key + ".mtlx");
         {
-            std::ofstream out(mtlxPath, std::ios::binary | std::ios::trunc);
-            if (!out || !(out << xml)) {
-                std::cerr << "[Hydra Material] Cannot write converted network '"
-                          << mtlxPath.string() << "'\n";
-                return nullptr;
+            // Content-addressed documents are immutable. Publish through a
+            // same-directory rename and never truncate a file a worker may
+            // already be reading.
+            std::lock_guard<std::mutex> cacheLock(gMaterialCacheMutex);
+            if (!std::filesystem::exists(result.mtlxPath, ec)) {
+                const std::filesystem::path temporary = result.mtlxPath.string() + "." +
+                    std::to_string(gResourcePublicationId.fetch_add(1)) + ".tmp";
+                std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
+                if (!out || !(out << result.xml)) {
+                    out.close();
+                    std::filesystem::remove(temporary, ec);
+                    std::cerr << "[Hydra Material] Cannot write converted network '"
+                              << result.mtlxPath.string() << "'\n";
+                    return result;
+                }
+                out.close();
+                std::filesystem::rename(temporary, result.mtlxPath, ec);
+                if (ec) {
+                    std::error_code existsError;
+                    const bool published = std::filesystem::exists(result.mtlxPath, existsError);
+                    std::filesystem::remove(temporary, existsError);
+                    if (!published) {
+                        std::cerr << "[Hydra Material] Cannot publish converted network '"
+                                  << result.mtlxPath.string() << "': " << ec.message() << "\n";
+                        return result;
+                    }
+                    ec.clear();
+                }
             }
         }
 
-        std::string materialName;
         const auto mxMaterials = doc->getMaterialNodes();
-        if (!mxMaterials.empty()) materialName = mxMaterials.front()->getName();
-        auto compiled = std::make_shared<MDLMaterial>(
-            mtlxPath.string(), *context, libraries, mdlPath, materialName);
-        if (!compiled->is_valid()) {
-            std::cerr << "[Hydra Material] MDL compile failed for "
-                      << materialPath << "; using its magenta error material\n";
+        if (!mxMaterials.empty()) result.materialName = mxMaterials.front()->getName();
+        result.valid = true;
+        return result;
+    }
+
+    std::shared_ptr<Material> Compile(Prepared const& prepared)
+    {
+        if (!prepared.valid) return nullptr;
+        if (prepared.cached) return prepared.cached;
+        {
+            std::unique_lock<std::mutex> cacheLock(gMaterialCacheMutex);
+            gMaterialCacheCondition.wait(cacheLock, [&] {
+                return !gMaterialCompiling.count(prepared.key);
+            });
+            auto found = gMaterialCache.find(prepared.key);
+            if (found != gMaterialCache.end() && found->second.xml == prepared.xml) {
+                ++contentCacheHits;
+                std::lock_guard<std::mutex> lock(mutex);
+                pathCache[prepared.path] = {prepared.source, found->second.material};
+                return found->second.material;
+            }
+            gMaterialCompiling.insert(prepared.key);
         }
-        gMaterialCache[key] = SharedCacheEntry{xml, compiled};
+        const auto compilationStart = std::chrono::steady_clock::now();
+        MDLMaterial::CompilationTimings timings;
+        std::shared_ptr<MDLMaterial> candidate;
+        try {
+            candidate = std::make_shared<MDLMaterial>(
+                prepared.mtlxPath.string(), *context, libraries, mdlPath,
+                prepared.materialName, &timings);
+        } catch (const std::exception& error) {
+            {
+                std::lock_guard<std::mutex> cacheLock(gMaterialCacheMutex);
+                gMaterialCompiling.erase(prepared.key);
+            }
+            gMaterialCacheCondition.notify_all();
+            ++failures;
+            std::cerr << "[Hydra Material] MDL compile threw for "
+                      << prepared.path << ": " << error.what() << "\n";
+            return nullptr;
+        } catch (...) {
+            {
+                std::lock_guard<std::mutex> cacheLock(gMaterialCacheMutex);
+                gMaterialCompiling.erase(prepared.key);
+            }
+            gMaterialCacheCondition.notify_all();
+            ++failures;
+            std::cerr << "[Hydra Material] MDL compile threw for "
+                      << prepared.path << "\n";
+            return nullptr;
+        }
+        compilationNanoseconds += std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - compilationStart).count();
+        ++compilations;
+        generationNanoseconds += static_cast<int64_t>(timings.generationSeconds * 1.0e9);
+        classCompilationNanoseconds += static_cast<int64_t>(
+            timings.classCompilationSeconds * 1.0e9);
+        nativeJitNanoseconds += static_cast<int64_t>(timings.nativeJitSeconds * 1.0e9);
+        if (!candidate->get_target_code().cacheHit) ++nativeJits;
+        if (!candidate->is_valid()) {
+            ++failures;
+            std::cerr << "[Hydra Material] MDL compile failed for "
+                      << prepared.path << "; using its magenta error material\n";
+        }
+        std::shared_ptr<Material> compiled = candidate;
+        {
+            std::lock_guard<std::mutex> cacheLock(gMaterialCacheMutex);
+            auto [it, inserted] = gMaterialCache.emplace(
+                prepared.key, SharedCacheEntry{prepared.xml, candidate});
+            if (!inserted && it->second.xml == prepared.xml) compiled = it->second.material;
+            gMaterialCompiling.erase(prepared.key);
+        }
+        gMaterialCacheCondition.notify_all();
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            pathCache[prepared.path] = {prepared.source, compiled};
+        }
         return compiled;
     }
+
+    std::shared_ptr<Material> Resolve(
+        const HdContainerDataSourceHandle& source, const SdfPath& path)
+    { return Compile(Prepare(source, path)); }
 
     mdl::Context* context = nullptr;
     std::string libraries;
     std::string mdlPath;
     std::filesystem::path cacheDir;
     std::mutex mutex;
+    struct PathEntry {
+        HdContainerDataSourceHandle source;
+        std::shared_ptr<Material> material;
+    };
+    std::unordered_map<SdfPath, PathEntry, SdfPath::Hash> pathCache;
+    std::atomic<uint64_t> requests{0}, pathCacheHits{0}, contentCacheHits{0};
+    std::atomic<uint64_t> compilations{0}, nativeJits{0}, jobs{0};
+    std::atomic<uint64_t> failures{0}, textureBytes{0};
+    std::atomic<int64_t> conversionNanoseconds{0}, compilationNanoseconds{0};
+    std::atomic<int64_t> generationNanoseconds{0}, classCompilationNanoseconds{0};
+    std::atomic<int64_t> nativeJitNanoseconds{0};
+    std::atomic<int64_t> resourceNanoseconds{0}, batchWallNanoseconds{0};
+    std::atomic<int64_t> workerCpuNanoseconds{0};
 };
 
 MaterialService::MaterialService(mdl::Context* context,
@@ -427,6 +674,102 @@ std::shared_ptr<Material> MaterialService::Resolve(
     const SdfPath& materialPath)
 {
     return m_impl->Resolve(materialPrimDataSource, materialPath);
+}
+
+void MaterialService::Prefetch(const std::vector<Request>& requests)
+{
+    if (requests.empty()) return;
+    // Finish shared MDL SDK configuration before worker transactions begin.
+    // Generated texture references are materialized as absolute paths during
+    // Prepare, so workers do not need to mutate resource search paths.
+    if (m_impl->context) {
+        if (!m_impl->mdlPath.empty()) {
+            m_impl->context->add_mdl_path(m_impl->mdlPath);
+            m_impl->context->add_resource_path(m_impl->mdlPath);
+        }
+        m_impl->context->add_resource_path(m_impl->cacheDir.string());
+    }
+    const auto batchStart = std::chrono::steady_clock::now();
+    std::vector<Request> unique;
+    unique.reserve(requests.size());
+    std::unordered_set<SdfPath, SdfPath::Hash> seen;
+    for (const Request& request : requests)
+        if (!request.path.IsEmpty() && seen.insert(request.path).second)
+            unique.push_back(request);
+    if (unique.empty()) return;
+    m_impl->jobs += unique.size();
+    // Hydra data sources are consumed on the calling sync thread. Workers see
+    // only serialized MaterialX and materialized resource paths.
+    std::vector<Impl::Prepared> prepared;
+    prepared.reserve(unique.size());
+    for (const Request& request : unique)
+        prepared.push_back(m_impl->Prepare(request.dataSource, request.path));
+    unsigned workers = std::max(1u, std::min(4u,
+        std::max(1u, std::thread::hardware_concurrency()) / 2u));
+    if (const char* value = std::getenv("PRISM_MATERIAL_THREADS")) {
+        char* end = nullptr;
+        const unsigned long parsed = std::strtoul(value, &end, 10);
+        if (end != value && *end == '\0' && parsed > 0)
+            workers = static_cast<unsigned>(std::min<unsigned long>(parsed, 64));
+    }
+    workers = std::min<unsigned>(workers, static_cast<unsigned>(prepared.size()));
+    std::atomic<size_t> next{0};
+    std::vector<std::thread> pool;
+    pool.reserve(workers);
+    for (unsigned i = 0; i < workers; ++i) {
+        pool.emplace_back([&] {
+            const double cpuStart = CurrentThreadCpuSeconds();
+            for (;;) {
+                const size_t index = next.fetch_add(1);
+                if (index >= prepared.size()) break;
+                m_impl->Compile(prepared[index]);
+            }
+            m_impl->workerCpuNanoseconds += static_cast<int64_t>(
+                (CurrentThreadCpuSeconds() - cpuStart) * 1.0e9);
+        });
+    }
+    for (std::thread& worker : pool) worker.join();
+    m_impl->batchWallNanoseconds += std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - batchStart).count();
+}
+
+void MaterialService::Invalidate(const SdfPath& path, bool subtree)
+{
+    std::lock_guard<std::mutex> lock(m_impl->mutex);
+    for (auto it = m_impl->pathCache.begin(); it != m_impl->pathCache.end();) {
+        const bool match = subtree ? it->first.HasPrefix(path) : it->first == path;
+        if (match) it = m_impl->pathCache.erase(it);
+        else ++it;
+    }
+}
+
+void MaterialService::InvalidateAll()
+{
+    std::lock_guard<std::mutex> lock(m_impl->mutex);
+    m_impl->pathCache.clear();
+}
+
+MaterialService::MaterialStats MaterialService::GetStats() const
+{
+    MaterialStats result;
+    result.requests = m_impl->requests.load();
+    result.pathCacheHits = m_impl->pathCacheHits.load();
+    result.contentCacheHits = m_impl->contentCacheHits.load();
+    result.compilations = m_impl->compilations.load();
+    result.nativeJits = m_impl->nativeJits.load();
+    result.jobs = m_impl->jobs.load();
+    result.failures = m_impl->failures.load();
+    result.textureBytes = m_impl->textureBytes.load();
+    result.conversionSeconds = m_impl->conversionNanoseconds.load() / 1.0e9;
+    result.compilationSeconds = m_impl->compilationNanoseconds.load() / 1.0e9;
+    result.generationSeconds = m_impl->generationNanoseconds.load() / 1.0e9;
+    result.classCompilationSeconds =
+        m_impl->classCompilationNanoseconds.load() / 1.0e9;
+    result.nativeJitSeconds = m_impl->nativeJitNanoseconds.load() / 1.0e9;
+    result.resourceReadSeconds = m_impl->resourceNanoseconds.load() / 1.0e9;
+    result.batchWallSeconds = m_impl->batchWallNanoseconds.load() / 1.0e9;
+    result.workerCpuSeconds = m_impl->workerCpuNanoseconds.load() / 1.0e9;
+    return result;
 }
 
 } // namespace prism::hydra

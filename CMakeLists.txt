@@ -139,8 +139,6 @@ if(PRISM_BUILD_HYDRA)
             tests/hydra/materials_test.cpp
             src/hydra/materials.cpp)
         target_link_libraries(prism_hydra_materials_test PRIVATE PrismRT::core ${PXR_LIBRARIES})
-        set_target_properties(prism_hydra_materials_test PROPERTIES
-            RUNTIME_OUTPUT_DIRECTORY "$<1:${CMAKE_BINARY_DIR}/hydra/plugin>")
         add_test(NAME prism_hydra_materials_test COMMAND prism_hydra_materials_test)
         set_tests_properties(prism_hydra_materials_test PROPERTIES ENVIRONMENT
             "PRISM_MATERIALX_LIBRARY_PATH=${EXTERNAL_DEPS}/MaterialX/install/libraries;PRISM_MATERIALX_MDL=${EXTERNAL_DEPS}/MaterialX/install/libraries/mdl;MDL_SDK_ROOT=${MDL_SDK_DIR}")
@@ -169,6 +167,14 @@ if(PRISM_BUILD_HYDRA)
             RUNTIME_OUTPUT_DIRECTORY "$<1:${CMAKE_BINARY_DIR}/hydra/plugin>")
         add_test(NAME prism_hydra_scene_bridge_test COMMAND prism_hydra_scene_bridge_test)
         set_tests_properties(prism_hydra_scene_bridge_test PROPERTIES ENVIRONMENT
+            "PRISM_MATERIALX_LIBRARY_PATH=${EXTERNAL_DEPS}/MaterialX/install/libraries;PRISM_MATERIALX_MDL=${EXTERNAL_DEPS}/MaterialX/install/libraries/mdl;MDL_SDK_ROOT=${MDL_SDK_DIR}")
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/material_loading_test.cpp")
+        add_executable(prism_hydra_material_loading_test
+            tests/hydra/material_loading_test.cpp src/hydra/materials.cpp)
+        target_link_libraries(prism_hydra_material_loading_test PRIVATE PrismRT::core ${PXR_LIBRARIES})
+        add_test(NAME prism_hydra_material_loading_test COMMAND prism_hydra_material_loading_test)
+        set_tests_properties(prism_hydra_material_loading_test PROPERTIES ENVIRONMENT
             "PRISM_MATERIALX_LIBRARY_PATH=${EXTERNAL_DEPS}/MaterialX/install/libraries;PRISM_MATERIALX_MDL=${EXTERNAL_DEPS}/MaterialX/install/libraries/mdl;MDL_SDK_ROOT=${MDL_SDK_DIR}")
     endif()
 endif()

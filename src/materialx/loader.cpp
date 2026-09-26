@@ -6,6 +6,15 @@
 #include <format>
 #include <iostream>
 #include <vector>
+#include <cstdlib>
+#include <string_view>
+
+namespace {
+bool VerboseMdl() {
+    const char* value = std::getenv("PRISM_MDL_VERBOSE");
+    return value && *value && std::string_view(value) != "0";
+}
+}
 
 DocumentLoader::DocumentLoader(MaterialX::DocumentPtr stdlib, bool clamp,
                                bool fallback_sss_to_diffuse)
@@ -36,6 +45,20 @@ MaterialX::DocumentPtr DocumentLoader::load(const std::string& filepath)
                 const std::string weight = node->getCategory() == "standard_surface"
                     ? "subsurface" : "subsurface_weight";
                 auto input = node->getInput(weight);
+                bool authoredUnsupportedSss = false;
+                if (input) {
+                    authoredUnsupportedSss = input->hasAttribute("nodename") ||
+                        input->hasAttribute("nodegraph") ||
+                        input->hasAttribute("output") ||
+                        input->hasAttribute("interfacename");
+                    if (!authoredUnsupportedSss && !input->getValueString().empty()) {
+                        try {
+                            authoredUnsupportedSss = std::stof(input->getValueString()) != 0.0f;
+                        } catch (...) {
+                            authoredUnsupportedSss = true;
+                        }
+                    }
+                }
                 if (!input) input = node->addInput(weight, "float");
 
                 // A value does not override a connection. Remove every binding
@@ -43,8 +66,12 @@ MaterialX::DocumentPtr DocumentLoader::load(const std::string& filepath)
                 for (const char* attribute : {"nodename", "nodegraph", "output", "interfacename"})
                     input->removeAttribute(attribute);
                 input->setValue(0.0f);
-                std::cout << "[MaterialX] SSS-to-diffuse fallback: "
-                          << node->getNamePath() << "." << weight << " = 0\n";
+                if (authoredUnsupportedSss)
+                    std::cerr << "[MaterialX] WARNING: unsupported authored SSS disabled at "
+                              << node->getNamePath() << "." << weight << "\n";
+                else if (VerboseMdl())
+                    std::cout << "[MaterialX] SSS-to-diffuse fallback: "
+                              << node->getNamePath() << "." << weight << " = 0\n";
             }
         }
 
