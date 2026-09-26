@@ -118,8 +118,15 @@ public:
         }
     }
 
+    Material *getMaterial(RayHit const &hit)
+    {
+        return geometry.at(hit.geomid)->getMaterial(hit.primid, hit.instid);
+    }
+
     Color3 trace(RTCRay ray, int depth, Color3 throughput, unsigned int &seed)
     {
+        if (environmentSampling)
+            return traceEnvironmentMis(ray, depth, throughput, seed, 0.0f, false);
         // reached maximum recursion
         if (depth >= max_depth)
             return Float3();
@@ -131,7 +138,7 @@ public:
         if (ray_hit.geomid != RTC_INVALID_GEOMETRY_ID)
         {
             // retrieve material by geomid and sample the surface
-            Material *material = geometry.at(ray_hit.geomid)->getMaterial(ray_hit.primid, ray_hit.instid);
+            Material *material = getMaterial(ray_hit);
             // sample normal map and perturbate normal
             material->perturbNormal(ray_hit);
 
@@ -168,6 +175,74 @@ public:
         return environment->sample(ray_hit);
     }
 
+    static float powerHeuristic(float a, float b) {
+        const float scale = std::max(a, b);
+        if (!(scale > 0) || !std::isfinite(scale)) return 0;
+        a /= scale; b /= scale;
+        const float aa = a*a, bb = b*b;
+        return aa + bb > 0.0f ? aa/(aa+bb) : 0.0f;
+    }
+
+    bool environmentVisible(const Float3& origin, const Float3& direction, unsigned int& seed) {
+        RTCRay shadow = initialize_ray(origin, direction);
+        for (int crossings=0; crossings<64; ++crossings) {
+            RayHit hit = cast_ray(shadow);
+            if (hit.geomid == RTC_INVALID_GEOMETRY_ID) return true;
+            Material* blocker = getMaterial(hit);
+            const float opacity = std::clamp(blocker->cutoutOpacity(hit), 0.0f, 1.0f);
+            if (opacity >= 1.0f || (opacity > 0.0f && rnd(seed) < opacity)) return false;
+            shadow = initialize_ray(hit.p, direction);
+        }
+        return false;
+    }
+
+    Color3 traceEnvironmentMis(RTCRay ray, int depth, Color3 throughput,
+                               unsigned int& seed, float previousPdf,
+                               bool previousNee, int nullCrossings = 0) {
+        if (depth >= max_depth) return Color3(0.0f);
+        RayHit hit = cast_ray(ray);
+        if (hit.geomid == RTC_INVALID_GEOMETRY_ID) {
+            const Color3 li = environment->radiance(ray_hit_direction(ray));
+            const float lightPdf = environment->directionPdf(ray_hit_direction(ray));
+            return li * (previousNee ? powerHeuristic(previousPdf, lightPdf) : 1.0f);
+        }
+        Material* material = getMaterial(hit);
+        material->perturbNormal(hit);
+        BRDFSample bs = material->sample(hit, seed);
+        Color3 result = bs.emission;
+        if (bs.null_event) {
+            if (nullCrossings >= 64) return result;
+            return result + bs.color * traceEnvironmentMis(initialize_ray(hit.p, bs.wi),
+                depth, throughput * bs.color, seed, previousPdf, previousNee, nullCrossings+1);
+        }
+        // At the depth boundary the competing continuation is truncated too.
+        const bool canNee = depth+1 < max_depth && material->supportsNee(hit);
+        if (canNee) {
+            EnvironmentSample light = environment->sampleDirection(seed);
+            if (light.pdf > 0.0f && std::isfinite(light.pdf) && environmentVisible(hit.p, light.wi, seed)) {
+                BRDFEvaluation f = material->evaluate(hit, light.wi);
+                if (f.valid && f.pdf >= 0.0f && std::isfinite(f.pdf))
+                    result += f.value * light.radiance * (powerHeuristic(light.pdf, f.pdf) / light.pdf);
+            }
+        }
+        if (!bs.scattered) return result;
+        throughput *= bs.color;
+        float rrWeight=1.0f;
+        if (depth >= rr_min_depth) {
+            const float q=std::clamp<float>(throughput.max_component(), .05f, .95f);
+            if (rnd(seed)>=q) return result;
+            rrWeight=1.0f/q; throughput*=rrWeight;
+        }
+        RTCRay next=initialize_ray(hit.p, bs.wi);
+        const bool weightMiss = canNee && !bs.delta && !bs.null_event && bs.pdf > 0.0f;
+        return result + bs.color * rrWeight * traceEnvironmentMis(next, depth+1, throughput,
+                                                                  seed, bs.pdf, weightMiss);
+    }
+
+    static Float3 ray_hit_direction(const RTCRay& ray) {
+        return Float3(ray.dir_x, ray.dir_y, ray.dir_z).normalize();
+    }
+
     void commitScene()
     {
         // FIXME: commented out, transforms don't seem to be working atm
@@ -191,6 +266,7 @@ public:
     int image_height = 720;
     int rr_min_depth = 4;
     int max_depth = 32;
+    bool environmentSampling = true;
 };
 
 class Earth : public SceneManager
