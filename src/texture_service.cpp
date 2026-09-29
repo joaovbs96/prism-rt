@@ -3,9 +3,10 @@
 
 #include <OpenImageIO/imagebuf.h>
 #include <OpenImageIO/imagebufalgo.h>
-#include <OpenImageIO/imagecache.h>
 #include <OpenImageIO/hash.h>
 #include <OpenImageIO/filesystem.h>
+#include <tbb/blocked_range.h>
+#include <tbb/parallel_for.h>
 
 #include <algorithm>
 #include <array>
@@ -50,10 +51,9 @@ uint64_t elapsedNanoseconds(std::chrono::steady_clock::time_point start)
         std::chrono::steady_clock::now() - start).count());
 }
 
-struct ImageCacheGuard {
-    std::shared_ptr<OIIO::ImageCache> &cache;
-    ~ImageCacheGuard() { if (cache) OIIO::ImageCache::destroy(cache); }
-};
+// Between full trims the cache size is estimated from this process's own
+// additions; the interval bounds how late growth by other processes is seen.
+constexpr auto kDiskTrimInterval = std::chrono::seconds(30);
 
 // OIIO rejects JPEGs whose first Photoshop resource is not IPTC ("Corrupted
 // IPTC data"), although the image data is fine. Returns the file with every
@@ -215,9 +215,10 @@ OIIO::TextureOpt::Wrap wrap(TextureWrap value)
     }
 }
 
-void trimDiskCache(std::filesystem::path const &root, double maxGB,
-                   std::unordered_map<std::string, bool> const &pinned,
-                   OIIO::TextureSystem *system)
+// Returns the bytes of prepared textures left in the cache.
+uintmax_t trimDiskCache(std::filesystem::path const &root, double maxGB,
+                        std::unordered_map<std::string, bool> const &pinned,
+                        OIIO::TextureSystem *system)
 {
     const uintmax_t limit = static_cast<uintmax_t>(maxGB * 1024.0 * 1024.0 * 1024.0);
     struct Entry { std::filesystem::path path; uintmax_t bytes; std::filesystem::file_time_type time; };
@@ -258,7 +259,7 @@ void trimDiskCache(std::filesystem::path const &root, double maxGB,
         else std::filesystem::remove(item.path(), ec);
         ec.clear();
     }
-    if (total <= limit) return;
+    if (total <= limit) return total;
     std::sort(entries.begin(), entries.end(), [](Entry const &a, Entry const &b) {
         return a.time < b.time;
     });
@@ -271,6 +272,7 @@ void trimDiskCache(std::filesystem::path const &root, double maxGB,
         if (!ec) total -= entry.bytes;
         ec.clear();
     }
+    return total;
 }
 
 class CrossProcessCacheLock {
@@ -348,6 +350,13 @@ struct TextureService::Impl {
     std::unordered_map<std::string, std::shared_ptr<std::mutex>> sourceGates;
     std::unordered_map<std::string, std::vector<std::string>> sourcePreparedKeys;
     std::unordered_map<std::string, std::unordered_map<std::string, std::string>> sourceKeyStamps;
+    struct DiskUsage {
+        uint64_t bytes = 0, added = 0;
+        std::chrono::steady_clock::time_point lastTrim;
+        bool known = false;
+    };
+    // Per cache root; see kDiskTrimInterval.
+    std::unordered_map<std::string, DiskUsage> diskUsage;
     std::atomic<uint64_t> prepareCalls{0}, memoryCacheHits{0}, diskCacheHits{0};
     std::atomic<uint64_t> resourceHashCalls{0}, sourceBytesHashed{0}, sourceWaitNanoseconds{0};
     std::atomic<uint64_t> contentWaitNanoseconds{0}, preparationNanoseconds{0};
@@ -758,10 +767,29 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
     auto publicationLock = std::make_unique<CrossProcessCacheLock>(root);
     m_impl->lockWaitNanoseconds.fetch_add(elapsedNanoseconds(lockWaitStart),
                                           std::memory_order_relaxed);
+    // Owns the pin from the moment it is written, so any failure below
+    // removes it again.
+    auto impl = std::make_shared<TextureResource::Impl>();
+    auto writePin = [&] {
+        // Trims and invalidations skip pinned entries and hold the whole-root
+        // lock while they decide. A pin written under that lock is therefore
+        // all the entry needs; opening it afterwards needs no lock.
+        impl->pinPath = root / (key + ".pin." + std::to_string(processId()) + "." +
+                                std::to_string(++texturePinSerial));
+        std::ofstream pin(impl->pinPath, std::ios::binary | std::ios::trunc);
+        if (!pin) throw std::runtime_error("cannot pin prepared texture: " + tx.string());
+        pin << tx.string();
+    };
+    uint64_t publishNanoseconds = 0;
     const bool cacheFilePresent = std::filesystem::exists(tx);
-    if (cacheFilePresent) m_impl->diskCacheHits.fetch_add(1, std::memory_order_relaxed);
-    else publicationLock.reset();
     auto stageStart = std::chrono::steady_clock::now();
+    if (cacheFilePresent) {
+        m_impl->diskCacheHits.fetch_add(1, std::memory_order_relaxed);
+        writePin();
+        publishNanoseconds += elapsedNanoseconds(stageStart);
+    }
+    publicationLock.reset();
+    stageStart = std::chrono::steady_clock::now();
     auto sourceInput = OIIO::ImageInput::open(absolute.string());
     // Kept alive until the end of preparation; readers below borrow it.
     std::vector<unsigned char> strippedJpeg;
@@ -780,7 +808,11 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
     }
     const OIIO::ImageSpec spec = sourceInput->spec();
     const std::string sourceInputFormat = sourceInput->format_name();
-    sourceInput->close();
+    // The JPEG reader ignores the unassociated-alpha hint a decode passes, so
+    // the inspected input decodes exactly what a reopened one would. Opening
+    // a large JPEG parses all of its metadata and costs more than the decode.
+    const bool decodeInspected = !cacheFilePresent && sourceInputFormat == "jpeg";
+    if (!decodeInspected) sourceInput->close();
     m_impl->inspectNanoseconds.fetch_add(elapsedNanoseconds(stageStart), std::memory_order_relaxed);
     if (options.firstChannel >= spec.nchannels)
         throw std::invalid_argument("texture channel range is outside source image");
@@ -789,42 +821,35 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
     if (!cacheFilePresent) {
         stageStart = std::chrono::steady_clock::now();
         std::vector<float> sourcePixels(static_cast<size_t>(spec.width) * spec.height * spec.nchannels);
-        auto decodeCache = OIIO::ImageCache::create(false);
-        if (!decodeCache)
-            throw std::runtime_error("cannot create image cache for texture decode");
-        ImageCacheGuard decodeCacheGuard{decodeCache};
-        if (options.unassociateAlpha && !decodeCache->attribute("unassociatedalpha", 1))
-            throw std::runtime_error("cannot request unassociated-alpha decoding");
-        if (strippedReader) {
-            // The image cache cannot read from memory, so decode directly.
+        std::unique_ptr<OIIO::ImageInput> decodeInput;
+        if (decodeInspected) {
+            decodeInput = std::move(sourceInput);
+        } else if (strippedReader) {
             OIIO::ImageSpec config;
             if (options.unassociateAlpha) config.attribute("oiio:UnassociatedAlpha", 1);
             // With a config, the reader takes its proxy from this hint.
             OIIO::Filesystem::IOProxy *proxy = strippedReader.get();
             config.attribute("oiio:ioproxy", OIIO::TypeDesc::PTR, &proxy);
             strippedReader->seek(0);
-            auto memoryInput = OIIO::ImageInput::open(absolute.string(), &config, strippedReader.get());
-            if (!memoryInput)
+            decodeInput = OIIO::ImageInput::open(absolute.string(), &config, strippedReader.get());
+            if (!decodeInput)
                 throw std::runtime_error("cannot read texture " + absolute.string() + ": " + OIIO::geterror());
-            if (!memoryInput->read_image(0, 0, 0, spec.nchannels, OIIO::TypeDesc::FLOAT,
-                                         sourcePixels.data())) {
-                const std::string error = memoryInput->geterror();
-                throw std::runtime_error("cannot decode texture pixels: " + error);
-            }
-            memoryInput->close();
         } else {
-            OIIO::ImageBuf input(absolute.string(), 0, 0, decodeCache);
-            if (!input.read(0, 0, true, OIIO::TypeDesc::FLOAT)) {
-                const std::string error = input.geterror();
-                throw std::runtime_error("cannot read texture " + absolute.string() + ": " + error);
-            }
-            const OIIO::ROI sourceRoi(spec.x, spec.x + spec.width, spec.y,
-                spec.y + spec.height, 0, 1, 0, spec.nchannels);
-            if (!input.get_pixels(sourceRoi, OIIO::TypeDesc::FLOAT, sourcePixels.data())) {
-                const std::string error = input.geterror();
-                throw std::runtime_error("cannot decode texture pixels: " + error);
-            }
+            // Exactly what an image-cache backed ImageBuf read passes to the
+            // reader: the cache's unassociatedalpha setting as an explicit
+            // hint. Reading directly skips the cache's own header parse.
+            OIIO::ImageSpec config;
+            config.attribute("oiio:UnassociatedAlpha", options.unassociateAlpha ? 1 : 0);
+            decodeInput = OIIO::ImageInput::open(absolute.string(), &config);
+            if (!decodeInput)
+                throw std::runtime_error("cannot read texture " + absolute.string() + ": " + OIIO::geterror());
         }
+        if (!decodeInput->read_image(0, 0, 0, spec.nchannels, OIIO::TypeDesc::FLOAT,
+                                     sourcePixels.data())) {
+            const std::string error = decodeInput->geterror();
+            throw std::runtime_error("cannot decode texture pixels: " + error);
+        }
+        decodeInput->close();
         m_impl->decodeNanoseconds.fetch_add(elapsedNanoseconds(stageStart), std::memory_order_relaxed);
         stageStart = std::chrono::steady_clock::now();
         const int displayWidth = spec.full_width > 0 ? spec.full_width : spec.width;
@@ -867,39 +892,54 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
             normalizedSpec.channelnames.push_back(sourceChannel < spec.nchannels
                 ? std::string(spec.channel_name(sourceChannel)) : "channel" + std::to_string(c));
         }
-        OIIO::ImageBuf normalized(normalizedSpec);
-        std::vector<float> outputPixels(static_cast<size_t>(displayWidth) * displayHeight * outChannels, 0.0f);
-        const int alpha = sourceAlpha;
-        const int colorChannels = std::max(1, std::min(3, spec.nchannels - (alpha >= 0 ? 1 : 0)));
-        const float gain = std::exp2(options.exposure);
-        for (size_t p = 0; p < static_cast<size_t>(spec.width) * spec.height; ++p) {
-            const int srcY = static_cast<int>(p / spec.width);
-            const int srcX = static_cast<int>(p % spec.width);
-            const int dstX = originX + srcX;
-            const int dstY = originY + srcY;
-            if (dstX < 0 || dstY < 0 || dstX >= displayWidth || dstY >= displayHeight)
-                continue;
-            for (int c = 0; c < outChannels; ++c) {
-                const int sourceChannel = options.firstChannel + c;
-                if (sourceChannel >= spec.nchannels) continue;
-                float value = sourcePixels[p * spec.nchannels + sourceChannel];
-                const bool color = sourceChannel != alpha &&
-                    sourceChannel - (alpha >= 0 && sourceChannel > alpha ? 1 : 0) < colorChannels;
-                if (color) {
-                    if (unassociateAlpha) {
-                        const float alphaValue = sourcePixels[p * spec.nchannels + alpha];
-                        value = alphaValue != 0.0f ? value / alphaValue : 0.0f;
+        // Without a channel, window or value change the loop below would
+        // copy every decoded value unchanged; use the decoded buffer instead.
+        const bool identity = !unassociateAlpha && options.gamma == 1.0f &&
+            options.exposure == 0.0f && options.firstChannel == 0 &&
+            outChannels == spec.nchannels && originX == 0 && originY == 0 &&
+            spec.width == displayWidth && spec.height == displayHeight;
+        std::vector<float> outputPixels;
+        if (!identity) {
+            outputPixels.assign(static_cast<size_t>(displayWidth) * displayHeight * outChannels, 0.0f);
+            const int alpha = sourceAlpha;
+            const int colorChannels = std::max(1, std::min(3, spec.nchannels - (alpha >= 0 ? 1 : 0)));
+            const float gain = std::exp2(options.exposure);
+            // Every source row writes its own destination row with the same
+            // per-value arithmetic, so the result does not depend on threads.
+            tbb::parallel_for(tbb::blocked_range<int>(0, spec.height),
+                [&](tbb::blocked_range<int> const &rows) {
+                for (int srcY = rows.begin(); srcY < rows.end(); ++srcY) {
+                    const int dstY = originY + srcY;
+                    if (dstY < 0 || dstY >= displayHeight) continue;
+                    for (int srcX = 0; srcX < spec.width; ++srcX) {
+                        const int dstX = originX + srcX;
+                        if (dstX < 0 || dstX >= displayWidth) continue;
+                        const size_t p = static_cast<size_t>(srcY) * spec.width + srcX;
+                        for (int c = 0; c < outChannels; ++c) {
+                            const int sourceChannel = options.firstChannel + c;
+                            if (sourceChannel >= spec.nchannels) continue;
+                            float value = sourcePixels[p * spec.nchannels + sourceChannel];
+                            const bool color = sourceChannel != alpha &&
+                                sourceChannel - (alpha >= 0 && sourceChannel > alpha ? 1 : 0) < colorChannels;
+                            if (color) {
+                                if (unassociateAlpha) {
+                                    const float alphaValue = sourcePixels[p * spec.nchannels + alpha];
+                                    value = alphaValue != 0.0f ? value / alphaValue : 0.0f;
+                                }
+                                if (options.gamma != 1.0f)
+                                    value = std::pow(std::max(0.0f, value), options.gamma);
+                                if (options.exposure != 0.0f) value *= gain;
+                            }
+                            outputPixels[(static_cast<size_t>(dstY) * displayWidth + dstX) * outChannels + c] = value;
+                        }
                     }
-                    if (options.gamma != 1.0f)
-                        value = std::pow(std::max(0.0f, value), options.gamma);
-                    if (options.exposure != 0.0f) value *= gain;
                 }
-                outputPixels[(static_cast<size_t>(dstY) * displayWidth + dstX) * outChannels + c] = value;
-            }
+            });
+            std::vector<float>().swap(sourcePixels);
         }
-        if (!normalized.set_pixels(OIIO::ROI(0, displayWidth, 0, displayHeight, 0, 1, 0, outChannels),
-                                   OIIO::TypeDesc::FLOAT, outputPixels.data()))
-            throw std::runtime_error("cannot normalize texture channels: " + normalized.geterror());
+        std::vector<float> &pixels = identity ? sourcePixels : outputPixels;
+        // make_texture reads a wrapped buffer in place; no copy is needed.
+        OIIO::ImageBuf normalized(normalizedSpec, OIIO::span<float>(pixels.data(), pixels.size()));
         m_impl->pixelNanoseconds.fetch_add(elapsedNanoseconds(stageStart), std::memory_order_relaxed);
         stageStart = std::chrono::steady_clock::now();
         static std::atomic<uint64_t> serial{0};
@@ -945,15 +985,16 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
             }
             std::filesystem::remove(temp, ec);
         }
-    } else {
-        stageStart = std::chrono::steady_clock::now();
+        writePin();
+        publicationLock.reset();
+        publishNanoseconds += elapsedNanoseconds(stageStart);
     }
+    stageStart = std::chrono::steady_clock::now();
     auto preparedInput = OIIO::ImageInput::open(tx.string());
     if (!preparedInput)
         throw std::runtime_error("cannot inspect prepared texture: " + OIIO::geterror());
     const OIIO::ImageSpec preparedSpec = preparedInput->spec();
     preparedInput->close();
-    auto impl = std::make_shared<TextureResource::Impl>();
     impl->source = absolute.filename().string().rfind("embedded-", 0) == 0
         ? std::filesystem::path{} : absolute;
     impl->prepared = tx;
@@ -973,24 +1014,28 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
     impl->handle = m_impl->system->get_texture_handle(OIIO::ustring(tx.string()));
     if (!impl->handle || !m_impl->system->good(impl->handle))
         throw std::runtime_error("cannot open prepared texture: " + m_impl->system->geterror());
-    impl->pinPath = root / (key + ".pin." + std::to_string(processId()) + "." +
-                            std::to_string(++texturePinSerial));
-    {
-        std::ofstream pin(impl->pinPath, std::ios::binary | std::ios::trunc);
-        if (!pin) throw std::runtime_error("cannot pin prepared texture: " + tx.string());
-        pin << impl->prepared.string();
-    }
-    publicationLock.reset();
     std::error_code accessError;
     std::filesystem::last_write_time(tx, std::filesystem::file_time_type::clock::now(), accessError);
-    m_impl->publishNanoseconds.fetch_add(elapsedNanoseconds(stageStart), std::memory_order_relaxed);
-    if (!cacheFilePresent) m_impl->coldPreparations.fetch_add(1, std::memory_order_relaxed);
+    publishNanoseconds += elapsedNanoseconds(stageStart);
+    m_impl->publishNanoseconds.fetch_add(publishNanoseconds, std::memory_order_relaxed);
+    uintmax_t addedBytes = 0;
+    if (!cacheFilePresent) {
+        m_impl->coldPreparations.fetch_add(1, std::memory_order_relaxed);
+        std::error_code sizeError;
+        addedBytes = std::filesystem::file_size(tx, sizeError);
+        if (sizeError) addedBytes = 0;
+    }
     const std::string resourceSourceKey = impl->source.generic_string();
     auto resource = std::shared_ptr<const TextureResource>(new TextureResource(std::move(impl)));
+    const double budgetGB = diskBudgetGB();
+    const auto limit = static_cast<uintmax_t>(budgetGB * 1024.0 * 1024.0 * 1024.0);
+    const auto now = std::chrono::steady_clock::now();
     std::unordered_map<std::string, bool> pinned;
+    bool trim = false;
+    uint64_t addedBeforeTrim = 0;
+    const std::string usageKey = root.generic_string();
     {
         std::lock_guard lock(m_impl->mutex);
-        stageStart = std::chrono::steady_clock::now();
         m_impl->resources[key] = resource;
         if (!resourceSourceKey.empty()) {
             auto &sourceKeys = m_impl->sourcePreparedKeys[resourceSourceKey];
@@ -998,15 +1043,38 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
                 sourceKeys.push_back(key);
             m_impl->sourceKeyStamps[resourceSourceKey][key] = stamp;
         }
-        for (auto const &[resourceKey, weak] : m_impl->resources) {
-            (void)resourceKey;
-            if (auto live = weak.lock()) pinned.emplace(live->preparedPath().filename().string(), true);
+        // A full trim enumerates the whole cache directory. This process
+        // tracks what it adds, so it trims as soon as its own additions cross
+        // the budget; growth by other processes and stale pins of exited ones
+        // are caught by the periodic trim within kDiskTrimInterval.
+        auto &usage = m_impl->diskUsage[usageKey];
+        usage.bytes += addedBytes;
+        usage.added += addedBytes;
+        trim = !usage.known || usage.bytes > limit || now - usage.lastTrim >= kDiskTrimInterval;
+        if (trim) {
+            usage.known = true;
+            usage.lastTrim = now;
+            addedBeforeTrim = usage.added;
+            for (auto const &[resourceKey, weak] : m_impl->resources) {
+                (void)resourceKey;
+                if (auto live = weak.lock()) pinned.emplace(live->preparedPath().filename().string(), true);
+            }
         }
+    }
+    if (trim) {
+        stageStart = std::chrono::steady_clock::now();
         lockWaitStart = std::chrono::steady_clock::now();
         CrossProcessCacheLock trimLock(root);
         const uint64_t trimLockWait = elapsedNanoseconds(lockWaitStart);
         m_impl->lockWaitNanoseconds.fetch_add(trimLockWait, std::memory_order_relaxed);
-        trimDiskCache(root, diskBudgetGB(), pinned, m_impl->system.get());
+        const uintmax_t remaining = trimDiskCache(root, budgetGB, pinned, m_impl->system.get());
+        {
+            // Files published while this trim ran may or may not be in
+            // remaining; counting them again only makes the estimate high.
+            std::lock_guard lock(m_impl->mutex);
+            auto &usage = m_impl->diskUsage[usageKey];
+            usage.bytes = remaining + (usage.added - addedBeforeTrim);
+        }
         m_impl->trimNanoseconds.fetch_add(elapsedNanoseconds(stageStart) - trimLockWait,
                                           std::memory_order_relaxed);
     }
