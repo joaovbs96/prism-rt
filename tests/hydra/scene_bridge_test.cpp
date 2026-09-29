@@ -1233,6 +1233,44 @@ int main()
                     "Embree memory monitor did not account live allocations");
         activeBridge = nullptr;
     }
+    {
+        // Before the first snapshot nothing is displayed, so capture gets the
+        // long budget; once one is published it drops back to the short one.
+        constexpr int primCount = 2500;
+        HdRetainedSceneIndexRefPtr largeScene = HdRetainedSceneIndex::New();
+        HdRetainedSceneIndex::AddedPrimEntries spheres;
+        spheres.reserve(primCount);
+        for (int i = 0; i < primCount; ++i)
+            spheres.push_back({SdfPath("/Large/S" + std::to_string(i)),
+                HdPrimTypeTokens->sphere,
+                FixtureSphereData(0.05, GfVec3d(i % 50, i / 50, 0.0))});
+        largeScene->AddPrims(spheres);
+        prism::hydra::SceneBridge bridge(largeScene, &thread);
+        prism::hydra::CameraState camera;
+        const TfTokenVector geometryTags{HdRenderTagTokens->geometry};
+        prism::hydra::RenderSettings settings;
+        settings.sphereBatching = true;
+        bridge.SetSettings(settings);
+        bridge.Prepare(camera, {}, geometryTags, 32, 32);
+        ok &= Check(DoubleStat(bridge.GetStats(),
+                               "captureBudgetMilliseconds") == 50.0,
+                    "first-load capture did not use the long budget");
+        ok &= Check(PumpPrepare(bridge, camera, {}, geometryTags, 32, 32),
+                    "large scene initial prepare did not publish");
+        VtDictionary stats = bridge.GetStats();
+        ok &= Check(Stat(stats, "capturedPrims") >= primCount &&
+                        Stat(stats, "sphereBatchEntryCount") == primCount,
+                    "large scene was not fully loaded");
+        largeScene->AddPrims({{SdfPath("/Large/S0"), HdPrimTypeTokens->sphere,
+            FixtureSphereData(0.1)}});
+        bridge.MarkSceneDirty(prism::hydra::SceneDirtyKind::Prototype,
+                              SdfPath("/Large/S0"));
+        ok &= Check(PumpPrepare(bridge, camera, {}, geometryTags, 32, 32),
+                    "large scene edit did not prepare");
+        ok &= Check(DoubleStat(bridge.GetStats(),
+                               "captureBudgetMilliseconds") == 3.0,
+                    "capture after first publication kept the long budget");
+    }
     thread.StopThread();
     return ok ? 0 : 1;
 }

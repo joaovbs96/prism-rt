@@ -77,6 +77,11 @@ PXR_NAMESPACE_USING_DIRECTIVE
 namespace prism::hydra {
 namespace {
 
+// Nothing is displayed before the first snapshot, so the host has no
+// responsiveness to protect and capture can finish in far fewer frames.
+constexpr double kInitialCaptureBudgetMilliseconds = 50.0;
+constexpr double kSteadyCaptureBudgetMilliseconds = 3.0;
+
 bool _CapturePrimData(TfToken const &primType)
 {
     std::string type = primType.GetString();
@@ -2623,6 +2628,7 @@ public:
     uint64_t prototypeBuilds = 0;
     uint64_t capturedPrims = 0;
     double captureMilliseconds = 0.0;
+    double captureBudgetMilliseconds = 0.0;
     std::chrono::steady_clock::time_point startTime;
     std::atomic<uint64_t> samples{0};
     uint64_t snapshotBuilds = 0;
@@ -2936,11 +2942,16 @@ bool SceneBridge::Prepare(CameraState const &camera,
         }
     }
 
-    // Start or advance an owner-thread capture. Each call is bounded to about
-    // three milliseconds between prim boundaries. _MakeStaticCopy retains
-    // typed sampled leaves at time zero and recursively severs live handles.
+    // Start or advance an owner-thread capture. Each call is bounded between
+    // prim boundaries: about three milliseconds once a snapshot is displayed,
+    // longer before the first one. _MakeStaticCopy retains typed sampled
+    // leaves at time zero and recursively severs live handles.
+    double captureBudget = kSteadyCaptureBudgetMilliseconds;
+    bool captureWorked = false;
     {
         std::lock_guard lock(_impl->mutex);
+        if (!_impl->snapshot)
+            captureBudget = kInitialCaptureBudgetMilliseconds;
         if (_impl->sceneDirty && !_impl->captureActive &&
             !_impl->buildFuture.valid()) {
             _impl->captureActive = true;
@@ -2981,6 +2992,7 @@ bool SceneBridge::Prepare(CameraState const &camera,
             break;
         }
         if (!_impl->captureQueue.empty()) {
+            captureWorked = true;
             SdfPath const path = _impl->captureQueue.front();
             _impl->captureQueue.pop_front();
             HdSceneIndexPrim const prim = _impl->sceneIndex->GetPrim(path);
@@ -3007,13 +3019,14 @@ bool SceneBridge::Prepare(CameraState const &camera,
             }
         } else break;
         if (std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - captureStart).count() >= 3.0)
+                std::chrono::steady_clock::now() - captureStart).count() >= captureBudget)
             break;
     }
     {
         std::lock_guard lock(_impl->mutex);
         _impl->captureMilliseconds += std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - captureStart).count();
+        if (captureWorked) _impl->captureBudgetMilliseconds = captureBudget;
         if (_impl->captureActive && _impl->captureQueue.empty() &&
             _impl->captureGeneration != _impl->requestedGeneration) {
             _impl->captureActive = false;
@@ -3676,6 +3689,8 @@ VtDictionary SceneBridge::GetStats() const
     result["retainedPrimRecordCount"] = VtValue(static_cast<int64_t>(
         _impl->staticPrims.size()));
     result["captureMilliseconds"] = VtValue(_impl->captureMilliseconds);
+    result["captureBudgetMilliseconds"] = VtValue(
+        _impl->captureBudgetMilliseconds);
     result["discardedSnapshotBuilds"] = VtValue(static_cast<int64_t>(
         _impl->discardedBuilds));
     result["reusedSnapshotBuilds"] = VtValue(static_cast<int64_t>(
