@@ -12,12 +12,17 @@
 #include <pxr/usd/sdf/assetPath.h>
 
 #include <algorithm>
+#include <cctype>
+#include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -26,10 +31,12 @@ using namespace prism::hydra;
 
 namespace {
 struct IsolatedCache {
-    std::filesystem::path path=std::filesystem::temp_directory_path()/
-        ("prism-hydra-material-loading-"+std::to_string(
-            std::chrono::steady_clock::now().time_since_epoch().count()));
-    IsolatedCache() {
+    std::filesystem::path path;
+    // Concurrent child processes may read the same clock value; tag them.
+    explicit IsolatedCache(const std::string& tag={})
+        : path(std::filesystem::temp_directory_path()/
+            ("prism-hydra-material-loading-"+tag+std::to_string(
+                std::chrono::steady_clock::now().time_since_epoch().count()))) {
         std::filesystem::create_directories(path);
 #ifdef _WIN32
         _putenv_s("PRISM_CACHE_DIR",path.string().c_str());
@@ -242,12 +249,301 @@ bool SameShading(MDLMaterial& a, MDLMaterial& b, std::string* detail)
     }
     return true;
 }
+
+// The pre-warm is process-wide, so its scenarios run in child processes of
+// this test: only a fresh process pre-warms from cold.
+struct PrewarmBatch {
+    std::vector<HdContainerDataSourceHandle> sources;
+    std::vector<MaterialService::Request> requests;
+};
+
+// A two-material template group and two structures of their own.
+PrewarmBatch MakePrewarmBatch()
+{
+    PrewarmBatch batch;
+    auto add=[&](const char* name,HdContainerDataSourceHandle source) {
+        batch.sources.push_back(std::move(source));
+        batch.requests.push_back({batch.sources.back(),SdfPath(name)});
+    };
+    add("/Looks/WarmA",MakeFoldingMaterial(SdfPath("/Looks/WarmA"),GfVec3f(0.8f,0.3f,0.1f),0.2f,0.2f));
+    add("/Looks/WarmB",MakeFoldingMaterial(SdfPath("/Looks/WarmB"),GfVec3f(0.1f,0.5f,0.7f),0.55f,0.2f));
+    add("/Looks/WarmC",MakeFoldingMaterial(SdfPath("/Looks/WarmC"),GfVec3f(0.6f,0.6f,0.2f),0.4f,0.3f,0.45f));
+    add("/Looks/WarmD",MakeFoldingMaterial(SdfPath("/Looks/WarmD"),GfVec3f(0.3f,0.3f,0.8f),0.35f,0.1f,
+                                           -1.0f,true,0.8f));
+    return batch;
 }
 
-int main()
+// SameShading's evaluations, samples and cutouts, printed exactly.
+std::string ShadingSignature(MDLMaterial& material)
 {
+    std::ostringstream out;
+    auto put=[&](float value) {
+        char text[32];
+        std::snprintf(text,sizeof(text)," %.9g",value);
+        out << text;
+    };
+    RTCRayHit embreeHit{};
+    embreeHit.hit.geomID=RTC_INVALID_GEOMETRY_ID;
+    RayHit hit(embreeHit);
+    hit.p=Float3(0.0f); hit.n=hit.n_g=Float3(0.0f,1.0f,0.0f);
+    hit.u=0.3f; hit.v=0.7f; hit.front_face=true;
+    for (const Float3 d : {Float3(0.0f,-1.0f,0.0f), Float3(0.6f,-0.8f,0.0f)}) {
+        hit.d=d;
+        for (const Float3 wi : {Float3(0.0f,1.0f,0.0f), Float3(-0.28f,0.96f,0.0f),
+                                Float3(0.0f,0.6f,0.8f)}) {
+            const auto x=material.evaluate(hit,wi);
+            for (int i=0;i<3;++i) put(x.value[i]);
+            put(x.pdf); put(x.valid ? 1.0f : 0.0f);
+        }
+        for (unsigned int seed : {1u,17u,4099u}) {
+            const auto x=material.sample(hit,seed);
+            for (int i=0;i<3;++i) { put(x.color[i]); put(x.wi[i]); }
+            put(x.pdf); put(x.scattered ? 1.0f : 0.0f);
+        }
+        put(material.cutoutOpacity(hit));
+    }
+    return out.str();
+}
+
+// Every statistic except timings and allocation-order dependent byte counts.
+std::string WorkSignature(const MaterialService::MaterialStats& s)
+{
+    std::ostringstream out;
+    out << "requests=" << s.requests << " path_hits=" << s.pathCacheHits
+        << " content_hits=" << s.contentCacheHits << " early_hits=" << s.earlyCacheHits
+        << " conversions=" << s.conversionCalls << " generations=" << s.generationCalls
+        << " template_hits=" << s.templateCacheHits << " compilations=" << s.compilations
+        << " folded=" << s.foldedCompilations << " jits=" << s.nativeJits
+        << " translations=" << s.sdkTranslationCalls << " program_hits=" << s.programCacheHits
+        << " bindings=" << s.bindingCreations << " fallbacks=" << s.fallbackTranslations
+        << " persistent_hits=" << s.persistentGenerationCacheHits
+        << " sdk_texture_fallbacks=" << s.sdkTextureFallbacks
+        << " custom_texture_targets=" << s.customTextureTargets << " jobs=" << s.jobs
+        << " failures=" << s.failures << " texture_bytes=" << s.textureBytes
+        << " evictions=" << s.cacheEvictions << " prewarm_jobs=" << s.prewarmJobs;
+    return out.str();
+}
+
+// Child process: prewarm (five concurrent Prewarm calls and a second
+// service's, then a batch), off (PRISM_MATERIAL_PREWARM=0, then the batch),
+// race (Prewarm and Prefetch released together on two threads) or teardown
+// (a service on a scoped SDK runtime destroyed right after Prewarm).
+int PrewarmChild(const std::string& mode, const std::string& run)
+{
+    const char* root=std::getenv("PRISM_MATERIALX_LIBRARY_PATH");
+    if (!root) return 2;
+    IsolatedCache isolatedCache(mode+"-"+run+"-");
+    const std::filesystem::path libraries(root);
+    // Explicit either way: the suite may run with the pre-warm disabled.
+    const char* prewarmSwitch=mode=="off" ? "0" : "1";
+#ifdef _WIN32
+    _putenv_s("PRISM_MATERIAL_PREWARM",prewarmSwitch);
+#else
+    setenv("PRISM_MATERIAL_PREWARM",prewarmSwitch,1);
+#endif
+    if (mode=="teardown") {
+        // The runtime shuts down right after the service; the pre-warm must
+        // have finished and released its transaction by then.
+        mdl::Context scoped;
+        if (!scoped.is_valid()) return 3;
+        {
+            MaterialService service(&scoped,libraries.string(),(libraries/"mdl").string());
+            service.Prewarm();
+        }
+        std::cout << "teardown finished\n";
+        return 0;
+    }
+    mdl::Context& context=SharedMdlContext();
+    if (!context.is_valid()) return 3;
+    MaterialService service(&context,libraries.string(),(libraries/"mdl").string());
+    const auto batch=MakePrewarmBatch();
+    if (mode=="prewarm") {
+        std::vector<std::future<void>> calls;
+        for (int i=0;i<5;++i)
+            calls.push_back(std::async(std::launch::async,[&] { service.Prewarm(); }));
+        for (auto& call : calls) call.get();
+        {
+            MaterialService other(&context,libraries.string(),(libraries/"mdl").string());
+            other.Prewarm();
+        }
+        service.WaitForPrewarm();
+        if (service.GetStats().prewarmJobs!=1) {
+            std::cerr << "repeated Prewarm calls started "
+                      << service.GetStats().prewarmJobs << " jobs\n";
+            return 5;
+        }
+        service.Prefetch(batch.requests);
+    } else if (mode=="off") {
+        service.Prewarm();
+        service.Prefetch(batch.requests);
+    } else if (mode=="race") {
+        std::promise<void> start;
+        const auto started=start.get_future().share();
+        auto prewarm=std::async(std::launch::async,[&] { started.wait(); service.Prewarm(); });
+        auto prefetch=std::async(std::launch::async,[&] {
+            started.wait(); service.Prefetch(batch.requests);
+        });
+        start.set_value();
+        prewarm.get();
+        prefetch.get();
+    } else {
+        return 4;
+    }
+    for (size_t i=0;i<batch.requests.size();++i) {
+        auto material=std::dynamic_pointer_cast<MDLMaterial>(
+            service.Resolve(batch.requests[i].dataSource,batch.requests[i].path));
+        std::cout << "shading " << i;
+        if (material && material->is_valid()) std::cout << ShadingSignature(*material);
+        else std::cout << " invalid";
+        std::cout << "\n";
+    }
+    const auto stats=service.GetStats();
+    std::cout << "work " << WorkSignature(stats) << "\n"
+              << "prewarm " << stats.prewarmSeconds << " " << stats.prewarmWaitSeconds << "\n";
+    return 0;
+}
+
+struct ChildRun {
+    int status=-1;
+    std::string output;
+    // Value of the first line starting with prefix, without the prefix.
+    std::string line(const std::string& prefix) const {
+        std::istringstream lines(output);
+        for (std::string text; std::getline(lines,text);)
+            if (text.rfind(prefix,0)==0) return text.substr(prefix.size());
+        return {};
+    }
+};
+
+ChildRun RunPrewarmChild(const std::filesystem::path& self, const std::string& mode,
+                         int index=0)
+{
+    ChildRun run;
+    // cmd.exe drops the outermost quotes, keeping the quoted executable path.
+    const std::string command="\"\""+self.string()+"\" --prewarm-child "+mode+" "+
+        std::to_string(index)+" 2>&1\"";
+#ifdef _WIN32
+    FILE* pipe=_popen(command.c_str(),"r");
+#else
+    FILE* pipe=popen(command.c_str(),"r");
+#endif
+    if (!pipe) return run;
+    char buffer[4096];
+    while (size_t read=std::fread(buffer,1,sizeof(buffer),pipe)) run.output.append(buffer,read);
+#ifdef _WIN32
+    run.status=_pclose(pipe);
+#else
+    run.status=pclose(pipe);
+#endif
+    return run;
+}
+
+bool SameSignature(const std::string& a, const std::string& b)
+{
+    std::istringstream x(a), y(b);
+    std::string p, q;
+    size_t count=0;
+    while (x >> p) {
+        if (!(y >> q)) return false;
+        ++count;
+        if (p==q) continue;
+        const float u=std::strtof(p.c_str(),nullptr), v=std::strtof(q.c_str(),nullptr);
+        if (!std::isfinite(u) || !std::isfinite(v) ||
+            std::abs(u-v)>=5e-4f*std::max({1.0f,std::abs(u),std::abs(v)})) return false;
+    }
+    return count>0 && !(y >> q);
+}
+
+// A: a pre-warmed batch against the same batch with the pre-warm disabled.
+// B: Prewarm racing Prefetch, 20 fresh processes. C: service teardown on a
+// scoped runtime right after Prewarm, 20 times. D: repeated Prewarm calls
+// start one job (checked inside the prewarm child).
+int CheckPrewarm(const std::filesystem::path& self)
+{
+    // The SDK reports a handle held across a commit as "still referenced".
+    auto clean=[](const ChildRun& run) {
+        return run.status==0 && run.output.find("pre-warm failed")==std::string::npos &&
+            run.output.find("referenced")==std::string::npos;
+    };
+    const auto warm=RunPrewarmChild(self,"prewarm");
+    const auto cold=RunPrewarmChild(self,"off");
+    for (const auto* run : {&warm,&cold}) {
+        if (!clean(*run) || run->line("work ").find(" failures=0 ")==std::string::npos) {
+            std::cerr << "pre-warm child failed (" << run->status << "):\n" << run->output;
+            return 50;
+        }
+    }
+    double warmSeconds=0.0, coldSeconds=-1.0;
+    std::istringstream(warm.line("prewarm ")) >> warmSeconds;
+    std::istringstream(cold.line("prewarm ")) >> coldSeconds;
+    if (!(warmSeconds>0.0) || coldSeconds!=0.0 ||
+        cold.line("work ").find(" prewarm_jobs=0")==std::string::npos) {
+        std::cerr << "pre-warm duration not reported, or PRISM_MATERIAL_PREWARM=0 pre-warmed: "
+                  << warmSeconds << " vs " << coldSeconds << "\n";
+        return 51;
+    }
+    for (size_t i=0;i<MakePrewarmBatch().requests.size();++i) {
+        const auto prefix="shading "+std::to_string(i);
+        const auto a=warm.line(prefix), b=cold.line(prefix);
+        if (a.find("invalid")!=std::string::npos || !SameSignature(a,b)) {
+            std::cerr << "pre-warmed material " << i << " shades differently:\n"
+                      << a << "\n" << b << "\n";
+            return 52;
+        }
+    }
+    // Four children at a time keep the 40 fresh processes affordable.
+    auto runMany=[&](const std::string& mode) {
+        std::vector<ChildRun> runs;
+        for (int first=0;first<20;first+=4) {
+            std::vector<std::future<ChildRun>> group;
+            for (int i=first;i<first+4;++i)
+                group.push_back(std::async(std::launch::async,[&,i] {
+                    return RunPrewarmChild(self,mode,i);
+                }));
+            for (auto& run : group) runs.push_back(run.get());
+        }
+        return runs;
+    };
+    const auto races=runMany("race");
+    std::string raceWork;
+    for (int repetition=0;repetition<20;++repetition) {
+        const auto& race=races[repetition];
+        const auto work=race.line("work ");
+        if (!clean(race) || work.find(" failures=0 ")==std::string::npos ||
+            (repetition>0 && work!=raceWork) || !SameSignature(race.line("shading 0"),
+                warm.line("shading 0"))) {
+            std::cerr << "pre-warm race repetition " << repetition << " differs ("
+                      << race.status << "):\n" << race.output << "first: " << raceWork << "\n";
+            return 53;
+        }
+        if (repetition==0) raceWork=work;
+    }
+    const auto teardowns=runMany("teardown");
+    for (int repetition=0;repetition<20;++repetition) {
+        const auto& teardown=teardowns[repetition];
+        std::string lower=teardown.output;
+        std::transform(lower.begin(),lower.end(),lower.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (!clean(teardown) || lower.find("teardown finished")==std::string::npos ||
+            lower.find("referenc")!=std::string::npos || lower.find("leak")!=std::string::npos) {
+            std::cerr << "pre-warm teardown repetition " << repetition << " failed ("
+                      << teardown.status << "):\n" << teardown.output;
+            return 54;
+        }
+    }
+    std::cout << "pre-warm: " << warmSeconds << " s, shading unchanged, 20 races and "
+                 "20 teardowns clean; race work: " << raceWork << "\n";
+    return 0;
+}
+}
+
+int main(int argc, char** argv)
+{
+    if (argc>=3 && std::string(argv[1])=="--prewarm-child")
+        return PrewarmChild(argv[2],argc>=4 ? argv[3] : "0");
     const char* root = std::getenv("PRISM_MATERIALX_LIBRARY_PATH");
     if (!root) return 2;
+    if (const int failed=CheckPrewarm(std::filesystem::absolute(argv[0]))) return failed;
     // This test asserts physical generation work. Isolate it from persistent
     // artifacts produced by earlier CTest entries while keeping the cache
     // alive until MaterialService and all bound resources have been released.

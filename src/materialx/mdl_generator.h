@@ -37,8 +37,13 @@ public:
     // building their own. generate() is serialized internally.
     static std::shared_ptr<MDLGenerator> shared(const std::string& mx_libraries_path);
     // One generator per worker avoids serializing GenContext while retaining
-    // standard-library reuse for all jobs executed by that worker.
+    // standard-library reuse for all jobs executed by that worker. It is taken
+    // from a process-wide idle pool and returned when the thread exits, so
+    // short-lived batch threads do not each build one.
     static std::shared_ptr<MDLGenerator> workerLocal(const std::string& mx_libraries_path);
+    // Fills the idle pool up to count generators (bounded), loading the
+    // standard library first if needed.
+    static void reserveWorkers(const std::string& mx_libraries_path, size_t count);
 
     GeneratedMDL generate(MaterialX::DocumentPtr doc,
                           const std::string& material_name);

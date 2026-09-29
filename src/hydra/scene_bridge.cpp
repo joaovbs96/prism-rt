@@ -2880,6 +2880,9 @@ public:
                 materialService = std::make_unique<MaterialService>(
                     &context, mx ? mx : "", mdl ? mdl : "",
                     reinterpret_cast<uint64_t>(sceneIndex.operator->()));
+                // Overlaps scene capture; the build job's services share its
+                // key, so their first Prefetch waits for it instead.
+                materialService->Prewarm();
             }
         } catch (std::exception const &e) {
             TF_WARN("PrismRT: MDL initialization failed: %s", e.what());
@@ -4116,6 +4119,9 @@ VtDictionary SceneBridge::GetStats() const
     result["processTexturePublishSeconds"] = VtValue(textureStats.publishNanoseconds / 1.0e9);
     result["processTextureTrimSeconds"] = VtValue(textureStats.trimNanoseconds / 1.0e9);
     result["processTextureLockWaitSeconds"] = VtValue(textureStats.lockWaitNanoseconds / 1.0e9);
+    result["processTextureAheadRequests"] = VtValue(static_cast<int64_t>(textureStats.aheadRequests));
+    result["processTextureAheadPreparations"] = VtValue(static_cast<int64_t>(textureStats.aheadPreparations));
+    result["processTextureAheadMemoryHits"] = VtValue(static_cast<int64_t>(textureStats.aheadMemoryHits));
     const auto resourceStats = prism::materialx::GetResolvedMaterialResourceStats();
     result["processMaterialResourceReadCalls"] = VtValue(static_cast<int64_t>(resourceStats.sourceReadCalls));
     result["processMaterialResourceHashCalls"] = VtValue(static_cast<int64_t>(resourceStats.sourceHashCalls));
@@ -4310,6 +4316,8 @@ VtDictionary SceneBridge::GetStats() const
         result["materialResourceReadSeconds"] = VtValue(stats.resourceReadSeconds);
         result["materialBatchWallSeconds"] = VtValue(stats.batchWallSeconds);
         result["materialWorkerCpuSeconds"] = VtValue(stats.workerCpuSeconds);
+        result["materialPrewarmSeconds"] = VtValue(stats.prewarmSeconds);
+        result["materialPrewarmWaitSeconds"] = VtValue(stats.prewarmWaitSeconds);
     }
     return result;
 }

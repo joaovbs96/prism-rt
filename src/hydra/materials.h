@@ -64,6 +64,12 @@ public:
         double resourceReadSeconds = 0.0;
         double batchWallSeconds = 0.0;
         double workerCpuSeconds = 0.0;
+        // Duration of the finished pre-warm of this service's key, and time
+        // Prefetch/Resolve of this service spent waiting for a running one.
+        double prewarmSeconds = 0.0;
+        double prewarmWaitSeconds = 0.0;
+        // Pre-warm jobs started in this process, for every key.
+        uint64_t prewarmJobs = 0;
     };
     MaterialService(mdl::Context* context,
                     std::string materialXLibrariesPath = {},
@@ -85,6 +91,19 @@ public:
     std::shared_ptr<Material> Resolve(
         const pxr::HdContainerDataSourceHandle& materialPrimDataSource,
         const pxr::SdfPath& materialPath);
+
+    // Starts, on a std::async thread, the scene-independent initialization the
+    // first material would otherwise pay: the MaterialX libraries of USD's
+    // converter and of the generator, idle worker generators, MDL search
+    // paths and the MaterialX MDL support modules. Runs at most once per
+    // process for this context and MaterialX library/MDL paths; thread-safe.
+    // Prefetch and Resolve wait for a running pre-warm of the same key, and
+    // the destructor waits for one this service started. A failure is logged
+    // and materials then initialize on first use. PRISM_MATERIAL_PREWARM=0
+    // disables it.
+    void Prewarm();
+    // Blocks until the pre-warm of this service's key, if any, has finished.
+    void WaitForPrewarm();
 
     // Captures a batch on the calling Hydra sync thread, then resolves it with
     // a bounded worker pool. Do not call this from multiple sync threads.

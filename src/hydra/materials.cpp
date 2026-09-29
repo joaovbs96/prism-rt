@@ -39,9 +39,13 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <iterator>
+#include <map>
 #include <mutex>
+#include <sstream>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -676,6 +680,114 @@ private:
     tbb::task_group m_group;
 };
 
+// PRISM_MATERIAL_PREWARM=0 leaves every one-time cost to the first material,
+// as before the pre-warm existed; used for measurement.
+bool PrewarmEnabled()
+{
+    const char* value = std::getenv("PRISM_MATERIAL_PREWARM");
+    return !value || std::string_view(value) != "0";
+}
+
+struct PrewarmResult {
+    double seconds = 0.0;
+    std::string error;
+};
+
+// One pre-warm per context and MaterialX paths for the whole process: the
+// initialized state is process-wide, while services come and go per build.
+std::mutex gPrewarmMutex;
+auto& gPrewarms = *new std::map<std::string, std::shared_future<PrewarmResult>>();
+std::atomic<uint64_t> gPrewarmJobs{0};
+
+std::string PrewarmContextPrefix(const mdl::Context* context)
+{
+    return std::to_string(reinterpret_cast<std::uintptr_t>(context)) + "\n";
+}
+
+// Loads the modules generated MDL imports, including the MaterialX support
+// modules, which the first generated module would otherwise load as most of
+// its class compilation. The names come from a minimal generated module, so
+// they follow the installed MaterialX version.
+std::string LoadSupportModules(mdl::Context& context, const std::string& libraries)
+{
+    auto generator = MDLGenerator::shared(libraries);
+    mx::DocumentPtr doc = mx::createDocument();
+    doc->setDataLibrary(generator->get_stdlib());
+    // No authored inputs: generate() bypasses the template caches.
+    doc->addMaterialNode("PrismMaterial",
+        doc->addNode("standard_surface", "Surface", "surfaceshader"));
+    const GeneratedMDL generated = generator->generate(doc, "PrismMaterial");
+    if (!generated.success) return "support module discovery: " + generated.error_message;
+    std::vector<std::string> modules;
+    std::istringstream lines(generated.mdl_source);
+    for (std::string line; std::getline(lines, line);) {
+        // "import ::df::*;" and "using ::materialx::core import *;"
+        size_t end = std::string::npos;
+        size_t begin = 0;
+        if (line.starts_with("import ::")) { begin = 7; end = line.find("::*"); }
+        else if (line.starts_with("using ::")) { begin = 6; end = line.find(" import"); }
+        if (end != std::string::npos && end > begin)
+            modules.push_back(line.substr(begin, end - begin));
+    }
+    if (modules.empty()) return "generated MDL imports no modules";
+
+    mi::base::Handle<mi::neuraylib::IScope> scope(
+        context.get_database()->get_global_scope());
+    mi::base::Handle<mi::neuraylib::ITransaction> transaction(
+        scope ? scope->create_transaction() : nullptr);
+    mi::base::Handle<mi::neuraylib::IMdl_execution_context> execution(
+        context.get_factory()->create_execution_context());
+    if (!transaction || !execution) return "cannot create an MDL transaction";
+    std::string error;
+    for (const std::string& module : modules) {
+        if (context.get_impexp()->load_module(
+                transaction.get(), module.c_str(), execution.get()) >= 0) continue;
+        error = "cannot load " + module;
+        for (mi::Size i = 0; i < execution->get_messages_count(); ++i) {
+            mi::base::Handle<const mi::neuraylib::IMessage> message(execution->get_message(i));
+            if (message && message->get_string()) error += std::string(": ") + message->get_string();
+        }
+        break;
+    }
+    // Committed even after a failure: modules loaded before it stay valid.
+    // No handle into the transaction may outlive the commit.
+    execution.reset();
+    scope.reset();
+    transaction->commit();
+    return error;
+}
+
+PrewarmResult RunPrewarm(mdl::Context* context, const std::string& libraries,
+                         const std::string& mdlPath, const std::filesystem::path& cacheDir)
+{
+    const auto start = std::chrono::steady_clock::now();
+    PrewarmResult result;
+    try {
+        // Loaded by the first hdMtlx conversion.
+        (void)HdMtlxStdLibraries();
+        // Loads the generator's standard library and digest, and leaves a
+        // generator for each worker of the first batch.
+        MDLGenerator::reserveWorkers(libraries, prism::MaterialWorkerCount());
+        // As Prefetch registers them; loading modules by name needs the path.
+        if (!mdlPath.empty()) {
+            context->add_mdl_path(mdlPath);
+            context->add_resource_path(mdlPath);
+        }
+        context->add_resource_path(cacheDir.string());
+        result.error = LoadSupportModules(*context, libraries);
+    } catch (const std::exception& error) {
+        result.error = error.what();
+    } catch (...) {
+        result.error = "unknown exception";
+    }
+    result.seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - start).count();
+    // Runs once per key, so this is logged once.
+    if (!result.error.empty())
+        std::cerr << "[Hydra Material] Material pre-warm failed; materials initialize "
+                     "on first use: " << result.error << "\n";
+    return result;
+}
 
 } // namespace
 
@@ -768,6 +880,7 @@ public:
             cacheDir = std::filesystem::path(local) / "PrismRT" / "cache" / "materials";
         else
             cacheDir = std::filesystem::temp_directory_path() / "prism-rt" / "materials";
+        prewarmKey = PrewarmContextPrefix(context) + this->libraries + "\n" + this->mdlPath;
         std::lock_guard<std::mutex> cacheLock(gMaterialCacheMutex);
         ++gAssociationScopeUsers[associationScope];
     }
@@ -1298,6 +1411,27 @@ public:
         return compiled;
     }
 
+    std::shared_future<PrewarmResult> FindPrewarm() const
+    {
+        std::lock_guard lock(gPrewarmMutex);
+        const auto found = gPrewarms.find(prewarmKey);
+        return found != gPrewarms.end() ? found->second : prewarm;
+    }
+
+    // Compiling alongside a running pre-warm would repeat its work and could
+    // use the libraries it is still loading.
+    void AwaitPrewarm()
+    {
+        const auto running = FindPrewarm();
+        if (!running.valid() ||
+            running.wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+            return;
+        const auto start = std::chrono::steady_clock::now();
+        running.wait();
+        prewarmWaitNanoseconds += std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - start).count();
+    }
+
     std::shared_ptr<Material> Resolve(
         const HdContainerDataSourceHandle& source, const SdfPath& path)
     {
@@ -1341,6 +1475,11 @@ public:
     std::atomic<int64_t> programWaitNanoseconds{0};
     std::atomic<int64_t> resourceNanoseconds{0}, batchWallNanoseconds{0};
     std::atomic<int64_t> workerCpuNanoseconds{0};
+    std::string prewarmKey;
+    // Pre-warm this service started or joined. Its context must outlive it,
+    // so the destructor waits; a scoped context may die right after.
+    std::shared_future<PrewarmResult> prewarm;
+    std::atomic<int64_t> prewarmWaitNanoseconds{0};
 };
 
 MaterialService::MaterialService(mdl::Context* context,
@@ -1352,8 +1491,19 @@ MaterialService::MaterialService(mdl::Context* context,
 {}
 
 MaterialService::~MaterialService() {
-    // Release per-path references before deciding which warm records are unused.
     const auto context = m_impl->context;
+    if (m_impl->prewarm.valid()) m_impl->prewarm.wait();
+    if (context != gSharedMdlContext.load(std::memory_order_acquire)) {
+        // A later Context may reuse this address; its key must pre-warm anew.
+        // Running entries belong to live services, which wait for them.
+        std::lock_guard lock(gPrewarmMutex);
+        const auto prefix = PrewarmContextPrefix(context);
+        std::erase_if(gPrewarms, [&](const auto& entry) {
+            return entry.first.starts_with(prefix) &&
+                entry.second.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+        });
+    }
+    // Release per-path references before deciding which warm records are unused.
     const uint64_t associationScope = m_impl->associationScope;
     m_impl.reset();
     std::lock_guard lock(gMaterialCacheMutex);
@@ -1382,13 +1532,47 @@ std::shared_ptr<Material> MaterialService::Resolve(
     const HdContainerDataSourceHandle& materialPrimDataSource,
     const SdfPath& materialPath)
 {
+    m_impl->AwaitPrewarm();
     return m_impl->Resolve(materialPrimDataSource, materialPath);
+}
+
+void MaterialService::Prewarm()
+{
+    Impl& impl = *m_impl;
+    if (!PrewarmEnabled() || !impl.context || !impl.context->is_valid() ||
+        impl.libraries.empty()) return;
+    std::lock_guard lock(gPrewarmMutex);
+    auto& entry = gPrewarms[impl.prewarmKey];
+    if (!entry.valid()) {
+        try {
+            // Owns copies only: the service may be destroyed while it runs.
+            entry = std::async(std::launch::async,
+                [context = impl.context, libraries = impl.libraries,
+                 mdlPath = impl.mdlPath, cacheDir = impl.cacheDir] {
+                    return RunPrewarm(context, libraries, mdlPath, cacheDir);
+                }).share();
+            ++gPrewarmJobs;
+        } catch (const std::exception& error) {
+            gPrewarms.erase(impl.prewarmKey);
+            std::cerr << "[Hydra Material] Cannot start the material pre-warm: "
+                      << error.what() << "\n";
+            return;
+        }
+    }
+    impl.prewarm = entry;
+}
+
+void MaterialService::WaitForPrewarm()
+{
+    const auto running = m_impl->FindPrewarm();
+    if (running.valid()) running.wait();
 }
 
 void MaterialService::Prefetch(const std::vector<Request>& requests,
                                const std::function<bool()>& cancelled)
 {
     if (requests.empty()) return;
+    m_impl->AwaitPrewarm();
     // Finish shared MDL SDK configuration before worker transactions begin.
     // Generated texture references are materialized as absolute paths during
     // Prepare, so workers do not need to mutate resource search paths.
@@ -1799,6 +1983,12 @@ MaterialService::MaterialStats MaterialService::GetStats() const
     result.resourceReadSeconds = m_impl->resourceNanoseconds.load() / 1.0e9;
     result.batchWallSeconds = m_impl->batchWallNanoseconds.load() / 1.0e9;
     result.workerCpuSeconds = m_impl->workerCpuNanoseconds.load() / 1.0e9;
+    const auto prewarm = m_impl->FindPrewarm();
+    if (prewarm.valid() &&
+        prewarm.wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+        result.prewarmSeconds = prewarm.get().seconds;
+    result.prewarmWaitSeconds = m_impl->prewarmWaitNanoseconds.load() / 1.0e9;
+    result.prewarmJobs = gPrewarmJobs.load();
     return result;
 }
 

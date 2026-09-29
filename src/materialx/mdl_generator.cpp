@@ -484,13 +484,69 @@ std::shared_ptr<MDLGenerator> MDLGenerator::shared(const std::string& mx_librari
     return generator;
 }
 
+namespace {
+// Generators not owned by any thread, by libraries path. Each is used by one
+// thread at a time: workerLocal takes it and the thread's exit returns it.
+struct IdleGenerators {
+    std::mutex mutex;
+    std::map<std::string, std::vector<std::shared_ptr<MDLGenerator>>> byPath;
+};
+constexpr size_t kIdleGeneratorLimit = 64;
+
+IdleGenerators& Idle() {
+    // Leaked: thread-local owners may return generators during process exit.
+    static auto& idle = *new IdleGenerators();
+    return idle;
+}
+
+struct WorkerGenerators {
+    std::map<std::string, std::shared_ptr<MDLGenerator>> byPath;
+    ~WorkerGenerators() {
+        auto& idle = Idle();
+        std::lock_guard lock(idle.mutex);
+        for (auto& [path, generator] : byPath) {
+            auto& pool = idle.byPath[path];
+            // A generator a caller still holds could be shared by two threads.
+            if (generator && generator.use_count() == 1 && pool.size() < kIdleGeneratorLimit)
+                pool.push_back(std::move(generator));
+        }
+    }
+};
+}
+
 std::shared_ptr<MDLGenerator> MDLGenerator::workerLocal(
     const std::string& mx_libraries_path) {
-    thread_local std::map<std::string, std::shared_ptr<MDLGenerator>> generators;
-    auto& generator = generators[mx_libraries_path];
-    if (!generator)
-        generator = std::make_shared<MDLGenerator>(mx_libraries_path);
+    thread_local WorkerGenerators generators;
+    auto& generator = generators.byPath[mx_libraries_path];
+    if (!generator) {
+        auto& idle = Idle();
+        {
+            std::lock_guard lock(idle.mutex);
+            auto& pool = idle.byPath[mx_libraries_path];
+            if (!pool.empty()) {
+                generator = std::move(pool.back());
+                pool.pop_back();
+            }
+        }
+        if (!generator)
+            generator = std::make_shared<MDLGenerator>(mx_libraries_path);
+    }
     return generator;
+}
+
+void MDLGenerator::reserveWorkers(const std::string& mx_libraries_path, size_t count) {
+    auto& idle = Idle();
+    count = std::min(count, kIdleGeneratorLimit);
+    for (size_t built = 0; built < count; ++built) {
+        {
+            std::lock_guard lock(idle.mutex);
+            if (idle.byPath[mx_libraries_path].size() >= count) return;
+        }
+        // Constructed unlocked: the first one loads the standard library.
+        auto generator = std::make_shared<MDLGenerator>(mx_libraries_path);
+        std::lock_guard lock(idle.mutex);
+        idle.byPath[mx_libraries_path].push_back(std::move(generator));
+    }
 }
 
 GeneratedMDL MDLGenerator::generate(MaterialX::DocumentPtr doc,
