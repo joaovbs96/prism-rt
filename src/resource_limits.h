@@ -110,8 +110,13 @@ private:
     uint64_t waitNanoseconds = 0;
 };
 
+// Measured whole-process peak (~2 GB) is far below the former 512 MB per-job estimate; these match observed use.
+inline constexpr uint64_t kMaterialCompileReservationBytes = 192ull * 1024ull * 1024ull;
+// A template bind performs no native JIT, so it needs far less than a full compile.
+inline constexpr uint64_t kMaterialBindReservationBytes = 64ull * 1024ull * 1024ull;
+
 inline unsigned MaterialWorkerCount() {
-    const unsigned fallback = std::max(1u, std::min(4u, std::thread::hardware_concurrency() / 2));
+    const unsigned fallback = std::max(1u, std::min(8u, std::thread::hardware_concurrency() / 2));
     return static_cast<unsigned>(ResourceLimit("PRISM_MATERIAL_THREADS", fallback, 64));
 }
 

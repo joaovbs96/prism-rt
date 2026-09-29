@@ -66,7 +66,7 @@ public:
                 const CompileSelector& select = {})
     {
         prism::PreparationAdmission::Reservation admission(
-            prism::PreparationAdmission::Shared(), 512ull * 1024ull * 1024ull);
+            prism::PreparationAdmission::Shared(), prism::kMaterialCompileReservationBytes);
         if (PrismMdlVerbose())
             std::cout << "[MDLMaterial] Compiling: " << mtlx_path << "\n";
 

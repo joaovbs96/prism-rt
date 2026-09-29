@@ -197,7 +197,7 @@ inline CompatibleBindResult BindCompatibleTemplate(
         return result;
     }
     prism::PreparationAdmission::Reservation admission(
-        prism::PreparationAdmission::Shared(),512ull*1024*1024);
+        prism::PreparationAdmission::Shared(),prism::kMaterialBindReservationBytes);
     auto scope=mi::base::make_handle(context.get_database()->get_global_scope());
     auto transaction=mi::base::make_handle(scope ? scope->create_transaction() : nullptr);
     mi::base::Handle<mi::neuraylib::IValue_factory> values;
