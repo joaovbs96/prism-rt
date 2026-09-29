@@ -5,6 +5,7 @@
 #include "pxr/base/vt/dictionary.h"
 
 #include <memory>
+#include <map>
 
 namespace prism::hydra {
 class SceneBridge;
@@ -84,6 +85,7 @@ private:
     bool _authoredSettingsDirty = true;
     SdfPathVector _renderSettingsPaths;
     VtDictionary _authoredSettings;
+    std::map<SdfPath, TfToken> _knownPrimTypes;
 };
 
 PXR_NAMESPACE_CLOSE_SCOPE

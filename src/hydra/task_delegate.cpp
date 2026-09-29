@@ -9,6 +9,8 @@
 
 #include "pxr/imaging/hd/camera.h"
 #include "pxr/imaging/hd/instancer.h"
+#include "pxr/imaging/hd/instancedBySchema.h"
+#include "pxr/imaging/hd/instancerTopologySchema.h"
 #include "pxr/imaging/hd/rprim.h"
 #include "pxr/imaging/hd/material.h"
 #include "pxr/imaging/hd/renderThread.h"
@@ -29,9 +31,13 @@ TfToken const _maxDepth("prism:maxDepth");
 TfToken const _rouletteDepth("prism:rrMinDepth");
 TfToken const _seed("prism:seed");
 TfToken const _sampleClamp("prism:maxSampleRadiance");
+TfToken const _adaptivePreview("prism:adaptivePreview");
+TfToken const _sphereBatching("prism:sphereBatching");
+TfToken const _previewTargetMs("prism:previewTargetMs");
 TfToken const _previewMaxDimension("prism:previewMaxDimension");
 TfToken const _refinementDelayMs("prism:refinementDelayMs");
 TfToken const _environmentSampling("prism:environmentSampling");
+TfToken const _textureFiltering("prism:textureFiltering");
 TfToken const _resourceRevision("prism:resourceRevision");
 TfToken const _selectionOutline("prism:selectionOutline");
 TfToken const _selectionOutlineRadius("prism:selectionOutlineRadius");
@@ -63,6 +69,7 @@ PrismTaskDelegate::~PrismTaskDelegate()
     if (_renderThread)
         _renderThread->StopThread();
     _ownedBridge.reset();
+    _bridge = nullptr;
 }
 
 void PrismTaskDelegate::SetTerminalSceneIndex(
@@ -86,6 +93,14 @@ void PrismTaskDelegate::SetTerminalSceneIndex(
     _taskContext->bridge.store(_bridge);
     _renderThread->SetRenderCallback([this] { _bridge->Render(); });
     _renderThread->StartThread();
+    _knownPrimTypes.clear();
+    SdfPathVector pending{SdfPath::AbsoluteRootPath()};
+    while (!pending.empty()) {
+        auto path = pending.back(); pending.pop_back();
+        _knownPrimTypes[path] = _sourceSceneIndex->GetPrim(path).primType;
+        auto children = _sourceSceneIndex->GetChildPrimPaths(path);
+        pending.insert(pending.end(), children.begin(), children.end());
+    }
     _sourceSceneIndex->AddObserver(HdSceneIndexObserverPtr(this));
 }
 
@@ -122,7 +137,12 @@ HdBprim *PrismTaskDelegate::CreateBprim(TfToken const &type, SdfPath const &id)
 HdBprim *PrismTaskDelegate::CreateFallbackBprim(TfToken const &type)
 { return type == HdPrimTypeTokens->renderBuffer
     ? new PrismRenderBuffer(SdfPath::EmptyPath(), _thread) : nullptr; }
-void PrismTaskDelegate::DestroyBprim(HdBprim *p) { delete p; }
+void PrismTaskDelegate::DestroyBprim(HdBprim *p)
+{
+    if (_bridge)
+        _bridge->RemoveRenderBuffer(dynamic_cast<HdRenderBuffer *>(p));
+    delete p;
+}
 void PrismTaskDelegate::CommitResources(HdChangeTracker *) {}
 
 HdAovDescriptor PrismTaskDelegate::GetDefaultAovDescriptor(TfToken const &name) const
@@ -155,9 +175,13 @@ HdRenderSettingDescriptorList PrismTaskDelegate::GetRenderSettingDescriptors() c
             {"Roulette depth", _rouletteDepth, VtValue(4)},
             {"Seed", _seed, VtValue(0)},
             {"Sample clamp", _sampleClamp, VtValue(10.0f)},
+            {"Adaptive preview", _adaptivePreview, VtValue(true)},
+            {"Sphere batching (experimental)", _sphereBatching, VtValue(false)},
+            {"Preview target (ms)", _previewTargetMs, VtValue(33)},
             {"Preview maximum dimension", _previewMaxDimension, VtValue(96)},
             {"Refinement delay (ms)", _refinementDelayMs, VtValue(100)},
             {"Environment sampling", _environmentSampling, VtValue(std::string("mis"))},
+            {"Texture filtering", _textureFiltering, VtValue(std::string("filtered"))},
             {"Resource revision", _resourceRevision, VtValue(0)},
             {"Selection outline", _selectionOutline, VtValue(true)},
             {"Selection outline radius", _selectionOutlineRadius, VtValue(2)},
@@ -173,11 +197,17 @@ VtValue PrismTaskDelegate::GetRenderSetting(TfToken const &key) const
     if (key == _rouletteDepth) return VtValue(s.rouletteDepth);
     if (key == _seed) return VtValue(s.seed);
     if (key == _sampleClamp) return VtValue(s.sampleClamp);
+    if (key == _adaptivePreview) return VtValue(s.adaptivePreview);
+    if (key == _sphereBatching) return VtValue(s.sphereBatching);
+    if (key == _previewTargetMs) return VtValue(s.previewTargetMs);
     if (key == _previewMaxDimension) return VtValue(s.previewMaxDimension);
     if (key == _refinementDelayMs) return VtValue(s.refinementDelayMs);
     if (key == _environmentSampling) return VtValue(std::string(
         s.environmentSampling == prism::hydra::RenderSettings::EnvironmentSampling::Mis
             ? "mis" : "bsdf"));
+    if (key == _textureFiltering) return VtValue(std::string(
+        s.textureFiltering == prism::TextureFiltering::Filtered
+            ? "filtered" : "bilinear"));
     if (key == _resourceRevision) return VtValue(s.resourceRevision);
     if (key == _selectionOutline)
         return VtValue(_selectionSettings->enableOutline.load());
@@ -254,6 +284,12 @@ void PrismTaskDelegate::SetRenderSetting(TfToken const &key, VtValue const &valu
     else if (key == _rouletteDepth) s.rouletteDepth = std::max(0, _Get(value, s.rouletteDepth));
     else if (key == _seed) s.seed = _Get(value, s.seed);
     else if (key == _sampleClamp) s.sampleClamp = std::max(0.0f, _Get(value, s.sampleClamp));
+    else if (key == _adaptivePreview)
+        s.adaptivePreview = _Get(value, s.adaptivePreview);
+    else if (key == _sphereBatching)
+        s.sphereBatching = _Get(value, s.sphereBatching);
+    else if (key == _previewTargetMs)
+        s.previewTargetMs = std::clamp(_Get(value, s.previewTargetMs), 1, 1000);
     else if (key == _previewMaxDimension)
         s.previewMaxDimension = std::clamp(_Get(value, s.previewMaxDimension), 16, 1024);
     else if (key == _refinementDelayMs)
@@ -269,6 +305,17 @@ void PrismTaskDelegate::SetRenderSetting(TfToken const &key, VtValue const &valu
             s.environmentSampling = prism::hydra::RenderSettings::EnvironmentSampling::Bsdf;
         else return;
     }
+    else if (key == _textureFiltering &&
+             (value.IsHolding<std::string>() || value.IsHolding<TfToken>())) {
+        const std::string mode = value.IsHolding<std::string>()
+            ? value.UncheckedGet<std::string>()
+            : value.UncheckedGet<TfToken>().GetString();
+        if (mode == "filtered")
+            s.textureFiltering = prism::TextureFiltering::Filtered;
+        else if (mode == "bilinear")
+            s.textureFiltering = prism::TextureFiltering::Bilinear;
+        else return;
+    }
     else if (key == _resourceRevision)
         s.resourceRevision = _Get(value, s.resourceRevision);
     else return;
@@ -276,7 +323,27 @@ void PrismTaskDelegate::SetRenderSetting(TfToken const &key, VtValue const &valu
 }
 
 VtDictionary PrismTaskDelegate::GetRenderStats() const
-{ return _bridge ? _bridge->GetStats() : VtDictionary{}; }
+{
+    VtDictionary result = _bridge ? _bridge->GetStats() : VtDictionary{};
+    result["selectionOffsetMilliseconds"] = VtValue(
+        _taskContext->selectionOffsetNanoseconds.load(
+            std::memory_order_relaxed) / 1.0e6);
+    result["selectionOffsetCalls"] = VtValue(static_cast<int64_t>(
+        _taskContext->selectionOffsetCalls.load(std::memory_order_relaxed)));
+    result["selectionPathsVisited"] = VtValue(static_cast<int64_t>(
+        _taskContext->selectionPathsVisited.load(std::memory_order_relaxed)));
+    result["selectionOffsetCacheHits"] = VtValue(static_cast<int64_t>(
+        _taskContext->selectionOffsetCacheHits.load(
+            std::memory_order_relaxed)));
+    result["selectionOffsetCacheMisses"] = VtValue(static_cast<int64_t>(
+        _taskContext->selectionOffsetCacheMisses.load(
+            std::memory_order_relaxed)));
+    result["pickMilliseconds"] = VtValue(
+        _taskContext->pickNanoseconds.load(std::memory_order_relaxed) / 1.0e6);
+    result["pickCalls"] = VtValue(static_cast<int64_t>(
+        _taskContext->pickCalls.load(std::memory_order_relaxed)));
+    return result;
+}
 bool PrismTaskDelegate::Pause() { _thread->PauseRender(); return true; }
 bool PrismTaskDelegate::Resume() { _thread->ResumeRender(); return true; }
 bool PrismTaskDelegate::Stop(bool) { _thread->StopRender(); return true; }
@@ -338,24 +405,40 @@ static bool _NeedsSceneRebuild(HdSceneIndexPrim const &prim)
 void PrismTaskDelegate::PrimsAdded(HdSceneIndexBase const &sender,
                                    AddedPrimEntries const &entries)
 {
-    bool sceneChanged = false;
-    for (const AddedPrimEntry &entry : entries) {
-        if (entry.primType == HdPrimTypeTokens->renderSettings)
-            _authoredSettingsDirty = true;
-        if (_NeedsSceneRebuild(sender.GetPrim(entry.primPath)))
-            sceneChanged = true;
+    if (!entries.empty()) {
+        _taskContext->selectionSceneRevision.fetch_add(1, std::memory_order_relaxed);
+        _taskContext->instanceTopologyRevision.fetch_add(1, std::memory_order_relaxed);
     }
-    if (sceneChanged && _bridge)
-        _bridge->MarkSceneDirty(prism::hydra::SceneDirtyKind::Structure);
+    SdfPathVector paths;
+    for (auto const& entry : entries) {
+        _knownPrimTypes[entry.primPath] = entry.primType;
+        if (entry.primType == HdPrimTypeTokens->renderSettings) _authoredSettingsDirty = true;
+        if (_NeedsSceneRebuild(sender.GetPrim(entry.primPath))) paths.push_back(entry.primPath);
+    }
+    if (_bridge && !paths.empty())
+        _bridge->MarkScenePathsDirty(prism::hydra::SceneDirtyKind::Structure, paths);
 }
 
 void PrismTaskDelegate::PrimsRemoved(HdSceneIndexBase const &,
                                      RemovedPrimEntries const &entries)
 {
-    for (const auto& entry : entries)
-        for (const auto& path : _renderSettingsPaths)
-            if (path.HasPrefix(entry.primPath)) _authoredSettingsDirty = true;
-    if (_bridge) _bridge->MarkSceneDirty(prism::hydra::SceneDirtyKind::Structure);
+    if (!entries.empty()) {
+        _taskContext->selectionSceneRevision.fetch_add(1, std::memory_order_relaxed);
+        _taskContext->instanceTopologyRevision.fetch_add(1, std::memory_order_relaxed);
+    }
+    SdfPathVector paths;
+    for (auto const& entry : entries) {
+        // Removed prims cannot be queried from the sender. Retain known types
+        // until their entire subtree has been accounted for.
+        for (auto it = _knownPrimTypes.lower_bound(entry.primPath);
+             it != _knownPrimTypes.end() && it->first.HasPrefix(entry.primPath);) {
+            if (it->second == HdPrimTypeTokens->renderSettings) _authoredSettingsDirty = true;
+            it = _knownPrimTypes.erase(it);
+        }
+        paths.push_back(entry.primPath);
+    }
+    if (_bridge && !paths.empty())
+        _bridge->MarkScenePathsDirty(prism::hydra::SceneDirtyKind::Structure, paths);
 }
 
 void PrismTaskDelegate::PrimsDirtied(HdSceneIndexBase const &sender,
@@ -364,6 +447,26 @@ void PrismTaskDelegate::PrimsDirtied(HdSceneIndexBase const &sender,
     bool sceneChanged = false;
     for (const DirtiedPrimEntry &entry : entries) {
         const auto prim = sender.GetPrim(entry.primPath);
+        bool selectionEncodingChanged = entry.dirtyLocators.IsEmpty();
+        bool instanceTopologyChanged = entry.dirtyLocators.IsEmpty();
+        for (HdDataSourceLocator const &locator : entry.dirtyLocators) {
+            auto intersects = [&](HdDataSourceLocator const &schema) {
+                return locator.HasPrefix(schema) || schema.HasPrefix(locator);
+            };
+            selectionEncodingChanged = selectionEncodingChanged ||
+                intersects(HdSelectionsSchema::GetDefaultLocator()) ||
+                intersects(HdInstancedBySchema::GetDefaultLocator()) ||
+                intersects(HdInstancerTopologySchema::GetDefaultLocator());
+            instanceTopologyChanged = instanceTopologyChanged ||
+                intersects(HdInstancedBySchema::GetDefaultLocator()) ||
+                intersects(HdInstancerTopologySchema::GetDefaultLocator());
+        }
+        if (selectionEncodingChanged)
+            _taskContext->selectionSceneRevision.fetch_add(
+                1, std::memory_order_relaxed);
+        if (instanceTopologyChanged)
+            _taskContext->instanceTopologyRevision.fetch_add(
+                1, std::memory_order_relaxed);
         if (prim.primType == HdPrimTypeTokens->renderSettings) {
             _authoredSettingsDirty = true;
             continue;
@@ -403,7 +506,7 @@ void PrismTaskDelegate::PrimsDirtied(HdSceneIndexBase const &sender,
                         text.rfind("visibility", 0) == 0 ||
                         text.rfind("instancerTopology", 0) == 0)
                         kind = prism::hydra::SceneDirtyKind::Placement;
-                    else if (text.rfind("mesh", 0) == 0 ||
+                    else if (text.rfind("mesh", 0) == 0 || text.rfind("sphere", 0) == 0 ||
                              text.rfind("primvars", 0) == 0)
                         kind = prism::hydra::SceneDirtyKind::Prototype;
                     else if (text.rfind("materialBindings", 0) == 0)
@@ -420,10 +523,25 @@ void PrismTaskDelegate::PrimsDirtied(HdSceneIndexBase const &sender,
 }
 
 void PrismTaskDelegate::PrimsRenamed(HdSceneIndexBase const &,
-                                     RenamedPrimEntries const &)
+                                     RenamedPrimEntries const &entries)
 {
+    _taskContext->selectionSceneRevision.fetch_add(1, std::memory_order_relaxed);
+    _taskContext->instanceTopologyRevision.fetch_add(1, std::memory_order_relaxed);
     _authoredSettingsDirty = true;
-    if (_bridge) _bridge->MarkSceneDirty(prism::hydra::SceneDirtyKind::Structure);
+    SdfPathVector paths;
+    for (auto const& entry : entries) {
+        std::vector<std::pair<SdfPath, TfToken>> moved;
+        for (auto it = _knownPrimTypes.lower_bound(entry.oldPrimPath);
+             it != _knownPrimTypes.end() && it->first.HasPrefix(entry.oldPrimPath);) {
+            moved.emplace_back(it->first.ReplacePrefix(entry.oldPrimPath, entry.newPrimPath), it->second);
+            it = _knownPrimTypes.erase(it);
+        }
+        for (auto const& item : moved) _knownPrimTypes.insert(item);
+        paths.push_back(entry.oldPrimPath);
+        paths.push_back(entry.newPrimPath);
+    }
+    if (_bridge && !paths.empty())
+        _bridge->MarkScenePathsDirty(prism::hydra::SceneDirtyKind::Structure, paths);
 }
 
 PXR_NAMESPACE_CLOSE_SCOPE

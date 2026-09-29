@@ -1,4 +1,7 @@
 #include "mdl_generator.h"
+#include "generated_cache.h"
+#include "../resource_limits.h"
+#include <MaterialXCore/Generated.h>
 #include <MaterialXFormat/XmlIo.h>
 #include <MaterialXFormat/Util.h>
 #include <MaterialXGenShader/GenContext.h>
@@ -10,11 +13,136 @@
 #include <iostream>
 #include <map>
 #include <cstdlib>
+#include <mutex>
+#include <filesystem>
+#include <array>
+#include <unordered_map>
+#include <MaterialXGenShader/TypeDesc.h>
+#include <MaterialXGenShader/Syntax.h>
 
 namespace {
 bool VerboseMdl() {
     const char* value = std::getenv("PRISM_MDL_VERBOSE");
     return value && *value && std::string(value) != "0";
+}
+
+MaterialX::DocumentPtr SharedStandardLibrary(const std::string& path) {
+    static std::mutex mutex;
+    static std::map<std::string, MaterialX::DocumentPtr> libraries;
+    const auto key = std::filesystem::weakly_canonical(path).generic_string();
+    std::lock_guard lock(mutex);
+    auto& library = libraries[key];
+    if (!library) {
+        auto loaded = MaterialX::createDocument();
+        MaterialX::FileSearchPath search;
+        search.append(MaterialX::FilePath(path));
+        MaterialX::loadLibraries({}, search, loaded);
+        // Documents are immutable after publication. MaterialX protects its
+        // internal lookup-cache construction; generator/GenContext stay local.
+        library = std::move(loaded);
+    }
+    return library;
+}
+
+std::string SharedLibraryDigest(const std::string& path) {
+    static std::mutex mutex;
+    static std::map<std::string,std::string> digests;
+    const auto key=std::filesystem::weakly_canonical(path).generic_string();
+    std::lock_guard lock(mutex);
+    auto& digest=digests[key];
+    if(digest.empty()) digest=prism::materialx::MaterialXLibraryDigest(path);
+    return digest;
+}
+
+std::string GeneratorOptionsIdentity(MaterialX::GenOptions const& o) {
+    return std::to_string(int(o.shaderInterfaceType))+"|"+
+        std::to_string(o.fileTextureVerticalFlip)+"|"+o.targetColorSpaceOverride+"|"+
+        o.targetDistanceUnit+"|"+std::to_string(o.addUpstreamDependencies)+"|"+
+        o.libraryPrefix.asString()+"|"+std::to_string(o.emitColorTransforms)+"|"+
+        std::to_string(o.hwTransparency)+"|"+
+        std::to_string(int(o.hwSpecularEnvironmentMethod))+"|"+
+        std::to_string(int(o.hwDirectionalAlbedoMethod))+"|"+
+        std::to_string(int(o.hwTransmissionRenderMethod))+"|"+
+        std::to_string(o.hwSrgbEncodeOutput)+"|"+
+        std::to_string(o.hwWriteDepthMoments)+"|"+std::to_string(o.hwShadowMap)+"|"+
+        std::to_string(o.hwAmbientOcclusion)+"|"+
+        std::to_string(o.hwMaxActiveLightSources)+"|"+
+        std::to_string(o.hwNormalizeUdimTexCoords)+"|"+
+        std::to_string(o.hwWriteAlbedoTable)+"|"+
+        std::to_string(o.hwWriteEnvPrefilter)+"|"+
+        std::to_string(o.hwImplicitBitangents);
+}
+
+bool HasExternalImplementationSources(MaterialX::DocumentPtr const& doc) {
+    const auto documentSource=doc->getSourceUri();
+    for(const auto& element:doc->traverseTree()) {
+        const auto source=element->getSourceUri();
+        // XmlIo serializes these children as XIncludes, so the normalized XML
+        // contains only their URI rather than the implementation content.
+        if(!source.empty()&&source!=documentSource)return true;
+    }
+    return false;
+}
+
+struct ColorTemplate {
+    GeneratedMDL generated;
+    std::vector<std::pair<std::string, std::pair<size_t,size_t>>> spans;
+    size_t bytes = 0;
+    uint64_t lastUse = 0;
+};
+std::mutex templateMutex;
+std::array<std::mutex,64> templateKeyMutexes;
+std::unordered_map<std::string, ColorTemplate> colorTemplates;
+size_t templateBytes = 0;
+uint64_t templateClock = 0;
+
+// Restrict the first template fast path to exposed color defaults. Graph,
+// scalar controls, node definitions, colorspace transforms and connections stay
+// in the signature; unsupported/nonpublic defaults take normal generation.
+std::string ColorTemplateKey(MaterialX::DocumentPtr const& doc,
+                             std::vector<MaterialX::InputPtr>& colors) {
+    auto normalized=doc->copy();
+    for (const auto& node : doc->getNodes()) {
+        if (node->getCategory()!="open_pbr_surface" && node->getCategory()!="standard_surface") continue;
+        for (const auto& input : node->getInputs()) {
+            if (input->getType()!="color3" || !input->getValue() ||
+                input->hasNodeName() || input->hasNodeGraphString() ||
+                input->hasInterfaceName()) continue;
+            colors.push_back(input);
+            auto replacement=normalized->getDescendant(input->getNamePath())->asA<MaterialX::Input>();
+            replacement->setValue(MaterialX::Color3(0.0f));
+        }
+    }
+    return colors.empty() ? std::string{} : MaterialX::writeToXmlString(normalized);
+}
+
+bool FindColorSpans(const std::string& source,
+                    const std::vector<MaterialX::InputPtr>& colors, ColorTemplate& result) {
+    const auto material=source.find("export material ");
+    const auto open=source.find('(',material);
+    if(material==std::string::npos || open==std::string::npos) return false;
+    size_t end=open+1; int depth=1; bool quoted=false,escaped=false;
+    for(;end<source.size() && depth;++end) {
+        const char c=source[end];
+        if(quoted) { if(escaped) escaped=false; else if(c=='\\') escaped=true; else if(c=='"') quoted=false; continue; }
+        if(c=='"') quoted=true; else if(c=='(') ++depth; else if(c==')') --depth;
+    }
+    if(depth) return false;
+    for(const auto& color : colors) {
+        const auto marker=std::string("materialx::core::origin(\"")+color->getNamePath()+"\")";
+        const auto origin=source.find(marker,open);
+        if(origin==std::string::npos || origin>=end || source.find(marker,origin+1)!=std::string::npos) return false;
+        const auto annotation=source.rfind("[[",origin);
+        const auto equal=source.rfind(" = ",annotation);
+        if(annotation==std::string::npos || equal==std::string::npos || equal<=open) return false;
+        const size_t begin=equal+3;
+        size_t finish=annotation;
+        while(finish>begin && std::isspace(static_cast<unsigned char>(source[finish-1]))) --finish;
+        if(source.compare(begin,6,"color(")!=0) return false;
+        result.spans.push_back({color->getNamePath(),{begin,finish}});
+    }
+    std::sort(result.spans.begin(),result.spans.end(),[](const auto& a,const auto& b){return a.second.first>b.second.first;});
+    return true;
 }
 }
 #include <mutex>
@@ -33,8 +161,8 @@ public:
         MaterialX::FileSearchPath librariesSearchPath;
         librariesSearchPath.append(librariesPath);
 
-        m_stdlib = MaterialX::createDocument();
-        MaterialX::loadLibraries({}, librariesSearchPath, m_stdlib);
+        m_stdlib = SharedStandardLibrary(mx_libraries_path);
+        m_libraryDigest = SharedLibraryDigest(mx_libraries_path);
 
         // Decode authored color spaces in the graph, leaving scalar/vector data
         // textures (roughness, metallic, normals) in their original linear form.
@@ -43,6 +171,9 @@ public:
         color_management->loadLibrary(m_stdlib);
         m_generator->setColorManagementSystem(color_management);
         m_context.getOptions().targetColorSpaceOverride = "lin_rec709";
+        m_optionsIdentity = GeneratorOptionsIdentity(m_context.getOptions());
+        m_diskCache=std::make_unique<prism::materialx::GeneratedTemplateDiskCache>(
+            prism::PersistentCacheRoot(),prism::GeneratedArtifactBudgetBytes());
 
         if (VerboseMdl()) std::cout << "[DEBUG] stdlib elements loaded: "
                 << m_stdlib->getChildren().size() << "\n";
@@ -59,6 +190,127 @@ public:
     }
 
     MaterialX::DocumentPtr get_stdlib() const { return m_stdlib; }
+
+GeneratedMDL generateCached(MaterialX::DocumentPtr doc, const std::string& material_name) {
+    std::vector<MaterialX::InputPtr> colors;
+    const auto structural=doc ? ColorTemplateKey(doc,colors) : std::string{};
+    if(structural.empty() || m_libraryDigest.empty() ||
+       doc->getDataLibrary()!=m_stdlib || HasExternalImplementationSources(doc) ||
+       std::getenv("PRISM_DISABLE_GENERATION_CACHE")) return generate(doc,material_name);
+    const auto persistentKey=prism::materialx::GeneratedTemplateKey({
+        "prism-generated-mdl-color-template-v1",
+        std::to_string(MATERIALX_MAJOR_VERSION)+"."+
+            std::to_string(MATERIALX_MINOR_VERSION)+"."+
+            std::to_string(MATERIALX_BUILD_VERSION),
+        m_generator->getTarget(),m_optionsIdentity,m_libraryDigest,
+        material_name,structural});
+    const auto& key=persistentKey;
+    std::lock_guard keyLock(templateKeyMutexes[std::hash<std::string>{}(key)%templateKeyMutexes.size()]);
+    ColorTemplate entry;
+    bool found=false;
+    bool diskFound=false;
+    { std::lock_guard lock(templateMutex); const auto it=colorTemplates.find(key); if(it!=colorTemplates.end()) {it->second.lastUse=++templateClock; entry=it->second; found=true;} }
+    if(!found) {
+        if(auto artifact=m_diskCache->load(persistentKey)) {
+            entry.generated.module_name=std::move(artifact->moduleName);
+            entry.generated.mdl_source=std::move(artifact->source);
+            entry.generated.texture_paths=std::move(artifact->texturePaths);
+            for (auto& uniform : artifact->uniforms) {
+                auto element = doc->getDescendant(uniform.path);
+                auto input = element ? element->asA<MaterialX::Input>() : nullptr;
+                entry.generated.uniforms.push_back({std::move(uniform.name),
+                    std::move(uniform.path), std::move(uniform.type),
+                    input ? input->getValue() : MaterialX::ValuePtr{}});
+            }
+            entry.generated.success=true;
+            entry.spans=std::move(artifact->spans);
+            found=diskFound=true;
+        }
+    }
+    if(found) {
+        for(const auto& [path,span]:entry.spans) {
+            const auto element=doc->getDescendant(path);
+            const auto input=element?element->asA<MaterialX::Input>():nullptr;
+            if(!input||input->getType()!="color3"||!input->getValue()) {
+                found=false;break;
+            }
+        }
+        for (const auto& uniform : entry.generated.uniforms) {
+            const auto element = doc->getDescendant(uniform.path);
+            const auto input = element ? element->asA<MaterialX::Input>() : nullptr;
+            // Input-block metadata can include ports inherited from the data
+            // library, which are intentionally absent from this small user
+            // document. The library digest and structural key validate those
+            // ports. If the path is authored locally, its type must still
+            // agree; its value may be a connection or an inherited default.
+            if (input && input->getType() != uniform.type) {
+                found = false; break;
+            }
+        }
+    }
+    if(found) {
+        // Older/on-disk artifacts predate the validated uniform map. A source
+        // template alone is insufficient for direct SDK argument binding, so
+        // generate one seed to publish authoritative ShaderPort metadata.
+        if (entry.generated.uniforms.empty())
+            return generate(doc, material_name);
+        if(diskFound) {
+            size_t bytes=key.size()+entry.generated.mdl_source.size()+sizeof(ColorTemplate);
+            for(const auto& span:entry.spans)bytes+=sizeof(span)+span.first.size();
+            constexpr size_t limit=64*1024*1024;
+            if(bytes<=limit) {
+                std::lock_guard lock(templateMutex);
+                while(templateBytes>limit-bytes&&!colorTemplates.empty()) {
+                    const auto oldest=std::min_element(colorTemplates.begin(),colorTemplates.end(),
+                        [](const auto& a,const auto& b){return a.second.lastUse<b.second.lastUse;});
+                    templateBytes-=oldest->second.bytes;colorTemplates.erase(oldest);
+                }
+                entry.bytes=bytes;entry.lastUse=++templateClock;
+                colorTemplates.emplace(key,entry);templateBytes+=bytes;
+            }
+        }
+        auto result=entry.generated;
+        // Match MdlShaderGenerator::generate's thread-local formatting scope,
+        // including its rounding. This also makes generated source identical.
+        MaterialX::ScopedFloatFormatting formatting(MaterialX::Value::FloatFormatFixed);
+        for(const auto& [path,span] : entry.spans) {
+            auto input=doc->getDescendant(path)->asA<MaterialX::Input>();
+            const auto text=m_generator->getSyntax().getValue(MaterialX::Type::COLOR3,*input->getValue(),true);
+            result.mdl_source.replace(span.first,span.second-span.first,text);
+        }
+        result.generationCacheHit=true;
+        result.generationPersistentCacheHit=diskFound;
+        return result;
+    }
+    auto result=generate(doc,material_name);
+    if(result.success && FindColorSpans(result.mdl_source,colors,entry)) {
+        entry.generated=result;
+        prism::materialx::GeneratedTemplateArtifact artifact{
+            result.module_name,result.mdl_source,result.texture_paths,entry.spans};
+        for (const auto& uniform : result.uniforms)
+            artifact.uniforms.push_back({uniform.name, uniform.path, uniform.type});
+        m_diskCache->store(persistentKey,artifact);
+        std::lock_guard lock(templateMutex);
+        size_t bytes=key.size()+result.mdl_source.size()+sizeof(ColorTemplate);
+        for (const auto& span : entry.spans) bytes += sizeof(span) + span.first.size();
+        // Entries are copied before use; evict only the least recently used
+        // source strings, without invalidating a worker's template or SDK code.
+        constexpr size_t limit=64*1024*1024;
+        if (bytes <= limit) {
+            while (templateBytes > limit-bytes && !colorTemplates.empty()) {
+                const auto oldest=std::min_element(colorTemplates.begin(),colorTemplates.end(),
+                    [](const auto& a,const auto& b) { return a.second.lastUse < b.second.lastUse; });
+                templateBytes -= oldest->second.bytes;
+                colorTemplates.erase(oldest);
+            }
+            entry.bytes=bytes;
+            entry.lastUse=++templateClock;
+            colorTemplates.emplace(key,std::move(entry));
+            templateBytes+=bytes;
+        }
+    }
+    return result;
+}
 
 GeneratedMDL generate(MaterialX::DocumentPtr doc, const std::string& material_name) {
     GeneratedMDL result;
@@ -173,10 +425,15 @@ GeneratedMDL generate(MaterialX::DocumentPtr doc, const std::string& material_na
     void extract_textures(MaterialX::ShaderPtr shader, GeneratedMDL& result) {
         const MaterialX::ShaderStage& pixelStage = shader->getStage(MaterialX::Stage::PIXEL);
 
-        for (const auto& [blockName, block] : pixelStage.getUniformBlocks()) {
+        auto capture = [&](const auto& blocks) {
+        for (const auto& [blockName, block] : blocks) {
             for (size_t i = 0; i < block->size(); ++i) {
                 const MaterialX::ShaderPort* variable = (*block)[i];
                 if (!variable) continue;
+
+                result.uniforms.push_back({variable->getVariable(),
+                    variable->getPath(), variable->getType().getName(),
+                    variable->getValue()});
 
                 if (variable->getType().getName() == "filename") {
                     auto value = variable->getValue();
@@ -185,7 +442,12 @@ GeneratedMDL generate(MaterialX::DocumentPtr doc, const std::string& material_na
                     }
                 }
             }
-        }
+        }};
+        // MdlShaderGenerator publishes material parameters in its input block;
+        // hardware generators generally use uniform blocks. Capture both and
+        // let template publication reject duplicate/ambiguous paths.
+        capture(pixelStage.getInputBlocks());
+        capture(pixelStage.getUniformBlocks());
     }
 
     // The GenContext is shared state, so a shared generator must not run
@@ -196,6 +458,9 @@ private:
     MaterialX::ShaderGeneratorPtr m_generator;
     MaterialX::GenContext         m_context;
     MaterialX::DocumentPtr        m_stdlib;
+    std::string m_libraryDigest;
+    std::string m_optionsIdentity;
+    std::unique_ptr<prism::materialx::GeneratedTemplateDiskCache> m_diskCache;
 };
 
 MDLGenerator::MDLGenerator(const std::string& mx_libraries_path)
@@ -231,7 +496,7 @@ std::shared_ptr<MDLGenerator> MDLGenerator::workerLocal(
 GeneratedMDL MDLGenerator::generate(MaterialX::DocumentPtr doc,
                                     const std::string& material_name) {
     std::lock_guard<std::mutex> lock(m_impl->generate_mutex);
-    return m_impl->generate(doc, material_name);
+    return m_impl->generateCached(doc, material_name);
 }
 
 GeneratedMDL MDLGenerator::generate(MaterialX::OutputPtr output) {

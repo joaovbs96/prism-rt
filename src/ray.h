@@ -8,10 +8,43 @@
 #include "float3.h"
 #include "float2.h"
 #include "rng.h"
+#include "texture_service.h"
+
+namespace prism {
+
+struct RayFootprint {
+    Float3 dOdx{0.0f}, dOdy{0.0f};
+    Float3 dDdx{0.0f}, dDdy{0.0f};
+    float width = 0.0f;
+    float spread = 0.0f;
+    bool exact = false;
+};
+
+struct TextureFootprint {
+    float dudx = 0.0f, dvdx = 0.0f;
+    float dudy = 0.0f, dvdy = 0.0f;
+    bool valid = false;
+    bool fallback = false;
+    TextureFiltering filtering = TextureFiltering::Bilinear;
+};
+
+struct DirectionFootprint {
+    float angularRadius = 0.0f;
+    TextureFiltering filtering = TextureFiltering::Bilinear;
+};
+
+struct PathRay {
+    RTCRay ray{};
+    RayFootprint footprint{};
+};
+
+} // namespace prism
 
 class RayHit {
     public:
-        RayHit(RTCRayHit e_rayhit, RTCGeometry* geom = nullptr, RTCGeometryType type = RTC_GEOMETRY_TYPE_TRIANGLE) {
+        RayHit(RTCRayHit e_rayhit, RTCGeometry* geom = nullptr,
+               RTCGeometryType type = RTC_GEOMETRY_TYPE_TRIANGLE,
+               Float3 const* localAnalyticNormal = nullptr) {
             o = Float3(e_rayhit.ray.org_x, e_rayhit.ray.org_y, e_rayhit.ray.org_z);
             d = Float3(e_rayhit.ray.dir_x, e_rayhit.ray.dir_y, e_rayhit.ray.dir_z);
             geomid = e_rayhit.hit.geomID;
@@ -68,7 +101,13 @@ class RayHit {
                     bitangent_sign = m_tangent[3] < 0.0f ? -1.0f : 1.0f;
                 } else if (type == RTC_GEOMETRY_TYPE_SPHERE_POINT) {
                     // Texture coordinates must not change when viewed from inside.
-                    Float3 outward = front_face ? n : -n;
+                    // Instanced analytic geometry reports its normal in the
+                    // prototype's local space.  SceneManager supplies that
+                    // untransformed normal after using the world-space normal
+                    // for front-face classification.
+                    Float3 outward = localAnalyticNormal
+                        ? localAnalyticNormal->normalize()
+                        : (front_face ? n : -n);
                     float theta = std::atan2f(outward.z(), outward.x());
                     float phi = std::acosf(outward.y());
 
@@ -96,6 +135,9 @@ class RayHit {
         float t;
         int geomid, primid, instid;
         int prototypeid = RTC_INVALID_GEOMETRY_ID;
+        prism::RayFootprint ray_footprint;
+        prism::TextureFootprint texture_footprint;
+        Float3 dpdx = Float3(0.0f), dpdy = Float3(0.0f);
 };
 
 inline RTCRay initialize_ray(Float3 o, Float3 d){

@@ -28,6 +28,15 @@ class Environment {
         rh.hit.geomID = RTC_INVALID_GEOMETRY_ID;
         return const_cast<Environment*>(this)->sample(RayHit(rh));
     }
+    virtual Color3 radiance(const Float3& direction, const prism::DirectionFootprint&) const {
+        return radiance(direction);
+    }
+    virtual EnvironmentSample sampleDirection(unsigned int& seed,
+                                               const prism::DirectionFootprint& footprint) const {
+        auto s = sampleDirection(seed);
+        s.radiance = radiance(s.wi, footprint);
+        return s;
+    }
     virtual EnvironmentSample sampleDirection(unsigned int& seed) const {
         const float y = 1.0f - 2.0f * rnd(seed);
         const float phi = 2.0f * PI * rnd(seed);
@@ -80,6 +89,9 @@ class EnvironmentMap : public Environment {
     }
 
     Color3 radiance(const Float3& direction) const override {
+        return EnvironmentMap::radiance(direction, prism::DirectionFootprint{});
+    }
+    Color3 radiance(const Float3& direction, const prism::DirectionFootprint& footprint) const override {
         Float3 d = direction.normalize();
         float lon = std::atan2f(d.z(), d.x());
         if (lon < 0.f) lon += 2.f * PI;
@@ -87,20 +99,33 @@ class EnvironmentMap : public Environment {
         Color3 result;
         if (auto* image = dynamic_cast<ImageTexture<Color3>*>(texture);
             image && image->width > 0 && image->height > 0) {
-            // Texel centers match the importance distribution. Longitude
-            // repeats; latitude clamps at the poles instead of wrapping.
-            const float x = lon / (2.f * PI) * image->width - .5f;
-            const float y = lat / PI * image->height - .5f;
-            const int ix = int(std::floor(x)), iy = int(std::floor(y));
-            const float tx = x-ix, ty = y-iy;
-            auto texel = [&](int px, int py) {
-                px = (px % image->width + image->width) % image->width;
-                py = std::clamp(py, 0, image->height-1);
-                float pixel[3]{}; image->buffer.getpixel(px, py, pixel, 3);
-                return Color3(pixel[0],pixel[1],pixel[2]);
-            };
-            result = multiplier * ((1-ty)*((1-tx)*texel(ix,iy)+tx*texel(ix+1,iy)) +
-                                   ty*((1-tx)*texel(ix,iy+1)+tx*texel(ix+1,iy+1)));
+            prism::TextureLookup lookup{};
+            lookup.s = lon / (2.f * PI); lookup.t = lat / PI;
+            lookup.wrapS = prism::TextureWrap::Periodic;
+            lookup.wrapT = prism::TextureWrap::Clamp;
+            lookup.filtering = footprint.filtering;
+            const float angle = footprint.angularRadius;
+            if (angle > 0 && std::isfinite(angle)) {
+                Float3 tangent = cross(std::fabs(d.y()) < .99f ? Float3(0,1,0) : Float3(1,0,0), d).normalize();
+                Float3 bitangent = cross(d, tangent);
+                const auto derivatives = [&](const Float3& offset, float& ds, float& dt) {
+                    const Float3 q = (d + angle * offset).normalize();
+                    float qlon = std::atan2(q.z(),q.x());
+                    if (qlon < 0) qlon += 2.f * PI;
+                    ds = qlon/(2.f*PI) - lookup.s;
+                    ds -= std::round(ds);
+                    dt = std::atan2(std::hypot(q.x(),q.z()),q.y())/PI - lookup.t;
+                };
+                derivatives(tangent, lookup.dsdx, lookup.dtdx);
+                derivatives(bitangent, lookup.dsdy, lookup.dtdy);
+                if (std::hypot(d.x(),d.z()) < angle) {
+                    lookup.dsdx = .5f;
+                    lookup.dtdx = 0;
+                    lookup.dsdy = 0;
+                    lookup.dtdy = angle / PI;
+                }
+            }
+            result = multiplier * image->lookup(lookup);
         } else {
             result = multiplier * texture->sampleInterp(lon / (2.f * PI),
                 std::min(lat / PI, std::nextafter(1.0f, 0.0f)), Float3(0.f));
@@ -111,7 +136,24 @@ class EnvironmentMap : public Environment {
     }
 
     EnvironmentSample sampleDirection(unsigned int& seed) const override {
-        if (probability.empty()) return Environment::sampleDirection(seed);
+        auto s = sampleLocalDirection(seed);
+        s.radiance = radiance(s.wi);
+        return s;
+    }
+    EnvironmentSample sampleDirection(unsigned int& seed, const prism::DirectionFootprint& footprint) const override {
+        auto s = sampleLocalDirection(seed);
+        s.radiance = radiance(s.wi, footprint);
+        return s;
+    }
+
+    // Sampling remains independent of texture filtering and its memory cache.
+    EnvironmentSample sampleLocalDirection(unsigned int& seed) const {
+        if (probability.empty()) {
+            const float y = 1.0f - 2.0f * rnd(seed);
+            const float phi = 2.0f * PI * rnd(seed);
+            const float r = std::sqrt(std::max(0.0f, 1.0f-y*y));
+            return {Float3(r*std::cos(phi),y,r*std::sin(phi)), Color3(0), 1.0f/(4.0f*PI)};
+        }
         const size_t n = probability.size();
         const double x = (double(rnd(seed)) + double(rnd(seed)) / 16777216.0) * n;
         const size_t column = std::min(static_cast<size_t>(x), n - 1);
@@ -127,7 +169,6 @@ class EnvironmentMap : public Environment {
         const float sinTheta = float(std::sqrt(std::max(0.0, 1.0 - cosTheta * cosTheta)));
         EnvironmentSample s;
         s.wi = Float3(sinTheta * std::cos(phi), float(cosTheta), sinTheta * std::sin(phi));
-        s.radiance = radiance(s.wi);
         s.pdf = texelProbability[index] / texelSolidAngle(py);
         return s;
     }
@@ -148,13 +189,18 @@ class EnvironmentMap : public Environment {
         width = image->width; height = image->height;
         const size_t count = static_cast<size_t>(width) * height;
         std::vector<float> weights(count); double total = 0.0;
-        for (int y = 0; y < height; ++y) for (int x = 0; x < width; ++x) {
-            float pixel[4] = {};
-            image->buffer.getpixel(x, y, pixel);
-            Color3 c = multiplier * Color3(pixel[0], pixel[1], pixel[2]);
-            float lum = std::max(0.0f, 0.2126f*c.x() + 0.7152f*c.y() + 0.0722f*c.z());
-            if (!std::isfinite(lum)) lum = 0.0f;
-            weights[static_cast<size_t>(y)*width+x] = lum * texelSolidAngle(y); total += weights[static_cast<size_t>(y)*width+x];
+        std::vector<float> row(static_cast<size_t>(width) * 3);
+        for (int y = 0; y < height; ++y) {
+            if (!image->readRow(y, row.data(), 3))
+                throw std::runtime_error("Cannot read environment sampling distribution");
+            for (int x = 0; x < width; ++x) {
+                const float* pixel = row.data() + 3*x;
+                Color3 c = multiplier * Color3(pixel[0], pixel[1], pixel[2]);
+                float lum = std::max(0.0f, 0.2126f*c.x() + 0.7152f*c.y() + 0.0722f*c.z());
+                if (!std::isfinite(lum)) lum = 0.0f;
+                weights[static_cast<size_t>(y)*width+x] = lum * texelSolidAngle(y);
+                total += weights[static_cast<size_t>(y)*width+x];
+            }
         }
         if (!(total > 0.0) || !std::isfinite(total)) return;
         texelProbability.resize(count); probability.resize(count); alias.resize(count);
@@ -197,12 +243,32 @@ public:
     Color3 radiance(const Float3& world) const override {
         return EnvironmentMap::radiance(apply(m, world).normalize());
     }
+    Color3 radiance(const Float3& world, const prism::DirectionFootprint& footprint) const override {
+        const Float3 local = apply(m, world).normalize();
+        auto transformed = footprint;
+        if (footprint.angularRadius > 0) {
+            const Float3 d = world.normalize();
+            const Float3 t = cross(std::fabs(d.y()) < .99f ? Float3(0,1,0) : Float3(1,0,0), d).normalize();
+            const Float3 b = cross(d,t);
+            transformed.angularRadius = std::max(
+                (apply(m,d+footprint.angularRadius*t).normalize()-local).length(),
+                (apply(m,d+footprint.angularRadius*b).normalize()-local).length());
+        }
+        return EnvironmentMap::radiance(local, transformed);
+    }
     Color3 sample(const RayHit& hit) override { return radiance(hit.d); }
     EnvironmentSample sampleDirection(unsigned int& seed) const override {
-        EnvironmentSample s = EnvironmentMap::sampleDirection(seed);
+        EnvironmentSample s = sampleLocalDirection(seed);
         const Float3 local = s.wi;
         s.wi = apply(inv, local).normalize();
         s.radiance = radiance(s.wi);
+        s.pdf *= localPerWorldJacobian(s.wi);
+        return s;
+    }
+    EnvironmentSample sampleDirection(unsigned int& seed, const prism::DirectionFootprint& footprint) const override {
+        EnvironmentSample s = sampleLocalDirection(seed);
+        s.wi = apply(inv, s.wi).normalize();
+        s.radiance = radiance(s.wi, footprint);
         s.pdf *= localPerWorldJacobian(s.wi);
         return s;
     }

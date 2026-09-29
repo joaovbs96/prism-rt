@@ -84,26 +84,31 @@ void checkFixtureAovs(UsdImagingGLEngine& engine) {
 int main(int argc, char** argv) {
     try {
         if (argc < 4) {
-            std::cerr << "usage: prism_hydra_render scene.usda /Camera output.exr [width height spp [--exercise] [--environment-sampling mis|bsdf] [--sample-clamp N] [--seed N]]\n";
+            std::cerr << "usage: prism_hydra_render scene.usda /Camera output.exr [width height spp [--exercise] [--environment-sampling mis|bsdf] [--sample-clamp N] [--seed N] [--sphere-batching]]\n";
             return 2;
         }
         const int width = argc > 4 ? std::stoi(argv[4]) : 128;
         const int height = argc > 5 ? std::stoi(argv[5]) : 128;
         const int spp = argc > 6 ? std::stoi(argv[6]) : 64;
         bool exercise = false;
+        bool sphereBatching = false;
         std::string sampling = "mis";
+        std::string filtering = "filtered";
         float sampleClamp = 10.0f;
         int seed = 0;
         for (int i = 7; i < argc; ++i) {
             const std::string option(argv[i]);
             if (option == "--exercise") { exercise = true; continue; }
+            if (option == "--sphere-batching") { sphereBatching = true; continue; }
             if (++i >= argc) throw std::runtime_error("Missing option value: " + option);
             if (option == "--environment-sampling") sampling = argv[i];
+            else if (option == "--texture-filtering") filtering = argv[i];
             else if (option == "--sample-clamp") sampleClamp = std::stof(argv[i]);
             else if (option == "--seed") seed = std::stoi(argv[i]);
             else throw std::runtime_error("Unknown option: " + option);
         }
         if ((sampling != "mis" && sampling != "bsdf") ||
+            (filtering != "filtered" && filtering != "bilinear") ||
             !std::isfinite(sampleClamp) || sampleClamp < 0)
             throw std::runtime_error("Invalid sampling mode or sample clamp");
         if (width <= 0 || height <= 0 || spp <= 0)
@@ -125,7 +130,9 @@ int main(int argc, char** argv) {
         engine.SetRendererSetting(TfToken("prism:rrMinDepth"), VtValue(4));
         engine.SetRendererSetting(TfToken("prism:maxSampleRadiance"), VtValue(sampleClamp));
         engine.SetRendererSetting(TfToken("prism:environmentSampling"), VtValue(TfToken(sampling)));
+        engine.SetRendererSetting(TfToken("prism:textureFiltering"), VtValue(TfToken(filtering)));
         engine.SetRendererSetting(TfToken("prism:seed"), VtValue(seed));
+        engine.SetRendererSetting(TfToken("prism:sphereBatching"), VtValue(sphereBatching));
         engine.SetRendererAovs({HdAovTokens->color, HdAovTokens->depth,
             HdAovTokens->cameraDepth, HdAovTokens->normal, HdAovTokens->Neye,
             HdAovTokens->primId, HdAovTokens->instanceId, HdAovTokens->elementId});

@@ -6,6 +6,7 @@
 #include "mdl/backend_compiler.h"
 #include "materialx/loader.h"
 #include "materialx/mdl_generator.h"
+#include "resource_limits.h"
 
 #include <mi/mdl_sdk.h>
 #include <memory>
@@ -16,6 +17,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <string_view>
+#include <new>
 
 inline bool PrismMdlVerbose()
 {
@@ -27,12 +29,21 @@ inline bool PrismMdlVerbose()
 // it through the full MaterialX -> MDL -> native CPU pipeline, and
 // provides PrismRT's Material interface for path tracing.
 class MDLMaterial : public Material {
+    struct ShadingStateData;
 public:
     struct CompilationTimings {
         double generationSeconds = 0.0;
         double classCompilationSeconds = 0.0;
         double nativeJitSeconds = 0.0;
+        bool persistentGenerationCacheHit = false;
+        uint64_t generationCalls = 0;
+        bool templateCacheHit = false;
     };
+    // Construct a material from an already validated immutable native program
+    // and a freshly bound argument/resource block. The binding retains its
+    // program and runtime, so no generator or SDK transaction is needed here.
+    explicit MDLMaterial(mdl::TargetCode boundTarget)
+        : m_target(std::move(boundTarget)), m_valid(m_target.success) {}
     // Compiles a .mtlx file into a callable MDL material.
     //   mtlx_path:         path to the .mtlx file
     //   mdl_context:       initialized MDL SDK context (from main)
@@ -46,6 +57,8 @@ public:
                 const std::string& material_name = "",
                 CompilationTimings* timings = nullptr)
     {
+        prism::PreparationAdmission::Reservation admission(
+            prism::PreparationAdmission::Shared(), 512ull * 1024ull * 1024ull);
         if (PrismMdlVerbose())
             std::cout << "[MDLMaterial] Compiling: " << mtlx_path << "\n";
 
@@ -94,8 +107,15 @@ public:
         }
 
         GeneratedMDL gen = generator.generate(doc, mat_name);
+        m_generated_uniforms = gen.uniforms;
         if (timings) timings->generationSeconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - generationStart).count();
+        if (timings) timings->persistentGenerationCacheHit =
+            gen.generationPersistentCacheHit;
+        if (timings) {
+            timings->generationCalls = gen.generationCacheHit ? 0 : 1;
+            timings->templateCacheHit = gen.generationCacheHit;
+        }
         if (!gen.success) {
             std::cerr << "[MDLMaterial] ERROR: MDL generation failed: " << gen.error_message << "\n";
             m_valid = false;
@@ -134,7 +154,7 @@ public:
         m_valid = true;
         // NOTE: prints the *resolved* name (material_name may be empty)
         if (PrismMdlVerbose())
-            std::cout << "[MDLMaterial] OK: " << m_target.target_code->get_callable_function_count()
+            std::cout << "[MDLMaterial] OK: " << m_target.program->target_code->get_callable_function_count()
                       << " functions compiled from '" << mat_name << "'\n";
     }
 
@@ -146,12 +166,41 @@ public:
 
     // Accessor for the target code (needed by MaterialXTest scene)
     const mdl::TargetCode& get_target_code() const { return m_target; }
+    const std::vector<GeneratedUniform>& get_generated_uniforms() const {
+        return m_generated_uniforms;
+    }
 
     // ----------------------------------------------------------------
     // PrismRT Material interface
     // ----------------------------------------------------------------
 
     BRDFSample sample(const RayHit ray_hit, unsigned int& seed) override
+    { return sampleWithState(ray_hit,seed,nullptr); }
+
+    bool prepare(const RayHit& hit, PreparedShadingContext& context) const override
+    {
+        static_assert(sizeof(ShadingStateData)<=sizeof(context.storage));
+        static_assert(alignof(PreparedShadingContext)>=alignof(ShadingStateData));
+        auto* ss=new(context.storage) ShadingStateData;
+        build_shading_state(hit,*ss);
+        context.owner=this;
+        context.valid=m_valid && m_target.program->target_code->execute_init(
+            m_target.program->functions.init_function_index,ss->base(),m_target.texture_handler(),
+            m_target.argument_data())==0;
+        return context.valid;
+    }
+
+    BRDFSample samplePrepared(const RayHit hit,unsigned int& seed,
+                              PreparedShadingContext& context) override
+    {
+        auto* ss=context.owner==this&&context.valid
+            ? reinterpret_cast<ShadingStateData*>(context.storage):nullptr;
+        return sampleWithState(hit,seed,ss);
+    }
+
+private:
+    BRDFSample sampleWithState(const RayHit ray_hit, unsigned int& seed,
+                               ShadingStateData* prepared)
     {
         BRDFSample s;
 
@@ -171,16 +220,17 @@ public:
         // ------------------------------------------------------------
         const bool backface = !ray_hit.front_face;
 
-        ShadingStateData ss;
-        build_shading_state(ray_hit, ss);
+        ShadingStateData local;
+        ShadingStateData& ss=prepared?*prepared:local;
+        if(!prepared) build_shading_state(ray_hit, ss);
 
         // NOTE: in single-init mode, execute_init may *modify*
-        // ss.state.normal (this is how MaterialX normal maps are
+        // ss.base().normal (this is how MaterialX normal maps are
         // applied). Everything after this call sees the perturbed
         // shading normal.
-        if (m_target.target_code->execute_init(
-            m_target.functions.init_function_index,
-            ss.state, nullptr, m_target.argument_data()) != 0)
+        if (!prepared && m_target.program->target_code->execute_init(
+            m_target.program->functions.init_function_index,
+            ss.base(), m_target.texture_handler(), m_target.argument_data()) != 0)
             return error_sample();
 
         // Outgoing direction: from the hit point toward the previous
@@ -190,7 +240,7 @@ public:
         mi::Float32_3 wo(-d_normalized.x(), -d_normalized.y(), -d_normalized.z());
 
         // Stochastic coverage: a hole transmits the ray unchanged and emits nothing.
-        const float opacity = get_opacity(ss.state);
+        const float opacity = get_opacity(ss.base());
         if (opacity <= 0.0f || (opacity < 1.0f && rnd(seed) >= opacity)) {
             s.scattered = true;
             s.color = Color3(1.0f);
@@ -217,7 +267,7 @@ public:
         // transmissive material runs Snell's law backwards
         // (1.0 -> ior instead of ior -> 1.0), breaking glass entirely.
         // ------------------------------------------------------------
-        const bool thinWalled = get_thin_walled(ss.state);
+        const bool thinWalled = get_thin_walled(ss.base());
         if (!backface || thinWalled) {
             sd.ior1 = mi::Float32_3(1.0f, 1.0f, 1.0f);
             sd.ior2 = mi::Float32_3(MI_NEURAYLIB_BSDF_USE_MATERIAL_IOR);
@@ -232,20 +282,20 @@ public:
         sd.xi.w = rnd(seed);
 
         const mi::Size bsdf_index = backface && thinWalled
-            ? m_target.functions.backface_bsdf_function_index
-            : m_target.functions.surface_bsdf_function_index;
+            ? m_target.program->functions.backface_bsdf_function_index
+            : m_target.program->functions.surface_bsdf_function_index;
         // An invalid DF index represents a zero BSDF, not an execution error.
         if (bsdf_index != ~mi::Size(0) &&
-            m_target.target_code->execute_bsdf_sample(
+            m_target.program->target_code->execute_bsdf_sample(
                 bsdf_index + mdl::MaterialFunctions::DF_SAMPLE,
-                &sd, ss.state, nullptr, m_target.argument_data()) != 0)
+                &sd, ss.base(), m_target.texture_handler(), m_target.argument_data()) != 0)
             return error_sample();
 
         if (sd.event_type == mi::neuraylib::BSDF_EVENT_ABSORB) {
             s.scattered = false;
             s.color = Color3(0.0f);
             s.wi = Float3(0.0f);
-            s.emission = get_emission(ss.state, wo, backface);
+            s.emission = get_emission(ss.base(), wo, backface);
             return s;
         }
 
@@ -260,22 +310,38 @@ public:
         // tells us whether the ray crossed the interface.
         // bool transmitted = (sd.event_type & mi::neuraylib::BSDF_EVENT_TRANSMISSION) != 0;
 
-        s.emission = get_emission(ss.state, wo, backface);
+        s.emission = get_emission(ss.base(), wo, backface);
         return s;
     }
 
+public:
+
     BRDFEvaluation evaluate(const RayHit& ray_hit, const Float3& wi) override
+    { return evaluateWithState(ray_hit,wi,nullptr); }
+
+    BRDFEvaluation evaluatePrepared(const RayHit& hit,const Float3& wi,
+        PreparedShadingContext& context) override
+    {
+        auto* ss=context.owner==this&&context.valid
+            ? reinterpret_cast<ShadingStateData*>(context.storage):nullptr;
+        return evaluateWithState(hit,wi,ss);
+    }
+
+private:
+    BRDFEvaluation evaluateWithState(const RayHit& ray_hit,const Float3& wi,
+                                     ShadingStateData* prepared)
     {
         BRDFEvaluation result;
         if (!m_valid) return result;
         const bool backface = !ray_hit.front_face;
-        ShadingStateData ss; build_shading_state(ray_hit, ss);
-        if (m_target.target_code->execute_init(m_target.functions.init_function_index,
-            ss.state, nullptr, m_target.argument_data()) != 0) return result;
-        const bool thinWalled = get_thin_walled(ss.state);
+        ShadingStateData local; ShadingStateData& ss=prepared?*prepared:local;
+        if(!prepared) build_shading_state(ray_hit,ss);
+        if (!prepared && m_target.program->target_code->execute_init(m_target.program->functions.init_function_index,
+            ss.base(), m_target.texture_handler(), m_target.argument_data()) != 0) return result;
+        const bool thinWalled = get_thin_walled(ss.base());
         const mi::Size index = backface && thinWalled
-            ? m_target.functions.backface_bsdf_function_index
-            : m_target.functions.surface_bsdf_function_index;
+            ? m_target.program->functions.backface_bsdf_function_index
+            : m_target.program->functions.surface_bsdf_function_index;
         if (index == ~mi::Size(0)) return result;
         mi::neuraylib::Bsdf_evaluate_data<mi::neuraylib::DF_HSM_NONE> ed;
         memset(&ed, 0, sizeof(ed));
@@ -287,8 +353,8 @@ public:
         } else {
             ed.ior1 = mi::Float32_3(MI_NEURAYLIB_BSDF_USE_MATERIAL_IOR); ed.ior2 = mi::Float32_3(1.0f);
         }
-        if (m_target.target_code->execute_bsdf_evaluate(index + mdl::MaterialFunctions::DF_EVALUATE,
-            &ed, ss.state, nullptr, m_target.argument_data()) != 0) return result;
+        if (m_target.program->target_code->execute_bsdf_evaluate(index + mdl::MaterialFunctions::DF_EVALUATE,
+            &ed, ss.base(), m_target.texture_handler(), m_target.argument_data()) != 0) return result;
         result.value = Color3(ed.bsdf_diffuse.x + ed.bsdf_glossy.x,
                               ed.bsdf_diffuse.y + ed.bsdf_glossy.y,
                               ed.bsdf_diffuse.z + ed.bsdf_glossy.z);
@@ -296,14 +362,21 @@ public:
         result.valid = result.pdf >= 0.0f && std::isfinite(result.pdf);
         return result;
     }
+public:
     bool supportsNee(const RayHit&) const override { return m_valid; }
 
     float cutoutOpacity(const RayHit& ray_hit) override {
         if (!m_valid) return 1.0f;
+        if (m_target.binding->constant_cutout_opacity)
+            return *m_target.binding->constant_cutout_opacity;
         ShadingStateData ss; build_shading_state(ray_hit, ss);
-        if (m_target.target_code->execute_init(m_target.functions.init_function_index,
-            ss.state, nullptr, m_target.argument_data()) != 0) return 1.0f;
-        return get_opacity(ss.state);
+        if (m_target.program->target_code->execute_init(m_target.program->functions.init_function_index,
+            ss.base(), m_target.texture_handler(), m_target.argument_data()) != 0) return 1.0f;
+        return get_opacity(ss.base());
+    }
+    bool provenOpaque() const override {
+        return m_target.binding->constant_cutout_opacity &&
+            *m_target.binding->constant_cutout_opacity >= 1.0f;
     }
 
     // Required stubs (issue 7 — needed for NEE, not in scope here)
@@ -324,9 +397,9 @@ public:
         ShadingStateData ss;
         build_shading_state(ray_hit, ss);
 
-        if (m_target.target_code->execute_init(
-            m_target.functions.init_function_index,
-            ss.state, nullptr, m_target.argument_data()) != 0)
+        if (m_target.program->target_code->execute_init(
+            m_target.program->functions.init_function_index,
+            ss.base(), m_target.texture_handler(), m_target.argument_data()) != 0)
             return Color3(1.0f, 0.0f, 1.0f);
 
         // FIX 2: evaluate the EDF toward the actual observer direction
@@ -334,15 +407,15 @@ public:
         mi::Float32_3 wo(-d_normalized.x(), -d_normalized.y(), -d_normalized.z());
 
         // Deterministic evaluation returns expected emission over surface coverage.
-        return get_opacity(ss.state) * get_emission(ss.state, wo, backface);
+        return get_opacity(ss.base()) * get_emission(ss.base(), wo, backface);
     }
 
 private:
     bool get_thin_walled(mi::neuraylib::Shading_state_material& state) const {
         bool value = false;
-        const auto index = m_target.functions.thin_walled_function_index;
+        const auto index = m_target.program->functions.thin_walled_function_index;
         if (index == ~mi::Size(0)) return false;
-        return m_target.target_code->execute(index, state, nullptr,
+        return m_target.program->target_code->execute(index, state, m_target.texture_handler(),
             m_target.argument_data(), &value) == 0 && value;
     }
     static BRDFSample error_sample() {
@@ -355,23 +428,29 @@ private:
     }
 
     float get_opacity(mi::neuraylib::Shading_state_material& state) const {
+        if (m_target.binding->constant_cutout_opacity)
+            return *m_target.binding->constant_cutout_opacity;
         mi::Float32 opacity = 1.0f;
-        const mi::Sint32 result = m_target.target_code->execute(
-            m_target.functions.cutout_opacity_function_index,
-            state, nullptr, m_target.argument_data(), &opacity);
+        const mi::Sint32 result = m_target.program->target_code->execute(
+            m_target.program->functions.cutout_opacity_function_index,
+            state, m_target.texture_handler(), m_target.argument_data(), &opacity);
         // Preserve an opaque surface if evaluation fails instead of losing geometry.
         return result == 0 && std::isfinite(opacity)
             ? std::clamp(opacity, 0.0f, 1.0f) : 1.0f;
     }
 
     struct ShadingStateData {
-        mi::neuraylib::Shading_state_material state;
-        mi::Float32_3 tex_coord;
+        mi::neuraylib::Shading_state_material_with_derivs state;
+        mi::neuraylib::tct_deriv_float3 tex_coord;
         mi::Float32_3 tangent_u;
         mi::Float32_3 tangent_v;
         mi::neuraylib::tct_float4 identity[4];
-        mi::neuraylib::tct_float4 text_results[128];
+        alignas(16) mi::neuraylib::tct_float4 text_results[128];
+        mi::neuraylib::Shading_state_material &base() {
+            return reinterpret_cast<mi::neuraylib::Shading_state_material &>(state);
+        }
     };
+    static_assert(alignof(ShadingStateData) >= 16);
 
     // Build the MDL shading state.
     //
@@ -393,7 +472,15 @@ private:
         memset(&ss, 0, sizeof(ss));
 
         // UV
-        ss.tex_coord = mi::Float32_3(hit.u, hit.v, 0.0f);
+        ss.tex_coord.val = mi::Float32_3(hit.u, hit.v, 0.0f);
+        const bool filtered = hit.texture_footprint.filtering ==
+            prism::TextureFiltering::Filtered;
+        ss.tex_coord.dx = filtered ? mi::Float32_3(
+            hit.texture_footprint.dudx, hit.texture_footprint.dvdx, 0.0f)
+            : mi::Float32_3(0.0f);
+        ss.tex_coord.dy = filtered ? mi::Float32_3(
+            hit.texture_footprint.dudy, hit.texture_footprint.dvdy, 0.0f)
+            : mi::Float32_3(0.0f);
 
         // Ray-facing normals straight from the hit. n_g is populated by
         // RayHit before shading-normal interpolation; the is_zero()
@@ -447,7 +534,9 @@ private:
         ss.identity[3] = { 0.0f, 0.0f, 0.0f, 1.0f };
 
         // MDL state
-        ss.state.position    = mi::Float32_3(hit.p.x(), hit.p.y(), hit.p.z());
+        ss.state.position.val = mi::Float32_3(hit.p.x(), hit.p.y(), hit.p.z());
+        ss.state.position.dx = mi::Float32_3(hit.dpdx.x(),hit.dpdx.y(),hit.dpdx.z());
+        ss.state.position.dy = mi::Float32_3(hit.dpdy.x(),hit.dpdy.y(),hit.dpdy.z());
         ss.state.normal      = mi::Float32_3(n.x(), n.y(), n.z());
         ss.state.geom_normal = mi::Float32_3(n_g.x(), n_g.y(), n_g.z());
         ss.state.tangent_u       = &ss.tangent_u;
@@ -455,7 +544,7 @@ private:
         ss.state.text_coords     = &ss.tex_coord;
         ss.state.animation_time  = 0.0f;
         ss.state.text_results    = ss.text_results;
-        ss.state.ro_data_segment = m_target.ro_data_segment;
+        ss.state.ro_data_segment = m_target.program->ro_data_segment;
         ss.state.world_to_object = ss.identity;
         ss.state.object_to_world = ss.identity;
         ss.state.object_id       = 0;
@@ -481,11 +570,11 @@ private:
 
         mi::Float32_3 ei(0.0f, 0.0f, 0.0f);
         const mi::Size intensity_index = backface
-            ? m_target.functions.backface_emission_intensity_function_index
-            : m_target.functions.surface_emission_intensity_function_index;
-        if (m_target.target_code->execute(
+            ? m_target.program->functions.backface_emission_intensity_function_index
+            : m_target.program->functions.surface_emission_intensity_function_index;
+        if (m_target.program->target_code->execute(
             intensity_index,
-            state, nullptr, m_target.argument_data(), &ei) != 0)
+            state, m_target.texture_handler(), m_target.argument_data(), &ei) != 0)
             return Color3(1.0f, 0.0f, 1.0f);
 
         if (ei.x <= 0.0f && ei.y <= 0.0f && ei.z <= 0.0f)
@@ -496,12 +585,12 @@ private:
         ed.k1 = wo;
 
         const mi::Size edf_index = backface
-            ? m_target.functions.backface_edf_function_index
-            : m_target.functions.surface_edf_function_index;
+            ? m_target.program->functions.backface_edf_function_index
+            : m_target.program->functions.surface_edf_function_index;
         if (edf_index == ~mi::Size(0)) return Color3(0.0f);
-        if (m_target.target_code->execute_edf_evaluate(
+        if (m_target.program->target_code->execute_edf_evaluate(
             edf_index + mdl::MaterialFunctions::DF_EVALUATE,
-            &ed, state, nullptr, m_target.argument_data()) != 0)
+            &ed, state, m_target.texture_handler(), m_target.argument_data()) != 0)
             return Color3(1.0f, 0.0f, 1.0f);
 
         return Color3(ei.x * ed.edf.x, ei.y * ed.edf.y, ei.z * ed.edf.z);
@@ -511,5 +600,6 @@ private:
     std::unique_ptr<mdl::MaterialCompiler> m_compiler;
     mdl::CompiledMaterial m_compiled;
     mdl::TargetCode m_target;
+    std::vector<GeneratedUniform> m_generated_uniforms;
     bool m_valid = false;
 };

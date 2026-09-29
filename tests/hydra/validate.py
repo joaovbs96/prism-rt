@@ -11,20 +11,29 @@ def main():
     parser.add_argument("--build", type=Path, default=Path("build"))
     parser.add_argument("--config", default="RelWithDebInfo")
     parser.add_argument("--spp", type=int, default=256)
+    parser.add_argument("--texture-filtering", choices=["filtered", "bilinear"], default="filtered")
+    parser.add_argument("--standalone", type=Path,
+                        help="override the standalone executable (for installed-app validation)")
+    parser.add_argument("--hydra", type=Path,
+                        help="override the Hydra render helper (for installed-plugin validation)")
+    parser.add_argument("--compare", type=Path,
+                        help="override the image comparison helper")
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[2]
     build = args.build.resolve()
-    out = build / "hydra-validation"
+    out = build / ("hydra-validation-" + args.texture_filtering)
     out.mkdir(parents=True, exist_ok=True)
     fixture = root / "tests/hydra/fixtures/parity.usda"
     preview = fixture.with_name("preview_parity.usda")
     preview_mtlx = fixture.with_name("preview_mtlx_parity.usda")
-    standalone = build / args.config / "PrismRT.exe"
-    hydra = build / "hydra/plugin/prism_hydra_render.exe"
-    compare = build / "hydra/plugin/prism_compare_images.exe"
+    standalone = args.standalone.resolve() if args.standalone else build / args.config / "PrismRT.exe"
+    hydra = args.hydra.resolve() if args.hydra else build / "hydra/plugin/prism_hydra_render.exe"
+    compare = args.compare.resolve() if args.compare else build / "hydra/plugin/prism_compare_images.exe"
     results = []
 
     def run(name, command):
+        if command[0] in (standalone, hydra):
+            command = [*command, "--texture-filtering", args.texture_filtering]
         start = time.monotonic()
         with (out / (name + ".log")).open("w", encoding="utf-8") as log:
             proc = subprocess.run([str(x) for x in command], cwd=root, stdout=log,

@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <functional>
 
 #include <pxr/pxr.h>
 #include <pxr/usd/sdf/path.h>
@@ -29,11 +30,26 @@ public:
         pxr::SdfPath path;
     };
     struct MaterialStats {
+        uint64_t cacheAccountedBytes = 0; // Known code, argument and XML bytes; SDK overhead excluded.
+        uint64_t unusedCacheBytes = 0;
+        uint64_t cacheEvictions = 0;
+        uint64_t preparationPeakReservedBytes = 0;
         uint64_t requests = 0;
         uint64_t pathCacheHits = 0;
         uint64_t contentCacheHits = 0;
+        uint64_t earlyCacheHits = 0;
+        uint64_t conversionCalls = 0;
+        uint64_t generationCalls = 0;
+        uint64_t templateCacheHits = 0;
         uint64_t compilations = 0;
         uint64_t nativeJits = 0;
+        uint64_t sdkTranslationCalls = 0;
+        uint64_t programCacheHits = 0;
+        uint64_t bindingCreations = 0;
+        uint64_t fallbackTranslations = 0;
+        uint64_t persistentGenerationCacheHits = 0;
+        uint64_t sdkTextureFallbacks = 0;
+        uint64_t customTextureTargets = 0;
         uint64_t jobs = 0;
         uint64_t failures = 0;
         uint64_t textureBytes = 0;
@@ -42,13 +58,15 @@ public:
         double generationSeconds = 0.0;
         double classCompilationSeconds = 0.0;
         double nativeJitSeconds = 0.0;
+        double programWaitSeconds = 0.0;
         double resourceReadSeconds = 0.0;
         double batchWallSeconds = 0.0;
         double workerCpuSeconds = 0.0;
     };
     MaterialService(mdl::Context* context,
                     std::string materialXLibrariesPath = {},
-                    std::string materialXMdlPath = {});
+                    std::string materialXMdlPath = {},
+                    uint64_t associationScope = 0);
     ~MaterialService();
 
     MaterialService(const MaterialService&) = delete;
@@ -58,16 +76,36 @@ public:
     // returned by HdSceneIndexBase::GetPrim(materialPath).dataSource.
     // Returns nullptr when no supported network or MDL context is available.
     // Records are cached by path until Invalidate/InvalidateAll. Callers must
-    // forward material dirty notices and explicitly invalidate texture reloads;
-    // data-source pointer identity is not a reliable change notification.
+    // forward material dirty notices. InvalidateAll is the explicit reload
+    // boundary for resolver-backed resources; ordinary filesystem textures are
+    // guarded by size and modification time across service recreation.
+    // Data-source pointer identity is not a reliable change notification.
     std::shared_ptr<Material> Resolve(
         const pxr::HdContainerDataSourceHandle& materialPrimDataSource,
         const pxr::SdfPath& materialPath);
 
     // Captures a batch on the calling Hydra sync thread, then resolves it with
     // a bounded worker pool. Do not call this from multiple sync threads.
-    void Prefetch(const std::vector<Request>& requests);
+    void Prefetch(const std::vector<Request>& requests,
+                  const std::function<bool()>& cancelled = {});
+    // Partitions process-wide records by the caller's resource generation.
+    void SetResourceRevision(uint64_t revision);
+    // These also invalidate matching process-wide conversion records.
     void Invalidate(const pxr::SdfPath& path, bool subtree = false);
+    // Drops only path-to-result shortcuts. Immutable exact graph/content
+    // records remain eligible when a recapture proves that they still match.
+    // An empty path drops every association owned by this service.
+    void InvalidateAssociations(const pxr::SdfPath& path,
+                                bool subtree = false);
+    // Marks matching material paths dirty and removes their process-wide
+    // early associations. Canonical content/program caches remain immutable.
+    void InvalidateResources(const pxr::SdfPath& path,
+                             bool subtree = false);
+    // Explicitly reload a resolved filesystem resource, including edits that
+    // preserve size/mtime. Call on the synchronization thread. The returned
+    // dependent paths must be scheduled for snapshot replacement by the caller.
+    // Existing bindings remain valid; compatible programs are retained.
+    std::vector<pxr::SdfPath> ReloadResource(const std::string& resolvedPath);
     void InvalidateAll();
     MaterialStats GetStats() const;
 

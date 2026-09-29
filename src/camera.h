@@ -24,6 +24,8 @@ class Camera {
             const float focus_dist_
         )
         {
+            description = {position_, target_, up_, image_width, image_height,
+                aspect_ratio_, vfov_, defocus_angle_, focus_dist_};
             defocus_angle = defocus_angle_;
             camera_center = position_;
 
@@ -66,17 +68,39 @@ class Camera {
             return camera_center + (p[0] * defocus_disk_u) + (p[1] * defocus_disk_v);
         }
 
-        RTCRay get_ray(float s, float t, unsigned int &seed) {
+        prism::PathRay get_path_ray(float s, float t, unsigned int &seed) {
             // Construct a camera ray originating from the defocus disk and directed at a randomly
             // sampled point around the pixel location s, t.
             Float3 pixel_offset = sample_square(seed);
             Float3 pixel_center = pixel00_loc + ((s + pixel_offset.x()) * pixel_delta_u) + ((t + pixel_offset.y()) * pixel_delta_v);
             Float3 ray_origin = (defocus_angle <= 0) ? camera_center : sample_disk(seed);
             Float3 ray_direction = pixel_center - ray_origin;
-            return initialize_ray(ray_origin, ray_direction);
+            prism::PathRay result;
+            result.ray=initialize_ray(ray_origin,ray_direction);
+            const Float3 mainDirection=ray_direction.normalize();
+            const Float3 dx=(ray_direction+pixel_delta_u).normalize()-mainDirection;
+            const Float3 dy=(ray_direction+pixel_delta_v).normalize()-mainDirection;
+            result.footprint.dDdx=pixel_delta_u;
+            result.footprint.dDdy=pixel_delta_v;
+            result.footprint.spread=std::max(dx.length(),dy.length());
+            result.footprint.exact=true;
+            return result;
         }
 
+        RTCRay get_ray(float s, float t, unsigned int &seed) {
+            return get_path_ray(s,t,seed).ray;
+        }
+
+        struct Description {
+            Float3 position, target, up;
+            int width = 1280, height = 720;
+            float aspect = 16.0f / 9.0f, verticalFov = 40.0f;
+            float defocusAngle = 0.0f, focusDistance = 10.0f;
+        };
+        const Description& getDescription() const { return description; }
+
     private:
+        Description description;
         Float3 camera_center;
         Float3 pixel00_loc;
         Float3 pixel_delta_u, pixel_delta_v;

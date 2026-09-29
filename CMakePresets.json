@@ -1,10 +1,6 @@
 {
   "version": 3,
-  "cmakeMinimumRequired": {
-    "major": 3,
-    "minor": 21,
-    "patch": 0
-  },
+  "cmakeMinimumRequired": { "major": 3, "minor": 21, "patch": 0 },
   "configurePresets": [
     {
       "name": "prism-base",
@@ -13,7 +9,8 @@
       "architecture": "x64",
       "binaryDir": "${sourceDir}/build",
       "cacheVariables": {
-        "VCPKG_MANIFEST_INSTALL": "OFF"
+        "VCPKG_MANIFEST_INSTALL": "OFF",
+        "CMAKE_INSTALL_PREFIX": "${sourceDir}/install"
       }
     },
     {
@@ -33,6 +30,12 @@
         "PRISM_BUILD_HYDRA": "ON",
         "PRISM_COPY_ASSETS": "OFF"
       }
+    },
+    {
+      "name": "prism-hydra-fresh",
+      "displayName": "PrismRT Hydra clean validation",
+      "inherits": "prism-hydra",
+      "binaryDir": "${sourceDir}/build-fresh-validation"
     }
   ],
   "buildPresets": [
@@ -48,6 +51,12 @@
       "configurePreset": "prism-hydra",
       "configuration": "RelWithDebInfo",
       "jobs": 8
+    },
+    {
+      "name": "prism-hydra-fresh",
+      "configurePreset": "prism-hydra-fresh",
+      "configuration": "RelWithDebInfo",
+      "jobs": 8
     }
   ],
   "testPresets": [
@@ -57,11 +66,11 @@
       "configuration": "RelWithDebInfo",
       "environment": {
         "PXR_PLUGINPATH_NAME": "${sourceDir}/build/hydra/resources",
-        "PXR_USD_WINDOWS_DLL_PATH": "${sourceDir}/build/hydra/plugin;${sourceDir}/build/vcpkg_installed/x64-windows/bin;C:/Users/joaov/Desktop/Programming_Projects/external_deps/OpenUSD/install/bin;C:/Users/joaov/Desktop/Programming_Projects/external_deps/OpenUSD/install/lib;C:/Users/joaov/Desktop/Programming_Projects/external_deps/MaterialX/install/lib;C:/Users/joaov/Desktop/Programming_Projects/include/tbb/redist/intel64/vc14;C:/Users/joaov/Desktop/Programming_Projects/include/Embree/bin;C:/Users/joaov/Desktop/Programming_Projects/mdl-sdk/bin;C:/Users/joaov/Desktop/Programming_Projects/mdl-sdk/nt-x86-64/lib",
-        "PATH": "${sourceDir}/build/hydra/plugin;${sourceDir}/build/vcpkg_installed/x64-windows/bin;C:/Users/joaov/Desktop/Programming_Projects/external_deps/OpenUSD/install/bin;C:/Users/joaov/Desktop/Programming_Projects/external_deps/OpenUSD/install/lib;C:/Users/joaov/Desktop/Programming_Projects/external_deps/MaterialX/install/lib;C:/Users/joaov/Desktop/Programming_Projects/include/tbb/redist/intel64/vc14;C:/Users/joaov/Desktop/Programming_Projects/include/Embree/bin;C:/Users/joaov/Desktop/Programming_Projects/mdl-sdk/bin;C:/Users/joaov/Desktop/Programming_Projects/mdl-sdk/nt-x86-64/lib;$penv{PATH}",
-        "PRISM_MATERIALX_LIBRARY_PATH": "C:/Users/joaov/Desktop/Programming_Projects/external_deps/MaterialX/install/libraries",
-        "PRISM_MATERIALX_MDL": "C:/Users/joaov/Desktop/Programming_Projects/external_deps/MaterialX/install/libraries/mdl",
-        "MDL_SDK_ROOT": "C:/Users/joaov/Desktop/Programming_Projects/mdl-sdk"
+        "PXR_USD_WINDOWS_DLL_PATH": "$penv{PXR_USD_WINDOWS_DLL_PATH}",
+        "PATH": "${sourceDir}/build/hydra/plugin;$penv{PATH}",
+        "PRISM_MATERIALX_LIBRARY_PATH": "$penv{PRISM_MATERIALX_LIBRARY_PATH}",
+        "PRISM_MATERIALX_MDL": "$penv{PRISM_MATERIALX_MDL}",
+        "MDL_SDK_ROOT": "$penv{PRISM_MDL_SDK_ROOT}"
       },
       "output": { "outputOnFailure": true }
     }

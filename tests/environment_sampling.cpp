@@ -75,6 +75,28 @@ int main() {
                 "transformed PDF is not normalized");
         TransformedEnvironmentMap rotated(&brightTexture, Color3(1),
             {0,0,1, 0,1,0, -1,0,0});
+        // Filtering changes radiance, not sampled directions, PDFs or RNG.
+        // Both MIS techniques must evaluate an identical outgoing footprint.
+        for (Environment* environment : std::vector<Environment*>{&brightMap, &transformed, &rotated}) {
+            for (float radius : {0.0f, 0.001f, 0.15f}) {
+                const prism::DirectionFootprint footprint{radius, prism::TextureFiltering::Filtered};
+                unsigned referenceSeed=1928, filteredSeed=referenceSeed;
+                for (int i=0;i<1024;++i) {
+                    const auto reference=environment->sampleDirection(referenceSeed);
+                    const auto filtered=environment->sampleDirection(filteredSeed,footprint);
+                    require(referenceSeed==filteredSeed && (reference.wi-filtered.wi).is_zero() && reference.pdf==filtered.pdf,
+                            "Filtering changed environment sampling distribution or RNG");
+                    const auto queried=environment->radiance(filtered.wi,footprint);
+                    require((queried-filtered.radiance).is_zero(),
+                            "NEE and BSDF techniques filter the same environment direction differently");
+                }
+                for (auto direction : {Float3(0,1,0),Float3(0,-1,0),Float3(1,0,0)}) {
+                    const auto value=environment->radiance(direction,footprint);
+                    require(std::isfinite(value.x()) && std::isfinite(value.y()) && std::isfinite(value.z()),
+                            "Environment footprint produced non-finite pole or seam radiance");
+                }
+            }
+        }
         for (int i=0;i<10000;++i) {
             const auto s=rotated.sampleDirection(seed);
             require(std::fabs(s.pdf-rotated.directionPdf(s.wi))<2e-5f,

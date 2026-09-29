@@ -4,6 +4,7 @@
 // STD Lib deps
 #include <iostream>
 #include <filesystem>
+#include <cmath>
 
 // External Deps
 #include <embree4/rtcore.h>
@@ -23,6 +24,10 @@ class Geometry {
         virtual unsigned int setupEmbree(RTCDevice &device, RTCScene &scene) = 0;
 
         virtual Material* getMaterial(unsigned int primid, unsigned int instid) = 0;
+
+        virtual bool analyticSphere(unsigned int, Float3 *, float *) const {
+            return false;
+        }
 
         // Apply the current transform matrix to all vertices
         virtual void applyTransform() {
@@ -104,7 +109,7 @@ class Geometry {
 
         int vertex_count;
         RTCGeometryType type;
-        RTCGeometry geom;
+        RTCGeometry geom = nullptr;
         unsigned int geomid;
         TransformMatrix* transform = new TransformMatrix();
         AABB bounding_box;
@@ -286,6 +291,14 @@ class Sphere : public Geometry {
 
         Material* getMaterial(unsigned int primid, unsigned int instid) override {
             return material;
+        }
+
+        bool analyticSphere(unsigned int primid, Float3 *center,
+                            float *radius) const override {
+            if (primid != 0 || !(r > 0.0f) || !std::isfinite(r)) return false;
+            if (center) *center = pos;
+            if (radius) *radius = r;
+            return true;
         }
 
         void updateAABB() override {

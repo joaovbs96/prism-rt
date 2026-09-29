@@ -9,6 +9,7 @@
 #include <array>
 #include <mutex>
 #include <string_view>
+#include "../resource_limits.h"
 
 namespace mdl {
 
@@ -567,19 +568,19 @@ CompiledMaterial MaterialCompiler::compile(const GeneratedMDL& generated_mdl,
         return result;
     }
 
-    // Dump the final MDL source next to the .mtlx file for inspection
-    {
+    // Optional diagnostics belong in the renderer cache, never beside source
+    // assets where compilation would mutate a project checkout.
+    if (verbose_mdl()) {
         std::string dump_name = module_name;
         if (dump_name.size() >= 2 && dump_name[0] == ':' && dump_name[1] == ':')
             dump_name = dump_name.substr(2);
         std::replace(dump_name.begin(), dump_name.end(), ':', '_');
         dump_name += ".mdl";
 
-        std::filesystem::path dump_path;
-        if (!mtlx_path.empty())
-            dump_path = std::filesystem::path(mtlx_path).parent_path() / dump_name;
-        else
-            dump_path = std::filesystem::current_path() / dump_name;
+        const std::filesystem::path dump_path =
+            prism::PersistentCacheRoot() / "generated-mdl" / "debug" / dump_name;
+        std::error_code directoryError;
+        std::filesystem::create_directories(dump_path.parent_path(),directoryError);
 
         std::ofstream f(dump_path);
         if (f) {
@@ -701,7 +702,10 @@ CompiledMaterial MaterialCompiler::compile(const GeneratedMDL& generated_mdl,
     result.transaction = transaction;
 
     result.success = true;
-    result.allowTargetCodeReuse = generated_mdl.texture_paths.empty();
+    // Target code is keyed by the compiled class program. Resource-valued
+    // arguments are rebound into an immutable per-argument-block runtime by
+    // BackendCompiler, so textured instances can safely share native code.
+    result.allowTargetCodeReuse = true;
     return result;
 }
 

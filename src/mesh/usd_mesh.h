@@ -2,12 +2,23 @@
 
 // STD Lib deps
 #include <iostream>
+#include <fstream>
+#include <atomic>
+#include <OpenImageIO/hash.h>
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 #include <filesystem>
 #include <map>
+#include <set>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <optional>
 #include <vector>
+#include <mutex>
 
 // Open USD Deps
 #include <pxr/pxr.h>
@@ -15,6 +26,8 @@
 #include <pxr/usd/usd/prim.h>
 #include <pxr/usd/usd/primRange.h>
 #include <pxr/usd/usdGeom/mesh.h>
+#include <pxr/usd/usdGeom/sphere.h>
+#include <pxr/imaging/pxOsd/meshTopology.h>
 #include <pxr/usd/usdGeom/primvarsAPI.h>
 #include <pxr/usd/usdGeom/xformCache.h>
 #include <pxr/usd/usdGeom/pointInstancer.h>
@@ -25,6 +38,8 @@
 #include <pxr/usd/sdf/path.h>
 #include <pxr/usd/sdf/reference.h>
 #include <pxr/usd/sdf/layer.h>
+#include <pxr/usd/ar/resolverContext.h>
+#include <pxr/usd/ar/resolverContextBinder.h>
 #include <pxr/base/gf/matrix4d.h>
 #include <pxr/base/gf/matrix4f.h>
 #include <pxr/base/gf/vec3f.h>
@@ -49,19 +64,27 @@
 #include <MaterialXCore/Document.h>
 #include <MaterialXFormat/XmlIo.h>
 #include <MaterialXFormat/Util.h>
+#include "../materialx/captured_material.h"
 
 PXR_NAMESPACE_USING_DIRECTIVE
 namespace mx = MaterialX;
 
 // internal deps
-#include "geometry.h"
-#include "mdl_material.h"
+#include "../geometry.h"
+#include "../mdl_material.h"
+#include "../materialx/usd_network.h"
+#include "../materialx/prepared_template.h"
 
 // ============================================================================
 // MaterialX material recovery from USD stages
 // ============================================================================
 
 /// Describes how a MaterialX material was found in the USD stage.
+inline bool UsdMaterialVerbose() {
+    const char* value = std::getenv("PRISM_MDL_VERBOSE");
+    return value && *value && std::string_view(value) != "0";
+}
+
 enum class MtlxSourceKind {
     ReferencedFile,   // A .mtlx file directly referenced into the stage
     UsdShadeEncoded   // MaterialX nodes encoded as a UsdShade network
@@ -74,6 +97,15 @@ struct ResolvedMtlxMaterial {
     std::string         mtlxFilePath;     // non-empty only for ReferencedFile
     mx::DocumentPtr     document;         // recovered mx::Document (for UsdShade)
     std::string         materialName;     // name of the material node inside the doc
+    prism::materialx::CapturedMaterialGraph capturedGraph;
+    prism::materialx::CapturedMaterialGraph conversionGraph;
+    std::vector<prism::materialx::CapturedFileDependency> dependencies;
+    ArResolverContext resolverContext;
+    std::string sourceVersion;
+    std::shared_ptr<HdMaterialNetwork2> capturedNetwork;
+    SdfPath terminalNodePath;
+    mx::DocumentPtr libraries;
+    bool conversionReusable = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -145,7 +177,10 @@ HasMtlxSurfaceOutput(const UsdShadeMaterial& material)
 
 static mx::DocumentPtr
 RecoverMtlxDocumentFromUsdShade(const UsdPrim& materialPrim,
-                                const mx::DocumentPtr& mtlxLibraries)
+                                const mx::DocumentPtr& mtlxLibraries,
+                                const std::string& librariesPath,
+                                prism::materialx::CapturedMaterialGraph* capturedOut=nullptr,
+                                std::vector<prism::materialx::CapturedFileDependency>* dependenciesOut=nullptr)
 {
     const TfToken mtlxContext("mtlx");
     const TfTokenVector contextVector    = { mtlxContext };
@@ -183,8 +218,69 @@ RecoverMtlxDocumentFromUsdShade(const UsdPrim& materialPrim,
         return nullptr;
     }
 
+    // Stage ingestion remains independent of Hydra scene synchronization, but
+    // both frontends share conversion of simple parameter-only OpenPBR graphs.
+    HdMaterialNetwork2Interface networkInterface(materialPath, &network2);
+    const auto captured = prism::materialx::CaptureMaterialGraph(
+        networkInterface, mtlxContext, materialPath);
+    std::vector<prism::materialx::CapturedFileDependency> dependencies;
+    const bool reusable = prism::materialx::CaptureFileDependencies(
+        captured, &dependencies,
+        ArGetResolver().GetCurrentContext().GetDebugString(), "0");
+    if (capturedOut) *capturedOut=captured;
+    if (dependenciesOut) *dependenciesOut=dependencies;
+    prism::materialx::CapturedConversionArtifact sharedKey;
+    std::optional<prism::materialx::CapturedMaterialRegistry::ConversionTicket>
+        conversionTicket;
+    if (reusable) {
+        sharedKey.libraries = librariesPath;
+        sharedKey.resolverIdentity = ArGetResolver().GetCurrentContext().GetDebugString();
+        sharedKey.resolverContext = ArGetResolver().GetCurrentContext();
+        sharedKey.sourceVersion = "0";
+        sharedKey.graph = captured;
+        sharedKey.dependencies = dependencies;
+        prism::materialx::CapturedConversionArtifact shared;
+        if (prism::materialx::CapturedMaterialRegistry::Shared().find(
+                sharedKey, &shared)) {
+            if (shared.document) return shared.document->copy();
+            if (!shared.xml.empty()) {
+                auto document = mx::createDocument();
+                mx::readFromXmlString(document, shared.xml);
+                document->setDataLibrary(mtlxLibraries);
+                return document;
+            }
+        }
+        conversionTicket.emplace(
+            prism::materialx::CapturedMaterialRegistry::Shared().acquire(sharedKey));
+        if (!conversionTicket->isOwner()) {
+            prism::materialx::CapturedConversionArtifact shared;
+            if (!conversionTicket->wait(&shared)) return nullptr;
+            if (shared.document) return shared.document->copy();
+            if (!shared.xml.empty()) {
+                auto document=mx::createDocument();
+                mx::readFromXmlString(document,shared.xml);
+                document->setDataLibrary(mtlxLibraries);
+                return document;
+            }
+            return nullptr;
+        }
+    }
+    if (auto simple = prism::materialx::SimpleOpenPbrDocument(
+            networkInterface, terminalNodePath.GetToken(), mtlxLibraries)) {
+        if (reusable) {
+            auto shared = sharedKey;
+            shared.document = simple;
+            shared.xml = prism::materialx::SerializeDocument(simple, librariesPath);
+            const auto materials = simple->getMaterialNodes();
+            if (!materials.empty()) shared.materialName = materials.front()->getName();
+            if (!conversionTicket || !conversionTicket->publish(std::move(shared)))
+                return nullptr;
+        }
+        return simple;
+    }
+
     HdMtlxTexturePrimvarData mxHdData;
-    return HdMtlxCreateMtlxDocumentFromHdNetwork(
+    auto converted = HdMtlxCreateMtlxDocumentFromHdNetwork(
         network2,
         terminalNodeIt->second,
         terminalNodePath,
@@ -192,6 +288,16 @@ RecoverMtlxDocumentFromUsdShade(const UsdPrim& materialPrim,
         mtlxLibraries,
         &mxHdData
     );
+    if (converted && reusable) {
+        auto shared = sharedKey;
+        shared.document = converted;
+        shared.xml = prism::materialx::SerializeDocument(converted, librariesPath);
+        const auto materials = converted->getMaterialNodes();
+        if (!materials.empty()) shared.materialName = materials.front()->getName();
+        if (!conversionTicket || !conversionTicket->publish(std::move(shared)))
+            return nullptr;
+    }
+    return converted;
 }
 
 // ---------------------------------------------------------------------------
@@ -207,12 +313,25 @@ CollectMaterialXMaterials(const UsdStageRefPtr& stage,
     // Same stdlib instance the material compilations below will use.
     mx::DocumentPtr mtlxStdLibraries = MDLGenerator::shared(mx_libraries_path)->get_stdlib();
 
-    for (const UsdPrim& prim : stage->Traverse()) {
-        if (!prim.IsA<UsdShadeMaterial>())
-            continue;
-
+    // Discover bindings on supported geometry first. Instance proxies and
+    // point-instancer prototype subtrees remain included; no camera/frustum
+    // test is involved, so offscreen shadow/reflection materials stay live.
+    std::set<SdfPath> required;
+    for (const UsdPrim& geometry : UsdPrimRange(stage->GetPseudoRoot(), UsdTraverseInstanceProxies())) {
+        if (!geometry.IsA<UsdGeomMesh>() && !geometry.IsA<UsdGeomSphere>()) continue;
+        if (geometry.IsA<UsdGeomSphere>()) {
+            UsdGeomSphere sphere(geometry);
+            if (sphere.ComputeVisibility() == UsdGeomTokens->invisible) continue;
+            const TfToken purpose = sphere.ComputePurpose();
+            if (purpose == UsdGeomTokens->guide || purpose == UsdGeomTokens->proxy) continue;
+        }
+        if (auto material = UsdShadeMaterialBindingAPI(geometry).ComputeBoundMaterial())
+            required.insert(material.GetPath());
+    }
+    for (const SdfPath& materialPath : required) {
+        const UsdPrim prim = stage->GetPrimAtPath(materialPath);
         UsdShadeMaterial material(prim);
-        SdfPath materialPath = prim.GetPath();
+        if (!material) continue;
 
         // --- Case 1: Direct .mtlx file reference ---
         auto mtlxFile = FindReferencedMtlxFileInAncestors(prim);
@@ -223,7 +342,7 @@ CollectMaterialXMaterials(const UsdStageRefPtr& stage,
             resolved.mtlxFilePath = mtlxFile.value();
             resolved.materialName = materialPath.GetName();
 
-            std::cout << "[MtlxCollect] Found referenced .mtlx: "
+            if (UsdMaterialVerbose()) std::cout << "[MtlxCollect] Found referenced .mtlx: "
                       << resolved.mtlxFilePath << " at " << materialPath << "\n";
 
             result[materialPath] = std::move(resolved);
@@ -232,26 +351,41 @@ CollectMaterialXMaterials(const UsdStageRefPtr& stage,
 
         // --- Case 2: UsdShade-encoded MaterialX ---
         if (HasMtlxSurfaceOutput(material)) {
-            mx::DocumentPtr doc =
-                RecoverMtlxDocumentFromUsdShade(prim, mtlxStdLibraries);
-
-            if (!doc) {
-                std::cerr << "[MtlxCollect] Failed to recover document for "
-                          << materialPath << "\n";
-                continue;
-            }
-
             ResolvedMtlxMaterial resolved;
+            const TfToken mtlxContext("mtlx");
+            const TfTokenVector contexts{mtlxContext};
+            const UsdShadeShader surface=material.ComputeSurfaceSource(contexts);
+            if (!surface) continue;
+            HdMaterialNetworkMap networkMap;
+            UsdImagingBuildHdMaterialNetworkFromTerminal(surface.GetPrim(),
+                HdMaterialTerminalTokens->surface,contexts,contexts,&networkMap,
+                UsdTimeCode::Default());
+            bool isVolume=false;
+            auto network=std::make_shared<HdMaterialNetwork2>(
+                HdConvertToHdMaterialNetwork2(networkMap,&isVolume));
+            const auto terminal=network->terminals.find(HdMaterialTerminalTokens->surface);
+            if (terminal==network->terminals.end() ||
+                !network->nodes.contains(terminal->second.upstreamNode)) continue;
+            HdMaterialNetwork2Interface networkInterface(materialPath,network.get());
+            resolved.capturedGraph=prism::materialx::CaptureMaterialGraph(
+                networkInterface,mtlxContext,materialPath);
+            resolved.conversionGraph=resolved.capturedGraph;
+            resolved.conversionReusable=prism::materialx::CaptureFileDependencies(
+                resolved.capturedGraph,&resolved.dependencies,
+                stage->GetPathResolverContext().GetDebugString(),"0");
+            if (!resolved.conversionReusable)
+                resolved.dependencies.clear();
+
             resolved.materialPath = materialPath;
             resolved.sourceKind   = MtlxSourceKind::UsdShadeEncoded;
-            resolved.document     = doc;
+            resolved.resolverContext=stage->GetPathResolverContext();
+            resolved.sourceVersion="0";
+            resolved.capturedNetwork=std::move(network);
+            resolved.terminalNodePath=terminal->second.upstreamNode;
+            resolved.libraries=mtlxStdLibraries;
+            resolved.materialName="PrismMaterial";
 
-            auto matNodes = doc->getMaterialNodes();
-            resolved.materialName = matNodes.empty()
-                ? materialPath.GetName()
-                : matNodes[0]->getName();
-
-            std::cout << "[MtlxCollect] Recovered UsdShade-encoded MaterialX: "
+            if (UsdMaterialVerbose()) std::cout << "[MtlxCollect] Recovered UsdShade-encoded MaterialX: "
                       << materialPath << " (material: '"
                       << resolved.materialName << "')\n";
 
@@ -266,14 +400,14 @@ CollectMaterialXMaterials(const UsdStageRefPtr& stage,
 // Compile a single resolved material into an MDLMaterial
 // ---------------------------------------------------------------------------
 
-static std::unique_ptr<MDLMaterial>
+static std::shared_ptr<MDLMaterial>
 CompileMtlxMaterial(const ResolvedMtlxMaterial& resolved,
                     mdl::Context& mdl_context,
                     const std::string& mx_libraries_path,
                     const std::string& mx_mdl_path)
 {
     if (resolved.sourceKind == MtlxSourceKind::ReferencedFile) {
-        return std::make_unique<MDLMaterial>(
+        return std::make_shared<MDLMaterial>(
             resolved.mtlxFilePath,
             mdl_context,
             mx_libraries_path,
@@ -282,33 +416,216 @@ CompileMtlxMaterial(const ResolvedMtlxMaterial& resolved,
         );
     }
 
-    if (!resolved.document) {
+    // Use immutable content names: material edits and concurrent CLI processes
+    // must not overwrite a document still referenced by an MDL transaction.
+    std::filesystem::path cache;
+    if (const char* configured = std::getenv("PRISM_CACHE_DIR"); configured && *configured)
+        cache = configured;
+    else if (const char* local = std::getenv("LOCALAPPDATA"); local && *local)
+        cache = std::filesystem::path(local) / "PrismRT" / "cache";
+    else
+        cache = std::filesystem::temp_directory_path() / "prism-rt";
+    cache /= "materials";
+    prism::materialx::CapturedMaterialGraph templateStructure;
+    const bool templateEligible=resolved.sourceKind==MtlxSourceKind::UsdShadeEncoded &&
+        prism::materialx::CompatibleTemplateStructure(
+            resolved.capturedGraph,&templateStructure);
+    if (templateEligible) {
+        prism::materialx::CompatibleMaterialTemplate prepared;
+        if (prism::materialx::CompatibleTemplateRegistry::Shared().find(
+                &mdl_context,mx_libraries_path,mx_mdl_path,
+                templateStructure,&prepared)) {
+            prism::materialx::CompatibleBindResult bound;
+            try {
+                bound=prism::materialx::BindCompatibleTemplate(
+                    prepared,resolved.capturedGraph,mdl_context,
+                    resolved.resolverContext,resolved.sourceVersion,cache);
+            } catch (const std::exception& error) { bound.error=error.what(); }
+            if (bound.material && bound.material->is_valid()) return bound.material;
+            if (UsdMaterialVerbose())
+                std::cerr << "[CompileMtlx] Template binding rejected for "
+                          << resolved.materialPath << ": " << bound.error << "\n";
+        }
+    }
+    mx::DocumentPtr document=resolved.document;
+    auto conversionGraph=resolved.conversionGraph.nodes.empty()
+        ? resolved.capturedGraph : resolved.conversionGraph;
+    if (!document && resolved.capturedNetwork && resolved.libraries) {
+        prism::materialx::CapturedConversionArtifact key;
+        key.libraries=mx_libraries_path;
+        key.resolverIdentity=resolved.resolverContext.GetDebugString();
+        key.resolverContext=resolved.resolverContext;
+        key.sourceVersion=resolved.sourceVersion;
+        key.graph=resolved.capturedGraph;
+        key.dependencies=resolved.dependencies;
+        auto& registry=prism::materialx::CapturedMaterialRegistry::Shared();
+        prism::materialx::CapturedConversionArtifact shared;
+        if (resolved.conversionReusable && registry.find(key,&shared)) {
+            conversionGraph=shared.graph;
+            if (shared.document) document=shared.document->copy();
+            else if (!shared.xml.empty()) {
+                document=mx::createDocument(); mx::readFromXmlString(document,shared.xml);
+                document->setDataLibrary(resolved.libraries);
+            }
+        }
+        std::optional<prism::materialx::CapturedMaterialRegistry::ConversionTicket> ticket;
+        if (!document && resolved.conversionReusable) {
+            ticket.emplace(registry.acquire(key));
+            if (!ticket->isOwner()) {
+                if (!ticket->wait(&shared)) return nullptr;
+                conversionGraph=shared.graph;
+                if (shared.document) document=shared.document->copy();
+                else if (!shared.xml.empty()) {
+                    document=mx::createDocument(); mx::readFromXmlString(document,shared.xml);
+                    document->setDataLibrary(resolved.libraries);
+                }
+            }
+        }
+        if (!document) {
+            auto conversionNetwork = std::make_shared<HdMaterialNetwork2>(
+                *resolved.capturedNetwork);
+            for (auto& [nodePath, node] : conversionNetwork->nodes) {
+                for (auto& [name, value] : node.parameters) {
+                    if (name != TfToken("file") && name != TfToken("filename")) continue;
+                    std::string authored, resolvedPattern;
+                    if (value.IsHolding<SdfAssetPath>()) {
+                        const auto& asset = value.UncheckedGet<SdfAssetPath>();
+                        authored = asset.GetAssetPath();
+                        resolvedPattern = asset.GetResolvedPath();
+                    } else if (value.IsHolding<std::string>()) {
+                        authored = value.UncheckedGet<std::string>();
+                    }
+                    const std::string extension=
+                        std::filesystem::path(authored).extension().string();
+                    if (authored.find("<UDIM>") != std::string::npos ||
+                        resolvedPattern.find("<UDIM>") != std::string::npos) {
+                        auto family = prism::materialx::PrepareMaterialUdimResource(
+                            authored, resolvedPattern, resolved.resolverContext,
+                            resolved.sourceVersion, cache, extension);
+                        if (!family.mdlPath.empty())
+                            value = VtValue(SdfAssetPath(family.mdlPath.substr(1)));
+                        continue;
+                    }
+                    PXR_NS::ArResolverContextBinder binder(resolved.resolverContext);
+                    const auto source = !resolvedPattern.empty()
+                        ? PXR_NS::ArResolvedPath(resolvedPattern)
+                        : PXR_NS::ArGetResolver().Resolve(authored);
+                    if (source.empty()) continue;
+                    auto resource=prism::materialx::PrepareMaterialResource(
+                        source,resolved.resolverContext,resolved.sourceVersion,
+                        cache,extension.empty()?".bin":extension);
+                    if (resource.resource)
+                        value=VtValue(SdfAssetPath(
+                            resource.resource->path.filename().generic_string()));
+                }
+            }
+            HdMaterialNetwork2Interface networkInterface(
+                resolved.materialPath,conversionNetwork.get());
+            document=prism::materialx::SimpleOpenPbrDocument(
+                networkInterface,resolved.terminalNodePath.GetToken(),resolved.libraries);
+            if (!document) {
+                const auto node=conversionNetwork->nodes.find(resolved.terminalNodePath);
+                if (node!=conversionNetwork->nodes.end()) {
+                    registry.recordStockConversion();
+                    HdMtlxTexturePrimvarData data;
+                    document=HdMtlxCreateMtlxDocumentFromHdNetwork(
+                        *conversionNetwork,node->second,resolved.terminalNodePath,
+                        resolved.materialPath,resolved.libraries,&data);
+                }
+            }
+            if (document) {
+                const auto materials=document->getMaterialNodes();
+                if (!materials.empty()) materials.front()->setName("PrismMaterial");
+            }
+            if (document && ticket) {
+                shared=key; shared.document=document;
+                shared.xml=prism::materialx::SerializeDocument(document,mx_libraries_path);
+                shared.materialName="PrismMaterial";
+                if (!ticket->publish(std::move(shared))) return nullptr;
+            }
+        }
+    }
+    if (!document) {
         std::cerr << "[CompileMtlx] No document for " << resolved.materialPath << "\n";
         return nullptr;
     }
-
-    std::filesystem::path tempDir  = std::filesystem::temp_directory_path();
-    // Full prim path, not just the leaf: same-named materials in different
-    // scopes must not share a temp file (and thus an MDL module name).
-    std::filesystem::path tempMtlx = tempDir /
-        (TfMakeValidIdentifier(resolved.materialPath.GetString()) + "_recovered.mtlx");
-
+    const std::string xml = prism::materialx::SerializeDocument(document, mx_libraries_path);
+    struct ExactCompiled {
+        mdl::Context* context = nullptr;
+        std::string libraries, mdlPath, xml, materialName;
+        std::weak_ptr<MDLMaterial> material;
+    };
+    static std::mutex compiledMutex;
+    static std::vector<ExactCompiled> compiled;
+    {
+        std::lock_guard lock(compiledMutex);
+        for (auto it = compiled.rbegin(); it != compiled.rend(); ++it) {
+            if (it->context == &mdl_context && it->libraries == mx_libraries_path &&
+                it->mdlPath == mx_mdl_path && it->xml == xml &&
+                it->materialName == resolved.materialName) {
+                if (auto material = it->material.lock()) return material;
+            }
+        }
+    }
+    const std::filesystem::path tempMtlx = cache /
+        ("standalone_" + OIIO::SHA1::digest(xml.data(), xml.size()) + ".mtlx");
     try {
-        mx::writeToXmlFile(resolved.document, tempMtlx.string());
+        std::filesystem::create_directories(cache);
+        if (!std::filesystem::exists(tempMtlx)) {
+            static std::atomic<unsigned long long> serial{0};
+#ifdef _WIN32
+            const auto process = _getpid();
+#else
+            const auto process = getpid();
+#endif
+            const auto staging = std::filesystem::path(tempMtlx.string() + ".tmp-" +
+                std::to_string(process) + "-" + std::to_string(serial++));
+            struct Cleanup {
+                std::filesystem::path path;
+                ~Cleanup() { std::error_code ec; std::filesystem::remove(path, ec); }
+            } cleanup{staging};
+            {
+                std::ofstream output(staging, std::ios::binary | std::ios::trunc);
+                output << xml;
+                output.close();
+                if (!output) throw std::runtime_error("Cannot write recovered MaterialX document");
+            }
+            std::error_code error;
+            std::filesystem::rename(staging, tempMtlx, error);
+            // A concurrent process may have published identical content first.
+            if (error && !std::filesystem::exists(tempMtlx))
+                throw std::filesystem::filesystem_error("Publish recovered MaterialX", staging, tempMtlx, error);
+        }
     } catch (const std::exception& e) {
-        std::cerr << "[CompileMtlx] Failed to write temp .mtlx: " << e.what() << "\n";
+        std::cerr << "[CompileMtlx] Failed to cache .mtlx: " << e.what() << "\n";
         return nullptr;
     }
 
-    std::cout << "[CompileMtlx] Wrote recovered document to: " << tempMtlx << "\n";
-
-    return std::make_unique<MDLMaterial>(
+    auto material = std::make_shared<MDLMaterial>(
         tempMtlx.string(),
         mdl_context,
         mx_libraries_path,
         mx_mdl_path,
         resolved.materialName
     );
+    if (material->is_valid()) {
+        if (templateEligible) {
+            std::vector<prism::materialx::CompatibleBinding> bindings;
+            if (prism::materialx::BuildCompatibleBindings(
+                    conversionGraph,material->get_generated_uniforms(),&bindings))
+                prism::materialx::CompatibleTemplateRegistry::Shared().publish(
+                    {&mdl_context,mx_libraries_path,mx_mdl_path,
+                     std::move(templateStructure),material,std::move(bindings)});
+        }
+        std::lock_guard lock(compiledMutex);
+        std::erase_if(compiled, [](const ExactCompiled& entry) {
+            return entry.material.expired();
+        });
+        if (compiled.size() >= 2048) compiled.erase(compiled.begin());
+        compiled.push_back({&mdl_context, mx_libraries_path, mx_mdl_path,
+            xml, resolved.materialName, material});
+    }
+    return material;
 }
 
 // ============================================================================
@@ -334,6 +651,36 @@ struct MeshData {
 
 class USDMesh : public Mesh {
 public:
+    struct AttachedSphere {
+        unsigned int id;
+        Sphere* geometry;
+        pxr::GfMatrix4d world;
+        Material* material;
+    };
+
+    size_t sphereCount() const { return m_spherePlacements.size(); }
+
+    // Spheres retain their local analytic shape. Affine Embree instances also
+    // represent nonuniformly scaled spheres without baking or tessellating them.
+    std::vector<AttachedSphere> attachSphereInstances(RTCDevice device, RTCScene target) {
+        std::vector<AttachedSphere> result;
+        for (const auto& placement : m_spherePlacements) {
+            auto& prototype = m_spherePrototypes[placement.radius];
+            if (!prototype) prototype = std::make_unique<SpherePrototype>(device, placement.radius);
+            RTCGeometry instance = rtcNewGeometry(device, RTC_GEOMETRY_TYPE_INSTANCE);
+            rtcSetGeometryInstancedScene(instance, prototype->scene);
+            float matrix[16];
+            for (int c=0; c<4; ++c) for (int r=0; r<4; ++r)
+                matrix[c*4+r] = float(placement.world[c][r]);
+            rtcSetGeometryTransform(instance, 0, RTC_FORMAT_FLOAT4X4_COLUMN_MAJOR, matrix);
+            rtcCommitGeometry(instance);
+            const unsigned id = rtcAttachGeometry(target, instance);
+            rtcReleaseGeometry(instance);
+            result.push_back({id, &prototype->geometry, placement.world,
+                material_override ? material_override : materials.at(placement.materialId)});
+        }
+        return result;
+    }
 
     // Basic constructor — no MDL/MaterialX support, uses displayColor fallback
     USDMesh(const std::filesystem::path& file_path)
@@ -355,6 +702,14 @@ public:
 
         // ── Phase 1: Detect and compile MaterialX materials ────────────────
         if (mdl_context && !mx_libraries_path.empty()) {
+            ArResolverContextBinder materialResolver(
+                stage->GetPathResolverContext());
+            // Template hits can bind a prepared texture before any full
+            // MDLMaterial construction has registered the document directory.
+            // Configure the shared material cache once on this ingestion
+            // thread before entering the per-material loop.
+            mdl_context->add_resource_path(
+                (prism::PersistentCacheRoot() / "materials").string());
             std::cout << "[USDMesh] Scanning for MaterialX materials...\n";
 
             auto mtlxMaterials = CollectMaterialXMaterials(stage, mx_libraries_path);
@@ -378,7 +733,7 @@ public:
                         if (cached != compiled_files.end()) {
                             m_mdl_material_lookup[matPath] = cached->second;
                             ++reused_materials;
-                            std::cout << "[USDMesh] Reused MaterialX material '"
+                            if (UsdMaterialVerbose()) std::cout << "[USDMesh] Reused MaterialX material '"
                                       << matPath << "' -> mat_id " << cached->second << "\n";
                             continue;
                         }
@@ -396,7 +751,7 @@ public:
                     // all reused bindings resolve to the same stable material ID.
                     if (cache_key) compiled_files.emplace(*cache_key, mat_id);
 
-                    std::cout << "[USDMesh] Compiled MaterialX material '"
+                    if (UsdMaterialVerbose()) std::cout << "[USDMesh] Compiled MaterialX material '"
                               << matPath << "' -> mat_id " << mat_id << "\n";
                 } else {
                     std::cerr << "[USDMesh] Failed to compile MaterialX material: "
@@ -416,7 +771,7 @@ public:
         // We do a single traversal. PointInstancers are handled inline;
         // their prototype subtrees are skipped by the traversal iterator
         // so we won't double-process prototype meshes.
-        pxr::UsdPrimRange range = stage->Traverse();
+        pxr::UsdPrimRange range(stage->GetPseudoRoot(), pxr::UsdTraverseInstanceProxies());
         for (auto iter = range.begin(); iter != range.end(); ++iter) {
             const pxr::UsdPrim& prim = *iter;
 
@@ -436,6 +791,9 @@ public:
                     pxr::UsdGeomMesh(prim), xformCache, timeCode,
                     xformCache.GetLocalToWorldTransform(prim));
                 appendMeshData(data);
+            } else if (prim.IsA<pxr::UsdGeomSphere>()) {
+                captureSphere(pxr::UsdGeomSphere(prim), timeCode,
+                    xformCache.GetLocalToWorldTransform(prim));
             }
         }
 
@@ -447,9 +805,48 @@ public:
 
 private:
 
+    struct SpherePlacement {
+        float radius;
+        pxr::GfMatrix4d world;
+        int materialId;
+    };
+    struct SpherePrototype {
+        Sphere geometry;
+        RTCScene scene;
+        SpherePrototype(RTCDevice device, float radius)
+            : geometry(Float3(0), radius, nullptr), scene(rtcNewScene(device)) {
+            geometry.setupEmbree(device, scene);
+            rtcCommitScene(scene);
+        }
+        ~SpherePrototype() {
+            rtcReleaseScene(scene);
+            if (geometry.geom) rtcReleaseGeometry(geometry.geom);
+            delete geometry.transform;
+        }
+    };
+    std::vector<SpherePlacement> m_spherePlacements;
+    std::map<float, std::unique_ptr<SpherePrototype>> m_spherePrototypes;
+
+    void captureSphere(const pxr::UsdGeomSphere& sphere,
+                       pxr::UsdTimeCode time, const pxr::GfMatrix4d& transform) {
+        if (sphere.ComputeVisibility(time) == pxr::UsdGeomTokens->invisible) return;
+        const TfToken purpose = sphere.ComputePurpose();
+        if (purpose == pxr::UsdGeomTokens->guide || purpose == pxr::UsdGeomTokens->proxy) return;
+        double radius = 1;
+        sphere.GetRadiusAttr().Get(&radius, time);
+        if (!(radius > 0) || !std::isfinite(radius) ||
+            !std::isfinite(float(radius)) || std::abs(transform.GetDeterminant()) < 1e-15) {
+            std::cerr << "[USDMesh] Invalid analytic sphere: " << sphere.GetPath() << '\n';
+            return;
+        }
+        m_spherePlacements.push_back({float(radius), transform, resolveMaterialId(sphere.GetPrim(), time)});
+    }
+
     int globalTriangleCount = 0;
 
-    std::vector<std::unique_ptr<MDLMaterial>> m_owned_mdl_materials;
+    std::vector<std::shared_ptr<MDLMaterial>> m_owned_mdl_materials;
+    std::vector<std::unique_ptr<ColorTexture>> m_owned_fallback_textures;
+    std::vector<std::unique_ptr<Diffuse>> m_owned_fallback_materials;
     std::map<SdfPath, int>                    m_mdl_material_lookup;
 
     // -----------------------------------------------------------------------
@@ -515,7 +912,11 @@ private:
         }
 
         int mat_id = static_cast<int>(materials.size());
-        materials[mat_id] = new Diffuse(new ColorTexture(mesh_color));
+        auto texture = std::make_unique<ColorTexture>(mesh_color);
+        auto material = std::make_unique<Diffuse>(texture.get());
+        materials[mat_id] = material.get();
+        m_owned_fallback_textures.push_back(std::move(texture));
+        m_owned_fallback_materials.push_back(std::move(material));
         return mat_id;
     }
 
@@ -594,6 +995,8 @@ private:
         pxr::UsdAttribute normalsAttr = mesh.GetNormalsAttr();
         if (normalsAttr && normalsAttr.Get(&meshNormals, timeCode)) {
             hasMeshNormals = true;
+            normalsInterpolation = mesh.GetNormalsInterpolation();
+            normalsAreFaceVarying = normalsInterpolation == pxr::UsdGeomTokens->faceVarying;
             pxr::UsdGeomPrimvar normalsPrimvar =
                 primvarsAPI.GetPrimvar(pxr::UsdGeomTokens->normals);
             if (normalsPrimvar) {
@@ -608,7 +1011,7 @@ private:
         // If UVs (or normals) are faceVarying we must expand: one vertex
         // per face corner. Otherwise we keep the compact indexed layout.
         //
-        if (isFaceVarying) {
+        if (isFaceVarying || normalsAreFaceVarying) {
             buildFaceVaryingLayout(
                 out, points, faceVertexIndices, faceVertexCounts,
                 uvValues, uvIndices, hasUvIndices,
@@ -999,6 +1402,8 @@ private:
             MeshData data = buildMeshData(
                 pxr::UsdGeomMesh(root), xformCache, timeCode, worldTransform);
             appendMeshData(data);
+        } else if (root.IsA<pxr::UsdGeomSphere>()) {
+            captureSphere(pxr::UsdGeomSphere(root), timeCode, worldTransform);
         }
 
         for (const pxr::UsdPrim& child : root.GetChildren()) {

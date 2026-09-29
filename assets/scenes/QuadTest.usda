@@ -1,0 +1,221 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    metersPerUnit = 1
+    renderSettingsPrimPath = "/Render/Settings"
+    upAxis = "Y"
+)
+
+def Xform "World"
+{
+    def Xform "Geometry"
+    {
+        def Mesh "Object_0" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            int[] faceVertexCounts = [4]
+            int[] faceVertexIndices = [0, 1, 2, 3]
+            rel material:binding = </World/Materials/Material_0>
+            normal3f[] normals = [(1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0)] (
+                interpolation = "faceVarying"
+            )
+            point3f[] points = [(-3, -2, 5), (-3, -2, 1), (-3, 2, 1), (-3, 2, 5)]
+            uniform token subdivisionScheme = "none"
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 0, 0, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+        }
+
+        def Mesh "Object_1" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            int[] faceVertexCounts = [4]
+            int[] faceVertexIndices = [0, 1, 2, 3]
+            rel material:binding = </World/Materials/Material_1>
+            normal3f[] normals = [(0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                interpolation = "faceVarying"
+            )
+            point3f[] points = [(-2, -2, 0), (2, -2, 0), (2, 2, 0), (-2, 2, 0)]
+            uniform token subdivisionScheme = "none"
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 0, 0, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+        }
+
+        def Mesh "Object_2" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            int[] faceVertexCounts = [4]
+            int[] faceVertexIndices = [0, 1, 2, 3]
+            rel material:binding = </World/Materials/Material_2>
+            normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0)] (
+                interpolation = "faceVarying"
+            )
+            point3f[] points = [(3, -2, 1), (3, -2, 5), (3, 2, 5), (3, 2, 1)]
+            uniform token subdivisionScheme = "none"
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 0, 0, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+        }
+
+        def Mesh "Object_3" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            int[] faceVertexCounts = [4]
+            int[] faceVertexIndices = [0, 1, 2, 3]
+            rel material:binding = </World/Materials/Material_3>
+            normal3f[] normals = [(0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0)] (
+                interpolation = "faceVarying"
+            )
+            point3f[] points = [(-2, 3, 1), (2, 3, 1), (2, 3, 5), (-2, 3, 5)]
+            uniform token subdivisionScheme = "none"
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 0, 0, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+        }
+
+        def Mesh "Object_4" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            int[] faceVertexCounts = [4]
+            int[] faceVertexIndices = [0, 1, 2, 3]
+            rel material:binding = </World/Materials/Material_4>
+            normal3f[] normals = [(-0, 1, 0), (-0, 1, 0), (-0, 1, 0), (-0, 1, 0)] (
+                interpolation = "faceVarying"
+            )
+            point3f[] points = [(-2, -3, 5), (2, -3, 5), (2, -3, 1), (-2, -3, 1)]
+            uniform token subdivisionScheme = "none"
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 0, 0, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+        }
+    }
+
+    def Scope "Materials"
+    {
+        def Material "Material_0"
+        {
+            token outputs:mtlx:surface.connect = </World/Materials/Material_0/Surface.outputs:out>
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_open_pbr_surface_surfaceshader"
+                color3f inputs:base_color = (0.2, 1, 0.2)
+                float inputs:base_diffuse_roughness = 0
+                float inputs:base_metalness = 0
+                float inputs:base_weight = 1
+                float inputs:coat_weight = 0
+                float inputs:emission_luminance = 0
+                float inputs:specular_weight = 0
+                float inputs:transmission_weight = 0
+                token outputs:out
+            }
+        }
+
+        def Material "Material_1"
+        {
+            token outputs:mtlx:surface.connect = </World/Materials/Material_1/Surface.outputs:out>
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_open_pbr_surface_surfaceshader"
+                color3f inputs:base_color = (0.2, 1, 0.2)
+                float inputs:base_diffuse_roughness = 0
+                float inputs:base_metalness = 0
+                float inputs:base_weight = 1
+                float inputs:coat_weight = 0
+                float inputs:emission_luminance = 0
+                float inputs:specular_weight = 0
+                float inputs:transmission_weight = 0
+                token outputs:out
+            }
+        }
+
+        def Material "Material_2"
+        {
+            token outputs:mtlx:surface.connect = </World/Materials/Material_2/Surface.outputs:out>
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_open_pbr_surface_surfaceshader"
+                color3f inputs:base_color = (0.2, 1, 0.2)
+                float inputs:base_diffuse_roughness = 0
+                float inputs:base_metalness = 0
+                float inputs:base_weight = 1
+                float inputs:coat_weight = 0
+                float inputs:emission_luminance = 0
+                float inputs:specular_weight = 0
+                float inputs:transmission_weight = 0
+                token outputs:out
+            }
+        }
+
+        def Material "Material_3"
+        {
+            token outputs:mtlx:surface.connect = </World/Materials/Material_3/Surface.outputs:out>
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_open_pbr_surface_surfaceshader"
+                color3f inputs:base_color = (0.2, 1, 0.2)
+                float inputs:base_diffuse_roughness = 0
+                float inputs:base_metalness = 0
+                float inputs:base_weight = 1
+                float inputs:coat_weight = 0
+                float inputs:emission_luminance = 0
+                float inputs:specular_weight = 0
+                float inputs:transmission_weight = 0
+                token outputs:out
+            }
+        }
+
+        def Material "Material_4"
+        {
+            token outputs:mtlx:surface.connect = </World/Materials/Material_4/Surface.outputs:out>
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_open_pbr_surface_surfaceshader"
+                color3f inputs:base_color = (0.2, 1, 0.2)
+                float inputs:base_diffuse_roughness = 0
+                float inputs:base_metalness = 0
+                float inputs:base_weight = 1
+                float inputs:coat_weight = 0
+                float inputs:emission_luminance = 0
+                float inputs:specular_weight = 0
+                float inputs:transmission_weight = 0
+                token outputs:out
+            }
+        }
+    }
+
+    def Camera "Camera"
+    {
+        float2 clippingRange = (0.001, 1e30)
+        float focalLength = 50
+        float focusDistance = 10
+        float fStop = 0
+        float horizontalAperture = 83.90996
+        float verticalAperture = 83.90996
+        matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, -0, 9, 1) )
+        uniform token[] xformOpOrder = ["xformOp:transform"]
+    }
+
+    def DomeLight "Environment"
+    {
+        color3f inputs:color = (1, 1, 1)
+        float inputs:intensity = 1
+        asset inputs:texture:file = @QuadTest_sky.exr@
+        token inputs:texture:format = "latlong"
+    }
+}
+
+def "Render"
+{
+    def RenderSettings "Settings"
+    {
+        rel camera = </World/Camera>
+        uniform int2 resolution = (1280, 1280)
+    }
+}
+

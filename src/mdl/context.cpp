@@ -36,13 +36,15 @@ public:
     }
 
 private:
-    static void emit(mi::base::Message_severity level, const char*, const char* message)
+    static void emit(mi::base::Message_severity level, const char* category, const char* message)
     {
         const std::string_view text = message ? message : "";
         if (!VerboseMdl()) {
             if (level > mi::base::MESSAGE_SEVERITY_WARNING) return;
             if (text.find("C183 unused parameter") != std::string_view::npos) return;
         }
+        if (VerboseMdl() && category && *category)
+            std::cerr << '[' << category << "] ";
         std::cerr << text << '\n';
     }
 };
@@ -88,7 +90,7 @@ Context::Context(const char* library_path, const std::vector<std::string>& plugi
 
 Context::~Context() {
     if (m_is_valid) {
-        ClearTargetCodeCache();
+        ClearTargetCodeCache(this);
         // Release interface handles (automatic via mi::base::Handle)
         m_mdl_factory.reset();
         m_mdl_impexp.reset();

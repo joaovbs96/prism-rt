@@ -1,0 +1,247 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    metersPerUnit = 1
+    renderSettingsPrimPath = "/Render/Settings"
+    upAxis = "Y"
+)
+
+def Xform "World"
+{
+    def Xform "Geometry"
+    {
+        def Mesh "Object_0" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            int[] faceVertexCounts = [4]
+            int[] faceVertexIndices = [0, 1, 2, 3]
+            rel material:binding = </World/Materials/Material_0>
+            normal3f[] normals = [(1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0)] (
+                interpolation = "faceVarying"
+            )
+            point3f[] points = [(555, 0, 0), (555, 555, 0), (555, 555, 555), (555, 0, 555)]
+            uniform token subdivisionScheme = "none"
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 0, 0, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+        }
+
+        def Mesh "Object_1" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            int[] faceVertexCounts = [4]
+            int[] faceVertexIndices = [0, 1, 2, 3]
+            rel material:binding = </World/Materials/Material_1>
+            normal3f[] normals = [(1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0)] (
+                interpolation = "faceVarying"
+            )
+            point3f[] points = [(0, 0, 0), (0, 555, 0), (0, 555, 555), (0, 0, 555)]
+            uniform token subdivisionScheme = "none"
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 0, 0, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+        }
+
+        def Mesh "Object_2" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            int[] faceVertexCounts = [4]
+            int[] faceVertexIndices = [0, 1, 2, 3]
+            rel material:binding = </World/Materials/Material_2>
+            normal3f[] normals = [(-0, -1, 0), (-0, -1, 0), (-0, -1, 0), (-0, -1, 0)] (
+                interpolation = "faceVarying"
+            )
+            point3f[] points = [(343, 554, 332), (213, 554, 332), (213, 554, 227), (343, 554, 227)]
+            uniform token subdivisionScheme = "none"
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 0, 0, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+        }
+
+        def Mesh "Object_3" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            int[] faceVertexCounts = [4]
+            int[] faceVertexIndices = [0, 1, 2, 3]
+            rel material:binding = </World/Materials/Material_3>
+            normal3f[] normals = [(0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0)] (
+                interpolation = "faceVarying"
+            )
+            point3f[] points = [(0, 0, 0), (555, 0, 0), (555, 0, 555), (0, 0, 555)]
+            uniform token subdivisionScheme = "none"
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 0, 0, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+        }
+
+        def Mesh "Object_4" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            int[] faceVertexCounts = [4]
+            int[] faceVertexIndices = [0, 1, 2, 3]
+            rel material:binding = </World/Materials/Material_3>
+            normal3f[] normals = [(-0, -1, 0), (-0, -1, 0), (-0, -1, 0), (-0, -1, 0)] (
+                interpolation = "faceVarying"
+            )
+            point3f[] points = [(555, 555, 555), (0, 555, 555), (0, 555, 0), (555, 555, 0)]
+            uniform token subdivisionScheme = "none"
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 0, 0, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+        }
+
+        def Mesh "Object_5" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            int[] faceVertexCounts = [4]
+            int[] faceVertexIndices = [0, 1, 2, 3]
+            rel material:binding = </World/Materials/Material_3>
+            normal3f[] normals = [(0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                interpolation = "faceVarying"
+            )
+            point3f[] points = [(0, 0, 555), (555, 0, 555), (555, 555, 555), (0, 555, 555)]
+            uniform token subdivisionScheme = "none"
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 0, 0, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+        }
+
+        def Mesh "Object_6" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+            int[] faceVertexIndices = [4, 5, 6, 7, 1, 0, 3, 2, 5, 1, 2, 6, 0, 4, 7, 3, 3, 7, 6, 2, 0, 1, 5, 4]
+            rel material:binding = </World/Materials/Material_3>
+            normal3f[] normals = [(0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0)] (
+                interpolation = "faceVarying"
+            )
+            point3f[] points = [(0, 0, 0), (165, 0, 0), (165, 330, 0), (0, 330, 0), (0, 0, 165), (165, 0, 165), (165, 330, 165), (0, 330, 165)]
+            uniform token subdivisionScheme = "none"
+            matrix4d xformOp:transform = ( (0.9659258127212524, 0, -0.258819043636322, 0), (0, 1, 0, 0), (0.258819043636322, 0, 0.9659258127212524, 0), (265, 0, 295, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+        }
+
+        def Mesh "Object_7" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+            int[] faceVertexIndices = [4, 5, 6, 7, 1, 0, 3, 2, 5, 1, 2, 6, 0, 4, 7, 3, 3, 7, 6, 2, 0, 1, 5, 4]
+            rel material:binding = </World/Materials/Material_3>
+            normal3f[] normals = [(0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0)] (
+                interpolation = "faceVarying"
+            )
+            point3f[] points = [(0, 0, 0), (165, 0, 0), (165, 165, 0), (0, 165, 0), (0, 0, 165), (165, 0, 165), (165, 165, 165), (0, 165, 165)]
+            uniform token subdivisionScheme = "none"
+            matrix4d xformOp:transform = ( (0.9510565400123596, 0, 0.30901700258255005, 0), (0, 1, 0, 0), (-0.30901700258255005, 0, 0.9510565400123596, 0), (103.5512466430664, 0, 101.99089050292969, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+        }
+    }
+
+    def Scope "Materials"
+    {
+        def Material "Material_0"
+        {
+            token outputs:mtlx:surface.connect = </World/Materials/Material_0/Surface.outputs:out>
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_open_pbr_surface_surfaceshader"
+                color3f inputs:base_color = (0.12, 0.45, 0.15)
+                float inputs:base_diffuse_roughness = 0
+                float inputs:base_metalness = 0
+                float inputs:base_weight = 1
+                float inputs:coat_weight = 0
+                float inputs:emission_luminance = 0
+                float inputs:specular_weight = 0
+                float inputs:transmission_weight = 0
+                token outputs:out
+            }
+        }
+
+        def Material "Material_1"
+        {
+            token outputs:mtlx:surface.connect = </World/Materials/Material_1/Surface.outputs:out>
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_open_pbr_surface_surfaceshader"
+                color3f inputs:base_color = (0.65, 0.05, 0.05)
+                float inputs:base_diffuse_roughness = 0
+                float inputs:base_metalness = 0
+                float inputs:base_weight = 1
+                float inputs:coat_weight = 0
+                float inputs:emission_luminance = 0
+                float inputs:specular_weight = 0
+                float inputs:transmission_weight = 0
+                token outputs:out
+            }
+        }
+
+        def Material "Material_2"
+        {
+            token outputs:mtlx:surface.connect = </World/Materials/Material_2/Surface.outputs:out>
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_open_pbr_surface_surfaceshader"
+                float inputs:base_metalness = 0
+                float inputs:base_weight = 0
+                float inputs:coat_weight = 0
+                color3f inputs:emission_color = (1, 1, 1)
+                float inputs:emission_luminance = 15
+                float inputs:specular_weight = 0
+                float inputs:transmission_weight = 0
+                token outputs:out
+            }
+        }
+
+        def Material "Material_3"
+        {
+            token outputs:mtlx:surface.connect = </World/Materials/Material_3/Surface.outputs:out>
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_open_pbr_surface_surfaceshader"
+                color3f inputs:base_color = (0.73, 0.73, 0.73)
+                float inputs:base_diffuse_roughness = 0
+                float inputs:base_metalness = 0
+                float inputs:base_weight = 1
+                float inputs:coat_weight = 0
+                float inputs:emission_luminance = 0
+                float inputs:specular_weight = 0
+                float inputs:transmission_weight = 0
+                token outputs:out
+            }
+        }
+    }
+
+    def Camera "Camera"
+    {
+        float2 clippingRange = (0.001, 1e30)
+        float focalLength = 50
+        float focusDistance = 10
+        float fStop = 0
+        float horizontalAperture = 36.397022
+        float verticalAperture = 36.397022
+        matrix4d xformOp:transform = ( (-1, 0, 0, 0), (0, 1, 0, 0), (0, 0, -1, 0), (278, 278, -800, 1) )
+        uniform token[] xformOpOrder = ["xformOp:transform"]
+    }
+
+    def DomeLight "Environment"
+    {
+        color3f inputs:color = (0, 0, 0)
+        float inputs:intensity = 1
+    }
+}
+
+def "Render"
+{
+    def RenderSettings "Settings"
+    {
+        rel camera = </World/Camera>
+        uniform int2 resolution = (1280, 1280)
+    }
+}
+

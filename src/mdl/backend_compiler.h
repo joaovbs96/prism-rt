@@ -7,11 +7,14 @@
 #include <string>
 #include <vector>
 #include <iostream>
+#include <memory>
+#include <optional>
 
 namespace mdl {
+class NativeTextureRuntime;
 
 // Releases process cache entries before an MDL SDK context shuts down.
-void ClearTargetCodeCache();
+void ClearTargetCodeCache(const Context* context = nullptr);
 
 // Stores the function indices for the generated target code.
 // These indices are used with ITarget_code::execute_*() methods.
@@ -58,32 +61,49 @@ struct MaterialFunctions {
     static constexpr mi::Size DF_AUXILIARY = 3;
 };
 
-// Result of Phase 5: native CPU target code with callable functions
-struct TargetCode {
-    // The generated native target code object.
-    // Owns the JIT-compiled machine code and provides execute_*() methods.
+// Published components are immutable. A binding always retains its program so
+// resource handlers and argument bytes cannot outlive their native ABI.
+struct CompiledProgram {
+    struct Parameter { std::string name; std::string type_name; };
     mi::base::Handle<const mi::neuraylib::ITarget_code> target_code;
-
-    // Function indices for calling the generated BSDF/EDF/expression functions
     MaterialFunctions functions;
-
-    // Whether the material is thin-walled (affects which functions to use)
-    bool is_thin_walled = false;
-
-    // Read-only data segment (needed for some materials)
     const char* ro_data_segment = nullptr;
     mi::Size ro_data_segment_size = 0;
+    std::shared_ptr<const NativeTextureRuntime> resource_prefix;
+    // Ordered resource capabilities of the compiled material arguments. This
+    // deliberately excludes resource values, which belong to MaterialBinding,
+    // but prevents a program compiled for one resource ABI from accepting a
+    // differently shaped argument interface.
+    std::string resource_interface;
+    std::vector<Parameter> parameters;
+    const Context* owner_identity = nullptr;
+    std::string identity;
+    bool builtin_resources = false;
+};
 
-    // Per-material values for class compilation. Target code is shared by
-    // materials with the same compiled class hash; this block is instance data.
+struct MaterialBinding {
+    std::shared_ptr<const CompiledProgram> program;
     mi::base::Handle<const mi::neuraylib::ITarget_argument_block> argument_block;
-    const mi::neuraylib::ITarget_argument_block* argument_data() const {
-        return argument_block.get();
-    }
+    std::shared_ptr<const NativeTextureRuntime> texture_runtime;
+    bool is_thin_walled = false;
+    std::optional<float> constant_cutout_opacity;
+};
 
+struct TargetCode {
+    std::shared_ptr<const CompiledProgram> program;
+    std::shared_ptr<const MaterialBinding> binding;
+    std::string textureFallbackReason;
+    mi::neuraylib::Texture_handler_base* texture_handler() const;
+    const mi::neuraylib::ITarget_argument_block* argument_data() const {
+        return binding ? binding->argument_block.get() : nullptr;
+    }
     bool success = false;
     bool cacheHit = false;
-    // Wall time spent inside the SDK's native translate call. Cache hits are 0.
+    bool cacheReuseRejected = false;
+    // Actual SDK calls, including failed/custom discovery translations.
+    uint64_t translationCalls = 0;
+    uint64_t fallbackTranslations = 0;
+    double programWaitSeconds = 0.0;
     double nativeJitSeconds = 0.0;
     std::string error_message;
 };
@@ -96,6 +116,9 @@ public:
 
     // Full pipeline: CompiledMaterial -> native target code with callable functions
     TargetCode generate_target_code(const CompiledMaterial& compiled);
+    TargetCode bind_arguments(const TargetCode& prototype,
+        const mi::neuraylib::IValue_list* overrides,
+        mi::neuraylib::ITransaction* transaction);
 
 private:
     void print_context_messages(mi::neuraylib::IMdl_execution_context* context);

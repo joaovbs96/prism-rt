@@ -1,8 +1,19 @@
 cmake_minimum_required(VERSION 3.20)
+
+# A user-wide `vcpkg integrate install` injects include/library paths into every
+# Visual Studio project unless the generated project opts out. Dependencies for
+# this build are selected explicitly through CMAKE_PREFIX_PATH/toolchain inputs;
+# allowing MSBuild integration as well can mix a different vcpkg ABI into them.
+if(CMAKE_GENERATOR MATCHES "^Visual Studio")
+    list(APPEND CMAKE_VS_GLOBALS "VcpkgEnabled=false")
+endif()
+
 project(PrismRT LANGUAGES CXX)
 
 option(PRISM_BUILD_HYDRA "Build the optional Hydra renderer delegate" OFF)
 option(PRISM_COPY_ASSETS "Copy the standalone renderer's runtime assets next to its executable" ON)
+option(PRISM_INSTALL_USDVIEW_PLUGIN "Install the usdview selection extension" ON)
+option(PRISM_INSTALL_ASSETS "Install bundled HDRI, material and texture assets" OFF)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED YES)
@@ -13,26 +24,16 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_MAP_IMPORTED_CONFIG_MINSIZEREL "RelWithDebInfo;Release")
 set(CMAKE_MAP_IMPORTED_CONFIG_RELEASE "RelWithDebInfo;Release")
 set(CMAKE_MAP_IMPORTED_CONFIG_DEBUG "Debug;RelWithDebInfo;Release")
+set(CMAKE_MAP_IMPORTED_CONFIG_RELWITHDEBINFO "RelWithDebInfo;Release")
 
-set(PROGRAMMING_PROJECTS "C:/Users/joaov/Desktop/Programming_Projects")
-set(EXTERNAL_DEPS "${PROGRAMMING_PROJECTS}/external_deps")
-
-if(NOT DEFINED CACHE{TBB_DIR})
-    set(TBB_DIR "${PROGRAMMING_PROJECTS}/include/tbb/lib/cmake/tbb"
-        CACHE PATH "Path to oneTBB's CMake package" FORCE)
+# Optional per-machine hints live in the ignored cmake/PrismLocalDependencies.cmake.
+# Normal package discovery through CMAKE_PREFIX_PATH remains the portable default.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/cmake/PrismLocalDependencies.cmake")
+    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/PrismLocalDependencies.cmake")
 endif()
-if(NOT DEFINED CACHE{pxr_DIR})
-    set(pxr_DIR "${EXTERNAL_DEPS}/OpenUSD/install"
-        CACHE PATH "Path to the OpenUSD installation" FORCE)
-endif()
-if(NOT DEFINED CACHE{MaterialX_DIR})
-    set(MaterialX_DIR "${EXTERNAL_DEPS}/MaterialX/install/lib/cmake/MaterialX"
-        CACHE PATH "Path to MaterialX's CMake package" FORCE)
-endif()
-if(NOT DEFINED CACHE{MDL_SDK_DIR})
-    set(MDL_SDK_DIR "${PROGRAMMING_PROJECTS}/mdl-sdk"
-        CACHE PATH "Path to the NVIDIA MDL SDK" FORCE)
-endif()
+set(MDL_SDK_DIR "" CACHE PATH "Optional NVIDIA MDL SDK root")
+set(PRISM_MATERIALX_LIBRARY_PATH "" CACHE PATH "MaterialX standard library directory")
+set(PRISM_MATERIALX_MDL "" CACHE PATH "MaterialX MDL library directory")
 
 set(TINYGLTF_HEADER_ONLY ON CACHE INTERNAL "" FORCE)
 set(TINYGLTF_INSTALL OFF CACHE INTERNAL "" FORCE)
@@ -49,7 +50,64 @@ find_package(TBB REQUIRED CONFIG)
 find_package(OpenGL REQUIRED)
 find_package(pxr REQUIRED)
 find_package(MaterialX REQUIRED)
-find_package(Python3 COMPONENTS Development REQUIRED)
+find_package(Python3 COMPONENTS Development Interpreter REQUIRED)
+
+set(PRISM_USD_ROOT "${pxr_DIR}")
+set(PRISM_OPENSUBDIV_ROOT "" CACHE PATH "OpenSubdiv runtime installation prefix used by OpenUSD")
+if(NOT PRISM_OPENSUBDIV_ROOT AND OpenSubdiv_DIR)
+    get_filename_component(_opensubdiv_dir "${OpenSubdiv_DIR}" DIRECTORY)
+    get_filename_component(_opensubdiv_dir "${_opensubdiv_dir}" DIRECTORY)
+    get_filename_component(PRISM_OPENSUBDIV_ROOT "${_opensubdiv_dir}" DIRECTORY)
+endif()
+set(PRISM_MATERIALX_ROOT "" CACHE PATH "MaterialX installation prefix for runtime data")
+if(NOT PRISM_MATERIALX_ROOT AND MaterialX_DIR)
+    get_filename_component(_mtlx_runtime_dir "${MaterialX_DIR}" DIRECTORY)
+    get_filename_component(_mtlx_runtime_dir "${_mtlx_runtime_dir}" DIRECTORY)
+    get_filename_component(PRISM_MATERIALX_ROOT "${_mtlx_runtime_dir}" DIRECTORY)
+endif()
+set(PRISM_MATERIALX_LIBRARY_PATH "" CACHE PATH "MaterialX standard library directory")
+set(PRISM_MATERIALX_MDL "" CACHE PATH "MaterialX MDL library directory")
+if(NOT PRISM_MATERIALX_LIBRARY_PATH AND PRISM_MATERIALX_ROOT AND
+   EXISTS "${PRISM_MATERIALX_ROOT}/libraries")
+    set(PRISM_MATERIALX_LIBRARY_PATH "${PRISM_MATERIALX_ROOT}/libraries")
+endif()
+if(NOT PRISM_MATERIALX_MDL AND PRISM_MATERIALX_LIBRARY_PATH AND
+   EXISTS "${PRISM_MATERIALX_LIBRARY_PATH}/mdl")
+    set(PRISM_MATERIALX_MDL "${PRISM_MATERIALX_LIBRARY_PATH}/mdl")
+endif()
+set(PRISM_TBB_REDIST "" CACHE PATH "oneTBB runtime directory")
+set(PRISM_EMBREE_RUNTIME_DIR "" CACHE PATH "Embree runtime directory")
+set(PRISM_EMBREE_BUILD_RUNTIME "" CACHE PATH "Embree build runtime directory")
+set(PRISM_VCPKG_BIN "" CACHE PATH "Runtime DLL directory for vcpkg dependencies")
+if(NOT PRISM_TBB_REDIST AND DEFINED ENV{PRISM_TBB_REDIST})
+    set(PRISM_TBB_REDIST "$ENV{PRISM_TBB_REDIST}")
+endif()
+if(NOT PRISM_EMBREE_RUNTIME_DIR AND DEFINED ENV{PRISM_EMBREE_RUNTIME_DIR})
+    set(PRISM_EMBREE_RUNTIME_DIR "$ENV{PRISM_EMBREE_RUNTIME_DIR}")
+elseif(NOT PRISM_EMBREE_RUNTIME_DIR AND DEFINED ENV{PRISM_EMBREE_ROOT})
+    set(PRISM_EMBREE_RUNTIME_DIR "$ENV{PRISM_EMBREE_ROOT}")
+endif()
+if(NOT PRISM_EMBREE_BUILD_RUNTIME AND DEFINED ENV{PRISM_EMBREE_BUILD_RUNTIME})
+    set(PRISM_EMBREE_BUILD_RUNTIME "$ENV{PRISM_EMBREE_BUILD_RUNTIME}")
+endif()
+if(NOT PRISM_VCPKG_BIN AND DEFINED ENV{PRISM_VCPKG_BIN})
+    set(PRISM_VCPKG_BIN "$ENV{PRISM_VCPKG_BIN}")
+endif()
+if(NOT PRISM_VCPKG_BIN AND OpenImageIO_DIR)
+    get_filename_component(_oiio_prefix "${OpenImageIO_DIR}" DIRECTORY)
+    get_filename_component(_oiio_prefix "${_oiio_prefix}" DIRECTORY)
+    if(EXISTS "${_oiio_prefix}/bin")
+        set(PRISM_VCPKG_BIN "${_oiio_prefix}/bin")
+    endif()
+endif()
+set(PRISM_PYTHON_ROOT "" CACHE PATH "Python runtime root used by OpenUSD")
+if(NOT PRISM_PYTHON_ROOT AND Python3_EXECUTABLE)
+    get_filename_component(PRISM_PYTHON_ROOT "${Python3_EXECUTABLE}" DIRECTORY)
+endif()
+foreach(_runtime_path IN ITEMS PRISM_USD_ROOT PRISM_OPENSUBDIV_ROOT PRISM_MATERIALX_ROOT PRISM_MATERIALX_LIBRARY_PATH PRISM_MATERIALX_MDL MDL_SDK_DIR PRISM_TBB_REDIST PRISM_EMBREE_RUNTIME_DIR PRISM_EMBREE_BUILD_RUNTIME PRISM_VCPKG_BIN PRISM_PYTHON_ROOT)
+    file(TO_CMAKE_PATH "${${_runtime_path}}" ${_runtime_path}_JSON)
+endforeach()
+configure_file(cmake/PrismRuntime.json.in "${CMAKE_BINARY_DIR}/prism-runtime.json" @ONLY)
 
 # OpenUSD exports Python3::Python for its bindings. On Windows FindPython3
 # may expose only the active RelWithDebInfo configuration, while Visual Studio
@@ -73,8 +131,10 @@ add_library(prism_core STATIC ${PRISM_CORE_SOURCES})
 add_library(PrismRT::core ALIAS prism_core)
 target_include_directories(prism_core PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/external/tinygltf"
-    "${CMAKE_CURRENT_SOURCE_DIR}/external/tinyobj"
-    "${MDL_SDK_DIR}/include")
+    "${CMAKE_CURRENT_SOURCE_DIR}/external/tinyobj")
+if(MDL_SDK_DIR)
+    target_include_directories(prism_core PUBLIC "${MDL_SDK_DIR}/include")
+endif()
 get_target_property(PRISM_TBB_INCLUDE_DIRS TBB::tbb INTERFACE_INCLUDE_DIRECTORIES)
 target_include_directories(prism_core BEFORE PUBLIC ${PRISM_TBB_INCLUDE_DIRS})
 target_include_directories(prism_core PUBLIC ${PXR_INCLUDE_DIRS})
@@ -107,8 +167,23 @@ if(PRISM_COPY_ASSETS)
 endif()
 
 if(PRISM_BUILD_HYDRA)
+    set(PRISM_HYDRA_RESOURCES_DIR "${CMAKE_BINARY_DIR}/hydra/resources")
     add_subdirectory(src/hydra)
     enable_testing()
+    # Keep the original MaterialX compatibility regressions in clean builds.
+    add_subdirectory(tests "${CMAKE_BINARY_DIR}/materialx-tests")
+
+    set(_prism_test_environment "PXR_PLUGINPATH_NAME=${PRISM_HYDRA_RESOURCES_DIR}")
+    if(PRISM_MATERIALX_LIBRARY_PATH)
+        list(APPEND _prism_test_environment
+            "PRISM_MATERIALX_LIBRARY_PATH=${PRISM_MATERIALX_LIBRARY_PATH}")
+    endif()
+    if(PRISM_MATERIALX_MDL)
+        list(APPEND _prism_test_environment "PRISM_MATERIALX_MDL=${PRISM_MATERIALX_MDL}")
+    endif()
+    if(MDL_SDK_DIR)
+        list(APPEND _prism_test_environment "MDL_SDK_ROOT=${MDL_SDK_DIR}")
+    endif()
 
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/compare_images.cpp")
         add_executable(prism_compare_images tests/hydra/compare_images.cpp)
@@ -130,8 +205,7 @@ if(PRISM_BUILD_HYDRA)
                     "/World/Camera"
                     "${CMAKE_BINARY_DIR}/hydra/parity_hydra.exr"
                     128 128 16 --exercise)
-            set_tests_properties(prism_hydra_render_exercise PROPERTIES ENVIRONMENT
-                "PXR_PLUGINPATH_NAME=${CMAKE_BINARY_DIR}/hydra/resources;PRISM_MATERIALX_LIBRARY_PATH=${EXTERNAL_DEPS}/MaterialX/install/libraries;PRISM_MATERIALX_MDL=${EXTERNAL_DEPS}/MaterialX/install/libraries/mdl;MDL_SDK_ROOT=${MDL_SDK_DIR}")
+            set_tests_properties(prism_hydra_render_exercise PROPERTIES ENVIRONMENT "${_prism_test_environment}")
         endif()
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/materials_test.cpp")
@@ -140,8 +214,7 @@ if(PRISM_BUILD_HYDRA)
             src/hydra/materials.cpp)
         target_link_libraries(prism_hydra_materials_test PRIVATE PrismRT::core ${PXR_LIBRARIES})
         add_test(NAME prism_hydra_materials_test COMMAND prism_hydra_materials_test)
-        set_tests_properties(prism_hydra_materials_test PROPERTIES ENVIRONMENT
-            "PRISM_MATERIALX_LIBRARY_PATH=${EXTERNAL_DEPS}/MaterialX/install/libraries;PRISM_MATERIALX_MDL=${EXTERNAL_DEPS}/MaterialX/install/libraries/mdl;MDL_SDK_ROOT=${MDL_SDK_DIR}")
+        set_tests_properties(prism_hydra_materials_test PROPERTIES ENVIRONMENT "${_prism_test_environment}")
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/selection_filter_test.cpp")
         add_executable(prism_hydra_selection_filter_test
@@ -166,25 +239,149 @@ if(PRISM_BUILD_HYDRA)
         set_target_properties(prism_hydra_scene_bridge_test PROPERTIES
             RUNTIME_OUTPUT_DIRECTORY "$<1:${CMAKE_BINARY_DIR}/hydra/plugin>")
         add_test(NAME prism_hydra_scene_bridge_test COMMAND prism_hydra_scene_bridge_test)
-        set_tests_properties(prism_hydra_scene_bridge_test PROPERTIES ENVIRONMENT
-            "PRISM_MATERIALX_LIBRARY_PATH=${EXTERNAL_DEPS}/MaterialX/install/libraries;PRISM_MATERIALX_MDL=${EXTERNAL_DEPS}/MaterialX/install/libraries/mdl;MDL_SDK_ROOT=${MDL_SDK_DIR}")
+        set_tests_properties(prism_hydra_scene_bridge_test PROPERTIES ENVIRONMENT "${_prism_test_environment}")
+    endif()
+
+    add_executable(prism_hydra_render_buffer_test
+        tests/hydra/render_buffer_test.cpp src/hydra/render_buffer.cpp)
+    target_include_directories(prism_hydra_render_buffer_test PRIVATE ${PXR_INCLUDE_DIRS})
+    target_link_libraries(prism_hydra_render_buffer_test PRIVATE PrismRT::core hd ${PXR_LIBRARIES})
+    add_test(NAME prism_hydra_render_buffer_test COMMAND prism_hydra_render_buffer_test)
+    set_tests_properties(prism_hydra_render_buffer_test PROPERTIES ENVIRONMENT "${_prism_test_environment}")
+
+    add_executable(prism_material_generation_cache_test tests/material_generation_cache.cpp)
+    target_link_libraries(prism_material_generation_cache_test PRIVATE PrismRT::core)
+    add_test(NAME prism_material_generation_cache_test COMMAND prism_material_generation_cache_test)
+    set_tests_properties(prism_material_generation_cache_test PROPERTIES
+        ENVIRONMENT "${_prism_test_environment}" SKIP_RETURN_CODE 77)
+    add_executable(prism_captured_material_graph_test tests/captured_material_graph.cpp)
+    target_include_directories(prism_captured_material_graph_test PRIVATE ${PXR_INCLUDE_DIRS})
+    target_link_libraries(prism_captured_material_graph_test PRIVATE
+        PrismRT::core hd ${PXR_LIBRARIES})
+    add_test(NAME prism_captured_material_graph_test COMMAND prism_captured_material_graph_test)
+    set_tests_properties(prism_captured_material_graph_test PROPERTIES
+        ENVIRONMENT "${_prism_test_environment}")
+    add_executable(prism_generated_mdl_cache_test tests/generated_mdl_cache.cpp)
+    target_link_libraries(prism_generated_mdl_cache_test PRIVATE PrismRT::core)
+    add_test(NAME prism_generated_mdl_cache_test COMMAND prism_generated_mdl_cache_test)
+    set_tests_properties(prism_generated_mdl_cache_test PROPERTIES ENVIRONMENT "${_prism_test_environment}")
+    add_test(NAME prism_generated_mdl_fresh_process_test
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/generated_mdl_fresh_process.py"
+            $<TARGET_FILE:prism_material_generation_cache_test>)
+    set_tests_properties(prism_generated_mdl_fresh_process_test PROPERTIES
+        ENVIRONMENT "${_prism_test_environment}" SKIP_RETURN_CODE 77)
+    add_test(NAME prism_generated_mdl_concurrent_process_test
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/generated_mdl_concurrent_process.py"
+            $<TARGET_FILE:prism_generated_mdl_cache_test>)
+    set_tests_properties(prism_generated_mdl_concurrent_process_test PROPERTIES
+        ENVIRONMENT "${_prism_test_environment}")
+    add_executable(prism_texture_cache_benchmark tests/texture_cache_benchmark.cpp)
+    target_link_libraries(prism_texture_cache_benchmark PRIVATE PrismRT::core)
+
+    add_executable(prism_ray_footprint_test tests/ray_footprint.cpp)
+    target_link_libraries(prism_ray_footprint_test PRIVATE PrismRT::core)
+    add_test(NAME prism_ray_footprint_test COMMAND prism_ray_footprint_test)
+
+    add_executable(prism_mdl_texture_runtime_test tests/mdl_texture_runtime.cpp)
+    target_link_libraries(prism_mdl_texture_runtime_test PRIVATE PrismRT::core)
+    add_test(NAME prism_mdl_texture_runtime_test COMMAND prism_mdl_texture_runtime_test)
+    set_tests_properties(prism_mdl_texture_runtime_test PROPERTIES ENVIRONMENT "${_prism_test_environment}")
+
+    add_executable(prism_mdl_texture_target_test tests/mdl_texture_target.cpp)
+    target_link_libraries(prism_mdl_texture_target_test PRIVATE PrismRT::core)
+    add_test(NAME prism_mdl_texture_target_test COMMAND prism_mdl_texture_target_test)
+    set_tests_properties(prism_mdl_texture_target_test PROPERTIES ENVIRONMENT "${_prism_test_environment}")
+
+    add_executable(prism_texture_service_test tests/texture_service.cpp)
+    target_link_libraries(prism_texture_service_test PRIVATE PrismRT::core)
+    add_test(NAME prism_texture_service_test COMMAND prism_texture_service_test)
+
+    add_executable(prism_resolved_material_resource_test
+        tests/resolved_material_resource.cpp)
+    target_include_directories(prism_resolved_material_resource_test PRIVATE ${PXR_INCLUDE_DIRS})
+    target_link_libraries(prism_resolved_material_resource_test PRIVATE
+        PrismRT::core ${PXR_LIBRARIES})
+    add_test(NAME prism_resolved_material_resource_test
+        COMMAND prism_resolved_material_resource_test)
+    set_tests_properties(prism_resolved_material_resource_test PROPERTIES
+        ENVIRONMENT "${_prism_test_environment}")
+
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/environment_sampling.cpp")
+        add_executable(prism_environment_sampling_test tests/environment_sampling.cpp)
+        target_link_libraries(prism_environment_sampling_test PRIVATE PrismRT::core)
+        add_test(NAME prism_environment_sampling_test COMMAND prism_environment_sampling_test)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/camera_rays.cpp")
+        add_executable(prism_camera_rays_test tests/camera_rays.cpp)
+        target_link_libraries(prism_camera_rays_test PRIVATE PrismRT::core)
+        add_test(NAME prism_camera_rays_test COMMAND prism_camera_rays_test)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/render_cost_benchmark.cpp")
+        add_executable(prism_render_cost_benchmark
+            tests/render_cost_benchmark.cpp)
+        target_link_libraries(prism_render_cost_benchmark PRIVATE
+            PrismRT::core ${PXR_LIBRARIES})
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/environment_lighting.cpp")
+        add_executable(prism_environment_lighting_test tests/environment_lighting.cpp)
+        target_link_libraries(prism_environment_lighting_test PRIVATE PrismRT::core)
+        add_test(NAME prism_environment_lighting_test COMMAND prism_environment_lighting_test)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/scene_export_test.cpp")
+        add_executable(prism_usd_spheres_test tests/usd_spheres.cpp)
+        target_link_libraries(prism_usd_spheres_test PRIVATE PrismRT::core ${PXR_LIBRARIES})
+        add_test(NAME prism_usd_spheres_test COMMAND prism_usd_spheres_test)
+        add_executable(prism_standalone_material_reuse_test tests/standalone_material_reuse.cpp)
+        target_link_libraries(prism_standalone_material_reuse_test PRIVATE
+            PrismRT::core ${PXR_LIBRARIES})
+        add_test(NAME prism_standalone_material_reuse_test
+            COMMAND prism_standalone_material_reuse_test)
+        set_tests_properties(prism_standalone_material_reuse_test PROPERTIES
+            ENVIRONMENT "${_prism_test_environment}" SKIP_RETURN_CODE 77)
+        add_executable(prism_scene_export_test tests/scene_export_test.cpp)
+        target_link_libraries(prism_scene_export_test PRIVATE PrismRT::core ${PXR_LIBRARIES})
+        add_test(NAME prism_scene_export_test COMMAND prism_scene_export_test)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/material_loading_test.cpp")
         add_executable(prism_hydra_material_loading_test
             tests/hydra/material_loading_test.cpp src/hydra/materials.cpp)
         target_link_libraries(prism_hydra_material_loading_test PRIVATE PrismRT::core ${PXR_LIBRARIES})
         add_test(NAME prism_hydra_material_loading_test COMMAND prism_hydra_material_loading_test)
-        set_tests_properties(prism_hydra_material_loading_test PROPERTIES ENVIRONMENT
-            "PRISM_MATERIALX_LIBRARY_PATH=${EXTERNAL_DEPS}/MaterialX/install/libraries;PRISM_MATERIALX_MDL=${EXTERNAL_DEPS}/MaterialX/install/libraries/mdl;MDL_SDK_ROOT=${MDL_SDK_DIR}")
+        set_tests_properties(prism_hydra_material_loading_test PROPERTIES ENVIRONMENT "${_prism_test_environment}")
     endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/environment_sampling.cpp")
-        add_executable(prism_environment_sampling_test tests/environment_sampling.cpp)
-        target_link_libraries(prism_environment_sampling_test PRIVATE PrismRT::core)
-        add_test(NAME prism_environment_sampling_test COMMAND prism_environment_sampling_test)
-    endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/environment_lighting.cpp")
-        add_executable(prism_environment_lighting_test tests/environment_lighting.cpp)
-        target_link_libraries(prism_environment_lighting_test PRIVATE PrismRT::core)
-        add_test(NAME prism_environment_lighting_test COMMAND prism_environment_lighting_test)
+endif()
+
+# Test resources stay inside the build tree, independent of user cache state.
+get_property(_prism_tests DIRECTORY PROPERTY TESTS)
+foreach(_test IN LISTS _prism_tests)
+    set_property(TEST ${_test} APPEND PROPERTY ENVIRONMENT
+        "PRISM_CACHE_DIR=${CMAKE_BINARY_DIR}/test-cache")
+endforeach()
+
+include(GNUInstallDirs)
+install(TARGETS PrismRT RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
+install(FILES prism_env.ps1 run_usdview.ps1
+    DESTINATION "${CMAKE_INSTALL_BINDIR}")
+install(FILES "${CMAKE_BINARY_DIR}/prism-runtime.json"
+    DESTINATION "${CMAKE_INSTALL_BINDIR}")
+if(PRISM_INSTALL_ASSETS)
+    install(DIRECTORY assets/environment assets/materials assets/textures
+        DESTINATION "${CMAKE_INSTALL_BINDIR}/assets")
+endif()
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/assets/scenes")
+    install(DIRECTORY assets/scenes/
+        DESTINATION "${CMAKE_INSTALL_BINDIR}/assets/scenes")
+endif()
+if(PRISM_BUILD_HYDRA)
+    install(TARGETS hdPrism
+        RUNTIME DESTINATION "${CMAKE_INSTALL_LIBDIR}/usd/plugins/prism/plugin"
+        LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}/usd/plugins/prism/plugin")
+    install(FILES "${CMAKE_BINARY_DIR}/hydra/resources/plugInfo.json"
+        DESTINATION "${CMAKE_INSTALL_LIBDIR}/usd/plugins/prism/resources")
+    if(PRISM_INSTALL_USDVIEW_PLUGIN)
+        install(DIRECTORY tools/usdview_plugins/prismUsdview/
+            DESTINATION "${CMAKE_INSTALL_LIBDIR}/usd/plugins/prism/usdview_plugins/prismUsdview"
+            PATTERN "__pycache__" EXCLUDE
+            PATTERN "*.pyc" EXCLUDE)
     endif()
 endif()

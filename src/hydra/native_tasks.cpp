@@ -1,5 +1,6 @@
 #include "native_tasks.h"
 #include "scene_bridge.h"
+#include "render_buffer.h"
 #include "selection_settings.h"
 #include <pxr/imaging/hd/camera.h>
 #include <pxr/imaging/hd/renderIndex.h>
@@ -16,17 +17,41 @@
 #include <pxr/imaging/hdx/tokens.h>
 #include <pxr/imaging/cameraUtil/conformWindow.h>
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <set>
 #include <tuple>
 #include <map>
+#include <mutex>
 
 PXR_NAMESPACE_OPEN_SCOPE
 namespace {
 
-void AppendInstanceSelection(HdSceneIndexBaseRefPtr const& scene,
-    SdfPath path, HdSelectionSchema const& selection, std::set<int>* selected)
+class TaskTimer final {
+public:
+    TaskTimer(std::atomic<uint64_t> *nanoseconds,
+              std::atomic<uint64_t> *calls)
+        : nanoseconds(nanoseconds), calls(calls),
+          start(std::chrono::steady_clock::now()) {}
+    ~TaskTimer()
+    {
+        nanoseconds->fetch_add(static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - start).count()),
+            std::memory_order_relaxed);
+        calls->fetch_add(1, std::memory_order_relaxed);
+    }
+private:
+    std::atomic<uint64_t> *nanoseconds;
+    std::atomic<uint64_t> *calls;
+    std::chrono::steady_clock::time_point start;
+};
+
+void AppendInstanceSelection(
+    std::vector<prism::hydra::PickingTable::InstanceLevel> const &chain,
+    HdSelectionSchema const& selection, std::set<int>* selected)
 {
     std::map<SdfPath,std::set<int>> constraints;
     const auto nested = selection.GetNestedInstanceIndices();
@@ -36,72 +61,22 @@ void AppendInstanceSelection(HdSceneIndexBaseRefPtr const& scene,
         const auto values=level.GetInstanceIndices()->GetTypedValue(0);
         constraints[level.GetInstancer()->GetTypedValue(0)]={values.begin(),values.end()};
     }
-    struct Level { SdfPath path; VtIntArray indices; };
-    std::vector<Level> chain;
-    std::set<SdfPath> visited;
-    while (!path.IsEmpty() && visited.insert(path).second) {
-        const auto instanced=HdInstancedBySchema::GetFromParent(scene->GetPrim(path).dataSource);
-        if (!instanced.GetPaths()) break;
-        const auto paths=instanced.GetPaths()->GetTypedValue(0);
-        if (paths.empty()) break;
-        auto topology=HdInstancerTopologySchema::GetFromParent(scene->GetPrim(paths[0]).dataSource);
-        if (!topology) return;
-        auto indices=topology.ComputeInstanceIndicesForProto(path);
-        if (indices.empty()) return;
-        chain.push_back({paths[0],std::move(indices)});
-        path=paths[0];
-    }
     if (chain.empty()) return;
-    for (const auto& [instancer,indices] : constraints)
-        if (std::none_of(chain.begin(),chain.end(),[&](auto const& l){return l.path==instancer;})) return;
-    std::vector<int> flattened{0};
-    for (auto it=chain.rbegin();it!=chain.rend();++it) {
-        std::vector<int> next;
-        const auto constraint=constraints.find(it->path);
-        for (int parent : flattened) for (size_t ordinal=0;ordinal<it->indices.size();++ordinal) {
-            // HdInstanceIndicesSchema stores compact per-prototype ordinals.
-            // The instancer topology array contains authored source indices;
-            // only its size/radix is relevant when translating the selection
-            // to the flattened instance IDs written by SceneBridge.
-            if (constraint!=constraints.end() &&
-                !constraint->second.count(static_cast<int>(ordinal))) continue;
-            const uint64_t id=uint64_t(parent)*it->indices.size()+ordinal;
-            if (id>uint64_t(std::numeric_limits<int>::max())) return;
-            next.push_back(int(id));
-        }
-        flattened=std::move(next);
-    }
-    selected->insert(flattened.begin(),flattened.end());
+    auto translated = prism::hydra::TranslatePickingInstanceSelection(
+        chain, constraints, false);
+    selected->insert(translated.begin(), translated.end());
 }
 
 void AppendUsdviewSelection(
-    HdSceneIndexBaseRefPtr const& scene,
-    SdfPath path,
+    std::vector<prism::hydra::PickingTable::InstanceLevel> const &chain,
+    SdfPath const &path,
     std::map<SdfPath, std::set<int>> const& selections,
     std::set<int>* selected,
     bool* fullySelected,
     bool* constrainedByIndexedSelection,
     bool* constrainedByWholeSelection)
 {
-    struct Level { SdfPath path; VtIntArray sourceIndices; };
-    std::vector<Level> chain;
-    std::set<SdfPath> visited;
-    SdfPath current = path;
-    while (!current.IsEmpty() && visited.insert(current).second) {
-        const auto instanced = HdInstancedBySchema::GetFromParent(
-            scene->GetPrim(current).dataSource);
-        if (!instanced.GetPaths()) break;
-        const auto paths = instanced.GetPaths()->GetTypedValue(0);
-        if (paths.empty()) break;
-        auto topology = HdInstancerTopologySchema::GetFromParent(
-            scene->GetPrim(paths[0]).dataSource);
-        if (!topology) break;
-        auto indices = topology.ComputeInstanceIndicesForProto(current);
-        if (indices.empty()) break;
-        chain.push_back({paths[0], std::move(indices)});
-        current = paths[0];
-    }
-
+    if (selections.empty()) return;
     // A whole authored prim selection applies to renderable descendants.
     for (const auto& [selectionPath, indices] : selections) {
         if (indices.count(-1) && path.HasPrefix(selectionPath)) {
@@ -113,10 +88,8 @@ void AppendUsdviewSelection(
     if (chain.empty()) return;
 
     bool constrained = false;
-    std::vector<int> flattened{0};
-    for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
-        std::vector<int> next;
-        const auto constraint = selections.find(it->path);
+    for (auto const &level : chain) {
+        const auto constraint = selections.find(level.instancerPath);
         constrained = constrained || constraint != selections.end();
         if (constraint != selections.end()) {
             if (constraint->second.count(-1))
@@ -124,43 +97,89 @@ void AppendUsdviewSelection(
             else
                 *constrainedByIndexedSelection = true;
         }
-        for (int parent : flattened) {
-            for (size_t ordinal = 0; ordinal < it->sourceIndices.size(); ++ordinal) {
-                if (constraint != selections.end() &&
-                    !constraint->second.count(-1) &&
-                    !constraint->second.count(it->sourceIndices[ordinal]))
-                    continue;
-                const uint64_t id = uint64_t(parent) * it->sourceIndices.size() + ordinal;
-                if (id > uint64_t(std::numeric_limits<int>::max())) return;
-                next.push_back(int(id));
-            }
-        }
-        flattened = std::move(next);
     }
-    if (constrained)
-        selected->insert(flattened.begin(), flattened.end());
+    if (constrained) {
+        auto translated = prism::hydra::TranslatePickingInstanceSelection(
+            chain, selections, true);
+        selected->insert(translated.begin(), translated.end());
+    }
 }
 
 // Hdx's compositor is reusable; only its legacy Rprim-ID encoding is replaced.
 class NativeSelectionTracker final : public HdxSelectionTracker {
 public:
+    std::shared_ptr<const prism::hydra::PublishedFrame> frame;
     NativeSelectionTracker(HdSceneIndexBaseRefPtr scene,
                            std::shared_ptr<prism::hydra::TaskContext> context)
         : scene(std::move(scene)), context(std::move(context)) {}
-    void UpdateSelection(HdRenderIndex*) override { _IncrementVersion(); }
+    void SetInputs(
+        std::shared_ptr<const prism::hydra::PublishedFrame> nextFrame,
+        HdxSelectionTrackerSharedPtr const &source,
+        bool selectEnabled, bool locateEnabled)
+    {
+        std::lock_guard lock(cacheMutex);
+        const uint64_t sourceVersion = source ? source->GetVersion() : 0;
+        const uint64_t sceneRevision =
+            context->selectionSceneRevision.load(std::memory_order_relaxed);
+        const uint64_t settingsRevision =
+            context->selectionSettings->revision.load(std::memory_order_relaxed);
+        const uint64_t topologyRevision =
+            context->instanceTopologyRevision.load(std::memory_order_relaxed);
+        auto const nextPicking = nextFrame ? nextFrame->picking : nullptr;
+        const bool pickingChanged = nextPicking != picking;
+        const bool changed = pickingChanged || source != sourceTracker ||
+            sourceVersion != sourceTrackerVersion ||
+            sceneRevision != cachedSceneRevision ||
+            settingsRevision != cachedSettingsRevision ||
+            selectEnabled != cachedSelectEnabled ||
+            locateEnabled != cachedLocateEnabled;
+        frame = std::move(nextFrame);
+        if (pickingChanged) pickingTopologyRevision = topologyRevision;
+        topologyStale = topologyRevision != pickingTopologyRevision;
+        if (!changed) return;
+        picking = std::move(nextPicking);
+        sourceTracker = source;
+        sourceTrackerVersion = sourceVersion;
+        cachedSceneRevision = sceneRevision;
+        cachedSettingsRevision = settingsRevision;
+        cachedSelectEnabled = selectEnabled;
+        cachedLocateEnabled = locateEnabled;
+        SetSelection(source ? source->GetSelectionMap() : HdSelectionSharedPtr());
+        for (CacheEntry &entry : cache) entry.valid = false;
+        _IncrementVersion();
+    }
+    void UpdateSelection(HdRenderIndex*) override {}
     bool GetSelectionOffsetBuffer(HdRenderIndex const*, bool select, bool locate,
                                   VtIntArray* output) const override {
+        TaskTimer timer(&context->selectionOffsetNanoseconds,
+                        &context->selectionOffsetCalls);
+        std::lock_guard lock(cacheMutex);
+        const size_t cacheIndex = (select ? 1u : 0u) | (locate ? 2u : 0u);
+        CacheEntry &cached = cache[cacheIndex];
+        if (cached.valid) {
+            context->selectionOffsetCacheHits.fetch_add(
+                1, std::memory_order_relaxed);
+            *output = cached.data;
+            return cached.any;
+        }
+        context->selectionOffsetCacheMisses.fetch_add(
+            1, std::memory_order_relaxed);
+        // Hdx invokes this from the render-index task thread. Cache misses may
+        // traverse live selection and instancer data here; no background
+        // snapshot worker calls this tracker.
         prism::hydra::SceneBridge * const bridge = context->bridge.load();
         if (!bridge) {
             output->clear();
             return false;
         }
-        std::vector<SdfPath> paths;
-        for (int id = 0; ; ++id) {
-            auto path = bridge->GetPrimPath(id);
-            if (path.IsEmpty()) break;
-            paths.push_back(path);
-        }
+        const std::vector<SdfPath> paths = frame && frame->picking
+            ? frame->picking->primPaths : std::vector<SdfPath>{};
+        context->selectionPathsVisited.fetch_add(
+            static_cast<uint64_t>(paths.size()) *
+                static_cast<uint64_t>(select) +
+            static_cast<uint64_t>(paths.size()) *
+                static_cast<uint64_t>(locate),
+            std::memory_order_relaxed);
         std::vector<int> data{2,0,0};
         bool any = false;
         const auto legacy = GetSelectionMap();
@@ -182,6 +201,11 @@ public:
             data.push_back(0); data.push_back(int(paths.size()));
             data.resize(data.size()+paths.size(),0);
             for (size_t id = 0; id < paths.size(); ++id) {
+                static const std::vector<
+                    prism::hydra::PickingTable::InstanceLevel> emptyTopology;
+                auto const &instanceTopology = frame && frame->picking &&
+                    id < frame->picking->instanceTopologies.size()
+                    ? frame->picking->instanceTopologies[id] : emptyTopology;
                 bool full = false;
                 bool constrainedByIndexedSelection = false;
                 bool constrainedByWholeSelection = false;
@@ -196,7 +220,7 @@ public:
                 if (mode == 0) {
                     if (usdviewActive) {
                         AppendUsdviewSelection(
-                            scene, paths[id], usdviewSelection,
+                            instanceTopology, paths[id], usdviewSelection,
                             &instances, &full,
                             &constrainedByIndexedSelection,
                             &constrainedByWholeSelection);
@@ -219,8 +243,9 @@ public:
                             auto selection = selections.GetElement(j);
                             auto nested = selection.GetNestedInstanceIndices();
                             if (nested.GetNumElements()) {
-                                AppendInstanceSelection(
-                                    scene,paths[id],selection,&instances);
+                                if (!topologyStale)
+                                    AppendInstanceSelection(
+                                        instanceTopology, selection, &instances);
                             } else if (auto selected = selection.GetFullySelected()) {
                                 full = full || selected->GetTypedValue(0);
                             }
@@ -255,12 +280,31 @@ public:
             }
         }
         data.resize(std::max(size_t(8),data.size()),0);
-        *output = VtIntArray(data.begin(),data.end());
-        return any;
+        cached.data = VtIntArray(data.begin(),data.end());
+        cached.any = any;
+        cached.valid = true;
+        *output = cached.data;
+        return cached.any;
     }
 private:
+    struct CacheEntry {
+        bool valid = false;
+        bool any = false;
+        VtIntArray data;
+    };
     HdSceneIndexBaseRefPtr scene;
     std::shared_ptr<prism::hydra::TaskContext> context;
+    mutable std::mutex cacheMutex;
+    mutable std::array<CacheEntry, 4> cache;
+    std::shared_ptr<const prism::hydra::PickingTable> picking;
+    HdxSelectionTrackerSharedPtr sourceTracker;
+    uint64_t sourceTrackerVersion = 0;
+    uint64_t cachedSceneRevision = 0;
+    uint64_t cachedSettingsRevision = 0;
+    bool cachedSelectEnabled = false;
+    bool cachedLocateEnabled = false;
+    uint64_t pickingTopologyRevision = 0;
+    bool topologyStale = false;
 };
 
 class NativeSelectionTask final : public HdxColorizeSelectionTask {
@@ -271,12 +315,37 @@ public:
         : HdxColorizeSelectionTask(delegate,id),
           tracker(std::make_shared<NativeSelectionTracker>(scene,context)),
           taskContext(context), sceneDelegate(delegate) {}
+    ~NativeSelectionTask() override { Unpin(); }
+    void Execute(HdTaskContext* context) override {
+        HdxColorizeSelectionTask::Execute(context);
+        Unpin();
+    }
     bool IsConverged() const override {
         return (!primId || primId->IsConverged()) &&
                (!instanceId || instanceId->IsConverged()) &&
                (!elementId || elementId->IsConverged());
     }
     void Prepare(HdTaskContext* context, HdRenderIndex* index) override {
+        Unpin();
+        std::shared_ptr<const prism::hydra::PublishedFrame> selectedFrame;
+        // Pin one coherent published frame through all Hdx Execute calls.
+        // Nested Map calls made by Hdx upload/selection see these same pixels,
+        // while render workers can continue publishing later generations.
+        if(auto* bridge=taskContext->bridge.load()) {
+            for(int attempt=0;attempt<2;++attempt) {
+                pinned=bridge->GetRenderBuffers();
+                bool consistent=!pinned.empty();
+                std::shared_ptr<const prism::hydra::PublishedFrame> frame;
+                for(auto* buffer:pinned) buffer->Map();
+                for(auto* buffer:pinned) {
+                    const auto captured=buffer->Capture();
+                    if(!frame) frame=captured.frame;
+                    if(!captured.frame || captured.frame!=frame) consistent=false;
+                }
+                if(consistent) { selectedFrame=std::move(frame); break; }
+                Unpin();
+            }
+        }
         // HdRenderDelegate::Update runs from inside SyncAll, where emitting a
         // scene-index dirty notice is forbidden.  Refresh these lightweight
         // presentation parameters directly before Prepare instead.  The
@@ -291,8 +360,12 @@ public:
         auto it = context->find(HdxTokens->selectionState);
         const bool hadOriginal = it != context->end();
         VtValue original = hadOriginal ? it->second : VtValue();
+        HdxSelectionTrackerSharedPtr sourceTracker;
         if (original.IsHolding<HdxSelectionTrackerSharedPtr>())
-            tracker->SetSelection(original.UncheckedGet<HdxSelectionTrackerSharedPtr>()->GetSelectionMap());
+            sourceTracker = original.UncheckedGet<HdxSelectionTrackerSharedPtr>();
+        tracker->SetInputs(std::move(selectedFrame), sourceTracker,
+                           params.enableSelectionHighlight,
+                           params.enableLocateHighlight);
         (*context)[HdxTokens->selectionState] = VtValue(HdxSelectionTrackerSharedPtr(tracker));
         HdxColorizeSelectionTask::Prepare(context,index);
         primId = dynamic_cast<HdRenderBuffer*>(index->GetBprim(
@@ -315,6 +388,11 @@ protected:
             selectionRevision = taskContext->selectionSettings->revision.load();
     }
 private:
+    void Unpin() {
+        for(auto* buffer:pinned) buffer->Unmap();
+        pinned.clear();
+    }
+    std::vector<PrismRenderBuffer*> pinned;
     std::shared_ptr<NativeSelectionTracker> tracker;
     std::shared_ptr<prism::hydra::TaskContext> taskContext;
     HdSceneDelegate* sceneDelegate;
@@ -325,14 +403,16 @@ private:
     HdRenderBuffer *elementId = nullptr;
 };
 
-template<class T> std::vector<T> ReadBuffer(HdRenderBuffer* buffer, HdFormat format) {
-    if (!buffer || buffer->GetFormat() != format) return {};
-    buffer->Resolve();
-    const T* data = static_cast<const T*>(buffer->Map());
-    std::vector<T> result;
-    if (data) result.assign(data,data+size_t(buffer->GetWidth())*buffer->GetHeight()*HdGetComponentCount(format));
-    buffer->Unmap();
-    return result;
+PrismRenderBuffer::ReadView CaptureBuffer(HdRenderBuffer* buffer) {
+    auto* native=dynamic_cast<PrismRenderBuffer*>(buffer);
+    return native ? native->Capture() : PrismRenderBuffer::ReadView{};
+}
+template<class T> std::vector<T> ReadBuffer(PrismRenderBuffer::ReadView const& view, HdFormat format) {
+    if(view.format!=format || !view.pixels) return {};
+    const size_t count=size_t(view.width)*view.height*HdGetComponentCount(format);
+    if(view.pixels->size()<count*sizeof(T)) return {};
+    const T* data=reinterpret_cast<const T*>(view.pixels->data());
+    return std::vector<T>(data,data+count);
 }
 
 class NativePickTask final : public HdxTask {
@@ -348,22 +428,26 @@ public:
         camera = dynamic_cast<HdCamera*>(index->GetSprim(HdPrimTypeTokens->camera,params.cameraId));
     }
     void Execute(HdTaskContext*) override {
+        TaskTimer timer(&context->pickNanoseconds, &context->pickCalls);
         prism::hydra::SceneBridge * const bridge = context->bridge.load();
         if (!bridge || !pick.outHits || !prim || !depth || !camera) return;
         if ((pick.pickTarget != HdxPickTokens->pickPrimsAndInstances && pick.pickTarget != HdxPickTokens->pickFaces) ||
             pick.resolveMode == HdxPickTokens->resolveDeep) {
             TF_WARN("PrismRT supports visible prim, instance and face picking only"); return;
         }
-        const auto ids=ReadBuffer<int>(prim,HdFormatInt32), instances=ReadBuffer<int>(instance,HdFormatInt32),
-                   elements=ReadBuffer<int>(element,HdFormatInt32);
-        const auto depths=ReadBuffer<float>(depth,HdFormatFloat32), normals=ReadBuffer<float>(normal,HdFormatFloat32Vec3);
+        const auto primView=CaptureBuffer(prim), instanceView=CaptureBuffer(instance),
+            elementView=CaptureBuffer(element), depthView=CaptureBuffer(depth), normalView=CaptureBuffer(normal);
+        const auto frame=primView.frame;
+        if(!frame || !frame->picking || depthView.frame!=frame ||
+           (instance && instanceView.frame!=frame) || (element && elementView.frame!=frame) ||
+           (normal && normalView.frame!=frame)) return;
+        const auto ids=ReadBuffer<int>(primView,HdFormatInt32), instances=ReadBuffer<int>(instanceView,HdFormatInt32),
+                   elements=ReadBuffer<int>(elementView,HdFormatInt32);
+        const auto depths=ReadBuffer<float>(depthView,HdFormatFloat32), normals=ReadBuffer<float>(normalView,HdFormatFloat32Vec3);
         if (ids.empty() || depths.size()!=ids.size()) return;
-        const int w=int(prim->GetWidth()),h=int(prim->GetHeight());
-        const auto policy=params.overrideWindowPolicy.value_or(camera->GetWindowPolicy());
-        const GfMatrix4d projection=params.framing.IsValid()
-            ? params.framing.ApplyToProjectionMatrix(camera->ComputeProjectionMatrix(),policy)
-            : CameraUtilConformedWindow(camera->ComputeProjectionMatrix(),policy, double(w)/std::max(h,1));
-        const GfMatrix4d view=camera->GetTransform().GetInverse();
+        const int w=int(primView.width),h=int(primView.height);
+        const GfMatrix4d projection=frame->camera.projection;
+        const GfMatrix4d view=frame->camera.worldToView;
         const GfMatrix4d toWorld=(view*projection).GetInverse();
         const GfMatrix4d toPick=pick.viewMatrix*pick.projectionMatrix;
         std::set<std::tuple<int,int,int>> seen;
@@ -376,9 +460,11 @@ public:
             const GfVec3d ndc=toPick.Transform(world);
             if(std::abs(ndc[0])>1 || std::abs(ndc[1])>1 || std::abs(ndc[2])>1) continue;
             HdxPickHit hit{};
-            hit.objectId=bridge->GetPrimPath(ids[i]);
+            if(size_t(ids[i])>=frame->picking->primPaths.size()) continue;
+            hit.objectId=frame->picking->primPaths[ids[i]];
             if(hit.objectId.IsEmpty()) continue;
-            hit.instancerId=bridge->GetInstancerPath(ids[i]);
+            if(size_t(ids[i])<frame->picking->instancerPaths.size())
+                hit.instancerId=frame->picking->instancerPaths[ids[i]];
             const auto matches = [&](SdfPath const& root) {
                 return hit.objectId.HasPrefix(root) ||
                     (!hit.instancerId.IsEmpty() && hit.instancerId.HasPrefix(root));
@@ -400,7 +486,7 @@ public:
             hit.worldSpaceHitPoint=world;
             hit.normalizedDepth=depths[i];
             if(normals.size()==ids.size()*3)
-                hit.worldSpaceHitNormal=GfVec3f(camera->GetTransform().TransformDir(GfVec3d(normals[i*3],normals[i*3+1],normals[i*3+2])));
+                hit.worldSpaceHitNormal=GfVec3f(view.GetInverse().TransformDir(GfVec3d(normals[i*3],normals[i*3+1],normals[i*3+2])));
             const double metric=pick.resolveMode==HdxPickTokens->resolveNearestToCenter
                 ? ndc[0]*ndc[0]+ndc[1]*ndc[1] : double(depths[i]);
             if(metric<best) {best=metric;nearest=hit;}

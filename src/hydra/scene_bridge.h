@@ -1,5 +1,7 @@
 #pragma once
 
+#include "../texture_service.h"
+
 #include "pxr/base/gf/matrix4d.h"
 #include "pxr/base/gf/vec4f.h"
 #include "pxr/imaging/hd/aov.h"
@@ -11,10 +13,12 @@
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+#include <vector>
 
 PXR_NAMESPACE_OPEN_SCOPE
 class HdRenderThread;
 class PrismRenderBuffer;
+class HdRenderBuffer;
 PXR_NAMESPACE_CLOSE_SCOPE
 
 namespace prism::hydra {
@@ -25,9 +29,14 @@ struct RenderSettings {
     int rouletteDepth = 4;
     int seed = 0;
     float sampleClamp = 10.0f;
+    bool adaptivePreview = true;
+    int previewTargetMs = 33;
     int previewMaxDimension = 96;
     int refinementDelayMs = 100;
     int resourceRevision = 0;
+    bool sphereBatching = false;
+    prism::TextureFiltering textureFiltering =
+        prism::TextureFiltering::Filtered;
     enum class EnvironmentSampling { Mis, Bsdf } environmentSampling =
         EnvironmentSampling::Mis;
 };
@@ -53,6 +62,25 @@ struct CameraState {
     bool orthographic = false;
 };
 
+struct PickingTable {
+    struct InstanceLevel {
+        pxr::SdfPath instancerPath;
+        std::vector<int> sourceIndicesByOrdinal;
+    };
+    std::vector<pxr::SdfPath> primPaths;
+    std::vector<pxr::SdfPath> instancerPaths;
+    std::vector<std::vector<InstanceLevel>> instanceTopologies;
+};
+
+struct PublishedFrame {
+    uint64_t generation = 0;
+    uint64_t cameraRevision = 0;
+    std::shared_ptr<const PickingTable> picking;
+    CameraState camera;
+    unsigned int width = 0;
+    unsigned int height = 0;
+};
+
 class SceneBridge final
 {
 public:
@@ -65,6 +93,7 @@ public:
 
     void MarkSceneDirty();
     void MarkSceneDirty(SceneDirtyKind kind, pxr::SdfPath const &path = {});
+    void MarkScenePathsDirty(SceneDirtyKind kind, pxr::SdfPathVector const &paths);
     void SetSettings(RenderSettings const &settings);
     RenderSettings GetSettings() const;
     bool Prepare(CameraState const &camera,
@@ -75,6 +104,8 @@ public:
     bool IsConverged() const { return _converged.load(); }
     pxr::SdfPath GetPrimPath(int primId) const;
     pxr::SdfPath GetInstancerPath(int primId) const;
+    std::vector<pxr::PrismRenderBuffer *> GetRenderBuffers() const;
+    void RemoveRenderBuffer(pxr::HdRenderBuffer *buffer);
     pxr::VtDictionary GetStats() const;
 
 private:

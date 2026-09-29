@@ -1,10 +1,15 @@
 build/
+build-fresh-validation/
+build-round3-clean/
+local/
+install/
 vcpkg_installed
 .vscode
 vcpkg-configuration.json
 output*
 *_old.*
 vcpkg/
-build_script.bat
+prism_local_env.ps1
+cmake/PrismLocalDependencies.cmake
 __pycache__/
 *.py[cod]

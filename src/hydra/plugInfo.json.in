@@ -4,7 +4,7 @@
       "Type": "library",
       "Name": "hdPrism",
       "Root": "..",
-      "LibraryPath": "plugin/hdPrism.dll",
+      "LibraryPath": "plugin/@PRISM_HYDRA_LIBRARY_FILE@",
       "ResourcePath": "resources",
       "Info": {
         "Types": {

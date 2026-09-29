@@ -6,7 +6,11 @@
 
 PrismRT is a CPU-based Path Tracer with support for rendering OpenUSD, glTF and OBJ files, powered by the Embree Ray Tracing framework, the oneTBB threading library and the OpenImageIO image processing library.
 
-Lorem ipsum dolor sit amet, consectetur adipiscing elit. Suspendisse congue ultricies sollicitudin. Aliquam erat volutpat. Quisque pellentesque velit vitae efficitur commodo. Sed tincidunt mollis tellus sit amet euismod. Maecenas blandit a nisl non rutrum. Integer pellentesque sem at dictum facilisis. Maecenas consequat porta justo, eu faucibus velit auctor in. Fusce mollis justo neque, aliquam bibendum urna accumsan at. In hac habitasse platea dictumst. Vivamus lorem dui, tempus vel diam eu, mollis hendrerit mi. Morbi euismod, tortor quis facilisis venenatis, diam massa pretium libero, sollicitudin placerat libero orci eget ex. Ut consectetur purus et sagittis sodales. Duis ut scelerisque mi, eget egestas tortor. Suspendisse a vehicula odio, id mollis felis. Nam elementum nisi at pellentesque iaculis.
+The optional PrismRT Hydra plugin renders in stock OpenUSD 26.05 usdview. Both frontends use the same CPU transport and MaterialX-to-MDL shading backend. See [Hydra usage](docs/hydra.md), [material support](docs/hydra_materials.md), and [Windows deployment](docs/deployment.md).
+
+See [texture cache configuration](docs/texture_service.md) and the
+[validation report](docs/round3_validation.md) for measured performance,
+standalone/Hydra image comparisons, and remaining acceptance work.
 
 
 ✅ Feature List
@@ -27,32 +31,36 @@ Lorem ipsum dolor sit amet, consectetur adipiscing elit. Suspendisse congue ultr
 ⚠️ System Requirements
 ---------------------------------------
 
-* Proin facilisis justo eget ligula sodales, id posuere enim aliquet.
-* Praesent sagittis tellus id tellus porttitor molestie.
-* Donec laoreet nisl id feugiat convallis.
-* Aenean eget dui vel nibh vulputate facilisis.
+* Windows x64 and a C++20 compiler (Visual Studio 2022).
+* One stock OpenUSD 26.05 installation, with Python, imaging and GL enabled for usdview.
+* Embree 4, oneTBB, OpenImageIO, MaterialX and the NVIDIA MDL SDK.
+* Matching development packages for dependencies required by the selected USD build, including OpenSubdiv.
 
 
 🛠️ Build Instructions (WIP)
 ---------------------------------------
 
-1. Clone this repo. Make sure to use the recursive flag: `git clone https://github.com/joaovbs96/prism-rt.git --recursive`
-2. cd into the repo folder.
-3. [Install the latest CMake release](https://cmake.org/download/).
-4. Install vcpkg:
-    1. Clone the vcpkg repo: `git clone https://github.com/microsoft/vcpkg.git`
-    2. Perform the initial vcpkg setup: `.\vcpkg\bootstrap-vcpkg.bat`
-    3. Install vcpkg dependencies: `.\vcpkg\vcpkg.exe install`
-5. Download and extract the newest Embree v4.X release into `external\embree`
-    * Note: if your version number is different than the one in the `.vscode\settings.json` file, you will need to update the path to the folder containing the `.cmake` files for Embree. For example, if your Embree version is v4.4.0, your cmake path will be: `${workspaceRoot}\external\embree\lib\cmake\embree-4.4.0`
-6. Download and extract the newest oneTBB release into `external\tbb`
-7. Build USD. Make sure to put its /bin and /lib subfolders into the PATH variable before running PrismRT.
+1. Clone this repository recursively to fetch the importer dependencies.
+2. Build or select the dependency installations. PrismRT does not bundle SDKs or patch USD.
+3. Copy `cmake/PrismLocalDependencies.cmake.example` to `cmake/PrismLocalDependencies.cmake` and fill in package roots, or use standard `CMAKE_PREFIX_PATH` discovery.
+4. Run `cmake --preset prism-hydra`, then `cmake --build --preset prism-hydra`.
+5. Launch `powershell -ExecutionPolicy Bypass -File run_usdview.ps1 path/to/scene.usda` and select **PrismRT**.
+
+For standalone rendering, initialize the same environment with `. ./prism_env.ps1`, then run:
+
+```powershell
+./build/RelWithDebInfo/PrismRT.exe --export-scene InOneWeekend --seed 0 --output scene.usda
+./build/RelWithDebInfo/PrismRT.exe --scene scene.usda --camera /World/Camera --spp 256 --output render.exr
+```
+
+No arguments display CLI help. USD, glTF/GLB and OBJ scene files are supported; rendering requires an explicit camera source. EXRs retain linear HDR values after the configurable sample clamp. Use `--max-sample-radiance 0` for energy/variance measurements. Local asset launchers belong in ignored `local/`; a template is provided under `tools/templates/`.
 
 
 🐛 Known Issues & Limitations
 ---------------------------------------
 
-* Currently, no error check is performed to check if files are present or not. A file not being present will cause the application to crash.
+* Curves, volumes, displacement, motion blur, subdivision refinement, and analytic-light/emissive-mesh sampling are not implemented.
+* Legacy rough-metal and glTF samplers remain BSDF-only when no matching PDF is available.
 * The setPosition method of AABBs doesn't set correctly the position, if it's not initially in zero.
 
 

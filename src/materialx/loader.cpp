@@ -14,6 +14,25 @@ bool VerboseMdl() {
     const char* value = std::getenv("PRISM_MDL_VERBOSE");
     return value && *value && std::string_view(value) != "0";
 }
+
+void AttachLibrary(const MaterialX::DocumentPtr& doc,
+                   const MaterialX::DocumentPtr& library)
+{
+    if (!doc || !library) return;
+
+    // A data-library reference avoids deep-copying the complete standard
+    // library into every material.  importLibrary gives authored top-level
+    // elements precedence, whereas data-library lookup checks the library
+    // first, so retain the copying path for the uncommon override case.
+    for (const auto& child : library->getChildren()) {
+        const std::string name = child->getQualifiedName(child->getName());
+        if (doc->getChild(name)) {
+            doc->importLibrary(library);
+            return;
+        }
+    }
+    doc->setDataLibrary(library);
+}
 }
 
 DocumentLoader::DocumentLoader(MaterialX::DocumentPtr stdlib, bool clamp,
@@ -138,9 +157,9 @@ MaterialX::DocumentPtr DocumentLoader::load(const std::string& filepath)
             }
         }
 
-        // Import after preprocessing: shared standard-library graphs retain their
-        // original behavior. Validate the final document used for generation.
-        doc->importLibrary(m_stdlib);
+        // Attach after preprocessing so shared standard-library graphs retain
+        // their original behavior. Validate the final document used for generation.
+        AttachLibrary(doc, m_stdlib);
         std::string validation_errors;
         if (!doc->validate(&validation_errors)) {
             std::cerr << "[WARN] Document validation issues: " << validation_errors << "\n";
@@ -155,6 +174,6 @@ MaterialX::DocumentPtr DocumentLoader::load(const std::string& filepath)
 MaterialX::DocumentPtr DocumentLoader::create_empty()
 {
     MaterialX::DocumentPtr doc = MaterialX::createDocument();
-    doc->importLibrary(m_stdlib);
+    AttachLibrary(doc, m_stdlib);
     return doc;
 }

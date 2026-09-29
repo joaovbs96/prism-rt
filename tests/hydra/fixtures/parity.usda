@@ -52,6 +52,9 @@ def Xform "World"
 
     def DomeLight "Environment"
     {
+        # UsdShade's NodeDefAPI default is "id"; author it explicitly because
+        # this UsdLux dome is also queried through that API during usdview.
+        uniform token info:implementationSource = "id"
         asset inputs:texture:file = @environment.ppm@
         token inputs:texture:format = "latlong"
         color3f inputs:color = (1,1,1)

@@ -10,7 +10,7 @@ PrismRT is a CPU-based physically-based path tracer written in C++20. It renders
 
 **Requirements:** CMake 3.20+, Visual Studio 2022, vcpkg (`VCPKG_ROOT` env var set; `vcpkg.json` provides OpenImageIO etc.)
 
-**External dependencies (not in repo, paths pinned in `CMakeLists.txt` under `C:/Users/joaov/Desktop/Programming_Projects`, overridable with `-D`):**
+**External dependencies (not in repo; use CMake package discovery, `-D` overrides, or the ignored `cmake/PrismLocalDependencies.cmake`):**
 - Embree v4.x → `embree_DIR` (`Embree/build/Release`)
 - oneTBB → `TBB_DIR` (`include/tbb/lib/cmake/tbb`)
 - OpenUSD → `pxr_DIR` (`external_deps/OpenUSD/install`)

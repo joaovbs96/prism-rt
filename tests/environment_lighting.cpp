@@ -45,6 +45,7 @@ int main() {
             float v=(x==12 && y==7) ? 1000.f : .02f;
             const float pixel[3]={v,v,v}; texture.buffer.setpixel(x,y,pixel);
         }
+        texture.publishEdits();
         EnvironmentMap sky(&texture,Color3(1));
         ColorTexture gray(Color3(.5f)); Diffuse diffuse(&gray);
         Fixture fixture;

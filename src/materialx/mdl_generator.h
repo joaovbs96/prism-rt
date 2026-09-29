@@ -6,11 +6,23 @@
 #include <string>
 #include <vector>
 
+struct GeneratedUniform {
+    std::string name;
+    std::string path;
+    std::string type;
+    MaterialX::ValuePtr value;
+};
+
 struct GeneratedMDL {
     std::string module_name;
     std::string mdl_source;
     std::vector<std::string> texture_paths;
+    // Generator-published mapping used only after the backend validates the
+    // corresponding compiled parameter name and exact MDL type.
+    std::vector<GeneratedUniform> uniforms;
     bool success;
+    bool generationCacheHit = false;
+    bool generationPersistentCacheHit = false;
     std::string error_message;
 };
 

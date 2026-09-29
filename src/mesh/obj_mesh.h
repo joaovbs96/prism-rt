@@ -62,17 +62,20 @@ class ObjMesh : public Mesh {
                     make_Float3<std::vector<tinyobj::real_t>>(vertices, attrib.vertices, idx1.vertex_index);
                     make_Float3<std::vector<tinyobj::real_t>>(vertices, attrib.vertices, idx2.vertex_index);
 
-                    // get the normal coordinates
-                    make_Float3<std::vector<tinyobj::real_t>>(normals, attrib.normals, idx0.normal_index);
-                    make_Float3<std::vector<tinyobj::real_t>>(normals, attrib.normals, idx1.normal_index);
-                    make_Float3<std::vector<tinyobj::real_t>>(normals, attrib.normals, idx2.normal_index);
-
-                    // // get the vertex tex coordinates
-                    make_Float2<std::vector<tinyobj::real_t>>(texcoords, attrib.texcoords, idx0.texcoord_index);
-                    make_Float2<std::vector<tinyobj::real_t>>(texcoords, attrib.texcoords, idx1.texcoord_index);
-                    make_Float2<std::vector<tinyobj::real_t>>(texcoords, attrib.texcoords, idx2.texcoord_index);
+                    const Float3 geometric = cross(vertices[vertices.size()-2]-vertices[vertices.size()-3],
+                        vertices.back()-vertices[vertices.size()-3]).normalize();
+                    for (const auto& corner : {idx0, idx1, idx2}) {
+                        if (corner.normal_index >= 0)
+                            make_Float3(normals, attrib.normals, corner.normal_index);
+                        else normals.push_back(geometric);
+                        if (corner.texcoord_index >= 0)
+                            make_Float2(texcoords, attrib.texcoords, corner.texcoord_index);
+                        else texcoords.emplace_back(0, 0);
+                    }
 
                     // set index vector
+                    indices.push_back(index++);
+                    indices.push_back(index++);
                     indices.push_back(index++);
 
                     // per-face material
@@ -88,15 +91,17 @@ class ObjMesh : public Mesh {
 
                 // Create Texture from image file or color value
                 Texture<Color3>* texture;
-                std::cout << mp.diffuse_texname << std::endl;
+                const Color3 diffuse(mp.diffuse[0], mp.diffuse[1], mp.diffuse[2]);
                 if (mp.diffuse_texname.length() > 0) {
-                    std::cout << Color3(*mp.diffuse) << std::endl;
-                    texture = new ImageMixTexture<Color3>(file_path.parent_path().concat("/").concat(mp.diffuse_texname), Color3(*mp.diffuse));
+                    texture = new ImageMixTexture<Color3>(file_path.parent_path() / mp.diffuse_texname, diffuse);
                 } else
-                    texture = new ColorTexture(Color3(*mp.diffuse));
+                    texture = new ColorTexture(diffuse);
 
                 // Assign texture index to the Material's name
                 materials[m] = new Diffuse(texture);
+                if (mp.illum > 2 || mp.dissolve < 1 || mp.emission[0] != 0 || mp.emission[1] != 0 || mp.emission[2] != 0)
+                    std::cerr << "PrismRT OBJ: only diffuse MTL shading is supported for " << mp.name << '\n';
             }
+            materials[-1] = new Diffuse(new ColorTexture(Color3(.5f)));
         }
 };

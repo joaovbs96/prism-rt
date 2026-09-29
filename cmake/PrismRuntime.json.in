@@ -1,0 +1,15 @@
+{
+  "usdRoot": "@PRISM_USD_ROOT_JSON@",
+  "openSubdivRoot": "@PRISM_OPENSUBDIV_ROOT_JSON@",
+  "materialXRoot": "@PRISM_MATERIALX_ROOT_JSON@",
+  "materialXLibraries": "@PRISM_MATERIALX_LIBRARY_PATH_JSON@",
+  "materialXMdl": "@PRISM_MATERIALX_MDL_JSON@",
+  "mdlSdkRoot": "@MDL_SDK_DIR_JSON@",
+  "tbbRuntime": "@PRISM_TBB_REDIST_JSON@",
+  "embreeRuntime": "@PRISM_EMBREE_RUNTIME_DIR_JSON@",
+  "embreeBuildRuntime": "@PRISM_EMBREE_BUILD_RUNTIME_JSON@",
+  "vcpkgRuntime": "@PRISM_VCPKG_BIN_JSON@",
+  "pythonRoot": "@PRISM_PYTHON_ROOT_JSON@",
+  "pluginPath": "../lib/usd/plugins/prism/resources",
+  "usdviewPluginPath": "../lib/usd/plugins/prism/usdview_plugins"
+}

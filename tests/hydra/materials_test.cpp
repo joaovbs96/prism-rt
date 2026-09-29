@@ -86,10 +86,6 @@ HdContainerDataSourceHandle MakeMaterial(bool materialXContext,
     texToDiffuse.outputName = TfToken("diffuseColor");
     network.relationships.push_back(texToDiffuse);
 
-    HdMaterialRelationship texToNormal = texToDiffuse;
-    texToNormal.outputName = TfToken("normal");
-    network.relationships.push_back(texToNormal);
-
     HdMaterialRelationship texToRoughness = texToDiffuse;
     texToRoughness.inputName = TfToken("r");
     texToRoughness.outputName = TfToken("roughness");
@@ -231,13 +227,101 @@ int main()
     }
     MaterialService replacement(&context, libraries.string(),
         (libraries / "mdl").string());
+    const auto replacementBefore = replacement.GetStats();
     const auto afterReplacement = replacement.Resolve(universal, materialPath);
+    const auto replacementAfter = replacement.GetStats();
     const auto survivorMdl = std::dynamic_pointer_cast<MDLMaterial>(survivor);
-    if (afterReplacement != changedTexture || !survivorMdl || !survivorMdl->is_valid()) {
+    if (afterReplacement != changedTexture || !survivorMdl || !survivorMdl->is_valid() ||
+        replacementAfter.conversionSeconds != replacementBefore.conversionSeconds ||
+        replacementAfter.resourceReadSeconds != replacementBefore.resourceReadSeconds ||
+        replacementAfter.earlyCacheHits != replacementBefore.earlyCacheHits + 1) {
         std::cerr << "Shared MDL cache/context did not survive service replacement\n";
         return 12;
     }
+    // Invalidation drops another service's association in the same scene scope;
+    // unchanged recaptured content must still be reused.
+    service.Invalidate(materialPath);
+    const auto crossInvalidationBefore = replacement.GetStats();
+    if (replacement.Resolve(universal, materialPath) != changedTexture) {
+        std::cerr << "Cross-service invalidation changed the resolved material\n";
+        return 16;
+    }
+    const auto crossInvalidationAfter = replacement.GetStats();
+    if (crossInvalidationAfter.pathCacheHits != crossInvalidationBefore.pathCacheHits ||
+        crossInvalidationAfter.conversionSeconds != crossInvalidationBefore.conversionSeconds ||
+        crossInvalidationAfter.earlyCacheHits !=
+            crossInvalidationBefore.earlyCacheHits + 1) {
+        std::cerr << "Cross-service invalidation did not recapture and validate exact content\n";
+        return 17;
+    }
+    const auto otherTexture = texture.parent_path() / "prism_hydra_unrelated_texture.ppm";
+    std::filesystem::copy_file(texture, otherTexture,
+        std::filesystem::copy_options::overwrite_existing);
+    const SdfPath otherPath("/Looks/Unrelated");
+    const auto otherSource = MakeMaterial(true, otherTexture.string(), otherTexture.string(), 0.1f);
+    const auto unrelated = service.Resolve(otherSource, otherPath);
+    const auto reloadSource = MakeMaterial(true, relativeTexture, texture.string(), 0.1f);
+    const auto retained = std::dynamic_pointer_cast<MDLMaterial>(service.Resolve(reloadSource, materialPath));
+    if (!retained || !retained->is_valid()) return 18;
+    RTCRayHit embreeHit{};
+    embreeHit.hit.geomID = RTC_INVALID_GEOMETRY_ID;
+    RayHit hit(embreeHit);
+    hit.p = Float3(0.0f); hit.d = Float3(0.0f, 0.0f, -1.0f);
+    hit.n = hit.n_g = hit.n_s = Float3(0.0f, 0.0f, 1.0f);
+    hit.u = hit.v = 0.5f; hit.front_face = true;
+    const auto oldEvaluation = retained->evaluate(hit, Float3(0.0f, 0.0f, 1.0f));
+    Material::PreparedShadingContext prepared;
+    if (!retained->prepare(hit, prepared)) {
+        std::cerr << "Textured opacity material did not prepare its shading state\n";
+        return 19;
+    }
+    const auto preparedEvaluation = retained->evaluatePrepared(
+        hit, Float3(0.0f, 0.0f, 1.0f), prepared);
+    if (!preparedEvaluation.valid) {
+        std::cerr << "Prepared textured opacity evaluation failed\n";
+        return 19;
+    }
+    const auto stamp = std::filesystem::last_write_time(texture);
+    const auto oldSize = std::filesystem::file_size(texture);
+    {
+        std::ofstream image(texture, std::ios::binary | std::ios::trunc);
+        image << "P3\n1 1\n255\n25 70 190\n";
+    }
+    std::filesystem::last_write_time(texture, stamp);
+    if (std::filesystem::file_size(texture) != oldSize ||
+        service.ReloadResource(texture.string()) != std::vector<SdfPath>{materialPath}) {
+        std::cerr << "Resource reload did not isolate its dependent material\n";
+        return 19;
+    }
+    const auto reloadBefore = service.GetStats();
+    if (service.Resolve(otherSource, otherPath) != unrelated ||
+        service.GetStats().pathCacheHits != reloadBefore.pathCacheHits + 1) {
+        std::cerr << "Resource reload invalidated an unrelated source\n";
+        return 20;
+    }
+    const auto reloaded = std::dynamic_pointer_cast<MDLMaterial>(service.Resolve(reloadSource, materialPath));
+    if (!reloaded || !reloaded->is_valid() || reloaded == retained ||
+        reloaded->get_target_code().program != retained->get_target_code().program ||
+        service.GetStats().sdkTranslationCalls != reloadBefore.sdkTranslationCalls) {
+        std::cerr << "Resource reload did not retain the compatible program\n";
+        return 21;
+    }
+    const auto retainedEvaluation = retained->evaluate(hit, Float3(0.0f, 0.0f, 1.0f));
+    const auto newEvaluation = reloaded->evaluate(hit, Float3(0.0f, 0.0f, 1.0f));
+    float difference = 0;
+    for (int i = 0; i < 3; ++i) {
+        if (oldEvaluation.value[i] != retainedEvaluation.value[i]) {
+            std::cerr << "Reload mutated a retained binding\n";
+            return 22;
+        }
+        difference += std::abs(oldEvaluation.value[i] - newEvaluation.value[i]);
+    }
+    if (!oldEvaluation.valid || !newEvaluation.valid || difference < 1.0e-5f) {
+        std::cerr << "Reload did not update shaded texture values\n";
+        return 23;
+    }
     std::error_code ec;
+    std::filesystem::remove(otherTexture, ec);
     std::filesystem::remove(texture, ec);
     std::cout << "Hydra material conversion and cache tests passed\n";
     return 0;

@@ -29,6 +29,8 @@ METRICS = {
     "bufferMapWaitMilliseconds": "Render-buffer map wait (ms)",
     "materialCpuToWallRatio": "Worker CPU / batch wall",
     "materialNativeJits": "Native JIT count",
+    "materialEarlyCacheHits": "Material pre-conversion cache hits",
+    "materialPathCacheHits": "Material path cache hits",
     "prototypeCount": "Geometry prototypes",
     "prototypePathCount": "Prototype paths",
     "prototypeBuildCount": "Prototype builds",

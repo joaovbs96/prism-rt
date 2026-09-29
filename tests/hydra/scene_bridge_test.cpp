@@ -1,5 +1,6 @@
 #include "../../src/hydra/scene_bridge.h"
 #include "../../src/hydra/render_buffer.h"
+#include "../../src/hydra/native_tasks.h"
 #include "../../src/hydra/triangulation.h"
 #include "../../src/scene.h"
 
@@ -7,6 +8,7 @@
 #include <pxr/base/gf/rotation.h>
 #include <pxr/imaging/hd/meshSchema.h>
 #include <pxr/imaging/hd/meshTopologySchema.h>
+#include <pxr/imaging/hd/sphereSchema.h>
 #include <pxr/imaging/hd/instancedBySchema.h>
 #include <pxr/imaging/hd/instancerTopologySchema.h>
 #include <pxr/imaging/hd/lightSchema.h>
@@ -19,11 +21,15 @@
 #include <pxr/imaging/hd/retainedDataSource.h>
 #include <pxr/imaging/hd/retainedSceneIndex.h>
 #include <pxr/imaging/hd/tokens.h>
+#include <pxr/imaging/hd/visibilitySchema.h>
 #include <pxr/imaging/hd/xformSchema.h>
 
 #include <cstdint>
+#include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
+#include <filesystem>
 #include <iostream>
 #include <thread>
 
@@ -31,16 +37,49 @@ PXR_NAMESPACE_USING_DIRECTIVE
 
 namespace {
 
+class OwnerCheckedPoints final
+    : public HdTypedSampledDataSource<VtVec3fArray>
+{
+public:
+    OwnerCheckedPoints(VtVec3fArray values, std::thread::id owner,
+                       std::atomic<bool> *wrongThread)
+        : _values(std::move(values)), _owner(owner),
+          _wrongThread(wrongThread) {}
+    VtValue GetValue(Time) override
+    {
+        _Check();
+        return VtValue(_values);
+    }
+    VtVec3fArray GetTypedValue(Time) override
+    {
+        _Check();
+        return _values;
+    }
+    bool GetContributingSampleTimesForInterval(
+        Time, Time, std::vector<Time> *) override { return false; }
+private:
+    void _Check()
+    {
+        if (std::this_thread::get_id() != _owner)
+            _wrongThread->store(true);
+    }
+    VtVec3fArray _values;
+    std::thread::id _owner;
+    std::atomic<bool> *_wrongThread;
+};
+
 HdContainerDataSourceHandle FixtureMeshData(
     bool holeSecondFace,
     TfToken const &purpose = HdRenderTagTokens->geometry,
     GfVec3f const &displayColor = GfVec3f(0.7f),
-    float pointOffset = 0.0f)
+    float pointOffset = 0.0f,
+    HdVec3fArrayDataSourceHandle const &pointsOverride = {})
 {
     const VtVec3fArray points{{-1 + pointOffset, -1, 0}, {1, -1, 0}, {1, 1, 0},
                               {-1, 1, 0}, {0, 0, 1}};
     HdContainerDataSourceHandle pointsPrimvar = HdPrimvarSchema::Builder()
-        .SetPrimvarValue(HdRetainedTypedSampledDataSource<VtVec3fArray>::New(points))
+        .SetPrimvarValue(pointsOverride ? pointsOverride :
+            HdRetainedTypedSampledDataSource<VtVec3fArray>::New(points))
         .SetInterpolation(HdPrimvarSchema::BuildInterpolationDataSource(
             HdPrimvarSchemaTokens->vertex))
         .Build();
@@ -102,7 +141,45 @@ HdContainerDataSourceHandle DomeData()
         HdLightSchemaTokens->light, light);
 }
 
-HdContainerDataSourceHandle InstancerData(double offset = 1.0)
+HdContainerDataSourceHandle FixtureSphereData(
+    double radius, GfVec3d const &translation = GfVec3d(0.0),
+    GfVec3f const &color = GfVec3f(0.7f, 0.3f, 0.1f))
+{
+    HdContainerDataSourceHandle colorPrimvar = HdPrimvarSchema::Builder()
+        .SetPrimvarValue(HdRetainedTypedSampledDataSource<VtVec3fArray>::New(
+            VtVec3fArray{color}))
+        .SetInterpolation(HdPrimvarSchema::BuildInterpolationDataSource(
+            HdPrimvarSchemaTokens->constant))
+        .Build();
+    GfMatrix4d matrix(1.0);
+    matrix.SetTranslate(translation);
+    return HdRetainedContainerDataSource::New(
+        HdSphereSchemaTokens->sphere,
+        HdSphereSchema::Builder()
+            .SetRadius(HdRetainedTypedSampledDataSource<double>::New(radius))
+            .Build(),
+        HdPrimvarsSchemaTokens->primvars,
+        HdRetainedContainerDataSource::New(
+            TfToken("displayColor"), colorPrimvar),
+        HdXformSchemaTokens->xform,
+        HdXformSchema::Builder()
+            .SetMatrix(HdRetainedTypedSampledDataSource<GfMatrix4d>::New(matrix))
+            .Build());
+}
+
+HdContainerDataSourceHandle FixtureXformData(GfVec3d const &translation)
+{
+    GfMatrix4d matrix(1.0);
+    matrix.SetTranslate(translation);
+    return HdRetainedContainerDataSource::New(
+        HdXformSchemaTokens->xform,
+        HdXformSchema::Builder()
+            .SetMatrix(HdRetainedTypedSampledDataSource<GfMatrix4d>::New(matrix))
+            .Build());
+}
+
+HdContainerDataSourceHandle InstancerData(double offset = 1.0,
+                                          bool visible = true)
 {
     HdDataSourceBaseHandle const instanceIndexArrays[] = {
         HdRetainedTypedSampledDataSource<VtIntArray>::New(VtIntArray{1, 3})};
@@ -146,7 +223,12 @@ HdContainerDataSourceHandle InstancerData(double offset = 1.0)
     return HdRetainedContainerDataSource::New(
         HdInstancerTopologySchemaTokens->instancerTopology, topology,
         HdPrimvarsSchemaTokens->primvars, primvars,
-        HdXformSchemaTokens->xform, xform);
+        HdXformSchemaTokens->xform, xform,
+        HdVisibilitySchemaTokens->visibility,
+        HdVisibilitySchema::Builder()
+            .SetVisibility(
+                HdRetainedTypedSampledDataSource<bool>::New(visible))
+            .Build());
 }
 
 int64_t Stat(VtDictionary const &stats, char const *name)
@@ -161,6 +243,38 @@ double DoubleStat(VtDictionary const &stats, char const *name)
     auto it = stats.find(name);
     return it != stats.end() && it->second.IsHolding<double>()
         ? it->second.UncheckedGet<double>() : -1.0;
+}
+
+bool BoolStat(VtDictionary const &stats, char const *name)
+{
+    auto it = stats.find(name);
+    return it != stats.end() && it->second.IsHolding<bool>() &&
+        it->second.UncheckedGet<bool>();
+}
+
+bool PumpPrepare(prism::hydra::SceneBridge &bridge,
+                 prism::hydra::CameraState const &camera,
+                 HdRenderPassAovBindingVector const &bindings,
+                 TfTokenVector const &renderTags,
+                 unsigned int width, unsigned int height)
+{
+    bool changed = bridge.Prepare(
+        camera, bindings, renderTags, width, height);
+    const int64_t targetGeneration = Stat(
+        bridge.GetStats(), "preparationGeneration");
+    auto const deadline = std::chrono::steady_clock::now() +
+        std::chrono::seconds(60);
+    while (std::chrono::steady_clock::now() < deadline) {
+        VtDictionary const stats = bridge.GetStats();
+        if (!BoolStat(stats, "preparationPending") &&
+            Stat(stats, "displayedGeneration") >= targetGeneration)
+            break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        changed |= bridge.Prepare(camera, bindings, renderTags, width, height);
+    }
+    VtDictionary const stats = bridge.GetStats();
+    return changed && !BoolStat(stats, "preparationPending") &&
+        Stat(stats, "displayedGeneration") >= targetGeneration;
 }
 
 bool Check(bool condition, char const *message)
@@ -341,10 +455,80 @@ HitSignature HitTransformedTriangle(bool instanced, bool mirrored)
     return result;
 }
 
+RayHit HitTransformedSphere(bool mirrored)
+{
+    RTCDevice device = rtcNewDevice(nullptr);
+    SceneManager scene(device);
+    Sphere sphere(Float3(0.0f), 1.0f, nullptr);
+    RTCScene prototype = rtcNewScene(device);
+    sphere.setupEmbree(device, prototype);
+    rtcCommitScene(prototype);
+
+    GfMatrix4d scale(1.0), rotation(1.0), translation(1.0);
+    scale.SetScale(GfVec3d(mirrored ? -2.0 : 2.0, 1.25, 0.5));
+    rotation.SetRotate(GfRotation(GfVec3d(0, 1, 0), 27.0));
+    translation.SetTranslate(GfVec3d(0.5, -0.25, 1.0));
+    const GfMatrix4d world = scale * rotation * translation;
+    const GfMatrix4d normalMatrix = world.GetInverse().GetTranspose();
+    RTCGeometry instance = rtcNewGeometry(device, RTC_GEOMETRY_TYPE_INSTANCE);
+    rtcSetGeometryInstancedScene(instance, prototype);
+    float transform[16];
+    for (int column = 0; column < 4; ++column)
+        for (int row = 0; row < 4; ++row)
+            transform[column * 4 + row] = float(world[column][row]);
+    rtcSetGeometryTransform(instance, 0, RTC_FORMAT_FLOAT4X4_COLUMN_MAJOR,
+                            transform);
+    rtcCommitGeometry(instance);
+    const unsigned id = rtcAttachGeometry(scene.scene, instance);
+    rtcReleaseGeometry(instance);
+    scene.geometry.emplace(id, &sphere);
+    scene.intersection_geometry.emplace(id, sphere.geom);
+    SceneManager::PlacementTransform placement;
+    for (int row = 0; row < 3; ++row)
+        for (int column = 0; column < 3; ++column) {
+            placement.normal[row * 3 + column] =
+                float(normalMatrix[row][column]);
+            placement.tangent[row * 3 + column] = float(world[row][column]);
+        }
+    placement.mirrored = mirrored;
+    placement.flipOrientation = false;
+    scene.placement_transforms.emplace(id, placement);
+    rtcCommitScene(scene.scene);
+
+    const GfVec3d surface = world.Transform(GfVec3d(1, 0, 0));
+    const GfVec3d outward = normalMatrix.TransformDir(
+        GfVec3d(1, 0, 0)).GetNormalized();
+    RayHit result = scene.cast_ray(initialize_ray(
+        Float3(float(surface[0] + 2 * outward[0]),
+               float(surface[1] + 2 * outward[1]),
+               float(surface[2] + 2 * outward[2])),
+        Float3(float(-outward[0]), float(-outward[1]),
+               float(-outward[2]))));
+    scene.geometry.clear();
+    scene.intersection_geometry.clear();
+    scene.placement_transforms.clear();
+    rtcReleaseGeometry(sphere.geom);
+    sphere.geom = nullptr;
+    delete sphere.transform;
+    sphere.transform = nullptr;
+    rtcReleaseScene(prototype);
+    rtcReleaseScene(scene.scene);
+    scene.scene = nullptr;
+    rtcReleaseDevice(device);
+    return result;
+}
+
 } // namespace
 
 int main()
 {
+    const std::string testCache =
+        (std::filesystem::current_path() / "scene_bridge_test_cache").string();
+#ifdef _WIN32
+    _putenv_s("PRISM_CACHE_DIR", testCache.c_str());
+#else
+    setenv("PRISM_CACHE_DIR", testCache.c_str(), 1);
+#endif
     bool flatTangent = false, nativeTangent = false;
     bool flatMirroredTangent = false, nativeMirroredTangent = false;
     const Color3 flat = TraceTriangle(false, false, &flatTangent);
@@ -368,6 +552,14 @@ int main()
                         flattened.frontFace == instanced.frontFace &&
                         flattened.frontFace,
                     "rotated/nonuniform native hit differs from flattened baseline");
+        RayHit const sphere = HitTransformedSphere(mirrored);
+        ok &= Check(sphere.geomid != RTC_INVALID_GEOMETRY_ID &&
+                        sphere.front_face &&
+                        std::abs(sphere.u - 0.5f) < 1e-5f &&
+                        std::abs(sphere.v - 0.5f) < 1e-5f &&
+                        sphere.n.length() > 0.999f &&
+                        sphere.tangent.length() > 0.999f,
+                    "analytic sphere local UV or transformed frame is invalid");
     }
     // A fan crosses the missing corner of this concave pentagon.  Validate
     // that the ear-clipped result covers exactly the authored polygon area.
@@ -429,11 +621,43 @@ int main()
     ok &= Check(subsetSlots == std::vector<int>({4, 4, 1, 9, 9}),
                 "material subset assignment did not preserve coarse faces");
     {
+        using Level = prism::hydra::PickingTable::InstanceLevel;
+        const std::vector<Level> retainedTopology{
+            {SdfPath("/Outer"), {10, 20}},
+            {SdfPath("/Inner"), {3, 7, 9}}};
+        const std::vector<Level> reorderedLiveTopology{
+            {SdfPath("/Outer"), {20, 10}},
+            {SdfPath("/Inner"), {9, 3, 7}}};
+        const std::map<SdfPath, std::set<int>> sourceSelection{
+            {SdfPath("/Outer"), {20}}, {SdfPath("/Inner"), {3}},
+            {SdfPath("/UnrelatedInstancer"), {99}}};
+        ok &= Check(prism::hydra::TranslatePickingInstanceSelection(
+                        retainedTopology, sourceSelection, true) ==
+                        std::set<int>{3} &&
+                    prism::hydra::TranslatePickingInstanceSelection(
+                        reorderedLiveTopology, sourceSelection, true) ==
+                        std::set<int>{1},
+                    "retained picking topology followed reordered live source indices");
+        const std::map<SdfPath, std::set<int>> ordinalSelection{
+            {SdfPath("/Outer"), {1}}, {SdfPath("/Inner"), {2}}};
+        ok &= Check(prism::hydra::TranslatePickingInstanceSelection(
+                        retainedTopology, ordinalSelection, false) ==
+                        std::set<int>{5},
+                    "nested compact instance ordinals changed flattening semantics");
+        const std::vector<Level> topologyWithMaskedHole{
+            {SdfPath("/Outer"), {-1, 20}}};
+        ok &= Check(prism::hydra::TranslatePickingInstanceSelection(
+                        topologyWithMaskedHole,
+                        {{SdfPath("/Outer"), {20}}}, true) ==
+                        std::set<int>{1},
+                    "missing placement metadata changed retained ordinal radix");
+    }
+    {
         prism::hydra::SceneBridge bridge(scene, &thread);
         activeBridge = &bridge;
         prism::hydra::CameraState camera;
         const TfTokenVector geometryTags{HdRenderTagTokens->geometry};
-        ok &= Check(bridge.Prepare(camera, {}, geometryTags, 32, 32),
+        ok &= Check(PumpPrepare(bridge, camera, {}, geometryTags, 32, 32),
                     "initial prepare did not rebuild");
         VtDictionary stats = bridge.GetStats();
         ok &= Check(Stat(stats, "meshCount") == 1, "mesh was not populated");
@@ -448,29 +672,66 @@ int main()
         ok &= Check(DoubleStat(stats, "snapshotBuildSeconds") >= 0.0,
                     "snapshot build timing was not populated");
 
+        // A completed or running older generation must never publish after a
+        // newer owner-thread capture. The second authored value is observable
+        // in the final topology and the obsolete build is accounted for.
+        scene->AddPrims({{SdfPath("/Mesh"), HdPrimTypeTokens->mesh,
+                          FixtureMeshData(false, HdRenderTagTokens->guide)}});
+        bridge.MarkSceneDirty();
+        bridge.Prepare(camera, {}, geometryTags, 32, 32);
+        scene->AddPrims({{SdfPath("/Mesh"), HdPrimTypeTokens->mesh,
+                          FixtureMeshData(false)}});
+        bridge.MarkSceneDirty();
+        ok &= Check(PumpPrepare(bridge, camera, {}, geometryTags, 32, 32),
+                    "latest generation did not finish after supersession");
+        stats = bridge.GetStats();
+        ok &= Check(Stat(stats, "discardedSnapshotBuilds") >= 1 &&
+                        Stat(stats, "meshCount") == 1 &&
+                        Stat(stats, "triangleCount") == 3,
+                    "superseded generation published stale scene data");
+        std::atomic<bool> liveSourceReadByWorker{false};
+        HdVec3fArrayDataSourceHandle checkedPoints(
+            new OwnerCheckedPoints(
+                VtVec3fArray{{-1, -1, 0}, {1, -1, 0}, {1, 1, 0},
+                             {-1, 1, 0}, {0, 0, 1}},
+                std::this_thread::get_id(), &liveSourceReadByWorker));
+        scene->AddPrims({{SdfPath("/Mesh"), HdPrimTypeTokens->mesh,
+                          FixtureMeshData(false, HdRenderTagTokens->geometry,
+                                          GfVec3f(0.7f), 0.0f,
+                                          checkedPoints)}});
+        bridge.MarkSceneDirty(prism::hydra::SceneDirtyKind::Prototype,
+                              SdfPath("/Mesh"));
+        ok &= Check(PumpPrepare(bridge, camera, {}, geometryTags, 32, 32),
+                    "immutable-source generation did not finish");
+        ok &= Check(!liveSourceReadByWorker.load(),
+                    "background generation traversed a live sampled data source");
+        const int64_t buildsAfterLatest = Stat(
+            bridge.GetStats(), "snapshotBuilds");
+
         camera.projection[0][0] = 2.0;
-        ok &= Check(bridge.Prepare(camera, {}, geometryTags, 32, 32),
+        ok &= Check(PumpPrepare(bridge, camera, {}, geometryTags, 32, 32),
                     "camera edit did not reset accumulation");
-        ok &= Check(Stat(bridge.GetStats(), "snapshotBuilds") == 1,
+        ok &= Check(Stat(bridge.GetStats(), "snapshotBuilds") ==
+                        buildsAfterLatest,
                     "camera-only edit rebuilt geometry");
 
         scene->AddPrims({{SdfPath("/Mesh"), HdPrimTypeTokens->mesh,
                           FixtureMeshData(false)}});
         bridge.MarkSceneDirty();
-        bridge.Prepare(camera, {}, geometryTags, 32, 32);
+        PumpPrepare(bridge, camera, {}, geometryTags, 32, 32);
         ok &= Check(Stat(bridge.GetStats(), "triangleCount") == 3,
                     "topology invalidation did not rebuild triangles");
 
         scene->AddPrims({{SdfPath("/Mesh"), HdPrimTypeTokens->mesh,
                           FixtureMeshData(false, HdRenderTagTokens->guide)}});
         bridge.MarkSceneDirty();
-        bridge.Prepare(camera, {}, geometryTags, 32, 32);
+        PumpPrepare(bridge, camera, {}, geometryTags, 32, 32);
         ok &= Check(Stat(bridge.GetStats(), "meshCount") == 0,
                     "purpose filtering did not exclude guide mesh");
 
         scene->RemovePrims({SdfPath("/Mesh")});
         bridge.MarkSceneDirty();
-        bridge.Prepare(camera, {}, geometryTags, 32, 32);
+        PumpPrepare(bridge, camera, {}, geometryTags, 32, 32);
         ok &= Check(Stat(bridge.GetStats(), "meshCount") == 0,
                     "subtree removal left stale geometry");
 
@@ -484,7 +745,7 @@ int main()
             {SdfPath("/Instancer"), HdPrimTypeTokens->instancer,
              InstancerData()}});
         bridge.MarkSceneDirty();
-        bridge.Prepare(camera, {}, geometryTags, 32, 32);
+        PumpPrepare(bridge, camera, {}, geometryTags, 32, 32);
         stats = bridge.GetStats();
         ok &= Check(Stat(stats, "meshCount") == 1 &&
                         Stat(stats, "instanceCount") == 2,
@@ -492,12 +753,15 @@ int main()
         ok &= Check(Stat(stats, "prototypeCount") == 1 &&
                         Stat(stats, "triangleCount") == 2,
                     "native instances duplicated prototype storage");
+        ok &= Check(Stat(stats, "pickingInstanceTopologyPrimCount") == 1 &&
+                        Stat(stats, "pickingInstanceTopologyFailures") == 0,
+                    "published picking metadata lost instance topology");
         const int64_t buildsBeforeTransform = Stat(stats, "snapshotBuilds");
         scene->AddPrims({{SdfPath("/Instancer"), HdPrimTypeTokens->instancer,
                           InstancerData(1.25)}});
         bridge.MarkSceneDirty(prism::hydra::SceneDirtyKind::Placement,
                               SdfPath("/Instancer"));
-        bridge.Prepare(camera, {}, geometryTags, 32, 32);
+        PumpPrepare(bridge, camera, {}, geometryTags, 32, 32);
         stats = bridge.GetStats();
         ok &= Check(Stat(stats, "snapshotBuilds") == buildsBeforeTransform &&
                         Stat(stats, "placementInvalidations") > 0 &&
@@ -508,7 +772,7 @@ int main()
                           FixtureMeshData(true)}});
         bridge.MarkSceneDirty(prism::hydra::SceneDirtyKind::Structure,
                               SdfPath("/StaticMesh"));
-        bridge.Prepare(camera, {}, geometryTags, 32, 32);
+        PumpPrepare(bridge, camera, {}, geometryTags, 32, 32);
         stats = bridge.GetStats();
         const int64_t buildsBeforePrototypeEdit = Stat(stats, "snapshotBuilds");
         const int64_t prototypeBuildsBeforeEdit =
@@ -520,20 +784,82 @@ int main()
                           InstancedMeshData(false)}});
         bridge.MarkSceneDirty(prism::hydra::SceneDirtyKind::Prototype,
                               SdfPath("/Proto/Mesh"));
-        bridge.Prepare(camera, {}, geometryTags, 32, 32);
+        PumpPrepare(bridge, camera, {}, geometryTags, 32, 32);
         stats = bridge.GetStats();
         ok &= Check(Stat(stats, "snapshotBuilds") == buildsBeforePrototypeEdit &&
                         Stat(stats, "prototypeBuildCount") ==
                             prototypeBuildsBeforeEdit + 1 &&
                         Stat(stats, "prototypeCount") == 2,
                     "topology edit rebuilt unaffected prototypes");
+
+        // Start from synchronized banks so this isolates the visibility-only
+        // journal replay from the preceding prototype edit.
+        bridge.MarkSceneDirty(prism::hydra::SceneDirtyKind::Structure,
+                              SdfPath("/Proto"));
+        PumpPrepare(bridge, camera, {}, geometryTags, 32, 32);
+        stats = bridge.GetStats();
+        const int64_t buildsBeforeVisibility = Stat(stats, "snapshotBuilds");
+        const int64_t prototypeBuildsBeforeVisibility =
+            Stat(stats, "prototypeBuildCount");
+        scene->AddPrims({{SdfPath("/Instancer"), HdPrimTypeTokens->instancer,
+                          InstancerData(1.25, false)}});
+        bridge.MarkSceneDirty(prism::hydra::SceneDirtyKind::Placement,
+                              SdfPath("/Instancer"));
+        PumpPrepare(bridge, camera, {}, geometryTags, 32, 32);
+        stats = bridge.GetStats();
+        ok &= Check(Stat(stats, "snapshotBuilds") == buildsBeforeVisibility &&
+                        Stat(stats, "prototypeBuildCount") ==
+                            prototypeBuildsBeforeVisibility &&
+                        Stat(stats, "lastPlacementRecordsVisited") == 2 &&
+                        Stat(stats, "lastVisibilityPlacementsUpdated") == 2,
+                    "visibility edit rebuilt or touched an unrelated prototype");
+        scene->AddPrims({{SdfPath("/Instancer"), HdPrimTypeTokens->instancer,
+                          InstancerData(1.25, true)}});
+        bridge.MarkSceneDirty(prism::hydra::SceneDirtyKind::Placement,
+                              SdfPath("/Instancer"));
+        PumpPrepare(bridge, camera, {}, geometryTags, 32, 32);
+        stats = bridge.GetStats();
+        ok &= Check(Stat(stats, "snapshotBuilds") == buildsBeforeVisibility &&
+                        Stat(stats, "prototypeBuildCount") ==
+                            prototypeBuildsBeforeVisibility &&
+                        Stat(stats, "lastPlacementRecordsVisited") == 2,
+                    "visibility restore rebuilt or touched an unrelated prototype");
+        const int64_t recoveriesBeforeHiddenPrototypeEdit =
+            Stat(stats, "visibilityRecoveryRebuilds");
+
+        // A hidden placement can legitimately lose its dependency records
+        // when a simultaneous prototype refresh rebuilds the inactive TLAS.
+        // Showing it again must take the conservative rebuild path and restore
+        // every instance rather than silently treating the empty index as a
+        // successful targeted update.
+        scene->AddPrims({{SdfPath("/Instancer"), HdPrimTypeTokens->instancer,
+                          InstancerData(1.25, false)}});
+        bridge.MarkSceneDirty(prism::hydra::SceneDirtyKind::Placement,
+                              SdfPath("/Instancer"));
+        PumpPrepare(bridge, camera, {}, geometryTags, 32, 32);
+        scene->AddPrims({{SdfPath("/Proto/Mesh"), HdPrimTypeTokens->mesh,
+                          InstancedMeshData(false, GfVec3f(0.6f))}});
+        bridge.MarkSceneDirty(prism::hydra::SceneDirtyKind::Prototype,
+                              SdfPath("/Proto/Mesh"));
+        PumpPrepare(bridge, camera, {}, geometryTags, 32, 32);
+        scene->AddPrims({{SdfPath("/Instancer"), HdPrimTypeTokens->instancer,
+                          InstancerData(1.25, true)}});
+        bridge.MarkSceneDirty(prism::hydra::SceneDirtyKind::Placement,
+                              SdfPath("/Instancer"));
+        PumpPrepare(bridge, camera, {}, geometryTags, 32, 32);
+        stats = bridge.GetStats();
+        ok &= Check(Stat(stats, "instanceCount") == 2 &&
+                        Stat(stats, "prototypeCount") == 2 &&
+                        Stat(stats, "visibilityRecoveryRebuilds") >
+                            recoveriesBeforeHiddenPrototypeEdit,
+                    "visibility restore after hidden prototype edit lost placements");
         const int64_t buildsBeforeStateEdits = Stat(stats, "snapshotBuilds");
         bridge.MarkSceneDirty(prism::hydra::SceneDirtyKind::Material,
                               SdfPath("/Looks/Unused"));
-        bridge.Prepare(camera, {}, geometryTags, 32, 32);
+        PumpPrepare(bridge, camera, {}, geometryTags, 32, 32);
         bridge.MarkSceneDirty(prism::hydra::SceneDirtyKind::Environment,
                               SdfPath("/Dome"));
-        bridge.Prepare(camera, {}, geometryTags, 32, 32);
+        PumpPrepare(bridge, camera, {}, geometryTags, 32, 32);
         stats = bridge.GetStats();
         ok &= Check(Stat(stats, "snapshotBuilds") == buildsBeforeStateEdits &&
                         Stat(stats, "prototypeCount") == 2 &&
@@ -543,7 +869,7 @@ int main()
         auto resourceSettings = bridge.GetSettings();
         ++resourceSettings.resourceRevision;
         bridge.SetSettings(resourceSettings);
-        bridge.Prepare(camera, {}, geometryTags, 32, 32);
+        PumpPrepare(bridge, camera, {}, geometryTags, 32, 32);
         stats = bridge.GetStats();
         ok &= Check(Stat(stats, "snapshotBuilds") == buildsBeforeStateEdits &&
                         Stat(stats, "prototypeCount") == 2,
@@ -557,7 +883,7 @@ int main()
                                           GfVec3f(0.7f), 0.2f)}});
         bridge.MarkSceneDirty(prism::hydra::SceneDirtyKind::Prototype,
                               SdfPath("/StaticMesh"));
-        bridge.Prepare(camera, {}, geometryTags, 32, 32);
+        PumpPrepare(bridge, camera, {}, geometryTags, 32, 32);
         stats = bridge.GetStats();
         ok &= Check(Stat(stats, "snapshotBuilds") == buildsBeforePoints &&
                         Stat(stats, "prototypeBuildCount") ==
@@ -612,7 +938,15 @@ int main()
         renderSettings.previewMaxDimension = 16;
         renderSettings.refinementDelayMs = 0;
         bridge.SetSettings(renderSettings);
-        bridge.Prepare(camera, aovs, geometryTags, resolution, resolution);
+        const int64_t previewsBeforeInitial = Stat(
+            bridge.GetStats(), "previewPublishes");
+        PumpPrepare(bridge, camera, aovs, geometryTags, resolution, resolution);
+        thread.StartRender();
+        ok &= Check(WaitFor([&] {
+            return Stat(bridge.GetStats(), "previewPublishes") >
+                previewsBeforeInitial;
+        }), "bounded camera preview was not published by the render worker");
+        thread.StopRender();
         stats = bridge.GetStats();
         const std::vector<float> previewColor = ReadBuffer<float>(&colorBuffer);
         bool previewAlpha = previewColor.size() == resolution * resolution * 4;
@@ -621,9 +955,8 @@ int main()
             previewAlpha = previewColor[pixel * 4 + 3] == 1.0f;
         ok &= Check(Stat(stats, "previewPublishes") > 0 &&
                         Stat(stats, "previewWidth") <= 16 &&
-                        Stat(stats, "previewHeight") <= 16 &&
-                        Stat(stats, "completedSamples") == 0,
-                    "bounded camera preview was not published synchronously");
+                        Stat(stats, "previewHeight") <= 16,
+                    "bounded camera preview dimensions are invalid");
         ok &= Check(previewAlpha,
                     "camera preview color buffer was malformed");
         thread.StartRender();
@@ -653,7 +986,7 @@ int main()
         // Depth one intentionally truncates that contribution to black.
         renderSettings.maxDepth = 2;
         bridge.SetSettings(renderSettings);
-        bridge.Prepare(camera, aovs, geometryTags, resolution, resolution);
+        PumpPrepare(bridge, camera, aovs, geometryTags, resolution, resolution);
         thread.StartRender();
         ok &= Check(WaitFor([&] { return bridge.IsConverged(); }),
                     "one-sample restart did not converge");
@@ -666,6 +999,7 @@ int main()
         bool foundInstance0 = false, foundInstance1 = false;
         bool validAovs = true;
         bool rotatedNormal = false, mirroredNormal = false;
+        bool smoothMissingNormals = false;
         GfVec3f observedRotated(0.0f), observedMirrored(0.0f);
         for (size_t pixel = 0; pixel < primIds.size(); ++pixel) {
             if (primIds[pixel] < 0) continue;
@@ -685,12 +1019,19 @@ int main()
             if (instanceIds[pixel] == 1) {
                 observedMirrored = normal;
                 mirroredNormal |= normal[2] > 0.9f;
+                // Coarse face zero lies in XY; its flat normal has no Y
+                // component. Shared vertices also belong to the slanted face,
+                // so a generated smooth normal must interpolate that slope.
+                smoothMissingNormals |= elementIds[pixel] == 0 &&
+                    std::abs(normal[1]) > 0.05f && normal[2] > 0.7f;
             }
         }
         ok &= Check(foundInstance0 && foundInstance1,
                     "instance transforms or flattened instance IDs are incorrect");
         ok &= Check(validAovs,
                     "primary-hit depth, normal, or coarse-face AOV is invalid");
+        ok &= Check(smoothMissingNormals,
+                    "missing authored normals fell back to flat triangle shading");
         if (!rotatedNormal || !mirroredNormal)
             std::cerr << "Observed transformed normals: rotated="
                       << observedRotated << " mirrored=" << observedMirrored << '\n';
@@ -702,7 +1043,7 @@ int main()
                           InstancedMeshData(false, GfVec3f(0.05f, 0.15f, 0.95f))}});
         bridge.MarkSceneDirty(prism::hydra::SceneDirtyKind::Prototype,
                               SdfPath("/Proto/Mesh"));
-        bridge.Prepare(camera, aovs, geometryTags, resolution, resolution);
+        PumpPrepare(bridge, camera, aovs, geometryTags, resolution, resolution);
         thread.StartRender();
         ok &= Check(WaitFor([&] { return bridge.IsConverged(); }),
                     "displayColor replacement frame did not converge");
@@ -714,21 +1055,27 @@ int main()
                         Stat(beforeColorStats, "snapshotBuilds"),
                     "displayColor edit rebuilt the full snapshot");
         ok &= Check(Stat(afterColorStats, "prototypeBuildCount") ==
-                        Stat(beforeColorStats, "prototypeBuildCount") + 1,
-                    "displayColor edit rebuilt an unexpected number of prototypes");
+                        Stat(beforeColorStats, "prototypeBuildCount"),
+                    "displayColor-only edit rebuilt Embree prototype geometry");
         ok &= Check(Stat(afterColorStats, "prototypeCount") == 2,
                     "displayColor edit changed unique prototype storage");
 
         camera.worldToView.SetTranslate(GfVec3d(0, 0, -4));
         const int64_t previewsBeforeMove = Stat(
             bridge.GetStats(), "previewPublishes");
-        ok &= Check(bridge.Prepare(camera, aovs, geometryTags,
+        ok &= Check(PumpPrepare(bridge, camera, aovs, geometryTags,
                                    resolution, resolution),
                     "camera change did not start a replacement frame");
+        thread.StartRender();
+        ok &= Check(WaitFor([&] {
+            return Stat(bridge.GetStats(), "previewPublishes") >
+                previewsBeforeMove;
+        }), "camera change did not publish a preview");
+        thread.StopRender();
         const std::vector<float> previewDepths = ReadBuffer<float>(&depthBuffer);
-        ok &= Check(Stat(bridge.GetStats(), "previewPublishes") ==
-                        previewsBeforeMove + 1 && previewDepths != depths,
-                    "camera change did not synchronously publish current depth");
+        ok &= Check(Stat(bridge.GetStats(), "previewPublishes") >
+                        previewsBeforeMove && previewDepths != depths,
+                    "camera preview did not publish current depth");
         thread.StartRender();
         ok &= Check(WaitFor([&] { return bridge.IsConverged(); }),
                     "camera replacement frame did not converge");
@@ -738,6 +1085,152 @@ int main()
         ok &= Check(depthChanged,
                     "camera replacement did not publish updated depth");
         thread.StopRender();
+
+        // A native implicit has no polygon element id. Radius edits should
+        // replace only its prototype and must visibly change its silhouette.
+        scene->RemovePrims({SdfPath("/Proto"), SdfPath("/Instancer"),
+                            SdfPath("/StaticMesh"), SdfPath("/Dome")});
+        scene->AddPrims({{SdfPath("/Sphere"), HdPrimTypeTokens->sphere,
+                          FixtureSphereData(0.6)}});
+        bridge.MarkSceneDirty(prism::hydra::SceneDirtyKind::Structure,
+                              SdfPath("/Sphere"));
+        renderSettings.samples = 1;
+        renderSettings.sphereBatching = true;
+        bridge.SetSettings(renderSettings);
+        camera.worldToView.SetTranslate(GfVec3d(0, 0, -4));
+        PumpPrepare(bridge, camera, aovs, geometryTags, resolution, resolution);
+        thread.StartRender();
+        ok &= Check(WaitFor([&] { return bridge.IsConverged(); }),
+                    "analytic sphere frame did not converge");
+        const std::vector<int> smallSpherePrims = ReadBuffer<int>(&primBuffer);
+        const std::vector<int> smallSphereElements =
+            ReadBuffer<int>(&elementBuffer);
+        size_t smallSpherePixels = 0;
+        bool implicitElements = true;
+        bool spherePickingPath = false;
+        for (size_t i = 0; i < smallSpherePrims.size(); ++i) {
+            if (smallSpherePrims[i] < 0) continue;
+            ++smallSpherePixels;
+            implicitElements &= smallSphereElements[i] == -1;
+            spherePickingPath |= bridge.GetPrimPath(smallSpherePrims[i]) ==
+                SdfPath("/Sphere");
+        }
+        const VtDictionary beforeRadiusStats = bridge.GetStats();
+        scene->AddPrims({{SdfPath("/Sphere"), HdPrimTypeTokens->sphere,
+                          FixtureSphereData(1.2)}});
+        bridge.MarkSceneDirty(prism::hydra::SceneDirtyKind::Prototype,
+                              SdfPath("/Sphere"));
+        PumpPrepare(bridge, camera, aovs, geometryTags, resolution, resolution);
+        thread.StartRender();
+        ok &= Check(WaitFor([&] { return bridge.IsConverged(); }),
+                    "sphere radius replacement frame did not converge");
+        const std::vector<int> largeSpherePrims = ReadBuffer<int>(&primBuffer);
+        const size_t largeSpherePixels = static_cast<size_t>(std::count_if(
+            largeSpherePrims.begin(), largeSpherePrims.end(),
+            [](int value) { return value >= 0; }));
+        const VtDictionary afterRadiusStats = bridge.GetStats();
+        ok &= Check(smallSpherePixels > 0 && implicitElements &&
+                        spherePickingPath &&
+                        largeSpherePixels > smallSpherePixels,
+                    "analytic sphere picking or radius silhouette is invalid");
+        ok &= Check(Stat(afterRadiusStats, "snapshotBuilds") ==
+                        Stat(beforeRadiusStats, "snapshotBuilds") &&
+                        Stat(afterRadiusStats, "prototypeBuildCount") ==
+                            Stat(beforeRadiusStats, "prototypeBuildCount") &&
+                        Stat(afterRadiusStats, "sphereBatchRebuilds") ==
+                            Stat(beforeRadiusStats, "sphereBatchRebuilds") + 1 &&
+                        Stat(afterRadiusStats, "sphereBatchEntriesUpdated") ==
+                            Stat(beforeRadiusStats, "sphereBatchEntriesUpdated") + 1,
+                    "sphere radius edit did not rebuild exactly its stable batch");
+        thread.StopRender();
+
+        scene->RemovePrims({SdfPath("/Sphere")});
+        scene->AddPrims({
+            {SdfPath("/Mixed"), TfToken("xform"),
+             FixtureXformData(GfVec3d(0.0))},
+            {SdfPath("/Mixed/Sphere"), HdPrimTypeTokens->sphere,
+             FixtureSphereData(0.2)},
+            {SdfPath("/Mixed/Mesh"), HdPrimTypeTokens->mesh,
+             FixtureMeshData(true)}});
+        bridge.MarkSceneDirty(prism::hydra::SceneDirtyKind::Structure,
+                              SdfPath("/Mixed"));
+        ok &= Check(PumpPrepare(bridge, camera, aovs, geometryTags,
+                                resolution, resolution),
+                    "mixed sphere/mesh parent did not prepare");
+        const VtDictionary mixedBefore = bridge.GetStats();
+        scene->AddPrims({{SdfPath("/Mixed"), TfToken("xform"),
+                          FixtureXformData(GfVec3d(1.0, 0.0, 0.0))}});
+        bridge.MarkSceneDirty(prism::hydra::SceneDirtyKind::Placement,
+                              SdfPath("/Mixed"));
+        ok &= Check(PumpPrepare(bridge, camera, aovs, geometryTags,
+                                resolution, resolution),
+                    "mixed parent placement edit did not prepare");
+        const VtDictionary mixedAfter = bridge.GetStats();
+        ok &= Check(Stat(mixedAfter, "sphereBatchRebuilds") ==
+                            Stat(mixedBefore, "sphereBatchRebuilds") + 1 &&
+                        Stat(mixedAfter, "lastPlacementRecordsVisited") > 0,
+                    "mixed parent edit skipped the ordinary mesh placement");
+
+        // The fixed cap must split 1025 independent spheres into two stable
+        // batches. Editing the final sphere must leave the unrelated
+        // 1024-entry batch untouched.
+        scene->RemovePrims({SdfPath("/Mixed")});
+        HdRetainedSceneIndex::AddedPrimEntries batchSpheres;
+        batchSpheres.reserve(1025);
+        for (int i = 0; i < 1025; ++i) {
+            const SdfPath path("/Batch/S" + std::to_string(i));
+            batchSpheres.push_back({path, HdPrimTypeTokens->sphere,
+                FixtureSphereData(0.05, GfVec3d(i % 41, i / 41, 0.0))});
+        }
+        scene->AddPrims(batchSpheres);
+        bridge.MarkSceneDirty(prism::hydra::SceneDirtyKind::Structure,
+                              SdfPath("/Batch"));
+        ok &= Check(PumpPrepare(bridge, camera, aovs, geometryTags,
+                                resolution, resolution),
+                    "1025-sphere batch scene did not prepare");
+        VtDictionary batchStats = bridge.GetStats();
+        ok &= Check(Stat(batchStats, "sphereBatchCount") == 2 &&
+                        Stat(batchStats, "sphereBatchEntryCount") == 1025,
+                    "1025 spheres were not split at the 1024-entry cap");
+        const int64_t batchRebuilds = Stat(batchStats, "sphereBatchRebuilds");
+        const int64_t batchEntries = Stat(batchStats,
+                                          "sphereBatchEntriesUpdated");
+        scene->AddPrims({{SdfPath("/Batch/S1024"), HdPrimTypeTokens->sphere,
+            FixtureSphereData(0.1, GfVec3d(0.0, 25.0, 0.0))}});
+        bridge.MarkSceneDirty(prism::hydra::SceneDirtyKind::Prototype,
+                              SdfPath("/Batch/S1024"));
+        ok &= Check(PumpPrepare(bridge, camera, aovs, geometryTags,
+                                resolution, resolution),
+                    "single-entry sphere batch edit did not prepare");
+        batchStats = bridge.GetStats();
+        ok &= Check(Stat(batchStats, "sphereBatchRebuilds") ==
+                            batchRebuilds + 1 &&
+                        Stat(batchStats, "sphereBatchEntriesUpdated") ==
+                            batchEntries + 1 &&
+                        Stat(batchStats, "sphereBatchConservativeFallbacks") == 0,
+                    "sphere batch edit touched an unrelated batch");
+        const int64_t materialRebuilds = Stat(batchStats,
+                                              "sphereBatchRebuilds");
+        const int64_t materialUpdates = Stat(batchStats,
+            "sphereBatchEntriesUpdated");
+        scene->AddPrims({{SdfPath("/Batch/S1024"), HdPrimTypeTokens->sphere,
+            FixtureSphereData(0.1, GfVec3d(0.0, 25.0, 0.0),
+                              GfVec3f(0.1f, 0.8f, 0.2f))}});
+        bridge.MarkSceneDirty(prism::hydra::SceneDirtyKind::Material,
+                              SdfPath("/Batch/S1024"));
+        ok &= Check(PumpPrepare(bridge, camera, aovs, geometryTags,
+                                resolution, resolution),
+                    "sphere batch material edit did not prepare");
+        batchStats = bridge.GetStats();
+        ok &= Check(Stat(batchStats, "sphereBatchRebuilds") ==
+                            materialRebuilds &&
+                        Stat(batchStats, "sphereBatchEntriesUpdated") ==
+                            materialUpdates + 1,
+                    "sphere material edit rebuilt geometry or touched siblings");
+        ok &= Check(Stat(batchStats, "embreeLiveBytes") > 0 &&
+                        Stat(batchStats, "embreePeakBytes") >=
+                            Stat(batchStats, "embreeLiveBytes"),
+                    "Embree memory monitor did not account live allocations");
         activeBridge = nullptr;
     }
     thread.StopThread();

@@ -5,7 +5,10 @@
 #include <atomic>
 #include <cstdint>
 #include <mutex>
+#include <memory>
 #include <vector>
+
+namespace prism::hydra { struct PublishedFrame; }
 
 PXR_NAMESPACE_OPEN_SCOPE
 class HdRenderThread;
@@ -36,15 +39,25 @@ public:
     // publishing; avoiding a redundant full-resolution clear keeps camera
     // interaction responsive.
     void BeginFrame(VtValue const &clearValue);
-    void Publish();
+    using Frame = std::shared_ptr<const prism::hydra::PublishedFrame>;
+    struct ReadView {
+        std::shared_ptr<const std::vector<uint8_t>> pixels;
+        Frame frame;
+        unsigned int width=0,height=0;
+        HdFormat format=HdFormatInvalid;
+    };
+    // Pixels and their picking/camera metadata are one immutable publication.
+    // The view stays valid through later publication and buffer allocation.
+    ReadView Capture() const;
+    void Publish(Frame frame = {});
     void PublishPreviewFloat(unsigned int previewWidth,
                              unsigned int previewHeight,
                              std::vector<float> const &values,
-                             size_t components);
+                             size_t components, Frame frame = {});
     void PublishPreviewInt(unsigned int previewWidth,
                            unsigned int previewHeight,
                            std::vector<int> const &values,
-                           size_t components);
+                           size_t components, Frame frame = {});
     void WriteFloat(unsigned int x, unsigned int y, const float *value,
                     size_t components, bool accumulate);
     void WriteInt(unsigned int x, unsigned int y, const int *value,
@@ -73,7 +86,13 @@ private:
     unsigned int _height = 0;
     HdFormat _format = HdFormatInvalid;
     bool _multiSampled = false;
-    std::vector<uint8_t> _pixels;
+    // Mappers pin one published generation until the last Unmap. Publication
+    // never modifies that generation or waits for an application to unmap it.
+    std::shared_ptr<std::vector<uint8_t>> _pixels;
+    std::shared_ptr<std::vector<uint8_t>> _mappedPixels;
+    Frame _frame, _mappedFrame;
+    unsigned int _mappedWidth=0,_mappedHeight=0;
+    HdFormat _mappedFormat=HdFormatInvalid;
     std::vector<uint8_t> _workingPixels;
     std::vector<float> _accumulation;
     std::vector<uint32_t> _sampleCounts;

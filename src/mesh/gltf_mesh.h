@@ -3,6 +3,7 @@
 // STD Lib deps
 #include <iostream>
 #include <filesystem>
+#include <stdexcept>
 
 // External Deps
 #include <tiny_gltf.h>
@@ -347,8 +348,14 @@ class glTFMesh : public Mesh {
             }
 
             if (!ret) {
-                std::cout << "Failed to parse glTF file" << std::endl;
-                return;
+                throw std::runtime_error("Failed to parse glTF file: " + file_path.string());
+            }
+
+            for (const auto& extension : model.extensionsUsed) {
+                if (extension != "KHR_materials_emissive_strength" &&
+                    extension != "KHR_materials_transmission")
+                    std::cerr << "PrismRT: unsupported glTF extension " << extension
+                              << "; using the existing core material/geometry behavior\n";
             }
 
             // Process scene hierarchy and calculate node transforms
@@ -375,6 +382,17 @@ class glTFMesh : public Mesh {
             // for each material in the scene file
             for (int m = 0; m < model.materials.size(); m++) {
                 tinygltf::Material mp = model.materials[m];
+                if (mp.alphaMode != "OPAQUE" || mp.pbrMetallicRoughness.baseColorFactor[3] != 1.0)
+                    std::cerr << "PrismRT: glTF material '" << mp.name
+                              << "' alpha/cutout settings are not supported by the legacy glTF shader\n";
+                if (mp.occlusionTexture.index >= 0)
+                    std::cerr << "PrismRT: glTF material '" << mp.name
+                              << "' authored occlusion texture is ignored\n";
+                if (mp.pbrMetallicRoughness.baseColorTexture.texCoord > 0 ||
+                    mp.pbrMetallicRoughness.metallicRoughnessTexture.texCoord > 0 ||
+                    mp.normalTexture.texCoord > 0 || mp.emissiveTexture.texCoord > 0)
+                    std::cerr << "PrismRT: glTF material '" << mp.name
+                              << "' requests additional UV sets; only TEXCOORD_0 is supported\n";
                 gltfPBR* gltf_material = new gltfPBR();
 
                 // Create Texture from image file or color value

@@ -5,6 +5,8 @@
 #include "rng.h"
 #include "ray.h"
 #include "texture.h"
+#include <cstddef>
+#include <cstdint>
 
 struct BRDFSample {
     Float3 wi;
@@ -25,6 +27,12 @@ struct BRDFEvaluation {
 
 class Material {
     public:
+        struct PreparedShadingContext {
+            alignas(16) std::byte storage[3072];
+            const Material* owner = nullptr;
+            bool valid = false;
+        };
+        static_assert(alignof(PreparedShadingContext) >= 16);
         Material() {}
         virtual ~Material() = default;
 
@@ -35,15 +43,24 @@ class Material {
         virtual BRDFSample sample(const RayHit ray_hit, unsigned int &seed) {
             BRDFSample s;
             s.wi = sample_direction(ray_hit, seed);
-            s.color = evaluate_color(ray_hit.p, ray_hit.n, -ray_hit.d, s.wi, ray_hit.u, ray_hit.v, seed);
+            s.color = evaluate_color(ray_hit.p, ray_hit.n, -ray_hit.d, s.wi,
+                ray_hit.u, ray_hit.v, seed, ray_hit.texture_footprint);
             s.emission = evaluate_emission(ray_hit);
             s.scattered = !s.wi.is_zero();
             return s;
         }
 
         virtual BRDFEvaluation evaluate(const RayHit&, const Float3&) { return {}; }
+        virtual bool prepare(const RayHit&, PreparedShadingContext&) const { return false; }
+        virtual BRDFSample samplePrepared(const RayHit h,unsigned int& seed,
+                                          PreparedShadingContext&) { return sample(h,seed); }
+        virtual BRDFEvaluation evaluatePrepared(const RayHit& h,const Float3& wi,
+                                                PreparedShadingContext&) {
+            return evaluate(h,wi);
+        }
         virtual bool supportsNee(const RayHit&) const { return false; }
         virtual float cutoutOpacity(const RayHit&) { return 1.0f; }
+        virtual bool provenOpaque() const { return false; }
 
         virtual Float3 sample_direction(const RayHit ray_hit, unsigned int &seed) = 0;
 
@@ -55,6 +72,12 @@ class Material {
             float u, float v,   // UV coordinates
             unsigned int &seed  // random number generator seed
         ) = 0;
+        virtual Color3 evaluate_color(
+            const Float3& p, const Float3& n, const Float3& wo, Float3& wi,
+            float u, float v, unsigned int &seed,
+            prism::TextureFootprint const&) {
+            return evaluate_color(p,n,wo,wi,u,v,seed);
+        }
 
         virtual Color3 evaluate_emission(const RayHit ray_hit) {
             return Color3(0.0f);
@@ -85,7 +108,8 @@ class Material {
             if (normal_texture == nullptr)
                 return Float3(0.0f);
 
-            return normal_texture->sample(ray_hit.u, ray_hit.v, ray_hit.p);
+            return normal_texture->sample(
+                ray_hit.u, ray_hit.v, ray_hit.p, ray_hit.texture_footprint);
         }
 
         void perturbNormal(RayHit& ray_hit) {
@@ -131,6 +155,11 @@ class Diffuse : public Material {
         Color3 evaluate_color(const Float3& p, const Float3& n, const Float3& wo, Float3& wi, float u, float v, unsigned int &seed) override {
             return diffuse_color->sample(u, v, p);
         }
+        Color3 evaluate_color(const Float3& p, const Float3&, const Float3&,
+            Float3&, float u, float v, unsigned int&,
+            prism::TextureFootprint const& footprint) override {
+            return diffuse_color->sample(u,v,p,footprint);
+        }
 
         BRDFSample sample(const RayHit ray_hit, unsigned int &seed) override {
             BRDFSample s = Material::sample(ray_hit, seed);
@@ -142,7 +171,8 @@ class Diffuse : public Material {
         BRDFEvaluation evaluate(const RayHit& hit, const Float3& wi) override {
             const float cosine = std::max(0.0f, dot(hit.n, wi.normalize()));
             BRDFEvaluation e;
-            e.value = diffuse_color->sample(hit.u, hit.v, hit.p) * (cosine / PI);
+            e.value = diffuse_color->sample(
+                hit.u, hit.v, hit.p, hit.texture_footprint) * (cosine / PI);
             e.pdf = cosine / PI; e.valid = cosine > 0.0f; return e;
         }
         bool supportsNee(const RayHit&) const override { return true; }
@@ -158,12 +188,19 @@ class Metal : public Material {
         Float3 sample_direction(const RayHit ray_hit, unsigned int &seed) override {
             // note that the ray incoming from the light (wi) is the next/scattered ray
             // don't forget that a ray tracer works "in reverse"
-            Float3 wi = reflect(ray_hit.d, ray_hit.n).normalize() + specular_roughness->sample(ray_hit.u, ray_hit.v, ray_hit.p) * random_unit_vector(seed);
+            Float3 wi = reflect(ray_hit.d, ray_hit.n).normalize() +
+                specular_roughness->sample(ray_hit.u, ray_hit.v, ray_hit.p,
+                    ray_hit.texture_footprint) * random_unit_vector(seed);
             return wi.normalize();
         }
 
         Color3 evaluate_color(const Float3& p, const Float3& n, const Float3& wo, Float3& wi, float u, float v, unsigned int &seed) override {
             return specular_color->sample(u, v, p);
+        }
+        Color3 evaluate_color(const Float3& p, const Float3&, const Float3&,
+            Float3&, float u, float v, unsigned int&,
+            prism::TextureFootprint const& footprint) override {
+            return specular_color->sample(u,v,p,footprint);
         }
 
         Texture<Float3>* specular_color;
@@ -184,7 +221,8 @@ class Emissive : public Material {
         }
 
         Color3 evaluate_emission(const RayHit ray_hit) override {
-            return emissive_color->sample(ray_hit.u, ray_hit.v, ray_hit.p) * emissive_multiplier;
+            return emissive_color->sample(ray_hit.u, ray_hit.v, ray_hit.p,
+                ray_hit.texture_footprint) * emissive_multiplier;
         }
 
         Texture<Color3>* emissive_color;
@@ -328,7 +366,8 @@ class MetalGltf : public Material {
         Float3 sample_direction(const RayHit ray_hit, unsigned int &seed) override {
             // note that the ray incoming from the light (wi) is the next/scattered ray
             // don't forget that a ray tracer works "in reverse"
-            float roughness = orm->sample(ray_hit.u, ray_hit.v, ray_hit.p).y();
+            float roughness = orm->sample(ray_hit.u, ray_hit.v, ray_hit.p,
+                ray_hit.texture_footprint).y();
             Float3 wi = reflect(ray_hit.d, ray_hit.n).normalize() + (roughness * roughness) * random_unit_vector(seed);
             return wi.normalize();
         }
@@ -405,10 +444,12 @@ class gltfPBR : public Material {
 
         BRDFSample sample(const RayHit ray_hit, unsigned int &seed) override {
             float prob = rnd(seed);
-            if (prob <= orm->sample(ray_hit.u, ray_hit.v, ray_hit.p).b()){
+            if (prob <= orm->sample(ray_hit.u, ray_hit.v, ray_hit.p,
+                    ray_hit.texture_footprint).b()){
                 return metal_brdf->sample(ray_hit, seed);
             } else {
-                if (prob <= transmission->sample(ray_hit.u, ray_hit.v, ray_hit.p)){
+                if (prob <= transmission->sample(ray_hit.u, ray_hit.v, ray_hit.p,
+                        ray_hit.texture_footprint)){
                     return specular_btdf->sample(ray_hit, seed);
                 } else {
                     return diffuse_brdf->sample(ray_hit, seed);
@@ -417,7 +458,8 @@ class gltfPBR : public Material {
         }
 
         Color3 evaluate_emission(const RayHit ray_hit) override {
-            return emissive_color->sample(ray_hit.u, ray_hit.v, ray_hit.p) * emissive_multiplier;
+            return emissive_color->sample(ray_hit.u, ray_hit.v, ray_hit.p,
+                ray_hit.texture_footprint) * emissive_multiplier;
         }
 
         // we won't need these: we will sample directly fomr the brdfs

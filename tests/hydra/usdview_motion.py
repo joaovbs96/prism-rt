@@ -52,6 +52,42 @@ def testUsdviewInputFunction(appController):
             image.height(), image.bytesPerLine())[:, :image.width() * 4]
         return image, pixels.reshape(image.height(), image.width(), 4).copy()
 
+    def capture_current_camera(previous_revision, label):
+        """Pump the async renderer through the exact latest camera revision."""
+        deadline = time.monotonic() + 10.0
+        target_revision = None
+        while True:
+            view.updateGL()
+            QtWidgets.QApplication.processEvents()
+            stats = view._renderer.GetRenderStats()
+            requested = stats.get("requestedCameraRevision", 0)
+            displayed = stats.get("displayedCameraRevision", 0)
+            if requested > previous_revision:
+                # One input can cause usdview to refine its free-camera state
+                # more than once. Require the framebuffer for the final
+                # revision, rather than accepting an older preview publish.
+                target_revision = requested
+            if (target_revision is not None and
+                    requested == target_revision and
+                    displayed == target_revision):
+                # The worker may have published after the preceding GL paint.
+                # Force one presentation pass, capture it, and verify that no
+                # newer camera revision arrived across that framebuffer read.
+                view.updateGL()
+                QtWidgets.QApplication.processEvents()
+                image, pixels = capture()
+                presented_stats = view._renderer.GetRenderStats()
+                if (presented_stats.get("requestedCameraRevision", 0) ==
+                        target_revision and
+                        presented_stats.get("displayedCameraRevision", 0) ==
+                        target_revision):
+                    return image, pixels, presented_stats, target_revision
+            assert time.monotonic() < deadline, \
+                (f"{label} did not publish its requested camera revision "
+                 f"(before={previous_revision}, requested={requested}, "
+                 f"displayed={displayed}, target={target_revision})")
+            time.sleep(0.001)
+
     def mouse(kind, x, y, button, buttons):
         point = QtCore.QPointF(x, y)
         return QtGui.QMouseEvent(kind, point, point, button, buttons,
@@ -83,14 +119,18 @@ def testUsdviewInputFunction(appController):
             x += (12 if step < 12 else -12) if mode == "truck" else 4
             if mode == "orbit":
                 y += 2
-            before = view._renderer.GetRenderStats().get("previewPublishes", 0)
+            before_stats = view._renderer.GetRenderStats()
+            before = before_stats.get("previewPublishes", 0)
+            before_revision = before_stats.get("requestedCameraRevision", 0)
             start = time.perf_counter()
             view.mouseMoveEvent(mouse(events.MouseMove, x, y, buttons.NoButton, button))
-            # Qt6 updateGL schedules a repaint; grabFrameBuffer forces that
-            # paint. Include it in timing, rather than timing only event enqueue.
-            image, current = capture()
+            # Preview generation is asynchronous. Pump Qt and capture until
+            # the framebuffer carries this event's final camera revision.
+            # The latency includes all waiting, repainting, and framebuffer
+            # reads, rather than timing only event enqueue.
+            image, current, stats, camera_revision = capture_current_camera(
+                before_revision, f"{mode} step {step}")
             milliseconds = (time.perf_counter() - start) * 1000
-            stats = view._renderer.GetRenderStats()
             changed = int(np.count_nonzero(np.any(current != previous, axis=2)))
             assert changed > 100, f"{mode} step {step} retained a frozen image"
             assert stats.get("previewPublishes", 0) > before, \
@@ -104,6 +144,7 @@ def testUsdviewInputFunction(appController):
                 assert np.count_nonzero(mask) > 100, "Panel disappeared during drag"
                 centers.append(float(np.nonzero(mask)[1].mean()))
             rows.append({"mode": mode, "step": step, "frame_ms": milliseconds,
+                         "camera_revision": camera_revision,
                          "changed_pixels": changed,
                          "preview_ms": stats.get("previewMilliseconds"),
                          "prepare_ms": stats.get("prepareMilliseconds"),

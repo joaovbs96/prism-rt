@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cstring>
 #include <chrono>
+#include <utility>
 
 PXR_NAMESPACE_OPEN_SCOPE
 
@@ -33,9 +34,10 @@ bool PrismRenderBuffer::Allocate(GfVec3i const &d, HdFormat format, bool ms)
     _height = static_cast<unsigned int>(d[1]);
     _format = format;
     _multiSampled = ms;
-    _pixels.assign(static_cast<size_t>(_width) * _height *
-                       HdDataSizeOfFormat(_format), 0);
-    _workingPixels = _pixels;
+    _pixels = std::make_shared<std::vector<uint8_t>>(
+        static_cast<size_t>(_width) * _height * HdDataSizeOfFormat(_format), 0);
+    _frame.reset();
+    _workingPixels = *_pixels;
     _accumulation.assign(static_cast<size_t>(_width) * _height *
                              HdGetComponentCount(_format), 0.0f);
     _sampleCounts.assign(static_cast<size_t>(_width) * _height, 0);
@@ -50,7 +52,8 @@ void PrismRenderBuffer::_Deallocate()
     std::lock_guard lock(_mutex);
     _width = _height = 0;
     _format = HdFormatInvalid;
-    _pixels.clear();
+    _pixels.reset();
+    _frame.reset();
     _workingPixels.clear();
     _accumulation.clear();
     _sampleCounts.clear();
@@ -61,18 +64,32 @@ void PrismRenderBuffer::_Deallocate()
 void *PrismRenderBuffer::Map()
 {
     const auto start = std::chrono::steady_clock::now();
-    _mutex.lock();
+    std::lock_guard lock(_mutex);
     _mapWaitNanoseconds.fetch_add(static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - start).count()));
-    ++_mappers;
-    return _pixels.empty() ? nullptr : _pixels.data();
+    if (_mappers.fetch_add(1) == 0) {
+        _mappedPixels = _pixels;
+        _mappedFrame = _frame;
+        _mappedWidth=_width; _mappedHeight=_height; _mappedFormat=_format;
+    }
+    return !_mappedPixels || _mappedPixels->empty() ? nullptr : _mappedPixels->data();
 }
 
 void PrismRenderBuffer::Unmap()
 {
-    --_mappers;
-    _mutex.unlock();
+    std::lock_guard lock(_mutex);
+    if (!TF_VERIFY(_mappers.load() > 0)) return;
+    if (_mappers.fetch_sub(1) == 1) {
+        _mappedPixels.reset(); _mappedFrame.reset();
+    }
+}
+
+PrismRenderBuffer::ReadView PrismRenderBuffer::Capture() const
+{
+    std::lock_guard lock(_mutex);
+    if(_mappers.load()) return {_mappedPixels,_mappedFrame,_mappedWidth,_mappedHeight,_mappedFormat};
+    return {_pixels,_frame,_width,_height,_format};
 }
 
 void PrismRenderBuffer::Resolve() {}
@@ -103,13 +120,14 @@ static void _StoreComponent(HdFormat format, uint8_t *dst, size_t c, float v)
 
 void PrismRenderBuffer::PublishPreviewFloat(
     unsigned int previewWidth, unsigned int previewHeight,
-    std::vector<float> const &values, size_t components)
+    std::vector<float> const &values, size_t components, Frame frame)
 {
     if (previewWidth == 0 || previewHeight == 0 || components == 0 ||
         values.size() < static_cast<size_t>(previewWidth) * previewHeight *
                             components) return;
-    std::lock_guard lock(_mutex);
     if (_width == 0 || _height == 0 || _format == HdFormatInvalid) return;
+    auto published = std::make_shared<std::vector<uint8_t>>(
+        static_cast<size_t>(_width) * _height * HdDataSizeOfFormat(_format));
     const size_t arity = HdGetComponentCount(_format);
     const size_t stride = HdDataSizeOfFormat(_format);
     std::vector<uint8_t> encoded(
@@ -136,21 +154,25 @@ void PrismRenderBuffer::PublishPreviewFloat(
                             src, stride);
         }
         for (unsigned int y = y0; y < y1; ++y)
-            std::memcpy(_pixels.data() + static_cast<size_t>(y) * _width * stride,
+            std::memcpy(published->data() + static_cast<size_t>(y) * _width * stride,
                         expandedRow.data(), expandedRow.size());
     }
+    std::lock_guard lock(_mutex);
+    _pixels = std::move(published);
+    _frame = std::move(frame);
     _hasPublished = true;
 }
 
 void PrismRenderBuffer::PublishPreviewInt(
     unsigned int previewWidth, unsigned int previewHeight,
-    std::vector<int> const &values, size_t components)
+    std::vector<int> const &values, size_t components, Frame frame)
 {
     if (previewWidth == 0 || previewHeight == 0 || components == 0 ||
         values.size() < static_cast<size_t>(previewWidth) * previewHeight *
                             components) return;
-    std::lock_guard lock(_mutex);
     if (_width == 0 || _height == 0 || _format == HdFormatInvalid) return;
+    auto published = std::make_shared<std::vector<uint8_t>>(
+        static_cast<size_t>(_width) * _height * HdDataSizeOfFormat(_format));
     const size_t arity = HdGetComponentCount(_format);
     const size_t stride = HdDataSizeOfFormat(_format);
     std::vector<uint8_t> encoded(
@@ -181,9 +203,12 @@ void PrismRenderBuffer::PublishPreviewInt(
                             src, stride);
         }
         for (unsigned int y = y0; y < y1; ++y)
-            std::memcpy(_pixels.data() + static_cast<size_t>(y) * _width * stride,
+            std::memcpy(published->data() + static_cast<size_t>(y) * _width * stride,
                         expandedRow.data(), expandedRow.size());
     }
+    std::lock_guard lock(_mutex);
+    _pixels = std::move(published);
+    _frame = std::move(frame);
     _hasPublished = true;
 }
 
@@ -261,7 +286,8 @@ void PrismRenderBuffer::Clear(VtValue const &value)
         }
     };
     clearWorking();
-    _pixels = _workingPixels;
+    _pixels = std::make_shared<std::vector<uint8_t>>(_workingPixels);
+    _frame.reset();
     _hasPublished = true;
 }
 
@@ -302,15 +328,26 @@ void PrismRenderBuffer::BeginFrame(VtValue const &value)
             }
         }
     }
-    if (!_hasPublished) _pixels = _workingPixels;
+    if (!_hasPublished) _pixels = std::make_shared<std::vector<uint8_t>>(_workingPixels);
 }
 
-void PrismRenderBuffer::Publish()
+void PrismRenderBuffer::Publish(Frame frame)
 {
     const auto start = std::chrono::steady_clock::now();
-    std::lock_guard lock(_mutex);
-    _pixels.swap(_workingPixels);
-    _hasPublished = true;
+    auto next = std::make_shared<std::vector<uint8_t>>(std::move(_workingPixels));
+    const auto size = next->size();
+    std::shared_ptr<std::vector<uint8_t>> previous;
+    {
+        std::lock_guard lock(_mutex);
+        previous = std::exchange(_pixels, std::move(next));
+        _frame = std::move(frame);
+        _hasPublished = true;
+    }
+    if (previous && previous.use_count() == 1)
+        _workingPixels = std::move(*previous);
+    else
+        _workingPixels.resize(size);
+    _workingPixels.resize(size);
     _publishNanoseconds.fetch_add(static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - start).count()),

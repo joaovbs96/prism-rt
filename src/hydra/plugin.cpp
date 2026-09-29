@@ -55,7 +55,6 @@ std::unique_ptr<HdRenderer> HdPrismRendererPlugin::_CreateRenderer(
     const auto toMesh = HdRetainedTypedSampledDataSource<TfToken>::New(
         HdsiImplicitSurfaceSceneIndexTokens->toMesh);
     const auto conversion = HdRetainedContainerDataSource::New(
-        HdPrimTypeTokens->sphere, toMesh,
         HdPrimTypeTokens->cube, toMesh,
         HdPrimTypeTokens->cone, toMesh,
         HdPrimTypeTokens->cylinder, toMesh,

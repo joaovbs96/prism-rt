@@ -5,6 +5,10 @@
 
 #include "float3.h"
 #include "float4.h"
+#include "texture_service.h"
+#include "ray.h"
+#include <memory>
+#include <stdexcept>
 #include <OpenImageIO/imagebuf.h>
 #include <OpenImageIO/imagebufalgo.h>
 #include <OpenImageIO/span.h>
@@ -24,6 +28,14 @@ class Texture {
 
         virtual T sampleInterp(float u, float v, const Float3& p) const = 0;
 
+        virtual T sample(float u, float v, const Float3& p,
+                         const prism::TextureFootprint& footprint) const {
+            return sample(u, v, p);
+        }
+        virtual T sampleInterp(float u, float v, const Float3& p,
+                               const prism::TextureFootprint& footprint) const {
+            return sampleInterp(u, v, p);
+        }
         virtual void gammaCorrect(float gamma) {}
 };
 
@@ -67,44 +79,87 @@ class ImageTexture : public Texture<T> {
             if (file_channel_n != channel_n) {
                 buffer = ImageBufAlgo::channels(buffer, channel_n, {});
             }
+            publishEdits();
         }
 
-        ImageTexture(const std::filesystem::path &file_path) {
-            channel_n = sizeof(T) / sizeof(float); // This is derived from the template class, can be 1, 3 or 4
+        ImageTexture(const std::filesystem::path &file_path)
+            : service(prism::TextureService::Acquire()), source(file_path) {
+            channel_n = sizeof(T) / sizeof(float);
+            prepareOptions.channelCount = channel_n;
+            publishResource();
+        }
 
-            std::cout << "Loading File: " << file_path << std::endl;
-            buffer = ImageBuf(file_path.string());
-            buffer.read(0, 0, true, TypeDesc::FLOAT);
-
-            width = buffer.spec().width;
-            height = buffer.spec().height;
-            file_channel_n = buffer.spec().nchannels;
-
-            // adjust channel count
-            if (file_channel_n != channel_n) {
-                buffer = ImageBufAlgo::channels(buffer, channel_n, {});
-            }
+        // Explicit boundary for callers editing the public ImageBuf (fixtures
+        // and procedural images). Published renderer resources remain immutable.
+        void publishEdits() {
+            if (!service) service = prism::TextureService::Acquire();
+            resource = service->prepare(buffer);
+            source = resource->preparedPath();
+            prepareOptions = {};
+            useResource();
         }
 
         void blur(float kernel_size = 5.0f) {
             ImageBuf K = ImageBufAlgo::make_kernel("gaussian", kernel_size, kernel_size);
             buffer = ImageBufAlgo::convolve(buffer, K);
+            publishEdits();
         }
 
         void gammaCorrect(float gamma) override {
-            const float g_ = 1.0 / gamma;
-            ImageBufAlgo::pow(buffer, buffer, {g_, g_, g_});
+            if (!(gamma > 0) || !std::isfinite(gamma))
+                throw std::runtime_error("Invalid image gamma");
+            if (!resource) { ImageBufAlgo::pow(buffer, buffer, {1/gamma,1/gamma,1/gamma}); return; }
+            prepareOptions.gamma /= gamma;
+            prepareOptions.exposure /= gamma;
+            publishResource();
         }
 
         void adjustExposure(float exposure) {
-            float multiplier = std::pow(2.0f, exposure);
-            ImageBufAlgo::mul(buffer, buffer, multiplier);
+            if (!std::isfinite(exposure)) throw std::runtime_error("Invalid image exposure");
+            if (!resource) { ImageBufAlgo::mul(buffer, buffer, std::pow(2.0f, exposure)); return; }
+            prepareOptions.exposure += exposure;
+            publishResource();
+        }
+
+        T lookup(prism::TextureLookup options) const {
+            float pixel[4]{};
+            if (resource) {
+                if (!service->lookup(*resource, options, channel_n, pixel))
+                    throw std::runtime_error("Texture lookup failed: " + source.string());
+            } else {
+                // Procedural/embedded mutable buffers are published explicitly.
+                buffer.interppixel(options.s * width, options.t * height, pixel);
+            }
+            return getValue<T>(pixel);
+        }
+
+        bool readRow(int y, float* pixels, int channels) const {
+            if (resource) return service->readPixels(*resource, 0, y, width, y+1, 0, channels, pixels);
+            return buffer.get_pixels(ROI(0,width,y,y+1,0,1,0,channels), TypeDesc::FLOAT, pixels);
+        }
+
+        T sample(float u, float v, const Float3& p,
+                 const prism::TextureFootprint& footprint) const override {
+            if (footprint.filtering == prism::TextureFiltering::Bilinear) return sample(u,v,p);
+            return sampleFiltered(u,v,footprint);
+        }
+        T sampleInterp(float u, float v, const Float3& p,
+                       const prism::TextureFootprint& footprint) const override {
+            if (footprint.filtering == prism::TextureFiltering::Bilinear) return sampleInterp(u,v,p);
+            return sampleFiltered(u,v,footprint);
         }
 
         T sample(float u, float v, const Float3& p) const override {
             auto i = int(std::fabsf(std::fmodf(u, 1.0)) * (width - 1));
             auto j = int(std::fabsf(std::fmodf(v, 1.0)) * (height - 1));
             float pixel[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            if (resource) {
+                prism::TextureLookup options{};
+                options.s = (i + .5f) / width; options.t = (j + .5f) / height;
+                options.filtering = prism::TextureFiltering::Bilinear;
+                options.nearest = true;
+                return lookup(options);
+            }
             buffer.getpixel(i, j, pixel);
             return getValue<T>(pixel);
         }
@@ -113,6 +168,13 @@ class ImageTexture : public Texture<T> {
             auto i = std::fabsf(std::fmodf(u, 1.0)) * (width - 1);
             auto j = std::fabsf(std::fmodf(v, 1.0)) * (height - 1);
             float pixel[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            if (resource) {
+                prism::TextureLookup options{};
+                options.s = i / width; options.t = j / height;
+                options.filtering = prism::TextureFiltering::Bilinear;
+                options.wrapS = options.wrapT = prism::TextureWrap::Black;
+                return lookup(options);
+            }
             buffer.interppixel(i, j, pixel);
             return getValue<T>(pixel);
         }
@@ -122,6 +184,30 @@ class ImageTexture : public Texture<T> {
         int file_channel_n; // original channel count from file
         int channel_n;      // effective channel count in use, due to template
         ImageBuf buffer;
+        std::shared_ptr<prism::TextureService> service;
+        std::shared_ptr<const prism::TextureResource> resource;
+    private:
+        std::filesystem::path source;
+        prism::TexturePrepareOptions prepareOptions;
+        void useResource() {
+            width = resource->width(); height = resource->height();
+            file_channel_n = resource->channels();
+            // Lazy access for preparation/legacy fixtures; no duplicate pixel array.
+            buffer = ImageBuf(resource->preparedPath().string());
+        }
+        void publishResource() {
+            resource = service->prepare(source, prepareOptions);
+            useResource();
+        }
+        T sampleFiltered(float u, float v, const prism::TextureFootprint& footprint) const {
+            prism::TextureLookup options{};
+            options.s = u; options.t = v;
+            options.dsdx = footprint.dudx; options.dtdx = footprint.dvdx;
+            options.dsdy = footprint.dudy; options.dtdy = footprint.dvdy;
+            options.wrapS = options.wrapT = prism::TextureWrap::Periodic;
+            options.filtering = footprint.filtering;
+            return lookup(options);
+        }
 };
 
 template <TextureType T = Float3>
@@ -145,6 +231,12 @@ class ImageMixTexture : public Texture<T> {
             return _image->sampleInterp(u, v, p) * _value->sampleInterp(u, v, p);
         }
 
+        T sample(float u, float v, const Float3& p, const prism::TextureFootprint& fp) const override {
+            return _image->sample(u,v,p,fp) * _value->sample(u,v,p);
+        }
+        T sampleInterp(float u, float v, const Float3& p, const prism::TextureFootprint& fp) const override {
+            return _image->sampleInterp(u,v,p,fp) * _value->sampleInterp(u,v,p);
+        }
         void gammaCorrect(float gamma) override {
             _image->gammaCorrect(gamma);
         }
