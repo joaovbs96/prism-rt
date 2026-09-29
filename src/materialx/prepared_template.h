@@ -273,7 +273,24 @@ public:
         }
         return false;
     }
+    // A template is only reusable if bind_arguments can write its bindings:
+    // it needs a class argument block and every bound uniform (passed to
+    // bind_arguments unchanged) must be a parameter of the compiled program.
+    static bool IsBindable(const CompatibleMaterialTemplate& entry) {
+        if (!entry.prototype || !entry.prototype->is_valid()) return false;
+        const auto& target=entry.prototype->get_target_code();
+        if (!target.binding || !target.binding->argument_block || !target.program ||
+            !target.program->target_code ||
+            target.program->target_code->get_argument_block_count()==0) return false;
+        const auto& parameters=target.program->parameters;
+        return std::all_of(entry.bindings.begin(),entry.bindings.end(),
+            [&](const CompatibleBinding& binding) {
+                return std::any_of(parameters.begin(),parameters.end(),
+                    [&](const auto& parameter) { return parameter.name==binding.uniform; });
+            });
+    }
     void publish(CompatibleMaterialTemplate entry) {
+        if (!IsBindable(entry)) return;
         std::lock_guard lock(m_mutex);
         std::erase_if(m_entries, [&](const auto& old) {
             return old.context == entry.context && old.libraries == entry.libraries &&
