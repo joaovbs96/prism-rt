@@ -2860,6 +2860,9 @@ public:
         // spare job reports its bank in spareSnapshot with spare set.
         bool needsSpare = false;
         bool spare = false;
+        // Set only when the spare bank was built to the end. A cancel raised
+        // after that point does not make the bank any less complete.
+        bool spareComplete = false;
     };
 
     Impl(HdSceneIndexBaseRefPtr index, HdRenderThread *thread)
@@ -2911,9 +2914,13 @@ public:
                         prototypePool, [cancel] {
                             return cancel->load(std::memory_order_relaxed);
                         }, seed ? &*seed : nullptr);
+                    // _BuildSnapshot returns null whenever it saw the cancel
+                    // flag before committing, so a snapshot here is whole.
                     if (result.spareSnapshot &&
                         result.spareSnapshot->materialSeedMissed)
                         result.error = "spare bank needs an unresolved material";
+                    result.spareComplete = result.spareSnapshot &&
+                        result.error.empty();
                 } catch (std::exception const &e) {
                     result.error = e.what();
                 } catch (...) {
@@ -3236,7 +3243,6 @@ bool SceneBridge::Prepare(CameraState const &camera,
     // conversion. Superseded generations are destroyed without publication.
     SceneBridge::Impl::BuildResult completed;
     bool hasCompleted = false;
-    bool completedCancelled = false;
     bool published = false;
     {
         std::lock_guard lock(_impl->mutex);
@@ -3259,8 +3265,6 @@ bool SceneBridge::Prepare(CameraState const &camera,
                 _impl->materialWorkTotals.programWaitSeconds += work.programWaitSeconds;
                 _impl->materialWorkTotals.textureBytes += work.textureBytes;
             }
-            completedCancelled = _impl->buildCancel &&
-                _impl->buildCancel->load(std::memory_order_relaxed);
             _impl->buildingGeneration = 0;
             _impl->buildCancel.reset();
             _impl->buildIsSpare = false;
@@ -3270,8 +3274,16 @@ bool SceneBridge::Prepare(CameraState const &camera,
     if (hasCompleted && completed.spare) {
         // Installing the spare bank leaves the displayed snapshot, its
         // accumulation and the material service alone, so the render worker
-        // keeps running. A superseded, cancelled or failed spare is dropped;
-        // the next edit then takes the missing-bank path.
+        // keeps running. A finished spare is installed even when edits
+        // arrived after it: it matches activeGeneration, and the journal
+        // records newer than it stay for the next job to replay. Only a spare
+        // cut short by a cancel, or a failed one, is dropped; the next edit
+        // then takes the missing-bank path.
+        // The spare job read the retained scene that incremental capture
+        // mutates in place. Capture starts only once buildFuture has been
+        // consumed here, so the job has finished reading before any capture
+        // writes, and this install precedes the bank decision for the newer
+        // generation's job.
         std::lock_guard lock(_impl->mutex);
         _impl->spareSnapshotSeconds = completed.seconds;
         if (completed.spareSnapshot) {
@@ -3280,10 +3292,8 @@ bool SceneBridge::Prepare(CameraState const &camera,
             _impl->sparePrototypeConversionCacheHits =
                 completed.spareSnapshot->prototypeConversionCacheHits;
         }
-        if (completed.spareSnapshot && completed.error.empty() &&
-            !completedCancelled && !_impl->sceneDirty &&
-            completed.generation == _impl->activeGeneration &&
-            completed.generation == _impl->requestedGeneration) {
+        if (completed.spareComplete && completed.error.empty() &&
+            completed.generation == _impl->activeGeneration) {
             _impl->inactiveSnapshot = std::move(completed.spareSnapshot);
             _impl->inactiveGeneration = completed.generation;
             while (!_impl->dirtyJournal.empty() &&
@@ -4078,6 +4088,11 @@ VtDictionary SceneBridge::GetStats() const
     result["snapshotBuildSeconds"] = VtValue(_impl->snapshotBuildSeconds);
     result["firstPublishSeconds"] = VtValue(_impl->firstPublishSeconds);
     result["spareSnapshotSeconds"] = VtValue(_impl->spareSnapshotSeconds);
+    // wait_for does not consume the result; Prepare still installs it.
+    result["spareSnapshotReady"] = VtValue(
+        _impl->buildIsSpare && _impl->buildFuture.valid() &&
+        _impl->buildFuture.wait_for(std::chrono::seconds(0)) ==
+            std::future_status::ready);
     result["spareSnapshotsInstalled"] = VtValue(static_cast<int64_t>(
         _impl->spareSnapshotsInstalled));
     result["spareSnapshotsDiscarded"] = VtValue(static_cast<int64_t>(

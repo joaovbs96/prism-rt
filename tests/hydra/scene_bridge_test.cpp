@@ -1770,6 +1770,133 @@ int main()
             activeBridge = nullptr;
         }
 
+        // F: a spare that finished while nobody called Prepare is installed
+        // by the Prepare that follows an edit, so the edit stays incremental.
+        {
+            HdRetainedSceneIndexRefPtr scene = HdRetainedSceneIndex::New();
+            AddConversionScene(scene);
+            prism::hydra::SceneBridge bridge(scene, &thread);
+            bridge.SetSettings(settings);
+            ok &= Check(prepareUntilDisplayed(bridge, aovs),
+                        "idle-host scene did not publish");
+            ok &= Check(WaitFor([&] {
+                return BoolStat(bridge.GetStats(), "spareSnapshotReady");
+            }), "spare job did not finish without Prepare calls");
+            VtDictionary const ready = bridge.GetStats();
+            ok &= Check(BoolStat(ready, "preparationPending") &&
+                            Stat(ready, "spareSnapshotsInstalled") == 0,
+                        "reading spareSnapshotReady consumed the spare job");
+            scene->AddPrims({{SdfPath("/Grid"), TfToken("xform"),
+                              FixtureXformData(GfVec3d(0.0, 0.0, 0.5))}});
+            bridge.MarkSceneDirty(prism::hydra::SceneDirtyKind::Placement,
+                                  SdfPath("/Grid"));
+            ok &= Check(PumpPrepare(bridge, camera, aovs, geometryTags,
+                                    resolution, resolution),
+                        "edit after an unconsumed spare did not prepare");
+            VtDictionary const edited = bridge.GetStats();
+            ok &= Check(Stat(edited, "spareSnapshotsInstalled") ==
+                            Stat(ready, "spareSnapshotsInstalled") + 1 &&
+                            Stat(edited, "spareSnapshotsDiscarded") ==
+                                Stat(ready, "spareSnapshotsDiscarded") &&
+                            Stat(edited, "snapshotBuilds") ==
+                                Stat(ready, "snapshotBuilds") &&
+                            Stat(edited, "reusedSnapshotBuilds") ==
+                                Stat(ready, "reusedSnapshotBuilds") + 1 &&
+                            Stat(edited, "primCount") == 68,
+                        "finished spare was discarded instead of taking the edit");
+            ok &= Check(renderFrame(bridge), "idle-host edit frame did not converge");
+            std::vector<int> const prims = ReadBuffer<int>(&primBuffer);
+            const size_t center = (resolution / 2) * resolution + resolution / 2;
+            ok &= Check(prims.size() == resolution * resolution &&
+                            prims[center] >= 0 &&
+                            bridge.GetPrimPath(prims[center]).GetParentPath() ==
+                                SdfPath("/Grid"),
+                        "edit applied to the installed spare was not displayed");
+            activeBridge = nullptr;
+        }
+
+        // G: a structural edit after an unconsumed spare still installs it,
+        // then rebuilds because structure cannot be replayed on a bank.
+        {
+            HdRetainedSceneIndexRefPtr scene = HdRetainedSceneIndex::New();
+            AddConversionScene(scene);
+            prism::hydra::SceneBridge bridge(scene, &thread);
+            bridge.SetSettings(settings);
+            ok &= Check(prepareUntilDisplayed(bridge, {}),
+                        "structural idle-host scene did not publish");
+            ok &= Check(WaitFor([&] {
+                return BoolStat(bridge.GetStats(), "spareSnapshotReady");
+            }), "structural idle-host spare did not finish");
+            VtDictionary const ready = bridge.GetStats();
+            scene->AddPrims({{SdfPath("/Extra"), HdPrimTypeTokens->mesh,
+                              FixtureMeshData(false, HdRenderTagTokens->geometry,
+                                              GfVec3f(0.7f), 0.95f)}});
+            bridge.MarkSceneDirty(prism::hydra::SceneDirtyKind::Structure,
+                                  SdfPath("/Extra"));
+            ok &= Check(PumpPrepare(bridge, camera, {}, geometryTags,
+                                    resolution, resolution),
+                        "structural edit after an unconsumed spare did not prepare");
+            VtDictionary const edited = bridge.GetStats();
+            ok &= Check(Stat(edited, "primCount") == 69 &&
+                            Stat(edited, "prototypeCount") == 67 &&
+                            Stat(edited, "triangleCount") == 64 * 3 + 3 + 2 + 3 &&
+                            Stat(edited, "instanceCount") == 2,
+                        "structural edit after an unconsumed spare lost scene contents");
+            ok &= Check(Stat(edited, "snapshotBuilds") ==
+                            Stat(ready, "snapshotBuilds") + 1 &&
+                            Stat(edited, "reusedSnapshotBuilds") ==
+                                Stat(ready, "reusedSnapshotBuilds") &&
+                            Stat(edited, "spareSnapshotsInstalled") ==
+                                Stat(ready, "spareSnapshotsInstalled") + 2 &&
+                            Stat(edited, "spareSnapshotsDiscarded") ==
+                                Stat(ready, "spareSnapshotsDiscarded") &&
+                            Stat(edited, "retainedSnapshotCount") == 2,
+                        "structural edit did not rebuild with a fresh spare bank");
+        }
+
+        // H: an edit while the spare job is still running cancels it before
+        // it completes; that spare is discarded and the edit is displayed.
+        // Enough meshes keep the spare job running well past the edit.
+        {
+            constexpr int meshCount = 10000;
+            HdRetainedSceneIndexRefPtr scene = HdRetainedSceneIndex::New();
+            HdRetainedSceneIndex::AddedPrimEntries prims;
+            prims.reserve(meshCount + 1);
+            prims.push_back({SdfPath("/Grid"), TfToken("xform"),
+                             FixtureXformData(GfVec3d(0.0))});
+            for (int i = 0; i < meshCount; ++i)
+                prims.push_back({SdfPath("/Grid/M" + std::to_string(i)),
+                    HdPrimTypeTokens->mesh,
+                    FixtureMeshData(false, HdRenderTagTokens->geometry,
+                                    GfVec3f(0.7f),
+                                    0.00005f * static_cast<float>(i + 1))});
+            scene->AddPrims(prims);
+            prism::hydra::SceneBridge bridge(scene, &thread);
+            bridge.SetSettings(settings);
+            ok &= Check(prepareUntilDisplayed(bridge, aovs),
+                        "large spare scene did not publish");
+            ok &= Check(!BoolStat(bridge.GetStats(), "spareSnapshotReady"),
+                        "spare job finished before the edit could interrupt it");
+            scene->AddPrims({{SdfPath("/Grid"), TfToken("xform"),
+                              FixtureXformData(GfVec3d(100.0, 0.0, 0.0))}});
+            bridge.MarkSceneDirty(prism::hydra::SceneDirtyKind::Placement,
+                                  SdfPath("/Grid"));
+            ok &= Check(PumpPrepare(bridge, camera, aovs, geometryTags,
+                                    resolution, resolution),
+                        "edit during a running spare job did not prepare");
+            VtDictionary const edited = bridge.GetStats();
+            ok &= Check(Stat(edited, "spareSnapshotsDiscarded") == 1 &&
+                            Stat(edited, "spareSnapshotsInstalled") == 1 &&
+                            Stat(edited, "primCount") == meshCount &&
+                            Stat(edited, "retainedSnapshotCount") == 2,
+                        "interrupted spare job was not discarded");
+            size_t hits = 0;
+            ok &= Check(renderFrame(bridge), "large moved frame did not converge");
+            ok &= Check(gridPixels(bridge, &hits) == 0,
+                        "edit during a running spare job was not displayed");
+            activeBridge = nullptr;
+        }
+
         // E: tearing a bridge down while its spare job is pending must cancel
         // and join it like any other build.
         for (int repetition = 0; repetition < 5; ++repetition) {
