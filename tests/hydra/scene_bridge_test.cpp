@@ -1908,6 +1908,87 @@ int main()
                         "spare job was not pending before teardown");
         }
     }
+    {
+        // Until a bound buffer shows a rendered frame it must hold its AOV
+        // clear value: the host blends the delegate's colour over its own
+        // background, so the zero-filled allocation would show as black.
+        const TfTokenVector geometryTags{HdRenderTagTokens->geometry};
+        prism::hydra::CameraState camera;
+        GfFrustum frustum;
+        frustum.SetPerspective(100.0, 1.0, 0.1, 100.0);
+        camera.projection = frustum.ComputeProjectionMatrix();
+        camera.worldToView.SetTranslate(GfVec3d(0, 0, -3));
+        camera.nearClip = 0.1f;
+        camera.farClip = 100.0f;
+        prism::hydra::RenderSettings settings;
+        settings.samples = 1;
+        settings.maxDepth = 1;
+        settings.refinementDelayMs = 0;
+        const GfVec4f colorClear(0.25f, 0.5f, 0.75f, 1.0f);
+        auto isCleared = [&](PrismRenderBuffer *color, PrismRenderBuffer *depth) {
+            const std::vector<float> c = ReadBuffer<float>(color);
+            const std::vector<float> d = ReadBuffer<float>(depth);
+            bool same = !c.empty() && c.size() == static_cast<size_t>(
+                color->GetWidth()) * color->GetHeight() * 4 &&
+                d.size() == static_cast<size_t>(depth->GetWidth()) *
+                    depth->GetHeight();
+            for (size_t i = 0; same && i < c.size(); ++i)
+                same &= c[i] == colorClear[i % 4];
+            for (size_t i = 0; same && i < d.size(); ++i) same &= d[i] == 1.0f;
+            return same;
+        };
+        auto allocate = [&](PrismRenderBuffer &color, PrismRenderBuffer &depth,
+                            unsigned resolution) {
+            color.Allocate(GfVec3i(resolution, resolution, 1),
+                           HdFormatFloat32Vec4, false);
+            depth.Allocate(GfVec3i(resolution, resolution, 1),
+                           HdFormatFloat32, false);
+        };
+        PrismRenderBuffer color(SdfPath("/LoadColor"), &thread);
+        PrismRenderBuffer depth(SdfPath("/LoadDepth"), &thread);
+        allocate(color, depth, 8);
+        HdRenderPassAovBindingVector aovs(2);
+        aovs[0].aovName = HdAovTokens->color;
+        aovs[0].renderBuffer = &color;
+        aovs[0].clearValue = VtValue(colorClear);
+        aovs[1].aovName = HdAovTokens->depth;
+        aovs[1].renderBuffer = &depth;
+        aovs[1].clearValue = VtValue(1.0f);
+        HdRetainedSceneIndexRefPtr loadScene = HdRetainedSceneIndex::New();
+        AddConversionScene(loadScene);
+        prism::hydra::SceneBridge bridge(loadScene, &thread);
+        bridge.SetSettings(settings);
+
+        bridge.Prepare(camera, aovs, geometryTags, 8, 8);
+        ok &= Check(isCleared(&color, &depth),
+                    "first Prepare left a bound buffer without its clear value");
+        ok &= Check(PumpPrepare(bridge, camera, aovs, geometryTags, 8, 8),
+                    "cleared-buffer scene did not prepare");
+        ok &= Check(isCleared(&color, &depth),
+                    "buffer changed before any frame was rendered");
+        activeBridge = &bridge;
+        thread.StartRender();
+        ok &= Check(WaitFor([&] {
+            return bridge.IsConverged() &&
+                Stat(bridge.GetStats(), "completedSamples") > 0;
+        }), "cleared-buffer scene did not render");
+        thread.StopRender();
+        ok &= Check(!isCleared(&color, &depth),
+                    "rendered image was not written over the clear value");
+        const std::vector<float> shown = ReadBuffer<float>(&color);
+        for (int i = 0; i < 3; ++i)
+            bridge.Prepare(camera, aovs, geometryTags, 8, 8);
+        ok &= Check(ReadBuffer<float>(&color) == shown,
+                    "Prepare erased a displayed image");
+
+        // A resize reallocates zero-filled storage; the next Prepare must
+        // replace it before anything can present it.
+        allocate(color, depth, 12);
+        bridge.Prepare(camera, aovs, geometryTags, 12, 12);
+        ok &= Check(isCleared(&color, &depth),
+                    "resized buffers were not cleared before a new frame");
+        activeBridge = nullptr;
+    }
     thread.StopThread();
     return ok ? 0 : 1;
 }

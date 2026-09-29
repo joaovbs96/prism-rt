@@ -3185,6 +3185,12 @@ bool SceneBridge::Prepare(CameraState const &camera,
     bool stateChanged = false;
     bool hasPreparationWork = false;
     bool spareOnly = false;
+    // Buffers that have not shown a frame still hold their zero allocation,
+    // which the host blends as transparent black over its background.
+    bool clearNeeded = false;
+    for (HdRenderPassAovBinding const &binding : bindings)
+        if (auto *buffer = dynamic_cast<PrismRenderBuffer *>(binding.renderBuffer))
+            clearNeeded |= buffer->NeedsInitialClear();
     {
         std::lock_guard lock(_impl->mutex);
         cameraChanged = _impl->camera.worldToView != camera.worldToView ||
@@ -3204,7 +3210,8 @@ bool SceneBridge::Prepare(CameraState const &camera,
         spareOnly = !_impl->sceneDirty && !_impl->captureActive &&
             _impl->buildFuture.valid() && _impl->buildIsSpare;
         if (!_impl->sceneDirty && !_impl->stateDirty && !cameraChanged &&
-            !bindingsChanged && !renderTagsChanged && !hasPreparationWork)
+            !bindingsChanged && !renderTagsChanged && !hasPreparationWork &&
+            !clearNeeded)
             return false;
     }
 
@@ -3212,13 +3219,20 @@ bool SceneBridge::Prepare(CameraState const &camera,
     // the render worker here. Scene notices already request a stop in
     // MarkSceneDirty; capture-only Prepare calls leave the old shaded snapshot
     // available for navigation.
-    if (cameraChanged || bindingsChanged || renderTagsChanged) {
+    if (cameraChanged || bindingsChanged || renderTagsChanged || clearNeeded) {
         auto const stopStart = std::chrono::steady_clock::now();
         _impl->renderThread->StopRender();
         std::lock_guard lock(_impl->mutex);
         _impl->stopRenderMilliseconds = 1000.0 * std::chrono::duration<double>(
             std::chrono::steady_clock::now() - stopStart).count();
     }
+    // The worker is stopped here, and only Prepare's caller restarts it, so it
+    // cannot be writing these buffers. Each buffer is cleared once per
+    // allocation and never after it has shown a frame.
+    if (clearNeeded)
+        for (HdRenderPassAovBinding const &binding : bindings)
+            if (auto *buffer = dynamic_cast<PrismRenderBuffer *>(binding.renderBuffer))
+                buffer->ApplyInitialClear(binding.clearValue);
 
     {
         std::lock_guard lock(_impl->mutex);
@@ -3727,7 +3741,7 @@ bool SceneBridge::Prepare(CameraState const &camera,
 
     std::lock_guard lock(_impl->mutex);
     if (spareOnly && !stateChanged && !cameraChanged && !bindingsChanged &&
-        !renderTagsChanged && !published && !captureWorked &&
+        !renderTagsChanged && !clearNeeded && !published && !captureWorked &&
         !_impl->sceneDirty && !_impl->captureActive) {
         // Only the spare bank advanced. The displayed frame is unchanged, so
         // neither restart the render worker nor clear its convergence.

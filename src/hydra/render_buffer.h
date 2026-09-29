@@ -39,6 +39,14 @@ public:
     // publishing; avoiding a redundant full-resolution clear keeps camera
     // interaction responsive.
     void BeginFrame(VtValue const &clearValue);
+    // True until the buffer has shown a frame or received its initial clear
+    // since it was last allocated.
+    bool NeedsInitialClear() const;
+    // Fills a not-yet-shown buffer with its AOV clear value so the host never
+    // presents the zero-filled allocation. The caller must have stopped the
+    // render worker. Does nothing once a frame exists, and only acts once per
+    // allocation, so it never touches a displayed image or a running render.
+    bool ApplyInitialClear(VtValue const &clearValue);
     using Frame = std::shared_ptr<const prism::hydra::PublishedFrame>;
     struct ReadView {
         std::shared_ptr<const std::vector<uint8_t>> pixels;
@@ -81,6 +89,8 @@ protected:
 private:
     void _Write(unsigned int x, unsigned int y, const float *value,
                 size_t components, bool accumulate);
+    // Replicates one encoded clear pixel over the whole working image.
+    void _FillWorking(VtValue const &clearValue);
 
     unsigned int _width = 0;
     unsigned int _height = 0;
@@ -103,6 +113,7 @@ private:
     std::atomic<uint64_t> _publishNanoseconds{0};
     std::atomic<uint64_t> _mapWaitNanoseconds{0};
     bool _hasPublished = false;
+    bool _initialCleared = false;
     HdRenderThread *_renderThread;
 };
 

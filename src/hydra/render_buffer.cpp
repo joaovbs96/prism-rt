@@ -42,6 +42,7 @@ bool PrismRenderBuffer::Allocate(GfVec3i const &d, HdFormat format, bool ms)
                              HdGetComponentCount(_format), 0.0f);
     _sampleCounts.assign(static_cast<size_t>(_width) * _height, 0);
     _hasPublished = false;
+    _initialCleared = false;
     _converged.store(false);
     return true;
 }
@@ -58,6 +59,7 @@ void PrismRenderBuffer::_Deallocate()
     _accumulation.clear();
     _sampleCounts.clear();
     _hasPublished = false;
+    _initialCleared = false;
     _converged.store(false);
 }
 
@@ -291,7 +293,7 @@ void PrismRenderBuffer::Clear(VtValue const &value)
     _hasPublished = true;
 }
 
-void PrismRenderBuffer::BeginFrame(VtValue const &value)
+void PrismRenderBuffer::_FillWorking(VtValue const &value)
 {
     float f[4] = {0, 0, 0, 0};
     int i[4] = {0, 0, 0, 0};
@@ -308,6 +310,36 @@ void PrismRenderBuffer::BeginFrame(VtValue const &value)
         i[0] = value.UncheckedGet<int>(); ints = true;
     }
 
+    const size_t stride = HdDataSizeOfFormat(_format);
+    const size_t rowBytes = static_cast<size_t>(_width) * stride;
+    if (rowBytes == 0 || _height == 0 || _workingPixels.size() < rowBytes * _height)
+        return;
+    // Encode a single pixel exactly as _Write would, then replicate it.
+    const size_t arity = HdGetComponentCount(_format);
+    uint8_t *row = _workingPixels.data();
+    for (size_t c = 0; c < arity; ++c) {
+        if (ints) {
+            const int v = c < n ? i[c] : 0;
+            if (HdGetComponentFormat(_format) == HdFormatInt32)
+                reinterpret_cast<int32_t *>(row)[c] = v;
+            else
+                _StoreComponent(_format, row, c, static_cast<float>(v));
+        } else {
+            _StoreComponent(_format, row, c,
+                            c < n ? f[c] : (c == 3 ? 1.0f : 0.0f));
+        }
+    }
+    for (size_t filled = stride; filled < rowBytes;) {
+        const size_t count = std::min(filled, rowBytes - filled);
+        std::memcpy(row + filled, row, count);
+        filled += count;
+    }
+    for (unsigned int y = 1; y < _height; ++y)
+        std::memcpy(row + static_cast<size_t>(y) * rowBytes, row, rowBytes);
+}
+
+void PrismRenderBuffer::BeginFrame(VtValue const &value)
+{
     std::lock_guard lock(_mutex);
     std::fill(_accumulation.begin(), _accumulation.end(), 0.0f);
     std::fill(_sampleCounts.begin(), _sampleCounts.end(), 0);
@@ -315,20 +347,26 @@ void PrismRenderBuffer::BeginFrame(VtValue const &value)
     // pass.  Once a preview/complete frame exists, clearing that hidden image
     // on the UI thread is redundant and expensive at viewport resolutions.
     if (_hasPublished) return;
-    for (unsigned int y = 0; y < _height; ++y) {
-        for (unsigned int x = 0; x < _width; ++x) {
-            if (ints) {
-                uint8_t *dst = _workingPixels.data() +
-                    (static_cast<size_t>(y) * _width + x) *
-                        HdDataSizeOfFormat(_format);
-                for (size_t c = 0; c < HdGetComponentCount(_format); ++c)
-                    reinterpret_cast<int32_t *>(dst)[c] = c < n ? i[c] : 0;
-            } else {
-                _Write(x, y, f, n, false);
-            }
-        }
-    }
-    if (!_hasPublished) _pixels = std::make_shared<std::vector<uint8_t>>(_workingPixels);
+    _FillWorking(value);
+    _pixels = std::make_shared<std::vector<uint8_t>>(_workingPixels);
+}
+
+bool PrismRenderBuffer::NeedsInitialClear() const
+{
+    std::lock_guard lock(_mutex);
+    return !_hasPublished && !_initialCleared && _width && _height;
+}
+
+bool PrismRenderBuffer::ApplyInitialClear(VtValue const &value)
+{
+    std::lock_guard lock(_mutex);
+    if (_hasPublished || _initialCleared || !_width || !_height) return false;
+    _initialCleared = true;
+    // A binding without a clear value asks the delegate not to clear.
+    if (value.IsEmpty()) return false;
+    _FillWorking(value);
+    _pixels = std::make_shared<std::vector<uint8_t>>(_workingPixels);
+    return true;
 }
 
 void PrismRenderBuffer::Publish(Frame frame)
