@@ -462,6 +462,11 @@ struct Snapshot {
     std::shared_ptr<PrototypePool> prototypePool = std::make_shared<PrototypePool>();
     std::unordered_map<SdfPath, std::shared_ptr<Material>, SdfPath::Hash>
         resolvedMaterials;
+    // Spare banks are built from the published snapshot's resolved
+    // materials instead of a MaterialService; a path missing from that seed
+    // is recorded rather than compiled.
+    bool materialsSeeded = false;
+    bool materialSeedMissed = false;
     std::unique_ptr<ColorTexture> fallbackTexture;
     std::unique_ptr<Diffuse> fallbackMaterial;
     std::vector<std::unique_ptr<ColorTexture>> displayColorTextures;
@@ -568,9 +573,15 @@ std::shared_ptr<Material> _ResolveMaterial(
     HdSceneIndexBaseRefPtr const &sceneIndex, SdfPath const &materialPath,
     MaterialService *materials, Snapshot *snapshot)
 {
-    if (materialPath.IsEmpty() || !materials) return {};
+    if (materialPath.IsEmpty() ||
+        (!materials && !snapshot->materialsSeeded)) return {};
     auto const found = snapshot->resolvedMaterials.find(materialPath);
     if (found != snapshot->resolvedMaterials.end()) return found->second;
+    if (!materials) {
+        // A seeded build must never differ from the snapshot it copies.
+        snapshot->materialSeedMissed = true;
+        return {};
+    }
     HdSceneIndexPrim const materialPrim = sceneIndex->GetPrim(materialPath);
     std::shared_ptr<Material> resolved = materials->Resolve(
         materialPrim.dataSource, materialPath);
@@ -1117,7 +1128,8 @@ bool _AppendMesh(HdSceneIndexBaseRefPtr const &sceneIndex,
         VtIntArray faces;
         if (!_ReadArray(subset.GetIndices(), &faces)) continue;
         const SdfPath subsetMaterialPath = _MaterialPath(child.dataSource);
-        if (subsetMaterialPath.IsEmpty() || !materials) continue;
+        if (subsetMaterialPath.IsEmpty() ||
+            (!materials && !snapshot->materialsSeeded)) continue;
         _RecordMaterialUser(snapshot, subsetMaterialPath, path);
         std::shared_ptr<Material> resolved = _ResolveMaterial(
             sceneIndex, subsetMaterialPath, materials, snapshot);
@@ -2089,11 +2101,17 @@ std::shared_ptr<Snapshot> _BuildSnapshot(HdSceneIndexBaseRefPtr const &scene,
                                          TfTokenVector const &renderTags,
                                          RTCDevice sharedDevice,
                                          std::shared_ptr<PrototypePool> const& pool = {},
-                                         std::function<bool()> cancelled = {})
+                                         std::function<bool()> cancelled = {},
+                                         decltype(Snapshot::resolvedMaterials) const
+                                             *seedMaterials = nullptr)
 {
     auto result = std::make_shared<Snapshot>();
     result->device = sharedDevice;
     if (pool) result->prototypePool = pool;
+    if (seedMaterials) {
+        result->resolvedMaterials = *seedMaterials;
+        result->materialsSeeded = true;
+    }
     if (!result->device) return {};
     result->scene = std::make_unique<SceneManager>(result->device);
     result->scene->max_depth = settings.maxDepth;
@@ -2133,6 +2151,8 @@ std::shared_ptr<Snapshot> _BuildSnapshot(HdSceneIndexBaseRefPtr const &scene,
     result->scene->commitScene();
     result->embreeSceneCommitSeconds += std::chrono::duration<double>(
         std::chrono::steady_clock::now() - sceneCommitStart).count();
+    // Later refreshes of this bank resolve through their job's service.
+    result->materialsSeeded = false;
     return result;
 }
 
@@ -2836,6 +2856,10 @@ public:
         bool visibilityRecoveryRebuild = false;
         bool sphereBatchFallback = false;
         uint64_t prototypeBuilds = 0;
+        // A rebuilt snapshot is published before its spare bank exists; the
+        // spare job reports its bank in spareSnapshot with spare set.
+        bool needsSpare = false;
+        bool spare = false;
     };
 
     Impl(HdSceneIndexBaseRefPtr index, HdRenderThread *thread)
@@ -2857,6 +2881,48 @@ public:
         } catch (std::exception const &e) {
             TF_WARN("PrismRT: MDL initialization failed: %s", e.what());
         }
+    }
+
+    // Builds the second bank for the snapshot just published, from the same
+    // retained scene and inputs as the job that produced it. It copies that
+    // snapshot's resolved materials, so it never prefetches or compiles and
+    // binds exactly the materials the displayed snapshot uses.
+    void LaunchSpareLocked(uint64_t generation)
+    {
+        std::optional<decltype(Snapshot::resolvedMaterials)> seed;
+        if (materialService && snapshot) seed = snapshot->resolvedMaterials;
+        auto cancel = std::make_shared<std::atomic<bool>>(false);
+        buildCancel = cancel;
+        buildingGeneration = generation;
+        buildIsSpare = true;
+        buildFuture = std::async(std::launch::async,
+            [generation, retained = jobScene, tags = jobRenderTags,
+             settings = jobSettings, resolverContext = jobResolverContext,
+             device = device, prototypePool = prototypePool,
+             cancel = std::move(cancel), seed = std::move(seed)]() {
+                BuildResult result;
+                result.generation = generation;
+                result.spare = true;
+                auto const start = std::chrono::steady_clock::now();
+                try {
+                    ArResolverContextBinder binder(resolverContext);
+                    result.spareSnapshot = _BuildSnapshot(
+                        retained, nullptr, settings, tags, device,
+                        prototypePool, [cancel] {
+                            return cancel->load(std::memory_order_relaxed);
+                        }, seed ? &*seed : nullptr);
+                    if (result.spareSnapshot &&
+                        result.spareSnapshot->materialSeedMissed)
+                        result.error = "spare bank needs an unresolved material";
+                } catch (std::exception const &e) {
+                    result.error = e.what();
+                } catch (...) {
+                    result.error = "unknown exception";
+                }
+                result.seconds = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - start).count();
+                return result;
+            });
     }
 
     ~Impl()
@@ -2931,6 +2997,20 @@ public:
     std::atomic<uint64_t> samples{0};
     uint64_t snapshotBuilds = 0;
     double snapshotBuildSeconds = 0.0;
+    // Inputs of the last launched job, reused by its follow-up spare job.
+    HdSceneIndexBaseRefPtr jobScene;
+    TfTokenVector jobRenderTags;
+    RenderSettings jobSettings;
+    ArResolverContext jobResolverContext;
+    bool buildIsSpare = false;
+    std::chrono::steady_clock::time_point constructionTime =
+        std::chrono::steady_clock::now();
+    double firstPublishSeconds = 0.0;
+    double spareSnapshotSeconds = 0.0;
+    uint64_t spareSnapshotsInstalled = 0;
+    uint64_t spareSnapshotsDiscarded = 0;
+    uint64_t sparePrototypeConversions = 0;
+    uint64_t sparePrototypeConversionCacheHits = 0;
     double renderSeconds = 0.0;
     uint64_t previewPublishes = 0;
     double previewMilliseconds = 0.0;
@@ -3094,6 +3174,7 @@ bool SceneBridge::Prepare(CameraState const &camera,
     bool renderTagsChanged = false;
     bool stateChanged = false;
     bool hasPreparationWork = false;
+    bool spareOnly = false;
     {
         std::lock_guard lock(_impl->mutex);
         cameraChanged = _impl->camera.worldToView != camera.worldToView ||
@@ -3110,6 +3191,8 @@ bool SceneBridge::Prepare(CameraState const &camera,
         stateChanged = _impl->stateDirty;
         hasPreparationWork = _impl->sceneDirty || _impl->captureActive ||
             _impl->buildFuture.valid();
+        spareOnly = !_impl->sceneDirty && !_impl->captureActive &&
+            _impl->buildFuture.valid() && _impl->buildIsSpare;
         if (!_impl->sceneDirty && !_impl->stateDirty && !cameraChanged &&
             !bindingsChanged && !renderTagsChanged && !hasPreparationWork)
             return false;
@@ -3153,6 +3236,7 @@ bool SceneBridge::Prepare(CameraState const &camera,
     // conversion. Superseded generations are destroyed without publication.
     SceneBridge::Impl::BuildResult completed;
     bool hasCompleted = false;
+    bool completedCancelled = false;
     bool published = false;
     {
         std::lock_guard lock(_impl->mutex);
@@ -3175,12 +3259,42 @@ bool SceneBridge::Prepare(CameraState const &camera,
                 _impl->materialWorkTotals.programWaitSeconds += work.programWaitSeconds;
                 _impl->materialWorkTotals.textureBytes += work.textureBytes;
             }
+            completedCancelled = _impl->buildCancel &&
+                _impl->buildCancel->load(std::memory_order_relaxed);
             _impl->buildingGeneration = 0;
             _impl->buildCancel.reset();
+            _impl->buildIsSpare = false;
             hasCompleted = true;
         }
     }
-    if (hasCompleted) {
+    if (hasCompleted && completed.spare) {
+        // Installing the spare bank leaves the displayed snapshot, its
+        // accumulation and the material service alone, so the render worker
+        // keeps running. A superseded, cancelled or failed spare is dropped;
+        // the next edit then takes the missing-bank path.
+        std::lock_guard lock(_impl->mutex);
+        _impl->spareSnapshotSeconds = completed.seconds;
+        if (completed.spareSnapshot) {
+            _impl->sparePrototypeConversions =
+                completed.spareSnapshot->prototypeConversions;
+            _impl->sparePrototypeConversionCacheHits =
+                completed.spareSnapshot->prototypeConversionCacheHits;
+        }
+        if (completed.spareSnapshot && completed.error.empty() &&
+            !completedCancelled && !_impl->sceneDirty &&
+            completed.generation == _impl->activeGeneration &&
+            completed.generation == _impl->requestedGeneration) {
+            _impl->inactiveSnapshot = std::move(completed.spareSnapshot);
+            _impl->inactiveGeneration = completed.generation;
+            while (!_impl->dirtyJournal.empty() &&
+                   _impl->dirtyJournal.front().generation <=
+                       _impl->inactiveGeneration)
+                _impl->dirtyJournal.pop_front();
+            ++_impl->spareSnapshotsInstalled;
+        } else {
+            ++_impl->spareSnapshotsDiscarded;
+        }
+    } else if (hasCompleted) {
         bool publish = false;
         {
             std::lock_guard lock(_impl->mutex);
@@ -3203,9 +3317,11 @@ bool SceneBridge::Prepare(CameraState const &camera,
                     std::chrono::steady_clock::now() - stopStart).count();
             // StopRender above is blocking, so no render callback can retain
             // the displayed snapshot while it becomes the inactive bank.
-            if (completed.spareSnapshot) {
-                _impl->inactiveSnapshot = std::move(completed.spareSnapshot);
-                _impl->inactiveGeneration = completed.generation;
+            if (completed.needsSpare) {
+                // The replaced snapshot predates a rebuild; the spare job
+                // launched below provides the bank instead.
+                _impl->inactiveSnapshot.reset();
+                _impl->inactiveGeneration = 0;
             } else if (_impl->snapshot) {
                 _impl->inactiveSnapshot = std::move(_impl->snapshot);
                 _impl->inactiveGeneration = _impl->activeGeneration;
@@ -3233,6 +3349,14 @@ bool SceneBridge::Prepare(CameraState const &camera,
                     "sphere batch eligibility or topology changed";
             }
             _impl->prototypeBuilds += completed.prototypeBuilds;
+            if (_impl->firstPublishSeconds == 0.0)
+                _impl->firstPublishSeconds = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() -
+                        _impl->constructionTime).count();
+            // Occupying buildFuture keeps capture gated and preparation
+            // pending until the spare bank is installed or dropped.
+            if (completed.needsSpare)
+                _impl->LaunchSpareLocked(completed.generation);
             published = true;
         } else if (!completed.error.empty()) {
             TF_WARN("PrismRT: background snapshot generation failed: %s",
@@ -3393,6 +3517,11 @@ bool SceneBridge::Prepare(CameraState const &camera,
             _impl->dirtyKinds = 0;
             _impl->dirtyPaths.clear();
             _impl->buildingGeneration = generation;
+            _impl->jobScene = retained;
+            _impl->jobRenderTags = tags;
+            _impl->jobSettings = jobSettings;
+            _impl->jobResolverContext = resolverContext;
+            _impl->buildIsSpare = false;
             auto cancel = std::make_shared<std::atomic<bool>>(false);
             _impl->buildCancel = cancel;
             _impl->buildFuture = std::async(std::launch::async,
@@ -3527,21 +3656,14 @@ bool SceneBridge::Prepare(CameraState const &camera,
                                 ? result.snapshot->prototypeBuildCount
                                 : result.snapshot->prototypeBuildCount -
                                     priorPrototypeBuilds;
-                            if (placementRebuiltAll && result.snapshot &&
-                                !cancel->load(std::memory_order_relaxed)) {
-                                // A visibility restore with no retained
-                                // placement IDs rebuilt the full TLAS. Keep the
-                                // second bank at the same state so the next
-                                // unrelated edit cannot republish an older
-                                // hidden scene.
-                                result.spareSnapshot = _BuildSnapshot(
-                                    retained, result.materialService.get(),
-                                    jobSettings, tags, device, prototypePool,
-                                    [cancel] {
-                                        return cancel->load(
-                                            std::memory_order_relaxed);
-                                    });
-                            }
+                            // A visibility restore with no retained
+                            // placement IDs rebuilt the full TLAS. Keep the
+                            // second bank at the same state so the next
+                            // unrelated edit cannot republish an older hidden
+                            // scene; Prepare builds it after publication.
+                            result.needsSpare = placementRebuiltAll &&
+                                result.snapshot &&
+                                !cancel->load(std::memory_order_relaxed);
                         } else {
                             result.snapshot = _BuildSnapshot(
                                 retained, result.materialService.get(),
@@ -3552,19 +3674,13 @@ bool SceneBridge::Prepare(CameraState const &camera,
                                 });
                             result.prototypeBuilds = result.snapshot
                                 ? result.snapshot->prototypeBuildCount : 0;
-                            if (result.snapshot &&
-                                !cancel->load(std::memory_order_relaxed)) {
-                                // Keep a synchronized mutable bank so the
-                                // first local edit after a structural rebuild
-                                // does not require another full conversion.
-                                result.spareSnapshot = _BuildSnapshot(
-                                    retained, result.materialService.get(),
-                                    jobSettings, tags, device, prototypePool,
-                                    [cancel] {
-                                        return cancel->load(
-                                            std::memory_order_relaxed);
-                                    });
-                            }
+                            // Keep a synchronized mutable bank so the first
+                            // local edit after a structural rebuild does not
+                            // require another full conversion. Prepare builds
+                            // it after publication so the first image does
+                            // not wait for it.
+                            result.needsSpare = result.snapshot &&
+                                !cancel->load(std::memory_order_relaxed);
                         }
                         if (result.snapshot && result.snapshot->scene) {
                             auto picking = std::make_shared<PickingTable>();
@@ -3597,6 +3713,15 @@ bool SceneBridge::Prepare(CameraState const &camera,
     }
 
     std::lock_guard lock(_impl->mutex);
+    if (spareOnly && !stateChanged && !cameraChanged && !bindingsChanged &&
+        !renderTagsChanged && !published && !captureWorked &&
+        !_impl->sceneDirty && !_impl->captureActive) {
+        // Only the spare bank advanced. The displayed frame is unchanged, so
+        // neither restart the render worker nor clear its convergence.
+        _impl->prepareMilliseconds = 1000.0 * std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - prepareStart).count();
+        return false;
+    }
     if ((stateChanged || published) && _impl->snapshot &&
         _impl->snapshot->scene) {
         _impl->snapshot->scene->max_depth = _impl->settings.maxDepth;
@@ -3642,8 +3767,9 @@ void SceneBridge::Render()
         width = _impl->width; height = _impl->height;
         generation = _impl->activeGeneration;
         cameraRevision = _impl->cameraRevision;
+        // A spare bank job never changes what is displayed.
         preparing = _impl->sceneDirty || _impl->captureActive ||
-            _impl->buildFuture.valid();
+            (_impl->buildFuture.valid() && !_impl->buildIsSpare);
     }
     if (!snapshot || !snapshot->scene || width == 0 || height == 0) {
         for (HdRenderPassAovBinding const &binding : bindings)
@@ -3950,6 +4076,16 @@ VtDictionary SceneBridge::GetStats() const
     result["snapshotBuilds"] = VtValue(static_cast<int64_t>(
         _impl->snapshotBuilds));
     result["snapshotBuildSeconds"] = VtValue(_impl->snapshotBuildSeconds);
+    result["firstPublishSeconds"] = VtValue(_impl->firstPublishSeconds);
+    result["spareSnapshotSeconds"] = VtValue(_impl->spareSnapshotSeconds);
+    result["spareSnapshotsInstalled"] = VtValue(static_cast<int64_t>(
+        _impl->spareSnapshotsInstalled));
+    result["spareSnapshotsDiscarded"] = VtValue(static_cast<int64_t>(
+        _impl->spareSnapshotsDiscarded));
+    result["sparePrototypeConversions"] = VtValue(static_cast<int64_t>(
+        _impl->sparePrototypeConversions));
+    result["sparePrototypeConversionCacheHits"] = VtValue(static_cast<int64_t>(
+        _impl->sparePrototypeConversionCacheHits));
     const auto textureStats = _impl->textureService->stats();
     result["processTextureSourceBytesHashed"] = VtValue(static_cast<int64_t>(textureStats.sourceBytesHashed));
     result["processTextureHashCalls"] = VtValue(static_cast<int64_t>(textureStats.resourceHashCalls));
