@@ -10,11 +10,14 @@
 #include <pxr/imaging/hd/utils.h>
 #include <pxr/usd/sdf/assetPath.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <optional>
+#include <string>
 #include <vector>
 
 PXR_NAMESPACE_USING_DIRECTIVE
@@ -123,6 +126,83 @@ HdContainerDataSourceHandle MakeTwoImageMaterial(
     const TfToken context("mtlx");
     auto material=HdMaterialSchema::BuildRetained(1,&context,&networkBase);
     return HdRetainedContainerDataSource::New(HdMaterialSchemaTokens->material,material);
+}
+
+// standard_surface with texture-free template values. A non-negative sheen
+// gives it a distinct structure. reference authors the default thin_walled,
+// which changes only the captured structure, so the same shader converts and
+// compiles independently of every non-reference material.
+HdContainerDataSourceHandle MakeFoldingMaterial(const SdfPath& path,
+    const GfVec3f& color, float roughness, float metalness,
+    float sheen = -1.0f, bool reference = false)
+{
+    HdMaterialNode surface;
+    surface.path=path.AppendChild(TfToken("Surface"));
+    surface.identifier=TfToken("ND_standard_surface_surfaceshader");
+    surface.parameters[TfToken("base_color")]=VtValue(color);
+    surface.parameters[TfToken("specular_roughness")]=VtValue(roughness);
+    surface.parameters[TfToken("metalness")]=VtValue(metalness);
+    surface.parameters[TfToken("coat")]=VtValue(0.25f);
+    if (sheen >= 0.0f) surface.parameters[TfToken("sheen")]=VtValue(sheen);
+    if (reference) surface.parameters[TfToken("thin_walled")]=VtValue(false);
+    HdMaterialNetwork network;
+    network.nodes={surface};
+    HdMaterialNetworkMap map; map.map[TfToken("surface")]=network;
+    HdContainerDataSourceHandle networkData=
+        HdUtils::ConvertHdMaterialNetworkToHdMaterialNetworkSchema(map);
+    HdDataSourceBaseHandle networkBase=networkData;
+    const TfToken context("mtlx");
+    auto material=HdMaterialSchema::BuildRetained(1,&context,&networkBase);
+    return HdRetainedContainerDataSource::New(HdMaterialSchemaTokens->material,material);
+}
+
+void SetCompileMode(const char* mode)
+{
+#ifdef _WIN32
+    _putenv_s("PRISM_MDL_COMPILE_MODE",mode ? mode : "");
+#else
+    if (mode) setenv("PRISM_MDL_COMPILE_MODE",mode,1);
+    else unsetenv("PRISM_MDL_COMPILE_MODE");
+#endif
+}
+
+// Evaluation, sampling and cutout of two materials at a few shading states.
+// Folded constants may reassociate floating-point work, so compare with a
+// relative tolerance rather than bitwise.
+bool SameShading(MDLMaterial& a, MDLMaterial& b, std::string* detail)
+{
+    auto close=[](float x,float y) {
+        return std::abs(x-y)<5e-4f*std::max({1.0f,std::abs(x),std::abs(y)});
+    };
+    RTCRayHit embreeHit{};
+    embreeHit.hit.geomID=RTC_INVALID_GEOMETRY_ID;
+    RayHit hit(embreeHit);
+    hit.p=Float3(0.0f); hit.n=hit.n_g=Float3(0.0f,1.0f,0.0f);
+    hit.u=0.3f; hit.v=0.7f; hit.front_face=true;
+    for (const Float3 d : {Float3(0.0f,-1.0f,0.0f), Float3(0.6f,-0.8f,0.0f)}) {
+        hit.d=d;
+        for (const Float3 wi : {Float3(0.0f,1.0f,0.0f), Float3(-0.28f,0.96f,0.0f),
+                                Float3(0.0f,0.6f,0.8f)}) {
+            const auto x=a.evaluate(hit,wi), y=b.evaluate(hit,wi);
+            for (int i=0;i<3;++i) if (!close(x.value[i],y.value[i])) {
+                *detail="evaluate "+std::to_string(x.value[i])+" vs "+std::to_string(y.value[i]);
+                return false;
+            }
+            if (x.valid!=y.valid || !close(x.pdf,y.pdf)) { *detail="evaluate pdf"; return false; }
+        }
+        for (unsigned int seed : {1u,17u,4099u}) {
+            unsigned int seedA=seed, seedB=seed;
+            const auto x=a.sample(hit,seedA), y=b.sample(hit,seedB);
+            if (x.scattered!=y.scattered || !close(x.pdf,y.pdf)) { *detail="sample pdf"; return false; }
+            for (int i=0;i<3;++i)
+                if (!close(x.color[i],y.color[i]) || !close(x.wi[i],y.wi[i])) {
+                    *detail="sample "+std::to_string(x.color[i])+" vs "+std::to_string(y.color[i]);
+                    return false;
+                }
+        }
+        if (!close(a.cutoutOpacity(hit),b.cutoutOpacity(hit))) { *detail="cutout"; return false; }
+    }
+    return true;
 }
 }
 
@@ -386,6 +466,145 @@ int main()
         std::cerr << "Could not remove UDIM tile for invalidation regression\n";
         return 15;
     }
+    // Folded compilation. A group keeps as arguments only the template values
+    // its members disagree on (base_color, specular_roughness) and folds the
+    // rest (metalness, coat); a material compiled alone folds everything.
+    // Each result must shade like its own unfolded class compilation.
+    const char* configuredMode=std::getenv("PRISM_MDL_COMPILE_MODE");
+    const std::optional<std::string> originalMode=configuredMode
+        ? std::optional<std::string>(configuredMode) : std::nullopt;
+    const GfVec3f foldColors[3]={GfVec3f(0.8f,0.3f,0.1f),GfVec3f(0.1f,0.5f,0.7f),
+                                 GfVec3f(0.4f,0.7f,0.2f)};
+    const float foldRoughness[3]={0.2f,0.55f,0.35f};
+    std::vector<HdContainerDataSourceHandle> foldSources, foldReferences;
+    std::vector<MaterialService::Request> foldRequests, referenceRequests;
+    std::vector<SdfPath> foldPaths, referencePaths;
+    auto addFoldMaterial=[&](const std::string& name,const GfVec3f& color,
+                             float roughness,float metalness,float sheen) {
+        foldPaths.emplace_back("/Looks/Fold"+name);
+        foldSources.push_back(MakeFoldingMaterial(foldPaths.back(),color,roughness,
+                                                  metalness,sheen));
+        foldRequests.push_back({foldSources.back(),foldPaths.back()});
+        referencePaths.emplace_back("/Looks/FoldReference"+name);
+        foldReferences.push_back(MakeFoldingMaterial(referencePaths.back(),color,
+                                                     roughness,metalness,sheen,true));
+        referenceRequests.push_back({foldReferences.back(),referencePaths.back()});
+    };
+    addFoldMaterial("Unique",GfVec3f(0.6f,0.6f,0.2f),0.4f,0.3f,0.45f);
+    for (int i=0;i<3;++i)
+        addFoldMaterial("Group"+std::to_string(i),foldColors[i],foldRoughness[i],0.2f,-1.0f);
+    // Same structure as the group; metalness was folded into its template.
+    addFoldMaterial("Mismatch",foldColors[0],foldRoughness[1],0.7f,-1.0f);
+    SetCompileMode("auto");
+    const auto foldBefore=service.GetStats();
+    service.Prefetch(std::vector<MaterialService::Request>(
+        foldRequests.begin(),foldRequests.begin()+4));
+    const auto foldAfter=service.GetStats();
+    if (foldAfter.nativeJits!=foldBefore.nativeJits+2 ||
+        foldAfter.compilations!=foldBefore.compilations+2 ||
+        foldAfter.templateCacheHits!=foldBefore.templateCacheHits+2 ||
+        foldAfter.foldedCompilations!=foldBefore.foldedCompilations+2 ||
+        foldAfter.failures!=foldBefore.failures) {
+        std::cerr << "folded batch work differs: jits="
+                  << foldAfter.nativeJits-foldBefore.nativeJits
+                  << " compilations=" << foldAfter.compilations-foldBefore.compilations
+                  << " template_hits=" << foldAfter.templateCacheHits-foldBefore.templateCacheHits
+                  << " folded=" << foldAfter.foldedCompilations-foldBefore.foldedCompilations
+                  << " failures=" << foldAfter.failures-foldBefore.failures << "\n";
+        SetCompileMode(originalMode ? originalMode->c_str() : nullptr);
+        return 30;
+    }
+    std::vector<std::shared_ptr<MDLMaterial>> folded;
+    for (size_t i=0;i<4;++i)
+        folded.push_back(std::dynamic_pointer_cast<MDLMaterial>(
+            service.Resolve(foldSources[i],foldPaths[i])));
+    const auto groupProgram=folded[1] ? folded[1]->get_target_code().program : nullptr;
+    bool foldedShape=groupProgram && folded[0] && folded[0]->is_valid() &&
+        folded[0]->has_folded_parameters() && folded[1]->has_folded_parameters() &&
+        folded[0]->get_target_code().program!=groupProgram;
+    for (size_t i=2;i<4;++i)
+        foldedShape=foldedShape && folded[i] && folded[i]->is_valid() &&
+            folded[i]->get_target_code().program==groupProgram;
+    // Only the two varying values remain arguments; nothing is texture-backed.
+    foldedShape=foldedShape && groupProgram->parameters.size()==2 &&
+        std::count_if(groupProgram->parameters.begin(),groupProgram->parameters.end(),
+            [](const auto& parameter) { return parameter.type_name=="color"; })==1 &&
+        std::count_if(groupProgram->parameters.begin(),groupProgram->parameters.end(),
+            [](const auto& parameter) { return parameter.type_name=="float"; })==1 &&
+        folded[0]->get_target_code().program->parameters.empty();
+    if (!foldedShape) {
+        std::cerr << "folded group did not share one folded program, or the unique "
+                     "material was not compiled folded\n";
+        SetCompileMode(originalMode ? originalMode->c_str() : nullptr);
+        return 31;
+    }
+    // Unfolded references, compiled as today's class programs.
+    SetCompileMode("class");
+    const auto referenceBefore=service.GetStats();
+    service.Prefetch(referenceRequests);
+    const auto referenceAfter=service.GetStats();
+    std::vector<std::shared_ptr<MDLMaterial>> references;
+    for (size_t i=0;i<referenceRequests.size();++i)
+        references.push_back(std::dynamic_pointer_cast<MDLMaterial>(
+            service.Resolve(foldReferences[i],referencePaths[i])));
+    if (referenceAfter.foldedCompilations!=referenceBefore.foldedCompilations ||
+        std::any_of(references.begin(),references.end(),[](const auto& reference) {
+            return !reference || !reference->is_valid() || reference->has_folded_parameters();
+        })) {
+        std::cerr << "class compile mode folded parameters or failed a reference\n";
+        SetCompileMode(originalMode ? originalMode->c_str() : nullptr);
+        return 32;
+    }
+    for (size_t i=0;i<4;++i) {
+        std::string detail;
+        if (!SameShading(*folded[i],*references[i],&detail)) {
+            std::cerr << "folded material " << foldPaths[i]
+                      << " differs from its unfolded compilation: " << detail << "\n";
+            SetCompileMode(originalMode ? originalMode->c_str() : nullptr);
+            return 33;
+        }
+    }
+    RTCRayHit foldEmbreeHit{};
+    foldEmbreeHit.hit.geomID=RTC_INVALID_GEOMETRY_ID;
+    RayHit foldHit(foldEmbreeHit);
+    foldHit.p=Float3(0.0f); foldHit.d=Float3(0.0f,-1.0f,0.0f);
+    foldHit.n=foldHit.n_g=Float3(0.0f,1.0f,0.0f); foldHit.front_face=true;
+    for (size_t i=1;i<4;++i) for (size_t j=i+1;j<4;++j)
+        if (evalDistance(folded[i]->evaluate(foldHit,Float3(0.0f,1.0f,0.0f)),
+                         folded[j]->evaluate(foldHit,Float3(0.0f,1.0f,0.0f)))<1e-4f) {
+            std::cerr << "folded group bindings did not preserve distinct values\n";
+            SetCompileMode(originalMode ? originalMode->c_str() : nullptr);
+            return 34;
+        }
+    // A later material of the same structure whose folded metalness differs
+    // must be rejected by the group template and compiled on its own.
+    SetCompileMode("auto");
+    const auto mismatchBefore=service.GetStats();
+    service.Prefetch({foldRequests[4]});
+    const auto mismatchAfter=service.GetStats();
+    auto mismatch=std::dynamic_pointer_cast<MDLMaterial>(
+        service.Resolve(foldSources[4],foldPaths[4]));
+    SetCompileMode(originalMode ? originalMode->c_str() : nullptr);
+    std::string mismatchDetail;
+    if (mismatchAfter.templateCacheHits!=mismatchBefore.templateCacheHits ||
+        mismatchAfter.compilations!=mismatchBefore.compilations+1 ||
+        mismatchAfter.foldedCompilations!=mismatchBefore.foldedCompilations+1 ||
+        mismatchAfter.failures!=mismatchBefore.failures ||
+        !mismatch || !mismatch->is_valid() ||
+        mismatch->get_target_code().program==groupProgram) {
+        std::cerr << "folded-value mismatch was served by the group template: template_hits="
+                  << mismatchAfter.templateCacheHits-mismatchBefore.templateCacheHits
+                  << " compilations=" << mismatchAfter.compilations-mismatchBefore.compilations
+                  << " folded=" << mismatchAfter.foldedCompilations-mismatchBefore.foldedCompilations
+                  << "\n";
+        return 35;
+    }
+    if (!SameShading(*mismatch,*references[4],&mismatchDetail)) {
+        std::cerr << "rejected-template recompilation differs from its unfolded compilation: "
+                  << mismatchDetail << "\n";
+        return 36;
+    }
+    std::cout << "folded compilation: group jit=1 binds=2, unique and rejected variant folded\n";
     service.InvalidateAll();
     std::error_code udimCleanup; std::filesystem::remove_all(udimRoot,udimCleanup);
     std::error_code multiCleanup; std::filesystem::remove_all(multiRoot,multiCleanup);

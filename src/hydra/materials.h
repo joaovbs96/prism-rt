@@ -42,6 +42,8 @@ public:
         uint64_t generationCalls = 0;
         uint64_t templateCacheHits = 0;
         uint64_t compilations = 0;
+        // Compilations whose program has class parameters folded to constants.
+        uint64_t foldedCompilations = 0;
         uint64_t nativeJits = 0;
         uint64_t sdkTranslationCalls = 0;
         uint64_t programCacheHits = 0;

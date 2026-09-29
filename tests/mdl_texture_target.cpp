@@ -7,6 +7,7 @@
 #include <MaterialXCore/Document.h>
 #include <MaterialXCore/Material.h>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
@@ -118,6 +119,34 @@ GeneratedMDL standardSurfaceMaterial(std::string const& libraries,
     return generated;
 }
 
+// A textured standard_surface with emission and partial opacity, so folding
+// is compared on BSDF, EDF and cutout while a resource stays an argument.
+GeneratedMDL foldingParityMaterial(std::string const& libraries,
+                                   std::string const& texture)
+{
+    MDLGenerator generator(libraries);
+    auto document=MaterialX::createDocument();
+    document->setDataLibrary(generator.get_stdlib());
+    auto image=document->addNode("image","Image","color3");
+    image->setInputValue("file",texture,"filename");
+    auto surface=document->addNode("standard_surface","Surface","surfaceshader");
+    surface->addInput("base_color","color3")->setConnectedNode(image);
+    surface->setInputValue("base",.9f);
+    surface->setInputValue("specular_roughness",.36f);
+    surface->setInputValue("metalness",.21f);
+    surface->setInputValue("coat",.3f);
+    surface->setInputValue("coat_roughness",.12f);
+    surface->setInputValue("sheen",.2f);
+    surface->setInputValue("emission",.4f);
+    surface->setInputValue("emission_color",MaterialX::Color3(.9f,.5f,.2f));
+    surface->setInputValue("opacity",MaterialX::Color3(.65f,.65f,.65f));
+    document->addMaterialNode("FoldingParity",surface);
+    auto generated=generator.generate(document,"FoldingParity");
+    require(generated.success,"folding parity generation failed: "+generated.error_message);
+    generated.module_name += "_folding_parity";
+    return generated;
+}
+
 GeneratedMDL openPbrMaterial(std::string const& libraries)
 {
     MDLGenerator generator(libraries);
@@ -176,7 +205,8 @@ struct CompiledTarget {
 };
 
 CompiledTarget compile(mdl::Context &context, std::filesystem::path const &root,
-                       GeneratedMDL generated)
+                       GeneratedMDL generated,
+                       mdl::CompileSpecification const &specification = {})
 {
     std::string mdlLibraries;
     if(const char* configured=std::getenv("PRISM_MATERIALX_MDL");configured&&*configured)
@@ -186,7 +216,8 @@ CompiledTarget compile(mdl::Context &context, std::filesystem::path const &root,
         mdlLibraries=(std::filesystem::path(libraries)/"mdl").string();
     mdl::MaterialCompiler compiler(context, mdlLibraries);
     CompiledTarget result;
-    result.compiled = compiler.compile(generated, (root / "fixture.mtlx").string());
+    result.compiled = compiler.compile(generated, (root / "fixture.mtlx").string(),
+                                       specification);
     require(result.compiled.success, "material compile failed: " + result.compiled.error_message);
     mdl::BackendCompiler backend(context);
     result.target = backend.generate_target_code(result.compiled);
@@ -287,6 +318,71 @@ float pdf(mdl::TargetCode const& target,mi::Float32_3 k2)
             mdl::MaterialFunctions::DF_PDF,&data,state.base(),target.texture_handler(),
         target.argument_data())==0,"BSDF pdf failed");
     return data.pdf;
+}
+std::array<float,3> emission(mdl::TargetCode const& target,float u,float v)
+{
+    State state(target,u,v);
+    require(target.program->target_code->execute_init(target.program->functions.init_function_index,
+        state.base(),target.texture_handler(),target.argument_data())==0,"emission init failed");
+    mi::Float32_3 intensity(0,0,0);
+    require(target.program->target_code->execute(
+        target.program->functions.surface_emission_intensity_function_index,state.base(),
+        target.texture_handler(),target.argument_data(),&intensity)==0,
+        "emission intensity failed");
+    mi::neuraylib::Edf_evaluate_data<mi::neuraylib::DF_HSM_NONE> data{};
+    data.k1=mi::Float32_3(0,0,1);
+    require(target.program->functions.surface_edf_function_index!=~mi::Size(0)&&
+        target.program->target_code->execute_edf_evaluate(
+            target.program->functions.surface_edf_function_index+
+                mdl::MaterialFunctions::DF_EVALUATE,&data,state.base(),
+            target.texture_handler(),target.argument_data())==0,"EDF evaluation failed");
+    return {intensity.x*data.edf.x,intensity.y*data.edf.y,intensity.z*data.edf.z};
+}
+float cutout(mdl::TargetCode const& target,float u,float v)
+{
+    State state(target,u,v);
+    require(target.program->target_code->execute_init(target.program->functions.init_function_index,
+        state.base(),target.texture_handler(),target.argument_data())==0,"cutout init failed");
+    mi::Float32 opacity=-1;
+    require(target.program->target_code->execute(
+        target.program->functions.cutout_opacity_function_index,state.base(),
+        target.texture_handler(),target.argument_data(),&opacity)==0,
+        "cutout opacity failed");
+    return opacity;
+}
+
+// Requires two targets to shade identically, within the tolerance used for
+// the custom/builtin sample and PDF comparisons, at several shading states.
+void requireSameShading(mdl::TargetCode const& a,mdl::TargetCode const& b,
+                        std::string const& what)
+{
+    auto close=[](float x,float y){return std::abs(x-y)<
+        5e-4f*std::max({1.0f,std::abs(x),std::abs(y)});};
+    auto closeColor=[&](std::array<float,3> const& x,std::array<float,3> const& y) {
+        return close(x[0],y[0])&&close(x[1],y[1])&&close(x[2],y[2]);
+    };
+    for(auto uv:std::array{std::array{.37f,.61f},std::array{10.5f/256,10.5f/256},
+                           std::array{11.5f/256,10.5f/256},std::array{.83f,.14f}}) {
+        const auto x=evaluate(a,uv[0],uv[1]),y=evaluate(b,uv[0],uv[1]);
+        require(closeColor(x,y),what+": BSDF evaluation differs: "+std::to_string(x[0])+
+            ","+std::to_string(x[1])+","+std::to_string(x[2])+" vs "+std::to_string(y[0])+
+            ","+std::to_string(y[1])+","+std::to_string(y[2]));
+        require(closeColor(emission(a,uv[0],uv[1]),emission(b,uv[0],uv[1])),
+                what+": emission differs");
+        require(close(cutout(a,uv[0],uv[1]),cutout(b,uv[0],uv[1])),
+                what+": cutout opacity differs");
+    }
+    for(auto xi:std::array{std::array{.01f,.19f,.43f,.71f},
+                           std::array{.37f,.53f,.79f,.97f},
+                           std::array{.999f,.001f,.5f,.25f}}) {
+        const auto x=sample(a,xi),y=sample(b,xi);
+        require(x.event==y.event,what+": sample selected a different event");
+        require(close(x.k2.x,y.k2.x)&&close(x.k2.y,y.k2.y)&&close(x.k2.z,y.k2.z)&&
+                    close(x.weight.x,y.weight.x)&&close(x.weight.y,y.weight.y)&&
+                    close(x.weight.z,y.weight.z)&&close(x.pdf,y.pdf),
+                what+": sample differs");
+        require(close(pdf(a,x.k2),pdf(b,y.k2)),what+": PDF differs");
+    }
 }
 
 void verifyRepeatedSdkLifetimes(ScratchDirectory const& scratch)
@@ -618,6 +714,87 @@ int main()
         require(std::abs(firstValue[0]-lastValue[0])>.01f,
                 "independent standard_surface bindings reused one argument block");
         setResourceMode(nullptr);
+
+        // Folding every non-resource class parameter bakes the values into
+        // the program. It must not change what the material computes, and
+        // the texture must stay an argument of the custom runtime.
+        {
+            auto parityGenerated=foldingParityMaterial(libraryPath,"/checker.ppm");
+            mdl::ClearTargetCodeCache(&context);
+            auto unfolded=compile(context,scratch.path,parityGenerated);
+            mdl::CompileSpecification foldAll;
+            foldAll.foldParameters=true;
+            foldAll.shareProgram=false;
+            auto folded=compile(context,scratch.path,parityGenerated,foldAll);
+            require(unfolded.compiled.folded_parameters.empty()&&
+                        !folded.compiled.folded_parameters.empty(),
+                    "folded compile did not fold any class parameter");
+            require(!folded.cacheHit&&folded.target.program!=unfolded.target.program&&
+                        folded.target.program->parameters.size()<
+                            unfolded.target.program->parameters.size(),
+                    "folded compile reused or kept the unfolded class program");
+            require(!folded.target.program->parameters.empty(),
+                    "folded compile dropped the texture argument");
+            for(auto const& parameter:folded.target.program->parameters)
+                require(parameter.type_name=="texture_2d",
+                        "folded program kept a non-resource argument: "+parameter.name);
+            require(bool(folded.target.binding->texture_runtime),
+                    "folded program lost the custom texture runtime: "+
+                        folded.target.textureFallbackReason);
+            require(cutout(unfolded.target,.37f,.61f)<.9f,
+                    "folding parity fixture is unexpectedly opaque");
+            requireSameShading(unfolded.target,folded.target,"folded standard_surface");
+            // A program folded for one material must not occupy the bounded
+            // target-code cache that shareable class programs rely on.
+            auto foldedAgain=compile(context,scratch.path,parityGenerated,foldAll);
+            require(!foldedAgain.cacheHit&&foldedAgain.target.translationCalls==1,
+                    "unshared folded program entered the target-code cache");
+            std::cout << "folding parity: class parameters="
+                      << unfolded.target.program->parameters.size()
+                      << " translate=" << unfolded.target.nativeJitSeconds << "s; folded parameters="
+                      << folded.target.program->parameters.size()
+                      << " translate=" << folded.target.nativeJitSeconds << "s\n";
+        }
+
+        // The target-code cache keys a program by its compiled-material hash
+        // and argument interface. Two materials that differ only in a folded
+        // constant have the same interface, so only the hash can keep them
+        // apart; sharing a program would render one with the other's value.
+        {
+            auto amberGenerated=standardSurfaceMaterial(
+                libraryPath,MaterialX::Color3(.83f,.41f,.12f));
+            auto tealGenerated=standardSurfaceMaterial(
+                libraryPath,MaterialX::Color3(.12f,.52f,.61f));
+            mdl::CompileSpecification foldShared;
+            foldShared.foldParameters=true;
+            auto amberFolded=compile(context,scratch.path,amberGenerated,foldShared);
+            auto tealFolded=compile(context,scratch.path,tealGenerated,foldShared);
+            const auto& amberProgram=*amberFolded.target.program;
+            const auto& tealProgram=*tealFolded.target.program;
+            require(std::any_of(tealFolded.compiled.folded_parameters.begin(),
+                        tealFolded.compiled.folded_parameters.end(),
+                        [](auto const& name){return name.find("base_color")!=std::string::npos;}),
+                    "standard_surface base color was not folded");
+            require(amberProgram.parameters.size()==tealProgram.parameters.size(),
+                    "folded fixtures unexpectedly differ in their argument interface");
+            std::cout << "folded program keys:\n  " << amberProgram.identity
+                      << "\n  " << tealProgram.identity << "\n";
+            require(!tealFolded.cacheHit&&tealFolded.target.translationCalls==1&&
+                        &tealProgram!=&amberProgram&&
+                        tealProgram.identity!=amberProgram.identity,
+                    "materials with different folded constants shared a target-code cache key");
+            auto amberAgain=compile(context,scratch.path,amberGenerated,foldShared);
+            require(amberAgain.cacheHit&&amberAgain.target.program==amberFolded.target.program,
+                    "shared folded program was not reused for identical folded constants");
+            auto amberUnfolded=compile(context,scratch.path,amberGenerated);
+            auto tealUnfolded=compile(context,scratch.path,tealGenerated);
+            requireSameShading(amberUnfolded.target,amberFolded.target,"folded amber");
+            requireSameShading(tealUnfolded.target,tealFolded.target,"folded teal");
+            const auto amberValue=evaluate(amberFolded.target,.37f,.61f);
+            const auto tealValue=evaluate(tealFolded.target,.37f,.61f);
+            require(std::abs(amberValue[0]-tealValue[0])>.01f,
+                    "folded base colors did not change standard_surface shading");
+        }
 
         std::cout << "custom MDL 2D/UDIM/BSDF-table targets, immutable bindings and SDK parity passed\n";
         mdl::ClearTargetCodeCache(&context);

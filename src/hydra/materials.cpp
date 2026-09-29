@@ -165,6 +165,51 @@ bool TemplateStructure(NetworkSnapshot graph, NetworkSnapshot* structure)
         std::move(graph), structure);
 }
 
+// Prefetch compile policy. "auto" (default) folds every class parameter that
+// no material of the batch needs to rebind; "class" keeps all of them runtime
+// arguments, which is how Resolve and the standalone loader always compile.
+bool FoldingCompileMode()
+{
+    const char* value = std::getenv("PRISM_MDL_COMPILE_MODE");
+    const std::string mode = value ? value : "";
+    if (mode == "class") return false;
+    if (!mode.empty() && mode != "auto") {
+        static std::once_flag warned;
+        std::call_once(warned, [&] {
+            std::cerr << "PrismRT: PRISM_MDL_COMPILE_MODE must be auto or class; using auto\n";
+        });
+    }
+    return true;
+}
+
+using TemplateValueKey = std::pair<TfToken, TfToken>;
+
+// Template values on which at least two captured group members disagree. All
+// members share one template structure, so their nodes and parameters align.
+std::vector<TemplateValueKey> VaryingTemplateValues(
+    const std::vector<const NetworkSnapshot*>& members)
+{
+    std::vector<TemplateValueKey> result;
+    if (members.empty()) return result;
+    const NetworkSnapshot& first = *members.front();
+    for (size_t n = 0; n < first.nodes.size(); ++n) {
+        const auto& node = first.nodes[n];
+        for (size_t p = 0; p < node.parameters.size(); ++p) {
+            const auto& parameter = node.parameters[p];
+            if (!prism::materialx::IsCompatibleTemplateValue(node, parameter)) continue;
+            const bool varies = std::any_of(members.begin() + 1, members.end(),
+                [&](const NetworkSnapshot* member) {
+                    return n >= member->nodes.size() ||
+                        p >= member->nodes[n].parameters.size() ||
+                        member->nodes[n].parameters[p].name != parameter.name ||
+                        member->nodes[n].parameters[p].data.value != parameter.data.value;
+                });
+            if (varies) result.emplace_back(node.name, parameter.name);
+        }
+    }
+    return result;
+}
+
 NetworkSnapshot CaptureNetwork(HdMaterialNetworkInterface& net,
                                const TfToken& context,
                                const SdfPath& materialPath)
@@ -521,6 +566,12 @@ public:
             conversionTicket;
         bool earlyCacheEligible = false;
         bool capturedOnly = false;
+        // Prefetch compile policy: fold every class parameter except resources
+        // and the captured template values in keptValues. A shared folded
+        // program serves a template group; an unshared one a single material.
+        bool foldParameters = false;
+        bool shareFoldedProgram = false;
+        std::vector<TemplateValueKey> keptValues;
         uint64_t resourceRevision = 0;
         uint64_t reloadGeneration = 0;
         uint64_t associationReloadGeneration = 0;
@@ -968,11 +1019,28 @@ public:
         }
         const auto compilationStart = std::chrono::steady_clock::now();
         MDLMaterial::CompilationTimings timings;
+        MDLMaterial::CompileSelector select;
+        // Kept values are captured (node, parameter) pairs; the generated
+        // uniforms that carry them are only known once generation ran.
+        if (prepared.foldParameters) select = [&prepared](const GeneratedMDL& generated) {
+            mdl::CompileSpecification specification;
+            specification.foldParameters = true;
+            specification.shareProgram = prepared.shareFoldedProgram;
+            std::vector<CompatibleBinding> bindings;
+            if (!prepared.keptValues.empty() && prism::materialx::BuildCompatibleBindings(
+                    prepared.conversionNetwork, generated.uniforms, &bindings))
+                for (const auto& binding : bindings)
+                    if (std::find(prepared.keptValues.begin(), prepared.keptValues.end(),
+                            TemplateValueKey(binding.node, binding.parameter)) !=
+                        prepared.keptValues.end())
+                        specification.keptUniforms.insert(binding.uniform);
+            return specification;
+        };
         std::shared_ptr<MDLMaterial> candidate;
         try {
             candidate = std::make_shared<MDLMaterial>(
                 prepared.mtlxPath.string(), *context, libraries, mdlPath,
-                prepared.materialName, &timings);
+                prepared.materialName, &timings, select);
         } catch (const std::exception& error) {
             {
                 std::lock_guard<std::mutex> cacheLock(gMaterialCacheMutex);
@@ -997,6 +1065,7 @@ public:
         compilationNanoseconds += std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - compilationStart).count();
         ++compilations;
+        if (timings.foldedParameters) ++foldedCompilations;
         if (timings.persistentGenerationCacheHit) ++persistentGenerationCacheHits;
         generationCalls += timings.generationCalls;
         if (timings.templateCacheHit) ++templateCacheHits;
@@ -1022,6 +1091,9 @@ public:
             bool compatible = TemplateStructure(prepared.network, &structure);
             if (compatible) compatible = prism::materialx::BuildCompatibleBindings(
                 prepared.conversionNetwork, candidate->get_generated_uniforms(), &bindings);
+            if (compatible && candidate->has_folded_parameters())
+                compatible = target.program && prism::materialx::RecordFoldedBindings(
+                    prepared.network, target.program->parameters, &bindings);
             if (compatible && !bindings.empty()) {
                 prism::materialx::CompatibleTemplateRegistry::Shared().publish(
                     {context, libraries, mdlPath, std::move(structure),
@@ -1099,7 +1171,7 @@ public:
     std::unordered_map<std::string,std::filesystem::path> resourceSourcePaths;
     std::atomic<uint64_t> requests{0}, pathCacheHits{0}, contentCacheHits{0}, earlyCacheHits{0};
     std::atomic<uint64_t> conversionCalls{0};
-    std::atomic<uint64_t> compilations{0}, nativeJits{0}, jobs{0};
+    std::atomic<uint64_t> compilations{0}, foldedCompilations{0}, nativeJits{0}, jobs{0};
     std::atomic<uint64_t> sdkTranslationCalls{0}, programCacheHits{0};
     std::atomic<uint64_t> bindingCreations{0}, fallbackTranslations{0};
     std::atomic<uint64_t> sdkTextureFallbacks{0}, customTextureTargets{0};
@@ -1211,6 +1283,45 @@ void MaterialService::Prefetch(const std::vector<Request>& requests,
         std::cerr << "\n";
     }
 
+    const bool fold = FoldingCompileMode();
+    // A material compiled alone folds everything except resources; no other
+    // material is expected to share its program.
+    auto foldAlone = [&](Impl::Prepared value) {
+        value.foldParameters = fold;
+        value.shareFoldedProgram = false;
+        value.keptValues.clear();
+        return value;
+    };
+    // Compiles on a bounded worker pool. Only immutable Prepared inputs reach
+    // the workers; Hydra data sources stay on the calling thread.
+    auto compileInPool = [&](std::vector<Impl::Prepared>& items,
+                             std::vector<std::shared_ptr<Material>>* results,
+                             std::vector<uint8_t>* needsFallback) {
+        const unsigned workers = std::min<unsigned>(
+            prism::MaterialWorkerCount(), static_cast<unsigned>(items.size()));
+        std::atomic<size_t> next{0};
+        std::vector<std::thread> pool;
+        pool.reserve(workers);
+        for (unsigned i = 0; i < workers; ++i) {
+            pool.emplace_back([&] {
+                const double cpuStart = CurrentThreadCpuSeconds();
+                for (;;) {
+                    if (cancelled && cancelled()) break;
+                    const size_t index = next.fetch_add(1);
+                    if (index >= items.size()) break;
+                    bool fallback = false;
+                    auto material = m_impl->Compile(
+                        items[index], needsFallback ? &fallback : nullptr);
+                    if (results) (*results)[index] = std::move(material);
+                    if (needsFallback) (*needsFallback)[index] = fallback ? 1 : 0;
+                }
+                m_impl->workerCpuNanoseconds += static_cast<int64_t>(
+                    (CurrentThreadCpuSeconds() - cpuStart) * 1.0e9);
+            });
+        }
+        for (std::thread& worker : pool) worker.join();
+    };
+
     // Hydra data sources are consumed on this calling sync thread. Workers see
     // only serialized MaterialX, bound templates and materialized resources.
     std::vector<Impl::Prepared> prepared;
@@ -1225,6 +1336,13 @@ void MaterialService::Prefetch(const std::vector<Request>& requests,
         const size_t seedIndex = group.indices.front();
         seeds.push_back(m_impl->Prepare(unique[seedIndex].dataSource,
                                        unique[seedIndex].path));
+        // The seed keeps as arguments exactly the template values on which
+        // group members disagree; its variants bind only those.
+        std::vector<const NetworkSnapshot*> members;
+        for (const size_t index : group.indices) members.push_back(&captured[index].network);
+        seeds.back().foldParameters = fold;
+        seeds.back().shareFoldedProgram = true;
+        seeds.back().keptValues = VaryingTemplateValues(members);
         seedGroupIndices.push_back(groupIndex);
         grouped[seedIndex] = true;
         for (size_t j = 1; j < group.indices.size(); ++j)
@@ -1232,30 +1350,15 @@ void MaterialService::Prefetch(const std::vector<Request>& requests,
     }
     std::vector<std::shared_ptr<Material>> seedMaterials(seeds.size());
     if (!seeds.empty()) {
-        const unsigned seedWorkers = std::min<unsigned>(
-            prism::MaterialWorkerCount(), static_cast<unsigned>(seeds.size()));
-        std::atomic<size_t> seedNext{0};
-        std::vector<std::thread> seedPool;
-        seedPool.reserve(seedWorkers);
-        for (unsigned i = 0; i < seedWorkers; ++i) {
-            seedPool.emplace_back([&] {
-                const double cpuStart = CurrentThreadCpuSeconds();
-                for (;;) {
-                    if (cancelled && cancelled()) break;
-                    const size_t index = seedNext.fetch_add(1);
-                    if (index >= seeds.size()) break;
-                    seedMaterials[index] = m_impl->Compile(seeds[index]);
-                }
-                m_impl->workerCpuNanoseconds += static_cast<int64_t>(
-                    (CurrentThreadCpuSeconds() - cpuStart) * 1.0e9);
-            });
-        }
-        for (auto& worker : seedPool) worker.join();
+        compileInPool(seeds, &seedMaterials, nullptr);
         for (size_t i = 0; i < seeds.size(); ++i) {
             if (cancelled && cancelled()) return;
             if (seedMaterials[i] || !seeds[i].templatePrototype) continue;
             auto fallback = m_impl->Prepare(
                 seeds[i].source, seeds[i].path, false);
+            fallback.foldParameters = seeds[i].foldParameters;
+            fallback.shareFoldedProgram = seeds[i].shareFoldedProgram;
+            fallback.keptValues = seeds[i].keptValues;
             seedMaterials[i] = m_impl->Compile(fallback);
         }
     }
@@ -1295,48 +1398,31 @@ void MaterialService::Prefetch(const std::vector<Request>& requests,
                 ++m_impl->earlyCacheHits;
                 prepared.push_back(std::move(variant));
             } else {
-                prepared.push_back(m_impl->Prepare(
-                    unique[index].dataSource, unique[index].path));
+                prepared.push_back(foldAlone(m_impl->Prepare(
+                    unique[index].dataSource, unique[index].path)));
             }
         }
     }
     for (size_t i = 0; i < unique.size(); ++i) {
         if (grouped[i]) continue;
         if (captured[i].cached) prepared.push_back(std::move(captured[i]));
-        else prepared.push_back(m_impl->Prepare(unique[i].dataSource, unique[i].path));
+        else prepared.push_back(foldAlone(
+            m_impl->Prepare(unique[i].dataSource, unique[i].path)));
     }
-    unsigned workers = prism::MaterialWorkerCount();
-    workers = std::min<unsigned>(workers, static_cast<unsigned>(prepared.size()));
-    std::atomic<size_t> next{0};
     std::vector<uint8_t> needsFallback(prepared.size(), 0);
-    std::vector<std::thread> pool;
-    pool.reserve(workers);
-    for (unsigned i = 0; i < workers; ++i) {
-        pool.emplace_back([&] {
-            const double cpuStart = CurrentThreadCpuSeconds();
-            for (;;) {
-                if (cancelled && cancelled()) break;
-                const size_t index = next.fetch_add(1);
-                if (index >= prepared.size()) break;
-                bool fallback = false;
-                m_impl->Compile(prepared[index], &fallback);
-                needsFallback[index] = fallback ? 1 : 0;
-            }
-            m_impl->workerCpuNanoseconds += static_cast<int64_t>(
-                (CurrentThreadCpuSeconds() - cpuStart) * 1.0e9);
-        });
-    }
-    for (std::thread& worker : pool) worker.join();
-    // Rare mapping/resource incompatibilities return to the Prefetch caller,
-    // which owns the captured data-source lifetime. Workers never recapture or
-    // traverse a caller-provided source.
+    compileInPool(prepared, nullptr, &needsFallback);
+    // Rejected template bindings (mapping/resource incompatibilities, or a
+    // value the template folded) return to the Prefetch caller, which owns the
+    // captured data-source lifetime and re-prepares them. Workers never
+    // recapture or traverse a caller-provided source; they only compile.
+    std::vector<Impl::Prepared> fallbacks;
     for (size_t i = 0; i < prepared.size(); ++i) {
         if (cancelled && cancelled()) break;
         if (!needsFallback[i]) continue;
-        auto fallback = m_impl->Prepare(
-            prepared[i].source, prepared[i].path, false);
-        m_impl->Compile(fallback);
+        fallbacks.push_back(foldAlone(m_impl->Prepare(
+            prepared[i].source, prepared[i].path, false)));
     }
+    if (!fallbacks.empty()) compileInPool(fallbacks, nullptr, nullptr);
     m_impl->batchWallNanoseconds += std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now() - batchStart).count();
 }
@@ -1458,6 +1544,7 @@ MaterialService::MaterialStats MaterialService::GetStats() const
     result.earlyCacheHits = m_impl->earlyCacheHits.load();
     result.conversionCalls = m_impl->conversionCalls.load();
     result.compilations = m_impl->compilations.load();
+    result.foldedCompilations = m_impl->foldedCompilations.load();
     result.nativeJits = m_impl->nativeJits.load();
     result.sdkTranslationCalls = m_impl->sdkTranslationCalls.load();
     result.programCacheHits = m_impl->programCacheHits.load();

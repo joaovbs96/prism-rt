@@ -116,6 +116,21 @@ std::string canonical_module_name(const std::string& structuralKey) {
     return "::prism_material_classes::m_" + fnv1a_hex(structuralKey);
 }
 
+// Textures, light profiles and BSDF measurements, also inside compounds.
+bool contains_resource(const mi::neuraylib::IValue* value) {
+    if (!value) return false;
+    mi::base::Handle<const mi::neuraylib::IValue_resource> resource(
+        value->get_interface<mi::neuraylib::IValue_resource>());
+    if (resource) return true;
+    mi::base::Handle<const mi::neuraylib::IValue_compound> compound(
+        value->get_interface<mi::neuraylib::IValue_compound>());
+    for (mi::Size i = 0; compound && i < compound->get_size(); ++i) {
+        mi::base::Handle<const mi::neuraylib::IValue> child(compound->get_value(i));
+        if (contains_resource(child.get())) return true;
+    }
+    return false;
+}
+
 } // namespace
 
 MaterialCompiler::MaterialCompiler(Context& ctx, const std::string& mx_mdl_path)
@@ -404,11 +419,61 @@ MaterialCompiler::compile_instance(
     return compiled;
 }
 
+void MaterialCompiler::fold_class_parameters(
+    mi::neuraylib::ITransaction* transaction,
+    const std::string& instance_name,
+    const CompileSpecification& specification,
+    mi::neuraylib::IMdl_execution_context* context,
+    CompiledMaterial& result)
+{
+    const auto& unfolded = result.compiled_material;
+    mi::base::Handle<mi::IDynamic_array> names(
+        transaction->create<mi::IDynamic_array>("String[]"));
+    if (!unfolded || !names) return;
+    std::vector<std::string> folded;
+    // "fold_parameters" takes the names the unfolded class compile reports.
+    for (mi::Size i = 0; i < unfolded->get_parameter_count(); ++i) {
+        const char* name = unfolded->get_parameter_name(i);
+        mi::base::Handle<const mi::neuraylib::IValue> value(unfolded->get_argument(i));
+        if (!name || contains_resource(value.get()) ||
+            specification.keptUniforms.contains(name))
+            continue;
+        mi::base::Handle<mi::IString> entry(transaction->create<mi::IString>("String"));
+        if (!entry) return;
+        entry->set_c_str(name);
+        names->push_back(entry.get());
+        folded.push_back(name);
+    }
+    if (folded.empty()) return;
+
+    context->clear_messages();
+    if (context->set_option("fold_parameters", names.get()) != 0 ||
+        context->set_option("fold_ternary_on_df", true) != 0 ||
+        context->set_option("fold_transparent_layers", true) != 0) {
+        std::cerr << "[WARN] Cannot set MDL parameter folding options; keeping class compilation\n";
+        print_context_messages(context);
+        return;
+    }
+    mi::base::Handle<const mi::neuraylib::ICompiled_material> compiled(
+        compile_instance(transaction, instance_name, context, true));
+    if (!compiled) {
+        // The unfolded class result is still a correct program for this material.
+        std::cerr << "[WARN] Folded class compilation failed; keeping class compilation\n";
+        return;
+    }
+    if (verbose_mdl())
+        std::cout << std::format("  Folded {} of {} class parameters; {} remain arguments\n",
+            folded.size(), unfolded->get_parameter_count(), compiled->get_parameter_count());
+    result.compiled_material = compiled;
+    result.folded_parameters = std::move(folded);
+}
+
 // ========================================================================
 // Full pipeline: GeneratedMDL -> CompiledMaterial
 // ========================================================================
 CompiledMaterial MaterialCompiler::compile(const GeneratedMDL& generated_mdl,
-                                           const std::string& mtlx_path) {
+                                           const std::string& mtlx_path,
+                                           const CompileSpecification& specification) {
     CompiledMaterial result;
     result.success = false;
 
@@ -676,6 +741,11 @@ CompiledMaterial MaterialCompiler::compile(const GeneratedMDL& generated_mdl,
         context->clear_messages();
         result.compiled_material = compile_instance(
             transaction.get(), result.instance_db_name, context.get(), false);
+    } else if (specification.foldParameters) {
+        // Folding needs the unfolded class compile above to enumerate the
+        // parameter names and types it may fold.
+        fold_class_parameters(transaction.get(), result.instance_db_name,
+                              specification, context.get(), result);
     }
 
     if (!result.compiled_material) {
@@ -705,7 +775,10 @@ CompiledMaterial MaterialCompiler::compile(const GeneratedMDL& generated_mdl,
     // Target code is keyed by the compiled class program. Resource-valued
     // arguments are rebound into an immutable per-argument-block runtime by
     // BackendCompiler, so textured instances can safely share native code.
-    result.allowTargetCodeReuse = true;
+    // A folded program serves only materials with the same folded constants;
+    // keep one nobody else will request out of the bounded cache.
+    result.allowTargetCodeReuse =
+        result.folded_parameters.empty() || specification.shareProgram;
     return result;
 }
 

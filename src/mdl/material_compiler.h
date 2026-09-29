@@ -4,11 +4,28 @@
 #include "../materialx/mdl_generator.h"
 
 #include <mi/mdl_sdk.h>
+#include <set>
 #include <string>
 #include <vector>
 #include <iostream>
 
 namespace mdl {
+
+// Selects which class parameters remain runtime arguments. Folding a parameter
+// bakes its value into the compiled material, so the SDK can drop BSDF lobes a
+// zero weight disables; the resulting program then only suits that value.
+// Resource-typed parameters (textures, light profiles, BSDF measurements)
+// always remain arguments so resource preflight and the custom texture runtime
+// keep binding them per argument block.
+struct CompileSpecification {
+    // false: every class parameter is an argument (full class compilation).
+    bool foldParameters = false;
+    // With foldParameters, the generated-uniform names that stay arguments.
+    std::set<std::string> keptUniforms;
+    // A folded program may enter the process target-code cache only when other
+    // materials are expected to share it (compatible template groups).
+    bool shareProgram = true;
+};
 
 // Result of compiling a MaterialX-generated MDL module
 struct CompiledMaterial {
@@ -28,6 +45,9 @@ struct CompiledMaterial {
 
     bool success = false;
     bool allowTargetCodeReuse = false;
+    // Class parameters baked into compiled_material as constants; empty for
+    // full class compilation and for the instance-compilation fallback.
+    std::vector<std::string> folded_parameters;
     std::string error_message;
 
     // Call this when you're done with the compiled material
@@ -57,8 +77,11 @@ public:
     // mtlx_path: path to the .mtlx file that was loaded. Used to resolve
     //            relative texture paths (the directory containing the .mtlx
     //            is registered as a resource search path).
+    // specification: which class parameters stay runtime arguments (default:
+    //            all of them).
     CompiledMaterial compile(const GeneratedMDL& generated_mdl,
-                             const std::string& mtlx_path = "");
+                             const std::string& mtlx_path = "",
+                             const CompileSpecification& specification = {});
 
     // Individual steps (if you need finer control)
 
@@ -87,6 +110,16 @@ public:
 private:
     // Helper: print all messages from the execution context
     void print_context_messages(mi::neuraylib::IMdl_execution_context* context);
+
+    // Recompiles a class-compiled result with every parameter folded except
+    // resources and specification.keptUniforms. Leaves the unfolded class
+    // result in place when nothing would fold or the folded compile fails.
+    void fold_class_parameters(
+        mi::neuraylib::ITransaction* transaction,
+        const std::string& instance_name,
+        const CompileSpecification& specification,
+        mi::neuraylib::IMdl_execution_context* context,
+        CompiledMaterial& result);
 
     Context& m_ctx;
     std::string m_mx_mdl_path;

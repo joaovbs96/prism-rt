@@ -16,6 +16,7 @@
 #include <cmath>
 #include <chrono>
 #include <cstdlib>
+#include <functional>
 #include <string_view>
 #include <new>
 
@@ -38,7 +39,12 @@ public:
         bool persistentGenerationCacheHit = false;
         uint64_t generationCalls = 0;
         bool templateCacheHit = false;
+        bool foldedParameters = false;
     };
+    // Chooses the compile specification once generation has published the
+    // material's uniforms. Empty: every class parameter is a runtime argument.
+    using CompileSelector =
+        std::function<mdl::CompileSpecification(const GeneratedMDL&)>;
     // Construct a material from an already validated immutable native program
     // and a freshly bound argument/resource block. The binding retains its
     // program and runtime, so no generator or SDK transaction is needed here.
@@ -50,12 +56,14 @@ public:
     //   mx_libraries_path: path to MaterialX install libraries/
     //   mx_mdl_path:       path to MaterialX install libraries/mdl/
     //   material_name:     name of the material node (empty = use first material found)
+    //   select:            which class parameters to fold (empty = none)
     MDLMaterial(const std::string& mtlx_path,
                 mdl::Context& mdl_context,
                 const std::string& mx_libraries_path,
                 const std::string& mx_mdl_path,
                 const std::string& material_name = "",
-                CompilationTimings* timings = nullptr)
+                CompilationTimings* timings = nullptr,
+                const CompileSelector& select = {})
     {
         prism::PreparationAdmission::Reservation admission(
             prism::PreparationAdmission::Shared(), 512ull * 1024ull * 1024ull);
@@ -125,9 +133,12 @@ public:
         // Phase 4: Load MDL into SDK and compile
         const auto compilationStart = std::chrono::steady_clock::now();
         m_compiler = std::make_unique<mdl::MaterialCompiler>(mdl_context, mx_mdl_path);
-        m_compiled = m_compiler->compile(gen, mtlx_path);
+        m_compiled = m_compiler->compile(gen, mtlx_path,
+            select ? select(gen) : mdl::CompileSpecification{});
+        m_foldedParameters = !m_compiled.folded_parameters.empty();
         if (timings) timings->classCompilationSeconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - compilationStart).count();
+        if (timings) timings->foldedParameters = m_foldedParameters;
 
         if (!m_compiled.success) {
             std::cerr << "[MDLMaterial] ERROR: Compilation failed: " << m_compiled.error_message << "\n";
@@ -169,6 +180,9 @@ public:
     const std::vector<GeneratedUniform>& get_generated_uniforms() const {
         return m_generated_uniforms;
     }
+    // True when some class parameters were baked into the program, so a
+    // generated uniform missing from its parameters is a folded constant.
+    bool has_folded_parameters() const { return m_foldedParameters; }
 
     // ----------------------------------------------------------------
     // PrismRT Material interface
@@ -601,5 +615,6 @@ private:
     mdl::CompiledMaterial m_compiled;
     mdl::TargetCode m_target;
     std::vector<GeneratedUniform> m_generated_uniforms;
+    bool m_foldedParameters = false;
     bool m_valid = false;
 };

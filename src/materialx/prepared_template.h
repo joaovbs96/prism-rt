@@ -21,6 +21,10 @@ namespace prism::materialx {
 struct CompatibleBinding {
     PXR_NS::TfToken node, parameter;
     std::string uniform, type;
+    // The uniform was folded into the prototype's program. The template then
+    // serves only materials whose captured value equals foldedValue.
+    bool folded = false;
+    PXR_NS::VtValue foldedValue;
 };
 struct CompatibleMaterialTemplate {
     mdl::Context* context = nullptr;
@@ -123,6 +127,40 @@ inline bool BuildCompatibleBindings(const CapturedMaterialGraph& graph,
     return !bindings->empty();
 }
 
+inline const CapturedParameter* FindCapturedParameter(
+    const CapturedMaterialGraph& graph, const CompatibleBinding& binding,
+    const CapturedNode** owner, std::string* error) {
+    const CapturedParameter* parameter=nullptr;
+    for (const auto& node : graph.nodes) if (node.name==binding.node)
+        for (const auto& candidate : node.parameters)
+            if (candidate.name==binding.parameter) {
+                if (parameter) { *error="ambiguous captured parameter"; return nullptr; }
+                parameter=&candidate; if (owner) *owner=&node;
+            }
+    if (!parameter) *error="captured parameter is missing";
+    return parameter;
+}
+
+// A folded program has baked in every generated uniform that is not one of its
+// runtime parameters. Record the prototype's captured value for those bindings
+// so a material with a different value can never reuse the program.
+inline bool RecordFoldedBindings(const CapturedMaterialGraph& graph,
+                                 const std::vector<mdl::CompiledProgram::Parameter>& parameters,
+                                 std::vector<CompatibleBinding>* bindings) {
+    if (!bindings) return false;
+    for (auto& binding : *bindings) {
+        if (std::any_of(parameters.begin(),parameters.end(),
+                [&](const auto& parameter) { return parameter.name==binding.uniform; }))
+            continue;
+        std::string error;
+        const CapturedParameter* parameter=FindCapturedParameter(graph,binding,nullptr,&error);
+        if (!parameter || parameter->data.value.IsEmpty()) return false;
+        binding.folded=true;
+        binding.foldedValue=parameter->data.value;
+    }
+    return true;
+}
+
 struct CompatibleBindResult {
     std::shared_ptr<MDLMaterial> material;
     uint64_t bytesRead = 0;
@@ -138,6 +176,20 @@ inline CompatibleBindResult BindCompatibleTemplate(
     if (!prepared.prototype || !prepared.prototype->is_valid()) {
         result.error="template prototype expired"; return result;
     }
+    // The program computes with the prototype's folded values; binding any
+    // other value would silently render a different material. Reject before
+    // any SDK or resource work.
+    for (const auto& binding : prepared.bindings) {
+        if (!binding.folded) continue;
+        const CapturedParameter* parameter=
+            FindCapturedParameter(graph,binding,nullptr,&result.error);
+        if (!parameter) return result;
+        if (parameter->data.value!=binding.foldedValue) {
+            result.error="folded template parameter differs: "+
+                binding.node.GetString()+"."+binding.parameter.GetString();
+            return result;
+        }
+    }
     prism::PreparationAdmission::Reservation admission(
         prism::PreparationAdmission::Shared(),512ull*1024*1024);
     auto scope=mi::base::make_handle(context.get_database()->get_global_scope());
@@ -150,15 +202,11 @@ inline CompatibleBindResult BindCompatibleTemplate(
         result.error="cannot create template binding transaction"; return result;
     }
     for (const auto& binding : prepared.bindings) {
-        const CapturedParameter* parameter=nullptr;
+        if (binding.folded) continue;
         const CapturedNode* capturedNode=nullptr;
-        for (const auto& node : graph.nodes) if (node.name==binding.node)
-            for (const auto& candidate : node.parameters)
-                if (candidate.name==binding.parameter) {
-                    if (parameter) { result.error="ambiguous captured parameter"; return result; }
-                    parameter=&candidate; capturedNode=&node;
-                }
-        if (!parameter) { result.error="captured parameter is missing"; return result; }
+        const CapturedParameter* parameter=
+            FindCapturedParameter(graph,binding,&capturedNode,&result.error);
+        if (!parameter) return result;
         mi::base::Handle<mi::neuraylib::IValue> value;
         const auto& source=parameter->data.value;
         if (source.IsHolding<float>()) value=values->create_float(source.UncheckedGet<float>());
@@ -274,17 +322,21 @@ public:
         return false;
     }
     // A template is only reusable if bind_arguments can write its bindings:
-    // it needs a class argument block and every bound uniform (passed to
-    // bind_arguments unchanged) must be a parameter of the compiled program.
+    // every bound uniform (passed to bind_arguments unchanged) must be a
+    // parameter of the compiled program, which then needs a class argument
+    // block. A folded binding is instead checked against its recorded value.
     static bool IsBindable(const CompatibleMaterialTemplate& entry) {
         if (!entry.prototype || !entry.prototype->is_valid()) return false;
         const auto& target=entry.prototype->get_target_code();
-        if (!target.binding || !target.binding->argument_block || !target.program ||
-            !target.program->target_code ||
-            target.program->target_code->get_argument_block_count()==0) return false;
+        if (!target.binding || !target.program || !target.program->target_code) return false;
+        const bool bindsArguments=std::any_of(entry.bindings.begin(),entry.bindings.end(),
+            [](const CompatibleBinding& binding) { return !binding.folded; });
+        if (bindsArguments && (!target.binding->argument_block ||
+            target.program->target_code->get_argument_block_count()==0)) return false;
         const auto& parameters=target.program->parameters;
         return std::all_of(entry.bindings.begin(),entry.bindings.end(),
             [&](const CompatibleBinding& binding) {
+                if (binding.folded) return !binding.foldedValue.IsEmpty();
                 return std::any_of(parameters.begin(),parameters.end(),
                     [&](const auto& parameter) { return parameter.name==binding.uniform; });
             });

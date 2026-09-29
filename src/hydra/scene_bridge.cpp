@@ -3799,6 +3799,7 @@ VtDictionary SceneBridge::GetStats() const
         result["materialContentCacheHits"] = VtValue(static_cast<int64_t>(stats.contentCacheHits));
         result["materialEarlyCacheHits"] = VtValue(static_cast<int64_t>(stats.earlyCacheHits));
         result["materialCompilations"] = VtValue(static_cast<int64_t>(stats.compilations));
+        result["materialFoldedCompilations"] = VtValue(static_cast<int64_t>(stats.foldedCompilations));
         result["materialNativeJits"] = VtValue(static_cast<int64_t>(stats.nativeJits));
         result["materialSdkTranslationCalls"] = VtValue(static_cast<int64_t>(_impl->materialWorkTotals.sdkTranslationCalls));
         result["materialProgramCacheHits"] = VtValue(static_cast<int64_t>(_impl->materialWorkTotals.programCacheHits));
