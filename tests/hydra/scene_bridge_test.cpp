@@ -1,3 +1,11 @@
+// Material schema tokens include `interface`, which Windows headers pulled in
+// by the renderer define as a macro; include them first.
+#include <pxr/imaging/hd/geomSubsetSchema.h>
+#include <pxr/imaging/hd/material.h>
+#include <pxr/imaging/hd/materialBindingSchema.h>
+#include <pxr/imaging/hd/materialBindingsSchema.h>
+#include <pxr/imaging/hd/materialSchema.h>
+#include <pxr/imaging/hd/utils.h>
 #include "../../src/hydra/scene_bridge.h"
 #include "../../src/hydra/render_buffer.h"
 #include "../../src/hydra/native_tasks.h"
@@ -229,6 +237,98 @@ HdContainerDataSourceHandle InstancerData(double offset = 1.0,
             .SetVisibility(
                 HdRetainedTypedSampledDataSource<bool>::New(visible))
             .Build());
+}
+
+HdContainerDataSourceHandle VisibilityMeshData(bool visible, float pointOffset)
+{
+    return HdOverlayContainerDataSource::New(
+        HdRetainedContainerDataSource::New(
+            HdVisibilitySchemaTokens->visibility,
+            HdVisibilitySchema::Builder()
+                .SetVisibility(
+                    HdRetainedTypedSampledDataSource<bool>::New(visible))
+                .Build()),
+        FixtureMeshData(false, HdRenderTagTokens->geometry, GfVec3f(0.7f),
+                        pointOffset));
+}
+
+HdContainerDataSourceHandle PreviewMaterialData(SdfPath const &path,
+                                                GfVec3f const &color)
+{
+    HdMaterialNode preview;
+    preview.path = path.AppendChild(TfToken("Preview"));
+    preview.identifier = TfToken("UsdPreviewSurface");
+    preview.parameters[TfToken("diffuseColor")] = VtValue(color);
+    HdMaterialNetworkMap networkMap;
+    networkMap.map[TfToken("surface")].nodes = {preview};
+    HdDataSourceBaseHandle const network =
+        HdUtils::ConvertHdMaterialNetworkToHdMaterialNetworkSchema(networkMap);
+    TfToken const context = HdMaterialSchemaTokens->universalRenderContext;
+    return HdRetainedContainerDataSource::New(
+        HdMaterialSchemaTokens->material,
+        HdMaterialSchema::BuildRetained(1, &context, &network));
+}
+
+HdContainerDataSourceHandle FaceSubsetData(VtIntArray const &faces,
+                                           SdfPath const &material)
+{
+    HdDataSourceBaseHandle const binding = HdMaterialBindingSchema::Builder()
+        .SetPath(HdRetainedTypedSampledDataSource<SdfPath>::New(material))
+        .Build();
+    TfToken const purpose = HdMaterialBindingsSchemaTokens->allPurpose;
+    return HdRetainedContainerDataSource::New(
+        HdGeomSubsetSchema::GetSchemaToken(),
+        HdGeomSubsetSchema::Builder()
+            .SetType(HdGeomSubsetSchema::BuildTypeDataSource(
+                HdGeomSubsetSchemaTokens->typeFaceSet))
+            .SetIndices(HdRetainedTypedSampledDataSource<VtIntArray>::New(faces))
+            .Build(),
+        HdMaterialBindingsSchema::GetSchemaToken(),
+        HdMaterialBindingsSchema::BuildRetained(1, &purpose, &binding));
+}
+
+// 64 distinct meshes, two identical paths plus an instanced prototype with
+// the same geometry, a mesh whose geom subsets bind two materials, and a
+// hidden mesh. Visible mesh paths: 68; distinct geometries: 66.
+void AddConversionScene(HdRetainedSceneIndexRefPtr const &scene)
+{
+    HdRetainedSceneIndex::AddedPrimEntries prims;
+    for (char const *parent : {"/Grid", "/Twin", "/Looks"})
+        prims.push_back({SdfPath(parent), TfToken("xform"),
+                         FixtureXformData(GfVec3d(0.0))});
+    for (int i = 0; i < 64; ++i)
+        prims.push_back({SdfPath("/Grid/M" + std::to_string(i)),
+            HdPrimTypeTokens->mesh,
+            FixtureMeshData(false, HdRenderTagTokens->geometry, GfVec3f(0.7f),
+                            0.01f * static_cast<float>(i + 1))});
+    prims.push_back({SdfPath("/Twin/A"), HdPrimTypeTokens->mesh,
+                     FixtureMeshData(true)});
+    prims.push_back({SdfPath("/Twin/B"), HdPrimTypeTokens->mesh,
+                     FixtureMeshData(true)});
+    prims.push_back({SdfPath("/Looks/Red"), HdPrimTypeTokens->material,
+                     PreviewMaterialData(SdfPath("/Looks/Red"),
+                                         GfVec3f(0.8f, 0.1f, 0.1f))});
+    prims.push_back({SdfPath("/Looks/Blue"), HdPrimTypeTokens->material,
+                     PreviewMaterialData(SdfPath("/Looks/Blue"),
+                                         GfVec3f(0.1f, 0.1f, 0.8f))});
+    prims.push_back({SdfPath("/Subset"), HdPrimTypeTokens->mesh,
+                     FixtureMeshData(false, HdRenderTagTokens->geometry,
+                                     GfVec3f(0.7f), -0.3f)});
+    prims.push_back({SdfPath("/Subset/Quad"), HdPrimTypeTokens->geomSubset,
+                     FaceSubsetData(VtIntArray{0}, SdfPath("/Looks/Red"))});
+    prims.push_back({SdfPath("/Subset/Apex"), HdPrimTypeTokens->geomSubset,
+                     FaceSubsetData(VtIntArray{1}, SdfPath("/Looks/Blue"))});
+    prims.push_back({SdfPath("/Proto"), TfToken("scope"),
+                     HdRetainedContainerDataSource::New(
+                         TfToken("present"),
+                         HdRetainedTypedSampledDataSource<bool>::New(true))});
+    prims.push_back({SdfPath("/Proto/Mesh"), HdPrimTypeTokens->mesh,
+                     InstancedMeshData()});
+    prims.push_back({SdfPath("/Instancer"), HdPrimTypeTokens->instancer,
+                     InstancerData()});
+    prims.push_back({SdfPath("/Hidden"), HdPrimTypeTokens->mesh,
+                     VisibilityMeshData(false, 0.9f)});
+    scene->AddPrims(prims);
 }
 
 int64_t Stat(VtDictionary const &stats, char const *name)
@@ -1270,6 +1370,130 @@ int main()
         ok &= Check(DoubleStat(bridge.GetStats(),
                                "captureBudgetMilliseconds") == 3.0,
                     "capture after first publication kept the long budget");
+    }
+    {
+        // Snapshot builds convert meshes in parallel ahead of the serial walk.
+        // Counts, storage sharing and prim ids must follow the serial rules.
+        constexpr unsigned resolution = 8;
+        const TfTokenVector geometryTags{HdRenderTagTokens->geometry};
+        prism::hydra::CameraState camera;
+        prism::hydra::RenderSettings settings;
+        settings.samples = 1;
+        settings.maxDepth = 1;
+        settings.refinementDelayMs = 0;
+        auto primBinding = [](PrismRenderBuffer *buffer) {
+            HdRenderPassAovBinding result;
+            result.aovName = HdAovTokens->primId;
+            result.renderBuffer = buffer;
+            result.clearValue = VtValue(-1);
+            return HdRenderPassAovBindingVector{result};
+        };
+        struct Loaded {
+            std::vector<std::pair<SdfPath, SdfPath>> picking;
+            VtDictionary stats;
+        };
+        // Picking tables are published with a rendered frame.
+        auto load = [&](prism::hydra::SceneBridge &bridge,
+                        PrismRenderBuffer *primBuffer) {
+            Loaded result;
+            bridge.SetSettings(settings);
+            activeBridge = &bridge;
+            ok &= Check(PumpPrepare(bridge, camera, primBinding(primBuffer),
+                                    geometryTags, resolution, resolution),
+                        "conversion scene did not prepare");
+            thread.StartRender();
+            ok &= Check(WaitFor([&] {
+                return bridge.IsConverged() && !bridge.GetPrimPath(0).IsEmpty();
+            }), "conversion scene frame did not publish");
+            thread.StopRender();
+            result.stats = bridge.GetStats();
+            for (int64_t id = 0; id < Stat(result.stats, "primCount"); ++id)
+                result.picking.emplace_back(
+                    bridge.GetPrimPath(static_cast<int>(id)),
+                    bridge.GetInstancerPath(static_cast<int>(id)));
+            return result;
+        };
+        PrismRenderBuffer firstPrims(SdfPath("/ConversionPrimsA"), &thread);
+        PrismRenderBuffer secondPrims(SdfPath("/ConversionPrimsB"), &thread);
+        firstPrims.Allocate(GfVec3i(resolution, resolution, 1),
+                            HdFormatInt32, false);
+        secondPrims.Allocate(GfVec3i(resolution, resolution, 1),
+                             HdFormatInt32, false);
+        HdRetainedSceneIndexRefPtr firstScene = HdRetainedSceneIndex::New();
+        HdRetainedSceneIndexRefPtr secondScene = HdRetainedSceneIndex::New();
+        AddConversionScene(firstScene);
+        AddConversionScene(secondScene);
+
+        prism::hydra::SceneBridge first(firstScene, &thread);
+        Loaded const firstLoad = load(first, &firstPrims);
+        VtDictionary const &stats = firstLoad.stats;
+        // Distinct geometries: 64 grid meshes, the subset mesh, and one
+        // storage shared by both twins and the instanced prototype.
+        ok &= Check(Stat(stats, "primCount") == 68 &&
+                        Stat(stats, "meshCount") == 66 &&
+                        Stat(stats, "triangleCount") == 64 * 3 + 3 + 2 &&
+                        Stat(stats, "instanceCount") == 2 &&
+                        Stat(stats, "prototypeBuildCount") == 66,
+                    "parallel conversion changed prim, triangle, prototype or instance counts");
+        ok &= Check(Stat(stats, "prototypeCount") == 66 &&
+                        Stat(stats, "prototypePathCount") == 68,
+                    "identical prototype paths did not share geometry storage");
+        ok &= Check(Stat(stats, "prototypeConversions") == 68 &&
+                        Stat(stats, "prototypeConversionCacheHits") == 0,
+                    "initial load did not convert each visible mesh path once");
+        bool pickingComplete = firstLoad.picking.size() == 68;
+        for (auto const &[primPath, instancerPath] : firstLoad.picking)
+            pickingComplete &= !primPath.IsEmpty() &&
+                (primPath == SdfPath("/Proto/Mesh")) ==
+                    (instancerPath == SdfPath("/Instancer"));
+        ok &= Check(pickingComplete,
+                    "parallel conversion published an incomplete picking table");
+        {
+            prism::hydra::SceneBridge second(secondScene, &thread);
+            Loaded const secondLoad = load(second, &secondPrims);
+            bool sameStats = true;
+            for (char const *name : {"meshCount", "triangleCount", "primCount",
+                    "instanceCount", "prototypeCount", "prototypePathCount",
+                    "prototypeBuildCount", "prototypeConversions",
+                    "prototypeConversionCacheHits", "estimatedGeometryBytes",
+                    "inactiveSnapshotGeometryBytes",
+                    "pickingInstanceTopologyPrimCount",
+                    "pickingInstanceTopologyFailures"})
+                sameStats &= Stat(firstLoad.stats, name) ==
+                    Stat(secondLoad.stats, name);
+            ok &= Check(firstLoad.picking == secondLoad.picking,
+                        "parallel conversion made picking prim ids nondeterministic");
+            ok &= Check(sameStats,
+                        "parallel conversion made geometry statistics nondeterministic");
+            activeBridge = nullptr;
+        }
+
+        // Showing a mesh that had no placement records rebuilds the snapshot
+        // from the incrementally captured scene. Every other prim keeps its
+        // captured data source, so only the newly visible mesh converts.
+        activeBridge = &first;
+        firstScene->AddPrims({{SdfPath("/Hidden"), HdPrimTypeTokens->mesh,
+                               VisibilityMeshData(true, 0.9f)}});
+        first.MarkSceneDirty(prism::hydra::SceneDirtyKind::Placement,
+                             SdfPath("/Hidden"));
+        ok &= Check(PumpPrepare(first, camera, primBinding(&firstPrims),
+                                geometryTags, resolution, resolution),
+                    "visibility restore did not prepare");
+        VtDictionary const shown = first.GetStats();
+        ok &= Check(Stat(shown, "visibilityRecoveryRebuilds") ==
+                        Stat(stats, "visibilityRecoveryRebuilds") + 1 &&
+                        Stat(shown, "prototypeConversionCacheHits") > 0 &&
+                        Stat(shown, "prototypeConversionCacheHits") == 68 &&
+                        Stat(shown, "prototypeConversions") == 1 &&
+                        Stat(shown, "prototypeBuildCount") == 67,
+                    "unchanged prims were converted again in an incremental snapshot build");
+        ok &= Check(Stat(shown, "primCount") == 69 &&
+                        Stat(shown, "prototypePathCount") == 69 &&
+                        Stat(shown, "prototypeCount") == 67 &&
+                        Stat(shown, "triangleCount") == 64 * 3 + 3 + 2 + 3 &&
+                        Stat(shown, "instanceCount") == 2,
+                    "conversion cache changed incremental snapshot geometry");
+        activeBridge = nullptr;
     }
     thread.StopThread();
     return ok ? 0 : 1;

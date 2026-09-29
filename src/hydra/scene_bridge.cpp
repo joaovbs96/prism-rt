@@ -375,9 +375,62 @@ struct PrototypeStorage {
         }
     }
 };
+// Everything mesh conversion derives from a prim data source except the Mesh
+// itself. It is small enough to cache beside the shared storage, so a reused
+// conversion still replays its warnings and material-subset metadata.
+struct MeshConversionInfo {
+    SharedFaceTable coarseFaces;
+    size_t faceCount = 0;
+    size_t geometryHash = 0;
+    size_t malformedFaceCount = 0;
+    size_t degenerateFaceCount = 0;
+    // Warnings after the motion check apply only once topology was readable.
+    bool topologyRead = false;
+    bool motionBlur = false;
+    bool multipleUvSets = false;
+    bool subdivisionControlHull = false;
+};
+
+// Geometry allocates its transform as a raw pointer; free it with a mesh that
+// is discarded because identical storage already exists.
+struct ConvertedMeshDeleter {
+    void operator()(Mesh *mesh) const
+    {
+        if (!mesh) return;
+        delete mesh->transform;
+        delete mesh;
+    }
+};
+
+struct MeshConversion {
+    MeshConversionInfo info;
+    // Null when no triangle survived conversion.
+    std::unique_ptr<Mesh, ConvertedMeshDeleter> mesh;
+};
+
 struct PrototypePool {
     std::mutex mutex;
     std::unordered_map<size_t, std::vector<std::weak_ptr<PrototypeStorage>>> buckets;
+    // Captured prim data sources are immutable, so an unchanged handle means
+    // an unchanged conversion. Each entry holds its handle so the address
+    // cannot be reused while it serves as the key.
+    struct ConversionEntry {
+        HdContainerDataSourceHandle source;
+        std::weak_ptr<PrototypeStorage> storage;
+        MeshConversionInfo info;
+        uint64_t lastBuild = 0;
+    };
+    std::unordered_map<HdDataSourceBase const *, ConversionEntry> conversions;
+    uint64_t conversionBuilds = 0;
+};
+
+// A mesh prim's conversion resolved to prototype storage. Snapshot builds
+// prepare these before the walk; prototype refreshes create one inline.
+struct PreparedMesh {
+    MeshConversionInfo info;
+    // Null when conversion produced no triangles.
+    std::shared_ptr<PrototypeStorage> storage;
+    bool builtStorage = false;
 };
 
 struct Snapshot {
@@ -437,6 +490,8 @@ struct Snapshot {
     size_t estimatedGeometryBytes = 0;
     uint64_t instanceCount = 0;
     uint64_t prototypeBuildCount = 0;
+    uint64_t prototypeConversions = 0;
+    uint64_t prototypeConversionCacheHits = 0;
     double meshConversionSeconds = 0.0;
     double embreeGeometryCommitSeconds = 0.0;
     double embreeSceneCommitSeconds = 0.0;
@@ -627,88 +682,57 @@ void _IndexPlacementDependencies(Snapshot *snapshot)
     }
 }
 
-bool _AppendMesh(HdSceneIndexBaseRefPtr const &sceneIndex,
-                 SdfPath const &path, HdSceneIndexPrim const &prim,
-                 MaterialService *materials, Snapshot *snapshot,
-                 GfMatrix4d const &world, SdfPath const &instancerPath,
-                 int instanceId, std::vector<InstanceLevel> const &instanceChain,
-                 TfTokenVector const &renderTags)
+// Pure: reads only the prim's data source and touches no Snapshot, pool,
+// Embree or material state, so snapshot builds run it on TBB workers. The
+// caller emits the warnings recorded in MeshConversionInfo.
+MeshConversion _ConvertMesh(HdContainerDataSourceHandle const &dataSource)
 {
-    if (!_WorldVisible(sceneIndex, path) ||
-        !_PurposeMatches(prim.dataSource, renderTags)) return false;
-    HdMeshSchema meshSchema = HdMeshSchema::GetFromParent(prim.dataSource);
+    MeshConversion result;
+    MeshConversionInfo &info = result.info;
+    HdMeshSchema meshSchema = HdMeshSchema::GetFromParent(dataSource);
     HdMeshTopologySchema topology = meshSchema.GetTopology();
-    HdPrimvarsSchema primvars = HdPrimvarsSchema::GetFromParent(prim.dataSource);
-    if (!meshSchema || !topology || !primvars) return false;
+    HdPrimvarsSchema primvars = HdPrimvarsSchema::GetFromParent(dataSource);
+    if (!meshSchema || !topology || !primvars) return result;
 
-    if (instanceId >= 0) {
-        auto const cached = snapshot->prototypes.find(path);
-        if (cached != snapshot->prototypes.end()) {
-            const unsigned int geomId = _AttachPrototype(
-                snapshot, path, cached->second, world);
-            PrimKey const primKey{path, instancerPath};
-            auto [it, inserted] = snapshot->primIds.emplace(
-                primKey, static_cast<int>(snapshot->primPaths.size()));
-            if (inserted) {
-                snapshot->primPaths.push_back(path);
-                snapshot->instancerPaths.push_back(instancerPath);
-            }
-            snapshot->geomToPrimId.emplace(geomId, it->second);
-            snapshot->geomToCoarseFaces.emplace(
-                geomId, cached->second.coarseFaces);
-            snapshot->geomToInstanceId.emplace(geomId, instanceId);
-            if (!instanceChain.empty())
-                snapshot->geomToInstanceChain.emplace(geomId, instanceChain);
-            ++snapshot->instanceCount;
-            return true;
-        }
-    }
-    const auto conversionStart = std::chrono::steady_clock::now();
+    HdXformSchema const xform = HdXformSchema::GetFromParent(dataSource);
+    HdPrimvarSchema const pointsPrimvar =
+        primvars.GetPrimvar(HdPrimvarsSchemaTokens->points);
+    info.motionBlur = (xform && _IsSampled(xform.GetMatrix())) ||
+        (pointsPrimvar && _IsSampled(pointsPrimvar.GetPrimvarValue()));
 
-    if (snapshot->warnedMotionPaths.insert(path).second) {
-        HdXformSchema const xform = HdXformSchema::GetFromParent(prim.dataSource);
-        HdPrimvarSchema const pointsPrimvar =
-            primvars.GetPrimvar(HdPrimvarsSchemaTokens->points);
-        if ((xform && _IsSampled(xform.GetMatrix())) ||
-            (pointsPrimvar && _IsSampled(pointsPrimvar.GetPrimvarValue()))) {
-            TF_WARN("PrismRT: motion blur authored on <%s> is not supported; using time 0",
-                    path.GetText());
-        }
-    }
-
-    VtIntArray counts, indices, holes;
-    VtVec3fArray points;
-    if (!_ReadArray(topology.GetFaceVertexCounts(), &counts) ||
-        !_ReadArray(topology.GetFaceVertexIndices(), &indices)) return false;
-    _ReadArray(topology.GetHoleIndices(), &holes);
+    VtIntArray readCounts, readIndices, readHoles;
+    if (!_ReadArray(topology.GetFaceVertexCounts(), &readCounts) ||
+        !_ReadArray(topology.GetFaceVertexIndices(), &readIndices)) return result;
+    _ReadArray(topology.GetHoleIndices(), &readHoles);
     PrimvarData pointsPv = _Primvar(primvars, HdPrimvarsSchemaTokens->points);
-    if (!pointsPv.value.IsHolding<VtVec3fArray>()) return false;
-    points = pointsPv.value.UncheckedGet<VtVec3fArray>();
-    if (points.empty()) return false;
+    if (!pointsPv.value.IsHolding<VtVec3fArray>()) return result;
+    // Const views: indexing a non-const VtArray detaches (copies) the buffer
+    // it still shares with the captured data source.
+    VtIntArray const counts = std::move(readCounts);
+    VtIntArray const indices = std::move(readIndices);
+    VtIntArray const holes = std::move(readHoles);
+    VtVec3fArray const points = pointsPv.value.UncheckedGet<VtVec3fArray>();
+    if (points.empty()) return result;
+    info.topologyRead = true;
+    info.faceCount = counts.size();
 
     PrimvarData normalPv = _Primvar(primvars, HdPrimvarsSchemaTokens->normals);
     PrimvarData uvPv = _Primvar(primvars, TfToken("st"));
     PrimvarData const alternateUvPv = _Primvar(primvars, TfToken("uv"));
-    if (!uvPv.value.IsEmpty() && !alternateUvPv.value.IsEmpty() &&
-        snapshot->warnedFeatures.insert("multipleUvSets").second) {
-        TF_WARN("PrismRT: multiple UV sets are not supported; using primvar 'st'");
-    }
+    info.multipleUvSets = !uvPv.value.IsEmpty() && !alternateUvPv.value.IsEmpty();
     if (uvPv.value.IsEmpty()) uvPv = alternateUvPv;
-    VtVec3fArray authoredNormals;
-    VtVec2fArray authoredUvs;
-    if (normalPv.value.IsHolding<VtVec3fArray>())
-        authoredNormals = normalPv.value.UncheckedGet<VtVec3fArray>();
-    if (uvPv.value.IsHolding<VtVec2fArray>())
-        authoredUvs = uvPv.value.UncheckedGet<VtVec2fArray>();
+    VtVec3fArray const authoredNormals =
+        normalPv.value.IsHolding<VtVec3fArray>()
+            ? normalPv.value.UncheckedGet<VtVec3fArray>() : VtVec3fArray();
+    VtVec2fArray const authoredUvs =
+        uvPv.value.IsHolding<VtVec2fArray>()
+            ? uvPv.value.UncheckedGet<VtVec2fArray>() : VtVec2fArray();
 
     TfToken orientation = HdMeshTopologySchemaTokens->rightHanded;
     if (auto o = topology.GetOrientation()) orientation = o->GetTypedValue(0.0f);
     if (auto scheme = meshSchema.GetSubdivisionScheme()) {
         TfToken const value = scheme->GetTypedValue(0.0f);
-        if (!value.IsEmpty() && value != TfToken("none") &&
-            snapshot->warnedFeatures.insert("subdivisionControlHull").second)
-            TF_WARN("PrismRT: subdivision refinement is unsupported; subdivision meshes are rendered as control hulls (first seen at <%s>)",
-                    path.GetText());
+        info.subdivisionControlHull = !value.IsEmpty() && value != TfToken("none");
     }
     const bool flip = orientation == HdMeshTopologySchemaTokens->leftHanded;
     const GfMatrix4d geometryTransform(1.0);
@@ -722,8 +746,10 @@ bool _AppendMesh(HdSceneIndexBaseRefPtr const &sceneIndex,
     // the inverse transpose later.
     std::vector<GfVec3d> generatedNormals(points.size(), GfVec3d(0.0));
     size_t generatedCorner = 0;
+    size_t triangleEstimate = 0;
     for (size_t face = 0; face < counts.size(); ++face) {
         const int count = counts[face];
+        if (count >= 3) triangleEstimate += count - 2;
         if (count < 3 || generatedCorner + count > indices.size()) {
             generatedCorner += std::max(0, count);
             continue;
@@ -751,25 +777,26 @@ bool _AppendMesh(HdSceneIndexBaseRefPtr const &sceneIndex,
         generatedCorner += count;
     }
 
-    auto mesh = std::make_unique<Mesh>();
-    // Geometry predates RAII and allocates this raw pointer in-class. Keep it
-    // guarded while conversion can still fail; Snapshot takes over only once
-    // the fully built mesh is committed below.
-    std::unique_ptr<TransformMatrix> transformOwner(mesh->transform);
+    std::unique_ptr<Mesh, ConvertedMeshDeleter> mesh(new Mesh());
+    mesh->vertices.reserve(3 * triangleEstimate);
+    mesh->normals.reserve(3 * triangleEstimate);
+    mesh->texcoords.reserve(3 * triangleEstimate);
+    mesh->indices.reserve(3 * triangleEstimate);
     std::vector<int> coarseFaces;
+    coarseFaces.reserve(triangleEstimate);
+    // Reused across faces so ordinary faces allocate nothing.
+    std::vector<GfVec3d> facePoints;
+    std::vector<std::array<int, 3>> triangles;
     size_t corner = 0;
-    size_t malformedFaceCount = 0;
-    size_t degenerateFaceCount = 0;
     for (size_t face = 0; face < counts.size(); ++face) {
         const int count = counts[face];
         if (count < 3 || corner + count > indices.size()) {
-            ++malformedFaceCount;
+            ++info.malformedFaceCount;
             corner += std::max(0, count);
             continue;
         }
         if (holeSet.count(static_cast<int>(face))) { corner += count; continue; }
-        std::vector<GfVec3d> facePoints;
-        facePoints.reserve(count);
+        facePoints.clear();
         bool validFace = true;
         for (int k = 0; k < count; ++k) {
             int const pi = indices[corner + k];
@@ -780,18 +807,20 @@ bool _AppendMesh(HdSceneIndexBaseRefPtr const &sceneIndex,
             facePoints.emplace_back(points[pi]);
         }
         if (!validFace) {
-            ++malformedFaceCount;
+            ++info.malformedFaceCount;
             corner += count;
             continue;
         }
-        std::vector<std::array<int, 3>> const triangles =
-            TriangulatePolygon(facePoints);
-        if (triangles.empty()) {
-            ++degenerateFaceCount;
+        triangles.resize(count - 2);
+        size_t const triangleCount = TriangulatePolygon(
+            facePoints.data(), facePoints.size(), triangles.data());
+        if (triangleCount == 0) {
+            ++info.degenerateFaceCount;
             corner += count;
             continue;
         }
-        for (std::array<int, 3> const &triangle : triangles) {
+        for (size_t t = 0; t < triangleCount; ++t) {
+            std::array<int, 3> const &triangle = triangles[t];
             int local[3] = {triangle[0], triangle[1], triangle[2]};
             if (flip) std::swap(local[1], local[2]);
             GfVec3d wp[3];
@@ -839,105 +868,8 @@ bool _AppendMesh(HdSceneIndexBaseRefPtr const &sceneIndex,
         }
         corner += count;
     }
-    if (malformedFaceCount)
-        TF_WARN("PrismRT: mesh <%s> skipped %zu malformed faces",
-                path.GetText(), malformedFaceCount);
-    if (degenerateFaceCount)
-        TF_WARN("PrismRT: mesh <%s> skipped %zu degenerate or non-triangulable faces",
-                path.GetText(), degenerateFaceCount);
-    if (mesh->indices.empty()) return false;
+    if (mesh->indices.empty()) return result;
 
-    Material *material = snapshot->fallbackMaterial.get();
-    PrimvarData displayColor = _Primvar(primvars, TfToken("displayColor"));
-    if (displayColor.value.IsHolding<VtVec3fArray>()) {
-        VtVec3fArray const &colors =
-            displayColor.value.UncheckedGet<VtVec3fArray>();
-        if (!colors.empty()) {
-            auto const existing = snapshot->displayMaterialsByPath.find(path);
-            if (existing != snapshot->displayMaterialsByPath.end()) {
-                material = existing->second;
-            } else {
-                GfVec3f const &value = colors.front();
-                auto texture = std::make_unique<ColorTexture>(
-                    Color3(value[0], value[1], value[2]));
-                auto displayMaterial = std::make_unique<Diffuse>(texture.get());
-                material = displayMaterial.get();
-                snapshot->displayColorTextures.push_back(std::move(texture));
-                snapshot->displayColorMaterials.push_back(std::move(displayMaterial));
-                snapshot->displayMaterialsByPath.emplace(path, material);
-            }
-        }
-    }
-    const SdfPath materialPath = _MaterialPath(prim.dataSource);
-    if (!materialPath.IsEmpty())
-        _RecordMaterialUser(snapshot, materialPath, path);
-    if (std::shared_ptr<Material> resolved = _ResolveMaterial(
-            sceneIndex, materialPath, materials, snapshot))
-        material = resolved.get();
-
-    // Hydra 2 represents authored material subsets as geomSubset children of
-    // the mesh.  Mesh::getMaterial indexes the Embree triangle id, so expand
-    // each coarse face assignment to every triangle emitted by the fan above.
-    // Faces outside an authored subset retain the mesh's base material.
-    std::unordered_map<int, Material *> faceMaterials;
-    for (SdfPath const &childPath : sceneIndex->GetChildPrimPaths(path)) {
-        HdSceneIndexPrim const child = sceneIndex->GetPrim(childPath);
-        HdGeomSubsetSchema const subset =
-            HdGeomSubsetSchema::GetFromParent(child.dataSource);
-        if (!subset) continue;
-        if (auto type = subset.GetType()) {
-            if (type->GetTypedValue(0.0f) !=
-                HdGeomSubsetSchemaTokens->typeFaceSet) continue;
-        }
-        VtIntArray faces;
-        if (!_ReadArray(subset.GetIndices(), &faces)) continue;
-        const SdfPath subsetMaterialPath = _MaterialPath(child.dataSource);
-        if (subsetMaterialPath.IsEmpty() || !materials) continue;
-        _RecordMaterialUser(snapshot, subsetMaterialPath, path);
-        std::shared_ptr<Material> resolved = _ResolveMaterial(
-            sceneIndex, subsetMaterialPath, materials, snapshot);
-        if (!resolved) continue;
-        Material *const subsetMaterial = resolved.get();
-        for (int const face : faces) {
-            if (face >= 0 && static_cast<size_t>(face) < counts.size())
-                faceMaterials[face] = subsetMaterial;
-        }
-    }
-    if (faceMaterials.empty()) {
-        mesh->material_override = material;
-    } else {
-        mesh->material_override = nullptr;
-        std::unordered_map<Material *, int> materialIds;
-        auto materialId = [&](Material *m) {
-            auto const found = materialIds.find(m);
-            if (found != materialIds.end()) return found->second;
-            int const id = static_cast<int>(materialIds.size());
-            materialIds.emplace(m, id);
-            mesh->materials.emplace(id, m);
-            return id;
-        };
-        int const baseMaterialId = materialId(material);
-        std::unordered_map<int, int> faceMaterialIds;
-        for (auto const &[face, faceMaterial] : faceMaterials)
-            faceMaterialIds.emplace(face, materialId(faceMaterial));
-        std::vector<int> const triangleMaterialIds = ExpandFaceAssignments(
-            coarseFaces, faceMaterialIds, baseMaterialId);
-        for (size_t triangle = 0; triangle < triangleMaterialIds.size(); ++triangle) {
-            mesh->material_mapping.emplace(static_cast<int>(triangle),
-                                           triangleMaterialIds[triangle]);
-        }
-    }
-    unsigned int geomId = RTC_INVALID_GEOMETRY_ID;
-    SceneManager::PlacementMaterialBinding placementBinding;
-    placementBinding.fallback = material;
-    if (mesh->material_override) placementBinding.fallback = mesh->material_override;
-    else for (auto const &[triangle, materialId] : mesh->material_mapping) {
-        auto it = mesh->materials.find(materialId);
-        if (it != mesh->materials.end())
-            placementBinding.triangles.emplace(triangle, it->second);
-    }
-    snapshot->meshConversionSeconds += std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - conversionStart).count();
     mesh->ensureTangents();
     // Merge only identical complete attribute tuples after tangent generation.
     // Keeping tangent sign in the key preserves mirrored UV seams and avoids
@@ -950,9 +882,17 @@ bool _AppendMesh(HdSceneIndexBaseRefPtr const &sceneIndex,
         }
     };
     std::unordered_map<std::array<uint32_t,12>, unsigned, VertexHash> uniqueVertices;
+    uniqueVertices.reserve(mesh->vertices.size());
+    // Shared corners usually make the compact arrays far smaller than the
+    // expanded ones; the authored point count is the closest cheap guess.
+    const size_t compactEstimate = std::min(mesh->vertices.size(), points.size());
     std::vector<Float3> compactPositions, compactNormals;
     std::vector<Float2> compactUvs;
     std::vector<float> compactTangents;
+    compactPositions.reserve(compactEstimate);
+    compactNormals.reserve(compactEstimate);
+    compactUvs.reserve(compactEstimate);
+    compactTangents.reserve(4 * compactEstimate);
     std::vector<unsigned> remap(mesh->vertices.size());
     for (size_t i=0; i<mesh->vertices.size(); ++i) {
         const auto& p=mesh->vertices[i]; const auto& n=mesh->normals[i];
@@ -994,65 +934,234 @@ bool _AppendMesh(HdSceneIndexBaseRefPtr const &sceneIndex,
     }
     for (float const value : mesh->tangents) hashCombine(geometryHash, value);
     for (unsigned int const index : mesh->indices) hashCombine(geometryHash, index);
-    auto equalGeometry = [&](Mesh const *other) {
-        if (!other || mesh->vertices.size() != other->vertices.size() ||
-            mesh->normals.size() != other->normals.size() ||
-            mesh->texcoords.size() != other->texcoords.size() ||
-            mesh->tangents != other->tangents ||
-            mesh->indices != other->indices) return false;
-        auto same3 = [](Float3 const &a, Float3 const &b) {
-            return a.x()==b.x() && a.y()==b.y() && a.z()==b.z(); };
-        for (size_t i=0;i<mesh->vertices.size();++i)
-            if (!same3(mesh->vertices[i], other->vertices[i])) return false;
-        for (size_t i=0;i<mesh->normals.size();++i)
-            if (!same3(mesh->normals[i], other->normals[i])) return false;
-        for (size_t i=0;i<mesh->texcoords.size();++i)
-            if (mesh->texcoords[i].u()!=other->texcoords[i].u() ||
-                mesh->texcoords[i].v()!=other->texcoords[i].v()) return false;
-        return true;
-    };
+    info.geometryHash = geometryHash;
+    info.coarseFaces = SharedFaceTable(std::move(coarseFaces));
+    result.mesh = std::move(mesh);
+    return result;
+}
+
+bool _EqualMeshGeometry(Mesh const &mesh, Mesh const *other)
+{
+    if (!other || mesh.vertices.size() != other->vertices.size() ||
+        mesh.normals.size() != other->normals.size() ||
+        mesh.texcoords.size() != other->texcoords.size() ||
+        mesh.tangents != other->tangents ||
+        mesh.indices != other->indices) return false;
+    auto same3 = [](Float3 const &a, Float3 const &b) {
+        return a.x()==b.x() && a.y()==b.y() && a.z()==b.z(); };
+    for (size_t i=0;i<mesh.vertices.size();++i)
+        if (!same3(mesh.vertices[i], other->vertices[i])) return false;
+    for (size_t i=0;i<mesh.normals.size();++i)
+        if (!same3(mesh.normals[i], other->normals[i])) return false;
+    for (size_t i=0;i<mesh.texcoords.size();++i)
+        if (mesh.texcoords[i].u()!=other->texcoords[i].u() ||
+            mesh.texcoords[i].v()!=other->texcoords[i].v()) return false;
+    return true;
+}
+
+std::shared_ptr<PrototypeStorage> _FindPooledStorage(
+    PrototypePool &pool, size_t geometryHash, Mesh const &mesh)
+{
+    std::lock_guard lock(pool.mutex);
+    auto& entries = pool.buckets[geometryHash];
+    for (auto it=entries.begin();it!=entries.end();) {
+        auto candidate=it->lock();
+        if (!candidate) { it=entries.erase(it); continue; }
+        if (_EqualMeshGeometry(mesh, dynamic_cast<Mesh*>(candidate->geometry.get()))) return candidate;
+        ++it;
+    }
+    return {};
+}
+
+// Owns one prototype scene from creation to commit, so distinct prototypes
+// can be built concurrently without a lock.
+void _BuildPrototypeScene(RTCDevice device, PrototypeStorage &storage,
+                          MeshConversion &conversion)
+{
+    storage.scene = rtcNewScene(device);
+    conversion.mesh->setupEmbree(device, storage.scene);
+    rtcCommitScene(storage.scene);
+    storage.geometry.reset(conversion.mesh.release());
+}
+
+bool _AppendMesh(HdSceneIndexBaseRefPtr const &sceneIndex,
+                 SdfPath const &path, HdSceneIndexPrim const &prim,
+                 MaterialService *materials, Snapshot *snapshot,
+                 GfMatrix4d const &world, SdfPath const &instancerPath,
+                 int instanceId, std::vector<InstanceLevel> const &instanceChain,
+                 TfTokenVector const &renderTags,
+                 PreparedMesh const *prepared = nullptr)
+{
+    if (!_WorldVisible(sceneIndex, path) ||
+        !_PurposeMatches(prim.dataSource, renderTags)) return false;
+    HdMeshSchema meshSchema = HdMeshSchema::GetFromParent(prim.dataSource);
+    HdMeshTopologySchema topology = meshSchema.GetTopology();
+    HdPrimvarsSchema primvars = HdPrimvarsSchema::GetFromParent(prim.dataSource);
+    if (!meshSchema || !topology || !primvars) return false;
+
+    if (instanceId >= 0) {
+        auto const cached = snapshot->prototypes.find(path);
+        if (cached != snapshot->prototypes.end()) {
+            const unsigned int geomId = _AttachPrototype(
+                snapshot, path, cached->second, world);
+            PrimKey const primKey{path, instancerPath};
+            auto [it, inserted] = snapshot->primIds.emplace(
+                primKey, static_cast<int>(snapshot->primPaths.size()));
+            if (inserted) {
+                snapshot->primPaths.push_back(path);
+                snapshot->instancerPaths.push_back(instancerPath);
+            }
+            snapshot->geomToPrimId.emplace(geomId, it->second);
+            snapshot->geomToCoarseFaces.emplace(
+                geomId, cached->second.coarseFaces);
+            snapshot->geomToInstanceId.emplace(geomId, instanceId);
+            if (!instanceChain.empty())
+                snapshot->geomToInstanceChain.emplace(geomId, instanceChain);
+            ++snapshot->instanceCount;
+            return true;
+        }
+    }
+
+    PreparedMesh inlineMesh;
+    if (!prepared) {
+        // Prototype refreshes touch a few prims, so they convert inline.
+        const auto conversionStart = std::chrono::steady_clock::now();
+        MeshConversion conversion = _ConvertMesh(prim.dataSource);
+        snapshot->meshConversionSeconds += std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - conversionStart).count();
+        inlineMesh.info = conversion.info;
+        if (conversion.mesh) {
+            inlineMesh.storage = _FindPooledStorage(
+                *snapshot->prototypePool, conversion.info.geometryHash,
+                *conversion.mesh);
+            if (!inlineMesh.storage) {
+                const auto prototypeCommitStart = std::chrono::steady_clock::now();
+                inlineMesh.storage = std::make_shared<PrototypeStorage>();
+                _BuildPrototypeScene(snapshot->device, *inlineMesh.storage,
+                                     conversion);
+                inlineMesh.builtStorage = true;
+                snapshot->embreeGeometryCommitSeconds += std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - prototypeCommitStart).count();
+                std::lock_guard lock(snapshot->prototypePool->mutex);
+                snapshot->prototypePool->buckets[conversion.info.geometryHash]
+                    .push_back(inlineMesh.storage);
+            }
+        }
+        prepared = &inlineMesh;
+    }
+    MeshConversionInfo const &info = prepared->info;
+
+    if (snapshot->warnedMotionPaths.insert(path).second && info.motionBlur) {
+        TF_WARN("PrismRT: motion blur authored on <%s> is not supported; using time 0",
+                path.GetText());
+    }
+    if (!info.topologyRead) return false;
+    if (info.multipleUvSets &&
+        snapshot->warnedFeatures.insert("multipleUvSets").second) {
+        TF_WARN("PrismRT: multiple UV sets are not supported; using primvar 'st'");
+    }
+    if (info.subdivisionControlHull &&
+        snapshot->warnedFeatures.insert("subdivisionControlHull").second)
+        TF_WARN("PrismRT: subdivision refinement is unsupported; subdivision meshes are rendered as control hulls (first seen at <%s>)",
+                path.GetText());
+    if (info.malformedFaceCount)
+        TF_WARN("PrismRT: mesh <%s> skipped %zu malformed faces",
+                path.GetText(), info.malformedFaceCount);
+    if (info.degenerateFaceCount)
+        TF_WARN("PrismRT: mesh <%s> skipped %zu degenerate or non-triangulable faces",
+                path.GetText(), info.degenerateFaceCount);
+    if (!prepared->storage) return false;
+
+    Material *material = snapshot->fallbackMaterial.get();
+    PrimvarData displayColor = _Primvar(primvars, TfToken("displayColor"));
+    if (displayColor.value.IsHolding<VtVec3fArray>()) {
+        VtVec3fArray const &colors =
+            displayColor.value.UncheckedGet<VtVec3fArray>();
+        if (!colors.empty()) {
+            auto const existing = snapshot->displayMaterialsByPath.find(path);
+            if (existing != snapshot->displayMaterialsByPath.end()) {
+                material = existing->second;
+            } else {
+                GfVec3f const &value = colors.front();
+                auto texture = std::make_unique<ColorTexture>(
+                    Color3(value[0], value[1], value[2]));
+                auto displayMaterial = std::make_unique<Diffuse>(texture.get());
+                material = displayMaterial.get();
+                snapshot->displayColorTextures.push_back(std::move(texture));
+                snapshot->displayColorMaterials.push_back(std::move(displayMaterial));
+                snapshot->displayMaterialsByPath.emplace(path, material);
+            }
+        }
+    }
+    const SdfPath materialPath = _MaterialPath(prim.dataSource);
+    if (!materialPath.IsEmpty())
+        _RecordMaterialUser(snapshot, materialPath, path);
+    if (std::shared_ptr<Material> resolved = _ResolveMaterial(
+            sceneIndex, materialPath, materials, snapshot))
+        material = resolved.get();
+
+    // Hydra 2 represents authored material subsets as geomSubset children of
+    // the mesh. Bindings index the Embree triangle id, so expand each coarse
+    // face assignment to every triangle emitted by triangulation. Faces
+    // outside an authored subset retain the mesh's base material.
+    std::unordered_map<int, Material *> faceMaterials;
+    for (SdfPath const &childPath : sceneIndex->GetChildPrimPaths(path)) {
+        HdSceneIndexPrim const child = sceneIndex->GetPrim(childPath);
+        HdGeomSubsetSchema const subset =
+            HdGeomSubsetSchema::GetFromParent(child.dataSource);
+        if (!subset) continue;
+        if (auto type = subset.GetType()) {
+            if (type->GetTypedValue(0.0f) !=
+                HdGeomSubsetSchemaTokens->typeFaceSet) continue;
+        }
+        VtIntArray faces;
+        if (!_ReadArray(subset.GetIndices(), &faces)) continue;
+        const SdfPath subsetMaterialPath = _MaterialPath(child.dataSource);
+        if (subsetMaterialPath.IsEmpty() || !materials) continue;
+        _RecordMaterialUser(snapshot, subsetMaterialPath, path);
+        std::shared_ptr<Material> resolved = _ResolveMaterial(
+            sceneIndex, subsetMaterialPath, materials, snapshot);
+        if (!resolved) continue;
+        Material *const subsetMaterial = resolved.get();
+        for (int const face : std::as_const(faces)) {
+            if (face >= 0 && static_cast<size_t>(face) < info.faceCount)
+                faceMaterials[face] = subsetMaterial;
+        }
+    }
+    SceneManager::PlacementMaterialBinding placementBinding;
+    placementBinding.fallback = material;
+    // Storage may be shared with other snapshots, so materials live only in
+    // this placement binding, never on the mesh.
+    if (!faceMaterials.empty()) {
+        for (size_t triangle = 0; triangle < info.coarseFaces.size(); ++triangle) {
+            auto const found = faceMaterials.find(info.coarseFaces[triangle]);
+            placementBinding.triangles.emplace(static_cast<int>(triangle),
+                found == faceMaterials.end() ? material : found->second);
+        }
+    }
+
+    std::shared_ptr<PrototypeStorage> storage = prepared->storage;
     Snapshot::Prototype const *shared = nullptr;
-    auto& bucket = snapshot->prototypeHashBuckets[geometryHash];
+    auto& bucket = snapshot->prototypeHashBuckets[info.geometryHash];
     for (auto const& candidatePath : bucket) {
         const auto found = snapshot->prototypes.find(candidatePath);
-        if (found != snapshot->prototypes.end() && found->second.geometryHash == geometryHash &&
-            equalGeometry(dynamic_cast<Mesh *>(found->second.geometry))) {
+        if (found != snapshot->prototypes.end() &&
+            found->second.geometryHash == info.geometryHash &&
+            (found->second.storage == storage || _EqualMeshGeometry(
+                *static_cast<Mesh *>(storage->geometry.get()),
+                dynamic_cast<Mesh *>(found->second.geometry)))) {
             shared = &found->second;
             break;
         }
     }
-    std::shared_ptr<PrototypeStorage> storage = shared ? shared->storage : nullptr;
-    if (!storage) {
-        std::lock_guard lock(snapshot->prototypePool->mutex);
-        auto& entries = snapshot->prototypePool->buckets[geometryHash];
-        for (auto it=entries.begin();it!=entries.end();) {
-            auto candidate=it->lock();
-            if (!candidate) { it=entries.erase(it); continue; }
-            if (equalGeometry(dynamic_cast<Mesh*>(candidate->geometry.get()))) { storage=std::move(candidate); break; }
-            ++it;
-        }
-    }
-    const bool builtStorage = !storage;
-    if (!storage) {
-        const auto prototypeCommitStart = std::chrono::steady_clock::now();
-        storage = std::make_shared<PrototypeStorage>();
-        storage->scene = rtcNewScene(snapshot->device);
-        mesh->setupEmbree(*snapshot->scene->device, storage->scene);
-        rtcCommitScene(storage->scene);
-        transformOwner.release();
-        storage->geometry = std::move(mesh);
-        snapshot->embreeGeometryCommitSeconds += std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - prototypeCommitStart).count();
-        std::lock_guard lock(snapshot->prototypePool->mutex);
-        snapshot->prototypePool->buckets[geometryHash].push_back(storage);
-    }
+    if (shared) storage = shared->storage;
     RTCScene prototypeScene = storage->scene;
     Mesh* prototypeMesh = static_cast<Mesh*>(storage->geometry.get());
-    Snapshot::Prototype prototype{prototypeScene, prototypeMesh, coarseFaces,
-                                  placementBinding, geometryHash, storage};
+    Snapshot::Prototype prototype{prototypeScene, prototypeMesh, info.coarseFaces,
+                                  placementBinding, info.geometryHash, storage};
     snapshot->prototypes.emplace(path, prototype);
     if (std::find(bucket.begin(), bucket.end(), path) == bucket.end()) bucket.push_back(path);
-    geomId = _AttachPrototype(snapshot, path, prototype, world);
+    const unsigned int geomId = _AttachPrototype(snapshot, path, prototype, world);
     PrimKey const primKey{path, instancerPath};
     auto const existingPrim = snapshot->primIds.find(primKey);
     int primId = existingPrim == snapshot->primIds.end()
@@ -1076,7 +1185,7 @@ bool _AppendMesh(HdSceneIndexBaseRefPtr const &sceneIndex,
             prototypeMesh->texcoords.size() * sizeof(Float2) +
             prototypeMesh->indices.size() * sizeof(unsigned int) +
             prototypeMesh->tangents.size() * sizeof(float);
-        if (builtStorage) ++snapshot->prototypeBuildCount;
+        if (prepared->builtStorage) ++snapshot->prototypeBuildCount;
         snapshot->geometries.emplace_back(storage, prototypeMesh);
     }
     return true;
@@ -1700,10 +1809,181 @@ void _SetDomeEnvironment(HdSceneIndexBaseRefPtr const &scene,
     }
 }
 
+// Mesh prototypes converted ahead of the serial walk, which consumes them in
+// traversal order. Instanced placements are kept so they are expanded once.
+struct MeshPreparation {
+    std::unordered_map<SdfPath, PreparedMesh, SdfPath::Hash> meshes;
+    std::unordered_map<SdfPath, std::vector<InstancePlacement>, SdfPath::Hash>
+        placements;
+};
+
+void _CollectMeshes(HdSceneIndexBaseRefPtr const &scene, SdfPath const &path,
+                    TfTokenVector const &renderTags,
+                    std::function<bool()> const &cancelled,
+                    MeshPreparation *preparation,
+                    std::vector<std::pair<SdfPath, HdContainerDataSourceHandle>>
+                        *candidates)
+{
+    if (cancelled && cancelled()) return;
+    HdSceneIndexPrim const prim = scene->GetPrim(path);
+    if (prim.primType == HdPrimTypeTokens->mesh) {
+        // Mirror _Walk and _AppendMesh: an instanced prim is appended only
+        // when it has placements, and only visible, matching meshes convert.
+        bool placed = true;
+        if (HdInstancedBySchema::GetFromParent(prim.dataSource)) {
+            std::vector<InstancePlacement> placements =
+                _InstancePlacements(scene, path, prim.dataSource);
+            placed = !placements.empty();
+            preparation->placements.emplace(path, std::move(placements));
+        }
+        HdMeshSchema const meshSchema =
+            HdMeshSchema::GetFromParent(prim.dataSource);
+        if (placed && meshSchema && meshSchema.GetTopology() &&
+            HdPrimvarsSchema::GetFromParent(prim.dataSource) &&
+            _WorldVisible(scene, path) &&
+            _PurposeMatches(prim.dataSource, renderTags))
+            candidates->emplace_back(path, prim.dataSource);
+    }
+    for (SdfPath const &child : scene->GetChildPrimPaths(path))
+        _CollectMeshes(scene, child, renderTags, cancelled, preparation,
+                       candidates);
+}
+
+// Conversion and Embree prototype builds are independent per prim, so they
+// run on TBB workers. Sharing is resolved serially in traversal order, which
+// keeps storage choice, prim ids and statistics identical to a serial walk.
+MeshPreparation _PrepareMeshes(HdSceneIndexBaseRefPtr const &scene,
+                               Snapshot *snapshot,
+                               TfTokenVector const &renderTags,
+                               std::function<bool()> const &cancelled)
+{
+    MeshPreparation preparation;
+    std::vector<std::pair<SdfPath, HdContainerDataSourceHandle>> candidates;
+    _CollectMeshes(scene, SdfPath::AbsoluteRootPath(), renderTags, cancelled,
+                   &preparation, &candidates);
+    if (cancelled && cancelled()) return preparation;
+
+    PrototypePool &pool = *snapshot->prototypePool;
+    uint64_t build = 0;
+    std::vector<size_t> misses;
+    {
+        std::lock_guard lock(pool.mutex);
+        build = ++pool.conversionBuilds;
+        for (size_t i = 0; i < candidates.size(); ++i) {
+            auto const entry = pool.conversions.find(candidates[i].second.get());
+            std::shared_ptr<PrototypeStorage> storage =
+                entry != pool.conversions.end()
+                    ? entry->second.storage.lock() : nullptr;
+            if (!storage) {
+                misses.push_back(i);
+                continue;
+            }
+            entry->second.lastBuild = build;
+            preparation.meshes[candidates[i].first] =
+                {entry->second.info, std::move(storage), false};
+        }
+    }
+    snapshot->prototypeConversions = misses.size();
+    snapshot->prototypeConversionCacheHits = candidates.size() - misses.size();
+
+    std::vector<MeshConversion> conversions(misses.size());
+    const auto conversionStart = std::chrono::steady_clock::now();
+    tbb::parallel_for(size_t(0), misses.size(), [&](size_t i) {
+        if (cancelled && cancelled()) return;
+        conversions[i] = _ConvertMesh(candidates[misses[i]].second);
+    });
+    // Wall time of the parallel phase, covering the whole pure conversion
+    // including tangents, vertex de-duplication and hashing.
+    snapshot->meshConversionSeconds += std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - conversionStart).count();
+    if (cancelled && cancelled()) return preparation;
+
+    // Identical geometry shares one storage, first within this batch (cache
+    // hits included), then with the pool. Storage built by this batch keeps
+    // builtStorage so whichever path attaches it first counts the build.
+    struct BatchStorage {
+        Mesh const *mesh = nullptr;
+        std::shared_ptr<PrototypeStorage> storage;
+        bool built = false;
+    };
+    std::unordered_map<size_t, std::vector<BatchStorage>> batch;
+    std::vector<std::pair<std::shared_ptr<PrototypeStorage>, MeshConversion *>>
+        builds;
+    size_t nextMiss = 0;
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        SdfPath const &path = candidates[i].first;
+        if (nextMiss >= misses.size() || misses[nextMiss] != i) {
+            PreparedMesh const &hit = preparation.meshes[path];
+            batch[hit.info.geometryHash].push_back({
+                static_cast<Mesh const *>(hit.storage->geometry.get()),
+                hit.storage, false});
+            continue;
+        }
+        MeshConversion &conversion = conversions[nextMiss++];
+        PreparedMesh prepared{conversion.info};
+        if (conversion.mesh) {
+            auto &sameHash = batch[conversion.info.geometryHash];
+            for (BatchStorage const &candidate : sameHash) {
+                if (_EqualMeshGeometry(*conversion.mesh, candidate.mesh)) {
+                    prepared.storage = candidate.storage;
+                    prepared.builtStorage = candidate.built;
+                    break;
+                }
+            }
+            if (!prepared.storage) {
+                prepared.storage = _FindPooledStorage(
+                    pool, conversion.info.geometryHash, *conversion.mesh);
+                if (prepared.storage) {
+                    sameHash.push_back({static_cast<Mesh const *>(
+                        prepared.storage->geometry.get()), prepared.storage, false});
+                } else {
+                    prepared.storage = std::make_shared<PrototypeStorage>();
+                    prepared.builtStorage = true;
+                    sameHash.push_back({conversion.mesh.get(), prepared.storage, true});
+                    builds.emplace_back(prepared.storage, &conversion);
+                }
+            }
+        }
+        preparation.meshes[path] = std::move(prepared);
+    }
+
+    const RTCDevice device = snapshot->device;
+    const auto commitStart = std::chrono::steady_clock::now();
+    tbb::parallel_for(size_t(0), builds.size(), [&](size_t i) {
+        if (cancelled && cancelled()) return;
+        _BuildPrototypeScene(device, *builds[i].first, *builds[i].second);
+    });
+    // Wall time of the parallel prototype build phase.
+    snapshot->embreeGeometryCommitSeconds += std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - commitStart).count();
+    if (cancelled && cancelled()) return preparation;
+
+    std::lock_guard lock(pool.mutex);
+    for (auto const &[storage, conversion] : builds)
+        pool.buckets[conversion->info.geometryHash].push_back(storage);
+    for (size_t const i : misses) {
+        auto const &[path, source] = candidates[i];
+        PreparedMesh const &prepared = preparation.meshes[path];
+        if (!prepared.storage) continue;
+        pool.conversions[source.get()] =
+            {source, prepared.storage, prepared.info, build};
+    }
+    // Keep only what this build used; a full re-capture creates new handles,
+    // so older entries could never hit again.
+    for (auto it = pool.conversions.begin(); it != pool.conversions.end();) {
+        if (it->second.lastBuild != build || it->second.storage.expired())
+            it = pool.conversions.erase(it);
+        else
+            ++it;
+    }
+    return preparation;
+}
+
 void _Walk(HdSceneIndexBaseRefPtr const &scene, SdfPath const &path,
            MaterialService *materials, Snapshot *snapshot,
            TfTokenVector const &renderTags,
-           std::function<bool()> const &cancelled)
+           std::function<bool()> const &cancelled,
+           MeshPreparation *preparation = nullptr)
 {
     if (cancelled && cancelled()) return;
     HdSceneIndexPrim prim = scene->GetPrim(path);
@@ -1712,12 +1992,25 @@ void _Walk(HdSceneIndexBaseRefPtr const &scene, SdfPath const &path,
         const GfMatrix4d world = _WorldTransform(scene, path);
         const bool isInstanced = bool(
             HdInstancedBySchema::GetFromParent(prim.dataSource));
-        std::vector<InstancePlacement> placements =
-            _InstancePlacements(scene, path, prim.dataSource);
+        std::vector<InstancePlacement> placements;
+        bool placementsPrepared = false;
+        PreparedMesh const *prepared = nullptr;
+        if (preparation && prim.primType == HdPrimTypeTokens->mesh) {
+            auto const storedPlacements = preparation->placements.find(path);
+            if (storedPlacements != preparation->placements.end()) {
+                placements = std::move(storedPlacements->second);
+                placementsPrepared = true;
+            }
+            auto const storedMesh = preparation->meshes.find(path);
+            if (storedMesh != preparation->meshes.end())
+                prepared = &storedMesh->second;
+        }
+        if (!placementsPrepared)
+            placements = _InstancePlacements(scene, path, prim.dataSource);
         if (placements.empty() && !isInstanced) {
             if (prim.primType == HdPrimTypeTokens->mesh)
                 _AppendMesh(scene, path, prim, materials, snapshot,
-                            world, SdfPath(), -1, {}, renderTags);
+                            world, SdfPath(), -1, {}, renderTags, prepared);
             else
                 _AppendSphere(scene, path, prim, materials, snapshot,
                               world, SdfPath(), -1, {}, renderTags);
@@ -1727,7 +2020,8 @@ void _Walk(HdSceneIndexBaseRefPtr const &scene, SdfPath const &path,
                 if (prim.primType == HdPrimTypeTokens->mesh)
                     _AppendMesh(scene, path, prim, materials, snapshot,
                                 placement.transform, placement.instancerPath,
-                                placement.instanceId, placement.chain, renderTags);
+                                placement.instanceId, placement.chain, renderTags,
+                                prepared);
                 else
                     _AppendSphere(scene, path, prim, materials, snapshot,
                                   placement.transform, placement.instancerPath,
@@ -1750,7 +2044,8 @@ void _Walk(HdSceneIndexBaseRefPtr const &scene, SdfPath const &path,
                 type.c_str());
     }
     for (SdfPath const &child : scene->GetChildPrimPaths(path))
-        _Walk(scene, child, materials, snapshot, renderTags, cancelled);
+        _Walk(scene, child, materials, snapshot, renderTags, cancelled,
+              preparation);
 }
 
 void _CollectMaterialRequests(HdSceneIndexBaseRefPtr const &scene,
@@ -1823,8 +2118,11 @@ std::shared_ptr<Snapshot> _BuildSnapshot(HdSceneIndexBaseRefPtr const &scene,
     }
     if (cancelled && cancelled()) return {};
     const auto traversalStart = std::chrono::steady_clock::now();
+    MeshPreparation preparation = _PrepareMeshes(
+        scene, result.get(), renderTags, cancelled);
+    if (cancelled && cancelled()) return {};
     _Walk(scene, SdfPath::AbsoluteRootPath(), materials, result.get(),
-          renderTags, cancelled);
+          renderTags, cancelled, &preparation);
     if (cancelled && cancelled()) return {};
     _FlushSphereBatches(result.get());
     _IndexPlacementDependencies(result.get());
@@ -3754,6 +4052,10 @@ VtDictionary SceneBridge::GetStats() const
             _impl->snapshot->lastVisibilityPlacementsUpdated : 0));
     result["prototypeBuildCount"] = VtValue(static_cast<int64_t>(
         _impl->prototypeBuilds));
+    result["prototypeConversions"] = VtValue(static_cast<int64_t>(
+        _impl->snapshot ? _impl->snapshot->prototypeConversions : 0));
+    result["prototypeConversionCacheHits"] = VtValue(static_cast<int64_t>(
+        _impl->snapshot ? _impl->snapshot->prototypeConversionCacheHits : 0));
     result["meshConversionSeconds"] = VtValue(
         _impl->snapshot ? _impl->snapshot->meshConversionSeconds : 0.0);
     result["embreeGeometryCommitSeconds"] = VtValue(
