@@ -308,7 +308,7 @@ TargetCode BackendCompiler::generate_target_code(const CompiledMaterial& compile
     // Configure backend options
     backend->set_option("num_texture_spaces", "1");
     backend->set_option("num_texture_results", "128");
-    backend->set_option("enable_auxiliary", "on");
+    backend->set_option("enable_auxiliary", "off");
     backend->set_option("texture_runtime_with_derivs", "on");
     backend->set_option("use_builtin_resource_handler", "off");
 
@@ -365,7 +365,7 @@ TargetCode BackendCompiler::generate_target_code(const CompiledMaterial& compile
         ClassProgramHash(compiled.compiled_material.get(), m_ctx.get_factory(),
                          compiled.transaction.get())) +
         ":native-deriv-textures-v3:mdl-" MI_NEURAYLIB_PRODUCT_VERSION_STRING
-        ":callables-init-bsdf-edf-cutout-thin-v1:spaces-1:results-128";
+        ":callables-init-bsdf-edf-cutout-thin-v2:spaces-1:results-128";
     if (VerboseMdl())
         std::cout << "  class cache key: " << materialHash
                   << " reusable=" << compiled.allowTargetCodeReuse << "\n";
