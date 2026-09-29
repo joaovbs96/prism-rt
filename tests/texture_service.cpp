@@ -34,6 +34,22 @@ void setEnv(char const *name, std::string const &value)
     setenv(name, value.c_str(), 1);
 #endif
 }
+
+// Every mip level of a prepared file, as floats.
+std::vector<std::vector<float>> mipLevels(std::filesystem::path const &prepared)
+{
+    std::vector<std::vector<float>> levels;
+    auto input = OIIO::ImageInput::open(prepared.string());
+    require(bool(input), "cannot open prepared texture for comparison");
+    for (int level = 0; input->seek_subimage(0, level); ++level) {
+        const OIIO::ImageSpec spec = input->spec();
+        levels.emplace_back(static_cast<size_t>(spec.width) * spec.height * spec.nchannels);
+        require(input->read_image(0, level, 0, spec.nchannels, OIIO::TypeDesc::FLOAT,
+                                  levels.back().data()),
+                "cannot read prepared texture level for comparison");
+    }
+    return levels;
+}
 }
 
 int main()
@@ -555,6 +571,86 @@ int main()
         require(cleanValues == app13Values, "APP13 JPEG pixels differ from the clean JPEG");
         cleanPrepared.reset();
         app13Prepared.reset();
+
+        // Sixteen different images requested by eight threads at once, each
+        // thread in its own order: every image is prepared exactly once and
+        // matches a serial preparation in a separate cache in every mip level.
+        constexpr int manyCount = 16, manyThreads = 8;
+        std::vector<std::filesystem::path> manyImages;
+        std::vector<prism::TexturePrepareOptions> manyOptions;
+        for (int i = 0; i < manyCount; ++i) {
+            const int width = 40 + 7 * i, height = 24 + 5 * i, channels = 1 + i % 4;
+            const bool png = i % 2 != 0;
+            OIIO::ImageSpec manySpec(width, height, channels,
+                                     png ? OIIO::TypeDesc::UINT8 : OIIO::TypeDesc::FLOAT);
+            if (channels == 4) manySpec.alpha_channel = 3;
+            OIIO::ImageBuf manyImage(manySpec);
+            std::vector<float> values(static_cast<size_t>(width) * height * channels);
+            for (size_t v = 0; v < values.size(); ++v)
+                values[v] = static_cast<float>((v * 37 + static_cast<size_t>(i) * 11) % 101) / 100.0f;
+            require(manyImage.set_pixels(OIIO::ROI(0, width, 0, height, 0, 1, 0, channels),
+                                         OIIO::TypeDesc::FLOAT, values.data()),
+                    "cannot create concurrent preparation fixture");
+            manyImages.push_back(root / ("many-" + std::to_string(i) + (png ? ".png" : ".exr")));
+            require(manyImage.write(manyImages.back().string()),
+                    "cannot write concurrent preparation fixture");
+            prism::TexturePrepareOptions options;
+            options.unassociateAlpha = i % 3 != 0;
+            if (i % 4 == 1) options.gamma = 2.2f;
+            manyOptions.push_back(options);
+        }
+        setEnv("PRISM_CACHE_DIR", (root / "concurrent-many").string());
+        const auto manyBefore = service->stats();
+        std::array<std::array<std::shared_ptr<const prism::TextureResource>, manyCount>,
+                   manyThreads> manyResults;
+        std::atomic<bool> manyStart{false};
+        std::atomic<int> manyFailures{0};
+        std::vector<std::thread> manyWorkers;
+        for (int t = 0; t < manyThreads; ++t)
+            manyWorkers.emplace_back([&, t] {
+                while (!manyStart.load(std::memory_order_acquire)) std::this_thread::yield();
+                for (int k = 0; k < manyCount; ++k) {
+                    const int i = (k + 2 * t) % manyCount;
+                    try { manyResults[t][i] = service->prepare(manyImages[i], manyOptions[i]); }
+                    catch (std::exception const &error) {
+                        std::cerr << "concurrent preparation failed: " << error.what() << '\n';
+                        ++manyFailures;
+                    }
+                }
+            });
+        manyStart.store(true, std::memory_order_release);
+        for (auto &worker : manyWorkers) worker.join();
+        const auto manyAfter = service->stats();
+        require(manyFailures == 0, "concurrent preparation of different images failed");
+        require(manyAfter.coldPreparations - manyBefore.coldPreparations == manyCount &&
+                manyAfter.diskCacheHits == manyBefore.diskCacheHits &&
+                manyAfter.prepareCalls - manyBefore.prepareCalls == manyCount * manyThreads,
+                "concurrent preparation did not prepare each image exactly once");
+        for (int i = 0; i < manyCount; ++i) {
+            auto sourceInput = OIIO::ImageInput::open(manyImages[i].string());
+            require(bool(sourceInput), "cannot inspect concurrent preparation fixture");
+            OIIO::ImageSpec const sourceSpec = sourceInput->spec();
+            sourceInput->close();
+            for (int t = 0; t < manyThreads; ++t)
+                require(manyResults[t][i] && manyResults[t][i] == manyResults[0][i],
+                        "concurrent requests for one image returned different resources");
+            require(manyResults[0][i]->width() == sourceSpec.width &&
+                    manyResults[0][i]->height() == sourceSpec.height &&
+                    manyResults[0][i]->channels() == sourceSpec.nchannels,
+                    "concurrently prepared texture has wrong dimensions or channels");
+        }
+        setEnv("PRISM_CACHE_DIR", (root / "serial-many").string());
+        for (int i = 0; i < manyCount; ++i) {
+            auto serial = service->prepare(manyImages[i], manyOptions[i]);
+            require(serial->preparedPath().parent_path() == root / "serial-many",
+                    "serial reference preparation reused the concurrent cache");
+            require(mipLevels(serial->preparedPath()) == mipLevels(manyResults[0][i]->preparedPath()),
+                    "concurrently prepared texture differs from its serial preparation");
+        }
+        require(service->stats().coldPreparations - manyAfter.coldPreparations == manyCount,
+                "serial reference preparation was not cold");
+        for (auto &row : manyResults)
+            for (auto &item : row) item.reset();
         service.reset();
         setEnv("PRISM_DISK_CACHE_GB", "10");
         std::filesystem::remove_all(root);

@@ -23,6 +23,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #ifdef _WIN32
 #include <process.h>
@@ -363,6 +364,9 @@ struct TextureService::Impl {
     std::atomic<uint64_t> coldPreparations{0}, inspectNanoseconds{0}, decodeNanoseconds{0};
     std::atomic<uint64_t> pixelNanoseconds{0}, mipNanoseconds{0}, publishNanoseconds{0};
     std::atomic<uint64_t> trimNanoseconds{0}, lockWaitNanoseconds{0};
+    std::atomic<uint64_t> aheadRequests{0}, aheadPreparations{0}, aheadMemoryHits{0};
+    // Keys whose resource a prepareAhead call produced; guarded by mutex.
+    std::unordered_set<std::string> aheadKeys;
 };
 
 TextureResource::TextureResource(std::shared_ptr<Impl> impl) : m_impl(std::move(impl)) {}
@@ -407,6 +411,12 @@ std::shared_ptr<const TextureResource> TextureService::prepareTrusted(
     registerTrustedSource(source, fingerprint);
     const std::string token = trustedFingerprintToken(fingerprint);
     return prepareImpl(source, options, token);
+}
+
+std::shared_ptr<const TextureResource> TextureService::prepareAhead(
+    std::filesystem::path const &source, TexturePrepareOptions const &options)
+{
+    return prepareImpl(source, options, {}, true);
 }
 
 void TextureService::registerTrustedSource(std::filesystem::path const &source,
@@ -578,9 +588,10 @@ bool TextureService::invalidate(std::filesystem::path const &source,
 
 std::shared_ptr<const TextureResource> TextureService::prepareImpl(
     std::filesystem::path const &source, TexturePrepareOptions const &options,
-    std::string const &trustedFingerprint)
+    std::string const &trustedFingerprint, bool ahead)
 {
     m_impl->prepareCalls.fetch_add(1, std::memory_order_relaxed);
+    if (ahead) m_impl->aheadRequests.fetch_add(1, std::memory_order_relaxed);
     const auto preparationStart = std::chrono::steady_clock::now();
     struct Timer {
         std::atomic<uint64_t> &counter;
@@ -721,6 +732,8 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
             if (auto resource = found->second.lock(); resource &&
                 resource->preparedPath().parent_path() == cacheRoot()) {
                 m_impl->memoryCacheHits.fetch_add(1, std::memory_order_relaxed);
+                if (!ahead && m_impl->aheadKeys.contains(key))
+                    m_impl->aheadMemoryHits.fetch_add(1, std::memory_order_relaxed);
                 cachedResource = std::move(resource);
             }
     }
@@ -754,6 +767,8 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
             if (auto resource = found->second.lock(); resource &&
                 resource->preparedPath().parent_path() == cacheRoot()) {
                 m_impl->memoryCacheHits.fetch_add(1, std::memory_order_relaxed);
+                if (!ahead && m_impl->aheadKeys.contains(key))
+                    m_impl->aheadMemoryHits.fetch_add(1, std::memory_order_relaxed);
                 cachedResource = std::move(resource);
             }
     }
@@ -1037,6 +1052,12 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
     {
         std::lock_guard lock(m_impl->mutex);
         m_impl->resources[key] = resource;
+        if (ahead) {
+            m_impl->aheadKeys.insert(key);
+            m_impl->aheadPreparations.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            m_impl->aheadKeys.erase(key);
+        }
         if (!resourceSourceKey.empty()) {
             auto &sourceKeys = m_impl->sourcePreparedKeys[resourceSourceKey];
             if (std::find(sourceKeys.begin(), sourceKeys.end(), key) == sourceKeys.end())
@@ -1200,6 +1221,9 @@ TextureServiceStats TextureService::stats() const noexcept
     result.publishNanoseconds = m_impl->publishNanoseconds.load(std::memory_order_relaxed);
     result.trimNanoseconds = m_impl->trimNanoseconds.load(std::memory_order_relaxed);
     result.lockWaitNanoseconds = m_impl->lockWaitNanoseconds.load(std::memory_order_relaxed);
+    result.aheadRequests = m_impl->aheadRequests.load(std::memory_order_relaxed);
+    result.aheadPreparations = m_impl->aheadPreparations.load(std::memory_order_relaxed);
+    result.aheadMemoryHits = m_impl->aheadMemoryHits.load(std::memory_order_relaxed);
     return result;
 }
 

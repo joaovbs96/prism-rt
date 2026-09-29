@@ -1,6 +1,7 @@
 #include "../../src/hydra/materials.h"
 #include "../../src/mdl/context.h"
 #include "../../src/mdl_material.h"
+#include "../../src/texture_service.h"
 
 #include <pxr/base/gf/vec3f.h>
 #include <pxr/base/vt/value.h>
@@ -148,6 +149,42 @@ HdContainerDataSourceHandle MakeFoldingMaterial(const SdfPath& path,
     if (reference) surface.parameters[TfToken("thin_walled")]=VtValue(false);
     HdMaterialNetwork network;
     network.nodes={surface};
+    HdMaterialNetworkMap map; map.map[TfToken("surface")]=network;
+    HdContainerDataSourceHandle networkData=
+        HdUtils::ConvertHdMaterialNetworkToHdMaterialNetworkSchema(map);
+    HdDataSourceBaseHandle networkBase=networkData;
+    const TfToken context("mtlx");
+    auto material=HdMaterialSchema::BuildRetained(1,&context,&networkBase);
+    return HdRetainedContainerDataSource::New(HdMaterialSchemaTokens->material,material);
+}
+
+// A color image drives base_color and a float image drives metalness, a
+// structure no other case in this test uses. reference adds the authored
+// default thin_walled, making it a structure of its own.
+HdContainerDataSourceHandle MakeImageMetalMaterial(const SdfPath& path,
+    const std::string& colorFile, const std::string& metalFile, bool reference)
+{
+    HdMaterialNode color;
+    color.path=path.AppendChild(TfToken("ColorImage"));
+    color.identifier=TfToken("ND_image_color3");
+    color.parameters[TfToken("file")]=VtValue(SdfAssetPath(colorFile,colorFile));
+    HdMaterialNode metal;
+    metal.path=path.AppendChild(TfToken("MetalImage"));
+    metal.identifier=TfToken("ND_image_float");
+    metal.parameters[TfToken("file")]=VtValue(SdfAssetPath(metalFile,metalFile));
+    HdMaterialNode surface;
+    surface.path=path.AppendChild(TfToken("Surface"));
+    surface.identifier=TfToken("ND_standard_surface_surfaceshader");
+    if (reference) surface.parameters[TfToken("thin_walled")]=VtValue(false);
+    HdMaterialRelationship base;
+    base.inputId=color.path; base.inputName=TfToken("out");
+    base.outputId=surface.path; base.outputName=TfToken("base_color");
+    HdMaterialRelationship metalness;
+    metalness.inputId=metal.path; metalness.inputName=TfToken("out");
+    metalness.outputId=surface.path; metalness.outputName=TfToken("metalness");
+    HdMaterialNetwork network;
+    network.nodes={color,metal,surface};
+    network.relationships={base,metalness};
     HdMaterialNetworkMap map; map.map[TfToken("surface")]=network;
     HdContainerDataSourceHandle networkData=
         HdUtils::ConvertHdMaterialNetworkToHdMaterialNetworkSchema(map);
@@ -782,6 +819,114 @@ int main()
     }
     restoreMode();
     std::cout << "folded-value edits and rejected batches regrow one kept template\n";
+    // A batch's textures are prepared ahead of, and concurrently with, its
+    // compiles: a group of three and a single material using eight files.
+    // Each file is prepared exactly once and every compile finds it in memory.
+    // The same batch over byte-different, pixel-identical files with
+    // pre-preparation disabled must shade identically.
+    {
+        const auto prefetchRoot=std::filesystem::temp_directory_path()/
+            "prism_hydra_texture_prefetch";
+        std::filesystem::create_directories(prefetchRoot);
+        const char* prefetchColors[8]={"200 40 30","30 190 60","50 70 210","90 90 90",
+                                       "220 200 40","170 170 170","40 140 140","60 60 60"};
+        auto writePrefetchImages=[&](const std::string& prefix,const char* separator) {
+            std::vector<std::string> files;
+            for (int i=0;i<8;++i) {
+                const auto path=prefetchRoot/(prefix+std::to_string(i)+".ppm");
+                std::ofstream out(path,std::ios::binary|std::ios::trunc);
+                out << "P3\n1" << separator << "1\n255\n" << prefetchColors[i] << '\n';
+                files.push_back(path.string());
+            }
+            return files;
+        };
+        struct PrefetchBatch {
+            std::vector<HdContainerDataSourceHandle> sources;
+            std::vector<MaterialService::Request> requests;
+        };
+        auto makePrefetchBatch=[&](const std::string& prefix,const std::vector<std::string>& files) {
+            PrefetchBatch batch;
+            for (int m=0;m<4;++m) {
+                const SdfPath path("/Looks/"+prefix+(m<3 ? "Group"+std::to_string(m) : std::string("Single")));
+                batch.sources.push_back(MakeImageMetalMaterial(path,files[2*m],files[2*m+1],m==3));
+                batch.requests.push_back({batch.sources.back(),path});
+            }
+            return batch;
+        };
+        auto setPrefetchMode=[](const char* mode) {
+#ifdef _WIN32
+            _putenv_s("PRISM_TEXTURE_PREPARE",mode);
+#else
+            if (*mode) setenv("PRISM_TEXTURE_PREPARE",mode,1);
+            else unsetenv("PRISM_TEXTURE_PREPARE");
+#endif
+        };
+        const auto textures=prism::TextureService::Acquire();
+        const auto parallel=makePrefetchBatch("Prefetch",writePrefetchImages("prefetch_"," "));
+        setPrefetchMode("");
+        const auto parallelMaterialsBefore=service.GetStats();
+        const auto parallelBefore=textures->stats();
+        service.Prefetch(parallel.requests);
+        const auto parallelAfter=textures->stats();
+        const auto parallelMaterialsAfter=service.GetStats();
+        const auto parallelMaterials=resolveAll(parallel.requests);
+        const uint64_t laterCalls=(parallelAfter.prepareCalls-parallelBefore.prepareCalls)-
+            (parallelAfter.aheadRequests-parallelBefore.aheadRequests);
+        const uint64_t laterMemoryHits=parallelAfter.aheadMemoryHits-parallelBefore.aheadMemoryHits;
+        std::cout << "texture pre-preparation: ahead="
+                  << parallelAfter.aheadPreparations-parallelBefore.aheadPreparations
+                  << " cold=" << parallelAfter.coldPreparations-parallelBefore.coldPreparations
+                  << " later_calls=" << laterCalls
+                  << " later_memory_hits=" << laterMemoryHits << "\n";
+        if (parallelMaterialsAfter.failures!=parallelMaterialsBefore.failures ||
+            parallelAfter.aheadRequests-parallelBefore.aheadRequests!=8 ||
+            parallelAfter.aheadPreparations-parallelBefore.aheadPreparations!=8 ||
+            parallelAfter.coldPreparations-parallelBefore.coldPreparations!=8 ||
+            parallelAfter.diskCacheHits!=parallelBefore.diskCacheHits ||
+            laterCalls<8 || laterMemoryHits!=laterCalls ||
+            parallelAfter.memoryCacheHits-parallelBefore.memoryCacheHits!=laterCalls) {
+            std::cerr << "texture pre-preparation did not serve every compile from memory\n";
+            return 43;
+        }
+        // Start the reference from empty registries, so it converts and
+        // compiles like the batch above instead of binding its templates.
+        service.InvalidateAll();
+        const auto serial=makePrefetchBatch("SerialPrefetch",writePrefetchImages("serial_","  "));
+        setPrefetchMode("serial");
+        const auto serialMaterialsBefore=service.GetStats();
+        const auto serialBefore=textures->stats();
+        service.Prefetch(serial.requests);
+        const auto serialAfter=textures->stats();
+        const auto serialMaterialsAfter=service.GetStats();
+        setPrefetchMode("");
+        const auto serialMaterials=resolveAll(serial.requests);
+        if (serialMaterialsAfter.failures!=serialMaterialsBefore.failures ||
+            serialAfter.aheadRequests!=serialBefore.aheadRequests ||
+            serialAfter.coldPreparations-serialBefore.coldPreparations!=8 ||
+            serialMaterialsAfter.compilations-serialMaterialsBefore.compilations!=
+                parallelMaterialsAfter.compilations-parallelMaterialsBefore.compilations) {
+            std::cerr << "serial texture preparation reference did not run as expected\n";
+            return 44;
+        }
+        for (size_t i=0;i<parallelMaterials.size();++i) {
+            std::string detail;
+            if (!parallelMaterials[i] || !serialMaterials[i] ||
+                !parallelMaterials[i]->is_valid() || !serialMaterials[i]->is_valid() ||
+                !SameShading(*parallelMaterials[i],*serialMaterials[i],&detail)) {
+                std::cerr << "pre-prepared material " << i
+                          << " shades differently from serial preparation: " << detail << "\n";
+                return 45;
+            }
+            for (size_t j=i+1;j<parallelMaterials.size();++j)
+                if (evalDistance(parallelMaterials[i]->evaluate(multiHit,Float3(0.0f,1.0f,0.0f)),
+                                 parallelMaterials[j]->evaluate(multiHit,Float3(0.0f,1.0f,0.0f)))<1e-4f) {
+                    std::cerr << "pre-prepared materials did not keep their own textures\n";
+                    return 46;
+                }
+        }
+        std::error_code prefetchCleanup;
+        std::filesystem::remove_all(prefetchRoot,prefetchCleanup);
+    }
     service.InvalidateAll();
     std::error_code udimCleanup; std::filesystem::remove_all(udimRoot,udimCleanup);
     std::error_code multiCleanup; std::filesystem::remove_all(multiRoot,multiCleanup);

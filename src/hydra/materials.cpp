@@ -44,7 +44,10 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
+#include <tbb/task_arena.h>
+#include <tbb/task_group.h>
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -529,6 +532,149 @@ void FixPreviewSurfaceNormalOutput(const mx::DocumentPtr& doc)
         normal->setType("vector3");
     }
 }
+
+// PRISM_TEXTURE_PREPARE=serial leaves every texture to the compile of the
+// material that uses it; the default prepares a batch's textures ahead.
+bool ParallelTexturePreparation()
+{
+    const char* value = std::getenv("PRISM_TEXTURE_PREPARE");
+    const std::string mode = value ? value : "";
+    if (mode == "serial") return false;
+    if (!mode.empty() && mode != "parallel") {
+        static std::once_flag warned;
+        std::call_once(warned, [] {
+            std::cerr << "PrismRT: PRISM_TEXTURE_PREPARE must be parallel or serial; using parallel\n";
+        });
+    }
+    return true;
+}
+
+// One texture file as ResolveTextureAssets materializes it, owned so that
+// worker threads never touch a captured graph or a Hydra data source.
+struct TextureWork {
+    std::string authored, preResolved;
+    ArResolverContext resolverContext;
+    std::string sourceVersion, extension;
+};
+
+void CollectTextureWork(const NetworkSnapshot& network,
+                        const ArResolverContext& resolverContext,
+                        const std::string& sourceVersion,
+                        std::unordered_set<std::string>* seen,
+                        std::vector<TextureWork>* result)
+{
+    for (const auto& node : network.nodes) {
+        for (const auto& parameter : node.parameters) {
+            if (parameter.name != TfToken("file") && parameter.name != TfToken("filename"))
+                continue;
+            // Conversion drops a value whose input is connected.
+            if (std::any_of(node.connections.begin(), node.connections.end(),
+                    [&](const auto& connection) {
+                        return connection.input == parameter.name &&
+                            !connection.connections.empty();
+                    })) continue;
+            TextureWork work;
+            const VtValue& value = parameter.data.value;
+            if (value.IsHolding<SdfAssetPath>()) {
+                work.authored = value.UncheckedGet<SdfAssetPath>().GetAssetPath();
+                work.preResolved = value.UncheckedGet<SdfAssetPath>().GetResolvedPath();
+            } else if (value.IsHolding<std::string>()) {
+                work.authored = value.UncheckedGet<std::string>();
+            }
+            // UDIM families are materialized tile by tile elsewhere.
+            if (work.authored.empty() ||
+                work.authored.find("<UDIM>") != std::string::npos ||
+                work.preResolved.find("<UDIM>") != std::string::npos) continue;
+            work.extension = std::filesystem::path(work.authored).extension().string();
+            if (work.extension.empty()) work.extension = ".bin";
+            work.resolverContext = resolverContext;
+            work.sourceVersion = sourceVersion;
+            const std::string identity = work.authored + "\n" + work.preResolved + "\n" +
+                resolverContext.GetDebugString() + "\n" + sourceVersion + "\n" + work.extension;
+            if (seen->insert(identity).second) result->push_back(std::move(work));
+        }
+    }
+}
+
+// Prepares the union of a batch's textures on a bounded TBB arena while the
+// batch converts and compiles, requesting exactly what the MDL texture
+// runtime will, so its calls find them in memory or wait on the service's
+// single-flight gate. It is only an optimization: failures are dropped and
+// the runtime prepares, and reports, on its own.
+class TexturePrefetch {
+public:
+    TexturePrefetch(std::vector<TextureWork> work, std::filesystem::path cacheDir,
+                    std::function<bool()> cancelled, std::atomic<uint64_t>* bytesRead)
+        : m_work(std::move(work)), m_cacheDir(std::move(cacheDir)),
+          m_cancelled(std::move(cancelled)), m_bytesRead(bytesRead),
+          m_results(m_work.size()),
+          // No slot is reserved for the calling thread: it goes on to
+          // convert and compile while the arena's workers prepare.
+          m_arena(static_cast<int>(std::min<size_t>(
+              prism::TexturePreparationThreadCount(), m_work.size())), 0)
+    {
+        m_arena.execute([this] {
+            for (int i = 0; i < m_arena.max_concurrency(); ++i)
+                m_group.run([this] { Run(); });
+        });
+    }
+    // Preparation jobs must finish before Prefetch returns; the MDL SDK and
+    // the texture service may be torn down right after it.
+    ~TexturePrefetch() { m_arena.execute([this] { m_group.wait(); }); }
+    TexturePrefetch(const TexturePrefetch&) = delete;
+    TexturePrefetch& operator=(const TexturePrefetch&) = delete;
+
+private:
+    struct Result {
+        std::shared_ptr<const prism::materialx::ResolvedMaterialResource> source;
+        // The service indexes resources weakly; holding them until the batch
+        // ends is what lets the compiles find them in memory.
+        std::shared_ptr<const prism::TextureResource> texture;
+    };
+    void Run()
+    {
+        for (;;) {
+            if (m_cancelled && m_cancelled()) return;
+            const size_t index = m_next.fetch_add(1);
+            if (index >= m_work.size()) return;
+            try { m_results[index] = Prepare(m_work[index]); }
+            catch (...) {}
+        }
+    }
+    Result Prepare(const TextureWork& work)
+    {
+        Result result;
+        ArResolverContextBinder binder(work.resolverContext);
+        const ArResolvedPath resolved = !work.preResolved.empty()
+            ? ArResolvedPath(work.preResolved) : ArGetResolver().Resolve(work.authored);
+        if (resolved.empty()) return result;
+        // The same single-flight registry ResolveTextureAssets and template
+        // binding use; whichever thread comes first reads, hashes and copies.
+        auto materialized = prism::materialx::PrepareMaterialResource(resolved,
+            work.resolverContext, work.sourceVersion, m_cacheDir, work.extension);
+        *m_bytesRead += materialized.bytesRead;
+        result.source = std::move(materialized.resource);
+        if (!result.source) return result;
+        // NativeTextureRuntime::prepareImage requests the texture's effective
+        // gamma with unassociated alpha. MaterialX-generated MDL declares every
+        // file texture tex::gamma_linear, and template binding creates textures
+        // with gamma 1, so the effective gamma is always 1.
+        prism::TexturePrepareOptions options;
+        options.unassociateAlpha = true;
+        result.texture = prism::TextureService::Acquire()->prepareAhead(
+            result.source->path, options);
+        return result;
+    }
+
+    std::vector<TextureWork> m_work;
+    std::filesystem::path m_cacheDir;
+    std::function<bool()> m_cancelled;
+    std::atomic<uint64_t>* m_bytesRead;
+    std::vector<Result> m_results;
+    std::atomic<size_t> m_next{0};
+    tbb::task_arena m_arena;
+    tbb::task_group m_group;
+};
 
 
 } // namespace
@@ -1273,6 +1419,21 @@ void MaterialService::Prefetch(const std::vector<Request>& requests,
         captured.push_back(m_impl->Prepare(
             request.dataSource, request.path, true, true));
     }
+    // Every texture of the batch is known now, long before the compile of
+    // the material that needs it. Declared after captured so that an early
+    // return waits for the preparations first.
+    std::unique_ptr<TexturePrefetch> texturePrefetch;
+    if (ParallelTexturePreparation()) {
+        std::vector<TextureWork> work;
+        std::unordered_set<std::string> seenTextures;
+        for (const auto& item : captured)
+            if (!item.cached)
+                CollectTextureWork(item.network, item.resolverContext,
+                    std::to_string(item.resourceRevision), &seenTextures, &work);
+        if (!work.empty())
+            texturePrefetch = std::make_unique<TexturePrefetch>(
+                std::move(work), m_impl->cacheDir, cancelled, &m_impl->textureBytes);
+    }
     struct Group { NetworkSnapshot structure; std::vector<size_t> indices; };
     std::vector<Group> groups;
     std::vector<bool> grouped(unique.size(), false);
@@ -1491,6 +1652,7 @@ void MaterialService::Prefetch(const std::vector<Request>& requests,
             rebound[i].source, rebound[i].path, false)));
     }
     if (!lastResort.empty()) compileInPool(lastResort, nullptr, nullptr, nullptr);
+    texturePrefetch.reset();
     m_impl->batchWallNanoseconds += std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now() - batchStart).count();
 }

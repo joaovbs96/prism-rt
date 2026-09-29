@@ -79,6 +79,11 @@ struct TextureServiceStats {
     uint64_t publishNanoseconds = 0;
     uint64_t trimNanoseconds = 0;
     uint64_t lockWaitNanoseconds = 0;
+    // prepareAhead calls, those that produced the resource (cold or from
+    // disk), and later ordinary calls served from memory by such a resource.
+    uint64_t aheadRequests = 0;
+    uint64_t aheadPreparations = 0;
+    uint64_t aheadMemoryHits = 0;
 };
 
 class TextureResource final {
@@ -110,6 +115,11 @@ public:
     std::shared_ptr<const TextureResource> prepareTrusted(
         std::filesystem::path const &source,
         TrustedTextureFingerprint const &fingerprint,
+        TexturePrepareOptions const &options = {});
+    // prepare() on behalf of a caller that expects the same request shortly,
+    // such as material compilation. Only the statistics differ.
+    std::shared_ptr<const TextureResource> prepareAhead(
+        std::filesystem::path const &source,
         TexturePrepareOptions const &options = {});
     // Register a digest for renderer-owned immutable materialized files so
     // later preparation can skip rereading their bytes for each interpretation.
@@ -148,7 +158,7 @@ private:
     std::shared_ptr<const TextureResource> prepareImpl(
         std::filesystem::path const &source,
         TexturePrepareOptions const &options,
-        std::string const &trustedFingerprint);
+        std::string const &trustedFingerprint, bool ahead = false);
     std::unique_ptr<Impl> m_impl;
 };
 
