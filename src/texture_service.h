@@ -69,6 +69,16 @@ struct TextureServiceStats {
     uint64_t sourceWaitNanoseconds = 0;
     uint64_t contentWaitNanoseconds = 0;
     uint64_t preparationNanoseconds = 0;
+    // Stage times summed over all preparations. Lock waits are counted only
+    // in lockWaitNanoseconds, never in the stage that acquired the lock.
+    uint64_t coldPreparations = 0;
+    uint64_t inspectNanoseconds = 0;
+    uint64_t decodeNanoseconds = 0;
+    uint64_t pixelNanoseconds = 0;
+    uint64_t mipNanoseconds = 0;
+    uint64_t publishNanoseconds = 0;
+    uint64_t trimNanoseconds = 0;
+    uint64_t lockWaitNanoseconds = 0;
 };
 
 class TextureResource final {

@@ -44,6 +44,12 @@ std::mutex singletonMutex;
 std::weak_ptr<TextureService> singleton;
 std::atomic<uint64_t> texturePinSerial{0};
 
+uint64_t elapsedNanoseconds(std::chrono::steady_clock::time_point start)
+{
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - start).count());
+}
+
 struct ImageCacheGuard {
     std::shared_ptr<OIIO::ImageCache> &cache;
     ~ImageCacheGuard() { if (cache) OIIO::ImageCache::destroy(cache); }
@@ -345,6 +351,9 @@ struct TextureService::Impl {
     std::atomic<uint64_t> prepareCalls{0}, memoryCacheHits{0}, diskCacheHits{0};
     std::atomic<uint64_t> resourceHashCalls{0}, sourceBytesHashed{0}, sourceWaitNanoseconds{0};
     std::atomic<uint64_t> contentWaitNanoseconds{0}, preparationNanoseconds{0};
+    std::atomic<uint64_t> coldPreparations{0}, inspectNanoseconds{0}, decodeNanoseconds{0};
+    std::atomic<uint64_t> pixelNanoseconds{0}, mipNanoseconds{0}, publishNanoseconds{0};
+    std::atomic<uint64_t> trimNanoseconds{0}, lockWaitNanoseconds{0};
 };
 
 TextureResource::TextureResource(std::shared_ptr<Impl> impl) : m_impl(std::move(impl)) {}
@@ -585,7 +594,10 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
         if (!slot) slot = std::make_shared<std::mutex>();
         sourceGate = slot;
     }
+    const auto sourceGateStart = std::chrono::steady_clock::now();
     std::lock_guard sourceLock(*sourceGate);
+    m_impl->lockWaitNanoseconds.fetch_add(elapsedNanoseconds(sourceGateStart),
+                                          std::memory_order_relaxed);
     uint64_t generation = 0;
     { std::lock_guard lock(m_impl->mutex); generation = m_impl->generations[pathKey]; }
     const std::string stamp = sourceStamp(absolute, options, generation);
@@ -610,9 +622,9 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
         if (fingerprintGate) {
             const auto sourceWaitStart = std::chrono::steady_clock::now();
             std::lock_guard fingerprintLock(*fingerprintGate);
-            m_impl->sourceWaitNanoseconds.fetch_add(static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::steady_clock::now() - sourceWaitStart).count()), std::memory_order_relaxed);
+            const uint64_t fingerprintWait = elapsedNanoseconds(sourceWaitStart);
+            m_impl->sourceWaitNanoseconds.fetch_add(fingerprintWait, std::memory_order_relaxed);
+            m_impl->lockWaitNanoseconds.fetch_add(fingerprintWait, std::memory_order_relaxed);
             {
                 std::lock_guard lock(m_impl->mutex);
                 if (auto it = m_impl->sourceFingerprints.find(rawStamp); it != m_impl->sourceFingerprints.end())
@@ -671,7 +683,10 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
         aliasImpl->handle = cached->m_impl->handle;
         aliasImpl->version = {absolute.generic_string(), stamp, rawFingerprint, generation};
         const auto preparedRoot = aliasImpl->prepared.parent_path();
+        const auto pinWaitStart = std::chrono::steady_clock::now();
         CrossProcessCacheLock pinLock(preparedRoot);
+        m_impl->lockWaitNanoseconds.fetch_add(elapsedNanoseconds(pinWaitStart),
+                                              std::memory_order_relaxed);
         aliasImpl->pinPath = preparedRoot / (key + ".pin." + std::to_string(processId()) + "." +
                                               std::to_string(++texturePinSerial));
         {
@@ -721,9 +736,9 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
         });
     const auto contentWaitStart = std::chrono::steady_clock::now();
     std::lock_guard preparation(*gate);
-    m_impl->contentWaitNanoseconds.fetch_add(static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now() - contentWaitStart).count()), std::memory_order_relaxed);
+    const uint64_t contentWait = elapsedNanoseconds(contentWaitStart);
+    m_impl->contentWaitNanoseconds.fetch_add(contentWait, std::memory_order_relaxed);
+    m_impl->lockWaitNanoseconds.fetch_add(contentWait, std::memory_order_relaxed);
     {
         std::lock_guard lock(m_impl->mutex);
         if (auto found = m_impl->resources.find(key); found != m_impl->resources.end())
@@ -737,12 +752,16 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
 
     const auto root = cacheRoot();
     std::filesystem::create_directories(root);
+    auto lockWaitStart = std::chrono::steady_clock::now();
     CrossProcessCacheLock processLock(root, key);
     const auto tx = root / (key + ".tx");
     auto publicationLock = std::make_unique<CrossProcessCacheLock>(root);
+    m_impl->lockWaitNanoseconds.fetch_add(elapsedNanoseconds(lockWaitStart),
+                                          std::memory_order_relaxed);
     const bool cacheFilePresent = std::filesystem::exists(tx);
     if (cacheFilePresent) m_impl->diskCacheHits.fetch_add(1, std::memory_order_relaxed);
     else publicationLock.reset();
+    auto stageStart = std::chrono::steady_clock::now();
     auto sourceInput = OIIO::ImageInput::open(absolute.string());
     // Kept alive until the end of preparation; readers below borrow it.
     std::vector<unsigned char> strippedJpeg;
@@ -762,11 +781,13 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
     const OIIO::ImageSpec spec = sourceInput->spec();
     const std::string sourceInputFormat = sourceInput->format_name();
     sourceInput->close();
+    m_impl->inspectNanoseconds.fetch_add(elapsedNanoseconds(stageStart), std::memory_order_relaxed);
     if (options.firstChannel >= spec.nchannels)
         throw std::invalid_argument("texture channel range is outside source image");
     if (options.alphaChannel >= spec.nchannels)
         throw std::invalid_argument("texture alpha channel is outside source image");
     if (!cacheFilePresent) {
+        stageStart = std::chrono::steady_clock::now();
         std::vector<float> sourcePixels(static_cast<size_t>(spec.width) * spec.height * spec.nchannels);
         auto decodeCache = OIIO::ImageCache::create(false);
         if (!decodeCache)
@@ -804,6 +825,8 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
                 throw std::runtime_error("cannot decode texture pixels: " + error);
             }
         }
+        m_impl->decodeNanoseconds.fetch_add(elapsedNanoseconds(stageStart), std::memory_order_relaxed);
+        stageStart = std::chrono::steady_clock::now();
         const int displayWidth = spec.full_width > 0 ? spec.full_width : spec.width;
         const int displayHeight = spec.full_height > 0 ? spec.full_height : spec.height;
         const int outChannels = options.channelCount ? options.channelCount
@@ -877,6 +900,8 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
         if (!normalized.set_pixels(OIIO::ROI(0, displayWidth, 0, displayHeight, 0, 1, 0, outChannels),
                                    OIIO::TypeDesc::FLOAT, outputPixels.data()))
             throw std::runtime_error("cannot normalize texture channels: " + normalized.geterror());
+        m_impl->pixelNanoseconds.fetch_add(elapsedNanoseconds(stageStart), std::memory_order_relaxed);
+        stageStart = std::chrono::steady_clock::now();
         static std::atomic<uint64_t> serial{0};
         const auto temp = root / (key + "." + std::to_string(processId()) + "." +
                                   std::to_string(++serial) + ".tmp.tx");
@@ -905,8 +930,13 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
             std::filesystem::remove(temp);
             throw std::runtime_error("cannot prepare texture " + absolute.string() + ": " + OIIO::geterror());
         }
+        m_impl->mipNanoseconds.fetch_add(elapsedNanoseconds(stageStart), std::memory_order_relaxed);
         std::error_code ec;
+        lockWaitStart = std::chrono::steady_clock::now();
         publicationLock = std::make_unique<CrossProcessCacheLock>(root);
+        m_impl->lockWaitNanoseconds.fetch_add(elapsedNanoseconds(lockWaitStart),
+                                              std::memory_order_relaxed);
+        stageStart = std::chrono::steady_clock::now();
         std::filesystem::rename(temp, tx, ec);
         if (ec) {
             if (!std::filesystem::exists(tx)) {
@@ -915,6 +945,8 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
             }
             std::filesystem::remove(temp, ec);
         }
+    } else {
+        stageStart = std::chrono::steady_clock::now();
     }
     auto preparedInput = OIIO::ImageInput::open(tx.string());
     if (!preparedInput)
@@ -951,11 +983,14 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
     publicationLock.reset();
     std::error_code accessError;
     std::filesystem::last_write_time(tx, std::filesystem::file_time_type::clock::now(), accessError);
+    m_impl->publishNanoseconds.fetch_add(elapsedNanoseconds(stageStart), std::memory_order_relaxed);
+    if (!cacheFilePresent) m_impl->coldPreparations.fetch_add(1, std::memory_order_relaxed);
     const std::string resourceSourceKey = impl->source.generic_string();
     auto resource = std::shared_ptr<const TextureResource>(new TextureResource(std::move(impl)));
     std::unordered_map<std::string, bool> pinned;
     {
         std::lock_guard lock(m_impl->mutex);
+        stageStart = std::chrono::steady_clock::now();
         m_impl->resources[key] = resource;
         if (!resourceSourceKey.empty()) {
             auto &sourceKeys = m_impl->sourcePreparedKeys[resourceSourceKey];
@@ -967,8 +1002,13 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
             (void)resourceKey;
             if (auto live = weak.lock()) pinned.emplace(live->preparedPath().filename().string(), true);
         }
+        lockWaitStart = std::chrono::steady_clock::now();
         CrossProcessCacheLock trimLock(root);
+        const uint64_t trimLockWait = elapsedNanoseconds(lockWaitStart);
+        m_impl->lockWaitNanoseconds.fetch_add(trimLockWait, std::memory_order_relaxed);
         trimDiskCache(root, diskBudgetGB(), pinned, m_impl->system.get());
+        m_impl->trimNanoseconds.fetch_add(elapsedNanoseconds(stageStart) - trimLockWait,
+                                          std::memory_order_relaxed);
     }
     return resource;
 }
@@ -1075,14 +1115,24 @@ OIIO::TextureSystem *TextureService::textureSystem() const noexcept { return m_i
 
 TextureServiceStats TextureService::stats() const noexcept
 {
-    return {m_impl->prepareCalls.load(std::memory_order_relaxed),
-            m_impl->memoryCacheHits.load(std::memory_order_relaxed),
-            m_impl->diskCacheHits.load(std::memory_order_relaxed),
-            m_impl->resourceHashCalls.load(std::memory_order_relaxed),
-            m_impl->sourceBytesHashed.load(std::memory_order_relaxed),
-            m_impl->sourceWaitNanoseconds.load(std::memory_order_relaxed),
-            m_impl->contentWaitNanoseconds.load(std::memory_order_relaxed),
-            m_impl->preparationNanoseconds.load(std::memory_order_relaxed)};
+    TextureServiceStats result;
+    result.prepareCalls = m_impl->prepareCalls.load(std::memory_order_relaxed);
+    result.memoryCacheHits = m_impl->memoryCacheHits.load(std::memory_order_relaxed);
+    result.diskCacheHits = m_impl->diskCacheHits.load(std::memory_order_relaxed);
+    result.resourceHashCalls = m_impl->resourceHashCalls.load(std::memory_order_relaxed);
+    result.sourceBytesHashed = m_impl->sourceBytesHashed.load(std::memory_order_relaxed);
+    result.sourceWaitNanoseconds = m_impl->sourceWaitNanoseconds.load(std::memory_order_relaxed);
+    result.contentWaitNanoseconds = m_impl->contentWaitNanoseconds.load(std::memory_order_relaxed);
+    result.preparationNanoseconds = m_impl->preparationNanoseconds.load(std::memory_order_relaxed);
+    result.coldPreparations = m_impl->coldPreparations.load(std::memory_order_relaxed);
+    result.inspectNanoseconds = m_impl->inspectNanoseconds.load(std::memory_order_relaxed);
+    result.decodeNanoseconds = m_impl->decodeNanoseconds.load(std::memory_order_relaxed);
+    result.pixelNanoseconds = m_impl->pixelNanoseconds.load(std::memory_order_relaxed);
+    result.mipNanoseconds = m_impl->mipNanoseconds.load(std::memory_order_relaxed);
+    result.publishNanoseconds = m_impl->publishNanoseconds.load(std::memory_order_relaxed);
+    result.trimNanoseconds = m_impl->trimNanoseconds.load(std::memory_order_relaxed);
+    result.lockWaitNanoseconds = m_impl->lockWaitNanoseconds.load(std::memory_order_relaxed);
+    return result;
 }
 
 std::string TextureService::textureStatistics() const

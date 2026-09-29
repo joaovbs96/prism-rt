@@ -4106,6 +4106,16 @@ VtDictionary SceneBridge::GetStats() const
     result["processTextureHashCalls"] = VtValue(static_cast<int64_t>(textureStats.resourceHashCalls));
     result["processTextureSourceWaitSeconds"] = VtValue(textureStats.sourceWaitNanoseconds / 1.0e9);
     result["processTextureContentWaitSeconds"] = VtValue(textureStats.contentWaitNanoseconds / 1.0e9);
+    result["processTextureColdPreparations"] = VtValue(static_cast<int64_t>(textureStats.coldPreparations));
+    result["processTextureDiskHits"] = VtValue(static_cast<int64_t>(textureStats.diskCacheHits));
+    result["processTextureMemoryHits"] = VtValue(static_cast<int64_t>(textureStats.memoryCacheHits));
+    result["processTextureInspectSeconds"] = VtValue(textureStats.inspectNanoseconds / 1.0e9);
+    result["processTextureDecodeSeconds"] = VtValue(textureStats.decodeNanoseconds / 1.0e9);
+    result["processTexturePixelSeconds"] = VtValue(textureStats.pixelNanoseconds / 1.0e9);
+    result["processTextureMipSeconds"] = VtValue(textureStats.mipNanoseconds / 1.0e9);
+    result["processTexturePublishSeconds"] = VtValue(textureStats.publishNanoseconds / 1.0e9);
+    result["processTextureTrimSeconds"] = VtValue(textureStats.trimNanoseconds / 1.0e9);
+    result["processTextureLockWaitSeconds"] = VtValue(textureStats.lockWaitNanoseconds / 1.0e9);
     const auto resourceStats = prism::materialx::GetResolvedMaterialResourceStats();
     result["processMaterialResourceReadCalls"] = VtValue(static_cast<int64_t>(resourceStats.sourceReadCalls));
     result["processMaterialResourceHashCalls"] = VtValue(static_cast<int64_t>(resourceStats.sourceHashCalls));

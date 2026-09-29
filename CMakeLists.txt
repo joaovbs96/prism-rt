@@ -277,6 +277,8 @@ if(PRISM_BUILD_HYDRA)
         ENVIRONMENT "${_prism_test_environment}")
     add_executable(prism_texture_cache_benchmark tests/texture_cache_benchmark.cpp)
     target_link_libraries(prism_texture_cache_benchmark PRIVATE PrismRT::core)
+    add_executable(prism_texture_digest tests/texture_digest.cpp)
+    target_link_libraries(prism_texture_digest PRIVATE PrismRT::core)
 
     add_executable(prism_ray_footprint_test tests/ray_footprint.cpp)
     target_link_libraries(prism_ray_footprint_test PRIVATE PrismRT::core)
