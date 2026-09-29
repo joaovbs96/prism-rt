@@ -5,6 +5,7 @@
 #include <OpenImageIO/imagebufalgo.h>
 #include <OpenImageIO/imagecache.h>
 #include <OpenImageIO/hash.h>
+#include <OpenImageIO/filesystem.h>
 
 #include <algorithm>
 #include <array>
@@ -47,6 +48,37 @@ struct ImageCacheGuard {
     std::shared_ptr<OIIO::ImageCache> &cache;
     ~ImageCacheGuard() { if (cache) OIIO::ImageCache::destroy(cache); }
 };
+
+// OIIO rejects JPEGs whose first Photoshop resource is not IPTC ("Corrupted
+// IPTC data"), although the image data is fine. Returns the file with every
+// APP13 segment removed, or empty if it is not a JPEG, has none, or is malformed.
+std::vector<unsigned char> jpegWithoutApp13(std::filesystem::path const &path)
+{
+    std::ifstream in(path, std::ios::binary);
+    const std::vector<unsigned char> data{std::istreambuf_iterator<char>(in),
+                                          std::istreambuf_iterator<char>()};
+    if (data.size() < 4 || data[0] != 0xFF || data[1] != 0xD8) return {};
+    std::vector<unsigned char> out(data.begin(), data.begin() + 2);
+    bool removed = false;
+    size_t pos = 2;
+    while (pos < data.size()) {
+        if (pos + 4 > data.size() || data[pos] != 0xFF) return {};
+        const unsigned char marker = data[pos + 1];
+        if (marker == 0xFF) return {};
+        const size_t length = (static_cast<size_t>(data[pos + 2]) << 8) | data[pos + 3];
+        if (length < 2 || pos + 2 + length > data.size()) return {};
+        const size_t end = pos + 2 + length;
+        if (marker == 0xED) removed = true;
+        else out.insert(out.end(), data.begin() + pos, data.begin() + end);
+        pos = end;
+        if (marker == 0xDA) {
+            // Entropy-coded data follows the scan header; copy it verbatim.
+            out.insert(out.end(), data.begin() + pos, data.end());
+            return removed ? out : std::vector<unsigned char>{};
+        }
+    }
+    return {};
+}
 
 std::filesystem::path cacheRoot()
 {
@@ -712,8 +744,21 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
     if (cacheFilePresent) m_impl->diskCacheHits.fetch_add(1, std::memory_order_relaxed);
     else publicationLock.reset();
     auto sourceInput = OIIO::ImageInput::open(absolute.string());
-    if (!sourceInput)
-        throw std::runtime_error("cannot inspect texture " + absolute.string() + ": " + OIIO::geterror());
+    // Kept alive until the end of preparation; readers below borrow it.
+    std::vector<unsigned char> strippedJpeg;
+    std::unique_ptr<OIIO::Filesystem::IOMemReader> strippedReader;
+    if (!sourceInput) {
+        const std::string inspectError = OIIO::geterror();
+        strippedJpeg = jpegWithoutApp13(absolute);
+        if (!strippedJpeg.empty()) {
+            strippedReader = std::make_unique<OIIO::Filesystem::IOMemReader>(
+                strippedJpeg.data(), strippedJpeg.size());
+            sourceInput = OIIO::ImageInput::open(absolute.string(), nullptr, strippedReader.get());
+            if (!sourceInput) (void)OIIO::geterror();
+        }
+        if (!sourceInput)
+            throw std::runtime_error("cannot inspect texture " + absolute.string() + ": " + inspectError);
+    }
     const OIIO::ImageSpec spec = sourceInput->spec();
     const std::string sourceInputFormat = sourceInput->format_name();
     sourceInput->close();
@@ -729,7 +774,24 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
         ImageCacheGuard decodeCacheGuard{decodeCache};
         if (options.unassociateAlpha && !decodeCache->attribute("unassociatedalpha", 1))
             throw std::runtime_error("cannot request unassociated-alpha decoding");
-        {
+        if (strippedReader) {
+            // The image cache cannot read from memory, so decode directly.
+            OIIO::ImageSpec config;
+            if (options.unassociateAlpha) config.attribute("oiio:UnassociatedAlpha", 1);
+            // With a config, the reader takes its proxy from this hint.
+            OIIO::Filesystem::IOProxy *proxy = strippedReader.get();
+            config.attribute("oiio:ioproxy", OIIO::TypeDesc::PTR, &proxy);
+            strippedReader->seek(0);
+            auto memoryInput = OIIO::ImageInput::open(absolute.string(), &config, strippedReader.get());
+            if (!memoryInput)
+                throw std::runtime_error("cannot read texture " + absolute.string() + ": " + OIIO::geterror());
+            if (!memoryInput->read_image(0, 0, 0, spec.nchannels, OIIO::TypeDesc::FLOAT,
+                                         sourcePixels.data())) {
+                const std::string error = memoryInput->geterror();
+                throw std::runtime_error("cannot decode texture pixels: " + error);
+            }
+            memoryInput->close();
+        } else {
             OIIO::ImageBuf input(absolute.string(), 0, 0, decodeCache);
             if (!input.read(0, 0, true, OIIO::TypeDesc::FLOAT)) {
                 const std::string error = input.geterror();

@@ -1,6 +1,7 @@
 #include "../src/texture_service.h"
 
 #include <OpenImageIO/imagebuf.h>
+#include <OpenImageIO/imageio.h>
 
 #include <array>
 #include <atomic>
@@ -494,6 +495,66 @@ int main()
         require(reloaded->preparedPath() == reloadedPath && std::filesystem::exists(reloadedPath),
                 "evicted texture was not prepared again on reload");
         reloaded.reset();
+
+        // OIIO refuses JPEGs whose first APP13 resource is not IPTC; the
+        // service must still prepare them from a copy without that segment.
+        setEnv("PRISM_CACHE_DIR", (root / "jpeg-app13-cache").string());
+        setEnv("PRISM_DISK_CACHE_GB", "10");
+        OIIO::ImageSpec jpegSpec(8, 8, 3, OIIO::TypeDesc::UINT8);
+        OIIO::ImageBuf jpegImage(jpegSpec);
+        std::array<unsigned char, 8 * 8 * 3> jpegPixels{};
+        for (int y = 0; y < 8; ++y)
+            for (int x = 0; x < 8; ++x) {
+                jpegPixels[(y * 8 + x) * 3 + 0] = static_cast<unsigned char>(x * 32);
+                jpegPixels[(y * 8 + x) * 3 + 1] = static_cast<unsigned char>(y * 32);
+                jpegPixels[(y * 8 + x) * 3 + 2] = static_cast<unsigned char>((x + y) * 16);
+            }
+        require(jpegImage.set_pixels(OIIO::ROI(0, 8, 0, 8, 0, 1, 0, 3),
+                                     OIIO::TypeDesc::UINT8, jpegPixels.data()),
+                "cannot create JPEG fixture");
+        const auto cleanJpeg = root / "clean.jpg";
+        require(jpegImage.write(cleanJpeg.string()), "cannot write JPEG fixture");
+        auto jpegBytes = bytes(cleanJpeg);
+        require(jpegBytes.size() > 4 && static_cast<unsigned char>(jpegBytes[0]) == 0xFF &&
+                static_cast<unsigned char>(jpegBytes[1]) == 0xD8,
+                "JPEG fixture has no start-of-image marker");
+        size_t insertAt = 2;
+        if (static_cast<unsigned char>(jpegBytes[2]) == 0xFF &&
+            static_cast<unsigned char>(jpegBytes[3]) == 0xE0)
+            insertAt = 4 + ((static_cast<unsigned char>(jpegBytes[4]) << 8) |
+                            static_cast<unsigned char>(jpegBytes[5]));
+        const std::array<unsigned char, 46> app13{
+            0xFF, 0xED, 0x00, 0x2C,
+            0x50, 0x68, 0x6f, 0x74, 0x6f, 0x73, 0x68, 0x6f, 0x70, 0x20, 0x33, 0x2e, 0x30, 0x00,
+            0x38, 0x42, 0x49, 0x4d, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10,
+            0xd4, 0x1d, 0x8c, 0xd9, 0x8f, 0x00, 0xb2, 0x04, 0xe9, 0x80, 0x09, 0x98, 0xec, 0xf8,
+            0x42, 0x7e};
+        auto app13Bytes = jpegBytes;
+        app13Bytes.insert(app13Bytes.begin() + insertAt,
+                          reinterpret_cast<char const *>(app13.data()),
+                          reinterpret_cast<char const *>(app13.data()) + app13.size());
+        const auto app13Jpeg = root / "app13.jpg";
+        {
+            std::ofstream out(app13Jpeg, std::ios::binary);
+            out.write(app13Bytes.data(), static_cast<std::streamsize>(app13Bytes.size()));
+        }
+        require(!OIIO::ImageInput::open(app13Jpeg.string()),
+                "OIIO unexpectedly accepts the APP13 JPEG; the fallback is no longer needed");
+        (void)OIIO::geterror();
+        auto cleanPrepared = service->prepare(cleanJpeg);
+        auto app13Prepared = service->prepare(app13Jpeg);
+        require(app13Prepared->width() == cleanPrepared->width() &&
+                app13Prepared->height() == cleanPrepared->height() &&
+                app13Prepared->channels() == cleanPrepared->channels() &&
+                app13Prepared->width() == 8 && app13Prepared->channels() == 3,
+                "APP13 JPEG prepared with different dimensions or channels");
+        std::array<float, 8 * 8 * 3> cleanValues{}, app13Values{};
+        require(service->readPixels(*cleanPrepared, 0, 0, 8, 8, 0, 3, cleanValues.data()) &&
+                service->readPixels(*app13Prepared, 0, 0, 8, 8, 0, 3, app13Values.data()),
+                "cannot read prepared JPEG pixels");
+        require(cleanValues == app13Values, "APP13 JPEG pixels differ from the clean JPEG");
+        cleanPrepared.reset();
+        app13Prepared.reset();
         service.reset();
         setEnv("PRISM_DISK_CACHE_GB", "10");
         std::filesystem::remove_all(root);
