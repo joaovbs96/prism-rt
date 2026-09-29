@@ -948,8 +948,11 @@ public:
         return result;
     }
 
+    // needsFallback: a template bind was rejected. grownKeepSet: when folded
+    // values caused that, the template's kept values plus the differing ones.
     std::shared_ptr<Material> Compile(Prepared const& prepared,
-                                      bool* needsFallback = nullptr)
+                                      bool* needsFallback = nullptr,
+                                      std::vector<TemplateValueKey>* grownKeepSet = nullptr)
     {
         if (!prepared.valid) return nullptr;
         if (prepared.cached) {
@@ -997,6 +1000,14 @@ public:
                 std::cerr << "[MaterialTemplate] binding rejected "
                           << prepared.path << ": " << bound.error << "\n";
             if (needsFallback) *needsFallback = true;
+            if (grownKeepSet && !bound.differingValues.empty()) {
+                // Keeping what this material changed as arguments lets the
+                // next edit of the same value bind instead of compiling.
+                *grownKeepSet = bound.differingValues;
+                for (const auto& binding : prepared.templateBindings)
+                    if (!binding.folded)
+                        grownKeepSet->emplace_back(binding.node, binding.parameter);
+            }
             return nullptr;
         }
         {
@@ -1296,7 +1307,8 @@ void MaterialService::Prefetch(const std::vector<Request>& requests,
     // the workers; Hydra data sources stay on the calling thread.
     auto compileInPool = [&](std::vector<Impl::Prepared>& items,
                              std::vector<std::shared_ptr<Material>>* results,
-                             std::vector<uint8_t>* needsFallback) {
+                             std::vector<uint8_t>* needsFallback,
+                             std::vector<std::vector<TemplateValueKey>>* grownKeepSets) {
         const unsigned workers = std::min<unsigned>(
             prism::MaterialWorkerCount(), static_cast<unsigned>(items.size()));
         std::atomic<size_t> next{0};
@@ -1311,7 +1323,8 @@ void MaterialService::Prefetch(const std::vector<Request>& requests,
                     if (index >= items.size()) break;
                     bool fallback = false;
                     auto material = m_impl->Compile(
-                        items[index], needsFallback ? &fallback : nullptr);
+                        items[index], needsFallback ? &fallback : nullptr,
+                        grownKeepSets ? &(*grownKeepSets)[index] : nullptr);
                     if (results) (*results)[index] = std::move(material);
                     if (needsFallback) (*needsFallback)[index] = fallback ? 1 : 0;
                 }
@@ -1350,7 +1363,7 @@ void MaterialService::Prefetch(const std::vector<Request>& requests,
     }
     std::vector<std::shared_ptr<Material>> seedMaterials(seeds.size());
     if (!seeds.empty()) {
-        compileInPool(seeds, &seedMaterials, nullptr);
+        compileInPool(seeds, &seedMaterials, nullptr, nullptr);
         for (size_t i = 0; i < seeds.size(); ++i) {
             if (cancelled && cancelled()) return;
             if (seedMaterials[i] || !seeds[i].templatePrototype) continue;
@@ -1410,19 +1423,74 @@ void MaterialService::Prefetch(const std::vector<Request>& requests,
             m_impl->Prepare(unique[i].dataSource, unique[i].path)));
     }
     std::vector<uint8_t> needsFallback(prepared.size(), 0);
-    compileInPool(prepared, nullptr, &needsFallback);
+    std::vector<std::vector<TemplateValueKey>> grownKeepSets(prepared.size());
+    compileInPool(prepared, nullptr, &needsFallback, &grownKeepSets);
     // Rejected template bindings (mapping/resource incompatibilities, or a
     // value the template folded) return to the Prefetch caller, which owns the
     // captured data-source lifetime and re-prepares them. Workers never
     // recapture or traverse a caller-provided source; they only compile.
+    // Materials rejected over folded values by one template share its
+    // structure: one seed keeping the template's arguments plus the union of
+    // their differing values replaces the template and serves them all.
+    struct Regroup {
+        const MDLMaterial* prototype = nullptr;
+        std::vector<size_t> indices;
+        std::vector<TemplateValueKey> keptValues;
+    };
+    std::vector<Regroup> regroups;
     std::vector<Impl::Prepared> fallbacks;
     for (size_t i = 0; i < prepared.size(); ++i) {
         if (cancelled && cancelled()) break;
         if (!needsFallback[i]) continue;
+        if (fold && !grownKeepSets[i].empty()) {
+            auto regroup = std::find_if(regroups.begin(), regroups.end(),
+                [&](const Regroup& entry) {
+                    return entry.prototype == prepared[i].templatePrototype.get();
+                });
+            if (regroup == regroups.end())
+                regroup = regroups.insert(regroups.end(),
+                    Regroup{prepared[i].templatePrototype.get(), {}, {}});
+            regroup->indices.push_back(i);
+            for (const auto& key : grownKeepSets[i])
+                if (std::find(regroup->keptValues.begin(), regroup->keptValues.end(), key) ==
+                    regroup->keptValues.end())
+                    regroup->keptValues.push_back(key);
+            continue;
+        }
         fallbacks.push_back(foldAlone(m_impl->Prepare(
             prepared[i].source, prepared[i].path, false)));
     }
-    if (!fallbacks.empty()) compileInPool(fallbacks, nullptr, nullptr);
+    std::vector<size_t> rebinds;
+    for (const Regroup& regroup : regroups) {
+        const size_t seedIndex = regroup.indices.front();
+        auto seed = m_impl->Prepare(
+            prepared[seedIndex].source, prepared[seedIndex].path, false);
+        seed.foldParameters = true;
+        seed.shareFoldedProgram = regroup.indices.size() > 1;
+        seed.keptValues = regroup.keptValues;
+        fallbacks.push_back(std::move(seed));
+        rebinds.insert(rebinds.end(), regroup.indices.begin() + 1, regroup.indices.end());
+    }
+    if (!fallbacks.empty()) compileInPool(fallbacks, nullptr, nullptr, nullptr);
+    // The other members bind against the templates those seeds published. A
+    // bind that is still rejected compiles all-folded on its own, so the
+    // fallback chain always terminates.
+    std::vector<Impl::Prepared> rebound;
+    for (const size_t index : rebinds) {
+        if (cancelled && cancelled()) break;
+        rebound.push_back(foldAlone(m_impl->Prepare(
+            prepared[index].source, prepared[index].path)));
+    }
+    std::vector<uint8_t> stillRejected(rebound.size(), 0);
+    if (!rebound.empty()) compileInPool(rebound, nullptr, &stillRejected, nullptr);
+    std::vector<Impl::Prepared> lastResort;
+    for (size_t i = 0; i < rebound.size(); ++i) {
+        if (cancelled && cancelled()) break;
+        if (!stillRejected[i]) continue;
+        lastResort.push_back(foldAlone(m_impl->Prepare(
+            rebound[i].source, rebound[i].path, false)));
+    }
+    if (!lastResort.empty()) compileInPool(lastResort, nullptr, nullptr, nullptr);
     m_impl->batchWallNanoseconds += std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now() - batchStart).count();
 }

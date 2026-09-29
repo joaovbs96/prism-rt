@@ -165,6 +165,9 @@ struct CompatibleBindResult {
     std::shared_ptr<MDLMaterial> material;
     uint64_t bytesRead = 0;
     std::string error;
+    // Every folded (node, parameter) whose captured value differs from the
+    // template's; a recompile keeping them lets later edits bind again.
+    std::vector<std::pair<PXR_NS::TfToken, PXR_NS::TfToken>> differingValues;
 };
 
 inline CompatibleBindResult BindCompatibleTemplate(
@@ -178,17 +181,20 @@ inline CompatibleBindResult BindCompatibleTemplate(
     }
     // The program computes with the prototype's folded values; binding any
     // other value would silently render a different material. Reject before
-    // any SDK or resource work.
+    // any SDK or resource work, reporting every differing value.
     for (const auto& binding : prepared.bindings) {
         if (!binding.folded) continue;
         const CapturedParameter* parameter=
             FindCapturedParameter(graph,binding,nullptr,&result.error);
-        if (!parameter) return result;
-        if (parameter->data.value!=binding.foldedValue) {
-            result.error="folded template parameter differs: "+
-                binding.node.GetString()+"."+binding.parameter.GetString();
-            return result;
-        }
+        if (!parameter) { result.differingValues.clear(); return result; }
+        if (parameter->data.value!=binding.foldedValue)
+            result.differingValues.emplace_back(binding.node,binding.parameter);
+    }
+    if (!result.differingValues.empty()) {
+        result.error="folded template parameters differ:";
+        for (const auto& [node,parameter] : result.differingValues)
+            result.error+=" "+node.GetString()+"."+parameter.GetString();
+        return result;
     }
     prism::PreparationAdmission::Reservation admission(
         prism::PreparationAdmission::Shared(),512ull*1024*1024);

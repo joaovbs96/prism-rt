@@ -128,13 +128,13 @@ HdContainerDataSourceHandle MakeTwoImageMaterial(
     return HdRetainedContainerDataSource::New(HdMaterialSchemaTokens->material,material);
 }
 
-// standard_surface with texture-free template values. A non-negative sheen
-// gives it a distinct structure. reference authors the default thin_walled,
-// which changes only the captured structure, so the same shader converts and
-// compiles independently of every non-reference material.
+// standard_surface with texture-free template values. A non-negative sheen or
+// specular gives it a distinct structure. reference authors the default
+// thin_walled, which changes only the captured structure, so the same shader
+// converts and compiles independently of every non-reference material.
 HdContainerDataSourceHandle MakeFoldingMaterial(const SdfPath& path,
     const GfVec3f& color, float roughness, float metalness,
-    float sheen = -1.0f, bool reference = false)
+    float sheen = -1.0f, bool reference = false, float specular = -1.0f)
 {
     HdMaterialNode surface;
     surface.path=path.AppendChild(TfToken("Surface"));
@@ -144,6 +144,7 @@ HdContainerDataSourceHandle MakeFoldingMaterial(const SdfPath& path,
     surface.parameters[TfToken("metalness")]=VtValue(metalness);
     surface.parameters[TfToken("coat")]=VtValue(0.25f);
     if (sheen >= 0.0f) surface.parameters[TfToken("sheen")]=VtValue(sheen);
+    if (specular >= 0.0f) surface.parameters[TfToken("specular")]=VtValue(specular);
     if (reference) surface.parameters[TfToken("thin_walled")]=VtValue(false);
     HdMaterialNetwork network;
     network.nodes={surface};
@@ -605,6 +606,182 @@ int main()
         return 36;
     }
     std::cout << "folded compilation: group jit=1 binds=2, unique and rejected variant folded\n";
+    // A rejected bind recompiles keeping the template's arguments plus the
+    // values that differed, so later edits of the same value bind again.
+    struct FoldSpec { GfVec3f color; float roughness, metalness, sheen, specular; };
+    auto makeFold=[](const SdfPath& path,const FoldSpec& spec,bool reference) {
+        return MakeFoldingMaterial(path,spec.color,spec.roughness,spec.metalness,
+                                   spec.sheen,reference,spec.specular);
+    };
+    auto restoreMode=[&] { SetCompileMode(originalMode ? originalMode->c_str() : nullptr); };
+    // Unfolded class-mode references with the same values, in one batch.
+    auto classReferences=[&](const std::string& prefix,const std::vector<FoldSpec>& specs) {
+        std::vector<HdContainerDataSourceHandle> sources;
+        std::vector<MaterialService::Request> requests;
+        for (size_t i=0;i<specs.size();++i) {
+            const SdfPath path("/Looks/"+prefix+std::to_string(i));
+            sources.push_back(makeFold(path,specs[i],true));
+            requests.push_back({sources.back(),path});
+        }
+        SetCompileMode("class");
+        service.Prefetch(requests);
+        SetCompileMode("auto");
+        std::vector<std::shared_ptr<MDLMaterial>> result;
+        for (const auto& request : requests) {
+            result.push_back(std::dynamic_pointer_cast<MDLMaterial>(
+                service.Resolve(request.dataSource,request.path)));
+            if (!result.back() || !result.back()->is_valid() ||
+                result.back()->has_folded_parameters()) result.back().reset();
+        }
+        return result;
+    };
+    auto resolveAll=[&](const std::vector<MaterialService::Request>& requests) {
+        std::vector<std::shared_ptr<MDLMaterial>> result;
+        for (const auto& request : requests)
+            result.push_back(std::dynamic_pointer_cast<MDLMaterial>(
+                service.Resolve(request.dataSource,request.path)));
+        return result;
+    };
+    SetCompileMode("auto");
+    const std::vector<FoldSpec> editGroup={
+        {GfVec3f(0.7f,0.2f,0.1f),0.25f,0.2f,-1.0f,0.8f},
+        {GfVec3f(0.2f,0.6f,0.3f),0.5f,0.2f,-1.0f,0.8f},
+        {GfVec3f(0.3f,0.3f,0.8f),0.4f,0.2f,-1.0f,0.8f}};
+    std::vector<HdContainerDataSourceHandle> editSources;
+    std::vector<MaterialService::Request> editRequests;
+    for (size_t i=0;i<editGroup.size();++i) {
+        const SdfPath path("/Looks/Edit"+std::to_string(i));
+        editSources.push_back(makeFold(path,editGroup[i],false));
+        editRequests.push_back({editSources.back(),path});
+    }
+    const auto editGroupBefore=service.GetStats();
+    service.Prefetch(editRequests);
+    const auto editGroupAfter=service.GetStats();
+    const auto editMaterials=resolveAll(editRequests);
+    if (editGroupAfter.nativeJits!=editGroupBefore.nativeJits+1 ||
+        editGroupAfter.templateCacheHits!=editGroupBefore.templateCacheHits+2 ||
+        std::any_of(editMaterials.begin(),editMaterials.end(),[&](const auto& material) {
+            return !material || material->get_target_code().program!=
+                editMaterials.front()->get_target_code().program;
+        })) {
+        std::cerr << "edit group did not share one folded program\n";
+        restoreMode(); return 37;
+    }
+    const Float3 untouchedDirections[2]={Float3(0.0f,1.0f,0.0f),Float3(0.6f,0.8f,0.0f)};
+    BRDFEvaluation untouchedBefore[2][2];
+    for (int m=0;m<2;++m) for (int d=0;d<2;++d)
+        untouchedBefore[m][d]=editMaterials[m+1]->evaluate(foldHit,untouchedDirections[d]);
+    std::vector<FoldSpec> editedSpecs;
+    for (const float metalness : {0.45f,0.6f,0.75f}) {
+        editedSpecs.push_back(editGroup[0]); editedSpecs.back().metalness=metalness;
+    }
+    const auto editReferences=classReferences("EditReference",editedSpecs);
+    for (size_t edit=0;edit<editedSpecs.size();++edit) {
+        const SdfPath& path=editRequests[0].path;
+        const auto source=makeFold(path,editedSpecs[edit],false);
+        service.Invalidate(path);
+        const auto before=service.GetStats();
+        service.Prefetch({{source,path}});
+        const auto after=service.GetStats();
+        auto edited=std::dynamic_pointer_cast<MDLMaterial>(service.Resolve(source,path));
+        const bool expected=edit==0
+            ? after.compilations==before.compilations+1 &&
+              after.nativeJits==before.nativeJits+1
+            : after.compilations==before.compilations &&
+              after.sdkTranslationCalls==before.sdkTranslationCalls &&
+              after.templateCacheHits==before.templateCacheHits+1;
+        if (!edited || !edited->is_valid() || after.failures!=before.failures || !expected) {
+            std::cerr << "folded-value edit " << edit << " work differs: compilations="
+                      << after.compilations-before.compilations
+                      << " jits=" << after.nativeJits-before.nativeJits
+                      << " translations=" << after.sdkTranslationCalls-before.sdkTranslationCalls
+                      << " template_hits=" << after.templateCacheHits-before.templateCacheHits
+                      << " failures=" << after.failures-before.failures << "\n";
+            restoreMode(); return 38;
+        }
+        std::string detail;
+        if (!editReferences[edit] || !SameShading(*edited,*editReferences[edit],&detail)) {
+            std::cerr << "folded-value edit " << edit
+                      << " differs from its unfolded compilation: " << detail << "\n";
+            restoreMode(); return 39;
+        }
+    }
+    // Replacing the registry template must not touch existing bindings.
+    for (int m=0;m<2;++m) {
+        const auto& request=editRequests[m+1];
+        auto untouched=std::dynamic_pointer_cast<MDLMaterial>(
+            service.Resolve(request.dataSource,request.path));
+        bool same=untouched==editMaterials[m+1];
+        for (int d=0;same && d<2;++d) {
+            const auto now=untouched->evaluate(foldHit,untouchedDirections[d]);
+            same=now.valid==untouchedBefore[m][d].valid && now.pdf==untouchedBefore[m][d].pdf;
+            for (int i=0;same && i<3;++i) same=now.value[i]==untouchedBefore[m][d].value[i];
+        }
+        if (!same) {
+            std::cerr << "untouched group member changed after edits of its sibling\n";
+            restoreMode(); return 40;
+        }
+    }
+    // Four new materials rejected by one template over two different folded
+    // values share one seed keeping both, instead of four folded programs.
+    const std::vector<FoldSpec> batchSeeds={
+        {GfVec3f(0.5f,0.5f,0.5f),0.3f,0.2f,0.15f,0.8f},
+        {GfVec3f(0.6f,0.4f,0.2f),0.3f,0.2f,0.15f,0.8f}};
+    std::vector<MaterialService::Request> batchSeedRequests;
+    std::vector<HdContainerDataSourceHandle> batchSources;
+    for (size_t i=0;i<batchSeeds.size();++i) {
+        const SdfPath path("/Looks/BatchSeed"+std::to_string(i));
+        batchSources.push_back(makeFold(path,batchSeeds[i],false));
+        batchSeedRequests.push_back({batchSources.back(),path});
+    }
+    service.Prefetch(batchSeedRequests);
+    const std::vector<FoldSpec> rejected={
+        {GfVec3f(0.9f,0.1f,0.1f),0.3f,0.6f,0.15f,0.8f},
+        {GfVec3f(0.1f,0.9f,0.1f),0.3f,0.7f,0.15f,0.8f},
+        {GfVec3f(0.1f,0.1f,0.9f),0.3f,0.2f,0.5f,0.8f},
+        {GfVec3f(0.8f,0.8f,0.1f),0.3f,0.65f,0.35f,0.8f}};
+    std::vector<MaterialService::Request> rejectedRequests;
+    for (size_t i=0;i<rejected.size();++i) {
+        const SdfPath path("/Looks/BatchRejected"+std::to_string(i));
+        batchSources.push_back(makeFold(path,rejected[i],false));
+        rejectedRequests.push_back({batchSources.back(),path});
+    }
+    const auto rejectedReferences=classReferences("BatchReference",rejected);
+    const auto rejectedBefore=service.GetStats();
+    service.Prefetch(rejectedRequests);
+    const auto rejectedAfter=service.GetStats();
+    const auto rejectedMaterials=resolveAll(rejectedRequests);
+    const auto batchSeedMaterials=resolveAll(batchSeedRequests);
+    if (rejectedAfter.nativeJits!=rejectedBefore.nativeJits+1 ||
+        rejectedAfter.compilations!=rejectedBefore.compilations+1 ||
+        rejectedAfter.templateCacheHits!=rejectedBefore.templateCacheHits+3 ||
+        rejectedAfter.failures!=rejectedBefore.failures ||
+        !batchSeedMaterials.front() ||
+        std::any_of(rejectedMaterials.begin(),rejectedMaterials.end(),[&](const auto& material) {
+            return !material || !material->is_valid() ||
+                material->get_target_code().program!=
+                    rejectedMaterials.front()->get_target_code().program ||
+                material->get_target_code().program==
+                    batchSeedMaterials.front()->get_target_code().program;
+        })) {
+        std::cerr << "rejected batch did not share one regrown program: jits="
+                  << rejectedAfter.nativeJits-rejectedBefore.nativeJits
+                  << " compilations=" << rejectedAfter.compilations-rejectedBefore.compilations
+                  << " template_hits=" << rejectedAfter.templateCacheHits-rejectedBefore.templateCacheHits
+                  << " failures=" << rejectedAfter.failures-rejectedBefore.failures << "\n";
+        restoreMode(); return 41;
+    }
+    for (size_t i=0;i<rejected.size();++i) {
+        std::string detail;
+        if (!rejectedReferences[i] ||
+            !SameShading(*rejectedMaterials[i],*rejectedReferences[i],&detail)) {
+            std::cerr << "rejected batch material " << i
+                      << " differs from its unfolded compilation: " << detail << "\n";
+            restoreMode(); return 42;
+        }
+    }
+    restoreMode();
+    std::cout << "folded-value edits and rejected batches regrow one kept template\n";
     service.InvalidateAll();
     std::error_code udimCleanup; std::filesystem::remove_all(udimRoot,udimCleanup);
     std::error_code multiCleanup; std::filesystem::remove_all(multiRoot,multiCleanup);
