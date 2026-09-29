@@ -62,7 +62,7 @@ void CaptureResources(const mi::neuraylib::IValue* value,
     mi::base::Handle<const mi::neuraylib::IValue_resource> resource(
         value->get_interface<mi::neuraylib::IValue_resource>());
     if (resource) {
-        result.arguments.emplace_back(resource.get());
+        result.arguments.push_back(resource);
         mi::base::Handle<const mi::IString> text(factory->dump(value, nullptr));
         const std::string item = text ? text->get_c_str() : "";
         result.signature += std::to_string(item.size()) + ":" + item;
