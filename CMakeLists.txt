@@ -261,6 +261,7 @@ if(PRISM_BUILD_HYDRA)
             tests/hydra/b3_fallback_opacity_integration_test.cpp
             tests/hydra/c2_geometric_aov_integration_test.cpp
             tests/hydra/snapshot_scaling_test.cpp
+            tests/hydra/snapshot_counts_test.cpp
             tests/hydra/task_delegate_settings_test.cpp
             src/hydra/scene_bridge.cpp
             src/hydra/materials.cpp

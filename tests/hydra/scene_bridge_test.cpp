@@ -49,6 +49,7 @@ int RunB2DoublePrimvarIntegrationTests();
 int RunB3FallbackOpacityIntegrationTests();
 int RunC2GeometricAovIntegrationTests();
 int RunSnapshotScalingTests();
+int RunCachedCountTests();
 
 namespace {
 
@@ -641,6 +642,7 @@ int main()
     if (RunB3FallbackOpacityIntegrationTests() != 0) return 1;
     if (RunC2GeometricAovIntegrationTests() != 0) return 1;
     if (RunSnapshotScalingTests() != 0) return 1;
+    if (RunCachedCountTests() != 0) return 1;
     bool flatTangent = false, nativeTangent = false;
     bool flatMirroredTangent = false, nativeMirroredTangent = false;
     const Color3 flat = TraceTriangle(false, false, &flatTangent);

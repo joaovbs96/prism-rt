@@ -473,6 +473,12 @@ struct Snapshot {
     RTCDevice device = nullptr;
     std::unique_ptr<SceneManager> scene;
     std::vector<std::shared_ptr<Geometry>> geometries;
+    // Cached diagnostics: recomputed with snapshot construction or geometry
+    // refreshes, never while polling GetStats().
+    size_t meshCount = 0;
+    int64_t triangleCount = 0;
+    size_t livePrimCount = 0;
+    size_t primPathSlotCount = 0;
     std::shared_ptr<PrototypePool> prototypePool = std::make_shared<PrototypePool>();
     std::unordered_map<SdfPath, std::shared_ptr<Material>, SdfPath::Hash>
         resolvedMaterials;
@@ -552,6 +558,24 @@ struct Snapshot {
         geometries.clear();
     }
 };
+
+void _RefreshCachedCounts(Snapshot *snapshot)
+{
+    if (!snapshot) return;
+    snapshot->meshCount = 0;
+    snapshot->triangleCount = 0;
+    for (auto const &geometry : snapshot->geometries) {
+        if (Mesh const *mesh = dynamic_cast<Mesh *>(geometry.get())) {
+            ++snapshot->meshCount;
+            snapshot->triangleCount += static_cast<int64_t>(
+                mesh->indices.size() / 3);
+        }
+    }
+    snapshot->livePrimCount = static_cast<size_t>(std::count_if(
+        snapshot->primPaths.begin(), snapshot->primPaths.end(),
+        [](SdfPath const &path) { return !path.IsEmpty(); }));
+    snapshot->primPathSlotCount = snapshot->primPaths.size();
+}
 
 void _RecordMaterialUser(Snapshot *snapshot, SdfPath const &material,
                          SdfPath const &prototype)
@@ -2274,6 +2298,7 @@ std::shared_ptr<Snapshot> _BuildSnapshot(HdSceneIndexBaseRefPtr const &scene,
         std::chrono::steady_clock::now() - sceneCommitStart).count();
     // Later refreshes of this bank resolve through their job's service.
     result->materialsSeeded = false;
+    _RefreshCachedCounts(result.get());
     return result;
 }
 
@@ -3945,6 +3970,10 @@ bool SceneBridge::Prepare(CameraState const &camera,
                                 placementNeedsFullSnapshot ||
                                 batchNeedsFullSnapshot;
                             result.reusedBank = !rebuiltSnapshot;
+                            if (result.reusedBank &&
+                                (jobDirtyKinds & static_cast<unsigned int>(
+                                    SceneDirtyKind::Prototype)) != 0)
+                                _RefreshCachedCounts(result.snapshot.get());
                             result.visibilityRecoveryRebuild =
                                 placementNeedsFullSnapshot;
                             result.prototypeBuilds = rebuiltSnapshot
@@ -4452,21 +4481,13 @@ VtDictionary SceneBridge::GetStats() const
     result["converged"] = VtValue(_converged.load());
     std::lock_guard lock(_impl->mutex);
     result["meshCount"] = VtValue(static_cast<int64_t>(
-        _impl->snapshot ? std::count_if(
-            _impl->snapshot->geometries.begin(),
-            _impl->snapshot->geometries.end(),
-            [](std::shared_ptr<Geometry> const &geometry) {
-                return dynamic_cast<Mesh *>(geometry.get()) != nullptr;
-            }) : 0));
-    int64_t triangles = 0;
-    if (_impl->snapshot) {
-        for (auto const &geometry : _impl->snapshot->geometries)
-            if (Mesh const *mesh = dynamic_cast<Mesh *>(geometry.get()))
-                triangles += static_cast<int64_t>(mesh->indices.size() / 3);
-    }
-    result["triangleCount"] = VtValue(triangles);
+        _impl->snapshot ? _impl->snapshot->meshCount : 0));
+    result["triangleCount"] = VtValue(
+        _impl->snapshot ? _impl->snapshot->triangleCount : int64_t{0});
     result["primCount"] = VtValue(static_cast<int64_t>(
-        _impl->snapshot ? _impl->snapshot->primPaths.size() : 0));
+        _impl->snapshot ? _impl->snapshot->livePrimCount : 0));
+    result["primPathSlotCount"] = VtValue(static_cast<int64_t>(
+        _impl->snapshot ? _impl->snapshot->primPathSlotCount : 0));
     result["snapshotBuilds"] = VtValue(static_cast<int64_t>(
         _impl->snapshotBuilds));
     result["snapshotBuildSeconds"] = VtValue(_impl->snapshotBuildSeconds);
