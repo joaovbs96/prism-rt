@@ -270,6 +270,8 @@ if(PRISM_BUILD_HYDRA)
             src/hydra/render_pass.cpp
             src/hydra/transport_filter.cpp
             src/hydra/native_tasks.cpp)
+        target_sources(prism_hydra_scene_bridge_test PRIVATE
+            tests/hydra/multisampled_presentation_test.cpp)
         target_include_directories(prism_hydra_scene_bridge_test PRIVATE ${PXR_INCLUDE_DIRS})
         target_link_libraries(prism_hydra_scene_bridge_test PRIVATE
             PrismRT::core hd hdx ${PXR_LIBRARIES})

@@ -2311,5 +2311,7 @@ int main()
         activeBridge = nullptr;
     }
     thread.StopThread();
+    int RunMultisampledPresentationTest();
+    if (RunMultisampledPresentationTest() != 0) return 1;
     return ok ? 0 : 1;
 }
