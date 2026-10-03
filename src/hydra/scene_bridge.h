@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../texture_service.h"
+#include "published_pick_scene.h"
 
 #include "pxr/base/gf/matrix4d.h"
 #include "pxr/base/gf/vec4f.h"
@@ -89,6 +90,7 @@ struct PublishedFrame {
     uint64_t generation = 0;
     uint64_t cameraRevision = 0;
     std::shared_ptr<const PickingTable> picking;
+    std::shared_ptr<const PublishedPickScene> pickScene;
     CameraState camera;
     unsigned int width = 0;
     unsigned int height = 0;

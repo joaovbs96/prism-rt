@@ -441,30 +441,43 @@ public:
         if(!frame || !frame->picking || depthView.frame!=frame ||
            (instance && instanceView.frame!=frame) || (element && elementView.frame!=frame) ||
            (normal && normalView.frame!=frame)) return;
-        const auto ids=ReadBuffer<int>(primView,HdFormatInt32), instances=ReadBuffer<int>(instanceView,HdFormatInt32),
-                   elements=ReadBuffer<int>(elementView,HdFormatInt32);
-        const auto depths=ReadBuffer<float>(depthView,HdFormatFloat32), normals=ReadBuffer<float>(normalView,HdFormatFloat32Vec3);
-        if (ids.empty() || depths.size()!=ids.size()) return;
-        const int w=int(primView.width),h=int(primView.height);
+        const auto& rayScene=frame->pickScene;
+        const auto ids=rayScene?std::vector<int>{}:ReadBuffer<int>(primView,HdFormatInt32),
+                   instances=rayScene?std::vector<int>{}:ReadBuffer<int>(instanceView,HdFormatInt32),
+                   elements=rayScene?std::vector<int>{}:ReadBuffer<int>(elementView,HdFormatInt32);
+        const auto depths=rayScene?std::vector<float>{}:ReadBuffer<float>(depthView,HdFormatFloat32),
+                   normals=rayScene?std::vector<float>{}:ReadBuffer<float>(normalView,HdFormatFloat32Vec3);
+        if (!rayScene && (ids.empty() || depths.size()!=ids.size())) return;
+        const int w=int(rayScene?frame->width:primView.width),
+                  h=int(rayScene?frame->height:primView.height);
+        if(w<=0 || h<=0) return;
         const GfMatrix4d projection=frame->camera.projection;
         const GfMatrix4d view=frame->camera.worldToView;
         const GfMatrix4d toWorld=(view*projection).GetInverse();
         const GfMatrix4d toPick=pick.viewMatrix*pick.projectionMatrix;
+        const auto bounds=rayScene
+            ? prism::hydra::GetPickRasterBounds(view*projection,toPick.GetInverse(),w,h)
+            : prism::hydra::PickRasterBounds{0,w,0,h};
         std::set<std::tuple<int,int,int>> seen;
         double best=std::numeric_limits<double>::infinity();
         HdxPickHit nearest{};
-        for(int y=0;y<h;++y) for(int x=0;x<w;++x) {
+        for(int y=bounds.yBegin;y<bounds.yEnd;++y) for(int x=bounds.xBegin;x<bounds.xEnd;++x) {
             const size_t i=size_t(y)*w+x;
-            if(ids[i]<0 || !std::isfinite(depths[i]) || depths[i]<0 || depths[i]>=1) continue;
-            const GfVec3d world=toWorld.Transform(GfVec3d(2*(x+.5)/w-1,2*(y+.5)/h-1,2*depths[i]-1));
+            prism::hydra::PublishedPickHit rayHit;
+            if(rayScene && !rayScene->PickPixel(x,h-1-y,&rayHit)) continue;
+            const int primId=rayScene?rayHit.primId:ids[i];
+            const float hitDepth=rayScene?rayHit.normalizedDepth:depths[i];
+            if(primId<0 || !std::isfinite(hitDepth) || hitDepth<0 || hitDepth>=1) continue;
+            const GfVec3d world=rayScene?rayHit.worldPoint:
+                toWorld.Transform(GfVec3d(2*(x+.5)/w-1,2*(y+.5)/h-1,2*hitDepth-1));
             const GfVec3d ndc=toPick.Transform(world);
             if(std::abs(ndc[0])>1 || std::abs(ndc[1])>1 || std::abs(ndc[2])>1) continue;
             HdxPickHit hit{};
-            if(size_t(ids[i])>=frame->picking->primPaths.size()) continue;
-            hit.objectId=frame->picking->primPaths[ids[i]];
+            if(size_t(primId)>=frame->picking->primPaths.size()) continue;
+            hit.objectId=frame->picking->primPaths[primId];
             if(hit.objectId.IsEmpty()) continue;
-            if(size_t(ids[i])<frame->picking->instancerPaths.size())
-                hit.instancerId=frame->picking->instancerPaths[ids[i]];
+            if(size_t(primId)<frame->picking->instancerPaths.size())
+                hit.instancerId=frame->picking->instancerPaths[primId];
             const auto matches = [&](SdfPath const& root) {
                 return hit.objectId.HasPrefix(root) ||
                     (!hit.instancerId.IsEmpty() && hit.instancerId.HasPrefix(root));
@@ -480,19 +493,20 @@ public:
                 }
             }
             if (clipped) continue;
-            hit.instanceIndex=instances.size()==ids.size()?instances[i]:-1;
-            hit.elementIndex=elements.size()==ids.size()?elements[i]:-1;
+            hit.instanceIndex=rayScene?rayHit.instanceId:(instances.size()==ids.size()?instances[i]:-1);
+            hit.elementIndex=rayScene?rayHit.elementId:(elements.size()==ids.size()?elements[i]:-1);
             hit.edgeIndex=hit.pointIndex=-1;
             hit.worldSpaceHitPoint=world;
-            hit.normalizedDepth=depths[i];
-            if(normals.size()==ids.size()*3)
+            hit.normalizedDepth=hitDepth;
+            if(rayScene) hit.worldSpaceHitNormal=rayHit.worldNormal;
+            else if(normals.size()==ids.size()*3)
                 hit.worldSpaceHitNormal=GfVec3f(view.GetInverse().TransformDir(GfVec3d(normals[i*3],normals[i*3+1],normals[i*3+2])));
             const double metric=pick.resolveMode==HdxPickTokens->resolveNearestToCenter
-                ? ndc[0]*ndc[0]+ndc[1]*ndc[1] : double(depths[i]);
+                ? ndc[0]*ndc[0]+ndc[1]*ndc[1] : double(hitDepth);
             if(metric<best) {best=metric;nearest=hit;}
             if(pick.resolveMode==HdxPickTokens->resolveAll) pick.outHits->push_back(hit);
             else if(pick.resolveMode==HdxPickTokens->resolveUnique &&
-                seen.emplace(ids[i],hit.instanceIndex,pick.pickTarget==HdxPickTokens->pickFaces?hit.elementIndex:-1).second)
+                seen.emplace(primId,hit.instanceIndex,pick.pickTarget==HdxPickTokens->pickFaces?hit.elementIndex:-1).second)
                 pick.outHits->push_back(hit);
         }
         if((pick.resolveMode==HdxPickTokens->resolveNearestToCenter || pick.resolveMode==HdxPickTokens->resolveNearestToCamera) && nearest.IsValid())

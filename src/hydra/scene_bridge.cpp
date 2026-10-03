@@ -2786,6 +2786,85 @@ prism::CameraRayParameters _CameraParameters(CameraState const &camera)
     return parameters;
 }
 
+
+class PublishedSnapshotPickScene final : public PublishedPickScene {
+public:
+    PublishedSnapshotPickScene(std::shared_ptr<const Snapshot> snapshot,
+        CameraState const& camera, unsigned int width, unsigned int height)
+        : snapshot(std::move(snapshot)), camera(camera),
+          parameters(_CameraParameters(camera)), width(width), height(height),
+          device(this->snapshot->device) { rtcRetainDevice(device); }
+    ~PublishedSnapshotPickScene() override {
+        // Release all Embree scenes/geometries before the explicit device pin.
+        snapshot.reset();
+        rtcReleaseDevice(device);
+    }
+    bool PickPixel(unsigned int x, unsigned int y, PublishedPickHit* result) const override {
+        if (!result || x>=width || y>=height) return false;
+        const RTCRay ray=prism::MakeCameraRayWithLens(parameters,
+            static_cast<float>(x)+.5f,static_cast<float>(y)+.5f,width,height,nullptr);
+        RTCRayHit raw=snapshot->scene->intersectRaw(prism::PathRay{ray,{}});
+        if(raw.hit.geomID==RTC_INVALID_GEOMETRY_ID) return false;
+        const unsigned int placementId=raw.hit.instID[0]!=RTC_INVALID_GEOMETRY_ID
+            ? raw.hit.instID[0] : raw.hit.geomID;
+        auto geometry=snapshot->scene->geometry.find(placementId);
+        if(geometry==snapshot->scene->geometry.end()) return false;
+        Geometry* geom=geometry->second;
+        RTCGeometry interpolation=geom->geom;
+        if(auto leaf=snapshot->scene->intersection_geometry.find(placementId);
+           leaf!=snapshot->scene->intersection_geometry.end()) interpolation=leaf->second;
+        const auto placement=snapshot->scene->placement_transforms.find(placementId);
+        Float3 localAnalyticNormal;
+        Float3 const* analyticNormal=nullptr;
+        const auto transform=[](Float3 const& v,std::array<float,9> const& m) {
+            return Float3(v.x()*m[0]+v.y()*m[3]+v.z()*m[6],
+                          v.x()*m[1]+v.y()*m[4]+v.z()*m[7],
+                          v.x()*m[2]+v.y()*m[5]+v.z()*m[8]);
+        };
+        if(placement!=snapshot->scene->placement_transforms.end()) {
+            Float3 normal(raw.hit.Ng_x,raw.hit.Ng_y,raw.hit.Ng_z);
+            if(geom->type==RTC_GEOMETRY_TYPE_SPHERE_POINT) {
+                localAnalyticNormal=normal; analyticNormal=&localAnalyticNormal;
+            }
+            normal=transform(normal,placement->second.normal);
+            if(placement->second.flipOrientation ||
+               (placement->second.mirrored && geom->type==RTC_GEOMETRY_TYPE_TRIANGLE))
+                normal=-normal;
+            raw.hit.Ng_x=normal.x(); raw.hit.Ng_y=normal.y(); raw.hit.Ng_z=normal.z();
+        }
+        RayHit hit(raw,&interpolation,geom->type,analyticNormal);
+        hit.geomid=static_cast<int>(placementId);
+        if(placement!=snapshot->scene->placement_transforms.end()) {
+            if(geom->type==RTC_GEOMETRY_TYPE_TRIANGLE)
+                hit.n=transform(hit.n,placement->second.normal).normalize();
+            if(placement->second.flipOrientation ||
+               (placement->second.mirrored && geom->type==RTC_GEOMETRY_TYPE_TRIANGLE))
+                hit.n=-hit.n;
+        }
+        result->primId=_PrimIdForHit(snapshot.get(),hit);
+        result->instanceId=-1; result->elementId=-1;
+        if(auto instance=snapshot->geomToInstanceId.find(placementId);
+           instance!=snapshot->geomToInstanceId.end()) result->instanceId=instance->second;
+        if(auto faces=snapshot->geomToCoarseFaces.find(placementId);
+           faces!=snapshot->geomToCoarseFaces.end() && hit.primid>=0 &&
+           static_cast<size_t>(hit.primid)<faces->second.size())
+            result->elementId=faces->second[hit.primid];
+        result->worldPoint=GfVec3d(hit.p.x(),hit.p.y(),hit.p.z());
+        result->worldNormal=GfVec3f(hit.n.x(),hit.n.y(),hit.n.z());
+        GfVec4d clip(hit.p.x(),hit.p.y(),hit.p.z(),1.0);
+        clip=clip*camera.worldToView*camera.projection;
+        if(std::abs(clip[3])<=1e-12) return false;
+        result->normalizedDepth=static_cast<float>(.5*clip[2]/clip[3]+.5);
+        return result->primId>=0;
+    }
+private:
+    std::shared_ptr<const Snapshot> snapshot;
+    CameraState camera;
+    prism::CameraRayParameters parameters;
+    unsigned int width,height;
+    RTCDevice device;
+};
+
 struct PreviewResult {
     unsigned int width = 0;
     unsigned int height = 0;
@@ -3034,6 +3113,7 @@ public:
         double seconds = 0.0;
         std::string error;
         bool reusedBank = false;
+        bool pinnedBankFallback = false;
         bool visibilityRecoveryRebuild = false;
         bool sphereBatchFallback = false;
         uint64_t prototypeBuilds = 0;
@@ -3123,6 +3203,9 @@ public:
             try { (void)buildFuture.get(); }
             catch (...) {}
         }
+        // A retained published pick frame can outlive this bridge. Remove the
+        // callback's Impl userdata after all bridge workers have quiesced.
+        if (device) rtcSetDeviceMemoryMonitorFunction(device, nullptr, nullptr);
         snapshot.reset();
         inactiveSnapshot.reset();
         // PrototypeStorage releases Embree scenes/geometries. Expire every
@@ -3227,6 +3310,7 @@ public:
     uint64_t environmentInvalidations = 0;
     uint64_t conservativeRebuilds = 0;
     uint64_t visibilityRecoveryRebuilds = 0;
+    uint64_t pinnedSnapshotFallbacks = 0;
     uint64_t sphereBatchFallbacks = 0;
     bool profileBufferWrites = false;
     std::string lastRebuildReason = "initial population";
@@ -3621,6 +3705,11 @@ bool SceneBridge::Prepare(CameraState const &camera,
             _impl->snapshotBuildSeconds = completed.seconds;
             if (completed.reusedBank) ++_impl->reusedSnapshotBuilds;
             else ++_impl->snapshotBuilds;
+            if (completed.pinnedBankFallback) {
+                ++_impl->pinnedSnapshotFallbacks;
+                ++_impl->conservativeRebuilds;
+                _impl->lastRebuildReason = "inactive snapshot retained by a published frame";
+            }
             if (completed.visibilityRecoveryRebuild) {
                 ++_impl->visibilityRecoveryRebuilds;
                 ++_impl->conservativeRebuilds;
@@ -3759,6 +3848,8 @@ bool SceneBridge::Prepare(CameraState const &camera,
                 _impl->inactiveSnapshot);
             std::shared_ptr<const PickingTable> publishedPicking =
                 _impl->snapshot ? _impl->snapshot->picking : nullptr;
+            const bool pinnedBankFallback = bank && bank.use_count() > 1;
+            if (pinnedBankFallback) bank.reset();
             const uint64_t bankGeneration = _impl->inactiveGeneration;
             {
                 // Even without a bank, each kind must keep its own paths.
@@ -3845,13 +3936,14 @@ bool SceneBridge::Prepare(CameraState const &camera,
                  jobPlacementPaths = std::move(jobPlacementPaths),
                  jobPrototypePaths = std::move(jobPrototypePaths),
                  jobMaterialPaths = std::move(jobMaterialPaths),
-                 bank = std::move(bank), device,
+                 bank = std::move(bank), device, pinnedBankFallback,
                  publishedPicking = std::move(publishedPicking),
                  prototypePool = std::move(prototypePool),
                  cancel = std::move(cancel),
                  mx = std::move(mx), mdl = std::move(mdl)]() mutable {
                     SceneBridge::Impl::BuildResult result;
                     result.generation = generation;
+                    result.pinnedBankFallback = pinnedBankFallback;
                     auto const start = std::chrono::steady_clock::now();
                     try {
                         bool placementTopologyChanged = false;
@@ -4166,6 +4258,8 @@ void SceneBridge::Render()
         initialFrame->generation = generation;
         initialFrame->cameraRevision = cameraRevision;
         initialFrame->picking = snapshot->picking;
+        initialFrame->pickScene = std::make_shared<PublishedSnapshotPickScene>(
+            snapshot, camera, width, height);
         initialFrame->camera = camera;
         initialFrame->width = width;
         initialFrame->height = height;
@@ -4674,6 +4768,7 @@ VtDictionary SceneBridge::GetStats() const
     result["materialInvalidations"] = VtValue(static_cast<int64_t>(_impl->materialInvalidations));
     result["environmentInvalidations"] = VtValue(static_cast<int64_t>(_impl->environmentInvalidations));
     result["conservativeRebuilds"] = VtValue(static_cast<int64_t>(_impl->conservativeRebuilds));
+    result["pinnedSnapshotFallbacks"] = VtValue(static_cast<int64_t>(_impl->pinnedSnapshotFallbacks));
     result["visibilityRecoveryRebuilds"] = VtValue(static_cast<int64_t>(
         _impl->visibilityRecoveryRebuilds));
     result["lastRebuildReason"] = VtValue(_impl->lastRebuildReason);

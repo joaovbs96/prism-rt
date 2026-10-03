@@ -74,6 +74,8 @@ The render buffers expose linear floating-point `color`, projected `depth` in `[
 
 Color alpha accumulates primary coverage, including stochastic cutouts and silhouette samples. With no dome, or `domeLightCameraVisibility=false`, primary rays that escape the scene produce transparent black; unresolved early terminations retain coverage. A visible dome keeps opaque alpha. Changing dome camera visibility restarts preview and full accumulation.
 
+Picking traces deterministic full-resolution rays against the camera and immutable scene owned by the displayed frame, including during low-resolution preview. Retained frames and mapped buffers keep their original geometry across later edits and renderer destruction. An externally retained inactive scene uses a conservative rebuild recorded by `pinnedSnapshotFallbacks`; ordinary released-frame bank reuse remains available.
+
 ## Standalone comparisons
 
 The no-argument executable displays help. Rendering uses scene files and requires an explicit camera. USD camera paths and explicit camera position/target are supported; glTF/GLB and OBJ use an explicit camera position/target:
