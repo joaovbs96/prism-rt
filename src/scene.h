@@ -35,6 +35,9 @@
 class SceneManager
 {
 public:
+    // A null cutout crossing is not an accepted surface. Truncated primary
+    // paths remain unresolved so callers can conservatively retain coverage.
+    enum class PrimaryOutcome { Unresolved, Escaped, AcceptedSurface };
     struct PlacementTransform {
         std::array<float, 9> normal{};
         std::array<float, 9> tangent{};
@@ -416,10 +419,11 @@ public:
     }
 
     Color3 trace(prism::PathRay pathRay, int depth, Color3 throughput,
-                 unsigned int &seed)
+                 unsigned int &seed, PrimaryOutcome* primaryOutcome = nullptr)
     {
         if (environmentSampling)
-            return traceEnvironmentMis(pathRay, depth, throughput, seed, 0.0f, false);
+            return traceEnvironmentMis(pathRay, depth, throughput, seed, 0.0f, false,
+                                       0, primaryOutcome);
         // reached maximum recursion
         if (depth >= max_depth)
             return Float3();
@@ -441,6 +445,10 @@ public:
             material->prepare(ray_hit,shadingContext);
             BRDFSample s=material->samplePrepared(ray_hit,seed,shadingContext);
             sampleTimer.stop();
+            if (!s.null_event && primaryOutcome) {
+                *primaryOutcome = PrimaryOutcome::AcceptedSurface;
+                primaryOutcome = nullptr;
+            }
             // MDLMaterial* d = dynamic_cast<MDLMaterial*>(material);
             // if (d != nullptr) {
             //     std::cout << "Color:" << s.color << std::endl;
@@ -465,17 +473,20 @@ public:
 
             throughput *= rr_weight;
 
-            return s.emission + s.color * rr_weight * trace(new_ray, depth + 1, throughput, seed);
+            return s.emission + s.color * rr_weight * trace(new_ray, depth + 1, throughput, seed,
+                                                          primaryOutcome);
         }
 
         // ray miss: sample environment
+        if (primaryOutcome) *primaryOutcome = PrimaryOutcome::Escaped;
         prism::profiling::Scope environmentTimer(prism::profiling::Environment);
         return environment->radiance(
             ray_hit.d, directionFootprint(pathRay.footprint));
     }
 
-    Color3 trace(RTCRay ray, int depth, Color3 throughput, unsigned int &seed)
-    { return trace(prism::PathRay{ray, {}}, depth, throughput, seed); }
+    Color3 trace(RTCRay ray, int depth, Color3 throughput, unsigned int &seed,
+                 PrimaryOutcome* primaryOutcome = nullptr)
+    { return trace(prism::PathRay{ray, {}}, depth, throughput, seed, primaryOutcome); }
 
     static float powerHeuristic(float a, float b) {
         const float scale = std::max(a, b);
@@ -511,10 +522,12 @@ public:
 
     Color3 traceEnvironmentMis(prism::PathRay pathRay, int depth, Color3 throughput,
                                unsigned int& seed, float previousPdf,
-                               bool previousNee, int nullCrossings = 0) {
+                               bool previousNee, int nullCrossings = 0,
+                               PrimaryOutcome* primaryOutcome = nullptr) {
         if (depth >= max_depth) return Color3(0.0f);
         RayHit hit = cast_ray(pathRay);
         if (hit.geomid == RTC_INVALID_GEOMETRY_ID) {
+            if (primaryOutcome) *primaryOutcome = PrimaryOutcome::Escaped;
             prism::profiling::Scope environmentTimer(prism::profiling::Environment);
             const Float3 direction = ray_hit_direction(pathRay.ray);
             const Color3 li = environment->radiance(
@@ -531,9 +544,15 @@ public:
         sampleTimer.stop();
         Color3 result = bs.emission;
         if (bs.null_event) {
+            if (!bs.scattered) primaryOutcome = nullptr;
             if (nullCrossings >= 64) return result;
             return result + bs.color * traceEnvironmentMis(spawnRay(hit,bs.wi,true),
-                depth, throughput * bs.color, seed, previousPdf, previousNee, nullCrossings+1);
+                depth, throughput * bs.color, seed, previousPdf, previousNee, nullCrossings+1,
+                primaryOutcome);
+        }
+        if (primaryOutcome) {
+            *primaryOutcome = PrimaryOutcome::AcceptedSurface;
+            primaryOutcome = nullptr;
         }
         // At the depth boundary the competing continuation is truncated too.
         const bool canNee = depth+1 < max_depth && material->supportsNee(hit);

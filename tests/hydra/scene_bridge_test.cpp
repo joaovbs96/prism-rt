@@ -45,6 +45,7 @@
 PXR_NAMESPACE_USING_DIRECTIVE
 
 int RunAuthoredSettingsTests();
+int RunCoverageIntegrationTests();
 int RunB2DoublePrimvarIntegrationTests();
 int RunB3FallbackOpacityIntegrationTests();
 int RunC2GeometricAovIntegrationTests();
@@ -2313,5 +2314,6 @@ int main()
     thread.StopThread();
     int RunMultisampledPresentationTest();
     if (RunMultisampledPresentationTest() != 0) return 1;
+    ok &= RunCoverageIntegrationTests() == 0;
     return ok ? 0 : 1;
 }

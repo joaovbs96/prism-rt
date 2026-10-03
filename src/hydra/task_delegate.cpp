@@ -32,6 +32,7 @@ TfToken const _rouletteDepth("prism:rrMinDepth");
 TfToken const _seed("prism:seed");
 TfToken const _sampleClamp("prism:maxSampleRadiance");
 TfToken const _adaptivePreview("prism:adaptivePreview");
+TfToken const _domeCameraVisibility("domeLightCameraVisibility");
 TfToken const _sphereBatching("prism:sphereBatching");
 TfToken const _previewTargetMs("prism:previewTargetMs");
 TfToken const _previewMaxDimension("prism:previewMaxDimension");
@@ -180,6 +181,7 @@ HdRenderSettingDescriptorList PrismTaskDelegate::GetRenderSettingDescriptors() c
             {"Seed", _seed, VtValue(0)},
             {"Sample clamp", _sampleClamp, VtValue(10.0f)},
             {"Adaptive preview", _adaptivePreview, VtValue(true)},
+            {"Dome light camera visibility", _domeCameraVisibility, VtValue(true)},
             {"Sphere batching (experimental)", _sphereBatching, VtValue(false)},
             {"Preview target (ms)", _previewTargetMs, VtValue(33)},
             {"Preview maximum dimension", _previewMaxDimension, VtValue(96)},
@@ -202,6 +204,7 @@ VtValue PrismTaskDelegate::GetRenderSetting(TfToken const &key) const
     if (key == _seed) return VtValue(s.seed);
     if (key == _sampleClamp) return VtValue(s.sampleClamp);
     if (key == _adaptivePreview) return VtValue(s.adaptivePreview);
+    if (key == _domeCameraVisibility) return VtValue(s.domeLightCameraVisibility);
     if (key == _sphereBatching) return VtValue(s.sphereBatching);
     if (key == _previewTargetMs) return VtValue(s.previewTargetMs);
     if (key == _previewMaxDimension) return VtValue(s.previewMaxDimension);
@@ -290,6 +293,8 @@ void PrismTaskDelegate::SetRenderSetting(TfToken const &key, VtValue const &valu
     else if (key == _sampleClamp) s.sampleClamp = std::max(0.0f, _Get(value, s.sampleClamp));
     else if (key == _adaptivePreview)
         s.adaptivePreview = _Get(value, s.adaptivePreview);
+    else if (key == _domeCameraVisibility)
+        s.domeLightCameraVisibility = _Get(value, s.domeLightCameraVisibility);
     else if (key == _sphereBatching)
         s.sphereBatching = _Get(value, s.sphereBatching);
     else if (key == _previewTargetMs)

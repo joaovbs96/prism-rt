@@ -42,6 +42,7 @@ python tests/hydra/validate.py
 | `prism:adaptivePreview` | true | Adapt preview resolution using measured render time |
 | `prism:previewTargetMs` | 33 | Preview render-time target, clamped to 1-1000 ms |
 | `prism:refinementDelayMs` | 100 | Quiet interval before refinement, clamped to 0-2000 ms |
+| `domeLightCameraVisibility` | true | Show dome light in primary camera rays; secondary lighting remains enabled |
 | `prism:environmentSampling` | `mis` | Environment next-event sampling with MIS, or `bsdf` |
 | `prism:textureFiltering` | `filtered` | Footprint-based anisotropic mip filtering, or highest-resolution `bilinear` reference mode |
 | `prism:sphereBatching` | false | Experimental batches of at most 1,024 eligible analytic spheres; ordinary instancing remains the default |
@@ -70,6 +71,8 @@ after a topology notice until the replacement picking table publishes.
 The launcher also loads PrismRT's Python usdview extension from `tools/usdview_plugins`. Stock 26.05 usdview drops the selected instance index when forwarding selection to its scene index. Our extension forwards the selection model's original indices through the internal `prism:usdviewSelection` renderer setting, preserving individual-instance outlines without patching USD. It uses usdview's plugin registration and `StageView` renderer-setting methods; it does not replace usdview functions. Other hosts can supply complete Hydra selection data directly. Without the extension, stock usdview still renders and picks correctly, but individual-instance highlighting follows its upstream whole-prim selection limitation.
 
 The render buffers expose linear floating-point `color`, projected `depth` in `[0,1]`, `cameraDepth`, world `normal`, eye-space `Neye`, and integer `primId`, `instanceId`, and `elementId`. IDs and geometric AOVs use a deterministic center ray independent of antialiasing and depth-of-field samples. `elementId` refers to the coarse polygon face. Prim, instance, and face picking use visible primary intersections; edge, vertex, and deep picking are deferred.
+
+Color alpha accumulates primary coverage, including stochastic cutouts and silhouette samples. With no dome, or `domeLightCameraVisibility=false`, primary rays that escape the scene produce transparent black; unresolved early terminations retain coverage. A visible dome keeps opaque alpha. Changing dome camera visibility restarts preview and full accumulation.
 
 ## Standalone comparisons
 

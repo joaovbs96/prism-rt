@@ -2892,9 +2892,13 @@ PreviewResult _RenderPreview(std::shared_ptr<Snapshot> const &snapshot,
                 (px + 0x85ebca6bu) ^ (py * 0xc2b2ae35u));
             RayPair rays = prism::GenerateCameraRays(
                 cameraParameters, x, y, width, height, seed);
+            SceneManager::PrimaryOutcome outcome = SceneManager::PrimaryOutcome::Unresolved;
             Color3 color = snapshot->scene->trace(
                 prism::PathRay{rays.sampled, rays.footprint},
-                0, Color3(1.0f), seed);
+                0, Color3(1.0f), seed, &outcome);
+            const float coverage = (snapshot->domeCount == 0 || !settings.domeLightCameraVisibility) &&
+                outcome == SceneManager::PrimaryOutcome::Escaped ? 0.0f : 1.0f;
+            if (coverage == 0.0f) color = Color3(0.0f);
             if (settings.sampleClamp > 0.0f) {
                 const float peak = color.max_component();
                 if (peak > settings.sampleClamp)
@@ -2911,7 +2915,7 @@ PreviewResult _RenderPreview(std::shared_ptr<Snapshot> const &snapshot,
                 if (target.name == HdAovTokens->color) {
                     float *dst = target.floats.data() + pixel * 4;
                     dst[0] = color.x(); dst[1] = color.y();
-                    dst[2] = color.z(); dst[3] = 1.0f;
+                    dst[2] = color.z(); dst[3] = coverage;
                     continue;
                 }
                 if (!primary) continue;
@@ -3348,6 +3352,7 @@ void SceneBridge::SetSettings(RenderSettings const &settings)
             current.resourceRevision == settings.resourceRevision &&
             current.sphereBatching == settings.sphereBatching &&
             current.textureFiltering == settings.textureFiltering &&
+            current.domeLightCameraVisibility == settings.domeLightCameraVisibility &&
             current.environmentSampling == settings.environmentSampling)
             return;
         imageChanged = current.maxDepth != settings.maxDepth ||
@@ -3357,7 +3362,8 @@ void SceneBridge::SetSettings(RenderSettings const &settings)
             current.resourceRevision != settings.resourceRevision ||
             current.sphereBatching != settings.sphereBatching ||
             current.textureFiltering != settings.textureFiltering ||
-            current.environmentSampling != settings.environmentSampling;
+            current.environmentSampling != settings.environmentSampling ||
+            current.domeLightCameraVisibility != settings.domeLightCameraVisibility;
         budgetChanged = current.samples != settings.samples;
     }
     // Budget changes quiesce a staged pass without discarding committed work.
@@ -4253,6 +4259,7 @@ void SceneBridge::Render()
     const size_t scratchPixels = firstSample < sampleCount
         ? static_cast<size_t>(width) * height : 0;
     std::vector<Color3> passColors(scratchPixels);
+    std::vector<float> passCoverage(scratchPixels);
     std::vector<unsigned int> rngStates(scratchPixels);
     std::vector<std::optional<RayHit>> passPrimary;
     if (firstSample == 0) passPrimary.resize(passColors.size());
@@ -4273,15 +4280,20 @@ void SceneBridge::Render()
                         unsigned int &seed = rngStates[pixel];
                         RayPair rays = prism::GenerateCameraRays(
                             cameraParameters, x, y, width, height, seed);
+                        SceneManager::PrimaryOutcome outcome = SceneManager::PrimaryOutcome::Unresolved;
                         Color3 c = snapshot->scene->trace(
                             prism::PathRay{rays.sampled, rays.footprint},
-                            0, Color3(1.0f), seed);
+                            0, Color3(1.0f), seed, &outcome);
+                        const float coverage = (snapshot->domeCount == 0 || !settings.domeLightCameraVisibility) &&
+                            outcome == SceneManager::PrimaryOutcome::Escaped ? 0.0f : 1.0f;
+                        if (coverage == 0.0f) c = Color3(0.0f);
                         if (settings.sampleClamp > 0.0f) {
                             const float peak = c.max_component();
                             if (peak > settings.sampleClamp) c *= settings.sampleClamp / peak;
                         }
                         c *= camera.linearExposureScale;
                         passColors[pixel] = c;
+                        passCoverage[pixel] = coverage;
                         if (sample == 0)
                             passPrimary[pixel] = snapshot->scene->cast_ray(rays.center);
                     }
@@ -4314,7 +4326,7 @@ void SceneBridge::Render()
                                 ? std::chrono::steady_clock::now()
                                 : std::chrono::steady_clock::time_point{};
                             if (binding.aovName == HdAovTokens->color) {
-                                float v[4] = {c.x(), c.y(), c.z(), 1.0f};
+                                float v[4] = {c.x(), c.y(), c.z(), passCoverage[pixel]};
                                 buffer->WriteFloat(x, bufferY, v, 4, true);
                             } else if (!primary) {
                                 continue;

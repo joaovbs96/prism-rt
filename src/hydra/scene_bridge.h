@@ -32,6 +32,7 @@ struct RenderSettings {
     int seed = 0;
     float sampleClamp = 10.0f;
     bool adaptivePreview = true;
+    bool domeLightCameraVisibility = true;
     int previewTargetMs = 33;
     int previewMaxDimension = 96;
     int refinementDelayMs = 100;
