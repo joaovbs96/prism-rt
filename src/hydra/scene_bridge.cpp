@@ -390,6 +390,8 @@ struct MeshConversionInfo {
     bool motionBlur = false;
     bool multipleUvSets = false;
     bool subdivisionControlHull = false;
+    bool missingPoints = false;
+    bool unsupportedPoints = false;
 };
 
 // Geometry allocates its transform as a raw pointer; free it with a mesh that
@@ -412,6 +414,7 @@ struct MeshConversion {
 struct PrototypePool {
     std::mutex mutex;
     std::unordered_map<size_t, std::vector<std::weak_ptr<PrototypeStorage>>> buckets;
+    std::unordered_set<SdfPath, SdfPath::Hash> warnedPointPaths;
     // Captured prim data sources are immutable, so an unchanged handle means
     // an unchanged conversion. Each entry holds its handle so the address
     // cannot be reused while it serves as the key.
@@ -717,14 +720,31 @@ MeshConversion _ConvertMesh(HdContainerDataSourceHandle const &dataSource)
         !_ReadArray(topology.GetFaceVertexIndices(), &readIndices)) return result;
     _ReadArray(topology.GetHoleIndices(), &readHoles);
     PrimvarData pointsPv = _Primvar(primvars, HdPrimvarsSchemaTokens->points);
-    if (!pointsPv.value.IsHolding<VtVec3fArray>()) return result;
+    VtVec3fArray const *pointsFloat = nullptr;
+    VtVec3dArray const *pointsDouble = nullptr;
+    if (pointsPv.value.IsHolding<VtVec3fArray>()) {
+        pointsFloat = &pointsPv.value.UncheckedGet<VtVec3fArray>();
+    } else if (pointsPv.value.IsHolding<VtVec3dArray>()) {
+        pointsDouble = &pointsPv.value.UncheckedGet<VtVec3dArray>();
+    } else {
+        info.missingPoints = pointsPv.value.IsEmpty();
+        info.unsupportedPoints = !pointsPv.value.IsEmpty();
+        return result;
+    }
+    const size_t pointCount = pointsFloat ? pointsFloat->size() : pointsDouble->size();
+    auto pointAt = [&](size_t i) -> GfVec3d {
+        return pointsFloat ? GfVec3d((*pointsFloat)[i])
+                           : GfVec3d(GfVec3f((*pointsDouble)[i]));
+    };
     // Const views: indexing a non-const VtArray detaches (copies) the buffer
     // it still shares with the captured data source.
     VtIntArray const counts = std::move(readCounts);
     VtIntArray const indices = std::move(readIndices);
     VtIntArray const holes = std::move(readHoles);
-    VtVec3fArray const points = pointsPv.value.UncheckedGet<VtVec3fArray>();
-    if (points.empty()) return result;
+    if (pointCount == 0) {
+        info.missingPoints = true;
+        return result;
+    }
     info.topologyRead = true;
     info.faceCount = counts.size();
 
@@ -733,12 +753,28 @@ MeshConversion _ConvertMesh(HdContainerDataSourceHandle const &dataSource)
     PrimvarData const alternateUvPv = _Primvar(primvars, TfToken("uv"));
     info.multipleUvSets = !uvPv.value.IsEmpty() && !alternateUvPv.value.IsEmpty();
     if (uvPv.value.IsEmpty()) uvPv = alternateUvPv;
-    VtVec3fArray const authoredNormals =
-        normalPv.value.IsHolding<VtVec3fArray>()
-            ? normalPv.value.UncheckedGet<VtVec3fArray>() : VtVec3fArray();
-    VtVec2fArray const authoredUvs =
-        uvPv.value.IsHolding<VtVec2fArray>()
-            ? uvPv.value.UncheckedGet<VtVec2fArray>() : VtVec2fArray();
+    VtVec3fArray const *authoredNormalsFloat = nullptr;
+    VtVec3dArray const *authoredNormalsDouble = nullptr;
+    if (normalPv.value.IsHolding<VtVec3fArray>()) {
+        authoredNormalsFloat = &normalPv.value.UncheckedGet<VtVec3fArray>();
+    } else if (normalPv.value.IsHolding<VtVec3dArray>()) {
+        authoredNormalsDouble = &normalPv.value.UncheckedGet<VtVec3dArray>();
+    }
+    const size_t authoredNormalCount = authoredNormalsFloat
+        ? authoredNormalsFloat->size() : (authoredNormalsDouble ? authoredNormalsDouble->size() : 0);
+    auto authoredNormalAt = [&](size_t i) -> GfVec3d {
+        return authoredNormalsFloat ? GfVec3d((*authoredNormalsFloat)[i])
+            : GfVec3d(GfVec3f((*authoredNormalsDouble)[i]));
+    };
+    VtVec2fArray const *authoredUvsFloat = nullptr;
+    VtVec2dArray const *authoredUvsDouble = nullptr;
+    if (uvPv.value.IsHolding<VtVec2fArray>()) {
+        authoredUvsFloat = &uvPv.value.UncheckedGet<VtVec2fArray>();
+    } else if (uvPv.value.IsHolding<VtVec2dArray>()) {
+        authoredUvsDouble = &uvPv.value.UncheckedGet<VtVec2dArray>();
+    }
+    const size_t authoredUvCount = authoredUvsFloat
+        ? authoredUvsFloat->size() : (authoredUvsDouble ? authoredUvsDouble->size() : 0);
 
     TfToken orientation = HdMeshTopologySchemaTokens->rightHanded;
     if (auto o = topology.GetOrientation()) orientation = o->GetTypedValue(0.0f);
@@ -756,7 +792,7 @@ MeshConversion _ConvertMesh(HdContainerDataSourceHandle const &dataSource)
     // partially authored: accumulate one area-weighted coarse-face normal at
     // each referenced point. Keep this in prototype space; placement applies
     // the inverse transpose later.
-    std::vector<GfVec3d> generatedNormals(points.size(), GfVec3d(0.0));
+    std::vector<GfVec3d> generatedNormals(pointCount, GfVec3d(0.0));
     size_t generatedCorner = 0;
     size_t triangleEstimate = 0;
     for (size_t face = 0; face < counts.size(); ++face) {
@@ -773,15 +809,14 @@ MeshConversion _ConvertMesh(HdContainerDataSourceHandle const &dataSource)
         bool valid = true;
         for (int k = 0; k < count; ++k) {
             const int pi = indices[generatedCorner + k];
-            valid &= pi >= 0 && static_cast<size_t>(pi) < points.size();
+            valid &= pi >= 0 && static_cast<size_t>(pi) < pointCount;
         }
         if (valid) {
             const int p0 = indices[generatedCorner];
             const int p1 = indices[generatedCorner + 1];
             const int p2 = indices[generatedCorner + 2];
             GfVec3d contribution = GfCross(
-                GfVec3d(points[p1]) - GfVec3d(points[p0]),
-                GfVec3d(points[p2]) - GfVec3d(points[p0]));
+                pointAt(p1) - pointAt(p0), pointAt(p2) - pointAt(p0));
             if (flip) contribution = -contribution;
             for (int k = 0; k < count; ++k)
                 generatedNormals[indices[generatedCorner + k]] += contribution;
@@ -812,11 +847,11 @@ MeshConversion _ConvertMesh(HdContainerDataSourceHandle const &dataSource)
         bool validFace = true;
         for (int k = 0; k < count; ++k) {
             int const pi = indices[corner + k];
-            if (pi < 0 || static_cast<size_t>(pi) >= points.size()) {
+            if (pi < 0 || static_cast<size_t>(pi) >= pointCount) {
                 validFace = false;
                 break;
             }
-            facePoints.emplace_back(points[pi]);
+            facePoints.emplace_back(pointAt(pi));
         }
         if (!validFace) {
             ++info.malformedFaceCount;
@@ -840,13 +875,21 @@ MeshConversion _ConvertMesh(HdContainerDataSourceHandle const &dataSource)
             for (int v = 0; v < 3; ++v) {
                 const size_t ci = corner + local[v];
                 const int pi = indices[ci];
-                wp[v] = geometryTransform.Transform(GfVec3d(points[pi]));
+                wp[v] = geometryTransform.Transform(pointAt(pi));
                 mesh->vertices.emplace_back(static_cast<float>(wp[v][0]),
                                             static_cast<float>(wp[v][1]),
                                             static_cast<float>(wp[v][2]));
                 const size_t ui = _PrimvarIndex(uvPv.interpolation, pi, ci, face);
-                if (ui < authoredUvs.size()) mesh->texcoords.emplace_back(
-                    authoredUvs[ui][0], authoredUvs[ui][1]);
+                if (ui < authoredUvCount) {
+                    if (authoredUvsFloat) {
+                        mesh->texcoords.emplace_back((*authoredUvsFloat)[ui][0],
+                                                     (*authoredUvsFloat)[ui][1]);
+                    } else {
+                        mesh->texcoords.emplace_back(
+                            static_cast<float>((*authoredUvsDouble)[ui][0]),
+                            static_cast<float>((*authoredUvsDouble)[ui][1]));
+                    }
+                }
                 else mesh->texcoords.emplace_back(0.0f, 0.0f);
             }
             const GfVec3d geometric = GfCross(wp[1] - wp[0], wp[2] - wp[0]).GetNormalized();
@@ -855,8 +898,8 @@ MeshConversion _ConvertMesh(HdContainerDataSourceHandle const &dataSource)
                 const int pi = indices[ci];
                 const size_t ni = _PrimvarIndex(normalPv.interpolation, pi, ci, face);
                 GfVec3d n = geometric;
-                if (ni < authoredNormals.size()) {
-                    GfVec3d authored(authoredNormals[ni]);
+                if (ni < authoredNormalCount) {
+                    GfVec3d authored = authoredNormalAt(ni);
                     if (authored.GetLengthSq() > 1e-20 &&
                         std::isfinite(authored.GetLengthSq())) {
                         n = normalMatrix.TransformDir(authored).GetNormalized();
@@ -897,7 +940,7 @@ MeshConversion _ConvertMesh(HdContainerDataSourceHandle const &dataSource)
     uniqueVertices.reserve(mesh->vertices.size());
     // Shared corners usually make the compact arrays far smaller than the
     // expanded ones; the authored point count is the closest cheap guess.
-    const size_t compactEstimate = std::min(mesh->vertices.size(), points.size());
+    const size_t compactEstimate = std::min(mesh->vertices.size(), pointCount);
     std::vector<Float3> compactPositions, compactNormals;
     std::vector<Float2> compactUvs;
     std::vector<float> compactTangents;
@@ -1066,6 +1109,18 @@ bool _AppendMesh(HdSceneIndexBaseRefPtr const &sceneIndex,
     if (snapshot->warnedMotionPaths.insert(path).second && info.motionBlur) {
         TF_WARN("PrismRT: motion blur authored on <%s> is not supported; using time 0",
                 path.GetText());
+    }
+    if (info.missingPoints || info.unsupportedPoints) {
+        bool shouldWarn = false;
+        {
+            std::lock_guard lock(snapshot->prototypePool->mutex);
+            shouldWarn = snapshot->prototypePool->warnedPointPaths.insert(path).second;
+        }
+        if (shouldWarn) {
+            TF_WARN("PrismRT: mesh <%s> skipped because points are %s",
+                path.GetText(), info.missingPoints ? "missing" : "an unsupported type");
+        }
+        return false;
     }
     if (!info.topologyRead) return false;
     if (info.multipleUvSets &&

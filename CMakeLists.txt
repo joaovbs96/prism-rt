@@ -257,6 +257,7 @@ if(PRISM_BUILD_HYDRA)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/scene_bridge_test.cpp")
         add_executable(prism_hydra_scene_bridge_test
             tests/hydra/scene_bridge_test.cpp
+            tests/hydra/b2_double_primvar_integration_test.cpp
             tests/hydra/task_delegate_settings_test.cpp
             src/hydra/scene_bridge.cpp
             src/hydra/materials.cpp

@@ -45,6 +45,7 @@
 PXR_NAMESPACE_USING_DIRECTIVE
 
 int RunAuthoredSettingsTests();
+int RunB2DoublePrimvarIntegrationTests();
 
 namespace {
 
@@ -633,6 +634,7 @@ int main()
     setenv("PRISM_CACHE_DIR", testCache.c_str(), 1);
 #endif
     if (RunAuthoredSettingsTests() != 0) return 1;
+    if (RunB2DoublePrimvarIntegrationTests() != 0) return 1;
     bool flatTangent = false, nativeTangent = false;
     bool flatMirroredTangent = false, nativeMirroredTangent = false;
     const Color3 flat = TraceTriangle(false, false, &flatTangent);
