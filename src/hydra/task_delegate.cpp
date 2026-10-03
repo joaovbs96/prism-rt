@@ -346,7 +346,11 @@ VtDictionary PrismTaskDelegate::GetRenderStats() const
 }
 bool PrismTaskDelegate::Pause() { _thread->PauseRender(); return true; }
 bool PrismTaskDelegate::Resume() { _thread->ResumeRender(); return true; }
-bool PrismTaskDelegate::Stop(bool) { _thread->StopRender(); return true; }
+bool PrismTaskDelegate::Stop(bool) {
+    // HdRenderThread exposes only the blocking StopRender operation here.
+    _thread->StopRender();
+    return true;
+}
 bool PrismTaskDelegate::Restart()
 { if (_bridge) _bridge->RestartAccumulation(); return true; }
 

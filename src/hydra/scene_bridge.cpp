@@ -3976,7 +3976,7 @@ void SceneBridge::Render()
         if (_impl->renderThread->IsStopRequested()) return;
         while (_impl->renderThread->IsPauseRequested()) {
             if (_impl->renderThread->IsStopRequested()) return;
-            std::this_thread::yield();
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
         tbb::parallel_for(tbb::blocked_range2d<unsigned int>(0, height, 8, 0, width, 8),
             [&](tbb::blocked_range2d<unsigned int> const &range) {
