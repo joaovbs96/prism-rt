@@ -3815,7 +3815,12 @@ bool SceneBridge::Prepare(CameraState const &camera,
             _impl->camera.orthographic != camera.orthographic ||
             _impl->camera.linearExposureScale != camera.linearExposureScale ||
             _impl->width != width || _impl->height != height;
-        bindingsChanged = _impl->bindings != bindings ||
+        auto renderBindings = bindings;
+        auto previousBindings = _impl->bindings;
+        // Color clear values belong to viewport presentation, not traced RGBA.
+        for (auto &b : renderBindings) if (b.aovName == HdAovTokens->color) b.clearValue = VtValue();
+        for (auto &b : previousBindings) if (b.aovName == HdAovTokens->color) b.clearValue = VtValue();
+        bindingsChanged = previousBindings != renderBindings ||
             _impl->bindingAllocationRevisions != allocationRevisions;
         renderTagsChanged = _impl->renderTags != renderTags;
         stateChanged = _impl->stateDirty;

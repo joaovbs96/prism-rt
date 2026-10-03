@@ -206,6 +206,14 @@ if(PRISM_BUILD_HYDRA)
                     "${CMAKE_BINARY_DIR}/hydra/parity_hydra.exr"
                     128 128 16 --exercise)
             set_tests_properties(prism_hydra_render_exercise PROPERTIES ENVIRONMENT "${_prism_test_environment}")
+            add_test(NAME prism_hydra_transparent_background_export
+                COMMAND prism_hydra_render
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/parity.usda"
+                    "/World/Camera"
+                    "${CMAKE_BINARY_DIR}/hydra/parity_hydra_transparent.exr"
+                    128 128 16 --hide-dome-background)
+            set_tests_properties(prism_hydra_transparent_background_export PROPERTIES
+                ENVIRONMENT "${_prism_test_environment}")
         endif()
         if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/animated.usda")
             add_test(NAME prism_hydra_animation_exercise

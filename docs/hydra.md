@@ -51,6 +51,19 @@ python tests/hydra/validate.py
 | `prism:selectionOutlineRadius` | 2 | Outline thickness in pixels |
 | `prism:selectionUseHostSettings` | false | Use the host's Hdx outline parameters instead of PrismRT's overrides |
 
+PrismRT follows usdview's dome-visibility and background controls. With dome
+camera visibility enabled, the environment remains visible to primary rays.
+When it is disabled, escaped primary rays are transparent in the raw color
+AOV; usdview composites those pixels over its selected clear color for the
+viewport. That presentation copy does not alter the render buffer, so image
+exports retain transparent RGBA background pixels. This keeps viewport
+screenshots opaque while PNG and EXR renders preserve alpha for later
+compositing. `tests/hydra/usdview_background.py` exercises both dome states and
+host clear colors in a real usdview session, then records PNG and EXR files
+through OpenUSD's FrameRecorder and checks their saved alpha channels. The
+post-fix run passed; screenshots, exports, and logs are in
+`build/hydra-background-final`.
+
 Selection reuses `HdxColorizeSelectionTask`, with native prim/instance/face IDs supplying its selection mask. usdview retains control of highlight color and highlight visibility. Outline changes affect presentation and do not restart accumulation. Host applications can supply `enableOutline` and `outlineRadius` through the standard Hdx task parameters when `prism:selectionUseHostSettings` is enabled.
 
 Selection-offset encoding is cached independently of the camera. Its bounded

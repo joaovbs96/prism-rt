@@ -12,10 +12,14 @@
 #include <pxr/imaging/hd/instancerTopologySchema.h>
 #include <pxr/imaging/hd/tokens.h>
 #include <pxr/imaging/hdx/colorizeSelectionTask.h>
+#include <pxr/imaging/hdx/aovInputTask.h>
 #include <pxr/imaging/hdx/pickFromRenderBufferTask.h>
 #include <pxr/imaging/hdx/selectionTracker.h>
 #include <pxr/imaging/hdx/tokens.h>
 #include <pxr/imaging/cameraUtil/conformWindow.h>
+#include <pxr/imaging/hgi/hgi.h>
+#include <pxr/imaging/hgi/blitCmds.h>
+#include <pxr/imaging/hgi/blitCmdsOps.h>
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -526,6 +530,89 @@ private:
     HdCamera* camera=nullptr;
 };
 
+// Leave the CPU AOV unchanged for image export. The stock input task manages
+// depth, intermediate targets and Hgi frame lifetime; only its color upload
+// receives a viewport background, before stock color correction runs.
+class PresentationInputTask final : public HdxAovInputTask {
+public:
+    PresentationInputTask(HdSceneDelegate *delegate, SdfPath const &id)
+        : HdxAovInputTask(delegate, id) {}
+    // The stock override is not exported from OpenUSD's Windows DLL. Cache
+    // readiness before upload just as it does, so an exporter cannot accept
+    // an older texture when the render worker finishes during Execute.
+    bool IsConverged() const override { return uploadedConverged; }
+    void Prepare(HdTaskContext *ctx, HdRenderIndex *index) override {
+        HdxAovInputTask::Prepare(ctx, index);
+        aovBuffer = aovPath.IsEmpty() ? nullptr : dynamic_cast<HdRenderBuffer *>(index->GetBprim(
+            HdPrimTypeTokens->renderBuffer, aovPath));
+        buffer = dynamic_cast<PrismRenderBuffer *>(aovBuffer);
+        depthBuffer = depthPath.IsEmpty() ? nullptr : dynamic_cast<HdRenderBuffer *>(index->GetBprim(
+            HdPrimTypeTokens->renderBuffer, depthPath));
+    }
+    void Execute(HdTaskContext *ctx) override {
+        const bool readyBeforeUpload = !aovBuffer || (aovBuffer->IsConverged() &&
+            (!depthBuffer || depthBuffer->IsConverged()));
+        uploadedConverged = false;
+        // Pin the same immutable publication for the stock upload and the
+        // presentation copy even if a sample pass publishes during Execute.
+        struct Mapping {
+            PrismRenderBuffer *buffer;
+            explicit Mapping(PrismRenderBuffer *buffer) : buffer(buffer) {
+                if (buffer) buffer->Map();
+            }
+            ~Mapping() { if (buffer) buffer->Unmap(); }
+        } mapping(buffer);
+        HdxAovInputTask::Execute(ctx);
+        UploadPresentation(ctx);
+        auto latest = [](HdRenderBuffer *candidate) {
+            auto *prism = dynamic_cast<PrismRenderBuffer *>(candidate);
+            return !prism || prism->Capture().pixels == prism->CapturePublished().pixels;
+        };
+        // Native selection may pin an earlier frame before this task uploads.
+        // Require another Execute after that mapping is released.
+        uploadedConverged = readyBeforeUpload && latest(aovBuffer) && latest(depthBuffer);
+    }
+private:
+    void UploadPresentation(HdTaskContext *ctx) {
+        if (!buffer) return;
+        auto const raw = buffer->Capture();
+        auto const presentation = buffer->CapturePresentation();
+        if (presentation.pixels == raw.pixels || !presentation.pixels) return;
+        auto const color = ctx->find(HdAovTokens->color);
+        if (color == ctx->end() || !color->second.IsHolding<HgiTextureHandle>()) return;
+        auto texture = color->second.UncheckedGet<HgiTextureHandle>();
+        if (!texture || texture->GetDescriptor().format != HgiFormatFloat32Vec4 ||
+            texture->GetDescriptor().dimensions != GfVec3i(presentation.width, presentation.height, 1)) return;
+        HgiTextureCpuToGpuOp upload;
+        upload.bufferByteSize = presentation.pixels->size();
+        upload.cpuSourceBuffer = presentation.pixels->data();
+        upload.gpuDestinationTexture = texture;
+        auto commands = _GetHgi()->CreateBlitCmds();
+        commands->PushDebugGroup("Prism viewport background");
+        commands->CopyTextureCpuToGpu(upload);
+        commands->PopDebugGroup();
+        _GetHgi()->SubmitCmds(commands.get());
+    }
+protected:
+    void _Sync(HdSceneDelegate *delegate, HdTaskContext *ctx, HdDirtyBits *dirty) override {
+        if (*dirty & HdChangeTracker::DirtyParams) {
+            HdxAovInputTaskParams params;
+            if (_GetTaskParams(delegate, &params)) {
+                aovPath = params.aovBufferPath;
+                depthPath = params.depthBufferPath;
+            }
+        }
+        HdxAovInputTask::_Sync(delegate, ctx, dirty);
+    }
+private:
+    SdfPath aovPath;
+    SdfPath depthPath;
+    HdRenderBuffer *aovBuffer = nullptr;
+    HdRenderBuffer *depthBuffer = nullptr;
+    PrismRenderBuffer *buffer = nullptr;
+    bool uploadedConverged = false;
+};
+
 class Factory final : public HdLegacyTaskFactory {
 public:
     Factory(HdLegacyTaskFactorySharedPtr original,HdSceneIndexBaseRefPtr scene,
@@ -533,6 +620,7 @@ public:
         : original(std::move(original)),scene(std::move(scene)),context(std::move(context)) {}
     HdTaskSharedPtr Create(HdSceneDelegate* delegate,SdfPath const& id) override {
         auto task=original->Create(delegate,id);
+        if(dynamic_cast<HdxAovInputTask*>(task.get())) return std::make_shared<PresentationInputTask>(delegate,id);
         if(dynamic_cast<HdxPickFromRenderBufferTask*>(task.get())) return std::make_shared<NativePickTask>(delegate,id,context);
         if(dynamic_cast<HdxColorizeSelectionTask*>(task.get())) return std::make_shared<NativeSelectionTask>(delegate,id,scene,context);
         return task;

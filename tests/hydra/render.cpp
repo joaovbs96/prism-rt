@@ -17,17 +17,21 @@
 #include <memory>
 #include <stdexcept>
 #include <thread>
+#include <utility>
 #include <vector>
 
 PXR_NAMESPACE_USING_DIRECTIVE
 
 namespace {
 void render(UsdImagingGLEngine& engine, const UsdStageRefPtr& stage,
-            UsdTimeCode frame = UsdTimeCode::Default()) {
+            UsdTimeCode frame = UsdTimeCode::Default(),
+            bool domeLightCameraVisibility = true) {
     UsdImagingGLRenderParams params;
     params.frame = frame;
     params.enableSceneMaterials = true;
     params.enableSceneLights = true;
+    engine.SetRendererSetting(TfToken("domeLightCameraVisibility"),
+                              VtValue(domeLightCameraVisibility));
     const auto start = std::chrono::steady_clock::now();
     do {
         engine.Render(stage->GetPseudoRoot(), params);
@@ -209,8 +213,30 @@ void checkFixtureAovs(UsdImagingGLEngine& engine) {
 
 int main(int argc, char** argv) {
     try {
+        if (argc == 3 && std::string(argv[1]) == "--check-transparent-alpha") {
+            OIIO::ImageBuf saved(argv[2]);
+            if (!saved.read(0, 0, true, OIIO::TypeDesc::FLOAT))
+                throw std::runtime_error("Cannot read export: " + saved.geterror());
+            const auto &spec = saved.spec();
+            if (spec.nchannels < 4 || spec.width <= 0 || spec.height <= 0)
+                throw std::runtime_error("Export has no RGBA channel data");
+            std::vector<float> pixel(size_t(spec.nchannels));
+            int transparentCorners = 0;
+            for (const auto &corner : {std::pair<int,int>{0,0}, {spec.width-1,0},
+                                       {0,spec.height-1}, {spec.width-1,spec.height-1}}) {
+                saved.getpixel(corner.first, corner.second, pixel.data(), spec.nchannels);
+                if (pixel[3] <= 0.001f) ++transparentCorners;
+            }
+            if (transparentCorners != 4)
+                throw std::runtime_error("Saved export corner pixels are not transparent");
+            saved.getpixel(spec.width/2, spec.height/2, pixel.data(), spec.nchannels);
+            if (pixel[3] < .99f)
+                throw std::runtime_error("Saved export geometry pixel is not opaque");
+            std::cout << "Transparent export alpha verified: " << argv[2] << '\n';
+            return 0;
+        }
         if (argc < 4) {
-            std::cerr << "usage: prism_hydra_render scene.usda /Camera output.exr [width height spp [--exercise] [--animation-exercise] [--environment-sampling mis|bsdf] [--sample-clamp N] [--seed N] [--sphere-batching]]\n";
+            std::cerr << "usage: prism_hydra_render scene.usda /Camera output.exr [width height spp [--exercise] [--animation-exercise] [--hide-dome-background] [--environment-sampling mis|bsdf] [--sample-clamp N] [--seed N] [--sphere-batching]]\n";
             return 2;
         }
         const int width = argc > 4 ? std::stoi(argv[4]) : 128;
@@ -219,6 +245,7 @@ int main(int argc, char** argv) {
         bool exercise = false;
         bool animationExercise = false;
         bool sphereBatching = false;
+        bool hideDomeBackground = false;
         std::string sampling = "mis";
         std::string filtering = "filtered";
         float sampleClamp = 10.0f;
@@ -228,6 +255,7 @@ int main(int argc, char** argv) {
             if (option == "--exercise") { exercise = true; continue; }
             if (option == "--animation-exercise") { animationExercise = true; continue; }
             if (option == "--sphere-batching") { sphereBatching = true; continue; }
+            if (option == "--hide-dome-background") { hideDomeBackground = true; continue; }
             if (++i >= argc) throw std::runtime_error("Missing option value: " + option);
             if (option == "--environment-sampling") sampling = argv[i];
             else if (option == "--texture-filtering") filtering = argv[i];
@@ -270,7 +298,7 @@ int main(int argc, char** argv) {
             std::cout << "Hydra animation exercise passed\n";
             return 0;
         }
-        render(engine, stage);
+        render(engine, stage, UsdTimeCode::Default(), !hideDomeBackground);
         for (const auto& [name,value] : engine.GetRenderStats())
             std::cout << "Render stat " << name << ": " << value << '\n';
         // Some SDK/plugin shutdown paths terminate the process without
@@ -279,6 +307,13 @@ int main(int argc, char** argv) {
         // on them even in those runtimes.
         std::cout.flush();
         const auto initial = pixels(engine, width, height);
+        const size_t backgroundAlpha = 3;
+        const size_t centerAlpha = (size_t(height / 2) * width + width / 2) * 4 + 3;
+        if (hideDomeBackground) {
+            if (initial[backgroundAlpha] != 0.0f || initial[centerAlpha] < 0.99f)
+                throw std::runtime_error(
+                    "Hidden-dome export must keep background transparent and geometry opaque");
+        }
         std::cout << "Center normal: "
                   << center<GfVec3f>(engine, HdAovTokens->normal, HdFormatFloat32Vec3)
                   << "; camera depth: "
@@ -286,6 +321,19 @@ int main(int argc, char** argv) {
         OIIO::ImageBuf image(OIIO::ImageSpec(width, height, 4, OIIO::TypeDesc::FLOAT));
         image.set_pixels(OIIO::ROI(), OIIO::TypeDesc::FLOAT, initial.data());
         if (!image.write(argv[3])) throw std::runtime_error(image.geterror());
+        if (hideDomeBackground) {
+            OIIO::ImageBuf saved(argv[3]);
+            if (!saved.read(0, 0, true, OIIO::TypeDesc::FLOAT))
+                throw std::runtime_error("Cannot read back transparent export: " + saved.geterror());
+            if (saved.spec().nchannels != 4)
+                throw std::runtime_error("Transparent export did not preserve four color channels");
+            std::vector<float> exported(size_t(width) * height * 4);
+            if (!saved.get_pixels(OIIO::ROI(), OIIO::TypeDesc::FLOAT, exported.data()))
+                throw std::runtime_error("Cannot inspect exported color channels: " + saved.geterror());
+            if (exported[backgroundAlpha] != 0.0f || exported[centerAlpha] < 0.99f)
+                throw std::runtime_error(
+                    "Saved export must retain transparent background and opaque geometry");
+        }
         if (exercise) {
             checkFixtureAovs(engine);
             // Same scene + seed must remain stable when asked to render again.

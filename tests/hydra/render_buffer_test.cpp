@@ -228,6 +228,47 @@ int main() {
         PrismRenderBuffer unsupported(SdfPath("/unsupported"), nullptr);
         if (unsupported.Allocate(GfVec3i(1, 1, 1), HdFormatFloat32UInt8, false))
             throw std::runtime_error("unsupported packed format was allocated");
+        PrismRenderBuffer presentation(SdfPath("/presentation"), nullptr);
+        presentation.Allocate(GfVec3i(3, 1, 1), HdFormatFloat32Vec4, false);
+        const float miss[4] = {0, 0, 0, 0};
+        const float edge[4] = {.125f, .25f, .375f, .5f};
+        const float opaque[4] = {2, 3, 4, 1};
+        presentation.WriteFloat(0, 0, miss, 4, false);
+        presentation.WriteFloat(1, 0, edge, 4, false);
+        presentation.WriteFloat(2, 0, opaque, 4, false);
+        presentation.Publish(frame);
+        auto raw = presentation.Capture();
+        const auto original = *raw.pixels;
+        presentation.SetPresentationClearColor(VtValue(GfVec4f(.25f, .5f, .75f, 1)));
+        auto viewport = presentation.CapturePresentation();
+        const float *shown = reinterpret_cast<float const *>(viewport.pixels->data());
+        const float expected[12] = {.25f, .5f, .75f, 1, .25f, .5f, .75f, 1, 2, 3, 4, 1};
+        if (!std::equal(shown, shown + 12, expected) || viewport.frame != frame ||
+            *presentation.Capture().pixels != original)
+            throw std::runtime_error("viewport background changed raw RGBA or mishandled premultiplied edges");
+        if (presentation.CapturePresentation().pixels != viewport.pixels)
+            throw std::runtime_error("unchanged viewport upload rebuilt its presentation copy");
+        const float *exported = static_cast<float const *>(presentation.Map());
+        if (!std::equal(exported, exported + 4, miss) || !std::equal(exported + 4, exported + 8, edge))
+            throw std::runtime_error("rendered-image mapping contains the viewport background");
+        presentation.Unmap();
+        presentation.SetPresentationClearColor(VtValue(GfVec4f(.5f, .25f, 0, 1)));
+        auto changedBackground = presentation.CapturePresentation();
+        const float *changed = reinterpret_cast<float const *>(changedBackground.pixels->data());
+        if (changed[0] != .5f || changed[1] != .25f || changed[2] != 0 ||
+            *presentation.Capture().pixels != original || !std::equal(shown, shown + 12, expected))
+            throw std::runtime_error("clear color update changed raw pixels or an immutable presentation copy");
+        presentation.SetPresentationClearColor(VtValue(GfVec4f(.25f, .5f, .75f, 0)));
+        if (presentation.CapturePresentation().pixels != raw.pixels)
+            throw std::runtime_error("transparent GPU export clear changed raw RGBA upload");
+        presentation.SetPresentationClearColor(VtValue(GfVec4f(.25f, .5f, .75f, .5f)));
+        auto translucent = presentation.CapturePresentation();
+        const float *partial = reinterpret_cast<float const *>(translucent.pixels->data());
+        if (partial[0] != .125f || partial[3] != .5f || partial[4] != .1875f || partial[7] != .75f)
+            throw std::runtime_error("presentation upload ignored clear color alpha");
+        presentation.SetPresentationClearColor(VtValue());
+        if (presentation.CapturePresentation().pixels != raw.pixels)
+            throw std::runtime_error("non-color AOV was composited with the background");
         std::cout << "Mapped storage survives publication, nested maps, and resize\n";
     } catch(const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
 }

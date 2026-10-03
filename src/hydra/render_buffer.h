@@ -1,6 +1,7 @@
 #pragma once
 
 #include "pxr/imaging/hd/renderBuffer.h"
+#include "pxr/base/gf/vec4f.h"
 
 #include <atomic>
 #include <cstdint>
@@ -57,6 +58,11 @@ public:
     // Pixels and their picking/camera metadata are one immutable publication.
     // The view stays valid through later publication and buffer allocation.
     ReadView Capture() const;
+    ReadView CapturePublished() const;
+    // Only the viewport upload uses this composited copy. Map/Capture retain
+    // the original premultiplied RGBA for rendered-image export.
+    void SetPresentationClearColor(VtValue const &value);
+    ReadView CapturePresentation() const;
     void Publish(Frame frame = {});
     void PublishPreviewFloat(unsigned int previewWidth,
                              unsigned int previewHeight,
@@ -116,6 +122,11 @@ private:
     std::atomic<uint64_t> _mapWaitNanoseconds{0};
     bool _hasPublished = false;
     bool _initialCleared = false;
+    bool _hasPresentationClearColor = false;
+    GfVec4f _presentationClearColor{0.0f};
+    mutable std::weak_ptr<const std::vector<uint8_t>> _presentationSource;
+    mutable std::shared_ptr<const std::vector<uint8_t>> _presentationPixels;
+    mutable GfVec4f _cachedPresentationClearColor{0.0f};
     HdRenderThread *_renderThread;
 };
 

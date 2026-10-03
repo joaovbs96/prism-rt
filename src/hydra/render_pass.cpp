@@ -5,6 +5,7 @@
 #include "pass_camera.h"
 
 #include "pxr/imaging/hd/renderPassState.h"
+#include "pxr/imaging/hd/aov.h"
 #include "pxr/imaging/hd/renderThread.h"
 #include "pxr/base/tf/diagnostic.h"
 
@@ -28,6 +29,9 @@ void PrismRenderPass::_Execute(HdRenderPassStateSharedPtr const &state,
     unsigned int width = 0, height = 0;
     std::vector<GfVec2i> dimensions;
     for (HdRenderPassAovBinding const &binding : bindings) {
+        if (auto *buffer = dynamic_cast<PrismRenderBuffer *>(binding.renderBuffer))
+            buffer->SetPresentationClearColor(binding.aovName == HdAovTokens->color
+                ? binding.clearValue : VtValue());
         if (binding.renderBuffer)
             dimensions.emplace_back(binding.renderBuffer->GetWidth(),
                                     binding.renderBuffer->GetHeight());

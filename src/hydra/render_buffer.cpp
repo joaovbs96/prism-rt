@@ -53,6 +53,8 @@ bool PrismRenderBuffer::Allocate(GfVec3i const &d, HdFormat format, bool ms)
     _pixels = std::make_shared<std::vector<uint8_t>>(
         static_cast<size_t>(_width) * _height * HdDataSizeOfFormat(_format), 0);
     _frame.reset();
+    _presentationSource.reset();
+    _presentationPixels.reset();
     _workingPixels = *_pixels;
     _accumulation.assign(static_cast<size_t>(_width) * _height *
                              HdGetComponentCount(_format), 0.0f);
@@ -73,6 +75,8 @@ void PrismRenderBuffer::_Deallocate()
     _format = HdFormatInvalid;
     _pixels.reset();
     _frame.reset();
+    _presentationSource.reset();
+    _presentationPixels.reset();
     _workingPixels.clear();
     _accumulation.clear();
     _sampleCounts.clear();
@@ -112,7 +116,71 @@ PrismRenderBuffer::ReadView PrismRenderBuffer::Capture() const
     return {_pixels,_frame,_width,_height,_format};
 }
 
+void PrismRenderBuffer::SetPresentationClearColor(VtValue const &value)
+{
+    std::lock_guard lock(_mutex);
+    const bool hasColor = value.IsHolding<GfVec4f>();
+    const GfVec4f color = hasColor ? value.UncheckedGet<GfVec4f>() : GfVec4f(0.0f);
+    if (hasColor != _hasPresentationClearColor || color != _presentationClearColor) {
+        _presentationSource.reset();
+        _presentationPixels.reset();
+    }
+    _hasPresentationClearColor = hasColor;
+    _presentationClearColor = color;
+}
+
+PrismRenderBuffer::ReadView PrismRenderBuffer::CapturePresentation() const
+{
+    ReadView view;
+    GfVec4f background;
+    {
+        std::lock_guard lock(_mutex);
+        view = Capture();
+        if (!_hasPresentationClearColor || view.format != HdFormatFloat32Vec4 || !view.pixels)
+            return view;
+        background = _presentationClearColor;
+        // FrameRecorder's GPU export also reads the AOV texture. Its
+        // transparent clear value must keep the original RGBA there too.
+        if (background[3] == 0.0f) return view;
+        if (_presentationPixels && _cachedPresentationClearColor == background &&
+            _presentationSource.lock() == view.pixels) {
+            view.pixels = _presentationPixels;
+            return view;
+        }
+    }
+    const auto source = view.pixels;
+    const float backgroundAlpha = std::clamp(background[3], 0.0f, 1.0f);
+    std::shared_ptr<std::vector<uint8_t>> pixels;
+    for (size_t offset = 0; offset + sizeof(float) * 4 <= view.pixels->size(); offset += sizeof(float) * 4) {
+        float rgba[4];
+        std::memcpy(rgba, view.pixels->data() + offset, sizeof(rgba));
+        if (rgba[3] == 1.0f) continue;
+        if (!pixels) pixels = std::make_shared<std::vector<uint8_t>>(*view.pixels);
+        const float uncovered = 1.0f - std::clamp(rgba[3], 0.0f, 1.0f);
+        for (size_t component = 0; component < 3; ++component)
+            rgba[component] += background[component] * backgroundAlpha * uncovered;
+        rgba[3] += backgroundAlpha * uncovered;
+        std::memcpy(pixels->data() + offset, rgba, sizeof(rgba));
+    }
+    if (pixels) view.pixels = std::move(pixels);
+    {
+        std::lock_guard lock(_mutex);
+        if (_hasPresentationClearColor && _presentationClearColor == background) {
+            _presentationSource = source;
+            _presentationPixels = view.pixels;
+            _cachedPresentationClearColor = background;
+        }
+    }
+    return view;
+}
+
 void PrismRenderBuffer::Resolve() {}
+
+PrismRenderBuffer::ReadView PrismRenderBuffer::CapturePublished() const
+{
+    std::lock_guard lock(_mutex);
+    return {_pixels,_frame,_width,_height,_format};
+}
 
 void PrismRenderBuffer::ResetSamples()
 {
