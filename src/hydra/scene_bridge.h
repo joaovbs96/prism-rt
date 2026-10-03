@@ -9,6 +9,7 @@
 #include "pxr/base/vt/dictionary.h"
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -74,10 +75,13 @@ struct PickingTable {
     struct InstanceLevel {
         pxr::SdfPath instancerPath;
         std::vector<int> sourceIndicesByOrdinal;
+        bool operator==(InstanceLevel const &) const = default;
     };
     std::vector<pxr::SdfPath> primPaths;
     std::vector<pxr::SdfPath> instancerPaths;
     std::vector<std::vector<InstanceLevel>> instanceTopologies;
+    std::vector<std::size_t> logicalPlacementCountsByPrim;
+    bool operator==(PickingTable const &) const = default;
 };
 
 struct PublishedFrame {

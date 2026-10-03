@@ -1451,6 +1451,21 @@ void _BuildPickingInstanceTopologies(Snapshot *snapshot,
                                      PickingTable *picking)
 {
     picking->instanceTopologies.resize(picking->primPaths.size());
+    picking->logicalPlacementCountsByPrim.assign(
+        picking->primPaths.size(), 0);
+    for (auto const &[geomId, primId] : snapshot->geomToPrimId) {
+        (void)geomId;
+        if (primId >= 0 && static_cast<size_t>(primId) <
+                picking->logicalPlacementCountsByPrim.size())
+            ++picking->logicalPlacementCountsByPrim[primId];
+    }
+    for (auto const &[geomId, primIds] : snapshot->sphereBatchPrimIds) {
+        (void)geomId;
+        for (int primId : primIds)
+            if (primId >= 0 && static_cast<size_t>(primId) <
+                    picking->logicalPlacementCountsByPrim.size())
+                ++picking->logicalPlacementCountsByPrim[primId];
+    }
     std::vector<bool> incompatible(picking->primPaths.size(), false);
     for (auto const &[geomId, chain] : snapshot->geomToInstanceChain) {
         auto prim = snapshot->geomToPrimId.find(geomId);
@@ -2266,11 +2281,13 @@ bool _UpdatePlacements(HdSceneIndexBaseRefPtr const &index, Snapshot *snapshot,
                        std::unordered_set<SdfPath, SdfPath::Hash> const &dirtyPaths = {},
                        std::function<bool()> const &cancelled = {},
                        bool *rebuiltAll = nullptr,
-                       bool *needsFullSnapshot = nullptr)
+                       bool *needsFullSnapshot = nullptr,
+                       bool *topologyChanged = nullptr)
 {
     if (!snapshot || !snapshot->scene) return false;
     if (rebuiltAll) *rebuiltAll = false;
     if (needsFullSnapshot) *needsFullSnapshot = false;
+    if (topologyChanged) *topologyChanged = false;
     snapshot->lastPlacementRecordsVisited = 0;
     snapshot->lastVisibilityPlacementsUpdated = 0;
     if (!dirtyPaths.empty()) {
@@ -2288,7 +2305,8 @@ bool _UpdatePlacements(HdSceneIndexBaseRefPtr const &index, Snapshot *snapshot,
                 if (prim == snapshot->geomToPrimId.end() || prim->second < 0 ||
                     static_cast<size_t>(prim->second) >= snapshot->primPaths.size())
                     return _UpdatePlacements(index, snapshot, {}, cancelled,
-                                             rebuiltAll, needsFullSnapshot);
+                                             rebuiltAll, needsFullSnapshot,
+                                             topologyChanged);
                 idsByPrototype[snapshot->primPaths[prim->second]].push_back(id);
             }
             bool canUpdateInPlace = true;
@@ -2342,22 +2360,22 @@ bool _UpdatePlacements(HdSceneIndexBaseRefPtr const &index, Snapshot *snapshot,
                                 std::to_string(level.radix);
                     return key;
                 };
+                auto newKey = [](InstancePlacement const &placement) {
+                    std::string key = placement.instancerPath.GetString() +
+                        "#" + std::to_string(placement.instanceId);
+                    for (InstanceLevel const &level : placement.chain)
+                        key += "|" + level.instancerPath.GetString() + ":" +
+                            std::to_string(level.sourceIndex) + ":" +
+                            std::to_string(level.ordinal) + ":" +
+                            std::to_string(level.radix);
+                    return key;
+                };
                 std::sort(ids.begin(), ids.end(), [&](unsigned int a, unsigned int b) {
                     return oldKey(a) < oldKey(b);
                 });
                 std::sort(placements.begin(), placements.end(),
-                    [](InstancePlacement const &a, InstancePlacement const &b) {
-                        auto key = [](InstancePlacement const &placement) {
-                            std::string result = placement.instancerPath.GetString() +
-                                "#" + std::to_string(placement.instanceId);
-                            for (InstanceLevel const &level : placement.chain)
-                                result += "|" + level.instancerPath.GetString() +
-                                    ":" + std::to_string(level.sourceIndex) +
-                                    ":" + std::to_string(level.ordinal) +
-                                    ":" + std::to_string(level.radix);
-                            return result;
-                        };
-                        return key(a) < key(b);
+                    [&](InstancePlacement const &a, InstancePlacement const &b) {
+                        return newKey(a) < newKey(b);
                     });
                 auto prototype = snapshot->prototypes.find(prototypePath);
                 if (prototype == snapshot->prototypes.end()) {
@@ -2372,8 +2390,16 @@ bool _UpdatePlacements(HdSceneIndexBaseRefPtr const &index, Snapshot *snapshot,
                 }
                 if (ids.size() != placements.size()) {
                     canUpdateInPlace = false;
+                    if (topologyChanged) *topologyChanged = true;
                     break;
                 }
+                for (size_t i = 0; i < ids.size(); ++i) {
+                    if (oldKey(ids[i]) == newKey(placements[i])) continue;
+                    canUpdateInPlace = false;
+                    if (topologyChanged) *topologyChanged = true;
+                    break;
+                }
+                if (!canUpdateInPlace) break;
                 for (size_t i = 0; i < ids.size(); ++i) {
                     _SetInstanceEnabled(snapshot, ids[i], true);
                     _SetInstanceTransform(
@@ -2398,9 +2424,11 @@ bool _UpdatePlacements(HdSceneIndexBaseRefPtr const &index, Snapshot *snapshot,
             // been removed by an intervening geometry edit. Ask the caller for
             // a complete immutable-scene rebuild.
             if (needsFullSnapshot) *needsFullSnapshot = true;
+            if (topologyChanged) *topologyChanged = true;
             return false;
         }
     }
+    if (topologyChanged) *topologyChanged = true;
     if (rebuiltAll) *rebuiltAll = true;
     RTCScene replacement = rtcNewScene(snapshot->device);
     if (!replacement) return false;
@@ -3698,6 +3726,8 @@ bool SceneBridge::Prepare(CameraState const &camera,
                 _impl->prototypePool;
             std::shared_ptr<Snapshot> bank = std::move(
                 _impl->inactiveSnapshot);
+            std::shared_ptr<const PickingTable> publishedPicking =
+                _impl->snapshot ? _impl->snapshot->picking : nullptr;
             const uint64_t bankGeneration = _impl->inactiveGeneration;
             {
                 // Even without a bank, each kind must keep its own paths.
@@ -3785,6 +3815,7 @@ bool SceneBridge::Prepare(CameraState const &camera,
                  jobPrototypePaths = std::move(jobPrototypePaths),
                  jobMaterialPaths = std::move(jobMaterialPaths),
                  bank = std::move(bank), device,
+                 publishedPicking = std::move(publishedPicking),
                  prototypePool = std::move(prototypePool),
                  cancel = std::move(cancel),
                  mx = std::move(mx), mdl = std::move(mdl)]() mutable {
@@ -3792,6 +3823,8 @@ bool SceneBridge::Prepare(CameraState const &camera,
                     result.generation = generation;
                     auto const start = std::chrono::steady_clock::now();
                     try {
+                        bool placementTopologyChanged = false;
+                        bool sphereBatchTopologyChanged = false;
                         ArResolverContextBinder binder(resolverContext);
                         mdl::Context &context = SharedMdlContext();
                         if (context.is_valid()) {
@@ -3846,6 +3879,8 @@ bool SceneBridge::Prepare(CameraState const &camera,
                                 jobPrototypePaths.erase(path);
                                 jobPlacementPaths.erase(path);
                             }
+                            sphereBatchTopologyChanged =
+                                !handledBatchPaths.empty() || batchNeedsFullSnapshot;
                             if (!batchNeedsFullSnapshot &&
                                 jobDirtyKinds & static_cast<unsigned int>(
                                     SceneDirtyKind::Prototype))
@@ -3869,7 +3904,8 @@ bool SceneBridge::Prepare(CameraState const &camera,
                                     return cancel->load(
                                         std::memory_order_relaxed);
                                 }, &placementRebuiltAll,
-                                   &placementNeedsFullSnapshot);
+                                    &placementNeedsFullSnapshot,
+                                    &placementTopologyChanged);
                             if (cancel->load(std::memory_order_relaxed))
                                 return result;
                             if (!batchNeedsFullSnapshot &&
@@ -3942,13 +3978,45 @@ bool SceneBridge::Prepare(CameraState const &camera,
                                 !cancel->load(std::memory_order_relaxed);
                         }
                         if (result.snapshot && result.snapshot->scene) {
-                            auto picking = std::make_shared<PickingTable>();
-                            picking->primPaths = result.snapshot->primPaths;
-                            picking->instancerPaths =
-                                result.snapshot->instancerPaths;
-                            _BuildPickingInstanceTopologies(
-                                result.snapshot.get(), picking.get());
-                            result.snapshot->picking = std::move(picking);
+                            auto const previousPicking =
+                                result.snapshot->picking;
+                            auto const fallbackPicking = publishedPicking
+                                ? publishedPicking : previousPicking;
+                            const unsigned int nonTopologyKinds =
+                                jobDirtyKinds & ~static_cast<unsigned int>(
+                                    SceneDirtyKind::Placement);
+                            const bool placementOnly =
+                                (jobDirtyKinds & static_cast<unsigned int>(
+                                    SceneDirtyKind::Placement)) != 0 &&
+                                nonTopologyKinds == 0;
+                            const bool onlyMaterialEnvironment =
+                                jobDirtyKinds != 0 &&
+                                (jobDirtyKinds & ~(
+                                    static_cast<unsigned int>(SceneDirtyKind::Material) |
+                                    static_cast<unsigned int>(SceneDirtyKind::Environment))) == 0;
+                            const bool canReusePickingDirectly = result.reusedBank &&
+                                fallbackPicking &&
+                                (onlyMaterialEnvironment ||
+                                 (placementOnly && !placementTopologyChanged &&
+                                  !sphereBatchTopologyChanged));
+                            if (canReusePickingDirectly) {
+                                result.snapshot->picking = fallbackPicking;
+                            } else {
+                                auto picking = std::make_shared<PickingTable>();
+                                picking->primPaths = result.snapshot->primPaths;
+                                picking->instancerPaths =
+                                    result.snapshot->instancerPaths;
+                                _BuildPickingInstanceTopologies(
+                                    result.snapshot.get(), picking.get());
+                                if (publishedPicking &&
+                                    *publishedPicking == *picking)
+                                    result.snapshot->picking = publishedPicking;
+                                else if (previousPicking &&
+                                    *previousPicking == *picking)
+                                    result.snapshot->picking = previousPicking;
+                                else
+                                    result.snapshot->picking = std::move(picking);
+                            }
                             result.snapshot->scene->max_depth =
                                 jobSettings.maxDepth;
                             result.snapshot->scene->rr_min_depth =
