@@ -423,6 +423,7 @@ struct MeshConversion {
 };
 
 struct PrototypePool {
+    std::atomic<uint64_t> topLevelSceneBuilds{0};
     EnvironmentCache environmentCache;
     std::shared_ptr<ColorTexture> whiteEnvironmentTexture =
         std::make_shared<ColorTexture>(Color3(1.0f));
@@ -504,6 +505,7 @@ struct Snapshot {
     std::unordered_map<unsigned int, std::vector<InstanceLevel>>
         geomToInstanceChain;
     std::unordered_map<unsigned int, bool> placementEnabled;
+    uint64_t enabledPlacementCount = 0;
     bool sphereBatching = false;
     std::vector<PendingSphere> pendingSpheres;
     std::vector<SphereBatch> sphereBatches;
@@ -666,6 +668,7 @@ unsigned int _AttachPrototype(Snapshot *snapshot, SdfPath const &path,
     snapshot->scene->placement_transforms.emplace(id, placement);
     snapshot->scene->placement_materials.emplace(id, prototype.binding);
     snapshot->placementEnabled[id] = true;
+    ++snapshot->enabledPlacementCount;
     snapshot->embreeGeometryCommitSeconds += std::chrono::duration<double>(
         std::chrono::steady_clock::now() - commitStart).count();
     return id;
@@ -704,11 +707,15 @@ void _SetInstanceEnabled(Snapshot *snapshot, unsigned int id, bool enabled)
     auto state = snapshot->placementEnabled.find(id);
     const bool changed = state == snapshot->placementEnabled.end() ||
         state->second != enabled;
+    if (!changed) return;
     RTCGeometry instance = rtcGetGeometry(snapshot->scene->scene, id);
     if (!instance) return;
     if (enabled) rtcEnableGeometry(instance);
     else rtcDisableGeometry(instance);
     rtcCommitGeometry(instance);
+    if (enabled) ++snapshot->enabledPlacementCount;
+    else if (state != snapshot->placementEnabled.end() && state->second)
+        --snapshot->enabledPlacementCount;
     snapshot->placementEnabled[id] = enabled;
     if (changed) ++snapshot->lastVisibilityPlacementsUpdated;
 }
@@ -1077,16 +1084,24 @@ void _BuildPrototypeScene(RTCDevice device, PrototypeStorage &storage,
     storage.geometry.reset(conversion.mesh.release());
 }
 
+bool _PlacementEligible(HdSceneIndexBaseRefPtr const &index,
+    SdfPath const &path, HdContainerDataSourceHandle const &data,
+    std::vector<InstanceLevel> const &chain, TfTokenVector const &tags)
+{
+    if (!_WorldVisible(index, path) || !_PurposeMatches(data, tags)) return false;
+    return std::all_of(chain.begin(), chain.end(), [&](InstanceLevel const &level) {
+        return _WorldVisible(index, level.instancerPath);
+    });
+}
+
 bool _AppendMesh(HdSceneIndexBaseRefPtr const &sceneIndex,
                  SdfPath const &path, HdSceneIndexPrim const &prim,
                  MaterialService *materials, Snapshot *snapshot,
                  GfMatrix4d const &world, SdfPath const &instancerPath,
                  int instanceId, std::vector<InstanceLevel> const &instanceChain,
                  TfTokenVector const &renderTags,
-                 PreparedMesh const *prepared = nullptr)
+                 PreparedMesh const *prepared = nullptr, bool attachPlacement = true)
 {
-    if (!_WorldVisible(sceneIndex, path) ||
-        !_PurposeMatches(prim.dataSource, renderTags)) return false;
     HdMeshSchema meshSchema = HdMeshSchema::GetFromParent(prim.dataSource);
     HdMeshTopologySchema topology = meshSchema.GetTopology();
     HdPrimvarsSchema primvars = HdPrimvarsSchema::GetFromParent(prim.dataSource);
@@ -1110,6 +1125,8 @@ bool _AppendMesh(HdSceneIndexBaseRefPtr const &sceneIndex,
             snapshot->geomToInstanceId.emplace(geomId, instanceId);
             if (!instanceChain.empty())
                 snapshot->geomToInstanceChain.emplace(geomId, instanceChain);
+            _SetInstanceEnabled(snapshot, geomId, _PlacementEligible(
+                sceneIndex, path, prim.dataSource, instanceChain, renderTags));
             ++snapshot->instanceCount;
             return true;
         }
@@ -1287,23 +1304,27 @@ bool _AppendMesh(HdSceneIndexBaseRefPtr const &sceneIndex,
                                   placementBinding, info.geometryHash, storage};
     snapshot->prototypes.emplace(path, prototype);
     if (std::find(bucket.begin(), bucket.end(), path) == bucket.end()) bucket.push_back(path);
-    const unsigned int geomId = _AttachPrototype(snapshot, path, prototype, world);
-    PrimKey const primKey{path, instancerPath};
-    auto const existingPrim = snapshot->primIds.find(primKey);
-    int primId = existingPrim == snapshot->primIds.end()
-        ? -1 : existingPrim->second;
-    if (primId < 0) {
-        primId = static_cast<int>(snapshot->primPaths.size());
-        snapshot->primPaths.push_back(path);
-        snapshot->instancerPaths.push_back(instancerPath);
-        snapshot->primIds.emplace(primKey, primId);
+    if (attachPlacement) {
+        const unsigned int geomId = _AttachPrototype(snapshot, path, prototype, world);
+        PrimKey const primKey{path, instancerPath};
+        auto const existingPrim = snapshot->primIds.find(primKey);
+        int primId = existingPrim == snapshot->primIds.end()
+            ? -1 : existingPrim->second;
+        if (primId < 0) {
+            primId = static_cast<int>(snapshot->primPaths.size());
+            snapshot->primPaths.push_back(path);
+            snapshot->instancerPaths.push_back(instancerPath);
+            snapshot->primIds.emplace(primKey, primId);
+        }
+        snapshot->geomToPrimId.emplace(geomId, primId);
+        snapshot->geomToCoarseFaces.emplace(geomId, prototype.coarseFaces);
+        snapshot->geomToInstanceId.emplace(geomId, instanceId);
+        if (!instanceChain.empty())
+            snapshot->geomToInstanceChain.emplace(geomId, instanceChain);
+        if (instanceId >= 0) ++snapshot->instanceCount;
+        _SetInstanceEnabled(snapshot, geomId, _PlacementEligible(
+            sceneIndex, path, prim.dataSource, instanceChain, renderTags));
     }
-    snapshot->geomToPrimId.emplace(geomId, primId);
-    snapshot->geomToCoarseFaces.emplace(geomId, prototype.coarseFaces);
-    snapshot->geomToInstanceId.emplace(geomId, instanceId);
-    if (!instanceChain.empty())
-        snapshot->geomToInstanceChain.emplace(geomId, instanceChain);
-    if (instanceId >= 0) ++snapshot->instanceCount;
     if (!shared) {
         snapshot->estimatedGeometryBytes +=
             prototypeMesh->vertices.size() * sizeof(Float3) +
@@ -1642,10 +1663,8 @@ bool _AppendSphere(HdSceneIndexBaseRefPtr const &sceneIndex,
                    GfMatrix4d const &world, SdfPath const &instancerPath,
                    int instanceId,
                    std::vector<InstanceLevel> const &instanceChain,
-                   TfTokenVector const &renderTags)
+                   TfTokenVector const &renderTags, bool attachPlacement = true)
 {
-    if (!_WorldVisible(sceneIndex, path) ||
-        !_PurposeMatches(prim.dataSource, renderTags)) return false;
 
     if (instanceId >= 0) {
         auto const cached = snapshot->prototypes.find(path);
@@ -1664,6 +1683,8 @@ bool _AppendSphere(HdSceneIndexBaseRefPtr const &sceneIndex,
             snapshot->geomToInstanceId.emplace(geomId, instanceId);
             if (!instanceChain.empty())
                 snapshot->geomToInstanceChain.emplace(geomId, instanceChain);
+            _SetInstanceEnabled(snapshot, geomId, _PlacementEligible(
+                sceneIndex, path, prim.dataSource, instanceChain, renderTags));
             ++snapshot->instanceCount;
             return true;
         }
@@ -1689,7 +1710,8 @@ bool _AppendSphere(HdSceneIndexBaseRefPtr const &sceneIndex,
         _RecordMaterialUser(snapshot, sphereMaterialPath, path);
     Material *material = _BaseMaterial(
         sceneIndex, path, prim, materials, snapshot);
-    if (snapshot->sphereBatching && instanceId < 0) {
+    if (attachPlacement && snapshot->sphereBatching && instanceId < 0 &&
+        _PlacementEligible(sceneIndex, path, prim.dataSource, instanceChain, renderTags)) {
         Float3 center;
         float scale = 1.0f;
         if (_BatchableSphereTransform(world, &center, &scale)) {
@@ -1758,21 +1780,25 @@ bool _AppendSphere(HdSceneIndexBaseRefPtr const &sceneIndex,
                                   binding, geometryHash, storage};
     snapshot->prototypes.emplace(path, prototype);
     if (std::find(sphereBucket.begin(), sphereBucket.end(), path) == sphereBucket.end()) sphereBucket.push_back(path);
-    const unsigned int geomId = _AttachPrototype(
-        snapshot, path, prototype, world);
-    PrimKey const key{path, instancerPath};
-    auto [it, inserted] = snapshot->primIds.emplace(
-        key, static_cast<int>(snapshot->primPaths.size()));
-    if (inserted) {
-        snapshot->primPaths.push_back(path);
-        snapshot->instancerPaths.push_back(instancerPath);
+    if (attachPlacement) {
+        const unsigned int geomId = _AttachPrototype(
+            snapshot, path, prototype, world);
+        PrimKey const key{path, instancerPath};
+        auto [it, inserted] = snapshot->primIds.emplace(
+            key, static_cast<int>(snapshot->primPaths.size()));
+        if (inserted) {
+            snapshot->primPaths.push_back(path);
+            snapshot->instancerPaths.push_back(instancerPath);
+        }
+        snapshot->geomToPrimId.emplace(geomId, it->second);
+        snapshot->geomToCoarseFaces.emplace(geomId, std::vector<int>{});
+        snapshot->geomToInstanceId.emplace(geomId, instanceId);
+        if (!instanceChain.empty())
+            snapshot->geomToInstanceChain.emplace(geomId, instanceChain);
+        if (instanceId >= 0) ++snapshot->instanceCount;
+        _SetInstanceEnabled(snapshot, geomId, _PlacementEligible(
+            sceneIndex, path, prim.dataSource, instanceChain, renderTags));
     }
-    snapshot->geomToPrimId.emplace(geomId, it->second);
-    snapshot->geomToCoarseFaces.emplace(geomId, std::vector<int>{});
-    snapshot->geomToInstanceId.emplace(geomId, instanceId);
-    if (!instanceChain.empty())
-        snapshot->geomToInstanceChain.emplace(geomId, instanceChain);
-    if (instanceId >= 0) ++snapshot->instanceCount;
     if (!shared) {
         snapshot->geometries.emplace_back(storage, prototypeSphere);
     }
@@ -1814,7 +1840,6 @@ std::vector<InstancePlacement> _InstancePlacements(
         : VtArray<SdfPath>();
     for (size_t p = 0; p < paths.size(); ++p) {
         HdSceneIndexPrim instancerPrim = scene->GetPrim(paths[p]);
-        if (!_WorldVisible(scene, paths[p])) continue;
         HdInstancerTopologySchema topology =
             HdInstancerTopologySchema::GetFromParent(instancerPrim.dataSource);
         if (!topology) continue;
@@ -1993,21 +2018,14 @@ void _CollectMeshes(HdSceneIndexBaseRefPtr const &scene, SdfPath const &path,
     if (cancelled && cancelled()) return;
     HdSceneIndexPrim const prim = scene->GetPrim(path);
     if (prim.primType == HdPrimTypeTokens->mesh) {
-        // Mirror _Walk and _AppendMesh: an instanced prim is appended only
-        // when it has placements, and only visible, matching meshes convert.
-        bool placed = true;
-        if (HdInstancedBySchema::GetFromParent(prim.dataSource)) {
-            std::vector<InstancePlacement> placements =
-                _InstancePlacements(scene, path, prim.dataSource);
-            placed = !placements.empty();
-            preparation->placements.emplace(path, std::move(placements));
-        }
+        // Preparation owns supported prototypes even without enabled placements.
+        if (HdInstancedBySchema::GetFromParent(prim.dataSource))
+            preparation->placements.emplace(path,
+                _InstancePlacements(scene, path, prim.dataSource));
         HdMeshSchema const meshSchema =
             HdMeshSchema::GetFromParent(prim.dataSource);
-        if (placed && meshSchema && meshSchema.GetTopology() &&
-            HdPrimvarsSchema::GetFromParent(prim.dataSource) &&
-            _WorldVisible(scene, path) &&
-            _PurposeMatches(prim.dataSource, renderTags))
+        if (meshSchema && meshSchema.GetTopology() &&
+            HdPrimvarsSchema::GetFromParent(prim.dataSource))
             candidates->emplace_back(path, prim.dataSource);
     }
     for (SdfPath const &child : scene->GetChildPrimPaths(path))
@@ -2180,6 +2198,13 @@ void _Walk(HdSceneIndexBaseRefPtr const &scene, SdfPath const &path,
             else
                 _AppendSphere(scene, path, prim, materials, snapshot,
                               world, SdfPath(), -1, {}, renderTags);
+        } else if (placements.empty()) {
+            if (prim.primType == HdPrimTypeTokens->mesh)
+                _AppendMesh(scene, path, prim, materials, snapshot,
+                    world, {}, -1, {}, renderTags, prepared, false);
+            else
+                _AppendSphere(scene, path, prim, materials, snapshot,
+                    world, {}, -1, {}, renderTags, false);
         } else {
             for (InstancePlacement const &placement : placements) {
                 if (cancelled && cancelled()) return;
@@ -2228,10 +2253,8 @@ void _CollectMaterialRequests(HdSceneIndexBaseRefPtr const &scene,
         if (!materialPath.IsEmpty() && seen->insert(materialPath).second)
             requests->push_back({scene->GetPrim(materialPath).dataSource, materialPath});
     };
-    // Only supported scene geometry needs shading preparation. This follows
-    // authored visibility/purpose, never camera visibility or screen bounds.
-    if ((prim.primType == HdPrimTypeTokens->mesh || prim.primType == HdPrimTypeTokens->sphere)
-        && _WorldVisible(scene, path) && _PurposeMatches(prim.dataSource, renderTags)) {
+    // Retained supported geometry needs materials before its first visibility-on.
+    if (prim.primType == HdPrimTypeTokens->mesh || prim.primType == HdPrimTypeTokens->sphere) {
         add(prim.dataSource);
         if (prim.primType == HdPrimTypeTokens->mesh) {
             for (auto const& childPath : scene->GetChildPrimPaths(path)) {
@@ -2268,6 +2291,7 @@ std::shared_ptr<Snapshot> _BuildSnapshot(HdSceneIndexBaseRefPtr const &scene,
     }
     if (!result->device) return {};
     result->scene = std::make_unique<SceneManager>(result->device);
+    ++result->prototypePool->topLevelSceneBuilds;
     result->scene->max_depth = settings.maxDepth;
     result->scene->rr_min_depth = settings.rouletteDepth;
     result->scene->environmentSampling =
@@ -2312,11 +2336,13 @@ std::shared_ptr<Snapshot> _BuildSnapshot(HdSceneIndexBaseRefPtr const &scene,
 }
 
 bool _UpdatePlacements(HdSceneIndexBaseRefPtr const &index, Snapshot *snapshot,
+                       TfTokenVector const &renderTags,
                        std::unordered_set<SdfPath, SdfPath::Hash> const &dirtyPaths = {},
                        std::function<bool()> const &cancelled = {},
                        bool *rebuiltAll = nullptr,
                        bool *needsFullSnapshot = nullptr,
-                       bool *topologyChanged = nullptr)
+                       bool *topologyChanged = nullptr,
+                       bool forceRebuild = false)
 {
     if (!snapshot || !snapshot->scene) return false;
     if (rebuiltAll) *rebuiltAll = false;
@@ -2324,8 +2350,12 @@ bool _UpdatePlacements(HdSceneIndexBaseRefPtr const &index, Snapshot *snapshot,
     if (topologyChanged) *topologyChanged = false;
     snapshot->lastPlacementRecordsVisited = 0;
     snapshot->lastVisibilityPlacementsUpdated = 0;
-    if (!dirtyPaths.empty()) {
+    if (!forceRebuild) {
         std::unordered_set<unsigned int> affected;
+        if (dirtyPaths.empty())
+            for (auto const &[id, primId] : snapshot->geomToPrimId) {
+                (void)primId; affected.insert(id);
+            }
         for (SdfPath const &path : dirtyPaths) {
             auto found = snapshot->placementDependencies.find(path);
             if (found != snapshot->placementDependencies.end())
@@ -2338,7 +2368,7 @@ bool _UpdatePlacements(HdSceneIndexBaseRefPtr const &index, Snapshot *snapshot,
                 auto prim = snapshot->geomToPrimId.find(id);
                 if (prim == snapshot->geomToPrimId.end() || prim->second < 0 ||
                     static_cast<size_t>(prim->second) >= snapshot->primPaths.size())
-                    return _UpdatePlacements(index, snapshot, {}, cancelled,
+                    return _UpdatePlacements(index, snapshot, renderTags, {}, cancelled,
                                              rebuiltAll, needsFullSnapshot,
                                              topologyChanged);
                 idsByPrototype[snapshot->primPaths[prim->second]].push_back(id);
@@ -2348,30 +2378,10 @@ bool _UpdatePlacements(HdSceneIndexBaseRefPtr const &index, Snapshot *snapshot,
                 if (cancelled && cancelled()) return false;
                 HdSceneIndexPrim const prim = index->GetPrim(prototypePath);
                 std::vector<InstancePlacement> placements;
-                if (_WorldVisible(index, prototypePath)) {
-                    placements = _InstancePlacements(
-                        index, prototypePath, prim.dataSource);
-                    if (placements.empty() &&
-                        !HdInstancedBySchema::GetFromParent(prim.dataSource))
-                        placements.push_back({
-                            _WorldTransform(index, prototypePath), {}, -1, {}});
-                }
-                bool hiddenByDirtyPath = !_WorldVisible(index, prototypePath);
-                if (!hiddenByDirtyPath) {
-                    for (SdfPath const &dirtyPath : dirtyPaths) {
-                        auto dependencies = snapshot->placementDependencies.find(
-                            dirtyPath);
-                        if (dependencies == snapshot->placementDependencies.end() ||
-                            _WorldVisible(index, dirtyPath)) continue;
-                        if (std::any_of(ids.begin(), ids.end(),
-                                [&](unsigned int id) {
-                                    return dependencies->second.count(id) != 0;
-                                })) {
-                            hiddenByDirtyPath = true;
-                            break;
-                        }
-                    }
-                }
+                placements = _InstancePlacements(index, prototypePath, prim.dataSource);
+                if (placements.empty() &&
+                    !HdInstancedBySchema::GetFromParent(prim.dataSource))
+                    placements.push_back({_WorldTransform(index, prototypePath), {}, -1, {}});
                 auto oldKey = [&](unsigned int id) {
                     int instanceId = -1;
                     auto instance = snapshot->geomToInstanceId.find(id);
@@ -2417,11 +2427,6 @@ bool _UpdatePlacements(HdSceneIndexBaseRefPtr const &index, Snapshot *snapshot,
                     break;
                 }
                 snapshot->lastPlacementRecordsVisited += ids.size();
-                if (hiddenByDirtyPath && placements.empty()) {
-                    for (unsigned int id : ids)
-                        _SetInstanceEnabled(snapshot, id, false);
-                    continue;
-                }
                 if (ids.size() != placements.size()) {
                     canUpdateInPlace = false;
                     if (topologyChanged) *topologyChanged = true;
@@ -2435,7 +2440,8 @@ bool _UpdatePlacements(HdSceneIndexBaseRefPtr const &index, Snapshot *snapshot,
                 }
                 if (!canUpdateInPlace) break;
                 for (size_t i = 0; i < ids.size(); ++i) {
-                    _SetInstanceEnabled(snapshot, ids[i], true);
+                    _SetInstanceEnabled(snapshot, ids[i], _PlacementEligible(
+                        index, prototypePath, prim.dataSource, placements[i].chain, renderTags));
                     _SetInstanceTransform(
                         snapshot, ids[i], placements[i].transform,
                         prototype->second);
@@ -2451,21 +2457,12 @@ bool _UpdatePlacements(HdSceneIndexBaseRefPtr const &index, Snapshot *snapshot,
                 return true;
             }
         }
-        if (affected.empty()) {
-            // Hidden prototypes have no top-level placement records. A later
-            // visibility-on notice therefore cannot be recovered by rebuilding
-            // the TLAS from Snapshot::prototypes: the prototype itself may have
-            // been removed by an intervening geometry edit. Ask the caller for
-            // a complete immutable-scene rebuild.
-            if (needsFullSnapshot) *needsFullSnapshot = true;
-            if (topologyChanged) *topologyChanged = true;
-            return false;
-        }
     }
     if (topologyChanged) *topologyChanged = true;
     if (rebuiltAll) *rebuiltAll = true;
     RTCScene replacement = rtcNewScene(snapshot->device);
     if (!replacement) return false;
+    ++snapshot->prototypePool->topLevelSceneBuilds;
     auto oldPrim = snapshot->geomToPrimId;
     auto oldFaces = snapshot->geomToCoarseFaces;
     auto oldInstances = snapshot->geomToInstanceId;
@@ -2476,6 +2473,7 @@ bool _UpdatePlacements(HdSceneIndexBaseRefPtr const &index, Snapshot *snapshot,
     snapshot->geomToInstanceId.clear();
     snapshot->geomToInstanceChain.clear();
     snapshot->placementEnabled.clear();
+    snapshot->enabledPlacementCount = 0;
     snapshot->scene->geometry.clear();
     snapshot->scene->intersection_geometry.clear();
     snapshot->scene->placement_transforms.clear();
@@ -2491,7 +2489,6 @@ bool _UpdatePlacements(HdSceneIndexBaseRefPtr const &index, Snapshot *snapshot,
     for (auto &[path, prototype] : snapshot->prototypes) {
         if (cancelled && cancelled()) return false;
         HdSceneIndexPrim prim = index->GetPrim(path);
-        if (!_WorldVisible(index, path)) continue;
         std::vector<InstancePlacement> placements =
             _InstancePlacements(index, path, prim.dataSource);
         if (placements.empty() &&
@@ -2504,11 +2501,18 @@ bool _UpdatePlacements(HdSceneIndexBaseRefPtr const &index, Snapshot *snapshot,
                 snapshot, path, prototype, placement.transform);
             PrimKey key{path, placement.instancerPath};
             auto found = snapshot->primIds.find(key);
-            if (found == snapshot->primIds.end()) continue;
+            if (found == snapshot->primIds.end()) {
+                found = snapshot->primIds.emplace(key,
+                    static_cast<int>(snapshot->primPaths.size())).first;
+                snapshot->primPaths.push_back(path);
+                snapshot->instancerPaths.push_back(placement.instancerPath);
+            }
             snapshot->geomToPrimId.emplace(id, found->second);
             snapshot->geomToCoarseFaces.emplace(id, prototype.coarseFaces);
             snapshot->geomToInstanceId.emplace(id, placement.instanceId);
             snapshot->geomToInstanceChain.emplace(id, placement.chain);
+            _SetInstanceEnabled(snapshot, id, _PlacementEligible(
+                index, path, prim.dataSource, placement.chain, renderTags));
             if (placement.instanceId >= 0) ++snapshot->instanceCount;
         }
     }
@@ -2517,6 +2521,7 @@ bool _UpdatePlacements(HdSceneIndexBaseRefPtr const &index, Snapshot *snapshot,
     if (cancelled && cancelled()) return false;
     rtcCommitScene(replacement);
     _IndexPlacementDependencies(snapshot);
+    _RefreshCachedCounts(snapshot);
     snapshot->embreeSceneCommitSeconds += std::chrono::duration<double>(
         std::chrono::steady_clock::now() - commitStart).count();
     return true;
@@ -2530,6 +2535,7 @@ bool _RefreshPrototypes(HdSceneIndexBaseRefPtr const &index,
     if (!snapshot || !snapshot->scene || paths.empty()) return false;
     RTCScene oldTop = snapshot->scene->scene;
     snapshot->scene->scene = rtcNewScene(snapshot->device);
+    if (snapshot->scene->scene) ++snapshot->prototypePool->topLevelSceneBuilds;
     if (!snapshot->scene->scene) {
         snapshot->scene->scene = oldTop;
         return false;
@@ -2544,6 +2550,7 @@ bool _RefreshPrototypes(HdSceneIndexBaseRefPtr const &index,
     snapshot->geomToInstanceChain.clear();
     snapshot->placementEnabled.clear();
     rtcReleaseScene(oldTop);
+    snapshot->enabledPlacementCount = 0;
 
     for (SdfPath const &path : paths) {
         // displayColor is a material input carried by a geometry primvar.  A
@@ -2603,6 +2610,13 @@ bool _RefreshPrototypes(HdSceneIndexBaseRefPtr const &index,
             else
                 _AppendSphere(index, path, prim, materials, snapshot,
                               _WorldTransform(index, path), {}, -1, {}, renderTags);
+        } else if (placements.empty()) {
+            if (prim.primType == HdPrimTypeTokens->mesh)
+                _AppendMesh(index, path, prim, materials, snapshot,
+                    _WorldTransform(index, path), {}, -1, {}, renderTags, nullptr, false);
+            else
+                _AppendSphere(index, path, prim, materials, snapshot,
+                    _WorldTransform(index, path), {}, -1, {}, renderTags, false);
         } else {
             for (InstancePlacement const &placement : placements) {
                 if (prim.primType == HdPrimTypeTokens->mesh)
@@ -2618,7 +2632,8 @@ bool _RefreshPrototypes(HdSceneIndexBaseRefPtr const &index,
     }
     // Recreate one coherent top-level scene from all retained and rebuilt
     // prototypes, discarding temporary attachments made during conversion.
-    return _UpdatePlacements(index, snapshot);
+    return _UpdatePlacements(index, snapshot, renderTags,
+        {}, {}, nullptr, nullptr, nullptr, true);
 }
 
 void _RefreshEnvironment(HdSceneIndexBaseRefPtr const &index,
@@ -2691,16 +2706,8 @@ void _RefreshMaterials(HdSceneIndexBaseRefPtr const &index,
                                 Snapshot::Prototype &prototype) {
         ++snapshot->materialPrototypesVisited;
         HdSceneIndexPrim const prim = index->GetPrim(path);
-        Material *base = snapshot->fallbackMaterial.get();
-        HdPrimvarsSchema primvars =
-            HdPrimvarsSchema::GetFromParent(prim.dataSource);
-        PrimvarData color = _Primvar(primvars, TfToken("displayColor"));
-        if (color.value.IsHolding<VtVec3fArray>() &&
-            !color.value.UncheckedGet<VtVec3fArray>().empty()) {
-            auto found = snapshot->displayMaterialsByPath.find(path);
-            if (found != snapshot->displayMaterialsByPath.end())
-                base = found->second;
-        }
+        snapshot->displayMaterialsByPath.erase(path);
+        Material *base = _BaseMaterial(index, path, prim, materials, snapshot);
         const SdfPath materialPath = _MaterialPath(prim.dataSource);
         if (!materialPath.IsEmpty())
             _RecordMaterialUser(snapshot, materialPath, path);
@@ -3586,16 +3593,16 @@ bool SceneBridge::Prepare(CameraState const &camera,
 
     {
         std::lock_guard lock(_impl->mutex);
-        if (renderTagsChanged) {
+        if (renderTagsChanged && _impl->snapshot) {
             if (_impl->buildCancel)
                 _impl->buildCancel->store(true, std::memory_order_relaxed);
             _impl->sceneDirty = true;
             ++_impl->requestedGeneration;
             _impl->dirtyKinds |= static_cast<unsigned int>(
-                SceneDirtyKind::Unknown);
+                SceneDirtyKind::Placement);
             _impl->dirtyJournal.push_back({
                 _impl->requestedGeneration,
-                static_cast<unsigned int>(SceneDirtyKind::Unknown), {}});
+                static_cast<unsigned int>(SceneDirtyKind::Placement), {}});
             _impl->lastRebuildReason = "render tags changed";
         }
         _impl->camera = camera;
@@ -4032,7 +4039,7 @@ bool SceneBridge::Prepare(CameraState const &camera,
                                 jobDirtyKinds & static_cast<unsigned int>(
                                     SceneDirtyKind::Placement))
                                 _UpdatePlacements(retained, bank.get(),
-                                  jobPlacementPaths, [cancel] {
+                                  tags, jobPlacementPaths, [cancel] {
                                     return cancel->load(
                                         std::memory_order_relaxed);
                                 }, &placementRebuiltAll,
@@ -4605,6 +4612,10 @@ VtDictionary SceneBridge::GetStats() const
         _impl->snapshot ? _impl->snapshot->primPathSlotCount : 0));
     result["snapshotBuilds"] = VtValue(static_cast<int64_t>(
         _impl->snapshotBuilds));
+    result["topLevelSceneBuilds"] = VtValue(static_cast<int64_t>(
+        _impl->prototypePool->topLevelSceneBuilds.load()));
+    result["enabledPlacementCount"] = VtValue(static_cast<int64_t>(
+        _impl->snapshot ? _impl->snapshot->enabledPlacementCount : 0));
     result["snapshotBuildSeconds"] = VtValue(_impl->snapshotBuildSeconds);
     result["firstPublishSeconds"] = VtValue(_impl->firstPublishSeconds);
     result["spareSnapshotSeconds"] = VtValue(_impl->spareSnapshotSeconds);

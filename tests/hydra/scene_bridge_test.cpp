@@ -48,6 +48,7 @@ int RunAuthoredSettingsTests();
 int RunCoverageIntegrationTests();
 int RunPickingIntegrationTests();
 int RunEnvironmentCacheIntegrationTests();
+int RunVisibilityRetentionTests();
 int RunB2DoublePrimvarIntegrationTests();
 int RunB3FallbackOpacityIntegrationTests();
 int RunC2GeometricAovIntegrationTests();
@@ -998,8 +999,9 @@ int main()
                           FixtureMeshData(false, HdRenderTagTokens->guide)}});
         bridge.MarkSceneDirty();
         PumpPrepare(bridge, camera, {}, geometryTags, 32, 32);
-        ok &= Check(Stat(bridge.GetStats(), "meshCount") == 0,
-                    "purpose filtering did not exclude guide mesh");
+        ok &= Check(Stat(bridge.GetStats(), "meshCount") == 1 &&
+                        Stat(bridge.GetStats(), "enabledPlacementCount") == 0,
+                    "purpose filtering did not retain disabled guide mesh");
 
         scene->RemovePrims({SdfPath("/Mesh")});
         bridge.MarkSceneDirty();
@@ -1101,7 +1103,7 @@ int main()
 
         // A hidden placement can legitimately lose its dependency records
         // when a simultaneous prototype refresh rebuilds the inactive TLAS.
-        // Showing it again must take the conservative rebuild path and restore
+        // Showing it again must reuse disabled placement records and restore
         // every instance rather than silently treating the empty index as a
         // successful targeted update.
         scene->AddPrims({{SdfPath("/Instancer"), HdPrimTypeTokens->instancer,
@@ -1122,7 +1124,7 @@ int main()
         stats = bridge.GetStats();
         ok &= Check(Stat(stats, "instanceCount") == 2 &&
                         Stat(stats, "prototypeCount") == 2 &&
-                        Stat(stats, "visibilityRecoveryRebuilds") >
+                        Stat(stats, "visibilityRecoveryRebuilds") ==
                             recoveriesBeforeHiddenPrototypeEdit,
                     "visibility restore after hidden prototype edit lost placements");
         const int64_t buildsBeforeStateEdits = Stat(stats, "snapshotBuilds");
@@ -1718,19 +1720,19 @@ int main()
         VtDictionary const &stats = firstLoad.stats;
         // Distinct geometries: 64 grid meshes, the subset mesh, and one
         // storage shared by both twins and the instanced prototype.
-        ok &= Check(Stat(stats, "primCount") == 68 &&
-                        Stat(stats, "meshCount") == 66 &&
-                        Stat(stats, "triangleCount") == 64 * 3 + 3 + 2 &&
+        ok &= Check(Stat(stats, "primCount") == 69 &&
+                        Stat(stats, "meshCount") == 67 &&
+                        Stat(stats, "triangleCount") == 64 * 3 + 3 + 2 + 3 &&
                         Stat(stats, "instanceCount") == 2 &&
-                        Stat(stats, "prototypeBuildCount") == 66,
+                        Stat(stats, "prototypeBuildCount") == 67,
                     "parallel conversion changed prim, triangle, prototype or instance counts");
-        ok &= Check(Stat(stats, "prototypeCount") == 66 &&
-                        Stat(stats, "prototypePathCount") == 68,
+        ok &= Check(Stat(stats, "prototypeCount") == 67 &&
+                        Stat(stats, "prototypePathCount") == 69,
                     "identical prototype paths did not share geometry storage");
-        ok &= Check(Stat(stats, "prototypeConversions") == 68 &&
+        ok &= Check(Stat(stats, "prototypeConversions") == 69 &&
                         Stat(stats, "prototypeConversionCacheHits") == 0,
-                    "initial load did not convert each visible mesh path once");
-        bool pickingComplete = firstLoad.picking.size() == 68;
+                    "initial load did not convert each retained mesh path once");
+        bool pickingComplete = firstLoad.picking.size() == 69;
         for (auto const &[primPath, instancerPath] : firstLoad.picking)
             pickingComplete &= !primPath.IsEmpty() &&
                 (primPath == SdfPath("/Proto/Mesh")) ==
@@ -1757,9 +1759,8 @@ int main()
             activeBridge = nullptr;
         }
 
-        // Showing a mesh that had no placement records rebuilds the snapshot
-        // from the incrementally captured scene. Every other prim keeps its
-        // captured data source, so only the newly visible mesh converts.
+        // Initially hidden prototypes already own disabled placement records.
+        // Showing them must reuse geometry and the retained top-level scene.
         activeBridge = &first;
         firstScene->AddPrims({{SdfPath("/Hidden"), HdPrimTypeTokens->mesh,
                                VisibilityMeshData(true, 0.9f)}});
@@ -1770,12 +1771,13 @@ int main()
                     "visibility restore did not prepare");
         VtDictionary const shown = first.GetStats();
         ok &= Check(Stat(shown, "visibilityRecoveryRebuilds") ==
-                        Stat(stats, "visibilityRecoveryRebuilds") + 1 &&
-                        Stat(shown, "prototypeConversionCacheHits") > 0 &&
-                        Stat(shown, "prototypeConversionCacheHits") == 68 &&
-                        Stat(shown, "prototypeConversions") == 1 &&
-                        Stat(shown, "prototypeBuildCount") == 67,
-                    "unchanged prims were converted again in an incremental snapshot build");
+                        Stat(stats, "visibilityRecoveryRebuilds") &&
+                        Stat(shown, "snapshotBuilds") == Stat(stats, "snapshotBuilds") &&
+                        Stat(shown, "prototypeBuilds") == Stat(stats, "prototypeBuilds") &&
+                        Stat(shown, "topLevelSceneBuilds") == Stat(stats, "topLevelSceneBuilds") &&
+                        Stat(shown, "enabledPlacementCount") ==
+                            Stat(stats, "enabledPlacementCount") + 1,
+                    "visibility restore rebuilt retained geometry or did not enable its placement");
         ok &= Check(Stat(shown, "primCount") == 69 &&
                         Stat(shown, "prototypePathCount") == 69 &&
                         Stat(shown, "prototypeCount") == 67 &&
@@ -1883,9 +1885,9 @@ int main()
                             Stat(stats, "spareSnapshotsDiscarded") == 0 &&
                             Stat(stats, "retainedSnapshotCount") == 2,
                         "initial load did not install exactly one spare bank");
-            ok &= Check(Stat(stats, "sparePrototypeConversionCacheHits") == 68 &&
+            ok &= Check(Stat(stats, "sparePrototypeConversionCacheHits") == 69 &&
                             Stat(stats, "sparePrototypeConversions") == 0 &&
-                            Stat(stats, "prototypeBuildCount") == 66,
+                            Stat(stats, "prototypeBuildCount") == 67,
                         "spare bank converted or rebuilt mesh prototypes");
             ok &= Check(DoubleStat(stats, "firstPublishSeconds") > 0.0 &&
                             DoubleStat(stats, "spareSnapshotSeconds") >= 0.0,
@@ -1913,7 +1915,7 @@ int main()
                             Stat(settled, "retainedSnapshotCount") == 2 &&
                             Stat(settled, "snapshotBuilds") == 1 &&
                             Stat(settled, "discardedSnapshotBuilds") == 0 &&
-                            Stat(settled, "prototypeBuildCount") == 66,
+                            Stat(settled, "prototypeBuildCount") == 67,
                         "installing the spare bank counted as a snapshot build");
         }
 
@@ -1938,8 +1940,8 @@ int main()
             ok &= Check(Stat(moved, "spareSnapshotsDiscarded") +
                             Stat(moved, "spareSnapshotsInstalled") == 2 &&
                             Stat(moved, "spareSnapshotsInstalled") >= 1 &&
-                            Stat(moved, "primCount") == 68 &&
-                            Stat(moved, "triangleCount") == 64 * 3 + 3 + 2,
+                            Stat(moved, "primCount") == 69 &&
+                            Stat(moved, "triangleCount") == 64 * 3 + 3 + 2 + 3,
                         "spare job interrupted by an edit was not accounted for");
             size_t hits = 0;
             ok &= Check(renderFrame(bridge), "moved grid frame did not converge");
@@ -1958,7 +1960,7 @@ int main()
                             reusedBefore + 1 &&
                             Stat(returned, "snapshotBuilds") ==
                                 Stat(moved, "snapshotBuilds") &&
-                            Stat(returned, "primCount") == 68,
+                            Stat(returned, "primCount") == 69,
                         "second edit did not reuse the installed spare bank");
             ok &= Check(renderFrame(bridge), "returned grid frame did not converge");
             std::vector<int> const prims = ReadBuffer<int>(&primBuffer);
@@ -2126,7 +2128,7 @@ int main()
                                 Stat(ready, "snapshotBuilds") &&
                             Stat(edited, "reusedSnapshotBuilds") ==
                                 Stat(ready, "reusedSnapshotBuilds") + 1 &&
-                            Stat(edited, "primCount") == 68,
+                            Stat(edited, "primCount") == 69,
                         "finished spare was discarded instead of taking the edit");
             ok &= Check(renderFrame(bridge), "idle-host edit frame did not converge");
             std::vector<int> const prims = ReadBuffer<int>(&primBuffer);
@@ -2161,9 +2163,9 @@ int main()
                                     resolution, resolution),
                         "structural edit after an unconsumed spare did not prepare");
             VtDictionary const edited = bridge.GetStats();
-            ok &= Check(Stat(edited, "primCount") == 69 &&
-                            Stat(edited, "prototypeCount") == 67 &&
-                            Stat(edited, "triangleCount") == 64 * 3 + 3 + 2 + 3 &&
+            ok &= Check(Stat(edited, "primCount") == 70 &&
+                            Stat(edited, "prototypeCount") == 68 &&
+                            Stat(edited, "triangleCount") == 64 * 3 + 3 + 2 + 3 + 3 &&
                             Stat(edited, "instanceCount") == 2,
                         "structural edit after an unconsumed spare lost scene contents");
             ok &= Check(Stat(edited, "snapshotBuilds") ==
@@ -2319,5 +2321,6 @@ int main()
     ok &= RunCoverageIntegrationTests() == 0;
     ok &= RunPickingIntegrationTests() == 0;
     ok &= RunEnvironmentCacheIntegrationTests() == 0;
+    ok &= RunVisibilityRetentionTests() == 0;
     return ok ? 0 : 1;
 }
