@@ -269,6 +269,60 @@ int main() {
         presentation.SetPresentationClearColor(VtValue());
         if (presentation.CapturePresentation().pixels != raw.pixels)
             throw std::runtime_error("non-color AOV was composited with the background");
+        auto refinement = std::make_shared<std::vector<uint8_t>>(original);
+        float *refined = reinterpret_cast<float *>(refinement->data());
+        refined[0] = .125f; refined[1] = .25f; refined[2] = .375f; refined[3] = .5f;
+        presentation.SetPresentationPixels(refinement, frame);
+        presentation.SetPresentationClearColor(VtValue(GfVec4f(0)));
+        if (presentation.CapturePresentation().pixels != refinement ||
+            *presentation.Capture().pixels != original ||
+            presentation.CapturePublished().pixels != raw.pixels)
+            throw std::runtime_error("display refinement changed committed raw publication");
+        exported = static_cast<float const *>(presentation.Map());
+        if (!std::equal(exported, exported + 4, miss))
+            throw std::runtime_error("display refinement changed raw export mapping");
+        presentation.Unmap();
+        presentation.SetPresentationClearColor(VtValue(GfVec4f(.25f, .5f, .75f, 1)));
+        auto refinedBackground = presentation.CapturePresentation();
+        const float *composed = reinterpret_cast<float const *>(refinedBackground.pixels->data());
+        if (composed[0] != .25f || composed[1] != .5f || composed[2] != .75f || composed[3] != 1)
+            throw std::runtime_error("viewport background ignored the progressive display pixels");
+        presentation.SetPresentationClearColor(VtValue(GfVec4f(0)));
+        auto heldRefinement = presentation.CapturePresentation();
+        presentation.ClearPresentationPixels();
+        if (presentation.CapturePresentation().pixels != raw.pixels ||
+            heldRefinement.pixels != refinement || (*heldRefinement.pixels)[0] != (*refinement)[0])
+            throw std::runtime_error("cancellation changed raw pixels or held immutable refinement");
+        presentation.SetPresentationPixels(refinement, frame);
+        presentation.Publish(frame);
+        if (presentation.CapturePresentation().pixels != presentation.Capture().pixels)
+            throw std::runtime_error("complete sample publication retained a partial override");
+        auto oldPinned = presentation.Capture();
+        presentation.Map();
+        auto nextFrame = std::make_shared<prism::hydra::PublishedFrame>();
+        nextFrame->generation = 8;
+        presentation.WriteFloat(0, 0, opaque, 4, false);
+        presentation.Publish(nextFrame);
+        auto newest = presentation.CapturePublished();
+        auto nextRefinement = std::make_shared<std::vector<uint8_t>>(*newest.pixels);
+        presentation.SetPresentationPixels(nextRefinement, nextFrame);
+        auto pinnedPresentation = presentation.CapturePresentation();
+        if (pinnedPresentation.frame != oldPinned.frame || pinnedPresentation.pixels != oldPinned.pixels ||
+            presentation.CapturePublished().frame != nextFrame)
+            throw std::runtime_error("new-camera refinement replaced an older mapped geometric frame");
+        presentation.Unmap();
+        if (presentation.CapturePresentation().pixels != nextRefinement)
+            throw std::runtime_error("latest refinement did not appear after releasing old frame mapping");
+        presentation.ResetSamples();
+        if (presentation.CapturePresentation().pixels != newest.pixels)
+            throw std::runtime_error("accumulation reset retained partial display pixels");
+        presentation.SetPresentationPixels(nextRefinement, nextFrame);
+        presentation.Allocate(GfVec3i(1, 1, 1), HdFormatFloat32Vec4, false);
+        presentation.SetPresentationPixels(nextRefinement, nextFrame);
+        auto resizedPresentation = presentation.CapturePresentation();
+        if (resizedPresentation.width != 1 || resizedPresentation.frame ||
+            resizedPresentation.pixels != presentation.CapturePublished().pixels)
+            throw std::runtime_error("resize accepted stale refinement dimensions or frame metadata");
         std::cout << "Mapped storage survives publication, nested maps, and resize\n";
     } catch(const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
 }

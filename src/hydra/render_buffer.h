@@ -59,6 +59,9 @@ public:
     // The view stays valid through later publication and buffer allocation.
     ReadView Capture() const;
     ReadView CapturePublished() const;
+    void SetPresentationPixels(std::shared_ptr<const std::vector<uint8_t>> pixels,
+                               Frame frame);
+    void ClearPresentationPixels();
     // Only the viewport upload uses this composited copy. Map/Capture retain
     // the original premultiplied RGBA for rendered-image export.
     void SetPresentationClearColor(VtValue const &value);
@@ -127,6 +130,8 @@ private:
     mutable std::weak_ptr<const std::vector<uint8_t>> _presentationSource;
     mutable std::shared_ptr<const std::vector<uint8_t>> _presentationPixels;
     mutable GfVec4f _cachedPresentationClearColor{0.0f};
+    std::shared_ptr<const std::vector<uint8_t>> _refinementPixels;
+    Frame _refinementFrame;
     HdRenderThread *_renderThread;
 };
 

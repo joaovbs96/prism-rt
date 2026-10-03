@@ -120,6 +120,15 @@ Camera changes immediately trace and display a coarse one-sample preview for the
 
 `tests/hydra/usdview_motion.py` tests held-button trucking and orbiting through usdview's mouse-event handlers, checks that the rendered image changes on every input event without rebuilding geometry, and verifies refinement after release. It records screenshots and frame timings in `build/hydra-motion` (or `PRISM_VALIDATION_DIR`). The controlled parity fixture also checks that the panel moves in the expected screen direction, so changing noise or GL overlays cannot substitute for actual camera feedback. Run it with the installed USD runtime and `testusdview --testScript`, using either `tests/hydra/fixtures/parity.usda` or the OpenChessSet stage.
 
+During full-resolution refinement, the Float32 RGBA viewport can publish
+immutable partial-row display updates while a pass is still running. These
+updates affect only presentation: raw AOV mapping, saved render pixels,
+accumulation state, and random-number sequences remain tied to complete
+passes. A canceled or replaced frame discards its partial display image, and
+deterministic geometric AOVs continue to come from the committed full render.
+Compact hit staging and on-demand bound-AOV resolution avoid retaining large
+per-pixel hit records for the progressive viewport path.
+
 usdview's **default dome** is OpenUSD's Stinson Beach environment, not PrismRT's bundled indoor EXR. It uses intensity 1 and exposure 0. Hydra respects these authored values without the standalone environment's historical extra factor of two. To reproduce standalone lighting, use the same HDR and account for that factor (for example, standalone exposure -0.5 corresponds to a USD dome exposure +0.5 at intensity 1).
 
 The beach HDR contains a small, extremely bright sun. Environment MIS is now the default in both frontends: one importance-sampled environment direction competes with BSDF sampling at supported scattering vertices. The distribution uses exact texel solid angles and a small uniform mixture to cover filtered texture values. Diffuse and MDL materials supply matching BSDF evaluations/PDFs; legacy rough-metal and glTF samplers retain their BSDF-only behavior. The default sample clamp of 10 can still reduce brightness: use zero when measuring energy or variance. "Converged" means the requested sample count was reached, not that a noise threshold was met.

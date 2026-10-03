@@ -1561,7 +1561,8 @@ void _FlushSphereBatches(Snapshot *snapshot)
     snapshot->pendingSpheres.clear();
 }
 
-int _PrimIdForHit(Snapshot const *snapshot, RayHit const &hit)
+template<class Hit>
+int _PrimIdForHit(Snapshot const *snapshot, Hit const &hit)
 {
     auto batch = snapshot->sphereBatchPrimIds.find(
         static_cast<unsigned int>(hit.geomid));
@@ -3537,6 +3538,10 @@ public:
     uint64_t sparePrototypeConversionCacheHits = 0;
     double renderSeconds = 0.0;
     uint64_t previewPublishes = 0;
+    uint64_t refinementPublishes = 0;
+    uint64_t firstPassPrimaryScratchBytes = 0;
+    double lastPassTraceMilliseconds = 0;
+    double lastPassCommitMilliseconds = 0;
     double previewMilliseconds = 0.0;
     double previewRayWorkMilliseconds = 0.0;
     double previewPublicationMilliseconds = 0.0;
@@ -4755,70 +4760,162 @@ void SceneBridge::Render()
         // Full-resolution RNG setup belongs to the render worker.  Camera motion
         // only pays for the bounded preview above on the UI/Execute thread.
         _impl->committedRngStates.resize(static_cast<size_t>(width) * height);
-        tbb::parallel_for(
-            tbb::blocked_range2d<unsigned int>(0, height, 16, 0, width, 64),
-            [&](tbb::blocked_range2d<unsigned int> const &range) {
-                for (unsigned int y = range.rows().begin();
-                     y != range.rows().end(); ++y) {
-                    for (unsigned int x = range.cols().begin();
-                         x != range.cols().end(); ++x) {
-                        if (_impl->renderThread->IsStopRequested()) return;
-                        _impl->committedRngStates[static_cast<size_t>(y) * width + x] =
-                            tea<64>((y * width) ^ settings.seed, x);
-                    }
-                }
-            });
-        if (_impl->renderThread->IsStopRequested()) return;
     }
     prism::CameraRayParameters const cameraParameters =
         _CameraParameters(camera);
     prism::DumpCameraRayDiagnostics(
         cameraParameters, width, height, settings.seed, "hydra");
+    enum class AovKind { Color, Depth, CameraDepth, Normal, Neye, Peye, St, PrimId, ElementId, InstanceId, Unknown };
+    struct ResolvedBinding { PrismRenderBuffer *buffer; AovKind kind; };
+    std::vector<ResolvedBinding> resolvedBindings;
+    const TfToken stToken("primvars:st");
+    for (auto const &binding : bindings) {
+        AovKind kind = AovKind::Unknown;
+        const auto &name = binding.aovName;
+        if (name == HdAovTokens->color) kind = AovKind::Color;
+        else if (name == HdAovTokens->depth) kind = AovKind::Depth;
+        else if (name == HdAovTokens->cameraDepth) kind = AovKind::CameraDepth;
+        else if (name == HdAovTokens->normal) kind = AovKind::Normal;
+        else if (name == HdAovTokens->Neye) kind = AovKind::Neye;
+        else if (name == HdAovTokens->Peye) kind = AovKind::Peye;
+        else if (name == stToken) kind = AovKind::St;
+        else if (name == HdAovTokens->primId) kind = AovKind::PrimId;
+        else if (name == HdAovTokens->elementId) kind = AovKind::ElementId;
+        else if (name == HdAovTokens->instanceId) kind = AovKind::InstanceId;
+        resolvedBindings.push_back({dynamic_cast<PrismRenderBuffer *>(binding.renderBuffer), kind});
+    }
     const int sampleCount = std::max(1, settings.samples);
     const size_t scratchPixels = firstSample < sampleCount
         ? static_cast<size_t>(width) * height : 0;
     std::vector<Color3> passColors(scratchPixels);
     std::vector<float> passCoverage(scratchPixels);
     std::vector<unsigned int> rngStates(scratchPixels);
-    std::vector<std::optional<RayHit>> passPrimary;
-    if (firstSample == 0) passPrimary.resize(passColors.size());
+    // Retain only deterministic AOV attributes, never path differential payloads.
+    struct PrimaryAttributes {
+        Float3 p, n;
+        float u, v;
+        int geomid, primid;
+        explicit PrimaryAttributes(RayHit const &h)
+            : p(h.p), n(h.n), u(h.u), v(h.v), geomid(h.geomid), primid(h.primid) {}
+    };
+    const bool needsPrimary = std::any_of(bindings.begin(), bindings.end(),
+        [](auto const &b) { return b.aovName != HdAovTokens->color; });
+    std::vector<std::optional<PrimaryAttributes>> passPrimary;
+    if (firstSample == 0 && needsPrimary) passPrimary.resize(passColors.size());
+    {
+        std::lock_guard lock(_impl->mutex);
+        _impl->firstPassPrimaryScratchBytes = passPrimary.capacity() * sizeof(passPrimary[0]);
+    }
+    struct DisplayTarget {
+        PrismRenderBuffer *buffer;
+        PrismRenderBuffer::ReadView base;
+        std::shared_ptr<std::vector<uint8_t>> pixels;
+    };
+    std::vector<DisplayTarget> displays;
+    struct DisplayCleanup {
+        std::vector<ResolvedBinding> const &targets;
+        ~DisplayCleanup() { for (auto &t : targets) if (t.buffer) t.buffer->ClearPresentationPixels(); }
+    } displayCleanup{resolvedBindings};
     for (int sample = firstSample; sample < sampleCount; ++sample) {
         if (_impl->renderThread->IsStopRequested()) return;
         while (_impl->renderThread->IsPauseRequested()) {
             if (_impl->renderThread->IsStopRequested()) return;
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
-        std::copy(_impl->committedRngStates.begin(),
-                  _impl->committedRngStates.end(), rngStates.begin());
-        tbb::parallel_for(tbb::blocked_range2d<unsigned int>(0, height, 8, 0, width, 8),
-            [&](tbb::blocked_range2d<unsigned int> const &range) {
-                for (unsigned int y = range.rows().begin(); y != range.rows().end(); ++y) {
-                    if (_impl->renderThread->IsStopRequested()) return;
-                    for (unsigned int x = range.cols().begin(); x != range.cols().end(); ++x) {
-                        const size_t pixel = static_cast<size_t>(y) * width + x;
-                        unsigned int &seed = rngStates[pixel];
-                        RayPair rays = prism::GenerateCameraRays(
-                            cameraParameters, x, y, width, height, seed);
-                        SceneManager::PrimaryOutcome outcome = SceneManager::PrimaryOutcome::Unresolved;
-                        Color3 c = snapshot->scene->trace(
-                            prism::PathRay{rays.sampled, rays.footprint},
-                            0, Color3(1.0f), seed, &outcome);
-                        const float coverage = (snapshot->domeCount == 0 || !settings.domeLightCameraVisibility) &&
-                            outcome == SceneManager::PrimaryOutcome::Escaped ? 0.0f : 1.0f;
-                        if (coverage == 0.0f) c = Color3(0.0f);
-                        if (settings.sampleClamp > 0.0f) {
-                            const float peak = c.max_component();
-                            if (peak > settings.sampleClamp) c *= settings.sampleClamp / peak;
+        if (sample != 0)
+            std::copy(_impl->committedRngStates.begin(),
+                      _impl->committedRngStates.end(), rngStates.begin());
+        displays.clear();
+        for (auto const &binding : bindings) {
+            if (binding.aovName != HdAovTokens->color) continue;
+            auto *buffer = dynamic_cast<PrismRenderBuffer *>(binding.renderBuffer);
+            if (!buffer) continue;
+            auto base = buffer->CapturePublished();
+            if (base.format != HdFormatFloat32Vec4 || base.frame != frame || !base.pixels) continue;
+            displays.push_back({buffer, base, std::make_shared<std::vector<uint8_t>>(*base.pixels)});
+        }
+        const auto traceStart = std::chrono::steady_clock::now();
+        auto nextDisplay = traceStart + std::chrono::milliseconds(100);
+        bool publishedPartial = false;
+        constexpr unsigned int rowBatch = 16;
+        for (unsigned int rowStart = 0; rowStart < height; rowStart += rowBatch) {
+            const unsigned int rowEnd = std::min(height, rowStart + rowBatch);
+            tbb::parallel_for(tbb::blocked_range2d<unsigned int>(rowStart, rowEnd, 8, 0, width, 8),
+                [&](tbb::blocked_range2d<unsigned int> const &range) {
+                    for (unsigned int y = range.rows().begin(); y != range.rows().end(); ++y) {
+                        if (_impl->renderThread->IsStopRequested()) return;
+                        for (unsigned int x = range.cols().begin(); x != range.cols().end(); ++x) {
+                            const size_t pixel = static_cast<size_t>(y) * width + x;
+                            unsigned int &seed = rngStates[pixel];
+                            if (sample == 0) seed = tea<64>((y * width) ^ settings.seed, x);
+                            RayPair rays = prism::GenerateCameraRays(
+                                cameraParameters, x, y, width, height, seed);
+                            SceneManager::PrimaryOutcome outcome = SceneManager::PrimaryOutcome::Unresolved;
+                            Color3 c = snapshot->scene->trace(
+                                prism::PathRay{rays.sampled, rays.footprint},
+                                0, Color3(1.0f), seed, &outcome);
+                            const float coverage = (snapshot->domeCount == 0 || !settings.domeLightCameraVisibility) &&
+                                outcome == SceneManager::PrimaryOutcome::Escaped ? 0.0f : 1.0f;
+                            if (coverage == 0.0f) c = Color3(0.0f);
+                            if (settings.sampleClamp > 0.0f) {
+                                const float peak = c.max_component();
+                                if (peak > settings.sampleClamp) c *= settings.sampleClamp / peak;
+                            }
+                            c *= camera.linearExposureScale;
+                            passColors[pixel] = c;
+                            passCoverage[pixel] = coverage;
+                            if (sample == 0 && needsPrimary) {
+                                auto hit = snapshot->scene->cast_ray(rays.center);
+                                passPrimary[pixel].emplace(hit);
+                            }
                         }
-                        c *= camera.linearExposureScale;
-                        passColors[pixel] = c;
-                        passCoverage[pixel] = coverage;
-                        if (sample == 0)
-                            passPrimary[pixel] = snapshot->scene->cast_ray(rays.center);
+                    }
+                });
+            if (_impl->renderThread->IsStopRequested()) return;
+            for (auto &target : displays) {
+                float *dst = reinterpret_cast<float *>(target.pixels->data());
+                float const *previous = reinterpret_cast<float const *>(target.base.pixels->data());
+                for (unsigned int y = rowStart; y < rowEnd; ++y) {
+                    for (unsigned int x = 0; x < width; ++x) {
+                        const size_t pixel = static_cast<size_t>(y) * width + x;
+                        const size_t offset = (static_cast<size_t>(height - 1 - y) * width + x) * 4;
+                        const auto &c = passColors[pixel];
+                        const float values[4] = {c.x(), c.y(), c.z(), passCoverage[pixel]};
+                        for (size_t component = 0; component < 4; ++component)
+                            dst[offset + component] = sample == 0 ? values[component] :
+                                (previous[offset + component] * sample + values[component]) / (sample + 1);
                     }
                 }
-            });
+            }
+            if (std::chrono::steady_clock::now() >= nextDisplay && rowEnd < height) {
+                for (auto &target : displays) {
+                    target.buffer->SetPresentationPixels(target.pixels, frame);
+                    // Published pixels are immutable while the UI uploads them.
+                    target.pixels = std::make_shared<std::vector<uint8_t>>(*target.pixels);
+                }
+                {
+                    std::lock_guard lock(_impl->mutex);
+                    if (!displays.empty()) {
+                        ++_impl->refinementPublishes;
+                        publishedPartial = true;
+                    }
+                }
+                nextDisplay = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+            }
+        }
         if (_impl->renderThread->IsStopRequested()) return;
+        // Complete the display before the atomic raw-buffer commit, so a slow
+        // geometric-AOV commit cannot leave the final rows at preview quality.
+        if (publishedPartial) {
+            for (auto &target : displays)
+                target.buffer->SetPresentationPixels(target.pixels, frame);
+            std::lock_guard lock(_impl->mutex);
+            ++_impl->refinementPublishes;
+        }
+        const auto commitStart = std::chrono::steady_clock::now();
+        // Release previous raw image references so publication can recycle its storage.
+        // The buffer keeps the immutable display override alive until Publish.
+        displays.clear();
         // Commit is bounded buffer work: finish it even if a stop arrives.
         // The next RNG state and sample count advance only with publication.
         tbb::parallel_for(tbb::blocked_range2d<unsigned int>(0, height, 8, 0, width, 8),
@@ -4829,35 +4926,36 @@ void SceneBridge::Render()
                     for (unsigned int x = range.cols().begin(); x != range.cols().end(); ++x) {
                         const size_t pixel = static_cast<size_t>(y) * width + x;
                         Color3 const &c = passColors[pixel];
-                        std::optional<RayHit> primary;
-                        if (sample == 0) primary = passPrimary[pixel];
+                        std::optional<PrimaryAttributes> primary;
+                        if (sample == 0 && needsPrimary) primary = passPrimary[pixel];
                         // Hydra's render buffers are addressed bottom-up. Camera sampling
                         // remains top-down so the generated rays match standalone PrismRT.
                         const unsigned int bufferY = height - 1 - y;
                         for (size_t bindingIndex = 0;
                              bindingIndex < bindings.size(); ++bindingIndex) {
-                            HdRenderPassAovBinding const &binding = bindings[bindingIndex];
-                            if (sample != 0 && binding.aovName != HdAovTokens->color)
+                            auto const &resolved = resolvedBindings[bindingIndex];
+                            const AovKind kind = resolved.kind;
+                            if (sample != 0 && kind != AovKind::Color)
                                 continue;
-                            auto *buffer = dynamic_cast<PrismRenderBuffer *>(binding.renderBuffer);
+                            auto *buffer = resolved.buffer;
                             if (!buffer) continue;
                             const auto writeStart = _impl->profileBufferWrites
                                 ? std::chrono::steady_clock::now()
                                 : std::chrono::steady_clock::time_point{};
-                            if (binding.aovName == HdAovTokens->color) {
+                            if (kind == AovKind::Color) {
                                 float v[4] = {c.x(), c.y(), c.z(), passCoverage[pixel]};
                                 buffer->WriteFloat(x, bufferY, v, 4, true);
                             } else if (!primary) {
                                 continue;
-                            } else if (binding.aovName == HdAovTokens->depth ||
-                                       binding.aovName == HdAovTokens->cameraDepth) {
-                                float v = binding.aovName == HdAovTokens->depth
+                            } else if (kind == AovKind::Depth ||
+                                       kind == AovKind::CameraDepth) {
+                                float v = kind == AovKind::Depth
                                     ? 1.0f : std::numeric_limits<float>::infinity();
                                 if (primary->geomid != RTC_INVALID_GEOMETRY_ID) {
                                     GfVec4d view(primary->p.x(), primary->p.y(),
                                                  primary->p.z(), 1.0);
                                     view = view * camera.worldToView;
-                                    if (binding.aovName == HdAovTokens->cameraDepth) {
+                                    if (kind == AovKind::CameraDepth) {
                                         v = static_cast<float>(-view[2]);
                                     } else {
                                         GfVec4d clip = view * camera.projection;
@@ -4867,10 +4965,10 @@ void SceneBridge::Render()
                                     }
                                 }
                                 buffer->WriteFloat(x, bufferY, &v, 1, false);
-                            } else if (binding.aovName == HdAovTokens->normal ||
-                                       binding.aovName == HdAovTokens->Neye) {
+                            } else if (kind == AovKind::Normal ||
+                                       kind == AovKind::Neye) {
                                 Float3 n = primary->n;
-                                if (binding.aovName == HdAovTokens->Neye &&
+                                if (kind == AovKind::Neye &&
                                     primary->geomid != RTC_INVALID_GEOMETRY_ID) {
                                     GfVec3d eye = camera.worldToView.TransformDir(
                                         GfVec3d(n.x(), n.y(), n.z())).GetNormalized();
@@ -4880,7 +4978,7 @@ void SceneBridge::Render()
                                 }
                                 float v[3] = {n.x(), n.y(), n.z()};
                                 buffer->WriteFloat(x, bufferY, v, 3, false);
-                            } else if (binding.aovName == HdAovTokens->Peye) {
+                            } else if (kind == AovKind::Peye) {
                                 float v[3] = {0, 0, 0};
                                 if (primary->geomid != RTC_INVALID_GEOMETRY_ID) {
                                     GfVec3d eye = camera.worldToView.Transform(
@@ -4890,17 +4988,17 @@ void SceneBridge::Render()
                                     v[2] = static_cast<float>(eye[2]);
                                 }
                                 buffer->WriteFloat(x, bufferY, v, 3, false);
-                            } else if (binding.aovName == TfToken("primvars:st")) {
+                            } else if (kind == AovKind::St) {
                                 float v[2] = {0, 0};
                                 if (primary->geomid != RTC_INVALID_GEOMETRY_ID) {
                                     v[0] = primary->u;
                                     v[1] = primary->v;
                                 }
                                 buffer->WriteFloat(x, bufferY, v, 2, false);
-                            } else if (binding.aovName == HdAovTokens->primId) {
+                            } else if (kind == AovKind::PrimId) {
                                 int id = _PrimIdForHit(snapshot.get(), *primary);
                                 buffer->WriteInt(x, bufferY, &id, 1);
-                            } else if (binding.aovName == HdAovTokens->elementId) {
+                            } else if (kind == AovKind::ElementId) {
                                 int id = -1;
                                 auto it = snapshot->geomToCoarseFaces.find(primary->geomid);
                                 if (it != snapshot->geomToCoarseFaces.end() &&
@@ -4909,7 +5007,7 @@ void SceneBridge::Render()
                                     id = it->second[primary->primid];
                                 }
                                 buffer->WriteInt(x, bufferY, &id, 1);
-                            } else if (binding.aovName == HdAovTokens->instanceId) {
+                            } else if (kind == AovKind::InstanceId) {
                                 int id = -1;
                                 auto it = snapshot->geomToInstanceId.find(primary->geomid);
                                 if (it != snapshot->geomToInstanceId.end()) id = it->second;
@@ -4927,8 +5025,7 @@ void SceneBridge::Render()
                 if (_impl->profileBufferWrites) {
                     for (size_t i = 0; i < bindings.size(); ++i) {
                         if (tileWriteNanoseconds[i] == 0) continue;
-                        if (auto *buffer = dynamic_cast<PrismRenderBuffer *>(
-                                bindings[i].renderBuffer))
+                        if (auto *buffer = resolvedBindings[i].buffer)
                             buffer->RecordWriteNanoseconds(tileWriteNanoseconds[i]);
                     }
                 }
@@ -4943,11 +5040,13 @@ void SceneBridge::Render()
         {
             std::lock_guard lock(_impl->mutex);
             _impl->lastPublishedFrame = frame;
+            _impl->lastPassTraceMilliseconds = std::chrono::duration<double,std::milli>(commitStart-traceStart).count();
+            _impl->lastPassCommitMilliseconds = std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-commitStart).count();
         }
         _impl->committedRngStates.swap(rngStates);
         _impl->samples.store(static_cast<uint64_t>(sample + 1));
         if (sample == 0)
-            std::vector<std::optional<RayHit>>().swap(passPrimary);
+            std::vector<std::optional<PrimaryAttributes>>().swap(passPrimary);
     }
     for (HdRenderPassAovBinding const &binding : bindings)
         if (auto *buffer = dynamic_cast<PrismRenderBuffer *>(binding.renderBuffer))
@@ -5011,6 +5110,10 @@ VtDictionary SceneBridge::GetStats() const
     result["completedSamples"] = VtValue(static_cast<int64_t>(_impl->samples.load()));
     result["converged"] = VtValue(_converged.load());
     std::lock_guard lock(_impl->mutex);
+    result["refinementPublishes"] = VtValue(static_cast<int64_t>(_impl->refinementPublishes));
+    result["firstPassPrimaryScratchBytes"] = VtValue(static_cast<int64_t>(_impl->firstPassPrimaryScratchBytes));
+    result["lastPassTraceMilliseconds"] = VtValue(_impl->lastPassTraceMilliseconds);
+    result["lastPassCommitMilliseconds"] = VtValue(_impl->lastPassCommitMilliseconds);
     result["meshCount"] = VtValue(static_cast<int64_t>(
         _impl->snapshot ? _impl->snapshot->meshCount : 0));
     result["triangleCount"] = VtValue(

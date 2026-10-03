@@ -53,6 +53,7 @@ bool PrismRenderBuffer::Allocate(GfVec3i const &d, HdFormat format, bool ms)
     _pixels = std::make_shared<std::vector<uint8_t>>(
         static_cast<size_t>(_width) * _height * HdDataSizeOfFormat(_format), 0);
     _frame.reset();
+    _refinementPixels.reset(); _refinementFrame.reset();
     _presentationSource.reset();
     _presentationPixels.reset();
     _workingPixels = *_pixels;
@@ -75,6 +76,7 @@ void PrismRenderBuffer::_Deallocate()
     _format = HdFormatInvalid;
     _pixels.reset();
     _frame.reset();
+    _refinementPixels.reset(); _refinementFrame.reset();
     _presentationSource.reset();
     _presentationPixels.reset();
     _workingPixels.clear();
@@ -129,6 +131,26 @@ void PrismRenderBuffer::SetPresentationClearColor(VtValue const &value)
     _presentationClearColor = color;
 }
 
+PrismRenderBuffer::ReadView PrismRenderBuffer::CapturePublished() const
+{
+    std::lock_guard lock(_mutex);
+    return {_pixels,_frame,_width,_height,_format};
+}
+
+void PrismRenderBuffer::SetPresentationPixels(
+    std::shared_ptr<const std::vector<uint8_t>> pixels, Frame frame)
+{
+    std::lock_guard lock(_mutex);
+    if (!pixels || !frame || frame != _frame || !_pixels || pixels->size()!=_pixels->size()) return;
+    _refinementPixels=std::move(pixels); _refinementFrame=std::move(frame);
+}
+
+void PrismRenderBuffer::ClearPresentationPixels()
+{
+    std::lock_guard lock(_mutex);
+    _refinementPixels.reset(); _refinementFrame.reset();
+}
+
 PrismRenderBuffer::ReadView PrismRenderBuffer::CapturePresentation() const
 {
     ReadView view;
@@ -136,6 +158,11 @@ PrismRenderBuffer::ReadView PrismRenderBuffer::CapturePresentation() const
     {
         std::lock_guard lock(_mutex);
         view = Capture();
+        // A mapper may still pin an earlier camera/allocation. Never display
+        // a progressive color estimate with that older geometric frame.
+        if (_refinementPixels && view.frame == _refinementFrame &&
+            view.width == _width && view.height == _height && view.format == _format)
+            view.pixels = _refinementPixels;
         if (!_hasPresentationClearColor || view.format != HdFormatFloat32Vec4 || !view.pixels)
             return view;
         background = _presentationClearColor;
@@ -176,15 +203,10 @@ PrismRenderBuffer::ReadView PrismRenderBuffer::CapturePresentation() const
 
 void PrismRenderBuffer::Resolve() {}
 
-PrismRenderBuffer::ReadView PrismRenderBuffer::CapturePublished() const
-{
-    std::lock_guard lock(_mutex);
-    return {_pixels,_frame,_width,_height,_format};
-}
-
 void PrismRenderBuffer::ResetSamples()
 {
     std::lock_guard lock(_mutex);
+    _refinementPixels.reset(); _refinementFrame.reset();
     std::fill(_accumulation.begin(), _accumulation.end(), 0.0f);
     std::fill(_sampleCounts.begin(), _sampleCounts.end(), 0);
     _converged.store(false);
@@ -290,6 +312,7 @@ void PrismRenderBuffer::PublishPreviewFloat(
     std::lock_guard lock(_mutex);
     _pixels = std::move(published);
     _frame = std::move(frame);
+    _refinementPixels.reset(); _refinementFrame.reset();
     _hasPublished = true;
 }
 
@@ -336,6 +359,7 @@ void PrismRenderBuffer::PublishPreviewInt(
     std::lock_guard lock(_mutex);
     _pixels = std::move(published);
     _frame = std::move(frame);
+    _refinementPixels.reset(); _refinementFrame.reset();
     _hasPublished = true;
 }
 
@@ -396,6 +420,7 @@ void PrismRenderBuffer::Clear(VtValue const &value)
         std::copy(v.data(), v.data() + 4, f);
     } else if (value.IsHolding<int>()) { i[0] = value.UncheckedGet<int>(); ints = true; }
     std::lock_guard lock(_mutex);
+    _refinementPixels.reset(); _refinementFrame.reset();
     auto clearWorking = [&] {
         std::fill(_accumulation.begin(), _accumulation.end(), 0.0f);
         std::fill(_sampleCounts.begin(), _sampleCounts.end(), 0);
@@ -411,6 +436,7 @@ void PrismRenderBuffer::Clear(VtValue const &value)
     clearWorking();
     _pixels = std::make_shared<std::vector<uint8_t>>(_workingPixels);
     _frame.reset();
+    _refinementPixels.reset(); _refinementFrame.reset();
     _hasPublished = true;
 }
 
@@ -459,6 +485,7 @@ void PrismRenderBuffer::_FillWorking(VtValue const &value)
 void PrismRenderBuffer::BeginFrame(VtValue const &value)
 {
     std::lock_guard lock(_mutex);
+    _refinementPixels.reset(); _refinementFrame.reset();
     std::fill(_accumulation.begin(), _accumulation.end(), 0.0f);
     std::fill(_sampleCounts.begin(), _sampleCounts.end(), 0);
     // Every supported AOV overwrites every working pixel in the first full
@@ -497,6 +524,7 @@ void PrismRenderBuffer::Publish(Frame frame)
         std::lock_guard lock(_mutex);
         previous = std::exchange(_pixels, std::move(next));
         _frame = std::move(frame);
+        _refinementPixels.reset(); _refinementFrame.reset();
         _hasPublished = true;
     }
     if (previous && previous.use_count() == 1)

@@ -42,6 +42,54 @@ changes; they are not new acceptance results for individual fixes.
 | B3/C2 test registration | Registered fallback-opacity and geometric-AOV integration helpers in the bridge test target, plus the fallback helper unit target. | Commits `17b8639` and `d2f34bb`; registration verified in `CMakeLists.txt`. |
 | D1 | Added persistent canonical prim slots and incremental reconciliation for eligible typed leaf mesh and ordinary sphere additions/removals. Removed paths remain tombstones; re-adding the same path revives its slot. | Commit `f6669f8`; final harness commit `37d5259`. Focused `prism_hydra_scene_bridge_test` passed 1/1 in 3.98 s. The full structural matrix below checks nine fresh-process scenes. |
 
+## Follow-up viewport background regression
+
+Commit `1baa527` keeps hidden-dome primary misses transparent in the raw color
+AOV and composites usdview's clear color into a separate presentation image.
+The real-host regression passed against the rebuilt plugin: dome visibility on
+showed the environment; visibility off showed usdview's selected white and
+black clear colors. OpenUSD FrameRecorder also wrote PNG and EXR exports with
+dome visibility off. The alpha checker read both saved files and verified all
+four image corners remained transparent while center geometry remained opaque.
+Artifacts and logs are under `build/hydra-background-final`.
+
+The pre-fix host probe confirmed the reported issue: the visible-dome check
+passed, while hidden-dome corners stayed `(0, 0, 0)` with a white host clear
+color. The final test checks the actual usdview framebuffer and saved export
+files; the earlier observation is diagnostic only and is not a timing
+comparison.
+
+## Progressive viewport refinement
+
+Float32 RGBA viewport presentation can publish immutable partial-row updates
+during full-resolution refinement. The updates are display-only; raw AOVs,
+accumulation and RNG state remain tied to complete passes, and canceled or
+replaced generations discard their partial image. Other AOV formats retain
+whole-pass presentation.
+
+The final observer-corrected 4K Kitchen run is
+`build/hydra-refinement-optimized-kitchen-4k-r4/cadence.json`. It measured a
+1.578 s first full pass and a 0.516 s first sample-counter advance. The first
+pass trace was 1,211 ms and its commit was 78.4 ms. Across 12 s, the framebuffer
+CRC changed 65 times; 56 changes occurred while the completed-sample count was
+unchanged. The median CRC-change gap was 172 ms and maximum 250 ms. There were
+153 actual paints (median 47 ms, maximum 109 ms); the maximum paint gap was
+187 ms. Compact primary-hit scratch storage was 364,953,600 bytes. Focused
+integration tests passed 2/2 in 5.41 s.
+
+The pre-change evidence is one run only: first full pass 8.094 s and five CRC
+changes. It has no saved pre-change DLL, so it does not support a repeated-run
+or speedup comparison. Earlier r2/r3 apparent gaps included PNG encoding in
+the timed interval; r4 moved image saving outside that interval, so those gaps
+are not reported as renderer stalls. The full 33-test CTest suite passed in
+55.80 s (`build/hydra-progressive-validation/ctest-full.log`). Both filtered
+and bilinear 256-spp validations passed. Each of the standalone and Hydra
+images matched its preserved baseline exactly in both filters; all four
+comparisons reported zero RMSE and zero luminance error. Logs are
+`validate-filtered.log`, `validate-bilinear.log`, and
+`exact-{standalone,hydra}-{filtered,bilinear}.log` in
+`build/hydra-progressive-validation`.
+
 ## Focused validation checkpoint
 
 The expanded `prism_hydra_scene_bridge_test` passed 1/1 in 3.98 seconds against
