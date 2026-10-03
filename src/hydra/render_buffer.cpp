@@ -10,6 +10,8 @@
 #include <algorithm>
 #include <cstring>
 #include <chrono>
+#include <cmath>
+#include <limits>
 #include <utility>
 
 PXR_NAMESPACE_OPEN_SCOPE
@@ -28,6 +30,20 @@ bool PrismRenderBuffer::Allocate(GfVec3i const &d, HdFormat format, bool ms)
     if (_renderThread) _renderThread->StopRender();
     std::lock_guard lock(_mutex);
     if (d[0] < 0 || d[1] < 0 || d[2] != 1 || format == HdFormatInvalid) {
+        return false;
+    }
+    switch (HdGetComponentFormat(format)) {
+    case HdFormatFloat32:
+    case HdFormatFloat16:
+    case HdFormatUNorm8:
+    case HdFormatSNorm8:
+    case HdFormatInt16:
+    case HdFormatUInt16:
+    case HdFormatInt32:
+        break;
+    default:
+        TF_WARN("PrismRT render buffer does not support format %d",
+                static_cast<int>(format));
         return false;
     }
     _width = static_cast<unsigned int>(d[0]);
@@ -115,8 +131,50 @@ static void _StoreComponent(HdFormat format, uint8_t *dst, size_t c, float v)
     case HdFormatSNorm8:
         reinterpret_cast<int8_t *>(dst)[c] = static_cast<int8_t>(
             std::clamp(v, -1.0f, 1.0f) * 127.0f); break;
-    case HdFormatInt32: reinterpret_cast<int32_t *>(dst)[c] = static_cast<int32_t>(v); break;
+    case HdFormatInt16: {
+        const float bounded = std::isnan(v) ? 0.0f :
+            std::clamp(v, static_cast<float>(std::numeric_limits<int16_t>::min()),
+                       static_cast<float>(std::numeric_limits<int16_t>::max()));
+        reinterpret_cast<int16_t *>(dst)[c] = static_cast<int16_t>(bounded);
+        break;
+    }
+    case HdFormatUInt16: {
+        const float bounded = std::isnan(v) ? 0.0f :
+            std::clamp(v, 0.0f,
+                       static_cast<float>(std::numeric_limits<uint16_t>::max()));
+        reinterpret_cast<uint16_t *>(dst)[c] = static_cast<uint16_t>(bounded);
+        break;
+    }
+    case HdFormatInt32: {
+        const double bounded = std::isnan(v) ? 0.0 :
+            std::clamp(static_cast<double>(v),
+                static_cast<double>(std::numeric_limits<int32_t>::min()),
+                static_cast<double>(std::numeric_limits<int32_t>::max()));
+        reinterpret_cast<int32_t *>(dst)[c] = static_cast<int32_t>(bounded);
+        break;
+    }
     default: break;
+    }
+}
+
+static void _StoreIntComponent(HdFormat format, uint8_t *dst, size_t c, int v)
+{
+    switch (HdGetComponentFormat(format)) {
+    case HdFormatInt16:
+        reinterpret_cast<int16_t *>(dst)[c] = static_cast<int16_t>(
+            std::clamp(v, static_cast<int>(std::numeric_limits<int16_t>::min()),
+                       static_cast<int>(std::numeric_limits<int16_t>::max())));
+        break;
+    case HdFormatUInt16:
+        reinterpret_cast<uint16_t *>(dst)[c] = static_cast<uint16_t>(
+            std::clamp(v, 0, static_cast<int>(std::numeric_limits<uint16_t>::max())));
+        break;
+    case HdFormatInt32:
+        reinterpret_cast<int32_t *>(dst)[c] = static_cast<int32_t>(v);
+        break;
+    default:
+        _StoreComponent(format, dst, c, static_cast<float>(v));
+        break;
     }
 }
 
@@ -185,10 +243,7 @@ void PrismRenderBuffer::PublishPreviewInt(
         const int *src = values.data() + pixel * components;
         for (size_t c = 0; c < arity; ++c) {
             const int v = c < components ? src[c] : 0;
-            if (HdGetComponentFormat(_format) == HdFormatInt32)
-                reinterpret_cast<int32_t *>(dst)[c] = v;
-            else
-                _StoreComponent(_format, dst, c, static_cast<float>(v));
+            _StoreIntComponent(_format, dst, c, v);
         }
     }
     std::vector<uint8_t> expandedRow(static_cast<size_t>(_width) * stride);
@@ -252,11 +307,7 @@ void PrismRenderBuffer::WriteInt(unsigned int x, unsigned int y,
         (static_cast<size_t>(y) * _width + x) * HdDataSizeOfFormat(_format);
     for (size_t c = 0; c < arity; ++c) {
         const int v = c < n ? value[c] : 0;
-        if (HdGetComponentFormat(_format) == HdFormatInt32) {
-            reinterpret_cast<int32_t *>(dst)[c] = v;
-        } else {
-            _StoreComponent(_format, dst, c, static_cast<float>(v));
-        }
+        _StoreIntComponent(_format, dst, c, v);
     }
 }
 
@@ -283,7 +334,7 @@ void PrismRenderBuffer::Clear(VtValue const &value)
             uint8_t *dst = _workingPixels.data() +
                 (static_cast<size_t>(y) * _width + x) * HdDataSizeOfFormat(_format);
             for (size_t c = 0; c < HdGetComponentCount(_format); ++c)
-                reinterpret_cast<int32_t *>(dst)[c] = c < n ? i[c] : 0;
+                _StoreIntComponent(_format, dst, c, c < n ? i[c] : 0);
         } else _Write(x, y, f, n, false);
         }
     };
@@ -320,10 +371,7 @@ void PrismRenderBuffer::_FillWorking(VtValue const &value)
     for (size_t c = 0; c < arity; ++c) {
         if (ints) {
             const int v = c < n ? i[c] : 0;
-            if (HdGetComponentFormat(_format) == HdFormatInt32)
-                reinterpret_cast<int32_t *>(row)[c] = v;
-            else
-                _StoreComponent(_format, row, c, static_cast<float>(v));
+            _StoreIntComponent(_format, row, c, v);
         } else {
             _StoreComponent(_format, row, c,
                             c < n ? f[c] : (c == 3 ? 1.0f : 0.0f));

@@ -3,9 +3,13 @@
 
 #include <pxr/base/gf/vec3i.h>
 #include <pxr/base/gf/vec4f.h>
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
 #include <future>
 #include <chrono>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 
 PXR_NAMESPACE_USING_DIRECTIVE
@@ -123,6 +127,107 @@ int main() {
             if (!allEqual(depth, depthClear, 1))
                 throw std::runtime_error("resized depth buffer was not cleared");
         }
+        auto checkIntegerFormat = [&]<typename Component>(
+            HdFormat format, size_t components) {
+            PrismRenderBuffer integerBuffer(SdfPath("/integer"), nullptr);
+            if (!integerBuffer.Allocate(GfVec3i(2, 1, 1), format, false))
+                throw std::runtime_error("integer format allocation failed");
+            const int lowInput[4] = {
+                std::numeric_limits<int>::min(), -17, 40000, -40000};
+            const int highInput[4] = {
+                std::numeric_limits<int>::max(), 17, 90000, 23};
+            integerBuffer.WriteInt(0, 0, lowInput, components);
+            integerBuffer.WriteInt(1, 0, highInput, components);
+            integerBuffer.Publish();
+            integerBuffer.Resolve();
+            const Component *pixels = static_cast<Component const *>(integerBuffer.Map());
+            if (!pixels) throw std::runtime_error("integer mapping failed");
+            for (size_t c = 0; c < components; ++c) {
+                const long long low = std::clamp<long long>(
+                    lowInput[c], std::numeric_limits<Component>::lowest(),
+                    std::numeric_limits<Component>::max());
+                const long long high = std::clamp<long long>(
+                    highInput[c], std::numeric_limits<Component>::lowest(),
+                    std::numeric_limits<Component>::max());
+                if (pixels[c] != static_cast<Component>(low) ||
+                    pixels[components + c] != static_cast<Component>(high))
+                    throw std::runtime_error("integer write lost or misclamped a component");
+            }
+            integerBuffer.Unmap();
+
+            integerBuffer.Clear(VtValue(-3));
+            const Component *cleared = static_cast<Component const *>(integerBuffer.Map());
+            if (!cleared) throw std::runtime_error("integer clear mapping failed");
+            for (size_t i = 0; i < 2 * components; ++i) {
+                const long long expected = std::clamp<long long>(
+                    i % components == 0 ? -3 : 0,
+                    std::numeric_limits<Component>::lowest(),
+                    std::numeric_limits<Component>::max());
+                if (cleared[i] != static_cast<Component>(expected))
+                    throw std::runtime_error("integer clear used the wrong component width");
+            }
+            integerBuffer.Unmap();
+
+            integerBuffer.PublishPreviewInt(1, 1,
+                std::vector<int>(lowInput, lowInput + components), components);
+            const Component *preview = static_cast<Component const *>(integerBuffer.Map());
+            if (!preview) throw std::runtime_error("integer preview mapping failed");
+            for (size_t c = 0; c < components; ++c) {
+                const long long expected = std::clamp<long long>(
+                    lowInput[c], std::numeric_limits<Component>::lowest(),
+                    std::numeric_limits<Component>::max());
+                if (preview[c] != static_cast<Component>(expected) ||
+                    preview[components + c] != static_cast<Component>(expected))
+                    throw std::runtime_error("integer preview lost or misclamped a component");
+            }
+            integerBuffer.Unmap();
+        };
+        checkIntegerFormat.template operator()<int16_t>(HdFormatInt16, 1);
+        checkIntegerFormat.template operator()<int16_t>(HdFormatInt16Vec2, 2);
+        checkIntegerFormat.template operator()<int16_t>(HdFormatInt16Vec3, 3);
+        checkIntegerFormat.template operator()<int16_t>(HdFormatInt16Vec4, 4);
+        checkIntegerFormat.template operator()<uint16_t>(HdFormatUInt16, 1);
+        checkIntegerFormat.template operator()<uint16_t>(HdFormatUInt16Vec2, 2);
+        checkIntegerFormat.template operator()<uint16_t>(HdFormatUInt16Vec3, 3);
+        checkIntegerFormat.template operator()<uint16_t>(HdFormatUInt16Vec4, 4);
+        checkIntegerFormat.template operator()<int32_t>(HdFormatInt32, 1);
+        checkIntegerFormat.template operator()<int32_t>(HdFormatInt32Vec2, 2);
+        checkIntegerFormat.template operator()<int32_t>(HdFormatInt32Vec3, 3);
+        checkIntegerFormat.template operator()<int32_t>(HdFormatInt32Vec4, 4);
+
+        PrismRenderBuffer multisampled(SdfPath("/multisampled"), nullptr);
+        if (!multisampled.Allocate(GfVec3i(1, 1, 1), HdFormatInt32, true) ||
+            !multisampled.IsMultiSampled())
+            throw std::runtime_error("multisampled allocation metadata was lost");
+        const int largeId = 16777217;
+        multisampled.WriteInt(0, 0, &largeId, 1);
+        multisampled.Publish();
+        multisampled.Resolve();
+        const int *resolved = static_cast<int const *>(multisampled.Map());
+        if (!resolved || resolved[0] != largeId)
+            throw std::runtime_error("Resolve did not expose the published single-image result");
+        multisampled.Unmap();
+
+        PrismRenderBuffer floatToInt(SdfPath("/floatToInt"), nullptr);
+        if (!floatToInt.Allocate(GfVec3i(1, 1, 1), HdFormatInt32Vec4, false))
+            throw std::runtime_error("float-to-integer allocation failed");
+        const float exceptionalValues[4] = {
+            std::numeric_limits<float>::quiet_NaN(),
+            std::numeric_limits<float>::infinity(),
+            -std::numeric_limits<float>::infinity(), 123.75f};
+        floatToInt.WriteFloat(0, 0, exceptionalValues, 4, false);
+        floatToInt.Publish();
+        const int *converted = static_cast<int const *>(floatToInt.Map());
+        if (!converted || converted[0] != 0 ||
+            converted[1] != std::numeric_limits<int32_t>::max() ||
+            converted[2] != std::numeric_limits<int32_t>::min() ||
+            converted[3] != 123)
+            throw std::runtime_error("float-to-int conversion was not bounded");
+        floatToInt.Unmap();
+
+        PrismRenderBuffer unsupported(SdfPath("/unsupported"), nullptr);
+        if (unsupported.Allocate(GfVec3i(1, 1, 1), HdFormatFloat32UInt8, false))
+            throw std::runtime_error("unsupported packed format was allocated");
         std::cout << "Mapped storage survives publication, nested maps, and resize\n";
     } catch(const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
 }
