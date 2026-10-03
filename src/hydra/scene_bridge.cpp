@@ -1,4 +1,5 @@
 #include "scene_bridge.h"
+#include "fallback_material.h"
 
 #include "materials.h"
 #include "render_buffer.h"
@@ -1140,6 +1141,13 @@ bool _AppendMesh(HdSceneIndexBaseRefPtr const &sceneIndex,
     if (!prepared->storage) return false;
 
     Material *material = snapshot->fallbackMaterial.get();
+    PrimvarData opacityPv = _Primvar(primvars, TfToken("displayOpacity"));
+    float opacity = 1.0f;
+    if (opacityPv.interpolation == HdPrimvarSchemaTokens->constant &&
+        opacityPv.value.IsHolding<VtFloatArray>()) {
+        auto const &values = opacityPv.value.UncheckedGet<VtFloatArray>();
+        if (!values.empty()) opacity = values.front();
+    }
     PrimvarData displayColor = _Primvar(primvars, TfToken("displayColor"));
     if (displayColor.value.IsHolding<VtVec3fArray>()) {
         VtVec3fArray const &colors =
@@ -1152,12 +1160,25 @@ bool _AppendMesh(HdSceneIndexBaseRefPtr const &sceneIndex,
                 GfVec3f const &value = colors.front();
                 auto texture = std::make_unique<ColorTexture>(
                     Color3(value[0], value[1], value[2]));
-                auto displayMaterial = std::make_unique<Diffuse>(texture.get());
+                auto displayMaterial = std::make_unique<FallbackMaterial>(texture.get(), opacity);
                 material = displayMaterial.get();
                 snapshot->displayColorTextures.push_back(std::move(texture));
                 snapshot->displayColorMaterials.push_back(std::move(displayMaterial));
                 snapshot->displayMaterialsByPath.emplace(path, material);
             }
+        }
+    }
+    if (material == snapshot->fallbackMaterial.get() &&
+        NormalizeFallbackOpacity(opacity) < 1.0f) {
+        auto const existing = snapshot->displayMaterialsByPath.find(path);
+        if (existing != snapshot->displayMaterialsByPath.end()) {
+            material = existing->second;
+        } else {
+            auto displayMaterial = std::make_unique<FallbackMaterial>(
+                snapshot->fallbackTexture.get(), opacity);
+            material = displayMaterial.get();
+            snapshot->displayColorMaterials.push_back(std::move(displayMaterial));
+            snapshot->displayMaterialsByPath.emplace(path, material);
         }
     }
     const SdfPath materialPath = _MaterialPath(prim.dataSource);
@@ -1267,6 +1288,13 @@ Material *_BaseMaterial(HdSceneIndexBaseRefPtr const &sceneIndex,
     Material *material = snapshot->fallbackMaterial.get();
     HdPrimvarsSchema primvars =
         HdPrimvarsSchema::GetFromParent(prim.dataSource);
+    PrimvarData opacityPv = _Primvar(primvars, TfToken("displayOpacity"));
+    float opacity = 1.0f;
+    if (opacityPv.interpolation == HdPrimvarSchemaTokens->constant &&
+        opacityPv.value.IsHolding<VtFloatArray>()) {
+        auto const &values = opacityPv.value.UncheckedGet<VtFloatArray>();
+        if (!values.empty()) opacity = values.front();
+    }
     PrimvarData displayColor = _Primvar(primvars, TfToken("displayColor"));
     if (displayColor.value.IsHolding<VtVec3fArray>()) {
         VtVec3fArray const &colors =
@@ -1279,13 +1307,26 @@ Material *_BaseMaterial(HdSceneIndexBaseRefPtr const &sceneIndex,
                 GfVec3f const &value = colors.front();
                 auto texture = std::make_unique<ColorTexture>(
                     Color3(value[0], value[1], value[2]));
-                auto displayMaterial = std::make_unique<Diffuse>(texture.get());
+                auto displayMaterial = std::make_unique<FallbackMaterial>(texture.get(), opacity);
                 material = displayMaterial.get();
                 snapshot->displayColorTextures.push_back(std::move(texture));
                 snapshot->displayColorMaterials.push_back(
                     std::move(displayMaterial));
                 snapshot->displayMaterialsByPath.emplace(path, material);
             }
+        }
+    }
+    if (material == snapshot->fallbackMaterial.get() &&
+        NormalizeFallbackOpacity(opacity) < 1.0f) {
+        auto const existing = snapshot->displayMaterialsByPath.find(path);
+        if (existing != snapshot->displayMaterialsByPath.end()) {
+            material = existing->second;
+        } else {
+            auto displayMaterial = std::make_unique<FallbackMaterial>(
+                snapshot->fallbackTexture.get(), opacity);
+            material = displayMaterial.get();
+            snapshot->displayColorMaterials.push_back(std::move(displayMaterial));
+            snapshot->displayMaterialsByPath.emplace(path, material);
         }
     }
     if (std::shared_ptr<Material> resolved = _ResolveMaterial(
