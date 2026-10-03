@@ -247,6 +247,12 @@ if(PRISM_BUILD_HYDRA)
     set_tests_properties(prism_hydra_pick_bounds_test PROPERTIES
         ENVIRONMENT "${_prism_test_environment}")
 
+    add_executable(prism_hydra_environment_cache_test tests/hydra/environment_cache_test.cpp)
+    target_link_libraries(prism_hydra_environment_cache_test PRIVATE PrismRT::core)
+    add_test(NAME prism_hydra_environment_cache_test COMMAND prism_hydra_environment_cache_test)
+    set_tests_properties(prism_hydra_environment_cache_test PROPERTIES
+        ENVIRONMENT "${_prism_test_environment}")
+
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/materials_test.cpp")
         add_executable(prism_hydra_materials_test
             tests/hydra/materials_test.cpp
@@ -277,6 +283,7 @@ if(PRISM_BUILD_HYDRA)
             tests/hydra/task_delegate_settings_test.cpp
             tests/hydra/coverage_integration_test.cpp
             tests/hydra/picking_integration_test.cpp
+            tests/hydra/environment_cache_integration_test.cpp
             src/hydra/scene_bridge.cpp
             src/hydra/materials.cpp
             src/hydra/render_buffer.cpp

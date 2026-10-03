@@ -76,6 +76,8 @@ Color alpha accumulates primary coverage, including stochastic cutouts and silho
 
 Picking traces deterministic full-resolution rays against the camera and immutable scene owned by the displayed frame, including during low-resolution preview. Retained frames and mapped buffers keep their original geometry across later edits and renderer destruction. An externally retained inactive scene uses a conservative rebuild recorded by `pinnedSnapshotFallbacks`; ordinary released-frame bank reuse remains available.
 
+Hydra caches local-space environment importance distributions by prepared texture identity and exact RGB multiplier. Dome rotation and bank reuse share the distribution while each wrapper keeps its authored direction transform and PDF. Multiplier or texture-resource changes rebuild it. Statistics expose distribution builds, cache hits and uniquely shared importance-table bytes.
+
 ## Standalone comparisons
 
 The no-argument executable displays help. Rendering uses scene files and requires an explicit camera. USD camera paths and explicit camera position/target are supported; glTF/GLB and OBJ use an explicit camera position/target:

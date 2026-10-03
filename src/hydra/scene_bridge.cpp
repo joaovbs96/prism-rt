@@ -2,6 +2,7 @@
 #include "fallback_material.h"
 
 #include "materials.h"
+#include "environment_cache.h"
 #include "render_buffer.h"
 #include "triangulation.h"
 
@@ -422,6 +423,9 @@ struct MeshConversion {
 };
 
 struct PrototypePool {
+    EnvironmentCache environmentCache;
+    std::shared_ptr<ColorTexture> whiteEnvironmentTexture =
+        std::make_shared<ColorTexture>(Color3(1.0f));
     std::mutex mutex;
     std::unordered_map<size_t, std::vector<std::weak_ptr<PrototypeStorage>>> buckets;
     std::unordered_set<SdfPath, SdfPath::Hash> warnedPointPaths;
@@ -1463,6 +1467,8 @@ int _PrimIdForHit(Snapshot const *snapshot, RayHit const &hit)
 size_t _EnvironmentImportanceBytes(Snapshot const *snapshot)
 {
     if (!snapshot || !snapshot->environment) return 0;
+    if (auto const* cached = dynamic_cast<CachedTransformedEnvironment const*>(snapshot->environment.get()))
+        return cached->importanceBytes();
     auto const *map = dynamic_cast<EnvironmentMap const *>(
         snapshot->environment.get());
     if (!map) return 0;
@@ -1958,8 +1964,11 @@ void _SetDomeEnvironment(HdSceneIndexBaseRefPtr const &scene,
             for (int column = 0; column < 3; ++column)
                 linear[row * 3 + column] = static_cast<float>(
                     worldToDome[column][row]);
-        snapshot->environment = std::make_unique<TransformedEnvironmentMap>(
-            snapshot->environmentTexture.get(), multiplier, linear);
+        std::shared_ptr<Texture<Color3>> texture = snapshot->prototypePool->whiteEnvironmentTexture;
+        if (auto* image = dynamic_cast<ImageTexture<Color3>*>(snapshot->environmentTexture.get()))
+            texture = std::make_shared<ImageTexture<Color3>>(*image);
+        auto local = snapshot->prototypePool->environmentCache.Get(std::move(texture), multiplier);
+        snapshot->environment = std::make_unique<CachedTransformedEnvironment>(std::move(local), linear);
         snapshot->scene->environment = snapshot->environment.get();
     } catch (std::exception const &e) {
         TF_WARN("PrismRT: failed to load dome environment: %s", e.what());
@@ -4767,6 +4776,12 @@ VtDictionary SceneBridge::GetStats() const
     result["prototypeInvalidations"] = VtValue(static_cast<int64_t>(_impl->prototypeInvalidations));
     result["materialInvalidations"] = VtValue(static_cast<int64_t>(_impl->materialInvalidations));
     result["environmentInvalidations"] = VtValue(static_cast<int64_t>(_impl->environmentInvalidations));
+    result["environmentDistributionBuilds"] = VtValue(static_cast<int64_t>(
+        _impl->prototypePool->environmentCache.BuildCount()));
+    result["environmentDistributionCacheHits"] = VtValue(static_cast<int64_t>(
+        _impl->prototypePool->environmentCache.HitCount()));
+    result["sharedEnvironmentImportanceBytes"] = VtValue(static_cast<int64_t>(
+        _impl->prototypePool->environmentCache.LiveImportanceBytes()));
     result["conservativeRebuilds"] = VtValue(static_cast<int64_t>(_impl->conservativeRebuilds));
     result["pinnedSnapshotFallbacks"] = VtValue(static_cast<int64_t>(_impl->pinnedSnapshotFallbacks));
     result["visibilityRecoveryRebuilds"] = VtValue(static_cast<int64_t>(
