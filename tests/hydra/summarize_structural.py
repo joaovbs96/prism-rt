@@ -160,7 +160,9 @@ def main():
 
     operations_to_show = (
         "cold", "recreate", "transform-1", "material-parameter",
+        "structural-rename-control", "structural-restore-control-name",
         "one-prototype-points", "one-point-instance-position",
+        "instancer-count-add", "instancer-count-remove",
     )
     columns = ("axis", "value", "n") + tuple(f"{name}_s_med" for name in operations_to_show)
     print("\t".join(columns))
@@ -172,6 +174,40 @@ def main():
             value = (result or {}).get("elapsedSeconds", {}).get("median")
             row.append(f"{value:.3f}" if value is not None else "-")
         print("\t".join(row))
+    work_fields = (
+        "structuralLeafUpdates", "structuralFallbacks",
+        "lastStructuralPathsUpdated", "lastStructuralPlacementsAttached",
+        "lastStructuralPlacementsDetached", "capturedPrims",
+        "lastPlacementRecordsVisited", "lastPlacementTransformsUpdated",
+        "lastPrototypePathsUpdated", "lastPrototypePlacementsRepointed",
+        "prototypeBuildCount", "snapshotBuilds", "topLevelSceneBuilds",
+        "topLevelSceneCommits", "placementTopologyFallbacks",
+        "prototypeUpdateFallbacks",
+    )
+    for group in groups:
+        for name in ("structural-control", "structural-after-material",
+                     "structural-remove-control", "structural-remove-after-material"):
+            operation = group["operations"].get(name)
+            if not operation:
+                continue
+            medians = operation["afterNumericMedians"]
+            values = {field: medians[field] for field in work_fields if field in medians}
+            print("work\t{}\t{}\t{}\t{}".format(
+                group["axis"], group["value"], name,
+                json.dumps(values, sort_keys=True, separators=(",", ":"))))
+    for group in groups:
+        if group["axis"] != "placements":
+            continue
+        for name in ("one-prototype-points", "one-point-instance-position",
+                     "instancer-count-add", "instancer-count-remove"):
+            operation = group["operations"].get(name)
+            if not operation:
+                continue
+            medians = operation["afterNumericMedians"]
+            values = {field: medians[field] for field in work_fields if field in medians}
+            print("work\t{}\t{}\t{}\t{}".format(
+                group["axis"], group["value"], name,
+                json.dumps(values, sort_keys=True, separators=(",", ":"))))
     print(f"summary_json\t{output_path}")
     print(f"failed_runs\t{len(failed_runs)}\tmalformed_runs\t{len(malformed_runs)}")
 

@@ -164,10 +164,127 @@ def testUsdviewInputFunction(appController):
         value = points.Get()
         value[0] += Gf.Vec3f(.0001, 0, 0)
         edit("one-prototype-points", lambda: points.Set(value))
+        row = rows[-1]
+        before, after = row["before"], row["after"]
+        assert after.get("lastPrototypePathsUpdated", 0) > 0, (
+            "Prototype point edit did not report an updated prototype path")
+        assert after.get("lastPrototypePlacementsRepointed", 0) > 0, (
+            "Prototype point edit did not report repointed placements")
+        assert after.get("topLevelSceneBuilds") == before.get("topLevelSceneBuilds"), (
+            "Prototype point edit allocated a new top-level scene")
+        assert after.get("snapshotBuilds") == before.get("snapshotBuilds"), (
+            "Prototype point edit rebuilt a complete snapshot")
+        row["prototypeUpdateEvidence"] = {
+            "prototypePathsUpdated": after.get("lastPrototypePathsUpdated"),
+            "placementsRepointed": after.get("lastPrototypePlacementsRepointed"),
+            "topLevelSceneBuildsBefore": before.get("topLevelSceneBuilds"),
+            "topLevelSceneBuildsAfter": after.get("topLevelSceneBuilds"),
+            "snapshotBuildsBefore": before.get("snapshotBuilds"),
+            "snapshotBuildsAfter": after.get("snapshotBuilds"),
+            "topLevelSceneCommitsBefore": before.get("topLevelSceneCommits"),
+            "topLevelSceneCommitsAfter": after.get("topLevelSceneCommits"),
+        }
+        write_probe()
     if case.get("editInstancePositions"):
-        attribute = model.stage.GetPrimAtPath(case["editInstancePositions"]).GetAttribute("positions")
-        value = attribute.Get()
+        instancer = model.stage.GetPrimAtPath(case["editInstancePositions"])
+        attribute = instancer.GetAttribute("positions")
+        prototype_indices = instancer.GetAttribute("protoIndices")
+        original_positions = [Gf.Vec3f(position) for position in attribute.Get()]
+        original_indices = list(prototype_indices.Get())
+        value = [Gf.Vec3f(position) for position in original_positions]
         value[0] += Gf.Vec3f(.001, 0, 0)
+        assert value != original_positions, "Point-instancer edit did not change its position array"
         edit("one-point-instance-position", lambda: attribute.Set(value))
+        row = rows[-1]
+        before, after = row["before"], row["after"]
+        transforms_updated = after.get("lastPlacementTransformsUpdated", 0)
+        records_visited = after.get("lastPlacementRecordsVisited", 0)
+        assert transforms_updated > 0, "Point edit did not update a placement transform"
+        assert transforms_updated <= records_visited, (
+            "Updated placement transforms exceed visited placement records")
+        assert after.get("prototypeBuildCount") == before.get("prototypeBuildCount"), (
+            "Point-instancer position edit rebuilt prototype geometry")
+        assert after.get("topLevelSceneBuilds") == before.get("topLevelSceneBuilds"), (
+            "Point-instancer position edit allocated a new top-level scene")
+        assert after.get("topLevelSceneCommits", 0) > before.get("topLevelSceneCommits", 0), (
+            "Point-instancer position edit did not commit the changed top-level scene")
+        row["stablePlacementEvidence"] = {
+            "placementTransformsUpdated": transforms_updated,
+            "placementRecordsVisited": records_visited,
+            "prototypeBuildsBefore": before.get("prototypeBuildCount"),
+            "prototypeBuildsAfter": after.get("prototypeBuildCount"),
+            "topLevelSceneBuildsBefore": before.get("topLevelSceneBuilds"),
+            "topLevelSceneBuildsAfter": after.get("topLevelSceneBuilds"),
+            "topLevelSceneCommitsBefore": before.get("topLevelSceneCommits"),
+            "topLevelSceneCommitsAfter": after.get("topLevelSceneCommits"),
+        }
+        write_probe()
+
+        # Exercise the documented count/topology fallback separately from
+        # stable-count instance movement. Batch both required arrays so each
+        # probe represents one logical edit.
+        count_base_positions = list(attribute.Get())
+        count_base_indices = list(prototype_indices.Get())
+        baseline_stats = stats()
+        baseline_meshes = baseline_stats.get("meshCount")
+        baseline_triangles = baseline_stats.get("triangleCount")
+
+        def set_instancer_arrays(label, positions, indices, expected_count):
+            def change_arrays():
+                with Sdf.ChangeBlock():
+                    attribute.Set(positions)
+                    prototype_indices.Set(indices)
+            edit(label, change_arrays)
+            after = rows[-1]["after"]
+            assert after.get("instanceCount") == expected_count, (
+                f"{label}: expected {expected_count} instances, "
+                f"got {after.get('instanceCount')}")
+            assert after.get("meshCount") == baseline_meshes, (
+                f"{label}: mesh count changed: {after.get('meshCount')}")
+            assert after.get("triangleCount") == baseline_triangles, (
+                f"{label}: triangle count changed: {after.get('triangleCount')}")
+            topology_fallbacks_before = rows[-1]["before"].get(
+                "placementTopologyFallbacks", 0)
+            topology_fallbacks_after = after.get("placementTopologyFallbacks", 0)
+            prototype_fallbacks_before = rows[-1]["before"].get(
+                "prototypeUpdateFallbacks", 0)
+            prototype_fallbacks_after = after.get("prototypeUpdateFallbacks", 0)
+            if (topology_fallbacks_after > topology_fallbacks_before or
+                    prototype_fallbacks_after > prototype_fallbacks_before):
+                assert after.get("lastRebuildReason"), (
+                    f"{label}: fallback counter advanced without a named rebuild reason")
+            rows[-1]["topologyFallbackEvidence"] = {
+                "lastRebuildReason": after.get("lastRebuildReason"),
+                "expectedInstanceCount": expected_count,
+                "instanceCount": after.get("instanceCount"),
+                "meshCount": after.get("meshCount"),
+                "triangleCount": after.get("triangleCount"),
+                "placementTopologyFallbacksBefore": rows[-1]["before"].get(
+                    "placementTopologyFallbacks"),
+                "placementTopologyFallbacksAfter": after.get(
+                    "placementTopologyFallbacks"),
+                "prototypeUpdateFallbacksBefore": rows[-1]["before"].get(
+                    "prototypeUpdateFallbacks"),
+                "prototypeUpdateFallbacksAfter": after.get(
+                    "prototypeUpdateFallbacks"),
+            }
+            write_probe()
+
+        added_positions = count_base_positions + [
+            count_base_positions[-1] + Gf.Vec3f(.002, 0, 0)]
+        added_indices = count_base_indices + [count_base_indices[-1]]
+        set_instancer_arrays("instancer-count-add", added_positions,
+                             added_indices, len(count_base_positions) + 1)
+        set_instancer_arrays("instancer-count-remove", count_base_positions,
+                             count_base_indices, len(count_base_positions))
+        assert list(attribute.Get()) != original_positions, (
+            "Position restore would be a no-op; the authored point edit was not retained")
+        edit("restore-one-point-instance-position",
+             lambda: attribute.Set(original_positions))
+        restored = stats()
+        assert restored.get("instanceCount") == len(original_positions), (
+            "Restoring instancer positions changed the instance count")
+        assert list(attribute.Get()) == original_positions
+        assert list(prototype_indices.Get()) == original_indices
     faulthandler.cancel_dump_traceback_later()
     appController._resetPrimView = original_reset
