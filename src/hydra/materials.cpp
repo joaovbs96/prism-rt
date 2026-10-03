@@ -9,6 +9,7 @@
 #include "../resource_limits.h"
 
 #include <pxr/base/tf/stringUtils.h>
+#include <pxr/base/tf/diagnostic.h>
 #include <pxr/usd/ar/resolver.h>
 #include <pxr/usd/ar/resolverContextBinder.h>
 #include <pxr/usd/ar/asset.h>
@@ -385,8 +386,8 @@ bool RewritePreviewSurfaceNetwork(HdMaterialNetworkInterface& net)
         const TfToken translated = mappedType(sourceType);
         if (!translated.IsEmpty()) net.SetNodeType(node, translated);
         else if (sourceType.GetString().rfind("ND_", 0) != 0) {
-            std::cerr << "[Hydra Material] Unsupported node '" << sourceType
-                      << "' in UsdPreviewSurface graph\n";
+            TF_WARN("[Hydra Material] Unsupported node '%s' in UsdPreviewSurface graph",
+                    sourceType.GetText());
             return false;
         }
 
@@ -470,8 +471,8 @@ std::string ResolveTextureAssets(HdMaterialNetworkInterface& net,
                         continue;
                     }
                 } catch (const std::exception& error) {
-                    std::cerr << "[Hydra Material] Cannot materialize UDIM texture '"
-                              << authored << "': " << error.what() << "\n";
+                    TF_WARN("[Hydra Material] Cannot materialize UDIM texture '%s': %s",
+                            authored.c_str(), error.what());
                 }
                 // Preserve the authored token for the stock SDK path when a
                 // custom resolver cannot enumerate an owned tile family.
@@ -481,8 +482,8 @@ std::string ResolveTextureAssets(HdMaterialNetworkInterface& net,
             const ArResolvedPath resolved = !preResolved.empty()
                 ? ArResolvedPath(preResolved) : resolver.Resolve(authored);
             if (resolved.empty()) {
-                std::cerr << "[Hydra Material] Could not resolve texture '"
-                          << authored << "' on node " << node << "\n";
+                TF_WARN("[Hydra Material] Could not resolve texture '%s' on node %s",
+                        authored.c_str(), node.GetText());
                 continue;
             }
             prism::materialx::MaterialResourceResult preparedResource;
@@ -490,8 +491,8 @@ std::string ResolveTextureAssets(HdMaterialNetworkInterface& net,
                 preparedResource = prism::materialx::PrepareMaterialResource(
                     resolved, resolverContext, sourceVersion, cacheDir, extension);
             } catch (const std::exception& error) {
-                std::cerr << "[Hydra Material] Cannot materialize texture '"
-                          << resolved.GetPathString() << "': " << error.what() << "\n";
+                TF_WARN("[Hydra Material] Cannot materialize texture '%s': %s",
+                        resolved.GetPathString().c_str(), error.what());
                 continue;
             }
             if (!preparedResource.resource) continue;
@@ -784,8 +785,8 @@ PrewarmResult RunPrewarm(mdl::Context* context, const std::string& libraries,
         std::chrono::steady_clock::now() - start).count();
     // Runs once per key, so this is logged once.
     if (!result.error.empty())
-        std::cerr << "[Hydra Material] Material pre-warm failed; materials initialize "
-                     "on first use: " << result.error << "\n";
+        TF_WARN("[Hydra Material] Material pre-warm failed; materials initialize "
+                "on first use: %s", result.error.c_str());
     return result;
 }
 
@@ -1074,8 +1075,8 @@ public:
         const bool previewSurface = IsPreviewSurfaceNetwork(netInterface);
         if (contextName == HdMaterialSchemaTokens->universalRenderContext &&
             !previewSurface) {
-            std::cerr << "[Hydra Material] Unsupported universal material network at "
-                      << materialPath << "\n";
+            TF_WARN("[Hydra Material] Unsupported universal material network at %s",
+                    materialPath.GetText());
             return result;
         }
 
@@ -1103,8 +1104,8 @@ public:
                 HdMtlxStdLibraries(), &mtlxData);
         }
         if (!doc) {
-            std::cerr << "[Hydra Material] MaterialX conversion failed at "
-                      << materialPath << "\n";
+            TF_WARN("[Hydra Material] MaterialX conversion failed at %s",
+                    materialPath.GetText());
             return result;
         }
         if (previewSurface) FixPreviewSurfaceNormalOutput(doc);
@@ -1161,8 +1162,8 @@ public:
         std::error_code ec;
         if (!PublishImmutableText(cacheDir, artifactKey, result.xml,
                                   &result.mtlxPath)) {
-            std::cerr << "[Hydra Material] Cannot create material cache '"
-                      << cacheDir.string() << "'\n";
+            TF_WARN("[Hydra Material] Cannot create material cache '%s'",
+                    cacheDir.string().c_str());
             return result;
         }
 
@@ -1318,8 +1319,8 @@ public:
             }
             gMaterialCacheCondition.notify_all();
             ++failures;
-            std::cerr << "[Hydra Material] MDL compile threw for "
-                      << prepared.path << ": " << error.what() << "\n";
+            TF_WARN("[Hydra Material] MDL compile threw for %s: %s",
+                    prepared.path.GetText(), error.what());
             return nullptr;
         } catch (...) {
             {
@@ -1328,8 +1329,8 @@ public:
             }
             gMaterialCacheCondition.notify_all();
             ++failures;
-            std::cerr << "[Hydra Material] MDL compile threw for "
-                      << prepared.path << "\n";
+            TF_WARN("[Hydra Material] MDL compile threw for %s",
+                    prepared.path.GetText());
             return nullptr;
         }
         compilationNanoseconds += std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1379,8 +1380,8 @@ public:
         }
         if (!candidate->is_valid()) {
             ++failures;
-            std::cerr << "[Hydra Material] MDL compile failed for "
-                      << prepared.path << "; using its magenta error material\n";
+            TF_WARN("[Hydra Material] MDL compile failed for %s; using its magenta error material",
+                    prepared.path.GetText());
         }
         std::shared_ptr<Material> compiled = candidate;
         {
@@ -1554,8 +1555,8 @@ void MaterialService::Prewarm()
             ++gPrewarmJobs;
         } catch (const std::exception& error) {
             gPrewarms.erase(impl.prewarmKey);
-            std::cerr << "[Hydra Material] Cannot start the material pre-warm: "
-                      << error.what() << "\n";
+            TF_WARN("[Hydra Material] Cannot start the material pre-warm: %s",
+                    error.what());
             return;
         }
     }
@@ -1926,8 +1927,8 @@ void MaterialService::InvalidateAll()
     for (const auto& resource : resources) {
         try { textures->invalidate(resource); }
         catch (const std::exception& error) {
-            std::cerr << "Material resource invalidation failed for '" << resource
-                      << "': " << error.what() << '\n';
+            TF_WARN("Material resource invalidation failed for '%s': %s",
+                    resource.c_str(), error.what());
         }
     }
     std::lock_guard<std::mutex> cacheLock(gMaterialCacheMutex);
