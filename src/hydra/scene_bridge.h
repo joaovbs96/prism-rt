@@ -55,10 +55,20 @@ enum class SceneDirtyKind : unsigned int {
     Unknown = 1u << 5
 };
 
+struct StructuralChange {
+    enum class Operation { Add, Remove, Replace, Rename, Unknown };
+    Operation operation = Operation::Unknown;
+    pxr::SdfPath path;
+    pxr::TfToken previousType;
+    pxr::TfToken newType;
+    bool previousHadChildren = false;
+};
+
 struct SceneDirtyNotice {
     SceneDirtyKind kind = SceneDirtyKind::Unknown;
     pxr::SdfPathVector paths;
     std::string reason;
+    std::vector<StructuralChange> structuralChanges;
 };
 
 struct CameraState {

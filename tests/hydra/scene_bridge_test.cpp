@@ -50,6 +50,7 @@ int RunPickingIntegrationTests();
 int RunEnvironmentCacheIntegrationTests();
 int RunVisibilityRetentionTests();
 int RunDependencyUpdateTests();
+int RunStructuralUpdateTests();
 int RunB2DoublePrimvarIntegrationTests();
 int RunB3FallbackOpacityIntegrationTests();
 int RunC2GeometricAovIntegrationTests();
@@ -2324,5 +2325,6 @@ int main()
     ok &= RunEnvironmentCacheIntegrationTests() == 0;
     ok &= RunVisibilityRetentionTests() == 0;
     ok &= RunDependencyUpdateTests() == 0;
+    ok &= RunStructuralUpdateTests() == 0;
     return ok ? 0 : 1;
 }

@@ -294,6 +294,7 @@ if(PRISM_BUILD_HYDRA)
             tests/hydra/environment_cache_integration_test.cpp
             tests/hydra/visibility_retention_test.cpp
             tests/hydra/dependency_updates_test.cpp
+            tests/hydra/structural_updates_test.cpp
             src/hydra/scene_bridge.cpp
             src/hydra/materials.cpp
             src/hydra/render_buffer.cpp

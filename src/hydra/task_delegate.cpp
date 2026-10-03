@@ -464,25 +464,29 @@ void PrismTaskDelegate::PrimsAdded(HdSceneIndexBase const &sender,
         _taskContext->selectionSceneRevision.fetch_add(1, std::memory_order_relaxed);
         _taskContext->instanceTopologyRevision.fetch_add(1, std::memory_order_relaxed);
     }
-    SdfPathVector paths;
+    using prism::hydra::StructuralChange;
+    std::vector<prism::hydra::SceneDirtyNotice> notices;
     bool renderSettingsChanged = false;
     for (auto const& entry : entries) {
         auto previous = _knownPrimTypes.find(entry.primPath);
-        const bool previousWasRenderSettings =
-            previous != _knownPrimTypes.end() &&
-            previous->second == HdPrimTypeTokens->renderSettings;
+        const TfToken previousType = previous == _knownPrimTypes.end() ? TfToken{} : previous->second;
+        auto next = previous == _knownPrimTypes.end() ? _knownPrimTypes.upper_bound(entry.primPath) : std::next(previous);
+        const bool hadChildren = next != _knownPrimTypes.end() && next->first.HasPrefix(entry.primPath);
+        const bool previousWasRenderSettings = previousType == HdPrimTypeTokens->renderSettings;
         renderSettingsChanged = renderSettingsChanged ||
-            entry.primType == HdPrimTypeTokens->renderSettings ||
-            previousWasRenderSettings;
+            entry.primType == HdPrimTypeTokens->renderSettings || previousWasRenderSettings;
+        const bool previousWasGeometry = previousType == HdPrimTypeTokens->mesh || previousType == HdPrimTypeTokens->sphere;
+        if (_NeedsSceneRebuild(sender.GetPrim(entry.primPath)) || previousWasGeometry || hadChildren) {
+            StructuralChange change{previous == _knownPrimTypes.end() ? StructuralChange::Operation::Add :
+                StructuralChange::Operation::Replace, entry.primPath,previousType,entry.primType,hadChildren};
+            notices.push_back({prism::hydra::SceneDirtyKind::Structure,{entry.primPath},{},{change}});
+        }
         _knownPrimTypes[entry.primPath] = entry.primType;
-        if (entry.primType == HdPrimTypeTokens->renderSettings ||
-            previousWasRenderSettings)
+        if (entry.primType == HdPrimTypeTokens->renderSettings || previousWasRenderSettings)
             _authoredSettingsDirty = true;
-        if (_NeedsSceneRebuild(sender.GetPrim(entry.primPath))) paths.push_back(entry.primPath);
     }
     if (renderSettingsChanged) _RefreshRenderSettingsPaths();
-    if (_bridge && !paths.empty())
-        _bridge->MarkScenePathsDirty(prism::hydra::SceneDirtyKind::Structure, paths);
+    if (_bridge && !notices.empty()) _bridge->MarkSceneDirtyBatch(notices);
 }
 
 void PrismTaskDelegate::PrimsRemoved(HdSceneIndexBase const &,
@@ -492,24 +496,35 @@ void PrismTaskDelegate::PrimsRemoved(HdSceneIndexBase const &,
         _taskContext->selectionSceneRevision.fetch_add(1, std::memory_order_relaxed);
         _taskContext->instanceTopologyRevision.fetch_add(1, std::memory_order_relaxed);
     }
-    SdfPathVector paths;
+    using prism::hydra::StructuralChange;
+    std::vector<prism::hydra::SceneDirtyNotice> notices;
     bool renderSettingsChanged = false;
     for (auto const& entry : entries) {
-        // Removed prims cannot be queried from the sender. Retain known types
-        // until their entire subtree has been accounted for.
-        for (auto it = _knownPrimTypes.lower_bound(entry.primPath);
-             it != _knownPrimTypes.end() && it->first.HasPrefix(entry.primPath);) {
-            if (it->second == HdPrimTypeTokens->renderSettings) {
-                _authoredSettingsDirty = true;
-                renderSettingsChanged = true;
+        auto previous = _knownPrimTypes.find(entry.primPath);
+        const TfToken previousType = previous == _knownPrimTypes.end() ? TfToken{} : previous->second;
+        auto next = previous == _knownPrimTypes.end() ? _knownPrimTypes.lower_bound(entry.primPath) : std::next(previous);
+        const bool hadChildren = next != _knownPrimTypes.end() && next->first.HasPrefix(entry.primPath);
+        StructuralChange change{previous == _knownPrimTypes.end() ? StructuralChange::Operation::Unknown :
+            StructuralChange::Operation::Remove,entry.primPath,previousType,{},hadChildren};
+        notices.push_back({prism::hydra::SceneDirtyKind::Structure,{entry.primPath},{},{change}});
+        if (previous != _knownPrimTypes.end() && !hadChildren) {
+            if (previousType == HdPrimTypeTokens->renderSettings) {
+                _authoredSettingsDirty = true; renderSettingsChanged = true;
             }
-            it = _knownPrimTypes.erase(it);
+            _knownPrimTypes.erase(previous);
+        } else {
+            // Ancestor/unknown removal remains a conservative subtree operation.
+            for (auto it = _knownPrimTypes.lower_bound(entry.primPath);
+                 it != _knownPrimTypes.end() && it->first.HasPrefix(entry.primPath);) {
+                if (it->second == HdPrimTypeTokens->renderSettings) {
+                    _authoredSettingsDirty = true; renderSettingsChanged = true;
+                }
+                it = _knownPrimTypes.erase(it);
+            }
         }
-        paths.push_back(entry.primPath);
     }
     if (renderSettingsChanged) _RefreshRenderSettingsPaths();
-    if (_bridge && !paths.empty())
-        _bridge->MarkScenePathsDirty(prism::hydra::SceneDirtyKind::Structure, paths);
+    if (_bridge && !notices.empty()) _bridge->MarkSceneDirtyBatch(notices);
 }
 
 void PrismTaskDelegate::PrimsDirtied(HdSceneIndexBase const &sender,
@@ -614,8 +629,15 @@ void PrismTaskDelegate::PrimsRenamed(HdSceneIndexBase const &,
     _taskContext->selectionSceneRevision.fetch_add(1, std::memory_order_relaxed);
     _taskContext->instanceTopologyRevision.fetch_add(1, std::memory_order_relaxed);
     SdfPathVector paths;
+    std::vector<prism::hydra::StructuralChange> changes;
     bool renderSettingsChanged = false;
     for (auto const& entry : entries) {
+        auto previous = _knownPrimTypes.find(entry.oldPrimPath);
+        TfToken oldType = previous == _knownPrimTypes.end() ? TfToken{} : previous->second;
+        changes.push_back({prism::hydra::StructuralChange::Operation::Rename,
+            entry.oldPrimPath,oldType,{},true});
+        changes.push_back({prism::hydra::StructuralChange::Operation::Rename,
+            entry.newPrimPath,{},oldType,true});
         std::vector<std::pair<SdfPath, TfToken>> moved;
         for (auto it = _knownPrimTypes.lower_bound(entry.oldPrimPath);
              it != _knownPrimTypes.end() && it->first.HasPrefix(entry.oldPrimPath);) {
@@ -633,7 +655,7 @@ void PrismTaskDelegate::PrimsRenamed(HdSceneIndexBase const &,
         _RefreshRenderSettingsPaths();
     }
     if (_bridge && !paths.empty())
-        _bridge->MarkScenePathsDirty(prism::hydra::SceneDirtyKind::Structure, paths);
+        _bridge->MarkSceneDirtyBatch({{prism::hydra::SceneDirtyKind::Structure,paths,{},changes}});
 }
 
 PXR_NAMESPACE_CLOSE_SCOPE

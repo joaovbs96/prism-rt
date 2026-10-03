@@ -176,7 +176,9 @@ int RunSnapshotScalingTests()
         Require(std::find(ordinaryRemoved->primPaths.begin(),
                           ordinaryRemoved->primPaths.end(),
                           SdfPath("/Ordinary")) == ordinaryRemoved->primPaths.end() &&
-                ordinaryRemoved->logicalPlacementCountsByPrim.empty(),
+                ordinaryRemoved->logicalPlacementCountsByPrim.size()==ordinaryBefore->primPaths.size() &&
+                std::all_of(ordinaryRemoved->logicalPlacementCountsByPrim.begin(),
+                    ordinaryRemoved->logicalPlacementCountsByPrim.end(),[](size_t count) { return count==0; }),
                 "Removing an ordinary prim left a stale logical placement row");
 
         ordinary.scene->AddPrims({

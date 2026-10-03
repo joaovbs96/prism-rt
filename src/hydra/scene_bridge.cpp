@@ -337,6 +337,8 @@ struct PrimKeyHash {
     }
 };
 
+using CanonicalPrimIds = std::unordered_map<PrimKey, int, PrimKeyHash>;
+
 struct InstanceLevel {
     SdfPath instancerPath;
     int sourceIndex = -1;
@@ -458,6 +460,7 @@ struct MeshConversion {
 struct PrototypePool {
     std::atomic<uint64_t> topLevelSceneBuilds{0};
     std::atomic<uint64_t> topLevelSceneCommits{0};
+    std::atomic<uint64_t> structuralPlacementDetachCalls{0};
     EnvironmentCache environmentCache;
     std::shared_ptr<ColorTexture> whiteEnvironmentTexture =
         std::make_shared<ColorTexture>(Color3(1.0f));
@@ -552,7 +555,8 @@ struct Snapshot {
     std::vector<SdfPath> primPaths;
     std::vector<SdfPath> instancerPaths;
     std::shared_ptr<const PickingTable> picking;
-    std::unordered_map<PrimKey, int, PrimKeyHash> primIds;
+    CanonicalPrimIds primIds;
+    std::shared_ptr<const CanonicalPrimIds> canonicalIds;
     size_t estimatedGeometryBytes = 0;
     uint64_t instanceCount = 0;
     uint64_t prototypeBuildCount = 0;
@@ -584,6 +588,9 @@ struct Snapshot {
     uint64_t lastPlacementTransformsUpdated = 0;
     uint64_t lastPrototypePlacementsRepointed = 0;
     uint64_t lastPrototypePathsUpdated = 0;
+    uint64_t lastStructuralPathsUpdated = 0;
+    uint64_t lastStructuralPlacementsAttached = 0;
+    uint64_t lastStructuralPlacementsDetached = 0;
     uint64_t sphereBatchRebuilds = 0;
     uint64_t sphereBatchEntriesUpdated = 0;
     uint64_t sphereBatchConservativeFallbacks = 0;
@@ -603,6 +610,22 @@ struct Snapshot {
     }
 };
 
+int _EnsurePrimId(Snapshot *snapshot, PrimKey const &key)
+{
+    auto existing = snapshot->primIds.find(key);
+    int id = existing == snapshot->primIds.end() ? -1 : existing->second;
+    if (id < 0 && snapshot->canonicalIds) {
+        auto canonical = snapshot->canonicalIds->find(key);
+        if (canonical != snapshot->canonicalIds->end()) id = canonical->second;
+    }
+    if (id < 0) id = static_cast<int>(snapshot->primPaths.size());
+    const size_t slots = std::max(snapshot->primPaths.size(), static_cast<size_t>(id + 1));
+    snapshot->primPaths.resize(slots); snapshot->instancerPaths.resize(slots);
+    snapshot->primPaths[id] = key.path; snapshot->instancerPaths[id] = key.instancerPath;
+    snapshot->primIds[key] = id;
+    return id;
+}
+
 void _RefreshCachedCounts(Snapshot *snapshot)
 {
     if (!snapshot) return;
@@ -619,6 +642,39 @@ void _RefreshCachedCounts(Snapshot *snapshot)
         snapshot->primPaths.begin(), snapshot->primPaths.end(),
         [](SdfPath const &path) { return !path.IsEmpty(); }));
     snapshot->primPathSlotCount = snapshot->primPaths.size();
+}
+
+bool _CanonicalizePrimIds(Snapshot *snapshot, CanonicalPrimIds *registry)
+{
+    if (!snapshot) return false;
+    if (registry->empty()) {
+        *registry = snapshot->primIds;
+    } else {
+        std::vector<PrimKey> missing;
+        for (auto const &[key, id] : snapshot->primIds)
+            if (!registry->contains(key)) missing.push_back(key);
+        std::sort(missing.begin(), missing.end(), [](PrimKey const &a, PrimKey const &b) {
+            return a.path != b.path ? a.path < b.path : a.instancerPath < b.instancerPath;
+        });
+        for (auto const &key : missing) registry->emplace(key, static_cast<int>(registry->size()));
+    }
+    std::vector<int> remap(snapshot->primPaths.size(), -1);
+    std::vector<SdfPath> paths(registry->size()), instancers(registry->size());
+    for (auto &[key, id] : snapshot->primIds) {
+        const int canonical = registry->at(key);
+        if (id >= 0 && static_cast<size_t>(id) < remap.size()) remap[id] = canonical;
+        id = canonical; paths[id] = key.path; instancers[id] = key.instancerPath;
+    }
+    auto mapId = [&](int id) { return id >= 0 && static_cast<size_t>(id) < remap.size() ? remap[id] : -1; };
+    for (auto &[geom, id] : snapshot->geomToPrimId) id = mapId(id);
+    for (auto &[geom, ids] : snapshot->sphereBatchPrimIds) for (int &id : ids) id = mapId(id);
+    for (auto &batch : snapshot->sphereBatches) for (int &id : batch.primIds) id = mapId(id);
+    for (auto &entry : snapshot->pendingSpheres) entry.primId = mapId(entry.primId);
+    const bool changed = paths != snapshot->primPaths || instancers != snapshot->instancerPaths;
+    snapshot->primPaths = std::move(paths); snapshot->instancerPaths = std::move(instancers);
+    snapshot->canonicalIds = std::make_shared<const CanonicalPrimIds>(*registry);
+    if (changed) _RefreshCachedCounts(snapshot);
+    return changed;
 }
 
 void _RecordMaterialUser(Snapshot *snapshot, SdfPath const &material,
@@ -707,6 +763,8 @@ unsigned int _AttachPrototype(Snapshot *snapshot, SdfPath const &path,
     snapshot->scene->placement_materials.emplace(id, prototype.binding);
     snapshot->placementEnabled[id] = true;
     snapshot->placementMatrices[id] = world;
+    for (SdfPath ancestor = path; !ancestor.IsEmpty() && ancestor != SdfPath::AbsoluteRootPath();
+         ancestor = ancestor.GetParentPath()) snapshot->placementDependencies[ancestor].insert(id);
     ++snapshot->enabledPlacementCount;
     snapshot->embreeGeometryCommitSeconds += std::chrono::duration<double>(
         std::chrono::steady_clock::now() - commitStart).count();
@@ -1156,13 +1214,8 @@ bool _AppendMesh(HdSceneIndexBaseRefPtr const &sceneIndex,
             const unsigned int geomId = _AttachPrototype(
                 snapshot, path, cached->second, world);
             PrimKey const primKey{path, instancerPath};
-            auto [it, inserted] = snapshot->primIds.emplace(
-                primKey, static_cast<int>(snapshot->primPaths.size()));
-            if (inserted) {
-                snapshot->primPaths.push_back(path);
-                snapshot->instancerPaths.push_back(instancerPath);
-            }
-            snapshot->geomToPrimId.emplace(geomId, it->second);
+            const int primId = _EnsurePrimId(snapshot, primKey);
+            snapshot->geomToPrimId.emplace(geomId, primId);
             snapshot->geomToCoarseFaces.emplace(
                 geomId, cached->second.coarseFaces);
             snapshot->geomToInstanceId.emplace(geomId, instanceId);
@@ -1350,15 +1403,7 @@ bool _AppendMesh(HdSceneIndexBaseRefPtr const &sceneIndex,
     if (attachPlacement) {
         const unsigned int geomId = _AttachPrototype(snapshot, path, prototype, world);
         PrimKey const primKey{path, instancerPath};
-        auto const existingPrim = snapshot->primIds.find(primKey);
-        int primId = existingPrim == snapshot->primIds.end()
-            ? -1 : existingPrim->second;
-        if (primId < 0) {
-            primId = static_cast<int>(snapshot->primPaths.size());
-            snapshot->primPaths.push_back(path);
-            snapshot->instancerPaths.push_back(instancerPath);
-            snapshot->primIds.emplace(primKey, primId);
-        }
+        const int primId = _EnsurePrimId(snapshot, primKey);
         snapshot->geomToPrimId.emplace(geomId, primId);
         snapshot->geomToCoarseFaces.emplace(geomId, prototype.coarseFaces);
         snapshot->geomToInstanceId.emplace(geomId, instanceId);
@@ -1718,13 +1763,8 @@ bool _AppendSphere(HdSceneIndexBaseRefPtr const &sceneIndex,
             const unsigned int geomId = _AttachPrototype(
                 snapshot, path, cached->second, world);
             PrimKey const key{path, instancerPath};
-            auto [it, inserted] = snapshot->primIds.emplace(
-                key, static_cast<int>(snapshot->primPaths.size()));
-            if (inserted) {
-                snapshot->primPaths.push_back(path);
-                snapshot->instancerPaths.push_back(instancerPath);
-            }
-            snapshot->geomToPrimId.emplace(geomId, it->second);
+            const int primId = _EnsurePrimId(snapshot, key);
+            snapshot->geomToPrimId.emplace(geomId, primId);
             snapshot->geomToCoarseFaces.emplace(geomId, std::vector<int>{});
             snapshot->geomToInstanceId.emplace(geomId, instanceId);
             if (!instanceChain.empty())
@@ -1764,14 +1804,9 @@ bool _AppendSphere(HdSceneIndexBaseRefPtr const &sceneIndex,
             const float worldRadius = sphereRadius * scale;
             if (worldRadius > 0.0f && std::isfinite(worldRadius)) {
                 PrimKey const key{path, {}};
-                auto [it, inserted] = snapshot->primIds.emplace(
-                    key, static_cast<int>(snapshot->primPaths.size()));
-                if (inserted) {
-                    snapshot->primPaths.push_back(path);
-                    snapshot->instancerPaths.emplace_back();
-                }
+                const int primId = _EnsurePrimId(snapshot, key);
                 snapshot->pendingSpheres.push_back(
-                    {path, it->second, center, worldRadius, material});
+                    {path, primId, center, worldRadius, material});
                 return true;
             }
         }
@@ -1830,13 +1865,8 @@ bool _AppendSphere(HdSceneIndexBaseRefPtr const &sceneIndex,
         const unsigned int geomId = _AttachPrototype(
             snapshot, path, prototype, world);
         PrimKey const key{path, instancerPath};
-        auto [it, inserted] = snapshot->primIds.emplace(
-            key, static_cast<int>(snapshot->primPaths.size()));
-        if (inserted) {
-            snapshot->primPaths.push_back(path);
-            snapshot->instancerPaths.push_back(instancerPath);
-        }
-        snapshot->geomToPrimId.emplace(geomId, it->second);
+        const int primId = _EnsurePrimId(snapshot, key);
+        snapshot->geomToPrimId.emplace(geomId, primId);
         snapshot->geomToCoarseFaces.emplace(geomId, std::vector<int>{});
         snapshot->geomToInstanceId.emplace(geomId, instanceId);
         if (!instanceChain.empty())
@@ -2542,14 +2572,8 @@ bool _UpdatePlacements(HdSceneIndexBaseRefPtr const &index, Snapshot *snapshot,
             const unsigned int id = _AttachPrototype(
                 snapshot, path, prototype, placement.transform);
             PrimKey key{path, placement.instancerPath};
-            auto found = snapshot->primIds.find(key);
-            if (found == snapshot->primIds.end()) {
-                found = snapshot->primIds.emplace(key,
-                    static_cast<int>(snapshot->primPaths.size())).first;
-                snapshot->primPaths.push_back(path);
-                snapshot->instancerPaths.push_back(placement.instancerPath);
-            }
-            snapshot->geomToPrimId.emplace(id, found->second);
+            const int primId = _EnsurePrimId(snapshot, key);
+            snapshot->geomToPrimId.emplace(id, primId);
             snapshot->geomToCoarseFaces.emplace(id, prototype.coarseFaces);
             snapshot->geomToInstanceId.emplace(id, placement.instanceId);
             snapshot->geomToInstanceChain.emplace(id, placement.chain);
@@ -2569,6 +2593,160 @@ bool _UpdatePlacements(HdSceneIndexBaseRefPtr const &index, Snapshot *snapshot,
     _RefreshCachedCounts(snapshot);
     snapshot->embreeSceneCommitSeconds += std::chrono::duration<double>(
         std::chrono::steady_clock::now() - commitStart).count();
+    return true;
+}
+
+bool _GeometryLeafType(TfToken const &type) {
+    return type == HdPrimTypeTokens->mesh || type == HdPrimTypeTokens->sphere;
+}
+
+bool _EligibleStructuralChanges(HdSceneIndexBaseRefPtr const &oldScene,
+    HdSceneIndexBaseRefPtr const &newScene, std::vector<StructuralChange> const &changes,
+    bool sphereBatching, std::string *reason,
+    std::unordered_set<SdfPath,SdfPath::Hash> const *nativeRoots = nullptr)
+{
+    auto fail = [&](char const *why) { if (reason) *reason = why; return false; };
+    if (changes.empty()) return fail("untyped structural notice");
+    for (auto const &change : changes) {
+        if (change.operation == StructuralChange::Operation::Rename ||
+            change.operation == StructuralChange::Operation::Unknown)
+            return fail("structural rename or unknown operation");
+        if ((change.operation == StructuralChange::Operation::Remove ||
+             change.operation == StructuralChange::Operation::Replace) && change.previousType.IsEmpty())
+            return fail("structural previous type is unknown");
+        auto const path = change.path;
+        if (path.IsEmpty() || path == SdfPath::AbsoluteRootPath() || change.previousHadChildren)
+            return fail("structural ancestor or nonleaf edit");
+        if ((!change.previousType.IsEmpty() && !_GeometryLeafType(change.previousType)) ||
+            (!change.newType.IsEmpty() && !_GeometryLeafType(change.newType)))
+            return fail("structural unsupported prim type");
+        const auto oldPrim = oldScene ? oldScene->GetPrim(path) : HdSceneIndexPrim{};
+        const auto newPrim = newScene->GetPrim(path);
+        if (!newPrim.primType.IsEmpty() && !_GeometryLeafType(newPrim.primType))
+            return fail("structural final prim type changed");
+        if ((oldScene && !oldScene->GetChildPrimPaths(path).empty()) ||
+            !newScene->GetChildPrimPaths(path).empty())
+            return fail("structural leaf has children or subsets");
+        const auto parent = path.GetParentPath();
+        if (parent != SdfPath::AbsoluteRootPath()) {
+            const auto before = oldScene ? oldScene->GetPrim(parent) : HdSceneIndexPrim{};
+            const auto after = newScene->GetPrim(parent);
+            if ((!before.dataSource && before.primType.IsEmpty()) ||
+                (!after.dataSource && after.primType.IsEmpty()))
+                return fail("structural parent is missing or newly added");
+        }
+        for (SdfPath ancestor = path; ancestor != SdfPath::AbsoluteRootPath() && !ancestor.IsEmpty();
+             ancestor = ancestor.GetParentPath()) {
+            if (nativeRoots && nativeRoots->contains(ancestor))
+                return fail("structural edit belongs to a native prototype root");
+            const auto before = oldScene ? oldScene->GetPrim(ancestor) : HdSceneIndexPrim{};
+            const auto after = newScene->GetPrim(ancestor);
+            if (HdInstancedBySchema::GetFromParent(before.dataSource) ||
+                HdInstancedBySchema::GetFromParent(after.dataSource))
+                return fail("structural edit belongs to an instanced prototype");
+        }
+        auto batchEligible = [&](HdSceneIndexBaseRefPtr const &scene,HdSceneIndexPrim const &prim) {
+            if (!scene || prim.primType != HdPrimTypeTokens->sphere || !_WorldVisible(scene,path)) return false;
+            Float3 center; float scale;
+            if (!_BatchableSphereTransform(_WorldTransform(scene,path),&center,&scale)) return false;
+            auto sphere = HdSphereSchema::GetFromParent(prim.dataSource);
+            const double radius = sphere.GetRadius() ? sphere.GetRadius()->GetTypedValue(0.0f) : 1.0;
+            return radius > 0 && std::isfinite(radius);
+        };
+        if (sphereBatching && (batchEligible(oldScene,oldPrim) || batchEligible(newScene,newPrim)))
+            return fail("structural sphere batch membership requires full rebuild");
+    }
+    return true;
+}
+
+bool _UpdateStructuralLeaves(HdSceneIndexBaseRefPtr const &retained,
+    std::vector<StructuralChange> const &changes, MaterialService *materials,
+    Snapshot *snapshot, TfTokenVector const &tags,
+    std::vector<std::shared_ptr<PrototypeStorage>> *retired, std::function<bool()> const &cancel)
+{
+    std::unordered_set<SdfPath, SdfPath::Hash> paths;
+    for (auto const &change : changes) paths.insert(change.path);
+    for (auto const &path : paths) {
+        if (cancel && cancel()) return false;
+        ++snapshot->lastStructuralPathsUpdated;
+        auto key = PrimKey{path,{}};
+        auto oldId = snapshot->primIds.find(key);
+        const int primId = oldId == snapshot->primIds.end() ? -1 : oldId->second;
+        std::vector<unsigned int> ids;
+        if (auto deps = snapshot->placementDependencies.find(path); deps != snapshot->placementDependencies.end())
+            for (unsigned int id : deps->second) {
+                auto found = snapshot->geomToPrimId.find(id);
+                if (found != snapshot->geomToPrimId.end() && found->second == primId) ids.push_back(id);
+            }
+        if (snapshot->sphereBatchLocations.contains(path)) return false;
+        for (unsigned int id : ids) {
+            rtcDetachGeometry(snapshot->scene->scene, id);
+            if (snapshot->placementEnabled.contains(id) && snapshot->placementEnabled[id])
+                --snapshot->enabledPlacementCount;
+            snapshot->scene->geometry.erase(id); snapshot->scene->intersection_geometry.erase(id);
+            snapshot->scene->placement_materials.erase(id); snapshot->scene->placement_transforms.erase(id);
+            snapshot->geomToPrimId.erase(id); snapshot->geomToCoarseFaces.erase(id);
+            snapshot->geomToInstanceId.erase(id); snapshot->geomToInstanceChain.erase(id);
+            snapshot->placementEnabled.erase(id); snapshot->placementMatrices.erase(id);
+            for (SdfPath ancestor = path; !ancestor.IsEmpty() && ancestor != SdfPath::AbsoluteRootPath();
+                 ancestor = ancestor.GetParentPath()) {
+                auto dep = snapshot->placementDependencies.find(ancestor);
+                if (dep != snapshot->placementDependencies.end()) {
+                    dep->second.erase(id);
+                    if (dep->second.empty()) snapshot->placementDependencies.erase(dep);
+                }
+            }
+            ++snapshot->lastStructuralPlacementsDetached;
+            ++snapshot->prototypePool->structuralPlacementDetachCalls;
+        }
+        if (primId >= 0) {
+            snapshot->primPaths[primId] = {}; snapshot->instancerPaths[primId] = {};
+            snapshot->primIds.erase(key);
+        }
+        auto prototype = snapshot->prototypes.find(path);
+        if (prototype != snapshot->prototypes.end()) {
+            auto storage = prototype->second.storage;
+            const auto hash = prototype->second.geometryHash;
+            retired->push_back(storage);
+            snapshot->prototypes.erase(prototype);
+            auto bucket = snapshot->prototypeHashBuckets.find(hash);
+            if (bucket != snapshot->prototypeHashBuckets.end()) {
+                std::erase(bucket->second,path);
+                if (bucket->second.empty()) snapshot->prototypeHashBuckets.erase(bucket);
+            }
+            const bool shared = std::any_of(snapshot->prototypes.begin(),snapshot->prototypes.end(),
+                [&](auto const &item) { return item.second.storage == storage; });
+            if (!shared) {
+                std::erase_if(snapshot->geometries,[&](auto const &geometry) { return geometry.get() == storage->geometry.get(); });
+                size_t bytes = 4*sizeof(float);
+                if (auto mesh = dynamic_cast<Mesh *>(storage->geometry.get()))
+                    bytes = mesh->vertices.size()*sizeof(Float3)+mesh->normals.size()*sizeof(Float3)+
+                        mesh->texcoords.size()*sizeof(Float2)+mesh->indices.size()*sizeof(unsigned int)+
+                        mesh->tangents.size()*sizeof(float);
+                snapshot->estimatedGeometryBytes -= std::min(snapshot->estimatedGeometryBytes,bytes);
+            }
+        }
+        if (auto users = snapshot->prototypeMaterials.find(path); users != snapshot->prototypeMaterials.end()) {
+            for (auto const &material : users->second) {
+                auto reverse = snapshot->materialUsers.find(material);
+                if (reverse != snapshot->materialUsers.end()) {
+                    reverse->second.erase(path);
+                    if (reverse->second.empty()) snapshot->materialUsers.erase(reverse);
+                }
+            }
+            snapshot->prototypeMaterials.erase(users);
+        }
+        snapshot->displayMaterialsByPath.erase(path);
+        const auto prim = retained->GetPrim(path);
+        const size_t before = snapshot->geomToPrimId.size();
+        if (prim.primType == HdPrimTypeTokens->mesh)
+            _AppendMesh(retained,path,prim,materials,snapshot,_WorldTransform(retained,path),{},-1,{},tags);
+        else if (prim.primType == HdPrimTypeTokens->sphere)
+            _AppendSphere(retained,path,prim,materials,snapshot,_WorldTransform(retained,path),{},-1,{},tags);
+        const size_t attached = snapshot->geomToPrimId.size()-before;
+        snapshot->lastStructuralPlacementsAttached += attached;
+
+    }
     return true;
 }
 
@@ -3152,6 +3330,9 @@ public:
         uint64_t generation = 0;
         unsigned int kinds = 0;
         std::unordered_set<SdfPath, SdfPath::Hash> paths;
+        std::vector<StructuralChange> structuralChanges;
+        bool structuralEligible = false;
+        std::string structuralReason;
     };
     struct BuildResult {
         uint64_t generation = 0;
@@ -3164,6 +3345,9 @@ public:
         bool pinnedBankFallback = false;
         bool visibilityRecoveryRebuild = false;
         bool sphereBatchFallback = false;
+        bool structuralLeafUpdate = false;
+        bool structuralFallback = false;
+        CanonicalPrimIds canonicalSeed;
         bool prototypeUpdateFallback = false;
         bool placementTopologyFallback = false;
         std::string updateFallbackReason;
@@ -3217,10 +3401,12 @@ public:
             [generation, retained = jobScene, tags = jobRenderTags,
              settings = jobSettings, resolverContext = jobResolverContext,
              device = device, prototypePool = prototypePool,
+             canonicalSeed = canonicalPrimIds,
              cancel = std::move(cancel), seed = std::move(seed)]() {
                 BuildResult result;
                 result.generation = generation;
                 result.spare = true;
+                result.canonicalSeed = canonicalSeed;
                 auto const start = std::chrono::steady_clock::now();
                 try {
                     ArResolverContextBinder binder(resolverContext);
@@ -3296,6 +3482,12 @@ public:
     uint64_t requestedGeneration = 1;
     uint64_t cameraRevision = 0;
     std::deque<DirtyRecord> dirtyJournal;
+    std::vector<StructuralChange> dirtyStructuralChanges;
+    CanonicalPrimIds canonicalPrimIds;
+    bool canonicalIdsInitialized = false;
+    bool dirtyStructuralSafe = true;
+    std::unordered_set<SdfPath,SdfPath::Hash> nativePrototypeRoots;
+    bool captureNativeRootsDirty = false;
     uint64_t captureGeneration = 0;
     size_t lastPlacementDirtyPathCount = 0;
     size_t lastPrototypeDirtyPathCount = 0;
@@ -3363,6 +3555,8 @@ public:
     uint64_t visibilityRecoveryRebuilds = 0;
     uint64_t pinnedSnapshotFallbacks = 0;
     uint64_t sphereBatchFallbacks = 0;
+    uint64_t structuralLeafUpdates = 0;
+    uint64_t structuralFallbacks = 0;
     uint64_t prototypeUpdateFallbacks = 0;
     uint64_t placementTopologyFallbacks = 0;
     bool profileBufferWrites = false;
@@ -3403,12 +3597,18 @@ void SceneBridge::MarkSceneDirtyBatch(std::vector<SceneDirtyNotice> const &notic
         std::unordered_set<SdfPath, SdfPath::Hash> paths;
         bool allPaths = false;
         std::string reason;
+        std::vector<StructuralChange> structuralChanges;
     };
     std::map<SceneDirtyKind, Group> groups;
     for (auto const &notice : notices) {
         auto &group = groups[notice.kind];
         group.allPaths |= notice.paths.empty();
         group.paths.insert(notice.paths.begin(), notice.paths.end());
+        group.structuralChanges.insert(group.structuralChanges.end(),
+            notice.structuralChanges.begin(),notice.structuralChanges.end());
+        if (notice.kind == SceneDirtyKind::Structure && notice.structuralChanges.empty())
+            group.structuralChanges.push_back({StructuralChange::Operation::Unknown,
+                notice.paths.empty() ? SdfPath{} : notice.paths.front(),{},{},true});
         if (group.reason.empty())
             group.reason = !notice.reason.empty() ? notice.reason :
                 (notice.paths.empty() ? "unknown dirty locator" :
@@ -3423,8 +3623,29 @@ void SceneBridge::MarkSceneDirtyBatch(std::vector<SceneDirtyNotice> const &notic
     for (auto &[kind, group] : groups) {
         if (group.allPaths) group.paths.clear();
         _impl->dirtyAllPaths |= group.allPaths;
+        std::string structuralReason;
+        const bool structuralEligible = kind == SceneDirtyKind::Structure &&
+            _EligibleStructuralChanges(_impl->retainedSceneCache,_impl->sceneIndex,
+                group.structuralChanges,_impl->settings.sphereBatching,&structuralReason,&_impl->nativePrototypeRoots);
         _impl->dirtyJournal.push_back({_impl->requestedGeneration,
-            static_cast<unsigned int>(kind), group.paths});
+            static_cast<unsigned int>(kind), group.paths, group.structuralChanges,
+            structuralEligible,structuralReason});
+        if (kind == SceneDirtyKind::Structure) {
+            _impl->dirtyStructuralSafe &= structuralEligible;
+            _impl->dirtyStructuralChanges.insert(_impl->dirtyStructuralChanges.end(),
+                group.structuralChanges.begin(),group.structuralChanges.end());
+            if (_impl->canonicalIdsInitialized) {
+                SdfPathVector reserve;
+                for (auto const &change : group.structuralChanges)
+                    if (_GeometryLeafType(change.newType)) reserve.push_back(change.path);
+                std::sort(reserve.begin(),reserve.end());
+                for (auto const &path : reserve) {
+                    PrimKey key{path,{}};
+                    if (!_impl->canonicalPrimIds.contains(key))
+                        _impl->canonicalPrimIds.emplace(key,static_cast<int>(_impl->canonicalPrimIds.size()));
+                }
+            }
+        }
         _impl->dirtyKinds |= static_cast<unsigned int>(kind);
         _impl->dirtyPaths.insert(group.paths.begin(), group.paths.end());
         switch (kind) {
@@ -3706,6 +3927,8 @@ bool SceneBridge::Prepare(CameraState const &camera,
         }
         if (completed.spareComplete && completed.error.empty() &&
             completed.generation == _impl->activeGeneration) {
+            if (_CanonicalizePrimIds(completed.spareSnapshot.get(),&completed.canonicalSeed))
+                completed.spareSnapshot->picking.reset();
             _impl->inactiveSnapshot = std::move(completed.spareSnapshot);
             _impl->inactiveGeneration = completed.generation;
             while (!_impl->dirtyJournal.empty() &&
@@ -3748,6 +3971,17 @@ bool SceneBridge::Prepare(CameraState const &camera,
                 _impl->inactiveSnapshot = std::move(_impl->snapshot);
                 _impl->inactiveGeneration = _impl->activeGeneration;
             }
+            const bool idsChanged = _CanonicalizePrimIds(completed.snapshot.get(),&_impl->canonicalPrimIds);
+            _impl->canonicalIdsInitialized = true;
+            if (idsChanged) {
+                auto picking = std::make_shared<PickingTable>();
+                picking->primPaths = completed.snapshot->primPaths;
+                picking->instancerPaths = completed.snapshot->instancerPaths;
+                _BuildPickingInstanceTopologies(completed.snapshot.get(),picking.get());
+                if (_impl->snapshot && _impl->snapshot->picking && *_impl->snapshot->picking == *picking)
+                    completed.snapshot->picking = _impl->snapshot->picking;
+                else completed.snapshot->picking = std::move(picking);
+            }
             _impl->snapshot = std::move(completed.snapshot);
             _impl->activeGeneration = completed.generation;
             while (!_impl->dirtyJournal.empty() &&
@@ -3775,6 +4009,8 @@ bool SceneBridge::Prepare(CameraState const &camera,
                 _impl->lastRebuildReason =
                     "sphere batch eligibility or topology changed";
             }
+            if (completed.structuralLeafUpdate) ++_impl->structuralLeafUpdates;
+            if (completed.structuralFallback) ++_impl->structuralFallbacks;
             if (completed.prototypeUpdateFallback) ++_impl->prototypeUpdateFallbacks;
             if (completed.placementTopologyFallback) ++_impl->placementTopologyFallbacks;
             if (!completed.updateFallbackReason.empty())
@@ -3810,9 +4046,15 @@ bool SceneBridge::Prepare(CameraState const &camera,
             _impl->captureActive = true;
             _impl->captureGeneration = _impl->requestedGeneration;
             _impl->captureQueue.clear();
-            const unsigned int unsafeCapture =
-                static_cast<unsigned int>(SceneDirtyKind::Structure) |
-                static_cast<unsigned int>(SceneDirtyKind::Unknown);
+            _impl->captureNativeRootsDirty = false;
+            std::string structuralReason;
+            const bool leafStructure = (_impl->dirtyKinds & static_cast<unsigned int>(SceneDirtyKind::Structure)) != 0 &&
+                _impl->dirtyStructuralSafe &&
+                _EligibleStructuralChanges(_impl->retainedSceneCache,_impl->sceneIndex,
+                    _impl->dirtyStructuralChanges,_impl->settings.sphereBatching,&structuralReason,&_impl->nativePrototypeRoots);
+            const unsigned int unsafeCapture = static_cast<unsigned int>(SceneDirtyKind::Unknown) |
+                (leafStructure ? 0u : static_cast<unsigned int>(SceneDirtyKind::Structure));
+            if (!leafStructure && !structuralReason.empty()) _impl->lastRebuildReason = structuralReason;
             _impl->captureFull = !_impl->staticPrimsComplete ||
                 _impl->dirtyAllPaths ||
                 (_impl->dirtyKinds & unsafeCapture) != 0;
@@ -3850,6 +4092,13 @@ bool SceneBridge::Prepare(CameraState const &camera,
             SdfPath const path = _impl->captureQueue.front();
             _impl->captureQueue.pop_front();
             HdSceneIndexPrim const prim = _impl->sceneIndex->GetPrim(path);
+            auto prior = _impl->staticPrims.find(path);
+            if (prim.primType == HdPrimTypeTokens->instancer ||
+                HdInstancedBySchema::GetFromParent(prim.dataSource) ||
+                (prior != _impl->staticPrims.end() &&
+                 (prior->second.primType == HdPrimTypeTokens->instancer ||
+                  HdInstancedBySchema::GetFromParent(prior->second.dataSource))))
+                _impl->captureNativeRootsDirty = true;
             if (_CapturePrimData(prim.primType) &&
                 (!prim.primType.IsEmpty() || prim.dataSource)) {
                 _impl->staticPrims[path] = {
@@ -3889,6 +4138,19 @@ bool SceneBridge::Prepare(CameraState const &camera,
         if (_impl->captureActive && _impl->captureQueue.empty() &&
             !_impl->buildFuture.valid()) {
             _impl->staticPrimsComplete = true;
+            if (_impl->captureFull || _impl->captureNativeRootsDirty) {
+                _impl->nativePrototypeRoots.clear();
+                for (auto const &[path,prim] : _impl->staticPrims) {
+                    auto topology = HdInstancerTopologySchema::GetFromParent(prim.dataSource);
+                    if (auto prototypes = topology.GetPrototypes())
+                        for (auto const &root : prototypes->GetTypedValue(0.0f))
+                            _impl->nativePrototypeRoots.insert(root);
+                    auto by = HdInstancedBySchema::GetFromParent(prim.dataSource);
+                    if (auto roots = by.GetPrototypeRoots())
+                        for (auto const &root : roots->GetTypedValue(0.0f))
+                            _impl->nativePrototypeRoots.insert(root);
+                }
+            }
             _impl->retainedSceneCache = _impl->captureScene;
             const uint64_t generation = _impl->captureGeneration;
             HdSceneIndexBaseRefPtr retained = _impl->captureScene;
@@ -3897,6 +4159,10 @@ bool SceneBridge::Prepare(CameraState const &camera,
             unsigned int jobDirtyKinds = _impl->captureDirtyKinds;
             auto jobDirtyPaths = _impl->captureDirtyPaths;
             decltype(jobDirtyPaths) jobPlacementPaths, jobPrototypePaths, jobMaterialPaths;
+            std::vector<StructuralChange> jobStructuralChanges;
+            bool jobStructuralSafe = true;
+            std::string jobStructuralReason;
+            auto canonicalSeed = std::make_shared<const CanonicalPrimIds>(_impl->canonicalPrimIds);
             ArResolverContext resolverContext = _impl->captureResolverContext;
             RTCDevice device = _impl->device;
             std::shared_ptr<PrototypePool> prototypePool =
@@ -3922,6 +4188,14 @@ bool SceneBridge::Prepare(CameraState const &camera,
                     if (record.generation <= replayAfter ||
                         record.generation > generation) continue;
                     jobDirtyKinds |= record.kinds;
+                    if (record.kinds & static_cast<unsigned int>(SceneDirtyKind::Structure)) {
+                        jobStructuralSafe &= record.structuralEligible;
+                        if (!record.structuralReason.empty()) jobStructuralReason = record.structuralReason;
+                        if (record.structuralChanges.empty())
+                            jobStructuralChanges.push_back({StructuralChange::Operation::Unknown,{},{},{},true});
+                        else jobStructuralChanges.insert(jobStructuralChanges.end(),
+                            record.structuralChanges.begin(),record.structuralChanges.end());
+                    }
                     jobDirtyPaths.insert(
                         record.paths.begin(), record.paths.end());
                     if (record.kinds & static_cast<unsigned int>(
@@ -3977,6 +4251,8 @@ bool SceneBridge::Prepare(CameraState const &camera,
             _impl->dirtyKinds = 0;
             _impl->dirtyAllPaths = false;
             _impl->dirtyPaths.clear();
+            _impl->dirtyStructuralChanges.clear();
+            _impl->dirtyStructuralSafe = true;
             _impl->buildingGeneration = generation;
             _impl->jobScene = retained;
             _impl->jobRenderTags = tags;
@@ -3989,7 +4265,9 @@ bool SceneBridge::Prepare(CameraState const &camera,
                 [generation, associationScope = reinterpret_cast<uint64_t>(_impl->sceneIndex.operator->()),
                  retained = std::move(retained),
                  tags = std::move(tags), jobSettings, resolverContext,
-                 jobDirtyKinds,
+                 jobDirtyKinds, canonicalSeed = std::move(canonicalSeed),
+                 jobStructuralChanges = std::move(jobStructuralChanges),
+                 jobStructuralSafe, jobStructuralReason = std::move(jobStructuralReason),
                  jobPlacementPaths = std::move(jobPlacementPaths),
                  jobPrototypePaths = std::move(jobPrototypePaths),
                  jobMaterialPaths = std::move(jobMaterialPaths),
@@ -4015,14 +4293,32 @@ bool SceneBridge::Prepare(CameraState const &camera,
                                 static_cast<uint64_t>(
                                     jobSettings.resourceRevision));
                         }
-                        const unsigned int unsafeKinds =
-                            static_cast<unsigned int>(SceneDirtyKind::Structure) |
-                            static_cast<unsigned int>(SceneDirtyKind::Unknown);
+                        std::string structuralReason = jobStructuralReason;
+                        bool leafStructure = jobStructuralSafe &&
+                            (jobDirtyKinds & static_cast<unsigned int>(SceneDirtyKind::Structure)) != 0 &&
+                            _EligibleStructuralChanges(retained,retained,jobStructuralChanges,
+                                jobSettings.sphereBatching,&structuralReason);
+                        if (leafStructure && bank) for (auto const &change : jobStructuralChanges) {
+                            if (bank->sphereBatchLocations.contains(change.path)) leafStructure = false;
+                            for (auto const &[key,id] : bank->primIds)
+                                if (key.path == change.path && !key.instancerPath.IsEmpty()) leafStructure = false;
+                        }
+                        const unsigned int unsafeKinds = static_cast<unsigned int>(SceneDirtyKind::Unknown) |
+                            (leafStructure ? 0u : static_cast<unsigned int>(SceneDirtyKind::Structure));
+                        result.structuralFallback = (jobDirtyKinds & static_cast<unsigned int>(SceneDirtyKind::Structure)) && !leafStructure;
+                        if (result.structuralFallback) result.updateFallbackReason = structuralReason.empty()
+                            ? "structural bank topology requires full rebuild" : structuralReason;
                         if (cancel->load(std::memory_order_relaxed)) {
                             return result;
                         } else if (bank && (jobDirtyKinds & unsafeKinds) == 0) {
                             const uint64_t priorPrototypeBuilds =
                                 bank->prototypeBuildCount;
+                            bank->canonicalIds = canonicalSeed;
+                            bank->primPaths.resize(std::max(bank->primPaths.size(),canonicalSeed->size()));
+                            bank->instancerPaths.resize(bank->primPaths.size());
+                            bank->lastStructuralPathsUpdated = 0;
+                            bank->lastStructuralPlacementsAttached = 0;
+                            bank->lastStructuralPlacementsDetached = 0;
                             bank->lastPlacementRecordsVisited = 0;
                             bank->lastVisibilityPlacementsUpdated = 0;
                             bank->lastPlacementTransformsUpdated = 0;
@@ -4043,6 +4339,29 @@ bool SceneBridge::Prepare(CameraState const &camera,
                             bool placementRebuiltAll = false;
                             bool placementNeedsFullSnapshot = false;
                             bool batchNeedsFullSnapshot = false;
+                            const bool hadGlobalPlacement = jobPlacementPaths.empty() &&
+                                (jobDirtyKinds & static_cast<unsigned int>(SceneDirtyKind::Placement));
+                            if (leafStructure) {
+                                result.structuralLeafUpdate = true;
+                                placementTopologyChanged = true;
+                                if (!_UpdateStructuralLeaves(retained,jobStructuralChanges,
+                                    result.materialService.get(),bank.get(),tags,&displacedStorage,[cancel] {
+                                        return cancel->load(std::memory_order_relaxed);
+                                    })) {
+                                    if (cancel->load(std::memory_order_relaxed)) return result;
+                                    bank = _BuildSnapshot(retained,result.materialService.get(),jobSettings,tags,
+                                        device,prototypePool,[cancel] { return cancel->load(std::memory_order_relaxed); });
+                                    if (!bank) return result;
+                                    batchNeedsFullSnapshot = true; placementRebuiltAll = true;
+                                    result.structuralLeafUpdate = false; result.structuralFallback = true;
+                                    result.updateFallbackReason = "structural leaf update failed; full rebuild required";
+                                }
+                                for (auto const &change : jobStructuralChanges) {
+                                    jobPrototypePaths.erase(change.path); jobPlacementPaths.erase(change.path);
+                                }
+                                if (!hadGlobalPlacement && jobPlacementPaths.empty())
+                                    jobDirtyKinds &= ~static_cast<unsigned int>(SceneDirtyKind::Placement);
+                            }
                             std::unordered_set<SdfPath, SdfPath::Hash>
                                 batchDirtyPaths = jobPrototypePaths;
                             batchDirtyPaths.insert(jobPlacementPaths.begin(),
@@ -4056,7 +4375,7 @@ bool SceneBridge::Prepare(CameraState const &camera,
                             }
                             std::unordered_set<SdfPath, SdfPath::Hash>
                                 handledBatchPaths;
-                            if (!_RefreshSphereBatches(
+                            if (!batchNeedsFullSnapshot && !_RefreshSphereBatches(
                                     retained, batchDirtyPaths,
                                     result.materialService.get(), bank.get(),
                                     tags, &handledBatchPaths, true)) {
@@ -4155,7 +4474,8 @@ bool SceneBridge::Prepare(CameraState const &camera,
                             }
                             if (!batchNeedsFullSnapshot && !placementNeedsFullSnapshot &&
                                 (jobDirtyKinds & (static_cast<unsigned int>(SceneDirtyKind::Prototype) |
-                                    static_cast<unsigned int>(SceneDirtyKind::Placement))) != 0) {
+                                    static_cast<unsigned int>(SceneDirtyKind::Placement) |
+                                    static_cast<unsigned int>(SceneDirtyKind::Structure))) != 0) {
                                 if (cancel->load(std::memory_order_relaxed)) return result;
                                 auto const commitStart = std::chrono::steady_clock::now();
                                 rtcCommitScene(bank->scene->scene);
@@ -4169,8 +4489,8 @@ bool SceneBridge::Prepare(CameraState const &camera,
                                 batchNeedsFullSnapshot;
                             result.reusedBank = !rebuiltSnapshot;
                             if (result.reusedBank &&
-                                (jobDirtyKinds & static_cast<unsigned int>(
-                                    SceneDirtyKind::Prototype)) != 0)
+                                (jobDirtyKinds & (static_cast<unsigned int>(
+                                    SceneDirtyKind::Prototype) | static_cast<unsigned int>(SceneDirtyKind::Structure))) != 0)
                                 _RefreshCachedCounts(result.snapshot.get());
                             result.visibilityRecoveryRebuild =
                                 placementNeedsFullSnapshot;
@@ -4707,6 +5027,13 @@ VtDictionary SceneBridge::GetStats() const
     result["lastPrototypePathsUpdated"] = VtValue(static_cast<int64_t>(
         _impl->snapshot ? _impl->snapshot->lastPrototypePathsUpdated : 0));
     result["placementTopologyFallbacks"] = VtValue(static_cast<int64_t>(_impl->placementTopologyFallbacks));
+    result["structuralLeafUpdates"] = VtValue(static_cast<int64_t>(_impl->structuralLeafUpdates));
+    result["structuralPlacementDetachCalls"] = VtValue(static_cast<int64_t>(
+        _impl->prototypePool->structuralPlacementDetachCalls.load()));
+    result["structuralFallbacks"] = VtValue(static_cast<int64_t>(_impl->structuralFallbacks));
+    result["lastStructuralPathsUpdated"] = VtValue(static_cast<int64_t>(_impl->snapshot ? _impl->snapshot->lastStructuralPathsUpdated : 0));
+    result["lastStructuralPlacementsAttached"] = VtValue(static_cast<int64_t>(_impl->snapshot ? _impl->snapshot->lastStructuralPlacementsAttached : 0));
+    result["lastStructuralPlacementsDetached"] = VtValue(static_cast<int64_t>(_impl->snapshot ? _impl->snapshot->lastStructuralPlacementsDetached : 0));
     result["prototypeUpdateFallbacks"] = VtValue(static_cast<int64_t>(_impl->prototypeUpdateFallbacks));
     result["enabledPlacementCount"] = VtValue(static_cast<int64_t>(
         _impl->snapshot ? _impl->snapshot->enabledPlacementCount : 0));

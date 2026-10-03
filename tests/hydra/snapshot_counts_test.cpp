@@ -124,7 +124,7 @@ int RunCachedCountTests()
         ordinary.bridge->MarkSceneDirty(SceneDirtyKind::Structure,
                                         SdfPath("/Ordinary"));
         ordinary.Render();
-        CheckCounts(*ordinary.bridge, 0, 0, 0, 0, 0,
+        CheckCounts(*ordinary.bridge, 0, 0, 0, 1, 0,
             "Structural removal left stale cached diagnostics");
         ordinary.scene->AddPrims({
             {SdfPath("/Ordinary"), HdPrimTypeTokens->mesh, Plane()}});
