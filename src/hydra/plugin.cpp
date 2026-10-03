@@ -12,6 +12,7 @@
 #include "pxr/imaging/hd/sceneIndexInputArgsSchema.h"
 #include "pxr/imaging/hd/tokens.h"
 #include "pxr/imaging/hdsi/implicitSurfaceSceneIndex.h"
+#include "pxr/imaging/hdsi/extComputationPrimvarPruningSceneIndex.h"
 
 PXR_NAMESPACE_OPEN_SCOPE
 
@@ -62,7 +63,10 @@ std::unique_ptr<HdRenderer> HdPrismRendererPlugin::_CreateRenderer(
         HdPrimTypeTokens->plane, toMesh);
     auto context = std::make_shared<prism::hydra::TaskContext>();
     auto converted = HdsiImplicitSurfaceSceneIndex::New(sceneIndex, conversion);
-    auto transport = PrismTransportFilter::New(converted, context);
+    // Pull CPU-computed primvars as ordinary values before owner-thread
+    // snapshot capture severs their live data-source handles.
+    auto computed = HdSiExtComputationPrimvarPruningSceneIndex::New(converted);
+    auto transport = PrismTransportFilter::New(computed, context);
     // Let OpenUSD allocate the stock adapter.  This keeps HdRenderer and the
     // terminal HdRenderIndex constructor entirely on the OpenUSD side of the
     // DLL boundary while SetTerminalSceneIndex gives our delegate native scene

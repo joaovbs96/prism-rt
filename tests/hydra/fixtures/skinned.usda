@@ -1,0 +1,65 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    upAxis = "Y"
+    metersPerUnit = 1
+    startTimeCode = 1
+    endTimeCode = 2
+)
+
+def SkelRoot "World" (
+    prepend apiSchemas = ["SkelBindingAPI"]
+)
+{
+    rel skel:skeleton = </World/Skeleton>
+    def Camera "Camera"
+    {
+        float focalLength = 35
+        float horizontalAperture = 20
+        float verticalAperture = 20
+        float2 clippingRange = (0.1, 100)
+        double3 xformOp:translate = (0, 0, 4)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+    def Mesh "Panel" (
+        prepend apiSchemas = ["SkelBindingAPI"]
+    )
+    {
+        point3f[] points = [(-0.5,-0.5,0), (0.5,-0.5,0), (0,0.5,0)]
+        int[] faceVertexCounts = [3]
+        int[] faceVertexIndices = [0,1,2]
+        uniform token subdivisionScheme = "none"
+        color3f[] primvars:displayColor = [(0.5,0.2,0.1)]
+        matrix4d primvars:skel:geomBindTransform = ((1,0,0,0),(0,1,0,0),(0,0,1,0),(0,0,0,1))
+        int[] primvars:skel:jointIndices = [0,0,0] (
+            interpolation = "vertex"
+            elementSize = 1
+        )
+        float[] primvars:skel:jointWeights = [1,1,1] (
+            interpolation = "vertex"
+            elementSize = 1
+        )
+    }
+    def Skeleton "Skeleton" (
+        prepend apiSchemas = ["SkelBindingAPI"]
+    )
+    {
+        uniform token[] joints = ["root"]
+        uniform matrix4d[] bindTransforms = [((1,0,0,0),(0,1,0,0),(0,0,1,0),(0,0,0,1))]
+        uniform matrix4d[] restTransforms = [((1,0,0,0),(0,1,0,0),(0,0,1,0),(0,0,0,1))]
+        rel skel:animationSource = </World/Animation>
+    }
+    def SkelAnimation "Animation"
+    {
+        uniform token[] joints = ["root"]
+        float3[] translations = [(0.5,0,0)]
+        float3[] translations.timeSamples = {1: [(0.5,0,0)], 2: [(-0.5,0,0)]}
+        quatf[] rotations = [(1,0,0,0)]
+        half3[] scales = [(1,1,1)]
+    }
+    def DomeLight "Dome"
+    {
+        color3f inputs:color = (1,1,1)
+        float inputs:intensity = 1
+    }
+}

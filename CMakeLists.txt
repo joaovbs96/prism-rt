@@ -208,6 +208,15 @@ if(PRISM_BUILD_HYDRA)
             set_tests_properties(prism_hydra_render_exercise PROPERTIES ENVIRONMENT "${_prism_test_environment}")
         endif()
     endif()
+    add_executable(prism_hydra_ext_computation_test
+        tests/hydra/ext_computation_test.cpp)
+    target_include_directories(prism_hydra_ext_computation_test PRIVATE ${PXR_INCLUDE_DIRS})
+    target_link_libraries(prism_hydra_ext_computation_test PRIVATE hd hdsi usdImaging ${PXR_LIBRARIES})
+    add_test(NAME prism_hydra_ext_computation_test COMMAND prism_hydra_ext_computation_test
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/skinned.usda")
+    set_tests_properties(prism_hydra_ext_computation_test PROPERTIES
+        ENVIRONMENT "${_prism_test_environment}")
+
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/materials_test.cpp")
         add_executable(prism_hydra_materials_test
             tests/hydra/materials_test.cpp
