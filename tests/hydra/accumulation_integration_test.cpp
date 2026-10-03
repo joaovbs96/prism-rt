@@ -1,0 +1,220 @@
+#include "integration_fixture.h"
+
+#include <pxr/imaging/hd/light.h>
+#include <algorithm>
+#include <cmath>
+#include <iostream>
+
+namespace {
+using namespace pxr;
+using namespace prism::hydra;
+using namespace prism::hydra::test;
+
+constexpr unsigned kInitialSize = 32;
+constexpr unsigned kResizedSize = 16;
+constexpr int kContinuedSamples = 128;
+
+void AddScene(Fixture &fixture)
+{
+    fixture.scene->AddPrims({
+        {SdfPath("/Dome"), HdPrimTypeTokens->domeLight, Dome()},
+        {SdfPath("/Mesh"), HdPrimTypeTokens->mesh, Plane()},
+    });
+}
+
+void AddColorBinding(Fixture &fixture, PrismRenderBuffer &buffer)
+{
+    buffer.Allocate(GfVec3i(Fixture::Size, Fixture::Size, 1),
+                    HdFormatFloat32Vec4, false);
+    HdRenderPassAovBinding binding;
+    binding.aovName = HdAovTokens->color;
+    binding.renderBuffer = &buffer;
+    binding.clearValue = VtValue(GfVec4f(0));
+    fixture.bindings.push_back(binding);
+}
+
+void SetSampleBudget(Fixture &fixture, int samples)
+{
+    RenderSettings settings = fixture.bridge->GetSettings();
+    settings.samples = samples;
+    fixture.bridge->SetSettings(settings);
+}
+
+void Prepare(Fixture &fixture, unsigned width, unsigned height)
+{
+    TfTokenVector const tags{HdRenderTagTokens->geometry};
+    Wait([&] {
+        fixture.bridge->Prepare(fixture.camera, fixture.bindings, tags,
+                                width, height);
+        VtDictionary const stats = fixture.bridge->GetStats();
+        auto const pending = stats.find("preparationPending");
+        return pending != stats.end() && pending->second.IsHolding<bool>() &&
+            !pending->second.UncheckedGet<bool>() &&
+            Stat(stats, "displayedGeneration") >=
+                Stat(stats, "preparationGeneration");
+    }, "Accumulation integration fixture preparation timed out");
+}
+
+void Render(Fixture &fixture, unsigned width, unsigned height, int expectedSamples)
+{
+    Prepare(fixture, width, height);
+    fixture.thread.StartRender();
+    Wait([&] { return fixture.bridge->IsConverged() && fixture.color.IsConverged(); },
+         "Accumulation integration fixture render timed out");
+    fixture.thread.StopRender();
+    Require(Stat(fixture.bridge->GetStats(), "completedSamples") == expectedSamples,
+            "Render stopped at the wrong sample count");
+}
+
+void ResizeBuffers(Fixture &fixture, PrismRenderBuffer &secondColor,
+                   unsigned size)
+{
+    fixture.color.Allocate(GfVec3i(size, size, 1), HdFormatFloat32Vec4, false);
+    secondColor.Allocate(GfVec3i(size, size, 1), HdFormatFloat32Vec4, false);
+    fixture.prim.Allocate(GfVec3i(size, size, 1), HdFormatInt32, false);
+}
+
+void RequireCoherentColorFrames(Fixture &fixture, PrismRenderBuffer &secondColor)
+{
+    auto const colorFrame = fixture.color.Capture().frame;
+    Require(colorFrame && colorFrame == secondColor.Capture().frame &&
+                colorFrame == fixture.prim.Capture().frame,
+            "Color bindings and IDs do not share one published frame");
+    Require(Read<float>(fixture.color) == Read<float>(secondColor),
+            "Multiple color bindings produced different pixels");
+}
+
+void RequireUsefulColor(std::vector<float> const &pixels)
+{
+    bool hasRadiance = false;
+    for (size_t i = 0; i + 3 < pixels.size(); i += 4)
+        hasRadiance |= std::isfinite(pixels[i]) && std::isfinite(pixels[i + 1]) &&
+            std::isfinite(pixels[i + 2]) &&
+            pixels[i] + pixels[i + 1] + pixels[i + 2] > 0.003f;
+    Require(hasRadiance, "Accumulation fixture produced no nonzero color samples");
+}
+
+} // namespace
+
+int RunAccumulationIntegrationTests()
+{
+    try {
+        // Raising the budget must continue the existing stream. A distinct
+        // bridge renders the 128-sample reference from its own initial state.
+        Fixture continued;
+        PrismRenderBuffer continuedSecond(SdfPath("/continued_second"),
+                                          &continued.thread);
+        AddScene(continued);
+        AddColorBinding(continued, continuedSecond);
+        Render(continued, kInitialSize, kInitialSize, 64);
+        auto const first64 = Read<float>(continued.color);
+        RequireUsefulColor(first64);
+        SetSampleBudget(continued, kContinuedSamples);
+        Render(continued, kInitialSize, kInitialSize, kContinuedSamples);
+        auto const continued128 = Read<float>(continued.color);
+        RequireCoherentColorFrames(continued, continuedSecond);
+        Require(continued128 != first64,
+                "Increasing the budget did not add visible samples");
+        auto const continuationStats = continued.bridge->GetStats();
+        Require(Stat(continuationStats, "completedSamples") == kContinuedSamples,
+                "Continued render did not reach 128 samples");
+
+        Fixture fresh128;
+        PrismRenderBuffer fresh128Second(SdfPath("/fresh128_second"),
+                                         &fresh128.thread);
+        AddScene(fresh128);
+        AddColorBinding(fresh128, fresh128Second);
+        SetSampleBudget(fresh128, kContinuedSamples);
+        Render(fresh128, kInitialSize, kInitialSize, kContinuedSamples);
+        Require(continued128 == Read<float>(fresh128.color),
+                "64-to-128 continuation differs from an independent fresh 128-sample bridge");
+        RequireCoherentColorFrames(fresh128, fresh128Second);
+
+        // Stop after committed work, hold the budget at that count, then resume
+        // to a target that an independent bridge renders from sample zero.
+        RenderSettings interruptedSettings = continued.bridge->GetSettings();
+        interruptedSettings.samples = 1000000;
+        continued.bridge->SetSettings(interruptedSettings);
+        continued.bridge->RestartAccumulation();
+        Prepare(continued, kInitialSize, kInitialSize);
+        continued.thread.StartRender();
+        Wait([&] {
+            return Stat(continued.bridge->GetStats(), "completedSamples") >= 8;
+        }, "Interrupted accumulation did not commit its initial sample batch");
+        continued.thread.StopRender();
+        const int committedSamples = static_cast<int>(
+            Stat(continued.bridge->GetStats(), "completedSamples"));
+        Require(committedSamples >= 8 && committedSamples < 1000000,
+                "Interrupted accumulation has an invalid committed sample count");
+        auto const interruptedPixels = Read<float>(continued.color);
+        SetSampleBudget(continued, committedSamples);
+        Render(continued, kInitialSize, kInitialSize, committedSamples);
+        Require(Read<float>(continued.color) == interruptedPixels,
+                "Stopping and holding the committed target changed accumulated pixels");
+
+        const int resumedTarget = committedSamples + 4;
+        SetSampleBudget(continued, resumedTarget);
+        Render(continued, kInitialSize, kInitialSize, resumedTarget);
+        auto const resumedPixels = Read<float>(continued.color);
+        Fixture freshResumed;
+        PrismRenderBuffer freshResumedSecond(SdfPath("/fresh_resumed_second"),
+                                             &freshResumed.thread);
+        AddScene(freshResumed);
+        AddColorBinding(freshResumed, freshResumedSecond);
+        SetSampleBudget(freshResumed, resumedTarget);
+        Render(freshResumed, kInitialSize, kInitialSize, resumedTarget);
+        Require(resumedPixels == Read<float>(freshResumed.color),
+                "Interrupted accumulation resume differs from a fresh bridge at the committed target");
+        RequireCoherentColorFrames(continued, continuedSecond);
+
+        // Reallocation at a new size and replacement of a bound color buffer
+        // both reset accumulation identity while preserving coherent AOVs.
+        Fixture freshResized;
+        PrismRenderBuffer freshResizedSecond(SdfPath("/fresh_resized_second"),
+                                             &freshResized.thread);
+        AddScene(freshResized);
+        AddColorBinding(freshResized, freshResizedSecond);
+        ResizeBuffers(freshResized, freshResizedSecond, kResizedSize);
+        SetSampleBudget(freshResized, kContinuedSamples);
+        Render(freshResized, kResizedSize, kResizedSize, kContinuedSamples);
+        auto const resizedReference = Read<float>(freshResized.color);
+
+        const uint64_t oldAllocation = continued.color.GetAllocationRevision();
+        ResizeBuffers(continued, continuedSecond, kResizedSize);
+        Require(continued.color.GetAllocationRevision() > oldAllocation,
+                "Resizing did not replace render-buffer allocation identity");
+        Prepare(continued, kResizedSize, kResizedSize);
+        Require(Stat(continued.bridge->GetStats(), "completedSamples") == 0,
+                "Resized AOV buffers retained the previous accumulation");
+        SetSampleBudget(continued, kContinuedSamples);
+        Render(continued, kResizedSize, kResizedSize, kContinuedSamples);
+        Require(Read<float>(continued.color) == resizedReference,
+                "Resized buffers differ from an independent 128-sample render");
+        RequireCoherentColorFrames(continued, continuedSecond);
+
+        PrismRenderBuffer replacement(SdfPath("/replacement_color"),
+                                      &continued.thread);
+        replacement.Allocate(GfVec3i(kResizedSize, kResizedSize, 1),
+                             HdFormatFloat32Vec4, false);
+        auto const oldBinding = continued.bindings.back();
+        continued.bindings.back().renderBuffer = &replacement;
+        Prepare(continued, kResizedSize, kResizedSize);
+        Require(Stat(continued.bridge->GetStats(), "completedSamples") == 0,
+                "Replacing a color buffer did not restart accumulation");
+        Render(continued, kResizedSize, kResizedSize, kContinuedSamples);
+        Require(Read<float>(replacement) == resizedReference,
+                "Replacement color buffer did not begin with the fresh sample stream");
+        Require(replacement.Capture().frame &&
+                    replacement.Capture().frame == continued.color.Capture().frame &&
+                    replacement.Capture().frame == continued.prim.Capture().frame,
+                "Replacement buffer was not published with its peer AOVs");
+        continued.bindings.back() = oldBinding;
+
+        std::cout << "Independent accumulation integration tests passed\n";
+        return 0;
+    } catch (std::exception const &error) {
+        std::cerr << "Independent accumulation integration tests failed: "
+                  << error.what() << '\n';
+        return 1;
+    }
+}
