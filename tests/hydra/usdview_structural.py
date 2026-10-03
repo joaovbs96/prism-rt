@@ -5,7 +5,7 @@ import os
 import time
 from pathlib import Path
 
-from pxr import Gf, Sdf, UsdGeom, UsdShade
+from pxr import Gf, Sdf, Usd, UsdGeom, UsdShade
 from pxr.Usdviewq.qt import QtWidgets
 
 from usdview_loading import memory
@@ -83,6 +83,15 @@ def testUsdviewInputFunction(appController):
                 raise RuntimeError(f"Probe did not settle: old={previous_generation}, stats={current}")
             time.sleep(.01)
 
+    def write_probe():
+        (output / "probe.json").write_text(json.dumps(
+            dict(case=case, operations=rows, initialHostMemory=initial_host_memory,
+                 initialRenderer=initial_renderer,
+                 primBrowser="root-expanded" if collapsed_browser else "host-default",
+                 note="numericDifference includes last-operation gauges; consult before/after. "
+                      "Elapsed time includes host pumps, statistics queries and final framebuffer read."),
+            indent=2, default=str), encoding="utf-8")
+
     def save(label, start, before, after, stats_start, calls_start, cpu_start):
         delta = {key: value - before.get(key, 0) for key, value in after.items()
                  if isinstance(value, (int, float)) and not isinstance(value, bool)
@@ -96,13 +105,7 @@ def testUsdviewInputFunction(appController):
         row["hostTreeResetSeconds"] = host_tree_seconds - previous_host_time
         row["hostTreeResetCumulativeSeconds"] = host_tree_seconds
         rows.append(row)
-        (output / "probe.json").write_text(json.dumps(
-            dict(case=case, operations=rows, initialHostMemory=initial_host_memory,
-                 initialRenderer=initial_renderer,
-                 primBrowser="root-expanded" if collapsed_browser else "host-default",
-                 note="numericDifference includes last-operation gauges; consult before/after. "
-                      "Elapsed time includes host pumps, statistics queries and final framebuffer read."),
-            indent=2, default=str), encoding="utf-8")
+        write_probe()
         print("STRUCTURAL", label, row["elapsedSeconds"], flush=True)
         assert after.get("materialFailures", 0) == 0, "Material compilation failed"
 
@@ -129,6 +132,51 @@ def testUsdviewInputFunction(appController):
         after = settle(before["preparationGeneration"])
         save(label, begin, before, after, s0, c0, cpu)
 
+    def assert_leaf_edit(label, attached=0, detached=0, prim_delta=0):
+        """Check a generated leaf add/remove took the incremental path."""
+        row = rows[-1]
+        before, after = row["before"], row["after"]
+        assert after.get("primCount") == before.get("primCount", 0) + prim_delta, (
+            f"{label}: live prim count changed by "
+            f"{after.get('primCount', 0) - before.get('primCount', 0)}, "
+            f"expected {prim_delta}")
+        assert after.get("structuralLeafUpdates", 0) > before.get(
+            "structuralLeafUpdates", 0), f"{label}: no structural leaf update was reported"
+        assert after.get("structuralFallbacks", 0) == before.get(
+            "structuralFallbacks", 0), f"{label}: eligible leaf edit used a fallback"
+        assert after.get("lastStructuralPathsUpdated", 0) > 0, (
+            f"{label}: no structural path update was reported")
+        if attached:
+            assert after.get("lastStructuralPlacementsAttached", 0) > 0, (
+                f"{label}: no placement attach was reported")
+        if detached:
+            assert after.get("lastStructuralPlacementsDetached", 0) > 0, (
+                f"{label}: no placement detach was reported")
+        assert after.get("topLevelSceneBuilds") == before.get("topLevelSceneBuilds"), (
+            f"{label}: leaf edit allocated a new top-level scene")
+        assert after.get("capturedPrims", 0) <= 1, (
+            f"{label}: leaf edit captured more than its changed prim")
+        row["structuralLeafEvidence"] = {
+            "leafUpdatesBefore": before.get("structuralLeafUpdates"),
+            "leafUpdatesAfter": after.get("structuralLeafUpdates"),
+            "fallbacksBefore": before.get("structuralFallbacks"),
+            "fallbacksAfter": after.get("structuralFallbacks"),
+            "pathsUpdated": after.get("lastStructuralPathsUpdated"),
+            "placementsAttached": after.get("lastStructuralPlacementsAttached"),
+            "placementsDetached": after.get("lastStructuralPlacementsDetached"),
+            "capturedPrims": after.get("capturedPrims"),
+            "primCountBefore": before.get("primCount"),
+            "primCountAfter": after.get("primCount"),
+            "meshCountBefore": before.get("meshCount"),
+            "meshCountAfter": after.get("meshCount"),
+            "triangleCountBefore": before.get("triangleCount"),
+            "triangleCountAfter": after.get("triangleCount"),
+            "topLevelSceneBuildsBefore": before.get("topLevelSceneBuilds"),
+            "topLevelSceneBuildsAfter": after.get("topLevelSceneBuilds"),
+            "lastRebuildReason": after.get("lastRebuildReason"),
+        }
+        write_probe()
+
     prim = model.stage.GetPrimAtPath(case["editPrim"])
     translate = prim.GetAttribute("xformOp:translate")
     if translate:
@@ -151,10 +199,43 @@ def testUsdviewInputFunction(appController):
             binding = UsdShade.MaterialBindingAPI.Apply(mesh.GetPrim())
             binding.Bind(UsdShade.Material(material.GetParent()))
         edit("structural-control", lambda: add_control_mesh("/World/ProbeBaseline"))
+        assert_leaf_edit("structural-control", attached=1, prim_delta=1)
         edit("material-parameter", lambda: attribute.Set(.125))
         edit("structural-after-material", lambda: add_control_mesh("/World/ProbeAfterMaterial"))
+        assert_leaf_edit("structural-after-material", attached=1, prim_delta=1)
+
+        def rename_prim(old_path, new_path):
+            editor = Usd.NamespaceEditor(model.stage)
+            editor.MovePrimAtPath(Sdf.Path(old_path), Sdf.Path(new_path))
+            result = editor.CanApplyEdits()
+            assert result, f"Cannot rename {old_path} to {new_path}: {result.whyNot}"
+            assert editor.ApplyEdits(), f"Namespace edit failed: {old_path} to {new_path}"
+
+        def record_rename_evidence():
+            row = rows[-1]
+            before, after = row["before"], row["after"]
+            for key in ("meshCount", "triangleCount"):
+                assert after.get(key) == before.get(key), (
+                    f"Namespace rename changed {key}: {before.get(key)} -> {after.get(key)}")
+            row["namespaceEditEvidence"] = {
+                "lastRebuildReason": after.get("lastRebuildReason"),
+                "primCountBefore": before.get("primCount"),
+                "primCountAfter": after.get("primCount"),
+                "meshCount": after.get("meshCount"),
+                "triangleCount": after.get("triangleCount"),
+            }
+            write_probe()
+
+        edit("structural-rename-control",
+             lambda: rename_prim("/World/ProbeBaseline", "/World/ProbeRenamed"))
+        record_rename_evidence()
+        edit("structural-restore-control-name",
+             lambda: rename_prim("/World/ProbeRenamed", "/World/ProbeBaseline"))
+        record_rename_evidence()
         edit("structural-remove-control", lambda: model.stage.RemovePrim("/World/ProbeBaseline"))
+        assert_leaf_edit("structural-remove-control", detached=1, prim_delta=-1)
         edit("structural-remove-after-material", lambda: model.stage.RemovePrim("/World/ProbeAfterMaterial"))
+        assert_leaf_edit("structural-remove-after-material", detached=1, prim_delta=-1)
     visibility = UsdGeom.Imageable(prim).CreateVisibilityAttr()
     edit("visibility-hide", lambda: visibility.Set(UsdGeom.Tokens.invisible))
     edit("visibility-show", lambda: visibility.Set(UsdGeom.Tokens.inherited))
