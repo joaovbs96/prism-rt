@@ -22,6 +22,8 @@ protected:
 private:
     prism::hydra::SceneBridge *_bridge;
     HdRenderThread *_renderThread;
+    bool _framingInvalid = false;
+    bool _warnedFramingMismatch = false;
 };
 
 PXR_NAMESPACE_CLOSE_SCOPE

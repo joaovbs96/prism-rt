@@ -2737,6 +2737,7 @@ PreviewResult _RenderPreview(std::shared_ptr<Snapshot> const &snapshot,
                 if (peak > settings.sampleClamp)
                     color *= settings.sampleClamp / peak;
             }
+            color *= camera.linearExposureScale;
             std::optional<RayHit> primary;
             if (needPrimary)
                 primary.emplace(snapshot->scene->cast_ray(rays.center));
@@ -3215,6 +3216,7 @@ bool SceneBridge::Prepare(CameraState const &camera,
             _impl->camera.focalLength != camera.focalLength ||
             _impl->camera.focusDistance != camera.focusDistance ||
             _impl->camera.orthographic != camera.orthographic ||
+            _impl->camera.linearExposureScale != camera.linearExposureScale ||
             _impl->width != width || _impl->height != height;
         bindingsChanged = _impl->bindings != bindings;
         renderTagsChanged = _impl->renderTags != renderTags;
@@ -3932,6 +3934,7 @@ void SceneBridge::Render()
                             if (peak > settings.sampleClamp)
                                 c *= settings.sampleClamp / peak;
                         }
+                        c *= camera.linearExposureScale;
                         std::optional<RayHit> primary;
                         if (sample == 0) primary.emplace(
                             snapshot->scene->cast_ray(rays.center));

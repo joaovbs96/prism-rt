@@ -60,6 +60,7 @@ struct CameraState {
     float focalLength = 0.0f;
     float focusDistance = 1.0f;
     bool orthographic = false;
+    float linearExposureScale = 1.0f;
 };
 
 struct PickingTable {

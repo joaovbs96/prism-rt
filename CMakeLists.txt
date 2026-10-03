@@ -227,6 +227,14 @@ if(PRISM_BUILD_HYDRA)
     set_tests_properties(prism_hydra_ext_computation_test PROPERTIES
         ENVIRONMENT "${_prism_test_environment}")
 
+    add_executable(prism_hydra_pass_camera_test tests/hydra/pass_camera_test.cpp)
+    target_include_directories(prism_hydra_pass_camera_test PRIVATE ${PXR_INCLUDE_DIRS})
+    target_link_libraries(prism_hydra_pass_camera_test PRIVATE PrismRT::core hd usdImagingGL ${PXR_LIBRARIES})
+    add_test(NAME prism_hydra_pass_camera_test COMMAND prism_hydra_pass_camera_test
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/parity.usda")
+    set_tests_properties(prism_hydra_pass_camera_test PROPERTIES
+        ENVIRONMENT "${_prism_test_environment}")
+
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/materials_test.cpp")
         add_executable(prism_hydra_materials_test
             tests/hydra/materials_test.cpp
