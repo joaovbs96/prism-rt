@@ -44,6 +44,8 @@
 
 PXR_NAMESPACE_USING_DIRECTIVE
 
+int RunAuthoredSettingsTests();
+
 namespace {
 
 class OwnerCheckedPoints final
@@ -630,6 +632,7 @@ int main()
 #else
     setenv("PRISM_CACHE_DIR", testCache.c_str(), 1);
 #endif
+    if (RunAuthoredSettingsTests() != 0) return 1;
     bool flatTangent = false, nativeTangent = false;
     bool flatMirroredTangent = false, nativeMirroredTangent = false;
     const Color3 flat = TraceTriangle(false, false, &flatTangent);

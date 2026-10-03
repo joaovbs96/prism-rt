@@ -101,6 +101,7 @@ void PrismTaskDelegate::SetTerminalSceneIndex(
         auto children = _sourceSceneIndex->GetChildPrimPaths(path);
         pending.insert(pending.end(), children.begin(), children.end());
     }
+    _RefreshRenderSettingsPaths();
     _sourceSceneIndex->AddObserver(HdSceneIndexObserverPtr(this));
 }
 
@@ -358,15 +359,11 @@ void PrismTaskDelegate::_SyncAuthoredSettings()
 {
     if (!_authoredSettingsDirty || !_sourceSceneIndex || !_bridge) return;
     _authoredSettingsDirty = false;
-    _renderSettingsPaths.clear();
     VtDictionary authored;
-    SdfPathVector pending{SdfPath::AbsoluteRootPath()};
     bool foundActive = false;
-    while (!pending.empty()) {
-        const auto path = pending.back(); pending.pop_back();
+    for (const SdfPath &path : _renderSettingsPaths) {
         const auto prim = _sourceSceneIndex->GetPrim(path);
         if (prim.primType == HdPrimTypeTokens->renderSettings) {
-            _renderSettingsPaths.push_back(path);
             const auto settings = HdRenderSettingsSchema::GetFromParent(prim.dataSource);
             const auto active = settings.GetActive();
             if (!foundActive && active && active->GetTypedValue(0)) {
@@ -379,8 +376,6 @@ void PrismTaskDelegate::_SyncAuthoredSettings()
                 }
             }
         }
-        const auto children = _sourceSceneIndex->GetChildPrimPaths(path);
-        pending.insert(pending.end(), children.begin(), children.end());
     }
     for (const auto& descriptor : GetRenderSettingDescriptors()) {
         const auto key = descriptor.key.GetString();
@@ -393,6 +388,54 @@ void PrismTaskDelegate::_SyncAuthoredSettings()
             SetRenderSetting(TfToken(name), value);
     }
     _authoredSettings = std::move(authored);
+}
+
+std::vector<size_t> PrismTaskDelegate::_GetSceneIndexOrder(
+    SdfPath const &path) const
+{
+    SdfPathVector ancestry;
+    for (SdfPath current = path;
+         current != SdfPath::AbsoluteRootPath() && !current.IsEmpty();
+         current = current.GetParentPath())
+        ancestry.push_back(current);
+    std::reverse(ancestry.begin(), ancestry.end());
+
+    std::vector<size_t> order;
+    order.reserve(ancestry.size());
+    SdfPath parent = SdfPath::AbsoluteRootPath();
+    for (SdfPath const &child : ancestry) {
+        const SdfPathVector children = _sourceSceneIndex->GetChildPrimPaths(parent);
+        const auto found = std::find(children.begin(), children.end(), child);
+        order.push_back(found == children.end()
+            ? std::numeric_limits<size_t>::max()
+            : static_cast<size_t>(found - children.begin()));
+        parent = child;
+    }
+    return order;
+}
+
+void PrismTaskDelegate::_RefreshRenderSettingsPaths()
+{
+    _renderSettingsPaths.clear();
+    _renderSettingsOrder.clear();
+    for (auto const &[path, type] : _knownPrimTypes) {
+        if (type != HdPrimTypeTokens->renderSettings) continue;
+        _renderSettingsPaths.push_back(path);
+        _renderSettingsOrder.emplace(path, _GetSceneIndexOrder(path));
+    }
+    std::sort(_renderSettingsPaths.begin(), _renderSettingsPaths.end(),
+        [this](SdfPath const &a, SdfPath const &b) {
+            const auto &aOrder = _renderSettingsOrder.at(a);
+            const auto &bOrder = _renderSettingsOrder.at(b);
+            const size_t common = std::min(aOrder.size(), bOrder.size());
+            for (size_t i = 0; i < common; ++i) {
+                if (aOrder[i] != bOrder[i])
+                    // Initial population visits the last child first because
+                    // it pushes children onto a LIFO traversal stack.
+                    return aOrder[i] > bOrder[i];
+            }
+            return aOrder.size() < bOrder.size();
+        });
 }
 
 static bool _NeedsSceneRebuild(HdSceneIndexPrim const &prim)
@@ -414,11 +457,22 @@ void PrismTaskDelegate::PrimsAdded(HdSceneIndexBase const &sender,
         _taskContext->instanceTopologyRevision.fetch_add(1, std::memory_order_relaxed);
     }
     SdfPathVector paths;
+    bool renderSettingsChanged = false;
     for (auto const& entry : entries) {
+        auto previous = _knownPrimTypes.find(entry.primPath);
+        const bool previousWasRenderSettings =
+            previous != _knownPrimTypes.end() &&
+            previous->second == HdPrimTypeTokens->renderSettings;
+        renderSettingsChanged = renderSettingsChanged ||
+            entry.primType == HdPrimTypeTokens->renderSettings ||
+            previousWasRenderSettings;
         _knownPrimTypes[entry.primPath] = entry.primType;
-        if (entry.primType == HdPrimTypeTokens->renderSettings) _authoredSettingsDirty = true;
+        if (entry.primType == HdPrimTypeTokens->renderSettings ||
+            previousWasRenderSettings)
+            _authoredSettingsDirty = true;
         if (_NeedsSceneRebuild(sender.GetPrim(entry.primPath))) paths.push_back(entry.primPath);
     }
+    if (renderSettingsChanged) _RefreshRenderSettingsPaths();
     if (_bridge && !paths.empty())
         _bridge->MarkScenePathsDirty(prism::hydra::SceneDirtyKind::Structure, paths);
 }
@@ -431,16 +485,21 @@ void PrismTaskDelegate::PrimsRemoved(HdSceneIndexBase const &,
         _taskContext->instanceTopologyRevision.fetch_add(1, std::memory_order_relaxed);
     }
     SdfPathVector paths;
+    bool renderSettingsChanged = false;
     for (auto const& entry : entries) {
         // Removed prims cannot be queried from the sender. Retain known types
         // until their entire subtree has been accounted for.
         for (auto it = _knownPrimTypes.lower_bound(entry.primPath);
              it != _knownPrimTypes.end() && it->first.HasPrefix(entry.primPath);) {
-            if (it->second == HdPrimTypeTokens->renderSettings) _authoredSettingsDirty = true;
+            if (it->second == HdPrimTypeTokens->renderSettings) {
+                _authoredSettingsDirty = true;
+                renderSettingsChanged = true;
+            }
             it = _knownPrimTypes.erase(it);
         }
         paths.push_back(entry.primPath);
     }
+    if (renderSettingsChanged) _RefreshRenderSettingsPaths();
     if (_bridge && !paths.empty())
         _bridge->MarkScenePathsDirty(prism::hydra::SceneDirtyKind::Structure, paths);
 }
@@ -527,18 +586,24 @@ void PrismTaskDelegate::PrimsRenamed(HdSceneIndexBase const &,
 {
     _taskContext->selectionSceneRevision.fetch_add(1, std::memory_order_relaxed);
     _taskContext->instanceTopologyRevision.fetch_add(1, std::memory_order_relaxed);
-    _authoredSettingsDirty = true;
     SdfPathVector paths;
+    bool renderSettingsChanged = false;
     for (auto const& entry : entries) {
         std::vector<std::pair<SdfPath, TfToken>> moved;
         for (auto it = _knownPrimTypes.lower_bound(entry.oldPrimPath);
              it != _knownPrimTypes.end() && it->first.HasPrefix(entry.oldPrimPath);) {
+            renderSettingsChanged = renderSettingsChanged ||
+                it->second == HdPrimTypeTokens->renderSettings;
             moved.emplace_back(it->first.ReplacePrefix(entry.oldPrimPath, entry.newPrimPath), it->second);
             it = _knownPrimTypes.erase(it);
         }
         for (auto const& item : moved) _knownPrimTypes.insert(item);
         paths.push_back(entry.oldPrimPath);
         paths.push_back(entry.newPrimPath);
+    }
+    if (renderSettingsChanged) {
+        _authoredSettingsDirty = true;
+        _RefreshRenderSettingsPaths();
     }
     if (_bridge && !paths.empty())
         _bridge->MarkScenePathsDirty(prism::hydra::SceneDirtyKind::Structure, paths);

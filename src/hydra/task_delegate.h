@@ -6,6 +6,7 @@
 
 #include <memory>
 #include <map>
+#include <vector>
 
 namespace prism::hydra {
 class SceneBridge;
@@ -72,6 +73,8 @@ public:
 
 private:
     void _SyncAuthoredSettings();
+    void _RefreshRenderSettingsPaths();
+    std::vector<size_t> _GetSceneIndexOrder(SdfPath const &path) const;
 
     HdSceneIndexBaseRefPtr _sourceSceneIndex;
     std::unique_ptr<HdRenderThread> _renderThread;
@@ -84,6 +87,7 @@ private:
     HdResourceRegistrySharedPtr _resources;
     bool _authoredSettingsDirty = true;
     SdfPathVector _renderSettingsPaths;
+    std::map<SdfPath, std::vector<size_t>> _renderSettingsOrder;
     VtDictionary _authoredSettings;
     std::map<SdfPath, TfToken> _knownPrimTypes;
 };
