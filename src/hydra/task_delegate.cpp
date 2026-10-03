@@ -555,10 +555,27 @@ void PrismTaskDelegate::PrimsDirtied(HdSceneIndexBase const &sender,
                     prism::hydra::SceneDirtyKind kind =
                         prism::hydra::SceneDirtyKind::Unknown;
                     const std::string text = locator.GetString();
+                    // These locators affect Hydra's display representation,
+                    // but are not consumed by Prism's retained snapshot.
+                    if (text.rfind("extent", 0) == 0 ||
+                        text.rfind("displayStyle", 0) == 0) {
+                        marked = true;
+                        continue;
+                    }
+                    SdfPathVector dirtyPaths{entry.primPath};
                     if (prim.primType == HdPrimTypeTokens->domeLight)
                         kind = prism::hydra::SceneDirtyKind::Environment;
                     else if (prim.primType == HdPrimTypeTokens->material)
                         kind = prism::hydra::SceneDirtyKind::Material;
+                    else if (prim.primType == HdPrimTypeTokens->geomSubset) {
+                        // Subset data is captured with its parent mesh. Hydra
+                        // exposes materialBindings at the root, while subset
+                        // topology lives below geomSubset.
+                        kind = text.rfind("materialBindings", 0) == 0
+                            ? prism::hydra::SceneDirtyKind::Material
+                            : prism::hydra::SceneDirtyKind::Prototype;
+                        dirtyPaths.push_back(entry.primPath.GetParentPath());
+                    }
                     else if (text.rfind("xform", 0) == 0 ||
                         text.rfind("visibility", 0) == 0 ||
                         text.rfind("instancerTopology", 0) == 0)
@@ -568,7 +585,7 @@ void PrismTaskDelegate::PrimsDirtied(HdSceneIndexBase const &sender,
                         kind = prism::hydra::SceneDirtyKind::Prototype;
                     else if (text.rfind("materialBindings", 0) == 0)
                         kind = prism::hydra::SceneDirtyKind::Material;
-                    notices.push_back({kind, {entry.primPath},
+                    notices.push_back({kind, std::move(dirtyPaths),
                         entry.primPath.GetString() + ": " + text});
                     marked = true;
                 }

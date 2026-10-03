@@ -1,6 +1,7 @@
 #include "../../src/hydra/task_delegate.h"
 
 #include <pxr/imaging/hd/renderSettingsSchema.h>
+#include <pxr/imaging/hd/materialBindingsSchema.h>
 #include <pxr/imaging/hd/retainedDataSource.h>
 #include <pxr/imaging/hd/sceneIndex.h>
 #include <pxr/imaging/hd/tokens.h>
@@ -76,6 +77,13 @@ public:
         _SendPrimsDirtied(entries);
     }
 
+    void Dirty(SdfPath const &path, HdDataSourceLocator const &locator)
+    {
+        HdSceneIndexObserver::DirtiedPrimEntries entries;
+        entries.emplace_back(path, HdDataSourceLocatorSet(locator));
+        _SendPrimsDirtied(entries);
+    }
+
     mutable std::atomic<size_t> getPrimCalls{0};
     mutable std::atomic<size_t> getChildCalls{0};
     std::map<SdfPath, PrimRecord> prims;
@@ -140,6 +148,61 @@ int RunAuthoredSettingsTests()
         Require(delegate.GetRenderSetting(TfToken("prism:samplesPerPixel"))
                     .UncheckedGet<int>() == 31,
                 "Dirty active settings value was not synchronized");
+
+        auto dirtyIndex = TfCreateRefPtr(new CountingSceneIndex());
+        dirtyIndex->Add(root, TfToken(), HdRetainedContainerDataSource::New());
+        dirtyIndex->Add(SdfPath("/Mesh"), HdPrimTypeTokens->mesh,
+                        HdRetainedContainerDataSource::New());
+        dirtyIndex->Add(SdfPath("/Mesh/Subset"), HdPrimTypeTokens->geomSubset,
+                        HdRetainedContainerDataSource::New());
+        PrismTaskDelegate dirtyDelegate;
+        dirtyDelegate.SetTerminalSceneIndex(dirtyIndex);
+        auto stat = [](VtDictionary const &stats, char const *name) {
+            auto const found = stats.find(name);
+            return found != stats.end() && found->second.IsHolding<int64_t>()
+                ? found->second.UncheckedGet<int64_t>() : int64_t{0};
+        };
+        VtDictionary const beforeSubset = dirtyDelegate.GetRenderStats();
+        dirtyIndex->Dirty(SdfPath("/Mesh/Subset"), HdDataSourceLocator(
+            {TfToken("geomSubset"), TfToken("indices")}));
+        VtDictionary const afterSubset = dirtyDelegate.GetRenderStats();
+        Require(stat(afterSubset, "prototypeInvalidations") ==
+                    stat(beforeSubset, "prototypeInvalidations") + 1,
+                "geomSubset indices dirtiness was not mapped to prototype");
+        dirtyIndex->Dirty(SdfPath("/Mesh/Subset"), HdDataSourceLocator(
+            {TfToken("geomSubset"), TfToken("elementType")}));
+        VtDictionary const afterElementType = dirtyDelegate.GetRenderStats();
+        Require(stat(afterElementType, "prototypeInvalidations") ==
+                    stat(afterSubset, "prototypeInvalidations") + 1,
+                "geomSubset elementType dirtiness was not mapped to prototype");
+        dirtyIndex->Dirty(SdfPath("/Mesh/Subset"),
+            HdMaterialBindingsSchema::GetDefaultLocator());
+        VtDictionary const afterBinding = dirtyDelegate.GetRenderStats();
+        Require(stat(afterBinding, "materialInvalidations") ==
+                    stat(afterSubset, "materialInvalidations") + 1,
+                "root materialBindings dirtiness on geomSubset was not mapped to material");
+
+        VtDictionary const beforeIgnored = dirtyDelegate.GetRenderStats();
+        dirtyIndex->Dirty(SdfPath("/Mesh"), HdDataSourceLocator(
+            {TfToken("extent")}));
+        dirtyIndex->Dirty(SdfPath("/Mesh"), HdDataSourceLocator(
+            {TfToken("displayStyle")}));
+        VtDictionary const afterIgnored = dirtyDelegate.GetRenderStats();
+        Require(stat(afterIgnored, "materialInvalidations") ==
+                    stat(beforeIgnored, "materialInvalidations") &&
+                stat(afterIgnored, "placementInvalidations") ==
+                    stat(beforeIgnored, "placementInvalidations") &&
+                stat(afterIgnored, "prototypeInvalidations") ==
+                    stat(beforeIgnored, "prototypeInvalidations") &&
+                stat(afterIgnored, "conservativeRebuilds") ==
+                    stat(beforeIgnored, "conservativeRebuilds"),
+                "extent/displayStyle dirtiness triggered snapshot invalidation");
+
+        dirtyIndex->Dirty(SdfPath("/Mesh"), HdDataSourceLocator());
+        VtDictionary const afterEmpty = dirtyDelegate.GetRenderStats();
+        Require(stat(afterEmpty, "conservativeRebuilds") ==
+                    stat(afterIgnored, "conservativeRebuilds") + 1,
+                "empty dirty locator set did not retain conservative fallback");
     } catch (std::exception const &error) {
         std::cerr << error.what() << '\n';
         return 1;

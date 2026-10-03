@@ -2043,6 +2043,41 @@ int main()
                         "spare bank changed picking");
             ok &= Check(ReadBuffer<float>(&colorBuffer) == colorsBefore,
                         "spare bank changed material assignments");
+
+            // Rebinding a face subset must refresh its parent mesh's face
+            // material table. Marking only the subset path reproduces the
+            // pre-fix bug: _RefreshMaterials recognizes material-user and
+            // prototype paths, but the subset path is neither.
+            const SdfPath quadSubset("/Left/Mesh/Quad");
+            scene->AddPrims({{quadSubset, HdPrimTypeTokens->geomSubset,
+                              FaceSubsetData(VtIntArray{0},
+                                             SdfPath("/Looks/Blue"))}});
+            bridge.MarkSceneDirtyBatch({{
+                prism::hydra::SceneDirtyKind::Material,
+                {quadSubset, SdfPath("/Left/Mesh")},
+                "geomSubset/materialBindings edit"}});
+            ok &= Check(prepareUntilDisplayed(bridge, aovs) &&
+                            settle(bridge, aovs) &&
+                            renderFrame(bridge),
+                        "subset material rebind did not prepare");
+            const std::vector<float> colorsAfterSubsetRebind =
+                ReadBuffer<float>(&colorBuffer);
+            const std::vector<int> primsAfterSubsetRebind =
+                ReadBuffer<int>(&primBuffer);
+            bool leftRedAfterRebind = false;
+            bool leftBlueAfterRebind = false;
+            for (size_t pixel = 0; pixel < primsAfterSubsetRebind.size(); ++pixel) {
+                if (primsAfterSubsetRebind[pixel] < 0 ||
+                    bridge.GetPrimPath(primsAfterSubsetRebind[pixel]) !=
+                        SdfPath("/Left/Mesh")) continue;
+                const float r = colorsAfterSubsetRebind[pixel * 4];
+                const float g = colorsAfterSubsetRebind[pixel * 4 + 1];
+                const float b = colorsAfterSubsetRebind[pixel * 4 + 2];
+                leftRedAfterRebind |= r > 2.0f * b && r > 2.0f * g;
+                leftBlueAfterRebind |= b > 2.0f * r && b > 2.0f * g;
+            }
+            ok &= Check(leftBlueAfterRebind && !leftRedAfterRebind,
+                        "geomSubset material rebind left stale face materials");
             activeBridge = nullptr;
         }
 
