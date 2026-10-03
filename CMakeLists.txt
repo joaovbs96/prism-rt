@@ -253,6 +253,14 @@ if(PRISM_BUILD_HYDRA)
     set_tests_properties(prism_hydra_environment_cache_test PROPERTIES
         ENVIRONMENT "${_prism_test_environment}")
 
+    add_executable(prism_hydra_fallback_material_test
+        tests/hydra/fallback_material_test.cpp)
+    target_link_libraries(prism_hydra_fallback_material_test PRIVATE PrismRT::core)
+    add_test(NAME prism_hydra_fallback_material_test
+        COMMAND prism_hydra_fallback_material_test)
+    set_tests_properties(prism_hydra_fallback_material_test PROPERTIES
+        ENVIRONMENT "${_prism_test_environment}")
+
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/materials_test.cpp")
         add_executable(prism_hydra_materials_test
             tests/hydra/materials_test.cpp
