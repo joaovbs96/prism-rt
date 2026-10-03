@@ -46,6 +46,8 @@ PXR_NAMESPACE_USING_DIRECTIVE
 
 int RunAuthoredSettingsTests();
 int RunB2DoublePrimvarIntegrationTests();
+int RunB3FallbackOpacityIntegrationTests();
+int RunC2GeometricAovIntegrationTests();
 
 namespace {
 
@@ -635,6 +637,8 @@ int main()
 #endif
     if (RunAuthoredSettingsTests() != 0) return 1;
     if (RunB2DoublePrimvarIntegrationTests() != 0) return 1;
+    if (RunB3FallbackOpacityIntegrationTests() != 0) return 1;
+    if (RunC2GeometricAovIntegrationTests() != 0) return 1;
     bool flatTangent = false, nativeTangent = false;
     bool flatMirroredTangent = false, nativeMirroredTangent = false;
     const Color3 flat = TraceTriangle(false, false, &flatTangent);

@@ -155,8 +155,11 @@ HdAovDescriptor PrismTaskDelegate::GetDefaultAovDescriptor(TfToken const &name) 
     if (name == HdAovTokens->cameraDepth)
         return {HdFormatFloat32, false,
                 VtValue(std::numeric_limits<float>::infinity())};
-    if (name == HdAovTokens->normal || name == HdAovTokens->Neye)
+    if (name == HdAovTokens->normal || name == HdAovTokens->Neye ||
+        name == HdAovTokens->Peye)
         return {HdFormatFloat32Vec3, false, VtValue(GfVec3f(0))};
+    if (name == TfToken("primvars:st"))
+        return {HdFormatFloat32Vec2, false, VtValue(GfVec2f(0))};
     if (name == HdAovTokens->primId || name == HdAovTokens->instanceId ||
         name == HdAovTokens->elementId)
         return {HdFormatInt32, false, VtValue(-1)};

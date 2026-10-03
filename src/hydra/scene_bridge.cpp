@@ -79,6 +79,15 @@ PXR_NAMESPACE_USING_DIRECTIVE
 namespace prism::hydra {
 namespace {
 
+void _WarnUnsupportedAov(TfToken const &name)
+{
+    static std::mutex mutex;
+    static std::unordered_set<std::string> warned;
+    std::lock_guard lock(mutex);
+    if (warned.insert(name.GetString()).second)
+        TF_WARN("PrismRT: AOV '%s' is not supported", name.GetText());
+}
+
 // Nothing is displayed before the first snapshot, so the host has no
 // responsiveness to protect and capture can finish in far fewer frames.
 constexpr double kInitialCaptureBudgetMilliseconds = 50.0;
@@ -2775,8 +2784,11 @@ PreviewResult _RenderPreview(std::shared_ptr<Snapshot> const &snapshot,
         if (binding.aovName == HdAovTokens->color) {
             target.components = 4; target.floats.resize(pixels * 4);
         } else if (binding.aovName == HdAovTokens->normal ||
-                   binding.aovName == HdAovTokens->Neye) {
-            target.components = 3; target.floats.resize(pixels * 3);
+                   binding.aovName == HdAovTokens->Neye ||
+                   binding.aovName == HdAovTokens->Peye ||
+                   binding.aovName == TfToken("primvars:st")) {
+            target.components = binding.aovName == TfToken("primvars:st") ? 2 : 3;
+            target.floats.resize(pixels * target.components);
             needPrimary = true;
         } else if (binding.aovName == HdAovTokens->depth ||
                    binding.aovName == HdAovTokens->cameraDepth) {
@@ -2788,6 +2800,7 @@ PreviewResult _RenderPreview(std::shared_ptr<Snapshot> const &snapshot,
             target.components = 1; target.ints.assign(pixels, -1);
             needPrimary = true;
         } else {
+            _WarnUnsupportedAov(binding.aovName);
             continue;
         }
         targets.push_back(std::move(target));
@@ -2869,7 +2882,9 @@ PreviewResult _RenderPreview(std::shared_ptr<Snapshot> const &snapshot,
                     }
                     target.floats[pixel] = value;
                 } else if (target.name == HdAovTokens->normal ||
-                           target.name == HdAovTokens->Neye) {
+                           target.name == HdAovTokens->Neye ||
+                           target.name == HdAovTokens->Peye ||
+                           target.name == TfToken("primvars:st")) {
                     Float3 normal = primary->n;
                     if (target.name == HdAovTokens->Neye && hit) {
                         GfVec3d eye = camera.worldToView.TransformDir(
@@ -2878,8 +2893,19 @@ PreviewResult _RenderPreview(std::shared_ptr<Snapshot> const &snapshot,
                                         static_cast<float>(eye[1]),
                                         static_cast<float>(eye[2]));
                     }
-                    float *dst = target.floats.data() + pixel * 3;
-                    dst[0] = normal.x(); dst[1] = normal.y(); dst[2] = normal.z();
+                    float *dst = target.floats.data() + pixel * target.components;
+                    if (target.name == HdAovTokens->Peye && hit) {
+                        GfVec3d eye = camera.worldToView.Transform(
+                            GfVec3d(primary->p.x(), primary->p.y(), primary->p.z()));
+                        dst[0] = static_cast<float>(eye[0]);
+                        dst[1] = static_cast<float>(eye[1]);
+                        dst[2] = static_cast<float>(eye[2]);
+                    } else if (target.name == TfToken("primvars:st")) {
+                        dst[0] = hit ? primary->u : 0.0f;
+                        dst[1] = hit ? primary->v : 0.0f;
+                    } else {
+                        dst[0] = normal.x(); dst[1] = normal.y(); dst[2] = normal.z();
+                    }
                 } else {
                     int value = -1;
                     if (hit && target.name == HdAovTokens->primId) {
@@ -4016,6 +4042,16 @@ void SceneBridge::Render()
         }
         _converged.store(!preparing); return;
     }
+    for (HdRenderPassAovBinding const &binding : bindings) {
+        TfToken const &name = binding.aovName;
+        const bool supported = name == HdAovTokens->color ||
+            name == HdAovTokens->normal || name == HdAovTokens->Neye ||
+            name == HdAovTokens->Peye || name == TfToken("primvars:st") ||
+            name == HdAovTokens->depth || name == HdAovTokens->cameraDepth ||
+            name == HdAovTokens->primId || name == HdAovTokens->elementId ||
+            name == HdAovTokens->instanceId;
+        if (!supported) _WarnUnsupportedAov(name);
+    }
     const int firstSample = static_cast<int>(_impl->samples.load());
     std::shared_ptr<const PublishedFrame> frame;
     if (firstSample != 0) {
@@ -4216,6 +4252,23 @@ void SceneBridge::Render()
                                 }
                                 float v[3] = {n.x(), n.y(), n.z()};
                                 buffer->WriteFloat(x, bufferY, v, 3, false);
+                            } else if (binding.aovName == HdAovTokens->Peye) {
+                                float v[3] = {0, 0, 0};
+                                if (primary->geomid != RTC_INVALID_GEOMETRY_ID) {
+                                    GfVec3d eye = camera.worldToView.Transform(
+                                        GfVec3d(primary->p.x(), primary->p.y(), primary->p.z()));
+                                    v[0] = static_cast<float>(eye[0]);
+                                    v[1] = static_cast<float>(eye[1]);
+                                    v[2] = static_cast<float>(eye[2]);
+                                }
+                                buffer->WriteFloat(x, bufferY, v, 3, false);
+                            } else if (binding.aovName == TfToken("primvars:st")) {
+                                float v[2] = {0, 0};
+                                if (primary->geomid != RTC_INVALID_GEOMETRY_ID) {
+                                    v[0] = primary->u;
+                                    v[1] = primary->v;
+                                }
+                                buffer->WriteFloat(x, bufferY, v, 2, false);
                             } else if (binding.aovName == HdAovTokens->primId) {
                                 int id = _PrimIdForHit(snapshot.get(), *primary);
                                 buffer->WriteInt(x, bufferY, &id, 1);
