@@ -60,6 +60,7 @@ bool PrismRenderBuffer::Allocate(GfVec3i const &d, HdFormat format, bool ms)
     _hasPublished = false;
     _initialCleared = false;
     _converged.store(false);
+    _allocationRevision.fetch_add(1);
     return true;
 }
 
@@ -68,6 +69,7 @@ void PrismRenderBuffer::_Deallocate()
     if (_renderThread) _renderThread->StopRender();
     std::lock_guard lock(_mutex);
     _width = _height = 0;
+    _allocationRevision.fetch_add(1);
     _format = HdFormatInvalid;
     _pixels.reset();
     _frame.reset();

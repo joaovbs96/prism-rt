@@ -2960,11 +2960,14 @@ public:
     mutable std::mutex mutex;
     bool sceneDirty = true;
     bool stateDirty = true;
+    bool resumeRequested = false;
     unsigned int dirtyKinds = static_cast<unsigned int>(SceneDirtyKind::Unknown);
     std::unordered_set<SdfPath, SdfPath::Hash> dirtyPaths;
     RenderSettings settings;
     CameraState camera;
     HdRenderPassAovBindingVector bindings;
+    std::vector<uint64_t> bindingAllocationRevisions;
+    std::vector<unsigned int> committedRngStates;
     TfTokenVector renderTags;
     unsigned int width = 0, height = 0;
     std::shared_ptr<Snapshot> snapshot;
@@ -3153,6 +3156,8 @@ void SceneBridge::RestartAccumulation()
 
 void SceneBridge::SetSettings(RenderSettings const &settings)
 {
+    bool imageChanged = false;
+    bool budgetChanged = false;
     {
         std::lock_guard lock(_impl->mutex);
         RenderSettings const &current = _impl->settings;
@@ -3170,8 +3175,19 @@ void SceneBridge::SetSettings(RenderSettings const &settings)
             current.textureFiltering == settings.textureFiltering &&
             current.environmentSampling == settings.environmentSampling)
             return;
+        imageChanged = current.maxDepth != settings.maxDepth ||
+            current.rouletteDepth != settings.rouletteDepth ||
+            current.seed != settings.seed ||
+            current.sampleClamp != settings.sampleClamp ||
+            current.resourceRevision != settings.resourceRevision ||
+            current.sphereBatching != settings.sphereBatching ||
+            current.textureFiltering != settings.textureFiltering ||
+            current.environmentSampling != settings.environmentSampling;
+        budgetChanged = current.samples != settings.samples;
     }
-    _impl->renderThread->StopRender();
+    // Budget changes quiesce a staged pass without discarding committed work.
+    // Presentation controls are read at preview boundaries and need no stop.
+    if (imageChanged || budgetChanged) _impl->renderThread->StopRender();
     std::lock_guard lock(_impl->mutex);
     if (_impl->materialService)
         _impl->materialService->SetResourceRevision(
@@ -3208,8 +3224,14 @@ void SceneBridge::SetSettings(RenderSettings const &settings)
         _impl->lastRebuildReason = "sphere batching changed";
     }
     _impl->settings = settings;
-    _impl->stateDirty = true;
-    _converged.store(false);
+    _impl->stateDirty |= imageChanged;
+    _impl->resumeRequested |= budgetChanged;
+    if (imageChanged || budgetChanged) {
+        for (auto const &binding : _impl->bindings)
+            if (auto *buffer = dynamic_cast<PrismRenderBuffer *>(binding.renderBuffer))
+                buffer->SetConverged(false);
+        _converged.store(false);
+    }
 }
 
 RenderSettings SceneBridge::GetSettings() const
@@ -3228,6 +3250,12 @@ bool SceneBridge::Prepare(CameraState const &camera,
     bool bindingsChanged = false;
     bool renderTagsChanged = false;
     bool stateChanged = false;
+    bool resumeRequested = false;
+    std::vector<uint64_t> allocationRevisions;
+    for (auto const &binding : bindings) {
+        auto *buffer = dynamic_cast<PrismRenderBuffer *>(binding.renderBuffer);
+        allocationRevisions.push_back(buffer ? buffer->GetAllocationRevision() : 0);
+    }
     bool hasPreparationWork = false;
     bool spareOnly = false;
     // Buffers that have not shown a frame still hold their zero allocation,
@@ -3248,14 +3276,16 @@ bool SceneBridge::Prepare(CameraState const &camera,
             _impl->camera.orthographic != camera.orthographic ||
             _impl->camera.linearExposureScale != camera.linearExposureScale ||
             _impl->width != width || _impl->height != height;
-        bindingsChanged = _impl->bindings != bindings;
+        bindingsChanged = _impl->bindings != bindings ||
+            _impl->bindingAllocationRevisions != allocationRevisions;
         renderTagsChanged = _impl->renderTags != renderTags;
         stateChanged = _impl->stateDirty;
+        resumeRequested = _impl->resumeRequested;
         hasPreparationWork = _impl->sceneDirty || _impl->captureActive ||
             _impl->buildFuture.valid();
         spareOnly = !_impl->sceneDirty && !_impl->captureActive &&
             _impl->buildFuture.valid() && _impl->buildIsSpare;
-        if (!_impl->sceneDirty && !_impl->stateDirty && !cameraChanged &&
+        if (!_impl->sceneDirty && !_impl->stateDirty && !resumeRequested && !cameraChanged &&
             !bindingsChanged && !renderTagsChanged && !hasPreparationWork &&
             !clearNeeded)
             return false;
@@ -3297,6 +3327,7 @@ bool SceneBridge::Prepare(CameraState const &camera,
         _impl->camera = camera;
         if (cameraChanged) ++_impl->cameraRevision;
         _impl->bindings = bindings;
+        _impl->bindingAllocationRevisions = std::move(allocationRevisions);
         _impl->renderTags = renderTags;
         _impl->width = width;
         _impl->height = height;
@@ -3819,7 +3850,7 @@ bool SceneBridge::Prepare(CameraState const &camera,
     }
 
     std::lock_guard lock(_impl->mutex);
-    if (spareOnly && !stateChanged && !cameraChanged && !bindingsChanged &&
+    if (spareOnly && !stateChanged && !resumeRequested && !cameraChanged && !bindingsChanged &&
         !renderTagsChanged && !clearNeeded && !published && !captureWorked &&
         !_impl->sceneDirty && !_impl->captureActive) {
         // Only the spare bank advanced. The displayed frame is unchanged, so
@@ -3850,6 +3881,7 @@ bool SceneBridge::Prepare(CameraState const &camera,
         _impl->renderSeconds = 0.0;
     }
     _impl->stateDirty = false;
+    _impl->resumeRequested = false;
     _converged.store(false);
     _impl->prepareMilliseconds = 1000.0 * std::chrono::duration<double>(
         std::chrono::steady_clock::now() - prepareStart).count();
@@ -3888,105 +3920,128 @@ void SceneBridge::Render()
         }
         _converged.store(!preparing); return;
     }
-    auto frame = std::make_shared<PublishedFrame>();
-    frame->generation = generation;
-    frame->cameraRevision = cameraRevision;
-    frame->picking = snapshot->picking;
-    frame->camera = camera;
-    frame->width = width;
-    frame->height = height;
-    // Preview rendering runs on Hydra's render worker.  Prepare only captures
-    // the raw AOV bindings after StopRender has quiesced their previous user;
-    // buffer destruction and resize also stop this worker before changing
-    // storage, so no preparation worker ever dereferences a render buffer.
-    RenderSettings previewSettings = settings;
-    if (settings.adaptivePreview) {
+    const int firstSample = static_cast<int>(_impl->samples.load());
+    std::shared_ptr<const PublishedFrame> frame;
+    if (firstSample != 0) {
         std::lock_guard lock(_impl->mutex);
-        if (_impl->previewMilliseconds > 0.0) {
-            const double ratio = std::sqrt(
-                static_cast<double>(std::clamp(settings.previewTargetMs, 1, 1000)) /
-                _impl->previewMilliseconds);
-            previewSettings.previewMaxDimension = std::clamp(
-                static_cast<int>(std::lround(std::max(
-                    _impl->previewWidth, _impl->previewHeight) *
-                    std::clamp(ratio, 0.5, 2.0))),
-                16, std::clamp(settings.previewMaxDimension, 16, 1024));
-        }
+        frame = _impl->lastPublishedFrame;
     }
-    auto const previewStart = std::chrono::steady_clock::now();
-    PreviewResult const preview = _RenderPreview(
-        snapshot, camera, previewSettings, bindings, width, height,
-        _impl->renderThread, frame);
-    if (_impl->renderThread->IsStopRequested()) return;
-    {
-        std::lock_guard lock(_impl->mutex);
-        _impl->previewMilliseconds = 1000.0 * std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - previewStart).count();
-        _impl->previewPublicationMilliseconds =
-            preview.publicationMilliseconds;
-        _impl->previewRayWorkMilliseconds = std::max(
-            0.0, _impl->previewMilliseconds -
-                preview.publicationMilliseconds);
-        _impl->previewPublishedBytes = preview.publishedBytes;
-        _impl->previewTracedPixels = preview.tracedPixels;
-        _impl->previewBoundAovCount = preview.boundAovCount;
-        _impl->previewWidth = preview.width;
-        _impl->previewHeight = preview.height;
-        if (preview.published) {
-            ++_impl->previewPublishes;
-            _impl->lastPublishedFrame = frame;
-        }
+    if (!frame) {
+        auto initialFrame = std::make_shared<PublishedFrame>();
+        initialFrame->generation = generation;
+        initialFrame->cameraRevision = cameraRevision;
+        initialFrame->picking = snapshot->picking;
+        initialFrame->camera = camera;
+        initialFrame->width = width;
+        initialFrame->height = height;
+        frame = std::move(initialFrame);
     }
-    // Do not let full-resolution work contend with camera interaction.  Each
-    // new camera state cancels this wait in at most two milliseconds and starts
-    // a fresh quiet period; refinement begins automatically after input stops.
-    auto const refineAfter = std::chrono::steady_clock::now() +
-        std::chrono::milliseconds(std::clamp(settings.refinementDelayMs, 0, 2000));
-    while (std::chrono::steady_clock::now() < refineAfter) {
-        if (_impl->renderThread->IsStopRequested()) return;
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
-    }
-    if (_impl->renderThread->IsStopRequested()) return;
-    for (HdRenderPassAovBinding const &binding : bindings)
-        if (auto *buffer = dynamic_cast<PrismRenderBuffer *>(binding.renderBuffer))
-            buffer->BeginFrame(binding.clearValue);
-    // Full-resolution RNG setup belongs to the render worker.  Camera motion
-    // only pays for the bounded preview above on the UI/Execute thread.
-    std::vector<unsigned int> rngStates(static_cast<size_t>(width) * height);
-    tbb::parallel_for(
-        tbb::blocked_range2d<unsigned int>(0, height, 16, 0, width, 64),
-        [&](tbb::blocked_range2d<unsigned int> const &range) {
-            for (unsigned int y = range.rows().begin();
-                 y != range.rows().end(); ++y) {
-                for (unsigned int x = range.cols().begin();
-                     x != range.cols().end(); ++x) {
-                    if (_impl->renderThread->IsStopRequested()) return;
-                    rngStates[static_cast<size_t>(y) * width + x] =
-                        tea<64>((y * width) ^ settings.seed, x);
-                }
+    if (firstSample == 0) {
+        // Preview rendering runs on Hydra's render worker.  Prepare only captures
+        // the raw AOV bindings after StopRender has quiesced their previous user;
+        // buffer destruction and resize also stop this worker before changing
+        // storage, so no preparation worker ever dereferences a render buffer.
+        RenderSettings previewSettings = settings;
+        if (settings.adaptivePreview) {
+            std::lock_guard lock(_impl->mutex);
+            if (_impl->previewMilliseconds > 0.0) {
+                const double ratio = std::sqrt(
+                    static_cast<double>(std::clamp(settings.previewTargetMs, 1, 1000)) /
+                    _impl->previewMilliseconds);
+                previewSettings.previewMaxDimension = std::clamp(
+                    static_cast<int>(std::lround(std::max(
+                        _impl->previewWidth, _impl->previewHeight) *
+                        std::clamp(ratio, 0.5, 2.0))),
+                    16, std::clamp(settings.previewMaxDimension, 16, 1024));
             }
-        });
-    if (_impl->renderThread->IsStopRequested()) return;
+        }
+        auto const previewStart = std::chrono::steady_clock::now();
+        PreviewResult const preview = _RenderPreview(
+            snapshot, camera, previewSettings, bindings, width, height,
+            _impl->renderThread, frame);
+        if (_impl->renderThread->IsStopRequested()) return;
+        {
+            std::lock_guard lock(_impl->mutex);
+            _impl->previewMilliseconds = 1000.0 * std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - previewStart).count();
+            _impl->previewPublicationMilliseconds =
+                preview.publicationMilliseconds;
+            _impl->previewRayWorkMilliseconds = std::max(
+                0.0, _impl->previewMilliseconds -
+                    preview.publicationMilliseconds);
+            _impl->previewPublishedBytes = preview.publishedBytes;
+            _impl->previewTracedPixels = preview.tracedPixels;
+            _impl->previewBoundAovCount = preview.boundAovCount;
+            _impl->previewWidth = preview.width;
+            _impl->previewHeight = preview.height;
+            if (preview.published) {
+                ++_impl->previewPublishes;
+                _impl->lastPublishedFrame = frame;
+            }
+        }
+        // Do not let full-resolution work contend with camera interaction.  Each
+        // new camera state cancels this wait in at most two milliseconds and starts
+        // a fresh quiet period; refinement begins automatically after input stops.
+        auto const quietStart = std::chrono::steady_clock::now();
+        for (;;) {
+            if (_impl->renderThread->IsStopRequested()) return;
+            int delay;
+            {
+                std::lock_guard lock(_impl->mutex);
+                delay = _impl->settings.refinementDelayMs;
+            }
+            if (std::chrono::steady_clock::now() >= quietStart +
+                std::chrono::milliseconds(std::clamp(delay, 0, 2000))) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        if (_impl->renderThread->IsStopRequested()) return;
+        for (HdRenderPassAovBinding const &binding : bindings)
+            if (auto *buffer = dynamic_cast<PrismRenderBuffer *>(binding.renderBuffer))
+                buffer->BeginFrame(binding.clearValue);
+        // Full-resolution RNG setup belongs to the render worker.  Camera motion
+        // only pays for the bounded preview above on the UI/Execute thread.
+        _impl->committedRngStates.resize(static_cast<size_t>(width) * height);
+        tbb::parallel_for(
+            tbb::blocked_range2d<unsigned int>(0, height, 16, 0, width, 64),
+            [&](tbb::blocked_range2d<unsigned int> const &range) {
+                for (unsigned int y = range.rows().begin();
+                     y != range.rows().end(); ++y) {
+                    for (unsigned int x = range.cols().begin();
+                         x != range.cols().end(); ++x) {
+                        if (_impl->renderThread->IsStopRequested()) return;
+                        _impl->committedRngStates[static_cast<size_t>(y) * width + x] =
+                            tea<64>((y * width) ^ settings.seed, x);
+                    }
+                }
+            });
+        if (_impl->renderThread->IsStopRequested()) return;
+    }
     prism::CameraRayParameters const cameraParameters =
         _CameraParameters(camera);
     prism::DumpCameraRayDiagnostics(
         cameraParameters, width, height, settings.seed, "hydra");
     const int sampleCount = std::max(1, settings.samples);
-    for (int sample = 0; sample < sampleCount; ++sample) {
+    const size_t scratchPixels = firstSample < sampleCount
+        ? static_cast<size_t>(width) * height : 0;
+    std::vector<Color3> passColors(scratchPixels);
+    std::vector<unsigned int> rngStates(scratchPixels);
+    std::vector<std::optional<RayHit>> passPrimary;
+    if (firstSample == 0) passPrimary.resize(passColors.size());
+    for (int sample = firstSample; sample < sampleCount; ++sample) {
         if (_impl->renderThread->IsStopRequested()) return;
         while (_impl->renderThread->IsPauseRequested()) {
             if (_impl->renderThread->IsStopRequested()) return;
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
+        std::copy(_impl->committedRngStates.begin(),
+                  _impl->committedRngStates.end(), rngStates.begin());
         tbb::parallel_for(tbb::blocked_range2d<unsigned int>(0, height, 8, 0, width, 8),
             [&](tbb::blocked_range2d<unsigned int> const &range) {
-                std::vector<uint64_t> tileWriteNanoseconds(
-                    _impl->profileBufferWrites ? bindings.size() : 0, 0);
                 for (unsigned int y = range.rows().begin(); y != range.rows().end(); ++y) {
                     if (_impl->renderThread->IsStopRequested()) return;
                     for (unsigned int x = range.cols().begin(); x != range.cols().end(); ++x) {
-                        unsigned int &seed = rngStates[
-                            static_cast<size_t>(y) * width + x];
+                        const size_t pixel = static_cast<size_t>(y) * width + x;
+                        unsigned int &seed = rngStates[pixel];
                         RayPair rays = prism::GenerateCameraRays(
                             cameraParameters, x, y, width, height, seed);
                         Color3 c = snapshot->scene->trace(
@@ -3994,13 +4049,28 @@ void SceneBridge::Render()
                             0, Color3(1.0f), seed);
                         if (settings.sampleClamp > 0.0f) {
                             const float peak = c.max_component();
-                            if (peak > settings.sampleClamp)
-                                c *= settings.sampleClamp / peak;
+                            if (peak > settings.sampleClamp) c *= settings.sampleClamp / peak;
                         }
                         c *= camera.linearExposureScale;
+                        passColors[pixel] = c;
+                        if (sample == 0)
+                            passPrimary[pixel] = snapshot->scene->cast_ray(rays.center);
+                    }
+                }
+            });
+        if (_impl->renderThread->IsStopRequested()) return;
+        // Commit is bounded buffer work: finish it even if a stop arrives.
+        // The next RNG state and sample count advance only with publication.
+        tbb::parallel_for(tbb::blocked_range2d<unsigned int>(0, height, 8, 0, width, 8),
+            [&](tbb::blocked_range2d<unsigned int> const &range) {
+                std::vector<uint64_t> tileWriteNanoseconds(
+                    _impl->profileBufferWrites ? bindings.size() : 0, 0);
+                for (unsigned int y = range.rows().begin(); y != range.rows().end(); ++y) {
+                    for (unsigned int x = range.cols().begin(); x != range.cols().end(); ++x) {
+                        const size_t pixel = static_cast<size_t>(y) * width + x;
+                        Color3 const &c = passColors[pixel];
                         std::optional<RayHit> primary;
-                        if (sample == 0) primary.emplace(
-                            snapshot->scene->cast_ray(rays.center));
+                        if (sample == 0) primary = passPrimary[pixel];
                         // Hydra's render buffers are addressed bottom-up. Camera sampling
                         // remains top-down so the generated rays match standalone PrismRT.
                         const unsigned int bufferY = height - 1 - y;
@@ -4086,9 +4156,6 @@ void SceneBridge::Render()
                     }
                 }
             });
-        // A stop can arrive while TBB is completing the current tiles.  Keep
-        // the previous coherent frame instead of publishing that partial pass.
-        if (_impl->renderThread->IsStopRequested()) return;
         for (HdRenderPassAovBinding const &binding : bindings) {
             // Geometric AOVs are deterministic and only written on sample 0.
             // Color changes every pass as accumulation progresses.
@@ -4100,7 +4167,10 @@ void SceneBridge::Render()
             std::lock_guard lock(_impl->mutex);
             _impl->lastPublishedFrame = frame;
         }
+        _impl->committedRngStates.swap(rngStates);
         _impl->samples.store(static_cast<uint64_t>(sample + 1));
+        if (sample == 0)
+            std::vector<std::optional<RayHit>>().swap(passPrimary);
     }
     for (HdRenderPassAovBinding const &binding : bindings)
         if (auto *buffer = dynamic_cast<PrismRenderBuffer *>(binding.renderBuffer))

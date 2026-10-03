@@ -72,6 +72,7 @@ public:
                   size_t components);
     void SetConverged(bool value) { _converged.store(value); }
     void ResetSamples();
+    uint64_t GetAllocationRevision() const { return _allocationRevision.load(); }
     uint64_t GetWriteNanoseconds() const { return _writeNanoseconds.load(); }
     // Rendering workers measure a complete tile locally and update this
     // counter once per tile.  This keeps profiling out of the per-pixel fast
@@ -109,6 +110,7 @@ private:
     mutable std::recursive_mutex _mutex;
     std::atomic<int> _mappers{0};
     std::atomic<bool> _converged{false};
+    std::atomic<uint64_t> _allocationRevision{0};
     std::atomic<uint64_t> _writeNanoseconds{0};
     std::atomic<uint64_t> _publishNanoseconds{0};
     std::atomic<uint64_t> _mapWaitNanoseconds{0};

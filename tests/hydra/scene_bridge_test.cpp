@@ -1278,6 +1278,97 @@ int main()
         std::vector<float> const initialColors = ReadBuffer<float>(&colorBuffer);
         std::vector<float> const normals = ReadBuffer<float>(&normalBuffer);
         std::vector<float> const depths = ReadBuffer<float>(&depthBuffer);
+        PrismRenderBuffer secondColor(SdfPath("/SecondColor"), &thread);
+        secondColor.Allocate(GfVec3i(resolution, resolution, 1), HdFormatFloat32Vec4, false);
+        aovs.push_back(binding(HdAovTokens->color, &secondColor, VtValue(GfVec4f(0))));
+        auto finishSamples = [&](int count, bool restart) {
+            renderSettings.samples = count;
+            bridge.SetSettings(renderSettings);
+            if (restart) bridge.RestartAccumulation();
+            PumpPrepare(bridge, camera, aovs, geometryTags, resolution, resolution);
+            thread.StartRender();
+            ok &= Check(WaitFor([&] { return bridge.IsConverged(); }),
+                "sample continuation did not converge");
+            thread.StopRender();
+            return ReadBuffer<float>(&colorBuffer);
+        };
+        auto const uninterrupted128 = finishSamples(128, true);
+        auto const uninterruptedSecond128 = ReadBuffer<float>(&secondColor);
+        finishSamples(64, true);
+        const auto beforeContinuation = bridge.GetStats();
+        auto const continued128 = finishSamples(128, false);
+        auto const continuationFrame = colorBuffer.Capture().frame;
+        ok &= Check(continuationFrame &&
+            continuationFrame == primBuffer.Capture().frame &&
+            continuationFrame == depthBuffer.Capture().frame &&
+            continuationFrame == secondColor.Capture().frame,
+            "continuation broke coherent AOV frame identity for selection");
+        ok &= Check(continued128 == uninterrupted128 &&
+            ReadBuffer<float>(&secondColor) == uninterruptedSecond128 &&
+            continued128 == uninterruptedSecond128 &&
+            Stat(bridge.GetStats(), "completedSamples") == 128 &&
+            Stat(bridge.GetStats(), "previewPublishes") ==
+                Stat(beforeContinuation, "previewPublishes") &&
+            Stat(bridge.GetStats(), "snapshotBuilds") == buildsBeforeRestart,
+            "64-to-128 continuation changed pixels, repeated preview, or rebuilt scene");
+        renderSettings.previewTargetMs += 1;
+        renderSettings.previewMaxDimension += 1;
+        renderSettings.refinementDelayMs = 2;
+        renderSettings.adaptivePreview = !renderSettings.adaptivePreview;
+        bridge.SetSettings(renderSettings);
+        PumpPrepare(bridge, camera, aovs, geometryTags, resolution, resolution);
+        ok &= Check(Stat(bridge.GetStats(), "completedSamples") == 128 &&
+            bridge.IsConverged() && ReadBuffer<float>(&colorBuffer) == uninterrupted128,
+            "preview controls reset a converged accumulation");
+        renderSettings.refinementDelayMs = 0;
+
+        renderSettings.samples = 1000000;
+        bridge.SetSettings(renderSettings);
+        bridge.RestartAccumulation();
+        PumpPrepare(bridge, camera, aovs, geometryTags, resolution, resolution);
+        thread.StartRender();
+        ok &= Check(WaitFor([&] {
+            return Stat(bridge.GetStats(), "completedSamples") > 0;
+        }), "interrupted continuation did not start");
+        // Lowering the budget during rendering must quiesce the staged pass.
+        renderSettings.samples = 1;
+        bridge.SetSettings(renderSettings);
+        const int committedAtLowering = static_cast<int>(
+            Stat(bridge.GetStats(), "completedSamples"));
+        auto const committedPixels = ReadBuffer<float>(&colorBuffer);
+        finishSamples(1, false);
+        ok &= Check(Stat(bridge.GetStats(), "completedSamples") == committedAtLowering &&
+            ReadBuffer<float>(&colorBuffer) == committedPixels,
+            "lowered in-flight budget committed additional samples");
+        auto const resumed = finishSamples(committedAtLowering + 3, false);
+        auto const fresh = finishSamples(committedAtLowering + 3, true);
+        ok &= Check(resumed == fresh,
+            "interrupted pass advanced RNG or contaminated accumulation");
+
+        const auto allocationBefore = colorBuffer.GetAllocationRevision();
+        colorBuffer.Allocate(GfVec3i(resolution, resolution, 1), HdFormatFloat32Vec4, false);
+        PumpPrepare(bridge, camera, aovs, geometryTags, resolution, resolution);
+        ok &= Check(colorBuffer.GetAllocationRevision() > allocationBefore &&
+            Stat(bridge.GetStats(), "completedSamples") == 0,
+            "same-size allocation did not reset accumulation identity");
+        auto const reallocated = finishSamples(1, false);
+        ok &= Check(reallocated == initialColors,
+            "same-size reallocation reused stale RNG or accumulation");
+        PrismRenderBuffer replacementColor(SdfPath("/ReplacementColor"), &thread);
+        replacementColor.Allocate(GfVec3i(resolution, resolution, 1), HdFormatFloat32Vec4, false);
+        auto originalColorBinding = aovs.front();
+        aovs.front().renderBuffer = &replacementColor;
+        PumpPrepare(bridge, camera, aovs, geometryTags, resolution, resolution);
+        ok &= Check(Stat(bridge.GetStats(), "completedSamples") == 0,
+            "replacement buffer did not reset accumulation identity");
+        thread.StartRender();
+        ok &= Check(WaitFor([&] { return bridge.IsConverged(); }),
+            "replacement buffer did not render");
+        thread.StopRender();
+        ok &= Check(ReadBuffer<float>(&replacementColor) == initialColors,
+            "replacement buffer did not begin at the original first sample");
+        aovs.front() = originalColorBinding;
+        finishSamples(1, false);
         bool foundInstance0 = false, foundInstance1 = false;
         bool validAovs = true;
         bool rotatedNormal = false, mirroredNormal = false;
