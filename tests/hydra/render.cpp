@@ -11,7 +11,10 @@
 #include <chrono>
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <filesystem>
 #include <iostream>
+#include <memory>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -19,9 +22,10 @@
 PXR_NAMESPACE_USING_DIRECTIVE
 
 namespace {
-void render(UsdImagingGLEngine& engine, const UsdStageRefPtr& stage) {
+void render(UsdImagingGLEngine& engine, const UsdStageRefPtr& stage,
+            UsdTimeCode frame = UsdTimeCode::Default()) {
     UsdImagingGLRenderParams params;
-    params.frame = UsdTimeCode::Default();
+    params.frame = frame;
     params.enableSceneMaterials = true;
     params.enableSceneLights = true;
     const auto start = std::chrono::steady_clock::now();
@@ -31,6 +35,128 @@ void render(UsdImagingGLEngine& engine, const UsdStageRefPtr& stage) {
             throw std::runtime_error("Hydra failed to converge within five minutes");
         if (!engine.IsConverged()) std::this_thread::sleep_for(std::chrono::milliseconds(10));
     } while (!engine.IsConverged());
+}
+
+std::vector<float> pixels(UsdImagingGLEngine& engine, int width, int height);
+
+std::unique_ptr<UsdImagingGLEngine> makeAnimationEngine(
+    const UsdStageRefPtr& stage, const std::string& cameraPath,
+    int width, int height, int spp) {
+    UsdImagingGLEngine::Parameters parameters;
+    parameters.gpuEnabled = false;
+    parameters.rendererPluginId = TfToken("HdPrismRendererPlugin");
+    auto engine = std::make_unique<UsdImagingGLEngine>(parameters);
+    if (engine->GetCurrentRendererId() != parameters.rendererPluginId)
+        throw std::runtime_error("PrismRT plugin not loaded; check PXR_PLUGINPATH_NAME and DLL paths");
+    engine->SetCameraPath(SdfPath(cameraPath));
+    engine->SetRenderViewport(GfVec4d(0, 0, width, height));
+    engine->SetRendererSetting(TfToken("prism:samplesPerPixel"), VtValue(spp));
+    engine->SetRendererSetting(TfToken("prism:maxDepth"), VtValue(8));
+    engine->SetRendererSetting(TfToken("prism:rrMinDepth"), VtValue(2));
+    engine->SetRendererSetting(TfToken("prism:seed"), VtValue(17));
+    engine->SetEnablePresentation(false);
+    return engine;
+}
+
+int64_t statInt64(UsdImagingGLEngine& engine, const char* name) {
+    const VtDictionary stats = engine.GetRenderStats();
+    const auto found = stats.find(name);
+    if (found == stats.end() || !found->second.IsHolding<int64_t>())
+        throw std::runtime_error(std::string("Missing integer render stat: ") + name);
+    return found->second.UncheckedGet<int64_t>();
+}
+
+std::vector<float> renderFreshAt(
+    const std::string& scenePath, const std::string& cameraPath,
+    int width, int height, int spp, double frame) {
+    auto stage = UsdStage::Open(scenePath);
+    if (!stage) throw std::runtime_error("Cannot reopen animated USD scene");
+    auto engine = makeAnimationEngine(stage, cameraPath, width, height, spp);
+    render(*engine, stage, UsdTimeCode(frame));
+    return pixels(*engine, width, height);
+}
+
+void runAnimationExercise(const std::string& scenePath,
+                          const std::string& cameraPath,
+                          int width, int height, int spp) {
+    const int animationSpp = std::min(spp, 16);
+    auto stage = UsdStage::Open(scenePath);
+    if (!stage) throw std::runtime_error("Cannot open animated USD scene");
+    auto engine = makeAnimationEngine(
+        stage, cameraPath, width, height, animationSpp);
+    render(*engine, stage, UsdTimeCode(1.0));
+    const auto frame1 = pixels(*engine, width, height);
+    const int64_t buildsAfterFrame1 = statInt64(*engine, "snapshotBuilds");
+    const int64_t conservativeAfterFrame1 =
+        statInt64(*engine, "conservativeRebuilds");
+    render(*engine, stage, UsdTimeCode(2.0));
+    const auto frame2 = pixels(*engine, width, height);
+    if (frame1 == frame2)
+        throw std::runtime_error("Animated fixture did not change the rendered image");
+    if (frame2 != renderFreshAt(scenePath, cameraPath, width, height,
+                                animationSpp, 2.0))
+        throw std::runtime_error("Frame 2 differs from a fresh renderer at frame 2");
+    if (frame1 != renderFreshAt(scenePath, cameraPath, width, height,
+                                animationSpp, 1.0))
+        throw std::runtime_error("Frame 1 differs from a fresh renderer at frame 1");
+
+    const int64_t buildsAfterFrame2 = statInt64(*engine, "snapshotBuilds");
+    const int64_t conservativeAfterFrame2 =
+        statInt64(*engine, "conservativeRebuilds");
+    const bool animatedRebuilt = buildsAfterFrame2 != buildsAfterFrame1 ||
+        conservativeAfterFrame2 != conservativeAfterFrame1;
+    std::cout << "Animated counters: snapshotBuilds " << buildsAfterFrame1
+              << " -> " << buildsAfterFrame2 << ", conservativeRebuilds "
+              << conservativeAfterFrame1 << " -> "
+              << conservativeAfterFrame2 << '\n';
+
+    const auto xformPath = std::filesystem::path(scenePath).parent_path() /
+        "animated_xform.usda";
+    auto xformStage = UsdStage::Open(xformPath.string());
+    if (!xformStage) throw std::runtime_error("Cannot open xform-only fixture");
+    auto xformEngine = makeAnimationEngine(
+        xformStage, cameraPath, width, height, animationSpp);
+    render(*xformEngine, xformStage, UsdTimeCode(1.0));
+    const auto xformFrame1 = pixels(*xformEngine, width, height);
+    const int64_t xformBuilds = statInt64(*xformEngine, "snapshotBuilds");
+    const int64_t xformConservative =
+        statInt64(*xformEngine, "conservativeRebuilds");
+    const int64_t placementsBefore = statInt64(*xformEngine, "placementInvalidations");
+    const int64_t prototypesBefore = statInt64(*xformEngine, "prototypeInvalidations");
+    const int64_t materialsBefore = statInt64(*xformEngine, "materialInvalidations");
+    const int64_t environmentsBefore = statInt64(*xformEngine, "environmentInvalidations");
+    render(*xformEngine, xformStage, UsdTimeCode(2.0));
+    if (pixels(*xformEngine, width, height) == xformFrame1)
+        throw std::runtime_error("Xform-only animation did not change the image");
+    const auto xformFrame2 = pixels(*xformEngine, width, height);
+    if (xformFrame2 != renderFreshAt(xformPath.string(), cameraPath, width,
+                                     height, animationSpp, 2.0) ||
+        xformFrame1 != renderFreshAt(xformPath.string(), cameraPath, width,
+                                     height, animationSpp, 1.0))
+        throw std::runtime_error(
+            "Xform-only frame differs from its fresh-render reference");
+    const int64_t xformBuildsAfter = statInt64(*xformEngine, "snapshotBuilds");
+    const int64_t xformConservativeAfter =
+        statInt64(*xformEngine, "conservativeRebuilds");
+    const int64_t placementsAfter = statInt64(*xformEngine, "placementInvalidations");
+    const int64_t prototypesAfter = statInt64(*xformEngine, "prototypeInvalidations");
+    const int64_t materialsAfter = statInt64(*xformEngine, "materialInvalidations");
+    const int64_t environmentsAfter = statInt64(*xformEngine, "environmentInvalidations");
+    std::cout << "Xform-only counters: snapshotBuilds " << xformBuilds
+              << " -> " << xformBuildsAfter << ", conservativeRebuilds "
+              << xformConservative << " -> " << xformConservativeAfter << '\n';
+    std::cout << "Xform-only invalidations: placement " << placementsBefore
+              << " -> " << placementsAfter << ", prototype " << prototypesBefore
+              << " -> " << prototypesAfter << ", material " << materialsBefore
+              << " -> " << materialsAfter << ", environment "
+              << environmentsBefore << " -> " << environmentsAfter << '\n';
+    if (animatedRebuilt || xformBuildsAfter != xformBuilds ||
+        xformConservativeAfter != xformConservative ||
+        placementsAfter <= placementsBefore ||
+        prototypesAfter != prototypesBefore || materialsAfter != materialsBefore ||
+        environmentsAfter != environmentsBefore)
+        throw std::runtime_error(
+            "Timeline change caused a conservative scene rebuild");
 }
 
 std::vector<float> pixels(UsdImagingGLEngine& engine, int width, int height) {
@@ -84,13 +210,14 @@ void checkFixtureAovs(UsdImagingGLEngine& engine) {
 int main(int argc, char** argv) {
     try {
         if (argc < 4) {
-            std::cerr << "usage: prism_hydra_render scene.usda /Camera output.exr [width height spp [--exercise] [--environment-sampling mis|bsdf] [--sample-clamp N] [--seed N] [--sphere-batching]]\n";
+            std::cerr << "usage: prism_hydra_render scene.usda /Camera output.exr [width height spp [--exercise] [--animation-exercise] [--environment-sampling mis|bsdf] [--sample-clamp N] [--seed N] [--sphere-batching]]\n";
             return 2;
         }
         const int width = argc > 4 ? std::stoi(argv[4]) : 128;
         const int height = argc > 5 ? std::stoi(argv[5]) : 128;
         const int spp = argc > 6 ? std::stoi(argv[6]) : 64;
         bool exercise = false;
+        bool animationExercise = false;
         bool sphereBatching = false;
         std::string sampling = "mis";
         std::string filtering = "filtered";
@@ -99,6 +226,7 @@ int main(int argc, char** argv) {
         for (int i = 7; i < argc; ++i) {
             const std::string option(argv[i]);
             if (option == "--exercise") { exercise = true; continue; }
+            if (option == "--animation-exercise") { animationExercise = true; continue; }
             if (option == "--sphere-batching") { sphereBatching = true; continue; }
             if (++i >= argc) throw std::runtime_error("Missing option value: " + option);
             if (option == "--environment-sampling") sampling = argv[i];
@@ -137,6 +265,11 @@ int main(int argc, char** argv) {
             HdAovTokens->cameraDepth, HdAovTokens->normal, HdAovTokens->Neye,
             HdAovTokens->primId, HdAovTokens->instanceId, HdAovTokens->elementId});
         engine.SetEnablePresentation(false);
+        if (animationExercise) {
+            runAnimationExercise(argv[1], argv[2], width, height, spp);
+            std::cout << "Hydra animation exercise passed\n";
+            return 0;
+        }
         render(engine, stage);
         for (const auto& [name,value] : engine.GetRenderStats())
             std::cout << "Render stat " << name << ": " << value << '\n';

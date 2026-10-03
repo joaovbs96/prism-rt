@@ -479,17 +479,12 @@ void PrismTaskDelegate::PrimsDirtied(HdSceneIndexBase const &sender,
             }
         }
         if (selectionOnly) continue;
+        // Timeline changes arrive as root sceneGlobals notices as well as
+        // per-prim notices for animated data. The renderer captures sampled
+        // values from those prims, so the root notice must not force a global
+        // scene recapture and cancel that targeted work.
         if (entry.primPath == SdfPath::AbsoluteRootPath() &&
-            prim.primType.IsEmpty()) {
-            bool currentFrameChanged = false;
-            for (const HdDataSourceLocator &locator : entry.dirtyLocators) {
-                if (locator.GetString() == "sceneGlobals/currentFrame") {
-                    currentFrameChanged = true;
-                    break;
-                }
-            }
-            if (!currentFrameChanged) continue;
-        }
+            prim.primType.IsEmpty()) continue;
         if (_NeedsSceneRebuild(prim)) {
             sceneChanged = true;
             if (_bridge) {
