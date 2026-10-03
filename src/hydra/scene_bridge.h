@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -49,6 +50,12 @@ enum class SceneDirtyKind : unsigned int {
     Environment = 1u << 3,
     Structure = 1u << 4,
     Unknown = 1u << 5
+};
+
+struct SceneDirtyNotice {
+    SceneDirtyKind kind = SceneDirtyKind::Unknown;
+    pxr::SdfPathVector paths;
+    std::string reason;
 };
 
 struct CameraState {
@@ -95,6 +102,7 @@ public:
     void MarkSceneDirty();
     void MarkSceneDirty(SceneDirtyKind kind, pxr::SdfPath const &path = {});
     void MarkScenePathsDirty(SceneDirtyKind kind, pxr::SdfPathVector const &paths);
+    void MarkSceneDirtyBatch(std::vector<SceneDirtyNotice> const &notices);
     void RestartAccumulation();
     void SetSettings(RenderSettings const &settings);
     RenderSettings GetSettings() const;

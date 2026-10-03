@@ -9,6 +9,7 @@
 #include "../../src/hydra/scene_bridge.h"
 #include "../../src/hydra/render_buffer.h"
 #include "../../src/hydra/native_tasks.h"
+#include "../../src/hydra/task_delegate.h"
 #include "../../src/hydra/triangulation.h"
 #include "../../src/scene.h"
 
@@ -684,6 +685,161 @@ int main()
         if (activeBridge) activeBridge->Render();
     });
     thread.StartThread();
+    {
+        // Real retained-scene observer callbacks must batch every locator in
+        // one notice, including duplicate kinds and unrelated prim paths.
+        auto callbackScene = HdRetainedSceneIndex::New();
+        callbackScene->AddPrims({
+            {SdfPath("/Move"), HdPrimTypeTokens->mesh, FixtureMeshData(true)},
+            {SdfPath("/Paint"), HdPrimTypeTokens->mesh, FixtureMeshData(true)}});
+        PrismTaskDelegate delegate;
+        delegate.SetTerminalSceneIndex(callbackScene);
+        auto before = delegate.GetRenderStats();
+        callbackScene->DirtyPrims({
+            {SdfPath("/Move"), HdDataSourceLocatorSet{
+                HdDataSourceLocator(TfToken("xform"), TfToken("matrix")),
+                HdDataSourceLocator(TfToken("visibility"))}},
+            {SdfPath("/Paint"), HdDataSourceLocatorSet{
+                HdDataSourceLocator(TfToken("materialBindings"))}}});
+        auto after = delegate.GetRenderStats();
+        ok &= Check(Stat(after,"preparationGeneration") == Stat(before,"preparationGeneration") + 1 &&
+                    Stat(after,"placementInvalidations") == Stat(before,"placementInvalidations") + 1 &&
+                    Stat(after,"materialInvalidations") == Stat(before,"materialInvalidations") + 1,
+            "Dirty callback did not produce one generation and one invalidation per kind");
+        const int64_t generation = Stat(after,"preparationGeneration");
+        callbackScene->DirtyPrims({});
+        ok &= Check(Stat(delegate.GetRenderStats(),"preparationGeneration") == generation,
+            "Empty dirty callback invalidated the scene");
+        callbackScene->DirtyPrims({{SdfPath("/Paint"), HdDataSourceLocatorSet{
+            HdDataSourceLocator(TfToken("unhandled"), TfToken("value"))}}});
+        auto const unknown = delegate.GetRenderStats()["lastRebuildReason"];
+        ok &= Check(unknown.IsHolding<std::string>() &&
+            unknown.UncheckedGet<std::string>().find("/Paint: unhandled/value") != std::string::npos,
+            "Unknown locator diagnostic lost prim path or locator");
+    }
+    {
+        auto mixedScene = HdRetainedSceneIndex::New();
+        mixedScene->AddPrims({
+            {SdfPath("/Move"), HdPrimTypeTokens->sphere, FixtureSphereData(0.5)},
+            {SdfPath("/Paint"), HdPrimTypeTokens->mesh, FixtureMeshData(true)}});
+        prism::hydra::SceneBridge bridge(mixedScene, &thread);
+        activeBridge = &bridge;
+        prism::hydra::CameraState camera;
+        const TfTokenVector tags{HdRenderTagTokens->geometry};
+        auto dirtyMixed = [&] {
+            bridge.MarkSceneDirtyBatch({
+                {prism::hydra::SceneDirtyKind::Placement, {SdfPath("/Move")}, {}},
+                {prism::hydra::SceneDirtyKind::Material, {SdfPath("/Paint")}, {}}});
+        };
+        // No inactive bank exists yet: per-kind capture paths still must be
+        // derived from the journal rather than sharing its path union.
+        dirtyMixed();
+        ok &= Check(PumpPrepare(bridge,camera,{},tags,32,32),
+            "Initial mixed notice prepare failed");
+        auto const bankDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+        while (Stat(bridge.GetStats(),"retainedSnapshotCount") < 2 &&
+               std::chrono::steady_clock::now() < bankDeadline) {
+            bridge.Prepare(camera,{},tags,32,32);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        ok &= Check(Stat(bridge.GetStats(),"retainedSnapshotCount") == 2,
+            "Mixed notice test did not obtain an inactive bank");
+        auto stats = bridge.GetStats();
+        ok &= Check(Stat(stats,"lastPlacementDirtyPathCount") == 1 &&
+                    Stat(stats,"lastMaterialDirtyPathCount") == 1 &&
+                    Stat(stats,"lastPrototypeDirtyPathCount") == 0,
+            "Missing-bank capture shared paths between dirty kinds");
+        const int64_t fullBuilds = Stat(stats,"snapshotBuilds");
+        for (int edit=1; edit<=2; ++edit) {
+            mixedScene->AddPrims({
+                {SdfPath("/Move"), HdPrimTypeTokens->sphere,
+                    FixtureSphereData(0.5,GfVec3d(edit,0,0))},
+                {SdfPath("/Paint"), HdPrimTypeTokens->mesh,
+                    FixtureMeshData(true,HdRenderTagTokens->geometry,GfVec3f(0.1f*edit))}});
+            dirtyMixed();
+            ok &= Check(PumpPrepare(bridge,camera,{},tags,32,32),
+                "Mixed notice bank replay failed");
+            stats = bridge.GetStats();
+            ok &= Check(Stat(stats,"snapshotBuilds") == fullBuilds &&
+                        Stat(stats,"lastPlacementDirtyPathCount") == 1 &&
+                        Stat(stats,"lastMaterialDirtyPathCount") == 1 &&
+                        Stat(stats,"lastPlacementRecordsVisited") == 1 &&
+                        Stat(stats,"materialPrototypesVisited") == 1,
+                "Mixed notice replay visited unrelated placement or material paths");
+        }
+        activeBridge = nullptr;
+    }
+    {
+        // A global placement notice must recapture transforms even when the
+        // same batch also supplies a local material path.
+        auto globalScene = HdRetainedSceneIndex::New();
+        auto paint = [&] (float value) {
+            return HdOverlayContainerDataSource::New(
+                FixtureXformData(GfVec3d(10,0,0)),
+                FixtureMeshData(true,HdRenderTagTokens->geometry,GfVec3f(value)));
+        };
+        globalScene->AddPrims({
+            {SdfPath("/Move"),HdPrimTypeTokens->sphere,
+                FixtureSphereData(0.45,GfVec3d(-1,0,0))},
+            {SdfPath("/Paint"),HdPrimTypeTokens->mesh,paint(0.5f)}});
+        prism::hydra::SceneBridge bridge(globalScene,&thread);
+        activeBridge = &bridge;
+        auto settings = bridge.GetSettings();
+        settings.samples = 1;
+        settings.maxDepth = 1;
+        settings.adaptivePreview = false;
+        settings.refinementDelayMs = 0;
+        bridge.SetSettings(settings);
+        prism::hydra::CameraState camera;
+        camera.orthographic = true;
+        camera.worldToView.SetTranslate(GfVec3d(0,0,-5));
+        GfFrustum frustum;
+        frustum.SetOrthographic(-2,2,-1,1,0.1,20);
+        camera.projection = frustum.ComputeProjectionMatrix();
+        camera.nearClip = 0.1f;
+        camera.farClip = 20;
+        PrismRenderBuffer ids(SdfPath("/GlobalIds"),&thread);
+        settings.sphereBatching = true;
+        bridge.SetSettings(settings);
+        ids.Allocate(GfVec3i(2,1,1),HdFormatInt32,false);
+        HdRenderPassAovBinding binding;
+        binding.aovName = HdAovTokens->primId;
+        binding.renderBuffer = &ids;
+        binding.clearValue = VtValue(-1);
+        HdRenderPassAovBindingVector bindings{binding};
+        TfTokenVector tags{HdRenderTagTokens->geometry};
+        auto renderIds = [&] {
+            ok &= Check(PumpPrepare(bridge,camera,bindings,tags,2,1),
+                "Global notice scene did not prepare");
+            thread.StartRender();
+            auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+            while (!bridge.IsConverged() && std::chrono::steady_clock::now() < deadline)
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            thread.StopRender();
+            return ReadBuffer<int>(&ids);
+        };
+        auto initial = renderIds();
+        ok &= Check(initial.size()==2 && initial[0]>=0 && initial[1]==-1,
+            "Global notice fixture did not start on the left pixel");
+        globalScene->AddPrims({
+            {SdfPath("/Move"),HdPrimTypeTokens->sphere,
+                FixtureSphereData(0.45,GfVec3d(1,0,0))},
+            {SdfPath("/Paint"),HdPrimTypeTokens->mesh,paint(0.7f)}});
+        bridge.MarkSceneDirtyBatch({
+            {prism::hydra::SceneDirtyKind::Placement,{},{}},
+            {prism::hydra::SceneDirtyKind::Material,{SdfPath("/Paint")},{}}});
+        auto moved = renderIds();
+        ok &= Check(moved.size()==2 && moved[0]==-1 && moved[1]>=0 &&
+                    Stat(bridge.GetStats(),"capturedPrims") >= 3,
+            "Global placement plus local material reused a stale transform capture");
+        globalScene->AddPrims({{SdfPath("/Move"),HdPrimTypeTokens->sphere,
+            FixtureSphereData(0.45,GfVec3d(-1,0,0))}});
+        bridge.MarkScenePathsDirty(prism::hydra::SceneDirtyKind::Placement,{});
+        auto restored = renderIds();
+        ok &= Check(restored.size()==2 && restored[0]>=0 && restored[1]==-1,
+            "Empty-path placement wrapper failed to recapture live transforms");
+        activeBridge = nullptr;
+    }
     {
         PrismRenderBuffer buffer(SdfPath("/PublishedColor"), &thread);
         ok &= Check(buffer.Allocate(GfVec3i(2, 1, 1),

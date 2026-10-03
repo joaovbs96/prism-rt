@@ -65,6 +65,7 @@
 #include <functional>
 #include <future>
 #include <limits>
+#include <map>
 #include <deque>
 #include <shared_mutex>
 #include <thread>
@@ -2980,6 +2981,9 @@ public:
     uint64_t cameraRevision = 0;
     std::deque<DirtyRecord> dirtyJournal;
     uint64_t captureGeneration = 0;
+    size_t lastPlacementDirtyPathCount = 0;
+    size_t lastPrototypeDirtyPathCount = 0;
+    size_t lastMaterialDirtyPathCount = 0;
     bool captureActive = false;
     HdRetainedSceneIndexRefPtr captureScene;
     HdRetainedSceneIndexRefPtr retainedSceneCache;
@@ -2991,6 +2995,7 @@ public:
     std::unordered_map<SdfPath, StaticPrimRecord, SdfPath::Hash> staticPrims;
     bool staticPrimsComplete = false;
     bool captureFull = true;
+    bool dirtyAllPaths = false;
     TfTokenVector captureRenderTags;
     unsigned int captureDirtyKinds = 0;
     std::unordered_set<SdfPath, SdfPath::Hash> captureDirtyPaths;
@@ -3069,41 +3074,66 @@ void SceneBridge::MarkSceneDirty(SceneDirtyKind kind, SdfPath const &path)
 
 void SceneBridge::MarkScenePathsDirty(SceneDirtyKind kind, SdfPathVector const &paths)
 {
+    MarkSceneDirtyBatch({{kind, paths, {}}});
+}
+
+void SceneBridge::MarkSceneDirtyBatch(std::vector<SceneDirtyNotice> const &notices)
+{
+    if (notices.empty()) return;
+    struct Group {
+        std::unordered_set<SdfPath, SdfPath::Hash> paths;
+        bool allPaths = false;
+        std::string reason;
+    };
+    std::map<SceneDirtyKind, Group> groups;
+    for (auto const &notice : notices) {
+        auto &group = groups[notice.kind];
+        group.allPaths |= notice.paths.empty();
+        group.paths.insert(notice.paths.begin(), notice.paths.end());
+        if (group.reason.empty())
+            group.reason = !notice.reason.empty() ? notice.reason :
+                (notice.paths.empty() ? "unknown dirty locator" :
+                                       notice.paths.front().GetString());
+    }
     _impl->renderThread->StopRender();
     std::lock_guard lock(_impl->mutex);
     if (_impl->buildCancel)
         _impl->buildCancel->store(true, std::memory_order_relaxed);
     _impl->sceneDirty = true;
     ++_impl->requestedGeneration;
-    SceneBridge::Impl::DirtyRecord record;
-    record.generation = _impl->requestedGeneration;
-    record.kinds = static_cast<unsigned int>(kind);
-    record.paths.insert(paths.begin(), paths.end());
-    _impl->dirtyJournal.push_back(std::move(record));
-    _impl->dirtyKinds |= static_cast<unsigned int>(kind);
-    _impl->dirtyPaths.insert(paths.begin(), paths.end());
-    switch (kind) {
-    case SceneDirtyKind::Placement: ++_impl->placementInvalidations; break;
-    case SceneDirtyKind::Prototype: ++_impl->prototypeInvalidations; break;
-    case SceneDirtyKind::Material: ++_impl->materialInvalidations; break;
-    case SceneDirtyKind::Environment: ++_impl->environmentInvalidations; break;
-    default: ++_impl->conservativeRebuilds; break;
-    }
-    _impl->lastRebuildReason = paths.empty()
-        ? "unknown dirty locator" : paths.front().GetString();
-    if (_impl->snapshot && _impl->materialService) {
-        // Structural edits retain immutable graph/program caches. Only paths
-        // actually affected by a notice lose their association shortcut.
-        if (kind == SceneDirtyKind::Material) {
-            if (paths.empty()) _impl->materialService->InvalidateAssociations({}, true);
-            for (auto const& path : paths)
-                _impl->materialService->InvalidateResources(path, true);
-        } else if (kind == SceneDirtyKind::Structure || kind == SceneDirtyKind::Unknown) {
-            if (paths.empty()) _impl->materialService->InvalidateAssociations({}, true);
-            for (auto const& path : paths)
-                _impl->materialService->InvalidateAssociations(path, true);
+    for (auto &[kind, group] : groups) {
+        if (group.allPaths) group.paths.clear();
+        _impl->dirtyAllPaths |= group.allPaths;
+        _impl->dirtyJournal.push_back({_impl->requestedGeneration,
+            static_cast<unsigned int>(kind), group.paths});
+        _impl->dirtyKinds |= static_cast<unsigned int>(kind);
+        _impl->dirtyPaths.insert(group.paths.begin(), group.paths.end());
+        switch (kind) {
+        case SceneDirtyKind::Placement: ++_impl->placementInvalidations; break;
+        case SceneDirtyKind::Prototype: ++_impl->prototypeInvalidations; break;
+        case SceneDirtyKind::Material: ++_impl->materialInvalidations; break;
+        case SceneDirtyKind::Environment: ++_impl->environmentInvalidations; break;
+        default: ++_impl->conservativeRebuilds; break;
+        }
+        if (_impl->snapshot && _impl->materialService) {
+            // Keep resource invalidation attached to its own dirty kind.
+            if (kind == SceneDirtyKind::Material) {
+                if (group.paths.empty())
+                    _impl->materialService->InvalidateAssociations({}, true);
+                for (auto const &path : group.paths)
+                    _impl->materialService->InvalidateResources(path, true);
+            } else if (kind == SceneDirtyKind::Structure || kind == SceneDirtyKind::Unknown) {
+                if (group.paths.empty())
+                    _impl->materialService->InvalidateAssociations({}, true);
+                for (auto const &path : group.paths)
+                    _impl->materialService->InvalidateAssociations(path, true);
+            }
         }
     }
+    auto reason = groups.find(SceneDirtyKind::Unknown);
+    if (reason == groups.end()) reason = groups.find(SceneDirtyKind::Structure);
+    if (reason == groups.end()) reason = groups.begin();
+    _impl->lastRebuildReason = reason->second.reason;
     _converged.store(false);
 }
 
@@ -3426,6 +3456,7 @@ bool SceneBridge::Prepare(CameraState const &camera,
                 static_cast<unsigned int>(SceneDirtyKind::Structure) |
                 static_cast<unsigned int>(SceneDirtyKind::Unknown);
             _impl->captureFull = !_impl->staticPrimsComplete ||
+                _impl->dirtyAllPaths ||
                 (_impl->dirtyKinds & unsafeCapture) != 0;
             if (_impl->captureFull) {
                 _impl->captureScene = HdRetainedSceneIndex::New();
@@ -3507,15 +3538,7 @@ bool SceneBridge::Prepare(CameraState const &camera,
             RenderSettings jobSettings = _impl->settings;
             unsigned int jobDirtyKinds = _impl->captureDirtyKinds;
             auto jobDirtyPaths = _impl->captureDirtyPaths;
-            auto jobPlacementPaths =
-                (jobDirtyKinds & static_cast<unsigned int>(SceneDirtyKind::Placement))
-                    ? jobDirtyPaths : decltype(jobDirtyPaths){};
-            auto jobPrototypePaths =
-                (jobDirtyKinds & static_cast<unsigned int>(SceneDirtyKind::Prototype))
-                    ? jobDirtyPaths : decltype(jobDirtyPaths){};
-            auto jobMaterialPaths =
-                (jobDirtyKinds & static_cast<unsigned int>(SceneDirtyKind::Material))
-                    ? jobDirtyPaths : decltype(jobDirtyPaths){};
+            decltype(jobDirtyPaths) jobPlacementPaths, jobPrototypePaths, jobMaterialPaths;
             ArResolverContext resolverContext = _impl->captureResolverContext;
             RTCDevice device = _impl->device;
             std::shared_ptr<PrototypePool> prototypePool =
@@ -3523,32 +3546,64 @@ bool SceneBridge::Prepare(CameraState const &camera,
             std::shared_ptr<Snapshot> bank = std::move(
                 _impl->inactiveSnapshot);
             const uint64_t bankGeneration = _impl->inactiveGeneration;
-            if (bank) {
+            {
+                // Even without a bank, each kind must keep its own paths.
+                // With a bank, replay every generation it has not yet seen.
+                const uint64_t replayAfter = bank ? bankGeneration : _impl->activeGeneration;
                 jobDirtyKinds = 0;
                 jobDirtyPaths.clear();
                 jobPlacementPaths.clear();
                 jobPrototypePaths.clear();
                 jobMaterialPaths.clear();
+                bool allPlacements = false, allPrototypes = false, allMaterials = false;
                 for (auto const &record : _impl->dirtyJournal) {
-                    if (record.generation <= bankGeneration ||
+                    if (record.generation <= replayAfter ||
                         record.generation > generation) continue;
                     jobDirtyKinds |= record.kinds;
                     jobDirtyPaths.insert(
                         record.paths.begin(), record.paths.end());
                     if (record.kinds & static_cast<unsigned int>(
-                            SceneDirtyKind::Placement))
+                            SceneDirtyKind::Placement)) {
+                        allPlacements |= record.paths.empty();
                         jobPlacementPaths.insert(
                             record.paths.begin(), record.paths.end());
+                    }
                     if (record.kinds & static_cast<unsigned int>(
-                            SceneDirtyKind::Prototype))
+                            SceneDirtyKind::Prototype)) {
+                        allPrototypes |= record.paths.empty();
                         jobPrototypePaths.insert(
                             record.paths.begin(), record.paths.end());
+                    }
                     if (record.kinds & static_cast<unsigned int>(
-                            SceneDirtyKind::Material))
+                            SceneDirtyKind::Material)) {
+                        allMaterials |= record.paths.empty();
                         jobMaterialPaths.insert(
                             record.paths.begin(), record.paths.end());
+                    }
                 }
+                if (allPlacements) jobPlacementPaths.clear();
+                if (allPrototypes) {
+                    // Prototype refresh interprets an empty set as no work,
+                    // so enumerate captured geometry plus old bank records.
+                    // Retaining old paths lets a now-unsupported prim drop
+                    // its stale prototype too.
+                    jobPrototypePaths.clear();
+                    for (auto const &[path, prim] : _impl->staticPrims)
+                        if (prim.primType == HdPrimTypeTokens->mesh ||
+                            prim.primType == HdPrimTypeTokens->sphere)
+                            jobPrototypePaths.insert(path);
+                    if (bank) {
+                        for (auto const &[path, prototype] : bank->prototypes)
+                            jobPrototypePaths.insert(path);
+                        for (auto const &[path, location] : bank->sphereBatchLocations)
+                            jobPrototypePaths.insert(path);
+                    }
+                }
+                if (allMaterials) jobMaterialPaths.clear();
             }
+            _impl->lastPlacementDirtyPathCount = jobPlacementPaths.size();
+            _impl->lastPrototypeDirtyPathCount = jobPrototypePaths.size();
+            _impl->lastMaterialDirtyPathCount = jobMaterialPaths.size();
             _impl->inactiveGeneration = 0;
             std::string mx = std::getenv("PRISM_MATERIALX_LIBRARY_PATH") ?
                 std::getenv("PRISM_MATERIALX_LIBRARY_PATH") : "";
@@ -3558,6 +3613,7 @@ bool SceneBridge::Prepare(CameraState const &camera,
             _impl->captureScene.Reset();
             _impl->sceneDirty = false;
             _impl->dirtyKinds = 0;
+            _impl->dirtyAllPaths = false;
             _impl->dirtyPaths.clear();
             _impl->buildingGeneration = generation;
             _impl->jobScene = retained;
@@ -3608,6 +3664,13 @@ bool SceneBridge::Prepare(CameraState const &camera,
                                 batchDirtyPaths = jobPrototypePaths;
                             batchDirtyPaths.insert(jobPlacementPaths.begin(),
                                                    jobPlacementPaths.end());
+                            if (jobPlacementPaths.empty() &&
+                                (jobDirtyKinds & static_cast<unsigned int>(
+                                    SceneDirtyKind::Placement)) != 0) {
+                                for (auto const &dependency :
+                                     bank->sphereBatchDependencies)
+                                    batchDirtyPaths.insert(dependency.first);
+                            }
                             std::unordered_set<SdfPath, SdfPath::Hash>
                                 handledBatchPaths;
                             if (!_RefreshSphereBatches(
@@ -4284,6 +4347,9 @@ VtDictionary SceneBridge::GetStats() const
         std::max<int64_t>(0, _impl->embreePeakBytes.load(
             std::memory_order_relaxed))));
     result["placementInvalidations"] = VtValue(static_cast<int64_t>(_impl->placementInvalidations));
+    result["lastPlacementDirtyPathCount"] = VtValue(static_cast<int64_t>(_impl->lastPlacementDirtyPathCount));
+    result["lastPrototypeDirtyPathCount"] = VtValue(static_cast<int64_t>(_impl->lastPrototypeDirtyPathCount));
+    result["lastMaterialDirtyPathCount"] = VtValue(static_cast<int64_t>(_impl->lastMaterialDirtyPathCount));
     result["prototypeInvalidations"] = VtValue(static_cast<int64_t>(_impl->prototypeInvalidations));
     result["materialInvalidations"] = VtValue(static_cast<int64_t>(_impl->materialInvalidations));
     result["environmentInvalidations"] = VtValue(static_cast<int64_t>(_impl->environmentInvalidations));

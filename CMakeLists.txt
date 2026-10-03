@@ -259,10 +259,14 @@ if(PRISM_BUILD_HYDRA)
             tests/hydra/scene_bridge_test.cpp
             src/hydra/scene_bridge.cpp
             src/hydra/materials.cpp
-            src/hydra/render_buffer.cpp)
+            src/hydra/render_buffer.cpp
+            src/hydra/task_delegate.cpp
+            src/hydra/render_pass.cpp
+            src/hydra/transport_filter.cpp
+            src/hydra/native_tasks.cpp)
         target_include_directories(prism_hydra_scene_bridge_test PRIVATE ${PXR_INCLUDE_DIRS})
         target_link_libraries(prism_hydra_scene_bridge_test PRIVATE
-            PrismRT::core hd ${PXR_LIBRARIES})
+            PrismRT::core hd hdx ${PXR_LIBRARIES})
         set_target_properties(prism_hydra_scene_bridge_test PROPERTIES
             RUNTIME_OUTPUT_DIRECTORY "$<1:${CMAKE_BINARY_DIR}/hydra/plugin>")
         add_test(NAME prism_hydra_scene_bridge_test COMMAND prism_hydra_scene_bridge_test)

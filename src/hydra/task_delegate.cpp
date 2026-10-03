@@ -444,7 +444,7 @@ void PrismTaskDelegate::PrimsRemoved(HdSceneIndexBase const &,
 void PrismTaskDelegate::PrimsDirtied(HdSceneIndexBase const &sender,
                                      DirtiedPrimEntries const &entries)
 {
-    bool sceneChanged = false;
+    std::vector<prism::hydra::SceneDirtyNotice> notices;
     for (const DirtiedPrimEntry &entry : entries) {
         const auto prim = sender.GetPrim(entry.primPath);
         bool selectionEncodingChanged = entry.dirtyLocators.IsEmpty();
@@ -486,7 +486,6 @@ void PrismTaskDelegate::PrimsDirtied(HdSceneIndexBase const &sender,
         if (entry.primPath == SdfPath::AbsoluteRootPath() &&
             prim.primType.IsEmpty()) continue;
         if (_NeedsSceneRebuild(prim)) {
-            sceneChanged = true;
             if (_bridge) {
                 bool marked = false;
                 for (const HdDataSourceLocator &locator : entry.dirtyLocators) {
@@ -506,15 +505,17 @@ void PrismTaskDelegate::PrimsDirtied(HdSceneIndexBase const &sender,
                         kind = prism::hydra::SceneDirtyKind::Prototype;
                     else if (text.rfind("materialBindings", 0) == 0)
                         kind = prism::hydra::SceneDirtyKind::Material;
-                    _bridge->MarkSceneDirty(kind, entry.primPath);
+                    notices.push_back({kind, {entry.primPath},
+                        entry.primPath.GetString() + ": " + text});
                     marked = true;
                 }
-                if (!marked) _bridge->MarkSceneDirty(
-                    prism::hydra::SceneDirtyKind::Unknown, entry.primPath);
+                if (!marked) notices.push_back({
+                    prism::hydra::SceneDirtyKind::Unknown, {entry.primPath},
+                    entry.primPath.GetString() + ": empty dirty locator set"});
             }
         }
     }
-    if (sceneChanged && _bridge && entries.empty()) _bridge->MarkSceneDirty();
+    if (_bridge) _bridge->MarkSceneDirtyBatch(notices);
 }
 
 void PrismTaskDelegate::PrimsRenamed(HdSceneIndexBase const &,
