@@ -342,7 +342,40 @@ struct InstanceLevel {
     int sourceIndex = -1;
     int ordinal = -1;
     int radix = 0;
+    int duplicateRank = 0;
+    bool operator==(InstanceLevel const &) const = default;
 };
+
+struct PlacementIdentityLevel {
+    SdfPath instancerPath;
+    int sourceIndex, duplicateRank;
+    bool operator==(PlacementIdentityLevel const &) const = default;
+};
+struct PlacementKey {
+    SdfPath prototypePath;
+    std::vector<PlacementIdentityLevel> chain;
+    bool operator==(PlacementKey const &) const = default;
+};
+struct PlacementKeyHash {
+    size_t operator()(PlacementKey const &key) const {
+        size_t value = SdfPath::Hash{}(key.prototypePath);
+        auto combine = [&](size_t part) {
+            value ^= part + size_t{0x9e3779b9} + (value << 6) + (value >> 2);
+        };
+        for (auto const &level : key.chain) {
+            combine(SdfPath::Hash{}(level.instancerPath));
+            combine(std::hash<int>{}(level.sourceIndex));
+            combine(std::hash<int>{}(level.duplicateRank));
+        }
+        return value;
+    }
+};
+PlacementKey _PlacementKey(SdfPath const &path, std::vector<InstanceLevel> const &chain) {
+    PlacementKey key{path, {}};
+    for (auto const &level : chain)
+        key.chain.push_back({level.instancerPath, level.sourceIndex, level.duplicateRank});
+    return key;
+}
 
 PrimvarData _Primvar(HdPrimvarsSchema const &primvars, TfToken const &name)
 {
@@ -424,6 +457,7 @@ struct MeshConversion {
 
 struct PrototypePool {
     std::atomic<uint64_t> topLevelSceneBuilds{0};
+    std::atomic<uint64_t> topLevelSceneCommits{0};
     EnvironmentCache environmentCache;
     std::shared_ptr<ColorTexture> whiteEnvironmentTexture =
         std::make_shared<ColorTexture>(Color3(1.0f));
@@ -506,6 +540,7 @@ struct Snapshot {
         geomToInstanceChain;
     std::unordered_map<unsigned int, bool> placementEnabled;
     uint64_t enabledPlacementCount = 0;
+    std::unordered_map<unsigned int, GfMatrix4d> placementMatrices;
     bool sphereBatching = false;
     std::vector<PendingSphere> pendingSpheres;
     std::vector<SphereBatch> sphereBatches;
@@ -546,6 +581,9 @@ struct Snapshot {
     uint64_t materialBindingsUpdated = 0;
     uint64_t lastPlacementRecordsVisited = 0;
     uint64_t lastVisibilityPlacementsUpdated = 0;
+    uint64_t lastPlacementTransformsUpdated = 0;
+    uint64_t lastPrototypePlacementsRepointed = 0;
+    uint64_t lastPrototypePathsUpdated = 0;
     uint64_t sphereBatchRebuilds = 0;
     uint64_t sphereBatchEntriesUpdated = 0;
     uint64_t sphereBatchConservativeFallbacks = 0;
@@ -668,6 +706,7 @@ unsigned int _AttachPrototype(Snapshot *snapshot, SdfPath const &path,
     snapshot->scene->placement_transforms.emplace(id, placement);
     snapshot->scene->placement_materials.emplace(id, prototype.binding);
     snapshot->placementEnabled[id] = true;
+    snapshot->placementMatrices[id] = world;
     ++snapshot->enabledPlacementCount;
     snapshot->embreeGeometryCommitSeconds += std::chrono::duration<double>(
         std::chrono::steady_clock::now() - commitStart).count();
@@ -678,6 +717,8 @@ void _SetInstanceTransform(Snapshot *snapshot, unsigned int id,
                            GfMatrix4d const &world,
                            Snapshot::Prototype const &prototype)
 {
+    auto const previous = snapshot->placementMatrices.find(id);
+    if (previous != snapshot->placementMatrices.end() && previous->second == world) return;
     RTCGeometry instance = rtcGetGeometry(snapshot->scene->scene, id);
     if (!instance) return;
     float transform[16];
@@ -700,6 +741,8 @@ void _SetInstanceTransform(Snapshot *snapshot, unsigned int id,
     placement.flipOrientation = placement.mirrored &&
         prototype.geometry->type == RTC_GEOMETRY_TYPE_TRIANGLE;
     snapshot->scene->placement_transforms[id] = placement;
+    snapshot->placementMatrices[id] = world;
+    ++snapshot->lastPlacementTransformsUpdated;
 }
 
 void _SetInstanceEnabled(Snapshot *snapshot, unsigned int id, bool enabled)
@@ -1576,7 +1619,7 @@ bool _RefreshSphereBatches(
     std::unordered_set<SdfPath, SdfPath::Hash> const &dirtyPaths,
     MaterialService *materials, Snapshot *snapshot,
     TfTokenVector const &renderTags,
-    std::unordered_set<SdfPath, SdfPath::Hash> *handledPaths)
+    std::unordered_set<SdfPath, SdfPath::Hash> *handledPaths, bool deferCommit = false)
 {
     if (!snapshot->sphereBatching || dirtyPaths.empty()) return true;
     std::unordered_set<size_t> affected;
@@ -1637,7 +1680,10 @@ bool _RefreshSphereBatches(
         record.geometry->updateAABB();
         ++snapshot->sphereBatchRebuilds;
     }
-    if (!affected.empty()) rtcCommitScene(snapshot->scene->scene);
+    if (!affected.empty() && !deferCommit) {
+        rtcCommitScene(snapshot->scene->scene);
+        ++snapshot->prototypePool->topLevelSceneCommits;
+    }
     return true;
 }
 
@@ -1863,6 +1909,7 @@ std::vector<InstancePlacement> _InstancePlacements(
         const VtValue transforms = _Primvar(
             primvars, HdInstancerTokens->instanceTransforms).value;
         std::vector<InstancePlacement> local;
+        std::unordered_map<int, int> duplicateOccurrences;
         for (size_t ordinal = 0; ordinal < indices.size(); ++ordinal) {
             int const sourceIndex = indices[ordinal];
             if (sourceIndex < 0) continue;
@@ -1903,7 +1950,8 @@ std::vector<InstancePlacement> _InstancePlacements(
             // prototype's instance-indices array, not the authored source id.
             placement.instanceId = static_cast<int>(ordinal);
             placement.chain.push_back({paths[p], sourceIndex,
-                static_cast<int>(ordinal), static_cast<int>(indices.size())});
+                static_cast<int>(ordinal), static_cast<int>(indices.size()),
+                duplicateOccurrences[sourceIndex]++});
             local.push_back(std::move(placement));
         }
         const bool hasParent = bool(
@@ -2327,6 +2375,7 @@ std::shared_ptr<Snapshot> _BuildSnapshot(HdSceneIndexBaseRefPtr const &scene,
     const auto sceneCommitStart = std::chrono::steady_clock::now();
     if (cancelled && cancelled()) return {};
     result->scene->commitScene();
+    ++result->prototypePool->topLevelSceneCommits;
     result->embreeSceneCommitSeconds += std::chrono::duration<double>(
         std::chrono::steady_clock::now() - sceneCommitStart).count();
     // Later refreshes of this bank resolve through their job's service.
@@ -2342,7 +2391,8 @@ bool _UpdatePlacements(HdSceneIndexBaseRefPtr const &index, Snapshot *snapshot,
                        bool *rebuiltAll = nullptr,
                        bool *needsFullSnapshot = nullptr,
                        bool *topologyChanged = nullptr,
-                       bool forceRebuild = false)
+                       bool forceRebuild = false, bool deferCommit = false,
+                       std::string *fallbackReason = nullptr)
 {
     if (!snapshot || !snapshot->scene) return false;
     if (rebuiltAll) *rebuiltAll = false;
@@ -2350,6 +2400,7 @@ bool _UpdatePlacements(HdSceneIndexBaseRefPtr const &index, Snapshot *snapshot,
     if (topologyChanged) *topologyChanged = false;
     snapshot->lastPlacementRecordsVisited = 0;
     snapshot->lastVisibilityPlacementsUpdated = 0;
+    snapshot->lastPlacementTransformsUpdated = 0;
     if (!forceRebuild) {
         std::unordered_set<unsigned int> affected;
         if (dirtyPaths.empty())
@@ -2370,7 +2421,7 @@ bool _UpdatePlacements(HdSceneIndexBaseRefPtr const &index, Snapshot *snapshot,
                     static_cast<size_t>(prim->second) >= snapshot->primPaths.size())
                     return _UpdatePlacements(index, snapshot, renderTags, {}, cancelled,
                                              rebuiltAll, needsFullSnapshot,
-                                             topologyChanged);
+                                             topologyChanged, true, deferCommit, fallbackReason);
                 idsByPrototype[snapshot->primPaths[prim->second]].push_back(id);
             }
             bool canUpdateInPlace = true;
@@ -2382,75 +2433,63 @@ bool _UpdatePlacements(HdSceneIndexBaseRefPtr const &index, Snapshot *snapshot,
                 if (placements.empty() &&
                     !HdInstancedBySchema::GetFromParent(prim.dataSource))
                     placements.push_back({_WorldTransform(index, prototypePath), {}, -1, {}});
-                auto oldKey = [&](unsigned int id) {
-                    int instanceId = -1;
-                    auto instance = snapshot->geomToInstanceId.find(id);
-                    if (instance != snapshot->geomToInstanceId.end())
-                        instanceId = instance->second;
-                    SdfPath instancerPath;
-                    auto primId = snapshot->geomToPrimId.find(id);
-                    if (primId != snapshot->geomToPrimId.end() &&
-                        primId->second >= 0 && static_cast<size_t>(primId->second) <
-                            snapshot->instancerPaths.size())
-                        instancerPath = snapshot->instancerPaths[primId->second];
-                    std::string key = instancerPath.GetString() + "#" +
-                        std::to_string(instanceId);
-                    auto chain = snapshot->geomToInstanceChain.find(id);
-                    if (chain != snapshot->geomToInstanceChain.end())
-                        for (InstanceLevel const &level : chain->second)
-                            key += "|" + level.instancerPath.GetString() + ":" +
-                                std::to_string(level.sourceIndex) + ":" +
-                                std::to_string(level.ordinal) + ":" +
-                                std::to_string(level.radix);
-                    return key;
-                };
-                auto newKey = [](InstancePlacement const &placement) {
-                    std::string key = placement.instancerPath.GetString() +
-                        "#" + std::to_string(placement.instanceId);
-                    for (InstanceLevel const &level : placement.chain)
-                        key += "|" + level.instancerPath.GetString() + ":" +
-                            std::to_string(level.sourceIndex) + ":" +
-                            std::to_string(level.ordinal) + ":" +
-                            std::to_string(level.radix);
-                    return key;
-                };
-                std::sort(ids.begin(), ids.end(), [&](unsigned int a, unsigned int b) {
-                    return oldKey(a) < oldKey(b);
-                });
-                std::sort(placements.begin(), placements.end(),
-                    [&](InstancePlacement const &a, InstancePlacement const &b) {
-                        return newKey(a) < newKey(b);
-                    });
                 auto prototype = snapshot->prototypes.find(prototypePath);
                 if (prototype == snapshot->prototypes.end()) {
-                    canUpdateInPlace = false;
-                    break;
+                    if (needsFullSnapshot) *needsFullSnapshot = true;
+                    if (fallbackReason) *fallbackReason = "placement prototype missing";
+                    return false;
                 }
                 snapshot->lastPlacementRecordsVisited += ids.size();
                 if (ids.size() != placements.size()) {
                     canUpdateInPlace = false;
-                    if (topologyChanged) *topologyChanged = true;
+                    if (fallbackReason) *fallbackReason = "placement count changed";
                     break;
                 }
-                for (size_t i = 0; i < ids.size(); ++i) {
-                    if (oldKey(ids[i]) == newKey(placements[i])) continue;
+                std::unordered_map<PlacementKey, unsigned int, PlacementKeyHash> oldIds;
+                for (unsigned int id : ids) {
+                    auto chain = snapshot->geomToInstanceChain.find(id);
+                    auto key = _PlacementKey(prototypePath, chain == snapshot->geomToInstanceChain.end()
+                        ? std::vector<InstanceLevel>{} : chain->second);
+                    if (!oldIds.emplace(std::move(key), id).second) {
+                        canUpdateInPlace = false; break;
+                    }
+                }
+                std::vector<unsigned int> matched;
+                for (auto const &placement : placements) {
+                    auto found = oldIds.find(_PlacementKey(prototypePath, placement.chain));
+                    if (found == oldIds.end()) { canUpdateInPlace = false; break; }
+                    matched.push_back(found->second); oldIds.erase(found);
+                }
+                if (!canUpdateInPlace || !oldIds.empty()) {
                     canUpdateInPlace = false;
-                    if (topologyChanged) *topologyChanged = true;
+                    if (fallbackReason) *fallbackReason = "placement source-chain key set changed";
                     break;
                 }
-                if (!canUpdateInPlace) break;
-                for (size_t i = 0; i < ids.size(); ++i) {
-                    _SetInstanceEnabled(snapshot, ids[i], _PlacementEligible(
-                        index, prototypePath, prim.dataSource, placements[i].chain, renderTags));
-                    _SetInstanceTransform(
-                        snapshot, ids[i], placements[i].transform,
-                        prototype->second);
+                for (size_t i = 0; i < placements.size(); ++i) {
+                    unsigned int const id = matched[i];
+                    if (!rtcGetGeometry(snapshot->scene->scene, id)) {
+                        if (needsFullSnapshot) *needsFullSnapshot = true;
+                        if (fallbackReason) *fallbackReason = "placement instance geometry missing";
+                        return false;
+                    }
+                    auto const &placement = placements[i];
+                    if (snapshot->geomToInstanceId[id] != placement.instanceId ||
+                        snapshot->geomToInstanceChain[id] != placement.chain)
+                        if (topologyChanged) *topologyChanged = true;
+                    snapshot->geomToInstanceId[id] = placement.instanceId;
+                    snapshot->geomToInstanceChain[id] = placement.chain;
+                    _SetInstanceEnabled(snapshot, id, _PlacementEligible(
+                        index, prototypePath, prim.dataSource, placement.chain, renderTags));
+                    _SetInstanceTransform(snapshot, id, placement.transform, prototype->second);
                 }
             }
             if (canUpdateInPlace) {
                 if (cancelled && cancelled()) return false;
                 auto const commitStart = std::chrono::steady_clock::now();
-                rtcCommitScene(snapshot->scene->scene);
+                if (!deferCommit) {
+                    rtcCommitScene(snapshot->scene->scene);
+                    ++snapshot->prototypePool->topLevelSceneCommits;
+                }
                 snapshot->embreeSceneCommitSeconds +=
                     std::chrono::duration<double>(
                         std::chrono::steady_clock::now() - commitStart).count();
@@ -2459,6 +2498,8 @@ bool _UpdatePlacements(HdSceneIndexBaseRefPtr const &index, Snapshot *snapshot,
         }
     }
     if (topologyChanged) *topologyChanged = true;
+    if (fallbackReason && fallbackReason->empty())
+        *fallbackReason = "placement topology requires coherent rebuild";
     if (rebuiltAll) *rebuiltAll = true;
     RTCScene replacement = rtcNewScene(snapshot->device);
     if (!replacement) return false;
@@ -2473,6 +2514,7 @@ bool _UpdatePlacements(HdSceneIndexBaseRefPtr const &index, Snapshot *snapshot,
     snapshot->geomToInstanceId.clear();
     snapshot->geomToInstanceChain.clear();
     snapshot->placementEnabled.clear();
+    snapshot->placementMatrices.clear();
     snapshot->enabledPlacementCount = 0;
     snapshot->scene->geometry.clear();
     snapshot->scene->intersection_geometry.clear();
@@ -2519,7 +2561,10 @@ bool _UpdatePlacements(HdSceneIndexBaseRefPtr const &index, Snapshot *snapshot,
     _AttachSphereBatches(snapshot);
     const auto commitStart = std::chrono::steady_clock::now();
     if (cancelled && cancelled()) return false;
-    rtcCommitScene(replacement);
+    if (!deferCommit) {
+        rtcCommitScene(replacement);
+        ++snapshot->prototypePool->topLevelSceneCommits;
+    }
     _IndexPlacementDependencies(snapshot);
     _RefreshCachedCounts(snapshot);
     snapshot->embreeSceneCommitSeconds += std::chrono::duration<double>(
@@ -2530,29 +2575,21 @@ bool _UpdatePlacements(HdSceneIndexBaseRefPtr const &index, Snapshot *snapshot,
 bool _RefreshPrototypes(HdSceneIndexBaseRefPtr const &index,
                         std::unordered_set<SdfPath, SdfPath::Hash> const &paths,
                         MaterialService *materials, Snapshot *snapshot,
-                        TfTokenVector const &renderTags)
+                        TfTokenVector const &renderTags,
+                        std::vector<std::shared_ptr<PrototypeStorage>> *displacedStorage)
 {
     if (!snapshot || !snapshot->scene || paths.empty()) return false;
-    RTCScene oldTop = snapshot->scene->scene;
-    snapshot->scene->scene = rtcNewScene(snapshot->device);
-    if (snapshot->scene->scene) ++snapshot->prototypePool->topLevelSceneBuilds;
-    if (!snapshot->scene->scene) {
-        snapshot->scene->scene = oldTop;
-        return false;
-    }
-    snapshot->scene->geometry.clear();
-    snapshot->scene->intersection_geometry.clear();
-    snapshot->scene->placement_transforms.clear();
-    snapshot->scene->placement_materials.clear();
-    snapshot->geomToPrimId.clear();
-    snapshot->geomToCoarseFaces.clear();
-    snapshot->geomToInstanceId.clear();
-    snapshot->geomToInstanceChain.clear();
-    snapshot->placementEnabled.clear();
-    rtcReleaseScene(oldTop);
-    snapshot->enabledPlacementCount = 0;
-
     for (SdfPath const &path : paths) {
+        std::vector<unsigned int> dependentIds;
+        if (auto dependencies = snapshot->placementDependencies.find(path);
+            dependencies != snapshot->placementDependencies.end())
+            for (unsigned int id : dependencies->second) {
+                auto prim = snapshot->geomToPrimId.find(id);
+                if (prim != snapshot->geomToPrimId.end() && prim->second >= 0 &&
+                    static_cast<size_t>(prim->second) < snapshot->primPaths.size() &&
+                    snapshot->primPaths[prim->second] == path) dependentIds.push_back(id);
+            }
+        RTCGeometryType oldType = RTC_GEOMETRY_TYPE_INSTANCE;
         // displayColor is a material input carried by a geometry primvar.  A
         // prototype refresh must recapture its value instead of reusing the
         // path cache populated by the previous data source.
@@ -2561,6 +2598,8 @@ bool _RefreshPrototypes(HdSceneIndexBaseRefPtr const &index,
         auto found = snapshot->prototypes.find(path);
         if (found != snapshot->prototypes.end()) {
             Geometry *const oldGeometry = found->second.geometry;
+            oldType = oldGeometry->type;
+            displacedStorage->push_back(found->second.storage);
             RTCScene const oldPrototypeScene = found->second.scene;
             auto bucketIt = snapshot->prototypeHashBuckets.find(
                 found->second.geometryHash);
@@ -2598,42 +2637,35 @@ bool _RefreshPrototypes(HdSceneIndexBaseRefPtr const &index,
 
         HdSceneIndexPrim const prim = index->GetPrim(path);
         if (prim.primType != HdPrimTypeTokens->mesh &&
-            prim.primType != HdPrimTypeTokens->sphere) continue;
-        std::vector<InstancePlacement> placements =
-            _InstancePlacements(index, path, prim.dataSource);
-        const bool instanced = bool(
-            HdInstancedBySchema::GetFromParent(prim.dataSource));
-        if (placements.empty() && !instanced) {
-            if (prim.primType == HdPrimTypeTokens->mesh)
-                _AppendMesh(index, path, prim, materials, snapshot,
-                            _WorldTransform(index, path), {}, -1, {}, renderTags);
-            else
-                _AppendSphere(index, path, prim, materials, snapshot,
-                              _WorldTransform(index, path), {}, -1, {}, renderTags);
-        } else if (placements.empty()) {
-            if (prim.primType == HdPrimTypeTokens->mesh)
-                _AppendMesh(index, path, prim, materials, snapshot,
-                    _WorldTransform(index, path), {}, -1, {}, renderTags, nullptr, false);
-            else
-                _AppendSphere(index, path, prim, materials, snapshot,
-                    _WorldTransform(index, path), {}, -1, {}, renderTags, false);
-        } else {
-            for (InstancePlacement const &placement : placements) {
-                if (prim.primType == HdPrimTypeTokens->mesh)
-                    _AppendMesh(index, path, prim, materials, snapshot,
-                                placement.transform, placement.instancerPath,
-                                placement.instanceId, placement.chain, renderTags);
-                else
-                    _AppendSphere(index, path, prim, materials, snapshot,
-                                  placement.transform, placement.instancerPath,
-                                  placement.instanceId, placement.chain, renderTags);
-            }
+            prim.primType != HdPrimTypeTokens->sphere) {
+            if (oldType != RTC_GEOMETRY_TYPE_INSTANCE || !dependentIds.empty()) return false;
+            continue;
+        }
+        if (prim.primType == HdPrimTypeTokens->mesh)
+            _AppendMesh(index, path, prim, materials, snapshot,
+                _WorldTransform(index, path), {}, -1, {}, renderTags, nullptr, false);
+        else
+            _AppendSphere(index, path, prim, materials, snapshot,
+                _WorldTransform(index, path), {}, -1, {}, renderTags, false);
+        auto replacement = snapshot->prototypes.find(path);
+        if (replacement == snapshot->prototypes.end() ||
+            oldType == RTC_GEOMETRY_TYPE_INSTANCE ||
+            (oldType != RTC_GEOMETRY_TYPE_INSTANCE && oldType != replacement->second.geometry->type))
+            return false;
+        ++snapshot->lastPrototypePathsUpdated;
+        for (unsigned int id : dependentIds) {
+            RTCGeometry instance = rtcGetGeometry(snapshot->scene->scene, id);
+            if (!instance) return false;
+            rtcSetGeometryInstancedScene(instance, replacement->second.scene);
+            rtcCommitGeometry(instance);
+            snapshot->scene->geometry[id] = replacement->second.geometry;
+            snapshot->scene->intersection_geometry[id] = replacement->second.geometry->geom;
+            snapshot->scene->placement_materials[id] = replacement->second.binding;
+            snapshot->geomToCoarseFaces[id] = replacement->second.coarseFaces;
+            ++snapshot->lastPrototypePlacementsRepointed;
         }
     }
-    // Recreate one coherent top-level scene from all retained and rebuilt
-    // prototypes, discarding temporary attachments made during conversion.
-    return _UpdatePlacements(index, snapshot, renderTags,
-        {}, {}, nullptr, nullptr, nullptr, true);
+    return true;
 }
 
 void _RefreshEnvironment(HdSceneIndexBaseRefPtr const &index,
@@ -3132,6 +3164,9 @@ public:
         bool pinnedBankFallback = false;
         bool visibilityRecoveryRebuild = false;
         bool sphereBatchFallback = false;
+        bool prototypeUpdateFallback = false;
+        bool placementTopologyFallback = false;
+        std::string updateFallbackReason;
         uint64_t prototypeBuilds = 0;
         // A rebuilt snapshot is published before its spare bank exists; the
         // spare job reports its bank in spareSnapshot with spare set.
@@ -3328,6 +3363,8 @@ public:
     uint64_t visibilityRecoveryRebuilds = 0;
     uint64_t pinnedSnapshotFallbacks = 0;
     uint64_t sphereBatchFallbacks = 0;
+    uint64_t prototypeUpdateFallbacks = 0;
+    uint64_t placementTopologyFallbacks = 0;
     bool profileBufferWrites = false;
     std::string lastRebuildReason = "initial population";
 };
@@ -3738,6 +3775,10 @@ bool SceneBridge::Prepare(CameraState const &camera,
                 _impl->lastRebuildReason =
                     "sphere batch eligibility or topology changed";
             }
+            if (completed.prototypeUpdateFallback) ++_impl->prototypeUpdateFallbacks;
+            if (completed.placementTopologyFallback) ++_impl->placementTopologyFallbacks;
+            if (!completed.updateFallbackReason.empty())
+                _impl->lastRebuildReason = completed.updateFallbackReason;
             _impl->prototypeBuilds += completed.prototypeBuilds;
             if (_impl->firstPublishSeconds == 0.0)
                 _impl->firstPublishSeconds = std::chrono::duration<double>(
@@ -3982,6 +4023,23 @@ bool SceneBridge::Prepare(CameraState const &camera,
                         } else if (bank && (jobDirtyKinds & unsafeKinds) == 0) {
                             const uint64_t priorPrototypeBuilds =
                                 bank->prototypeBuildCount;
+                            bank->lastPlacementRecordsVisited = 0;
+                            bank->lastVisibilityPlacementsUpdated = 0;
+                            bank->lastPlacementTransformsUpdated = 0;
+                            bank->lastPrototypePlacementsRepointed = 0;
+                            bank->lastPrototypePathsUpdated = 0;
+                            std::vector<std::shared_ptr<PrototypeStorage>> displacedStorage;
+                            struct BankCleanup {
+                                std::shared_ptr<Snapshot> *bank;
+                                ~BankCleanup() { bank->reset(); }
+                            } bankCleanup{&bank};
+                            for (auto path = jobPrototypePaths.begin(); path != jobPrototypePaths.end();) {
+                                if (retained->GetPrim(*path).primType == HdPrimTypeTokens->instancer) {
+                                    jobPlacementPaths.insert(*path);
+                                    jobDirtyKinds |= static_cast<unsigned int>(SceneDirtyKind::Placement);
+                                    path = jobPrototypePaths.erase(path);
+                                } else ++path;
+                            }
                             bool placementRebuiltAll = false;
                             bool placementNeedsFullSnapshot = false;
                             bool batchNeedsFullSnapshot = false;
@@ -4001,7 +4059,7 @@ bool SceneBridge::Prepare(CameraState const &camera,
                             if (!_RefreshSphereBatches(
                                     retained, batchDirtyPaths,
                                     result.materialService.get(), bank.get(),
-                                    tags, &handledBatchPaths)) {
+                                    tags, &handledBatchPaths, true)) {
                                 bank = _BuildSnapshot(
                                     retained, result.materialService.get(),
                                     jobSettings, tags, device, prototypePool,
@@ -4024,29 +4082,45 @@ bool SceneBridge::Prepare(CameraState const &camera,
                                 jobDirtyKinds & static_cast<unsigned int>(
                                     SceneDirtyKind::Prototype))
                             {
-                                _RefreshPrototypes(
-                                    retained, jobPrototypePaths,
-                                    result.materialService.get(), bank.get(), tags);
+                                if (!jobPrototypePaths.empty() && !_RefreshPrototypes(
+                                    retained, jobPrototypePaths, result.materialService.get(),
+                                    bank.get(), tags, &displacedStorage)) {
+                                    bank = _BuildSnapshot(retained, result.materialService.get(),
+                                        jobSettings, tags, device, prototypePool, [cancel] {
+                                            return cancel->load(std::memory_order_relaxed);
+                                        });
+                                    if (!bank) return result;
+                                    batchNeedsFullSnapshot = true;
+                                    placementRebuiltAll = true;
+                                    result.prototypeUpdateFallback = true;
+                                    result.updateFallbackReason = "prototype conversion or geometry type requires full rebuild";
+                                }
                             }
                             if (cancel->load(std::memory_order_relaxed))
                                 return result;
-                            // Prototype refreshes rebuild the inactive TLAS and
-                            // its dependency index. Replay placement and
-                            // visibility edits afterward so a bank that is one
-                            // generation behind still preserves the latest
-                            // enabled state and transforms.
+                            // Replay placement edits after prototype repointing,
+                            // then commit the complete inactive scene once.
                             if (!batchNeedsFullSnapshot &&
                                 jobDirtyKinds & static_cast<unsigned int>(
-                                    SceneDirtyKind::Placement))
-                                _UpdatePlacements(retained, bank.get(),
+                                    SceneDirtyKind::Placement)) {
+                                bool const placementUpdated = _UpdatePlacements(retained, bank.get(),
                                   tags, jobPlacementPaths, [cancel] {
                                     return cancel->load(
                                         std::memory_order_relaxed);
                                 }, &placementRebuiltAll,
                                     &placementNeedsFullSnapshot,
-                                    &placementTopologyChanged);
+                                    &placementTopologyChanged, false, true,
+                                    &result.updateFallbackReason);
+                                if (!placementUpdated && !cancel->load(std::memory_order_relaxed)) {
+                                    placementNeedsFullSnapshot = true;
+                                    placementRebuiltAll = true;
+                                    if (result.updateFallbackReason.empty())
+                                        result.updateFallbackReason = "placement update failed; full rebuild required";
+                                }
+                            }
                             if (cancel->load(std::memory_order_relaxed))
                                 return result;
+                            result.placementTopologyFallback = placementRebuiltAll && !batchNeedsFullSnapshot;
                             if (!batchNeedsFullSnapshot &&
                                 placementNeedsFullSnapshot) {
                                 bank = _BuildSnapshot(
@@ -4078,6 +4152,16 @@ bool SceneBridge::Prepare(CameraState const &camera,
                                 bank->scene->environment = bank->environment.get();
                                 _RefreshEnvironment(
                                     retained, SdfPath::AbsoluteRootPath(), bank.get());
+                            }
+                            if (!batchNeedsFullSnapshot && !placementNeedsFullSnapshot &&
+                                (jobDirtyKinds & (static_cast<unsigned int>(SceneDirtyKind::Prototype) |
+                                    static_cast<unsigned int>(SceneDirtyKind::Placement))) != 0) {
+                                if (cancel->load(std::memory_order_relaxed)) return result;
+                                auto const commitStart = std::chrono::steady_clock::now();
+                                rtcCommitScene(bank->scene->scene);
+                                ++bank->prototypePool->topLevelSceneCommits;
+                                bank->embreeSceneCommitSeconds += std::chrono::duration<double>(
+                                    std::chrono::steady_clock::now() - commitStart).count();
                             }
                             result.snapshot = std::move(bank);
                             const bool rebuiltSnapshot =
@@ -4614,6 +4698,16 @@ VtDictionary SceneBridge::GetStats() const
         _impl->snapshotBuilds));
     result["topLevelSceneBuilds"] = VtValue(static_cast<int64_t>(
         _impl->prototypePool->topLevelSceneBuilds.load()));
+    result["topLevelSceneCommits"] = VtValue(static_cast<int64_t>(
+        _impl->prototypePool->topLevelSceneCommits.load()));
+    result["lastPlacementTransformsUpdated"] = VtValue(static_cast<int64_t>(
+        _impl->snapshot ? _impl->snapshot->lastPlacementTransformsUpdated : 0));
+    result["lastPrototypePlacementsRepointed"] = VtValue(static_cast<int64_t>(
+        _impl->snapshot ? _impl->snapshot->lastPrototypePlacementsRepointed : 0));
+    result["lastPrototypePathsUpdated"] = VtValue(static_cast<int64_t>(
+        _impl->snapshot ? _impl->snapshot->lastPrototypePathsUpdated : 0));
+    result["placementTopologyFallbacks"] = VtValue(static_cast<int64_t>(_impl->placementTopologyFallbacks));
+    result["prototypeUpdateFallbacks"] = VtValue(static_cast<int64_t>(_impl->prototypeUpdateFallbacks));
     result["enabledPlacementCount"] = VtValue(static_cast<int64_t>(
         _impl->snapshot ? _impl->snapshot->enabledPlacementCount : 0));
     result["snapshotBuildSeconds"] = VtValue(_impl->snapshotBuildSeconds);

@@ -587,7 +587,8 @@ void PrismTaskDelegate::PrimsDirtied(HdSceneIndexBase const &sender,
                     else if (text.rfind("xform", 0) == 0 ||
                         text.rfind("visibility", 0) == 0 ||
                         text.rfind("purpose", 0) == 0 ||
-                        text.rfind("instancerTopology", 0) == 0)
+                        text.rfind("instancerTopology", 0) == 0 ||
+                        (prim.primType == HdPrimTypeTokens->instancer && text.rfind("primvars", 0) == 0))
                         kind = prism::hydra::SceneDirtyKind::Placement;
                     else if (text.rfind("mesh", 0) == 0 || text.rfind("sphere", 0) == 0 ||
                              text.rfind("primvars", 0) == 0)
