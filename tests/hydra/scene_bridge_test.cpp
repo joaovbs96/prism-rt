@@ -1090,6 +1090,32 @@ int main()
         thread.StartRender();
         ok &= Check(WaitFor([&] { return bridge.IsConverged(); }),
                     "one-sample restart did not converge");
+        thread.StopRender();
+        const VtDictionary beforeRestart = bridge.GetStats();
+        const int64_t buildsBeforeRestart = Stat(beforeRestart, "snapshotBuilds");
+        const int64_t generationBeforeRestart =
+            Stat(beforeRestart, "preparationGeneration");
+        const int64_t displayedBeforeRestart =
+            Stat(beforeRestart, "displayedGeneration");
+        ok &= Check(Stat(beforeRestart, "completedSamples") == 1,
+                    "one-sample render did not record its completed pass");
+        bridge.RestartAccumulation();
+        const VtDictionary restartedStats = bridge.GetStats();
+        ok &= Check(Stat(restartedStats, "completedSamples") == 0 &&
+                        Stat(restartedStats, "snapshotBuilds") == buildsBeforeRestart &&
+                        !BoolStat(restartedStats, "converged"),
+                    "accumulation restart did not reset samples without rebuilding the scene");
+        PumpPrepare(bridge, camera, aovs, geometryTags, resolution, resolution);
+        thread.StartRender();
+        ok &= Check(WaitFor([&] { return bridge.IsConverged(); }),
+                    "accumulation restart did not render again");
+        thread.StopRender();
+        const VtDictionary afterRestartRender = bridge.GetStats();
+        ok &= Check(Stat(afterRestartRender, "completedSamples") == 1 &&
+                        Stat(afterRestartRender, "snapshotBuilds") == buildsBeforeRestart &&
+                        Stat(afterRestartRender, "preparationGeneration") == generationBeforeRestart &&
+                        Stat(afterRestartRender, "displayedGeneration") == displayedBeforeRestart,
+                    "accumulation restart changed the scene generation or failed to resume rendering");
         std::vector<int> const primIds = ReadBuffer<int>(&primBuffer);
         std::vector<int> const instanceIds = ReadBuffer<int>(&instanceBuffer);
         std::vector<int> const elementIds = ReadBuffer<int>(&elementBuffer);

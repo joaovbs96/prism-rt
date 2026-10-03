@@ -348,7 +348,7 @@ bool PrismTaskDelegate::Pause() { _thread->PauseRender(); return true; }
 bool PrismTaskDelegate::Resume() { _thread->ResumeRender(); return true; }
 bool PrismTaskDelegate::Stop(bool) { _thread->StopRender(); return true; }
 bool PrismTaskDelegate::Restart()
-{ if (_bridge) _bridge->MarkSceneDirty(); return true; }
+{ if (_bridge) _bridge->RestartAccumulation(); return true; }
 
 void PrismTaskDelegate::_SyncAuthoredSettings()
 {

@@ -94,6 +94,7 @@ public:
     void MarkSceneDirty();
     void MarkSceneDirty(SceneDirtyKind kind, pxr::SdfPath const &path = {});
     void MarkScenePathsDirty(SceneDirtyKind kind, pxr::SdfPathVector const &paths);
+    void RestartAccumulation();
     void SetSettings(RenderSettings const &settings);
     RenderSettings GetSettings() const;
     bool Prepare(CameraState const &camera,

@@ -3106,6 +3106,20 @@ void SceneBridge::MarkScenePathsDirty(SceneDirtyKind kind, SdfPathVector const &
     _converged.store(false);
 }
 
+void SceneBridge::RestartAccumulation()
+{
+    _impl->renderThread->StopRender();
+    std::lock_guard lock(_impl->mutex);
+    _impl->samples.store(0);
+    _impl->stateDirty = true;
+    for (HdRenderPassAovBinding const &binding : _impl->bindings)
+        if (auto *buffer = dynamic_cast<PrismRenderBuffer *>(binding.renderBuffer))
+            buffer->SetConverged(false);
+    _impl->startTime = std::chrono::steady_clock::now();
+    _impl->renderSeconds = 0.0;
+    _converged.store(false);
+}
+
 void SceneBridge::SetSettings(RenderSettings const &settings)
 {
     {
