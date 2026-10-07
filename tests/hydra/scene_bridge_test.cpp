@@ -1100,8 +1100,8 @@ int main()
         ok &= Check(Stat(stats, "snapshotBuilds") == buildsBeforeVisibility &&
                         Stat(stats, "prototypeBuildCount") ==
                             prototypeBuildsBeforeVisibility &&
-                        Stat(stats, "lastPlacementRecordsVisited") == 2,
-                    "visibility restore rebuilt or touched an unrelated prototype");
+                        Stat(stats, "lastPlacementRecordsVisited") == 0,
+                    "visibility restore did not reuse the already-visible inactive bank inputs");
         const int64_t recoveriesBeforeHiddenPrototypeEdit =
             Stat(stats, "visibilityRecoveryRebuilds");
 

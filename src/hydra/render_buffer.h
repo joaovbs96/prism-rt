@@ -39,7 +39,8 @@ public:
     // Once a frame exists, callers must overwrite every working pixel before
     // publishing; avoiding a redundant full-resolution clear keeps camera
     // interaction responsive.
-    void BeginFrame(VtValue const &clearValue);
+    // clearWorking also stages the clear for outputs that will not be traced.
+    void BeginFrame(VtValue const &clearValue, bool clearWorking = false);
     // True until the buffer has shown a frame or received its initial clear
     // since it was last allocated.
     bool NeedsInitialClear() const;
@@ -55,10 +56,30 @@ public:
         unsigned int width=0,height=0;
         HdFormat format=HdFormatInvalid;
     };
+    // Tile rows use render-buffer coordinates (bottom-up). Once published,
+    // both tiles and the complete pointer table are immutable.
+    struct PresentationTile {
+        unsigned int x=0,y=0,width=0,height=0;
+        std::vector<float> rgba;
+    };
+    struct PresentationSnapshot {
+        ReadView base;
+        uint64_t pass=0, revision=0;
+        std::vector<std::shared_ptr<const PresentationTile>> tiles;
+    };
+    struct PresentationState {
+        ReadView raw;
+        std::shared_ptr<const PresentationSnapshot> snapshot;
+        std::shared_ptr<const std::vector<uint8_t>> legacyPixels;
+        GfVec4f background{0.0f};
+        bool hasBackground=false;
+    };
     // Pixels and their picking/camera metadata are one immutable publication.
     // The view stays valid through later publication and buffer allocation.
     ReadView Capture() const;
     ReadView CapturePublished() const;
+    void SetPresentationSnapshot(std::shared_ptr<const PresentationSnapshot> snapshot);
+    PresentationState CapturePresentationState() const;
     void SetPresentationPixels(std::shared_ptr<const std::vector<uint8_t>> pixels,
                                Frame frame);
     void ClearPresentationPixels();
@@ -92,6 +113,7 @@ public:
     }
     uint64_t GetPublishNanoseconds() const { return _publishNanoseconds.load(); }
     uint64_t GetMapWaitNanoseconds() const { return _mapWaitNanoseconds.load(); }
+    uint64_t GetPresentationCopyBytes() const { return _presentationCopyBytes.load(); }
 
 protected:
     void _Deallocate() override;
@@ -101,6 +123,7 @@ private:
                 size_t components, bool accumulate);
     // Replicates one encoded clear pixel over the whole working image.
     void _FillWorking(VtValue const &clearValue);
+    void _ClearRefinement();
 
     unsigned int _width = 0;
     unsigned int _height = 0;
@@ -132,6 +155,10 @@ private:
     mutable GfVec4f _cachedPresentationClearColor{0.0f};
     std::shared_ptr<const std::vector<uint8_t>> _refinementPixels;
     Frame _refinementFrame;
+    std::shared_ptr<const PresentationSnapshot> _presentationSnapshot;
+    mutable std::weak_ptr<const PresentationSnapshot> _materializedSnapshot;
+    mutable std::shared_ptr<const std::vector<uint8_t>> _materializedPixels;
+    mutable std::atomic<uint64_t> _presentationCopyBytes{0};
     HdRenderThread *_renderThread;
 };
 

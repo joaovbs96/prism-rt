@@ -1,9 +1,401 @@
 # Hydra delegate improvement validation
 
-This ledger records completed work from `HYDRA_DELEGATE_PLAN.md` and the evidence
-collected for it. A plan item appears here only after its implementation and
-validation have finished. The plan remains the source for work that is still
-pending.
+This ledger records Hydra delegate changes and their validation evidence. The
+2026-10-03 integration work is recorded first; the older sections preserve the
+historical results associated with `HYDRA_DELEGATE_PLAN.md`.
+
+## Milestone 4 � structural transactions
+
+Instanced prototype/subset additions and removals passed the focused suite in
+15.21 seconds (`build/phase4-prototype-c-test.log`), including 16, 128, 1,024 and
+16,384 placements, fresh-render parity and retained old-frame picks. Preflight
+now accounts for subset additions and parent removals coalesced during bank
+replay; earlier candidates conservatively rebuilt these sequences.
+
+Subtree addition/removal/re-addition passed the focused suite in 14.57 seconds
+(`build/phase4-subtree-b-test.log`) at all four placement counts. Added descendants
+are captured recursively; removed geometry is inventoried from bank records.
+Unrelated paths retain IDs and geometry. A detach-count assertion first advances
+both banks: an older bank that never contained a transient added subtree can
+correctly perform zero physical detachments when that subtree is removed.
+
+Explicit paired renames passed the focused suite in 14.09 seconds
+(`build/phase4-rename-test.log`) at all four placement counts. Tests verify
+compatible prototype/placement reuse, exact image parity, destination-path IDs,
+tombstones, rename-back bank replay and retained old-frame picks. Additional
+nested/duplicate and evicted-prototype cases are in the final candidate build.
+The first final CTest run passed 32/33 tests and exposed a cold-rename replay
+ordering bug: a subsequent visible edit could restore using the old path before
+rekeying. The candidate now rechecks evicted-prototype eligibility after rekeying.
+The failed run is preserved in `build/phase4-full-ctest-cold-rename-failure.log`.
+Capture also deduplicates overlapping parent/descendant notices within a generation.
+The corrected focused suite passed in 14.97 seconds
+(`build/phase4-restoration-test.log`), and the complete CTest suite passed 33/33
+in 71.82 seconds (`build/phase4-full-ctest.log`). Nested instances with duplicate
+source indices and cold-prototype rename/restore/removal are included.
+The pre-review candidate is preserved as
+`build-fresh-validation/hydra-performance-phase4/hdPrism-before-counter-review.dll`,
+SHA-256 `ac716ef0634e07116f43b7ee4a6cc06d75ad97d11a5b629a5bd14c3a5d610f6d`.
+A final review made placement work counters accumulate across a transaction and
+removed a redundant second placement reconciliation during rename. The nested
+rename matrix now asserts exactly one visit per placement. The reviewed build
+passed 33/33 CTest tests in 69.39 seconds (`build/phase4-reviewed-ctest.log`).
+Its DLL is `build-fresh-validation/hydra-performance-phase4/hdPrism.dll`, SHA-256
+`bad8c4c743bc758e61f0fde4e1f0c521b3dadce9d83085bb93e1079b862b36ca`.
+
+Filtered and bilinear 256-sample parity tests passed, and all four final images
+matched the preserved pre-regression images exactly (zero RMSE and luminance
+error), recorded in `build/phase4-parity.log`. Stock usdview presentation, motion,
+preview picking, smoke and background/FrameRecorder PNG/EXR tests passed. The
+odd-size partial-tile screenshot was inspected and showed distributed updates.
+Host artifacts are in `build-fresh-validation/hydra-performance-phase1/ui/*-phase4`.
+Real-host structural scaling passed sequentially at 16, 128, 1,024 and 16,384
+placements (`build-fresh-validation/hydra-performance-phase4/scaling-final`).
+
+Procedural InOneWeekend and QuadTest export determinism and cross-frontend parity
+passed in both filtering modes. CornellBox is deterministic but its standalone
+versus Hydra comparison exceeds the existing 1% threshold: normalized RMSE
+0.0721589 at 64 samples and 0.04222 at 256 samples (luminance error 0.00160345 and
+0.00225168 respectively). The candidate matches the preserved pre-regression
+Hydra DLL exactly at 64 samples and at 256 samples in both filtering modes, so
+this is a pre-existing cross-frontend discrepancy, not a changed Hydra image.
+No tolerance or renderer code was changed to suppress it. Evidence is in
+`build/phase4-export-baseline.log`, `build/phase4-exports-and-scaling.log` and
+`build-fresh-validation/hydra-performance-phase4/export-confirmation`.
+The final-binary performance comparison passed all four gates at both
+resolutions. Five alternating runs per build/resolution were performed without
+concurrent validation jobs. Raw runs, per-run memory/work counters, and the
+hashed summary are in
+`build-fresh-validation/hydra-performance-phase1/gate-phase4-final/summary.json`.
+
+| Resolution / median metric | Pre-regression | Previous tiled | Final candidate |
+| --- | ---: | ---: | ---: |
+| 1080p first sample (s) | 0.5081 | 0.6085 | 0.4411 |
+| 1080p samples/s | 3.1654 | 2.3307 | 3.6661 |
+| 1080p paint p95 (ms) | 34.710 | 9.760 | 8.869 |
+| 1080p update-gap p95 (ms) | 146.456 | 138.209 | 137.208 |
+| 1080p setting-change cancellation (ms) | 4.143 | 2.593 | 2.511 |
+| 4K first sample (s) | 1.9840 | 2.2336 | 1.6298 |
+| 4K samples/s | 0.6599 | 0.5012 | 0.8331 |
+| 4K paint p95 (ms) | 110.231 | 14.128 | 13.468 |
+| 4K update-gap p95 (ms) | 283.814 | 206.519 | 162.838 |
+| 4K setting-change cancellation (ms) | 28.760 | 8.845 | 17.152 |
+
+The candidate beats the pre-regression first-sample and throughput targets and
+meets the paint/update-gap limits relative to the tiled build. The 4K cancellation
+tradeoff remains: the measured seed-setting call is slower than the tiled build.
+This is a host setting-call measurement, not isolated worker-drain time, and no
+claim is made that cancellation has been fixed. Results differ from the earlier
+milestone 1 session; comparisons use contemporaneous alternating runs.
+
+### Deferred follow-up: render interruption latency (2026-10-03)
+
+Deferred at the user's request; no cancellation optimization is underway.
+The final 4K benchmark measured a median of 17.152 ms for the complete
+random-seed setting call, versus 8.845 ms in the previous tiled build (about
+8.3 ms extra per interruption). This includes stopping ongoing work and updating
+the setting. It is neither isolated cancellation time nor time to the first
+replacement image, and it is not overhead paid on every frame. Camera movement
+also interrupts rendering, but these numbers were measured with seed changes.
+
+When revisiting, instrument worker draining, presentation-payload construction,
+final commit and setting-update work separately before attributing the increase.
+Investigate cancellation checks between payload tiles and the time spent draining
+active tasks; these are hypotheses, not established causes. Preserve immutable
+published frames and safe task draining, then repeat the alternating 1080p/4K
+comparison and verify that throughput, redraw cadence and image parity remain
+within the existing gates. Use the final benchmark summary linked above as the
+recorded starting point.
+
+All four implementation milestones are delivered in the separate validation
+build. The normal plugin has not been replaced. Renderer-core code, final color
+sampling and stock OpenUSD 26.05 remain unchanged. Remaining limitations are the
+named conservative structural fallbacks, whole-array comparisons for Hydra
+notices, copying the immutable picking table during topology changes, the 4K
+cancellation tradeoff, and the baseline-identical Cornell cross-frontend export
+threshold failure described above.
+
+## Milestone 3 � instance metadata deltas validated
+
+The initial milestone 3 validation build passed the scene bridge suite in
+11.20 seconds (`build/phase3-initial-test.log`). Single-source edits at 16, 128,
+1,024 and 16,384 placements visit one dependent placement and report zero
+canonical, picking, count, input-metadata and dependency rebuild records.
+This is an initial correctness result, not final milestone acceptance.
+
+The next candidate adds affected-prototype input-cache refresh, affected-prim
+picking reconstruction, immutable picking-pointer assertions and separate
+bookkeeping timing scopes. Full-array input comparisons remain explicit.
+Topology changes currently copy the immutable picking table before replacing
+its affected records; transform-only changes share the original table.
+`lastPlacementReconcileMilliseconds` is an enclosing scope; its input comparison
+and dependency subscopes must not be added to it as independent wall time.
+
+The final focused suite passed in 10.26 seconds (`build/phase3-final-test.log`).
+Stock usdview placement probes passed sequentially at 16, 128, 1,024 and 16,384
+placements (`build-fresh-validation/hydra-performance-phase3/scaling-pure`).
+The host probe distinguishes a position edit that must replay an earlier
+prototype change from a pure position edit; the initial combined assertion
+failed because it included that required replay. Both operations remain recorded.
+The preserved milestone 3 DLL SHA-256 is
+`eae59b227c88df72d7643f16ad2029922babc34d86d69cb9764f4bad4447fd61`.
+Final full-suite and image/host regression checks remain due after milestone 4.
+
+## Four-phase performance plan, 2026-10-03 — milestone 1 performance gate passed
+
+This follow-up is limited to refinement overhead, geometric-only AOV rendering,
+instance bookkeeping, and incremental prototype/subtree/rename transactions, in
+that order. Later milestones remain pending until the first performance gate
+passes. The renderer core and final color sampling are unchanged.
+
+The refinement candidate caches the interleaved tile schedule and replaces
+64-tile execution barriers with one pass-wide TBB job. A coordinator consumes
+completed-tile flags at approximately 100 ms intervals; only intermediate
+publications construct immutable tile payloads. Completion publishes the exact
+accumulated image directly. Cancellation drains the job before its captured
+buffers or scene can be released. Separate scopes measure summed ray/AOV worker
+time and coordinator wait, payload, publication, and final-commit wall time.
+
+Pilot measurements exposed two presentation costs after removing the rendering
+barriers. The candidate now reuses same-size GPU source textures, batches up to
+1,024 tiles per atlas, and destroys retired tile packets outside the buffer
+publication lock. These preserve partial updates, background composition, the
+unchanged-redraw upload cache, and the stock-format fallback.
+
+The preserved pre-regression DLL is
+`build/hydra-integration-baseline/bundle/plugin/hdPrism.dll`; the previous tiled
+DLL is `build-fresh-validation/hydra-display-candidate/bundle/plugin/hdPrism.dll`.
+Candidate versions and run artifacts are under
+`build-fresh-validation/hydra-performance-phase1`. The five-run comparison
+rotates all three variants, uses identical instanced Kitchen settings and a
+12-second observation window, and runs without concurrent validation jobs.
+The machine remains interactive, with uncontrolled background load.
+
+The harness now uses `perf_counter()` for Windows sub-millisecond timings and
+counts both partial packets and completed samples as display updates. Earlier
+partial-only gap calculations are not comparable. The tracked
+`tests/hydra/summarize_refinement.py` records binary hashes, per-run timings and
+work/memory counters, medians, and each acceptance criterion separately.
+
+The buffer and scene-bridge CTests passed 2/2 in 9.41 seconds
+(`build/phase1-focused-v5.log`). The cancellation test pauses after observing
+the first intermediate packet and retains that immutable packet directly;
+materializing an entire CPU display image before cancellation allowed the
+faster renderer to legitimately finish its pass during the test itself.
+
+Five 1080p runs per variant passed every performance threshold:
+
+| Median | Pre-regression | Previous tiled | Candidate |
+| --- | ---: | ---: | ---: |
+| First completed sample | 0.470 s | 0.580 s | 0.437 s |
+| Samples/second over observation | 3.330 | 2.417 | 3.834 |
+| p95 paint time | 27.68 ms | 8.70 ms | 8.81 ms |
+| p95 display-update gap | 138.26 ms | 131.69 ms | 133.99 ms |
+| Setting-change cancellation | 3.91 ms | 2.86 ms | 2.85 ms |
+
+The same candidate's five-run 4K comparison did not pass the paint-time gate:
+
+| Median | Pre-regression | Previous tiled | Candidate |
+| --- | ---: | ---: | ---: |
+| First completed sample | 1.775 s | 2.110 s | 1.395 s |
+| Samples/second over observation | 0.742 | 0.583 | 0.916 |
+| p95 paint time | 89.68 ms | 12.48 ms | 15.90 ms |
+| p95 display-update gap | 206.43 ms | 160.79 ms | 170.54 ms |
+| Setting-change cancellation | 14.61 ms | 8.49 ms | 19.82 ms |
+
+The other three 4K criteria passed. Raw measurements, hashes, and decisions are
+in `build-fresh-validation/hydra-performance-phase1/gate-v5/summary.json`; its
+candidate is preserved as `candidate-v5.dll`. Publication cadence refinement
+and broad correctness validation are still pending. These results must not be
+treated as completion of milestone 1 or the four-phase plan.
+
+The next candidate anchors publication deadlines rather than adding payload
+construction time to every 100 ms interval. Its focused 4K pilot recorded
+11.32 ms p95 paint time versus 12.46 ms for the tiled build; this single run is
+diagnostic, not acceptance. A subsequent exception-drain guard also releases
+paused workers if coordinator allocation fails. The resulting candidate is
+undergoing the full repeat in `gate-v7`.
+
+The cadence-corrected build passed all 33 CTests in 61.54 seconds
+(`build/phase1-ctest-v6.log`). After the exception-drain change, focused bridge
+and buffer tests passed 2/2 in 9.71 seconds (`build/phase1-focused-v7.log`).
+Filtered and bilinear 256-spp determinism, standalone/Hydra parity and
+PreviewSurface/MaterialX checks passed. All four final images match the
+preserved baselines exactly, with zero RMSE and luminance error. Evidence is
+under `hydra-performance-phase1/hydra-validation-{filtered,bilinear}` and
+`build/phase1-parity-v7b.log`. The first launcher attempt used the unwritable
+default user cache; the successful rerun explicitly uses `build/test-cache`.
+
+The real usdview presentation probe also passed on this candidate, covering
+zero uploads on unchanged redraws, selection/background changes, normal-AOV
+fallback, resize/cancellation, and a 2049-by-2049 partial display. Evidence is
+under `hydra-performance-phase1/ui/presentation` and
+`build/phase1-presentation-v7.log`.
+
+The final five alternating runs per variant/resolution passed all four gates
+at both resolutions (`hydra-performance-phase1/gate-v7/summary.json`). The
+accepted candidate DLL is preserved as `candidate-v7.dll`, SHA-256
+`b37a6aa4b7b9f7209ec27ecb6dfe822d9e80f17b8009e8be07b231644ad00cc9`.
+
+| Resolution / median | Pre-regression | Previous tiled | Accepted candidate |
+| --- | ---: | ---: | ---: |
+| 1080p first completed sample | 0.467 s | 0.572 s | 0.429 s |
+| 1080p samples/second | 3.408 | 2.499 | 3.917 |
+| 1080p p95 paint | 25.85 ms | 9.10 ms | 8.47 ms |
+| 1080p p95 display gap | 132.37 ms | 131.90 ms | 127.12 ms |
+| 1080p cancellation | 4.38 ms | 2.85 ms | 2.95 ms |
+| 4K first completed sample | 1.762 s | 2.062 s | 1.395 s |
+| 4K samples/second | 0.669 | 0.583 | 0.917 |
+| 4K p95 paint | 94.08 ms | 12.26 ms | 10.87 ms |
+| 4K p95 display gap | 207.27 ms | 159.57 ms | 160.81 ms |
+| 4K cancellation | 16.08 ms | 6.81 ms | 20.73 ms |
+
+The accepted candidate improves the measured first-sample and throughput
+regression while preserving redraw cadence. Cancellation remains bounded by
+draining worker tasks and any complete-frame commit already in progress; the
+4K cancellation median is worse than the tiled reference and is not claimed
+as an improvement. Raw memory/work counters and summed worker versus wall
+timings remain in each run's `cadence.json` and the summary. The candidate is
+accepted against the specified first-sample/throughput/paint/gap thresholds;
+milestones 2–4 remain pending.
+
+### Milestone 2 — geometric-only rendering
+
+Implemented classification before preview/color-pass allocation. Supported
+geometric-only requests generate the same deterministic center rays directly,
+resolve shared native AOV planes, and publish one complete pass. Color tracing,
+preview, refinement delay, color scratch and persistent RNG storage are skipped.
+Completed deterministic output is unaffected by sample-budget-only changes;
+adding color resets accumulation with the existing seed rules. Unsupported-only
+requests publish their clear values without ray work. Reused unsupported
+buffers explicitly stage their requested clear, preserving immutable old maps.
+
+Focused bridge/buffer tests passed 2/2 in 9.63 seconds
+(`build/phase2-focused-final.log`). They compare all nine supported geometric
+outputs byte-for-byte against mixed renders, with duplicate destinations,
+repeated bindings, null color, unsupported outputs and depth-of-field enabled.
+They verify zero extra color rays/previews, zero color scratch/RNG storage,
+shared requested-only staging, retained maps, sample-budget preservation,
+fresh color accumulation after rebinding, changed unsupported clears and exact
+integer clears of 16,777,217. A fresh 37-by-29 geometric-only fixture verifies
+one pass, camera/scene invalidation and zero color work. A 4097-by-2049 pass
+is canceled after center-ray work begins, preserving its complete clear and
+withholding convergence; resize/restart then succeeds. The refined quadrant
+assertion also passes for distributed intermediate color packets.
+
+The real usdview presentation/AOV-switching probe passed
+(`build/phase2-presentation.log`, artifacts under
+`hydra-performance-phase1/ui/presentation-phase2`). The milestone binary is
+preserved at `build-fresh-validation/hydra-performance-phase2/hdPrism.dll`.
+Milestones 3–4 and the final broad validation remain pending.
+
+## Hydra integration improvements, 2026-10-03
+
+The integration scope covers requested-only geometric AOV staging, cached GPU
+presentation, interleaved refinement, sparse instance edits, incremental
+instance-count/subset changes, and an opt-in hidden-geometry budget. Render
+regions and additional USD geometry features are outside this change.
+
+The `prism-hydra-fresh` build completed successfully in
+`build-fresh-validation`. The usual `build` plugin was still loaded by an
+existing usdview process, so it was not replaced. The fresh plugin SHA-256 is
+`a8aff0383ad5da31568f65362c770e392660e4e50cdeff4b2cfa4a0f85cbc814`.
+
+All 33 CTest tests passed in 68.74 seconds; the log is
+`build/hydra-integration-final-ctest.log`. The expanded bridge tests cover AOV
+subsets and repeated destinations, exact typed IDs, odd-size tile coverage,
+instance edits and count changes, and hidden-geometry eviction/restoration with
+retained immutable frames. Budget tests include shared storage, LRU ordering,
+edits while evicted, purpose changes, zero/default budgets and pinned overage.
+
+Both filtered and bilinear 256-spp validation runs passed determinism,
+standalone/Hydra parity, and PreviewSurface/MaterialX checks. All four final
+standalone/Hydra images also matched their preserved per-renderer baselines
+exactly, with zero RMSE and zero luminance error. Baselines are under
+`build/hydra-integration-baseline/hydra-validation-{filtered,bilinear}`; final
+results are under `build-fresh-validation/hydra-validation-{filtered,bilinear}`.
+
+The real usdview presentation probe passed with the fresh plugin. Twelve
+unchanged paints left CPU-to-GPU upload bytes unchanged at 21,199,920, while
+the skipped-upload counter rose from 89 to 115. Selection, deselection and
+background changes added no image uploads. The probe also exercised a normal
+AOV fallback and return to color, camera/resize cancellation, and partial
+presentation at an odd 2049-by-2049 resolution. That partial update used 17
+atlas draws and 17,825,792 uploaded atlas bytes. Artifacts are under
+`build-fresh-validation/hydra-display-candidate/presentation`.
+
+The default 256-spp background probe also passed, including visible-dome,
+white/black hidden-dome viewport checks and actual FrameRecorder PNG/EXR exports
+with transparent background alpha. Artifacts are under
+`build-fresh-validation/hydra-display-candidate/background-default-lazy`.
+The harness now forces the initial framebuffer/engine for hidden Qt windows and
+imports `UsdAppUtils` immediately before recorder creation. Importing it during
+testusdview's initial script loading caused a plugin-load failure in this
+environment; the same plugin bundle passed after the import was deferred.
+
+The existing usdview smoke and motion bodies passed against the same fresh
+binary, using a wrapper to initialize the hidden viewport before their normal
+steps. Smoke covered picking/selection, camera preview, time/geometry/material/
+visibility changes, superseded texture preparation, AOV switching, resize and
+renderer recreation. All 48 held-button truck/orbit motion events updated the
+image and camera without rebuilding geometry, then converged to 16 spp after
+release. Evidence is under `build-fresh-validation/hydra-integration-ui`,
+including `smoke-motion-results.json`, `smoke/interaction-timings.json` and
+`motion/motion.json`. Those interaction timings had concurrent validation load
+and are diagnostic only.
+
+The fresh-process structural probe passed all 76 operations across 16, 128,
+1,024 and 16,384 placements. At every size a single-source position edit visited
+and updated exactly one placement. Count-add attached one placement without
+allocating a new TLAS, rebuilding prototype geometry or incrementing the
+placement-topology fallback counter. Count-remove can reuse a bank that already
+has the requested count and therefore report zero detaches. Picking and
+structural correctness checks passed. Use
+`build-fresh-validation/hydra-integration-structural/fresh-run/results.json`
+and `results_summary.json`; the parent directory contains an unsuccessful
+launcher attempt.
+
+These checks establish correctness and reduced work, not a general timing
+speedup. Whole-array instance comparisons remain linear: the one-source edit
+reported 33, 257, 2,049 and 32,769 compared elements respectively. Hidden geometry
+has a soft budget over unique converted geometry storage; retained frames may
+pin storage above the limit. The default `hiddenGeometryBudgetMiB = 0` is
+unlimited. GPU upload counters describe the optimized Float32 RGBA/depth path;
+other presentation formats use the stock fallback.
+
+### Repeated viewport comparison
+
+Two alternating baseline/candidate pairs at each resolution completed without
+probe errors on the instanced Kitchen scene. Each fresh process used the same
+12-second observation interval, with hidden-window initialization outside that
+interval. Other agent build/test jobs were idle; this remained an interactive
+machine with uncontrolled background load. Per-run data and phase counters are
+in `build-fresh-validation/hydra-display-candidate/alternating-benchmarks/summary.json`.
+Each pair of values below represents the two runs, not an average.
+
+| Resolution / measurement | Baseline runs | Candidate runs |
+| --- | --- | --- |
+| 1080p p95 paint time | 140 / 78 ms | 16 / 31 ms |
+| 1080p first completed sample | 0.469 / 0.641 s | 0.796 / 0.937 s |
+| 1080p completed samples in 12 s | 12 / 18 | 19 / 13 |
+| 4K p95 paint time | 134.6 / 131.4 ms | 31 / 18.25 ms |
+| 4K first completed sample | 3.031 / 2.953 s | 3.797 / 3.500 s |
+| 4K completed samples in 12 s | 5 / 5 | 3 / 4 |
+
+The candidate reduced geometric staging from 44 to 16 bytes per pixel for
+usdview's bound AOV set: 91,238,400 to 33,177,600 bytes at 1080p and 364,953,600
+to 132,710,400 bytes at 4K, a 63.6% reduction. Candidate full-frame CPU
+presentation materialization remained zero; tile generation and atlas packing
+still copy pixel data. Reported zero median paint times mean below the harness
+timer's approximately 15-16 ms resolution, not literally zero work.
+
+These runs show shorter slow redraws and lower staging memory, with a
+first-sample regression at both resolutions and lower 4K sample throughput.
+At 4K, the first trace scope rose from 2,294 / 2,311 ms to 3,193 / 2,989 ms,
+and commit rose from 147 / 135 ms to 209 / 170 ms. The trace scope includes tile
+wave scheduling, tracing, payload construction and partial publication, so it
+does not isolate the cause. Profiling those phases is the next performance
+priority; these results do not support a general rendering speedup claim.
 
 ## Baseline
 

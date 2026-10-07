@@ -17,7 +17,7 @@ LEVELS = {
     "identical_materials": (1, 16, 64),
     "color_variants": (1, 16, 64),
     "structures": (1, 4, 16),
-    "placements": (16, 128, 1024),
+    "placements": (16, 128, 1024, 16384),
     "partition": (1, 16, 128),
     "textures_alias": (1, 8, 32),
     "textures_unique": (1, 8, 32),

@@ -275,6 +275,12 @@ def testUsdviewInputFunction(appController):
         value = [Gf.Vec3f(position) for position in original_positions]
         value[0] += Gf.Vec3f(.001, 0, 0)
         assert value != original_positions, "Point-instancer edit did not change its position array"
+        # The preceding operation changes prototype points. Bring the second
+        # bank through that replay before measuring a pure position update;
+        # otherwise its required geometry/count work is attributed to this edit.
+        replay_positions = [Gf.Vec3f(position) for position in original_positions]
+        replay_positions[0] += Gf.Vec3f(0, .001, 0)
+        edit("position-with-prototype-bank-replay", lambda: attribute.Set(replay_positions))
         edit("one-point-instance-position", lambda: attribute.Set(value))
         row = rows[-1]
         before, after = row["before"], row["after"]
@@ -283,6 +289,14 @@ def testUsdviewInputFunction(appController):
         assert transforms_updated > 0, "Point edit did not update a placement transform"
         assert transforms_updated <= records_visited, (
             "Updated placement transforms exceed visited placement records")
+        assert records_visited == 1, (
+            f"One source-position edit visited {records_visited} placement records")
+        assert after.get("lastInstanceArrayElementsScanned", 0) >= len(original_positions), (
+            "Whole-array change detection was not included in diagnostics")
+        for counter in ("lastCanonicalRecordsVisited", "lastPickingRecordsVisited",
+                        "lastCountRecordsVisited", "lastInputMetadataPrototypesVisited",
+                        "lastDependencyPlacementsVisited"):
+            assert after.get(counter) == 0, f"Point edit performed unrelated metadata work: {counter}={after.get(counter)}"
         assert after.get("prototypeBuildCount") == before.get("prototypeBuildCount"), (
             "Point-instancer position edit rebuilt prototype geometry")
         assert after.get("topLevelSceneBuilds") == before.get("topLevelSceneBuilds"), (
@@ -292,6 +306,7 @@ def testUsdviewInputFunction(appController):
         row["stablePlacementEvidence"] = {
             "placementTransformsUpdated": transforms_updated,
             "placementRecordsVisited": records_visited,
+            "instanceArrayElementsScanned": after.get("lastInstanceArrayElementsScanned"),
             "prototypeBuildsBefore": before.get("prototypeBuildCount"),
             "prototypeBuildsAfter": after.get("prototypeBuildCount"),
             "topLevelSceneBuildsBefore": before.get("topLevelSceneBuilds"),
@@ -301,7 +316,7 @@ def testUsdviewInputFunction(appController):
         }
         write_probe()
 
-        # Exercise the documented count/topology fallback separately from
+        # Exercise incremental count reconciliation separately from
         # stable-count instance movement. Batch both required arrays so each
         # probe represents one logical edit.
         count_base_positions = list(attribute.Get())
@@ -330,16 +345,24 @@ def testUsdviewInputFunction(appController):
             prototype_fallbacks_before = rows[-1]["before"].get(
                 "prototypeUpdateFallbacks", 0)
             prototype_fallbacks_after = after.get("prototypeUpdateFallbacks", 0)
-            if (topology_fallbacks_after > topology_fallbacks_before or
-                    prototype_fallbacks_after > prototype_fallbacks_before):
-                assert after.get("lastRebuildReason"), (
-                    f"{label}: fallback counter advanced without a named rebuild reason")
-            rows[-1]["topologyFallbackEvidence"] = {
+            assert topology_fallbacks_after == topology_fallbacks_before, (
+                f"{label}: ordinary count change took a placement fallback")
+            assert prototype_fallbacks_after == prototype_fallbacks_before, (
+                f"{label}: ordinary count change took a prototype fallback")
+            assert after.get("topLevelSceneBuilds") == rows[-1]["before"].get("topLevelSceneBuilds"), (
+                f"{label}: ordinary count change allocated a top-level scene")
+            assert after.get("prototypeBuildCount") == rows[-1]["before"].get("prototypeBuildCount"), (
+                f"{label}: ordinary count change rebuilt prototype geometry")
+            rows[-1]["topologyReconciliationEvidence"] = {
                 "lastRebuildReason": after.get("lastRebuildReason"),
                 "expectedInstanceCount": expected_count,
                 "instanceCount": after.get("instanceCount"),
                 "meshCount": after.get("meshCount"),
                 "triangleCount": after.get("triangleCount"),
+                "placementsAttached": after.get("lastPlacementTopologyAttached"),
+                "placementsDetached": after.get("lastPlacementTopologyDetached"),
+                "topLevelSceneBuildsBefore": rows[-1]["before"].get("topLevelSceneBuilds"),
+                "topLevelSceneBuildsAfter": after.get("topLevelSceneBuilds"),
                 "placementTopologyFallbacksBefore": rows[-1]["before"].get(
                     "placementTopologyFallbacks"),
                 "placementTopologyFallbacksAfter": after.get(

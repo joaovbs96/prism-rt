@@ -53,7 +53,7 @@ bool PrismRenderBuffer::Allocate(GfVec3i const &d, HdFormat format, bool ms)
     _pixels = std::make_shared<std::vector<uint8_t>>(
         static_cast<size_t>(_width) * _height * HdDataSizeOfFormat(_format), 0);
     _frame.reset();
-    _refinementPixels.reset(); _refinementFrame.reset();
+    _ClearRefinement();
     _presentationSource.reset();
     _presentationPixels.reset();
     _workingPixels = *_pixels;
@@ -76,7 +76,7 @@ void PrismRenderBuffer::_Deallocate()
     _format = HdFormatInvalid;
     _pixels.reset();
     _frame.reset();
-    _refinementPixels.reset(); _refinementFrame.reset();
+    _ClearRefinement();
     _presentationSource.reset();
     _presentationPixels.reset();
     _workingPixels.clear();
@@ -142,13 +142,65 @@ void PrismRenderBuffer::SetPresentationPixels(
 {
     std::lock_guard lock(_mutex);
     if (!pixels || !frame || frame != _frame || !_pixels || pixels->size()!=_pixels->size()) return;
+    _ClearRefinement();
     _refinementPixels=std::move(pixels); _refinementFrame=std::move(frame);
+}
+
+void PrismRenderBuffer::_ClearRefinement()
+{
+    _refinementPixels.reset(); _refinementFrame.reset();
+    _presentationSnapshot.reset();
+    _materializedSnapshot.reset(); _materializedPixels.reset();
+    _presentationSource.reset(); _presentationPixels.reset();
+}
+
+void PrismRenderBuffer::SetPresentationSnapshot(
+    std::shared_ptr<const PresentationSnapshot> snapshot)
+{
+    if (!snapshot) return;
+    std::lock_guard lock(_mutex);
+    auto const &base = snapshot->base;
+    if (base.pixels != _pixels || !base.frame || base.frame != _frame ||
+        base.width != _width || base.height != _height ||
+        base.format != HdFormatFloat32Vec4 || _format != base.format) return;
+    for (auto const &tile : snapshot->tiles) {
+        if (!tile) continue;
+        if (!tile->width || !tile->height || tile->width > 32 || tile->height > 32 ||
+            tile->x >= _width || tile->y >= _height ||
+            tile->width > _width-tile->x || tile->height > _height-tile->y ||
+            tile->rgba.size() != size_t(tile->width)*tile->height*4) return;
+    }
+    if (_presentationSnapshot && _presentationSnapshot->base.pixels == base.pixels &&
+        (snapshot->pass < _presentationSnapshot->pass ||
+         (snapshot->pass == _presentationSnapshot->pass &&
+          snapshot->revision <= _presentationSnapshot->revision))) return;
+    _ClearRefinement();
+    _presentationSnapshot = std::move(snapshot);
+}
+
+PrismRenderBuffer::PresentationState PrismRenderBuffer::CapturePresentationState() const
+{
+    std::lock_guard lock(_mutex);
+    PresentationState result;
+    result.raw = Capture();
+    result.background = _presentationClearColor;
+    result.hasBackground = _hasPresentationClearColor &&
+        result.raw.format == HdFormatFloat32Vec4;
+    if (_presentationSnapshot &&
+        _presentationSnapshot->base.pixels == result.raw.pixels &&
+        _presentationSnapshot->base.frame == result.raw.frame &&
+        result.raw.width == _width && result.raw.height == _height &&
+        result.raw.format == _format) result.snapshot = _presentationSnapshot;
+    if (_refinementPixels && result.raw.frame == _refinementFrame &&
+        result.raw.width == _width && result.raw.height == _height &&
+        result.raw.format == _format) result.legacyPixels = _refinementPixels;
+    return result;
 }
 
 void PrismRenderBuffer::ClearPresentationPixels()
 {
     std::lock_guard lock(_mutex);
-    _refinementPixels.reset(); _refinementFrame.reset();
+    _ClearRefinement();
 }
 
 PrismRenderBuffer::ReadView PrismRenderBuffer::CapturePresentation() const
@@ -157,12 +209,28 @@ PrismRenderBuffer::ReadView PrismRenderBuffer::CapturePresentation() const
     GfVec4f background;
     {
         std::lock_guard lock(_mutex);
-        view = Capture();
+        auto const state = CapturePresentationState();
+        view = state.raw;
         // A mapper may still pin an earlier camera/allocation. Never display
         // a progressive color estimate with that older geometric frame.
-        if (_refinementPixels && view.frame == _refinementFrame &&
-            view.width == _width && view.height == _height && view.format == _format)
-            view.pixels = _refinementPixels;
+        if (state.legacyPixels) view.pixels = state.legacyPixels;
+        if (state.snapshot) {
+            if (_materializedSnapshot.lock() != state.snapshot || !_materializedPixels) {
+                auto pixels = std::make_shared<std::vector<uint8_t>>(*view.pixels);
+                _presentationCopyBytes.fetch_add(pixels->size(), std::memory_order_relaxed);
+                for (auto const &tile : state.snapshot->tiles) {
+                    if (!tile) continue;
+                    const size_t rowBytes = size_t(tile->width)*sizeof(float)*4;
+                    for (unsigned y=0; y<tile->height; ++y)
+                        std::memcpy(pixels->data() +
+                            (size_t(tile->y+y)*view.width+tile->x)*sizeof(float)*4,
+                            tile->rgba.data()+size_t(y)*tile->width*4, rowBytes);
+                }
+                _materializedPixels = std::move(pixels);
+                _materializedSnapshot = state.snapshot;
+            }
+            view.pixels = _materializedPixels;
+        }
         if (!_hasPresentationClearColor || view.format != HdFormatFloat32Vec4 || !view.pixels)
             return view;
         background = _presentationClearColor;
@@ -182,7 +250,10 @@ PrismRenderBuffer::ReadView PrismRenderBuffer::CapturePresentation() const
         float rgba[4];
         std::memcpy(rgba, view.pixels->data() + offset, sizeof(rgba));
         if (rgba[3] == 1.0f) continue;
-        if (!pixels) pixels = std::make_shared<std::vector<uint8_t>>(*view.pixels);
+        if (!pixels) {
+            pixels = std::make_shared<std::vector<uint8_t>>(*view.pixels);
+            _presentationCopyBytes.fetch_add(pixels->size(), std::memory_order_relaxed);
+        }
         const float uncovered = 1.0f - std::clamp(rgba[3], 0.0f, 1.0f);
         for (size_t component = 0; component < 3; ++component)
             rgba[component] += background[component] * backgroundAlpha * uncovered;
@@ -206,7 +277,7 @@ void PrismRenderBuffer::Resolve() {}
 void PrismRenderBuffer::ResetSamples()
 {
     std::lock_guard lock(_mutex);
-    _refinementPixels.reset(); _refinementFrame.reset();
+    _ClearRefinement();
     std::fill(_accumulation.begin(), _accumulation.end(), 0.0f);
     std::fill(_sampleCounts.begin(), _sampleCounts.end(), 0);
     _converged.store(false);
@@ -312,7 +383,7 @@ void PrismRenderBuffer::PublishPreviewFloat(
     std::lock_guard lock(_mutex);
     _pixels = std::move(published);
     _frame = std::move(frame);
-    _refinementPixels.reset(); _refinementFrame.reset();
+    _ClearRefinement();
     _hasPublished = true;
 }
 
@@ -359,7 +430,7 @@ void PrismRenderBuffer::PublishPreviewInt(
     std::lock_guard lock(_mutex);
     _pixels = std::move(published);
     _frame = std::move(frame);
-    _refinementPixels.reset(); _refinementFrame.reset();
+    _ClearRefinement();
     _hasPublished = true;
 }
 
@@ -420,7 +491,7 @@ void PrismRenderBuffer::Clear(VtValue const &value)
         std::copy(v.data(), v.data() + 4, f);
     } else if (value.IsHolding<int>()) { i[0] = value.UncheckedGet<int>(); ints = true; }
     std::lock_guard lock(_mutex);
-    _refinementPixels.reset(); _refinementFrame.reset();
+    _ClearRefinement();
     auto clearWorking = [&] {
         std::fill(_accumulation.begin(), _accumulation.end(), 0.0f);
         std::fill(_sampleCounts.begin(), _sampleCounts.end(), 0);
@@ -436,7 +507,7 @@ void PrismRenderBuffer::Clear(VtValue const &value)
     clearWorking();
     _pixels = std::make_shared<std::vector<uint8_t>>(_workingPixels);
     _frame.reset();
-    _refinementPixels.reset(); _refinementFrame.reset();
+    _ClearRefinement();
     _hasPublished = true;
 }
 
@@ -482,18 +553,22 @@ void PrismRenderBuffer::_FillWorking(VtValue const &value)
         std::memcpy(row + static_cast<size_t>(y) * rowBytes, row, rowBytes);
 }
 
-void PrismRenderBuffer::BeginFrame(VtValue const &value)
+void PrismRenderBuffer::BeginFrame(VtValue const &value, bool clearWorking)
 {
     std::lock_guard lock(_mutex);
-    _refinementPixels.reset(); _refinementFrame.reset();
+    _ClearRefinement();
     std::fill(_accumulation.begin(), _accumulation.end(), 0.0f);
     std::fill(_sampleCounts.begin(), _sampleCounts.end(), 0);
     // Every supported AOV overwrites every working pixel in the first full
     // pass.  Once a preview/complete frame exists, clearing that hidden image
     // on the UI thread is redundant and expensive at viewport resolutions.
-    if (_hasPublished) return;
-    _FillWorking(value);
-    _pixels = std::make_shared<std::vector<uint8_t>>(_workingPixels);
+    if (_hasPublished && !clearWorking) return;
+    if (clearWorking && value.IsEmpty() && _pixels)
+        _workingPixels = *_pixels;
+    else
+        _FillWorking(value);
+    if (!_hasPublished)
+        _pixels = std::make_shared<std::vector<uint8_t>>(_workingPixels);
 }
 
 bool PrismRenderBuffer::NeedsInitialClear() const
@@ -520,13 +595,19 @@ void PrismRenderBuffer::Publish(Frame frame)
     auto next = std::make_shared<std::vector<uint8_t>>(std::move(_workingPixels));
     const auto size = next->size();
     std::shared_ptr<std::vector<uint8_t>> previous;
+    std::shared_ptr<const PresentationSnapshot> previousPresentation;
     {
         std::lock_guard lock(_mutex);
         previous = std::exchange(_pixels, std::move(next));
         _frame = std::move(frame);
-        _refinementPixels.reset(); _refinementFrame.reset();
+        // Releasing a pass can free thousands of tile allocations. Retire
+        // those outside the publication lock so a host Map never waits for
+        // tile destruction while trying to display the completed image.
+        previousPresentation = std::move(_presentationSnapshot);
+        _ClearRefinement();
         _hasPublished = true;
     }
+    previousPresentation.reset();
     if (previous && previous.use_count() == 1)
         _workingPixels = std::move(*previous);
     else

@@ -20,6 +20,7 @@
 #include "pxr/imaging/hd/lightSchema.h"
 #include "pxr/imaging/hd/renderSettingsSchema.h"
 #include "pxr/imaging/hd/selectionsSchema.h"
+#include "pxr/base/tf/diagnostic.h"
 
 #include <algorithm>
 #include <limits>
@@ -34,6 +35,7 @@ TfToken const _sampleClamp("prism:maxSampleRadiance");
 TfToken const _adaptivePreview("prism:adaptivePreview");
 TfToken const _domeCameraVisibility("domeLightCameraVisibility");
 TfToken const _sphereBatching("prism:sphereBatching");
+TfToken const _hiddenGeometryBudget("prism:hiddenGeometryBudgetMiB");
 TfToken const _previewTargetMs("prism:previewTargetMs");
 TfToken const _previewMaxDimension("prism:previewMaxDimension");
 TfToken const _refinementDelayMs("prism:refinementDelayMs");
@@ -183,6 +185,7 @@ HdRenderSettingDescriptorList PrismTaskDelegate::GetRenderSettingDescriptors() c
             {"Adaptive preview", _adaptivePreview, VtValue(true)},
             {"Dome light camera visibility", _domeCameraVisibility, VtValue(true)},
             {"Sphere batching (experimental)", _sphereBatching, VtValue(false)},
+            {"Hidden geometry budget (MiB, 0 unlimited)", _hiddenGeometryBudget, VtValue(0)},
             {"Preview target (ms)", _previewTargetMs, VtValue(33)},
             {"Preview maximum dimension", _previewMaxDimension, VtValue(96)},
             {"Refinement delay (ms)", _refinementDelayMs, VtValue(100)},
@@ -206,6 +209,7 @@ VtValue PrismTaskDelegate::GetRenderSetting(TfToken const &key) const
     if (key == _adaptivePreview) return VtValue(s.adaptivePreview);
     if (key == _domeCameraVisibility) return VtValue(s.domeLightCameraVisibility);
     if (key == _sphereBatching) return VtValue(s.sphereBatching);
+    if (key == _hiddenGeometryBudget) return VtValue(s.hiddenGeometryBudgetMiB);
     if (key == _previewTargetMs) return VtValue(s.previewTargetMs);
     if (key == _previewMaxDimension) return VtValue(s.previewMaxDimension);
     if (key == _refinementDelayMs) return VtValue(s.refinementDelayMs);
@@ -297,6 +301,13 @@ void PrismTaskDelegate::SetRenderSetting(TfToken const &key, VtValue const &valu
         s.domeLightCameraVisibility = _Get(value, s.domeLightCameraVisibility);
     else if (key == _sphereBatching)
         s.sphereBatching = _Get(value, s.sphereBatching);
+    else if (key == _hiddenGeometryBudget) {
+        if (!value.IsHolding<int>() || value.UncheckedGet<int>() < 0) {
+            TF_WARN("PrismRT: prism:hiddenGeometryBudgetMiB requires a non-negative integer; retaining the previous value");
+            return;
+        }
+        s.hiddenGeometryBudgetMiB = value.UncheckedGet<int>();
+    }
     else if (key == _previewTargetMs)
         s.previewTargetMs = std::clamp(_Get(value, s.previewTargetMs), 1, 1000);
     else if (key == _previewMaxDimension)
@@ -351,6 +362,16 @@ VtDictionary PrismTaskDelegate::GetRenderStats() const
         _taskContext->pickNanoseconds.load(std::memory_order_relaxed) / 1.0e6);
     result["pickCalls"] = VtValue(static_cast<int64_t>(
         _taskContext->pickCalls.load(std::memory_order_relaxed)));
+    result["presentationUploadBytes"] = VtValue(static_cast<int64_t>(
+        _taskContext->presentationUploadBytes.load(std::memory_order_relaxed)));
+    result["presentationUploadCalls"] = VtValue(static_cast<int64_t>(
+        _taskContext->presentationUploadCalls.load(std::memory_order_relaxed)));
+    result["presentationSkippedUploads"] = VtValue(static_cast<int64_t>(
+        _taskContext->presentationSkippedUploads.load(std::memory_order_relaxed)));
+    result["presentationAtlasBytes"] = VtValue(static_cast<int64_t>(
+        _taskContext->presentationAtlasBytes.load(std::memory_order_relaxed)));
+    result["presentationAtlasDraws"] = VtValue(static_cast<int64_t>(
+        _taskContext->presentationAtlasDraws.load(std::memory_order_relaxed)));
     return result;
 }
 bool PrismTaskDelegate::Pause() { _thread->PauseRender(); return true; }
@@ -635,9 +656,7 @@ void PrismTaskDelegate::PrimsRenamed(HdSceneIndexBase const &,
         auto previous = _knownPrimTypes.find(entry.oldPrimPath);
         TfToken oldType = previous == _knownPrimTypes.end() ? TfToken{} : previous->second;
         changes.push_back({prism::hydra::StructuralChange::Operation::Rename,
-            entry.oldPrimPath,oldType,{},true});
-        changes.push_back({prism::hydra::StructuralChange::Operation::Rename,
-            entry.newPrimPath,{},oldType,true});
+            entry.oldPrimPath,oldType,oldType,true,entry.newPrimPath});
         std::vector<std::pair<SdfPath, TfToken>> moved;
         for (auto it = _knownPrimTypes.lower_bound(entry.oldPrimPath);
              it != _knownPrimTypes.end() && it->first.HasPrefix(entry.oldPrimPath);) {

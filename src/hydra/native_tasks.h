@@ -28,6 +28,11 @@ struct TaskContext final {
     std::atomic<uint64_t> selectionOffsetCacheMisses{0};
     std::atomic<uint64_t> pickNanoseconds{0};
     std::atomic<uint64_t> pickCalls{0};
+    std::atomic<uint64_t> presentationUploadBytes{0};
+    std::atomic<uint64_t> presentationUploadCalls{0};
+    std::atomic<uint64_t> presentationSkippedUploads{0};
+    std::atomic<uint64_t> presentationAtlasBytes{0};
+    std::atomic<uint64_t> presentationAtlasDraws{0};
     std::atomic<uint64_t> selectionSceneRevision{0};
     std::atomic<uint64_t> instanceTopologyRevision{0};
 };

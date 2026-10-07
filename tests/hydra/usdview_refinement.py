@@ -9,6 +9,10 @@ import numpy as np
 from pxr import Sdf
 from pxr.Usdviewq.qt import QtGui, QtWidgets
 
+# Windows monotonic() can be quantized at the system tick; use the high
+# resolution performance counter for paint and first-sample comparisons.
+clock = time.perf_counter
+
 
 def testUsdviewInputFunction(appController):
     view = appController._stageView
@@ -31,11 +35,11 @@ def testUsdviewInputFunction(appController):
     view.makeCurrent()
     assert view.SetRendererPlugin("HdPrismRendererPlugin")
     view.SetRendererSetting("prism:samplesPerPixel", 1)
-    start = time.monotonic()
+    start = clock()
     while not view.IsRendererConverged():
         view.updateGL()
         QtWidgets.QApplication.processEvents()
-        assert time.monotonic() - start < 180, "Initial render did not converge"
+        assert clock() - start < 180, "Initial render did not converge"
         time.sleep(.005)
     initial_refinement = int(dict(view._renderer.GetRenderStats()).get("refinementPublishes", 0))
     view.SetRendererSetting("prism:samplesPerPixel", 10000)
@@ -45,14 +49,14 @@ def testUsdviewInputFunction(appController):
     rows = []
     frames = []
     screenshots = []
-    start = time.monotonic()
+    start = clock()
     next_capture = 0
     paint_rows = []
     original_paint = view.paintGL
     def observe_paint(*args, **kwargs):
-        paint_start = time.monotonic()
+        paint_start = clock()
         result = original_paint(*args, **kwargs)
-        paint_end = time.monotonic()
+        paint_end = clock()
         stats = dict(view._renderer.GetRenderStats())
         paint_rows.append({"time": paint_end - start,
                            "paintMs": (paint_end-paint_start)*1000,
@@ -63,16 +67,16 @@ def testUsdviewInputFunction(appController):
     previous_samples = -1
     previous_refinement = -1
     display_rows = []
-    while time.monotonic() - start < 12:
-        draw_start = time.monotonic()
+    while clock() - start < 12:
+        draw_start = clock()
         view.updateGL()
         QtWidgets.QApplication.processEvents()
-        draw_ms = (time.monotonic() - draw_start) * 1000
+        draw_ms = (clock() - draw_start) * 1000
         stats = dict(view._renderer.GetRenderStats())
-        now = time.monotonic() - start
+        now = clock() - start
         samples = stats.get("completedSamples", 0)
         refinement = stats.get("refinementPublishes", 0)
-        if refinement != previous_refinement:
+        if refinement != previous_refinement or samples != previous_samples:
             display_rows.append({"time": now, "samples": samples, "refinementPublishes": refinement})
             previous_refinement = refinement
         if samples != previous_samples:
@@ -82,7 +86,7 @@ def testUsdviewInputFunction(appController):
             image = view.grabFrameBuffer().convertToFormat(QtGui.QImage.Format_RGBA8888)
             raw = np.frombuffer(image.constBits(), dtype=np.uint8).reshape(image.height(), image.bytesPerLine())
             pixels = raw[:, :image.width()*4].copy()
-            frames.append({"time": time.monotonic()-start, "samples": samples,
+            frames.append({"time": clock()-start, "samples": samples,
                            "crc": zlib.crc32(pixels), "width": image.width(), "height": image.height()})
             if len(frames) in (1, 8, 24):
                 screenshots.append((output / f"screen-{len(frames)}.png", image.copy()))
@@ -92,7 +96,10 @@ def testUsdviewInputFunction(appController):
     # PNG compression is deliberately outside the measured event loop.
     for path, image in screenshots:
         image.save(str(path))
+    cancel_start = clock()
+    view.SetRendererSetting("prism:seed", 1)
+    cancellation_ms = (clock() - cancel_start) * 1000
     view.SetRendererSetting("prism:samplesPerPixel", max(1, int(previous_samples)))
-    result = {"stage": model.stage.GetRootLayer().identifier, "sampleChanges": rows, "screenFrames": frames, "displayChanges": display_rows, "initialRefinementPublishes": initial_refinement, "paints": paint_rows}
+    result = {"stage": model.stage.GetRootLayer().identifier, "sampleChanges": rows, "screenFrames": frames, "displayChanges": display_rows, "initialRefinementPublishes": initial_refinement, "paints": paint_rows, "settingCancellationMs": cancellation_ms}
     (output / "cadence.json").write_text(json.dumps(result, indent=2, default=str))
     print("Refinement cadence:", [(round(row["time"],3), row["stats"]["completedSamples"]) for row in rows])

@@ -127,6 +127,18 @@ int RunAuthoredSettingsTests()
 
         PrismTaskDelegate delegate;
         delegate.SetTerminalSceneIndex(index);
+        const TfToken hiddenBudget("prism:hiddenGeometryBudgetMiB");
+        Require(delegate.GetRenderSetting(hiddenBudget).UncheckedGet<int>() == 0,
+                "Hidden geometry budget must default to unlimited");
+        delegate.SetRenderSetting(hiddenBudget, VtValue(12));
+        Require(delegate.GetRenderSetting(hiddenBudget).UncheckedGet<int>() == 12,
+                "Hidden geometry budget was not applied");
+        delegate.SetRenderSetting(hiddenBudget, VtValue(-1));
+        delegate.SetRenderSetting(hiddenBudget, VtValue(2.0f));
+        delegate.SetRenderSetting(hiddenBudget, VtValue(std::string("2")));
+        Require(delegate.GetRenderSetting(hiddenBudget).UncheckedGet<int>() == 12,
+                "Invalid hidden geometry budget replaced the previous value");
+        delegate.SetRenderSetting(hiddenBudget, VtValue(0));
         delegate.Update();
         Require(delegate.GetRenderSetting(TfToken("prism:samplesPerPixel"))
                     .UncheckedGet<int>() == 23,

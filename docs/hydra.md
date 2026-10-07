@@ -46,6 +46,7 @@ python tests/hydra/validate.py
 | `prism:environmentSampling` | `mis` | Environment next-event sampling with MIS, or `bsdf` |
 | `prism:textureFiltering` | `filtered` | Footprint-based anisotropic mip filtering, or highest-resolution `bilinear` reference mode |
 | `prism:sphereBatching` | false | Experimental batches of at most 1,024 eligible analytic spheres; ordinary instancing remains the default |
+| `prism:hiddenGeometryBudgetMiB` | 0 | Soft budget for retained hidden converted geometry; zero keeps unlimited retention |
 | `prism:resourceRevision` | 0 | Increment to invalidate cached material and external texture fingerprints and reload dome resources without rebuilding geometry |
 | `prism:selectionOutline` | true | Draw selection as an outline; false uses filled highlighting |
 | `prism:selectionOutlineRadius` | 2 | Outline thickness in pixels |
@@ -121,13 +122,59 @@ Camera changes immediately trace and display a coarse one-sample preview for the
 `tests/hydra/usdview_motion.py` tests held-button trucking and orbiting through usdview's mouse-event handlers, checks that the rendered image changes on every input event without rebuilding geometry, and verifies refinement after release. It records screenshots and frame timings in `build/hydra-motion` (or `PRISM_VALIDATION_DIR`). The controlled parity fixture also checks that the panel moves in the expected screen direction, so changing noise or GL overlays cannot substitute for actual camera feedback. Run it with the installed USD runtime and `testusdview --testScript`, using either `tests/hydra/fixtures/parity.usda` or the OpenChessSet stage.
 
 During full-resolution refinement, the Float32 RGBA viewport can publish
-immutable partial-row display updates while a pass is still running. These
+immutable 32-by-32 tile updates while a pass is still running. Interleaved
+tile order spreads refinement across the image. The schedule is cached by
+resolution, and one pass-wide TBB job reports completed tiles to a publication
+coordinator at approximately 100 ms intervals. Presentation payloads are built
+only for completed tiles needed by an intermediate publication. A pass that
+finishes before publication is due publishes its exact image directly. These
 updates affect only presentation: raw AOV mapping, saved render pixels,
 accumulation state, and random-number sequences remain tied to complete
 passes. A canceled or replaced frame discards its partial display image, and
 deterministic geometric AOVs continue to come from the committed full render.
-Compact hit staging and on-demand bound-AOV resolution avoid retaining large
-per-pixel hit records for the progressive viewport path.
+Deterministic geometric staging retains one typed output plane per distinct
+supported bound AOV. Color-only bindings allocate no geometric scratch;
+depth alone or an individual ID AOV uses four bytes per pixel. Duplicate
+bindings share staging, and null/unsupported bindings add no scratch.
+
+When deduplicated bindings contain supported geometric outputs and no color
+destination, the delegate renders one deterministic center-ray pass. It skips
+color preview/path tracing, color-pass scratch, persistent color RNG state and
+the refinement delay. Geometric outputs use the same resolution, coordinate
+systems, miss values and typed integer storage as mixed color/geometric
+renders. They converge after publication regardless of the color sample
+budget; changing only that budget does not repeat a completed deterministic
+pass. Camera, scene, allocation and binding changes invalidate the outputs,
+and adding color starts fresh color accumulation with the usual seed rules.
+Unsupported-only requests warn and publish their clear values without rays.
+Cancellation leaves the previous complete AOV (or initial clear) visible and
+does not publish partially resolved geometric data.
+
+`colorTracedPixels` counts color-ray calls, including preview and canceled
+work; `geometricOnlyPixels` counts resolved center rays in non-color requests.
+Both aggregate once per task. `colorPassScratchBytes` and
+`colorRngStorageBytes` describe storage at the last render invocation; both
+are zero for geometric-only requests.
+
+The native presentation task caches a pristine GPU source and skips unchanged
+CPU uploads. Completed display tiles are packed into atlases of at most
+1024-by-1024 pixels and drawn in batches. Complete images reuse the GPU source
+allocation when dimensions match; selection, background compositing, and color correction use separate
+working targets. CPU callers can still request a full immutable presentation,
+which is materialized lazily. Complete passes replace partial estimates with
+the exact accumulated image. Integer and other non-RGBA display formats retain
+the stock OpenUSD upload path.
+
+Pass profiling separates ray work and geometric-AOV resolution (summed worker
+times, `lastPassRayWorkerMilliseconds` and `lastPassAovWorkerMilliseconds`)
+from coordinator waiting, payload construction, and intermediate publication
+(`lastPassWaitMilliseconds`, `lastPassPayloadMilliseconds`, and
+`lastPassPublicationMilliseconds`). Worker timings are aggregated per task,
+without per-pixel atomics. `lastPassTraceMilliseconds` is the enclosing wall
+time, and `lastPassCommitMilliseconds` measures final buffer commit. Worker
+times overlap each other and coordinator waiting; they must not be added to
+wall timings as though they were sequential phases. Cancellation drains the
+pass job before releasing its staging or scene references.
 
 usdview's **default dome** is OpenUSD's Stinson Beach environment, not PrismRT's bundled indoor EXR. It uses intensity 1 and exposure 0. Hydra respects these authored values without the standalone environment's historical extra factor of two. To reproduce standalone lighting, use the same HDR and account for that factor (for example, standalone exposure -0.5 corresponds to a USD dome exposure +0.5 at intensity 1).
 
@@ -137,7 +184,21 @@ Scene inputs are captured on the owning thread in incremental slices, then prepa
 
 Local-space mesh prototypes are shared by Embree instances with composed placement transforms; nested USD instances do not require deep Embree instance stacks. Two top-level scene versions replay outstanding changes only while inactive. Transform and visibility edits update dependent placements; material and dome updates retain geometry. Known geometry edits replace affected prototypes; unknown locators conservatively rebuild with a recorded reason. Hidden and purpose-filtered prototypes, including zero-instance prototypes, retain their geometry and material dependencies. Visibility, purpose and render-tag edits change placement eligibility without geometry conversion; empty render tags continue to include geometry and render purposes. Initial hidden batch-eligible spheres use ordinary disabled placements; changing visible batch membership records a named conservative fallback. Camera-only changes reuse geometry. `enabledPlacementCount` counts enabled ordinary instances (sphere batch entries have separate counts); `topLevelSceneBuilds` counts actual top-level scene allocations, including spare and canceled work. Subdivision meshes use their polygon control hull. Spheres remain analytic; other supported implicit shapes use USD's mesh-conversion filter.
 
-Disabled placements retain geometry and instance metadata, so scenes with many hidden or purpose-filtered prototypes can use more memory than scenes that omit them. The Kitchen smoke scene contained no disabled placements, and its process-level peak-memory samples were too noisy to estimate this overhead.
+Disabled placements retain geometry and instance metadata by default. Setting
+`prism:hiddenGeometryBudgetMiB` to a positive integer enables least-recently-used
+eviction of hidden, purpose-filtered, and zero-instance prototype geometry.
+The budget counts unique converted mesh arrays and analytic sphere payloads,
+deduplicated across snapshot banks; it excludes captured source data, materials,
+textures, and Embree acceleration structures. It is neither a process-memory
+cap nor a peak-loading limit. Negative or non-integer values warn and preserve
+the previous setting.
+
+Eviction occurs only during safe bank preparation or inactive-bank maintenance.
+Published frames remain immutable, and pinned geometry can keep usage above
+the target. A budget-only change does not restart accumulation; idle displayed
+snapshots may continue retaining geometry. Showing an evicted prototype restores
+it from the latest captured geometry and material data before publication.
+Increasing or disabling the budget does not eagerly restore cold geometry.
 
 Experimental sphere batching accepts uninstanced spheres with translation and positive uniform scale. Rotated, mirrored, nonuniformly scaled, and instanced spheres retain ordinary instances to preserve local UV frames and picking identity. Affected batches are bounded at 1,024 entries; eligibility changes can trigger a conservative rebuild. Keep batching disabled unless measurements on the intended scene justify it.
 
@@ -163,12 +224,49 @@ USD dome lighting is read when `--env` is absent. Explicit `--env` overrides it 
 
 `GetRenderStats()` exposes material conversion/generation/compilation counters and timings, worker CPU time separately from batch elapsed time, prototype/placement rebuild counters, Embree timings, and buffer publication/mapping timing. Set `PRISM_PROFILE_BUFFERS=1` to measure worker buffer-write time; workers accumulate timings locally and update each buffer once per tile, while ordinary rendering leaves this instrumentation disabled. Material compilation concurrency is configured with `PRISM_MATERIAL_THREADS`; the default is half the hardware threads capped at four, with a minimum of one. `PRISM_MDL_VERBOSE=1` enables compiler diagnostics that would otherwise obscure loading measurements.
 
-Supported prototype edits repoint dependent instances while retaining the top-level scene. Placement identity includes every instancer path, authored source index and duplicate occurrence; source-order changes refresh picking ordinals without replacing unchanged instances. Changed instance counts, unsupported geometry changes and sphere batch membership use named conservative fallbacks. `lastPlacementRecordsVisited`, `lastPlacementTransformsUpdated`, `lastVisibilityPlacementsUpdated`, `lastPrototypePathsUpdated` and `lastPrototypePlacementsRepointed` distinguish visited records from changed work across each bank's outstanding journal. `topLevelSceneCommits` counts commits separately from scene allocations. Dependency lookup limits geometry updates; picking metadata, geometry ownership cleanup and cached-count refresh may still scan retained scene data.
+Supported prototype edits repoint dependent instances while retaining the top-level scene. Placement identity includes every instancer path, authored source index and duplicate occurrence; source-order changes refresh picking ordinals without replacing unchanged instances. Unsupported geometry changes and sphere batch membership use named conservative fallbacks. `lastPlacementRecordsVisited`, `lastPlacementTransformsUpdated`, `lastVisibilityPlacementsUpdated`, `lastPrototypePathsUpdated` and `lastPrototypePlacementsRepointed` distinguish visited records from changed work across each bank's outstanding journal. `topLevelSceneCommits` counts commits separately from scene allocations. Dependency lookup limits geometry updates; picking metadata, geometry ownership cleanup and cached-count refresh may still scan retained scene data.
 
-Typed additions and removals of eligible leaf meshes and ordinary spheres capture and reconcile only the affected paths in each bank, retaining the TLAS. Focused D1 tests cover 16, 128 and 1,024 mesh fixtures: an eligible added mesh captures one prim and attaches one placement without a TLAS allocation; removal leaves a canonical ID tombstone, and re-adding that path revives its slot. Prim IDs remain stable across bank replay and spare builds. Ancestor, subset, instanced-prototype, unknown-type and sphere batch changes use named full fallbacks. `primCount` counts live slots; `primPathSlotCount` includes tombstones. `structuralLeafUpdates`, `structuralFallbacks` and the `lastStructuralPathsUpdated`, `lastStructuralPlacementsAttached` and `lastStructuralPlacementsDetached` gauges expose this work. `structuralPlacementDetachCalls` includes detached work from discarded jobs. These updates reduce geometry capture but do not make all bookkeeping constant-time: metadata, picking ownership cleanup and cached-count refresh may still scan retained scene data. The final D1-D3 nine-case structural matrix is recorded at `build/hydra-delegate-validation/structural-final-d1-d3-rerun1`.
+Typed structural transactions support meshes, ordinary spheres, subsets, containers and instancers, including geometry inside existing prototypes. Added descendants are captured recursively; removed descendants come from retained bank records. Transactions reconcile inherited transforms, eligibility and material bindings while preserving unrelated geometry and the top-level scene. Focused matrices cover 16, 128, 1,024 and 16,384 placements and compare images with fresh rebuilds.
 
-In the focused 16-placement probe, moving one point-instancer position visited 16 records and changed one instance transform without allocating a new top-level scene or rebuilding prototype geometry. This demonstrates narrower updates, not constant-time work at larger scene sizes.
+Explicit Hydra rename notices retain their old/new path pair. Compatible prototype storage and placement handles are rekeyed; canonical IDs follow the destination path. Unaffected paths retain their IDs, removed source slots remain tombstones, and renaming back revives the original destination-path slot. Published frames retain their original paths and picking tables. Hosts that report a namespace edit as separate removal/addition notices use those transactions; the delegate does not infer a rename pair.
 
-Completed items from the Hydra delegate improvement plan and their test evidence are tracked in [the delegate validation ledger](hydra_delegate_validation.md). Items still under review remain in `HYDRA_DELEGATE_PLAN.md` until they have implementation and validation results.
+Unknown operations, unsupported primitive transitions, invalid rename pairs or conflicting destinations, sphere-batch membership changes, and unavailable exclusive banks retain conservative fallbacks. Preflight runs before bank mutation; a canceled or failed transaction is discarded without publishing a partially reconciled scene. `primCount` counts live identities; `primPathSlotCount` includes tombstones. `structuralLeafUpdates` (the retained diagnostic name), `structuralFallbacks` and the `lastStructuralPathsUpdated`, `lastStructuralPlacementsAttached` and `lastStructuralPlacementsDetached` gauges expose transaction work. `structuralPlacementDetachCalls` includes discarded work. Structural bookkeeping can still scan retained identity and ownership data; these transactions are not claimed to be constant-time.
+
+Transform-only bank updates reuse the immutable canonical-ID registry and picking
+table. They skip geometry-count and input-topology refresh. Attachment/detachment
+updates placement dependency memberships individually; ordinal/radix changes
+refresh picking records without rewriting unchanged memberships. Input metadata
+refresh is limited to affected prototypes and picking reconstruction to affected
+prim records. Topology changes still copy the published picking table before
+replacing affected records; this copy is not constant-time.
+
+`lastCanonicalRecordsVisited`, `lastPickingRecordsVisited`,
+`lastCountRecordsVisited`, `lastInputMetadataPrototypesVisited` and
+`lastDependencyPlacementsVisited` expose this work. Corresponding timing scopes
+are `lastCanonicalMilliseconds`, `lastPickingMilliseconds`,
+`lastCountsMilliseconds`, `lastInputMetadataMilliseconds` and
+`lastDependencyMilliseconds`. `lastInputComparisonMilliseconds` measures captured
+array comparisons; `lastPlacementReconcileMilliseconds` encloses the entire
+placement update, including its subscopes. Counters describe work needed to bring
+the selected bank current, including replay of earlier pending changes.
+
+Instancer input caches compare changed arrays and map changed source indices to
+their dependent placements, including duplicate indices and nested instancers.
+`lastInstanceArrayElementsScanned` measures input comparison separately from
+`lastPlacementRecordsVisited` and `lastPlacementTransformsUpdated`. Whole-array
+Hydra notices can still require linear scanning. Count and source-key changes
+attach/detach placements in the existing inactive top-level scene; the
+`lastPlacementTopologyAttached` and `lastPlacementTopologyDetached` counters
+record the deltas. Subset additions/removals refresh the existing parent mesh's
+material binding metadata without converting unrelated geometry. Ancestor and
+prototype-root restructuring and sphere-batch membership retain named fallbacks.
+
+Presentation statistics report `presentationUploadBytes`,
+`presentationUploadCalls`, `presentationSkippedUploads`,
+`presentationAtlasBytes`, `presentationAtlasDraws`, and
+`presentationCopyBytes`. Upload counters describe the optimized Float32 RGBA
+path and its Float32 depth input; stock fallback uploads are not counted.
+
+Completed Hydra improvements and their test evidence are tracked in [the delegate validation ledger](hydra_delegate_validation.md), including the latest integration changes and historical plan results.
 
 `tests/hydra/benchmark_loading.py` runs stock `testusdview` in fresh processes at one, two, and four compilation workers, three runs each, and recreates the renderer in each process. It records cache labels, process-to-image time, renderer timings, peak working set, and screenshots. A fresh process clears process-local material caches; it does **not** flush the operating system's file cache. Compare cold and warm results separately.

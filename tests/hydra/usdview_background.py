@@ -7,7 +7,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from pxr import Sdf, Usd, UsdAppUtils, UsdGeom
+from pxr import Sdf, Usd, UsdGeom
 from pxr.Usdviewq.qt import QtWidgets
 from pxr.Usdviewq.common import ClearColors
 
@@ -29,6 +29,11 @@ def testUsdviewInputFunction(appController):
     settings.clearColorText = ClearColors.WHITE
     view.SetPhysicalWindowSize(256, 256)
     view.makeCurrent()
+    # A hidden Qt window may not receive its initial paint event. Force one
+    # before selecting a renderer; SetRendererPlugin otherwise succeeds with
+    # no engine, and IsRendererConverged can never become true.
+    view.grabFrameBuffer()
+    assert view._getRenderer() is not None, "Initial framebuffer did not create a renderer"
     assert view.SetRendererPlugin("HdPrismRendererPlugin"), "PrismRT plugin unavailable"
 
     def settle():
@@ -77,6 +82,10 @@ def testUsdviewInputFunction(appController):
     # clear must stay in the raw AOV even though usdview composites a viewport
     # background for display.
     view.makeCurrent()
+    # testusdview loads this script before constructing QApplication. Load
+    # export support after the viewport engine, avoiding Windows GL/plugin
+    # initialization failures caused by importing it during script loading.
+    from pxr import UsdAppUtils
     recorder = UsdAppUtils.FrameRecorder("HdPrismRendererPlugin", True, True)
     check(str(recorder.GetCurrentRendererId()) == "HdPrismRendererPlugin",
           "FrameRecorder did not select PrismRT")

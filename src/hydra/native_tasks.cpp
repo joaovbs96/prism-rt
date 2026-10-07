@@ -16,10 +16,16 @@
 #include <pxr/imaging/hdx/pickFromRenderBufferTask.h>
 #include <pxr/imaging/hdx/selectionTracker.h>
 #include <pxr/imaging/hdx/tokens.h>
+#include <pxr/imaging/hdx/effectsShader.h>
+#include <pxr/imaging/hdx/hgiConversions.h>
 #include <pxr/imaging/cameraUtil/conformWindow.h>
 #include <pxr/imaging/hgi/hgi.h>
 #include <pxr/imaging/hgi/blitCmds.h>
 #include <pxr/imaging/hgi/blitCmdsOps.h>
+#include <pxr/imaging/hgi/shaderFunction.h>
+#include <pxr/imaging/hgi/shaderProgram.h>
+#include <pxr/imaging/hgi/sampler.h>
+#include <cstring>
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -530,24 +536,150 @@ private:
     HdCamera* camera=nullptr;
 };
 
-// Leave the CPU AOV unchanged for image export. The stock input task manages
-// depth, intermediate targets and Hgi frame lifetime; only its color upload
-// receives a viewport background, before stock color correction runs.
+// One draw copies all updated atlas quads. Attachment Load is essential:
+// pixels outside these quads belong to earlier immutable tile publications.
+class PresentationCompositor final : public HdxEffectsShader {
+public:
+    struct Vertex { float x,y,z,w,u,v; };
+    explicit PresentationCompositor(Hgi *hgi)
+        : HdxEffectsShader(hgi,"Prism presentation tiles") {
+        HgiShaderFunctionDesc vertex, fragment;
+        vertex.debugName="Prism presentation vertex";
+        vertex.shaderStage=HgiShaderStageVertex;
+        HgiShaderFunctionAddStageInput(&vertex,"position","vec4","position");
+        HgiShaderFunctionAddStageInput(&vertex,"uvIn","vec2");
+        HgiShaderFunctionAddStageOutput(&vertex,"gl_Position","vec4","position");
+        HgiShaderFunctionAddStageOutput(&vertex,"uvOut","vec2");
+        vertex.shaderCode="void main() { gl_Position=position; uvOut=uvIn; }";
+        fragment.debugName="Prism presentation fragment";
+        fragment.shaderStage=HgiShaderStageFragment;
+        HgiShaderFunctionAddStageInput(&fragment,"uvOut","vec2");
+        HgiShaderFunctionAddStageOutput(&fragment,"hd_FragColor","vec4","color");
+        HgiShaderFunctionAddTexture(&fragment,"source",0);
+        HgiShaderFunctionAddConstantParam(&fragment,"background","vec4");
+        fragment.shaderCode=R"(
+            void main() {
+                vec4 c=vec4(HgiGet_source(uvOut));
+                if (background.a != 0.0) {
+                    float a=clamp(background.a,0.0,1.0)*(1.0-clamp(c.a,0.0,1.0));
+                    c.rgb += background.rgb*a;
+                    c.a += a;
+                }
+                hd_FragColor=c;
+            })";
+        HgiShaderProgramDesc program;
+        program.debugName="Prism presentation";
+        program.shaderFunctions={hgi->CreateShaderFunction(vertex),hgi->CreateShaderFunction(fragment)};
+        shader=hgi->CreateShaderProgram(program);
+        if (!shader || !shader->IsValid() ||
+            !program.shaderFunctions[0]->IsValid() || !program.shaderFunctions[1]->IsValid()) {
+            if (shader) TF_WARN("Prism presentation program: %s",shader->GetCompileErrors().c_str());
+            for (auto const &function : program.shaderFunctions)
+                if (function && !function->IsValid())
+                    TF_WARN("Prism presentation shader: %s",function->GetCompileErrors().c_str());
+            _DestroyShaderProgram(&shader);
+            return;
+        }
+        _SetShaderProgram(shader);
+        HgiVertexAttributeDesc position,uv;
+        position.format=HgiFormatFloat32Vec4; position.offset=0; position.shaderBindLocation=0;
+        uv.format=HgiFormatFloat32Vec2; uv.offset=4*sizeof(float); uv.shaderBindLocation=1;
+        HgiVertexBufferDesc vertices;
+        vertices.bindingIndex=0; vertices.vertexStride=sizeof(Vertex);
+        vertices.vertexAttributes={position,uv};
+        _SetVertexBufferDescs({vertices});
+        _SetPrimitiveType(HgiPrimitiveTypeTriangleList);
+        HgiDepthStencilState depth;
+        depth.depthTestEnabled=false; depth.depthWriteEnabled=false;
+        depth.stencilTestEnabled=false;
+        _SetDepthStencilState(depth);
+        HgiMultiSampleState multisample;
+        multisample.alphaToCoverageEnable=false;
+        _SetMultiSampleState(multisample);
+        HgiRasterizationState raster;
+        raster.cullMode=HgiCullModeNone;
+        _SetRasterizationState(raster);
+        HgiSamplerDesc samplerDesc;
+        samplerDesc.maxAnisotropy=1;
+        sampler=hgi->CreateSampler(samplerDesc);
+    }
+    ~PresentationCompositor() override {
+        _DestroyShaderProgram(&shader);
+        if (sampler) _GetHgi()->DestroySampler(&sampler);
+    }
+    bool IsValid() const { return bool(shader) && bool(sampler); }
+    static void Quad(std::vector<Vertex> *vertices,float x0,float y0,float x1,float y1,
+                     float u0=0,float v0=0,float u1=1,float v1=1) {
+        vertices->insert(vertices->end(),{
+            {x0,y0,0,1,u0,v0},{x1,y0,0,1,u1,v0},{x1,y1,0,1,u1,v1},
+            {x0,y0,0,1,u0,v0},{x1,y1,0,1,u1,v1},{x0,y1,0,1,u0,v1}});
+    }
+    void Draw(HgiTextureHandle source,HgiTextureHandle destination,
+              std::vector<Vertex> const &vertices,GfVec4f background,bool preserve) {
+        HgiBufferDesc desc;
+        desc.debugName="Prism presentation quads"; desc.usage=HgiBufferUsageVertex;
+        desc.byteSize=vertices.size()*sizeof(Vertex); desc.vertexStride=sizeof(Vertex);
+        desc.initialData=vertices.data();
+        vertexBuffer=_GetHgi()->CreateBuffer(desc);
+        vertexCount=static_cast<uint32_t>(vertices.size());
+        HgiTextureBindDesc binding;
+        binding.bindingIndex=0; binding.stageUsage=HgiShaderStageFragment;
+        binding.resourceType=HgiBindResourceTypeCombinedSamplerImage;
+        binding.textures={source}; binding.samplers={sampler};
+        _SetTextureBindings({binding});
+        HgiAttachmentDesc attachment;
+        attachment.loadOp=preserve ? HgiAttachmentLoadOpLoad : HgiAttachmentLoadOpDontCare;
+        attachment.storeOp=HgiAttachmentStoreOpStore;
+        attachment.blendEnabled=false;
+        _SetColorAttachments({attachment});
+        _SetShaderConstants(sizeof(background),background.data(),HgiShaderStageFragment);
+        auto dim=destination->GetDescriptor().dimensions;
+        _CreateAndSubmitGraphicsCmds({destination},{},{},{},GfVec4i(0,0,dim[0],dim[1]));
+        // Every atlas and vertex buffer is immutable until Hgi's deferred
+        // destruction releases GPU commands that reference it.
+        _GetHgi()->DestroyBuffer(&vertexBuffer);
+    }
+private:
+    void _RecordDrawCmds() override {
+        _DrawNonIndexed(vertexBuffer,vertexCount,0,1,0);
+    }
+    HgiShaderProgramHandle shader;
+    HgiSamplerHandle sampler;
+    HgiBufferHandle vertexBuffer;
+    uint32_t vertexCount=0;
+};
+
+// CPU exports retain the raw AOV. The optimized Float32 RGBA path has a
+// pristine GPU source; Hdx color correction/selection only touch working
+// textures. Other formats retain the stock conversion behavior.
 class PresentationInputTask final : public HdxAovInputTask {
 public:
-    PresentationInputTask(HdSceneDelegate *delegate, SdfPath const &id)
-        : HdxAovInputTask(delegate, id) {}
+    PresentationInputTask(HdSceneDelegate *delegate, SdfPath const &id,
+                          std::shared_ptr<prism::hydra::TaskContext> context)
+        : HdxAovInputTask(delegate, id),context(std::move(context)) {}
+    ~PresentationInputTask() override {
+        for (auto *texture : {&sourceTexture,&workingTexture,&intermediateTexture,
+                              &depthTexture,&depthIntermediate})
+            if (*texture) _GetHgi()->DestroyTexture(texture);
+    }
     // The stock override is not exported from OpenUSD's Windows DLL. Cache
     // readiness before upload just as it does, so an exporter cannot accept
     // an older texture when the render worker finishes during Execute.
     bool IsConverged() const override { return uploadedConverged; }
     void Prepare(HdTaskContext *ctx, HdRenderIndex *index) override {
-        HdxAovInputTask::Prepare(ctx, index);
         aovBuffer = aovPath.IsEmpty() ? nullptr : dynamic_cast<HdRenderBuffer *>(index->GetBprim(
             HdPrimTypeTokens->renderBuffer, aovPath));
         buffer = dynamic_cast<PrismRenderBuffer *>(aovBuffer);
         depthBuffer = depthPath.IsEmpty() ? nullptr : dynamic_cast<HdRenderBuffer *>(index->GetBprim(
             HdPrimTypeTokens->renderBuffer, depthPath));
+        optimized=buffer && buffer->GetFormat()==HdFormatFloat32Vec4 &&
+            (!depthBuffer || (dynamic_cast<PrismRenderBuffer *>(depthBuffer) &&
+                              depthBuffer->GetFormat()==HdFormatFloat32));
+        if (optimized && !compositor)
+            compositor=std::make_unique<PresentationCompositor>(_GetHgi());
+        optimized=optimized && compositor->IsValid();
+        if (optimized) _GetHgi()->StartFrame();
+        else HdxAovInputTask::Prepare(ctx,index);
     }
     void Execute(HdTaskContext *ctx) override {
         const bool readyBeforeUpload = !aovBuffer || (aovBuffer->IsConverged() &&
@@ -561,9 +693,12 @@ public:
                 if (buffer) buffer->Map();
             }
             ~Mapping() { if (buffer) buffer->Unmap(); }
-        } mapping(buffer);
-        HdxAovInputTask::Execute(ctx);
-        UploadPresentation(ctx);
+        } mapping(buffer), depthMapping(dynamic_cast<PrismRenderBuffer *>(depthBuffer));
+        if (optimized) ExecuteCached(ctx);
+        else {
+            HdxAovInputTask::Execute(ctx);
+            UploadPresentation(ctx);
+        }
         auto latest = [](HdRenderBuffer *candidate) {
             auto *prism = dynamic_cast<PrismRenderBuffer *>(candidate);
             return !prism || prism->Capture().pixels == prism->CapturePublished().pixels;
@@ -573,6 +708,144 @@ public:
         uploadedConverged = readyBeforeUpload && latest(aovBuffer) && latest(depthBuffer);
     }
 private:
+    HgiTextureHandle CreateTexture(unsigned width,unsigned height,HgiFormat format,
+                                   HgiTextureUsageBits usage,void const *pixels=nullptr,
+                                   size_t bytes=0) {
+        HgiTextureDesc desc;
+        desc.debugName="Prism presentation";
+        desc.dimensions=GfVec3i(width,height,1); desc.format=format;
+        desc.usage=usage|HgiTextureUsageBitsShaderRead;
+        desc.layerCount=1; desc.mipLevels=1; desc.sampleCount=HgiSampleCount1;
+        desc.initialData=pixels; desc.pixelsByteSize=bytes;
+        return _GetHgi()->CreateTexture(desc);
+    }
+    void EnsureTarget(HgiTextureHandle &texture,unsigned width,unsigned height,
+                      HgiFormat format,HgiTextureUsageBits usage) {
+        if (texture && (texture->GetDescriptor().dimensions!=GfVec3i(width,height,1) ||
+                        texture->GetDescriptor().format!=format)) _GetHgi()->DestroyTexture(&texture);
+        if (!texture) texture=CreateTexture(width,height,format,usage);
+    }
+    void RecordUpload(size_t bytes) {
+        context->presentationUploadBytes.fetch_add(bytes,std::memory_order_relaxed);
+        context->presentationUploadCalls.fetch_add(1,std::memory_order_relaxed);
+    }
+    void ExecuteCached(HdTaskContext *ctx) {
+        buffer->Resolve();
+        auto state=buffer->CapturePresentationState();
+        auto const &raw=state.raw;
+        ctx->erase(HdAovTokens->color); ctx->erase(HdAovTokens->depth);
+        ctx->erase(HdxAovTokens->colorIntermediate); ctx->erase(HdxAovTokens->depthIntermediate);
+        if (!raw.pixels || !raw.width || !raw.height) return;
+        auto pixels=state.legacyPixels ? state.legacyPixels : raw.pixels;
+        bool restore = !sourceTexture || cachedPixels.lock()!=pixels || cachedFrame.lock()!=raw.frame ||
+            sourceTexture->GetDescriptor().dimensions!=GfVec3i(raw.width,raw.height,1);
+        if (sourceHasTiles && (!state.snapshot || state.snapshot->pass!=cachedPass ||
+            state.snapshot->base.pixels!=cachedPixels.lock() ||
+            state.snapshot->tiles.size()!=cachedTiles.size())) restore=true;
+        if (!restore && sourceHasTiles && state.snapshot) {
+            // A canceled/replaced packet can remove completed tiles. Rebuild
+            // from raw instead of leaving pixels from that canceled work.
+            for (size_t i=0;i<state.snapshot->tiles.size();++i)
+                if (cachedTiles[i].present && !state.snapshot->tiles[i]) { restore=true; break; }
+        }
+        bool transferred=false;
+        if (restore) {
+            if (!sourceTexture || sourceTexture->GetDescriptor().dimensions !=
+                    GfVec3i(raw.width,raw.height,1)) {
+                if (sourceTexture) _GetHgi()->DestroyTexture(&sourceTexture);
+                sourceTexture=CreateTexture(raw.width,raw.height,HgiFormatFloat32Vec4,
+                    HgiTextureUsageBitsColorTarget,pixels->data(),pixels->size());
+            } else {
+                // Keep the GPU allocation and bindings across completed passes.
+                // Hgi orders this upload after prior draws using the texture.
+                HgiTextureCpuToGpuOp upload;
+                upload.bufferByteSize=pixels->size();
+                upload.cpuSourceBuffer=pixels->data();
+                upload.gpuDestinationTexture=sourceTexture;
+                auto commands=_GetHgi()->CreateBlitCmds();
+                commands->CopyTextureCpuToGpu(upload);
+                _GetHgi()->SubmitCmds(commands.get());
+            }
+            RecordUpload(pixels->size()); transferred=true;
+            cachedPixels=pixels; cachedFrame=raw.frame; cachedSnapshot.reset();
+            cachedTiles.clear(); sourceHasTiles=false;
+        }
+        if (state.snapshot && state.snapshot!=cachedSnapshot.lock()) {
+            std::vector<std::shared_ptr<const PrismRenderBuffer::PresentationTile>> changed;
+            for (size_t i=0;i<state.snapshot->tiles.size();++i) {
+                auto const &tile=state.snapshot->tiles[i];
+                if (tile && (i>=cachedTiles.size() ||
+                             tile!=cachedTiles[i].tile.lock())) changed.push_back(tile);
+            }
+            // A faster pass can complete hundreds of tiles per publication.
+            // Batch their quads into a bounded 1024x1024 atlas rather than
+            // paying graphics submission overhead for every 64 tiles.
+            constexpr size_t atlasTileCapacity=1024;
+            for (size_t begin=0;begin<changed.size();begin+=atlasTileCapacity) {
+                const size_t count=std::min(atlasTileCapacity,changed.size()-begin);
+                const unsigned columns=static_cast<unsigned>(std::min(size_t(32),count));
+                const unsigned atlasWidth=columns*32;
+                const unsigned atlasHeight=static_cast<unsigned>((count+columns-1)/columns)*32;
+                std::vector<float> atlas(size_t(atlasWidth)*atlasHeight*4,0);
+                std::vector<PresentationCompositor::Vertex> vertices;
+                vertices.reserve(count*6);
+                for (size_t i=0;i<count;++i) {
+                    auto const &tile=*changed[begin+i];
+                    const unsigned ax=static_cast<unsigned>(i%columns)*32;
+                    const unsigned ay=static_cast<unsigned>(i/columns)*32;
+                    for (unsigned y=0;y<tile.height;++y)
+                        std::memcpy(atlas.data()+(size_t(ay+y)*atlasWidth+ax)*4,
+                            tile.rgba.data()+size_t(y)*tile.width*4,size_t(tile.width)*4*sizeof(float));
+                    PresentationCompositor::Quad(&vertices,
+                        2.0f*tile.x/raw.width-1,2.0f*tile.y/raw.height-1,
+                        2.0f*(tile.x+tile.width)/raw.width-1,2.0f*(tile.y+tile.height)/raw.height-1,
+                        float(ax)/atlasWidth,float(ay)/atlasHeight,
+                        float(ax+tile.width)/atlasWidth,float(ay+tile.height)/atlasHeight);
+                }
+                const size_t bytes=atlas.size()*sizeof(float);
+                auto texture=CreateTexture(atlasWidth,atlasHeight,HgiFormatFloat32Vec4,
+                    HgiTextureUsageBitsShaderRead,atlas.data(),bytes);
+                RecordUpload(bytes); transferred=true;
+                context->presentationAtlasBytes.fetch_add(bytes,std::memory_order_relaxed);
+                compositor->Draw(texture,sourceTexture,vertices,GfVec4f(0),true);
+                context->presentationAtlasDraws.fetch_add(1,std::memory_order_relaxed);
+                _GetHgi()->DestroyTexture(&texture);
+            }
+        }
+        cachedSnapshot=state.snapshot;
+        sourceHasTiles=bool(state.snapshot);
+        if (state.snapshot) {
+            cachedPass=state.snapshot->pass;
+            cachedTiles.resize(state.snapshot->tiles.size());
+            for (size_t i=0;i<cachedTiles.size();++i)
+                cachedTiles[i]={state.snapshot->tiles[i],bool(state.snapshot->tiles[i])};
+        } else cachedTiles.clear();
+        if (!transferred) context->presentationSkippedUploads.fetch_add(1,std::memory_order_relaxed);
+        EnsureTarget(workingTexture,raw.width,raw.height,HgiFormatFloat32Vec4,HgiTextureUsageBitsColorTarget);
+        EnsureTarget(intermediateTexture,raw.width,raw.height,HgiFormatFloat32Vec4,HgiTextureUsageBitsColorTarget);
+        std::vector<PresentationCompositor::Vertex> fullQuad;
+        PresentationCompositor::Quad(&fullQuad,-1,-1,1,1);
+        compositor->Draw(sourceTexture,workingTexture,fullQuad,
+            state.hasBackground ? state.background : GfVec4f(0),false);
+        (*ctx)[HdAovTokens->color]=VtValue(workingTexture);
+        (*ctx)[HdxAovTokens->colorIntermediate]=VtValue(intermediateTexture);
+        if (auto *depth=dynamic_cast<PrismRenderBuffer *>(depthBuffer)) {
+            depth->Resolve();
+            auto view=depth->Capture();
+            if (view.pixels && view.width && view.height) {
+                if (!depthTexture || depthPixels.lock()!=view.pixels ||
+                    depthTexture->GetDescriptor().dimensions!=GfVec3i(view.width,view.height,1)) {
+                    if (depthTexture) _GetHgi()->DestroyTexture(&depthTexture);
+                    depthTexture=CreateTexture(view.width,view.height,HgiFormatFloat32,
+                        HgiTextureUsageBitsDepthTarget,view.pixels->data(),view.pixels->size());
+                    RecordUpload(view.pixels->size()); depthPixels=view.pixels;
+                } else context->presentationSkippedUploads.fetch_add(1,std::memory_order_relaxed);
+                EnsureTarget(depthIntermediate,view.width,view.height,HgiFormatFloat32,HgiTextureUsageBitsDepthTarget);
+                (*ctx)[HdAovTokens->depth]=VtValue(depthTexture);
+                (*ctx)[HdxAovTokens->depthIntermediate]=VtValue(depthIntermediate);
+            }
+        }
+    }
     void UploadPresentation(HdTaskContext *ctx) {
         if (!buffer) return;
         auto const raw = buffer->Capture();
@@ -611,6 +884,22 @@ private:
     HdRenderBuffer *depthBuffer = nullptr;
     PrismRenderBuffer *buffer = nullptr;
     bool uploadedConverged = false;
+    bool optimized=false;
+    std::shared_ptr<prism::hydra::TaskContext> context;
+    std::unique_ptr<PresentationCompositor> compositor;
+    HgiTextureHandle sourceTexture,workingTexture,intermediateTexture,depthTexture,depthIntermediate;
+    // Identity tracking must not pin the CPU publication after upload; doing
+    // so would defeat the worker's raw-buffer storage recycling.
+    std::weak_ptr<const std::vector<uint8_t>> cachedPixels,depthPixels;
+    std::weak_ptr<const prism::hydra::PublishedFrame> cachedFrame;
+    std::weak_ptr<const PrismRenderBuffer::PresentationSnapshot> cachedSnapshot;
+    struct CachedTile {
+        std::weak_ptr<const PrismRenderBuffer::PresentationTile> tile;
+        bool present=false;
+    };
+    std::vector<CachedTile> cachedTiles;
+    uint64_t cachedPass=0;
+    bool sourceHasTiles=false;
 };
 
 class Factory final : public HdLegacyTaskFactory {
@@ -620,7 +909,7 @@ public:
         : original(std::move(original)),scene(std::move(scene)),context(std::move(context)) {}
     HdTaskSharedPtr Create(HdSceneDelegate* delegate,SdfPath const& id) override {
         auto task=original->Create(delegate,id);
-        if(dynamic_cast<HdxAovInputTask*>(task.get())) return std::make_shared<PresentationInputTask>(delegate,id);
+        if(dynamic_cast<HdxAovInputTask*>(task.get())) return std::make_shared<PresentationInputTask>(delegate,id,context);
         if(dynamic_cast<HdxPickFromRenderBufferTask*>(task.get())) return std::make_shared<NativePickTask>(delegate,id,context);
         if(dynamic_cast<HdxColorizeSelectionTask*>(task.get())) return std::make_shared<NativeSelectionTask>(delegate,id,scene,context);
         return task;

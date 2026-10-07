@@ -40,6 +40,30 @@ HdContainerDataSourceHandle SmallRedMesh(float redValue=.7f) {
         HdPrimvarsSchemaTokens->primvars,HdRetainedContainerDataSource::New(
             TfToken("points"),points,TfToken("displayColor"),red)),Plane());
 }
+// A deterministic grid makes retention pressure real while keeping rendered
+// validation small. No synthetic memory estimate or allocator hook is needed.
+HdContainerDataSourceHandle GridMesh(int cells=200, float offset=0) {
+    VtVec3fArray vertices;
+    VtIntArray counts, indices;
+    vertices.reserve((cells+1)*(cells+1));
+    counts.reserve(cells*cells); indices.reserve(cells*cells*4);
+    for(int y=0;y<=cells;++y) for(int x=0;x<=cells;++x)
+        vertices.emplace_back(-.6f+1.2f*x/cells+offset,-.6f+1.2f*y/cells,0);
+    for(int y=0;y<cells;++y) for(int x=0;x<cells;++x) {
+        int a=y*(cells+1)+x;
+        counts.push_back(4);
+        for(int id:{a,a+1,a+cells+2,a+cells+1}) indices.push_back(id);
+    }
+    auto points=HdPrimvarSchema::Builder().SetPrimvarValue(
+        HdRetainedTypedSampledDataSource<VtVec3fArray>::New(vertices))
+        .SetInterpolation(HdPrimvarSchema::BuildInterpolationDataSource(HdPrimvarSchemaTokens->vertex)).Build();
+    auto topology=HdMeshTopologySchema::Builder().SetFaceVertexCounts(
+        HdRetainedTypedSampledDataSource<VtIntArray>::New(counts))
+        .SetFaceVertexIndices(HdRetainedTypedSampledDataSource<VtIntArray>::New(indices)).Build();
+    return HdOverlayContainerDataSource::New(HdRetainedContainerDataSource::New(
+        HdPrimvarsSchemaTokens->primvars,HdRetainedContainerDataSource::New(TfToken("points"),points),
+        HdMeshSchemaTokens->mesh,HdMeshSchema::Builder().SetTopology(topology).Build()),Plane());
+}
 HdContainerDataSourceHandle InstancedBy(SdfPath instancer,SdfPath root) {
     return HdRetainedContainerDataSource::New(HdInstancedBySchemaTokens->instancedBy,
         HdInstancedBySchema::Builder().SetPaths(
@@ -73,6 +97,40 @@ void RenderTags(Fixture& fixture,TfTokenVector const& tags) {
 }
 int RunVisibilityRetentionTests() {
     try {
+        {
+            Fixture fixture;
+            auto settings=fixture.bridge->GetSettings(); settings.hiddenGeometryBudgetMiB=1;
+            fixture.bridge->SetSettings(settings);
+            auto mesh=GridMesh();
+            fixture.scene->AddPrims({{SdfPath("/Hidden"),TfToken("xform"),Visible(false)},
+                {SdfPath("/Hidden/Mesh"),HdPrimTypeTokens->mesh,mesh},
+                {SdfPath("/Dome"),HdPrimTypeTokens->domeLight,Dome()}});
+            fixture.Render(); const auto before=fixture.bridge->GetStats();
+            Require(Stat(before,"evictedPrototypeCount")==1,"Rename fixture did not evict hidden geometry");
+            fixture.scene->RemovePrims({SdfPath("/Hidden")});
+            fixture.scene->AddPrims({{SdfPath("/Cold"),TfToken("xform"),Visible(false)},
+                {SdfPath("/Cold/Mesh"),HdPrimTypeTokens->mesh,mesh}});
+            fixture.bridge->MarkSceneDirtyBatch({{SceneDirtyKind::Structure,
+                {SdfPath("/Hidden"),SdfPath("/Cold")},{},
+                {{StructuralChange::Operation::Rename,SdfPath("/Hidden"),TfToken("xform"),
+                    TfToken("xform"),true,SdfPath("/Cold")}}}});
+            fixture.Render(); const auto renamed=fixture.bridge->GetStats();
+            Require(Stat(renamed,"evictedPrototypeCount")==1 && Stat(renamed,"meshCount")==0 &&
+                Stat(renamed,"topLevelSceneBuilds")==Stat(before,"topLevelSceneBuilds") &&
+                Stat(renamed,"prototypeBuilds")==Stat(before,"prototypeBuilds"),
+                "Renaming an evicted subtree eagerly restored geometry or rebuilt the scene");
+            fixture.scene->AddPrims({{SdfPath("/Cold"),TfToken("xform"),Visible(true)}});
+            fixture.bridge->MarkSceneDirty(SceneDirtyKind::Placement,SdfPath("/Cold")); fixture.Render();
+            Require(Hits(fixture)>0 && Stat(fixture.bridge->GetStats(),"evictedPrototypeCount")==0,
+                "Renamed cold prototype failed to restore or retained a ghost old path");
+            fixture.scene->RemovePrims({SdfPath("/Cold")});
+            fixture.bridge->MarkSceneDirtyBatch({{SceneDirtyKind::Structure,{SdfPath("/Cold")},{},
+                {{StructuralChange::Operation::Remove,SdfPath("/Cold"),TfToken("xform"),{},true}}}});
+            fixture.Render();
+            Require(Hits(fixture)==0 && Stat(fixture.bridge->GetStats(),"primCount")==0,
+                "Removing a restored renamed subtree left selectable geometry");
+        }
+
         {
             auto scene=HdRetainedSceneIndex::New();
             scene->AddPrims({{SdfPath("/Mesh"),HdPrimTypeTokens->mesh,Plane()}});
@@ -216,6 +274,185 @@ int RunVisibilityRetentionTests() {
                         Stat(fixture.bridge->GetStats(),"prototypeBuilds")==Stat(before,"prototypeBuilds"),
                         "Zero-instance prototype activation lost its geometry or picking ID");
             }
+        }
+        {
+            Fixture fixture;
+            auto settings=fixture.bridge->GetSettings(); settings.hiddenGeometryBudgetMiB=1;
+            fixture.bridge->SetSettings(settings);
+            fixture.scene->AddPrims({{SdfPath("/Hidden"),TfToken("xform"),Visible(false)},
+                {SdfPath("/Hidden/Mesh"),HdPrimTypeTokens->mesh,GridMesh()},
+                {SdfPath("/Dome"),HdPrimTypeTokens->domeLight,Dome()}});
+            fixture.Render();
+            const auto cold=fixture.bridge->GetStats();
+            Require(Stat(cold,"evictedPrototypeCount")==1 && Stat(cold,"meshCount")==0 &&
+                    Stat(cold,"hiddenGeometryResidentBytes")==0 && Stat(cold,"primCount")==1,
+                    "Budget eviction did not release hidden geometry and preserve its identity");
+            Require(Stat(cold,"sparePrototypeConversions")==0,
+                    "Spare bank reconverted a cold evicted prototype");
+            fixture.scene->AddPrims({{SdfPath("/Hidden/Mesh"),HdPrimTypeTokens->mesh,SmallRedMesh(.9f)}});
+            fixture.bridge->MarkSceneDirty(SceneDirtyKind::Prototype,SdfPath("/Hidden/Mesh")); fixture.Render();
+            const auto edited=fixture.bridge->GetStats();
+            Require(Stat(edited,"evictedPrototypeCount")==1 && Stat(edited,"meshCount")==0 &&
+                    Stat(edited,"prototypeBuilds")==Stat(cold,"prototypeBuilds"),
+                    "Editing an evicted prototype eagerly rebuilt its geometry");
+            settings.hiddenGeometryBudgetMiB=0; fixture.bridge->SetSettings(settings);
+            fixture.Prepare();
+            Require(Stat(fixture.bridge->GetStats(),"completedSamples")==Stat(edited,"completedSamples") &&
+                    Stat(fixture.bridge->GetStats(),"evictedPrototypeCount")==1,
+                    "Increasing retention budget reset accumulation or restored cold geometry");
+            fixture.scene->AddPrims({{SdfPath("/Hidden"),TfToken("xform"),Visible(true)}});
+            fixture.bridge->MarkSceneDirty(SceneDirtyKind::Placement,SdfPath("/Hidden")); fixture.Render();
+            Require(Hits(fixture)>0 && Hits(fixture)<100 &&
+                    Stat(fixture.bridge->GetStats(),"evictedPrototypeCount")==0 &&
+                    Stat(fixture.bridge->GetStats(),"hiddenGeometryRestorations")>0,
+                    "Evicted geometry did not restore its latest captured source");
+            Fixture reference;
+            reference.scene->AddPrims({{SdfPath("/Mesh"),HdPrimTypeTokens->mesh,SmallRedMesh(.9f)},
+                {SdfPath("/Dome"),HdPrimTypeTokens->domeLight,Dome()}}); reference.Render();
+            Require(Read<float>(fixture.color)==Read<float>(reference.color),
+                    "Restored evicted geometry differs from a fresh scene");
+        }
+        {
+            Fixture fixture;
+            fixture.scene->AddPrims({{SdfPath("/Hidden"),HdPrimTypeTokens->mesh,
+                HdOverlayContainerDataSource::New(Visible(false),GridMesh())}});
+            fixture.Render();
+            const auto before=fixture.bridge->GetStats();
+            Require(Stat(before,"hiddenGeometryResidentBytes")>1024*1024,
+                    "Unlimited retention did not account for actual hidden storage");
+            auto pinned=fixture.prim.Capture();
+            auto settings=fixture.bridge->GetSettings(); settings.hiddenGeometryBudgetMiB=1;
+            fixture.bridge->SetSettings(settings); fixture.Prepare();
+            const auto budgeted=fixture.bridge->GetStats();
+            Require(Stat(budgeted,"completedSamples")==Stat(before,"completedSamples") &&
+                    fixture.prim.Capture().pixels==pinned.pixels &&
+                    Stat(budgeted,"hiddenGeometryPinnedBytes")>0 &&
+                    Stat(budgeted,"hiddenGeometryBudgetOverageBytes")>0,
+                    "Budget change modified a published frame or hid pinned overage");
+            fixture.bridge->MarkSceneDirty(SceneDirtyKind::Environment); fixture.Render();
+            Require(Stat(fixture.bridge->GetStats(),"hiddenGeometryPinnedBytes")>0,
+                    "An externally retained pick frame lost its prototype storage");
+            pinned={}; fixture.Prepare();
+            Require(Stat(fixture.bridge->GetStats(),"hiddenGeometryResidentBytes")==0,
+                    "Released frames or inactive-bank aliases kept evicted storage alive");
+        }
+        {
+            Fixture fixture;
+            auto settings=fixture.bridge->GetSettings(); settings.hiddenGeometryBudgetMiB=1;
+            settings.samples=1; fixture.bridge->SetSettings(settings);
+            auto grid=GridMesh();
+            fixture.scene->AddPrims({{SdfPath("/Hidden"),HdPrimTypeTokens->mesh,
+                    HdOverlayContainerDataSource::New(Visible(false),grid)},
+                {SdfPath("/Visible"),HdPrimTypeTokens->mesh,grid}});
+            fixture.Render(); auto stats=fixture.bridge->GetStats();
+            Require(Hits(fixture)>0 && Stat(stats,"meshCount")==1 &&
+                    Stat(stats,"hiddenGeometryResidentBytes")==0 &&
+                    Stat(stats,"hiddenGeometryEvictions")==0,
+                    "Budget evicted or double-counted storage shared with visible geometry");
+        }
+        {
+            Fixture fixture;
+            auto settings=fixture.bridge->GetSettings(); settings.hiddenGeometryBudgetMiB=1;
+            settings.samples=1; fixture.bridge->SetSettings(settings);
+            auto grid=GridMesh();
+            fixture.scene->AddPrims({{SdfPath("/Mesh"),HdPrimTypeTokens->mesh,grid}});
+            fixture.Render();
+            auto pinned=fixture.prim.Capture();
+            Require(Hits(fixture)>0,"Visible frame was empty before pinning");
+            fixture.scene->AddPrims({{SdfPath("/Mesh"),HdPrimTypeTokens->mesh,
+                HdOverlayContainerDataSource::New(Visible(false),grid)}});
+            fixture.bridge->MarkSceneDirty(SceneDirtyKind::Placement,SdfPath("/Mesh")); fixture.Render();
+            const auto hidden=fixture.bridge->GetStats();
+            Require(Hits(fixture)==0 && Stat(hidden,"evictedPrototypeCount")==1 &&
+                    Stat(hidden,"hiddenGeometryPinnedBytes")>1024*1024 &&
+                    Stat(hidden,"hiddenGeometryBudgetOverageBytes")>0,
+                    "Historical visible frame exempted currently hidden storage from the budget");
+            pinned={}; fixture.Prepare();
+            Require(Stat(fixture.bridge->GetStats(),"hiddenGeometryResidentBytes")==0,
+                    "Formerly visible inactive-bank storage remained resident after unpinning");
+        }
+        {
+            Fixture fixture;
+            auto settings=fixture.bridge->GetSettings(); settings.hiddenGeometryBudgetMiB=1;
+            settings.samples=1; fixture.bridge->SetSettings(settings);
+            fixture.scene->AddPrims({{SdfPath("/A"),HdPrimTypeTokens->mesh,
+                    HdOverlayContainerDataSource::New(Visible(false),GridMesh(96))},
+                {SdfPath("/B"),HdPrimTypeTokens->mesh,
+                    HdOverlayContainerDataSource::New(Visible(false),GridMesh(96,.01f))}});
+            fixture.Render(); auto stats=fixture.bridge->GetStats();
+            Require(Stat(stats,"evictedPrototypeCount")==1 && Stat(stats,"meshCount")==1 &&
+                    Stat(stats,"hiddenGeometryResidentBytes")<=1024*1024,
+                    "Budget did not retain exactly the newest fitting unique storage");
+            fixture.scene->AddPrims({{SdfPath("/B"),HdPrimTypeTokens->mesh,GridMesh(96,.01f)}});
+            fixture.bridge->MarkSceneDirty(SceneDirtyKind::Placement,SdfPath("/B")); fixture.Render();
+            Require(Hits(fixture)>0 && Stat(fixture.bridge->GetStats(),"hiddenGeometryRestorations")==0,
+                    "Equal-age storage eviction did not use canonical-path ordering");
+        }
+        for(bool purpose:{false,true}) {
+            Fixture fixture;
+            auto settings=fixture.bridge->GetSettings(); settings.hiddenGeometryBudgetMiB=1;
+            settings.samples=1; fixture.bridge->SetSettings(settings);
+            if(purpose) {
+                fixture.scene->AddPrims({{SdfPath("/Mesh"),HdPrimTypeTokens->mesh,
+                    HdOverlayContainerDataSource::New(Purpose(HdRenderTagTokens->guide),GridMesh())}});
+            } else {
+                fixture.scene->AddPrims({{SdfPath("/Instancer"),HdPrimTypeTokens->instancer,
+                        Instancer(SdfPath("/Mesh"),true,true)},
+                    {SdfPath("/Mesh"),HdPrimTypeTokens->mesh,
+                        HdOverlayContainerDataSource::New(InstancedBy(SdfPath("/Instancer"),SdfPath("/Mesh")),GridMesh())}});
+            }
+            fixture.Render();
+            Require(Stat(fixture.bridge->GetStats(),"evictedPrototypeCount")==1,
+                    "Filtered or zero-instance geometry was not budgeted");
+            if(purpose) RenderTags(fixture,{HdRenderTagTokens->guide});
+            else {
+                fixture.scene->AddPrims({{SdfPath("/Instancer"),HdPrimTypeTokens->instancer,
+                    Instancer(SdfPath("/Mesh"),true,false)}});
+                fixture.bridge->MarkSceneDirty(SceneDirtyKind::Placement,SdfPath("/Instancer")); fixture.Render();
+            }
+            Require(Hits(fixture)>0 && Stat(fixture.bridge->GetStats(),"evictedPrototypeCount")==0,
+                    "Filtered or zero-instance evicted prototype did not restore");
+        }
+        {
+            Fixture fixture;
+            auto settings=fixture.bridge->GetSettings(); settings.hiddenGeometryBudgetMiB=1;
+            settings.samples=1; fixture.bridge->SetSettings(settings);
+            fixture.scene->AddPrims({{SdfPath("/Parent"),HdPrimTypeTokens->mesh,
+                    HdOverlayContainerDataSource::New(Visible(false),GridMesh())},
+                {SdfPath("/Parent/Child"),HdPrimTypeTokens->mesh,SmallRedMesh()}});
+            fixture.Render();
+            Require(Stat(fixture.bridge->GetStats(),"evictedPrototypeCount")==1,
+                    "Parent mesh did not create retention pressure");
+            fixture.scene->AddPrims({{SdfPath("/Parent"),HdPrimTypeTokens->mesh,GridMesh()}});
+            fixture.bridge->MarkSceneDirty(SceneDirtyKind::Placement,SdfPath("/Parent")); fixture.Render();
+            Require(Stat(fixture.bridge->GetStats(),"enabledPlacementCount")==2,
+                    "Restoring a parent prototype duplicated its resident child placement");
+        }
+        {
+            Fixture fixture;
+            auto settings=fixture.bridge->GetSettings(); settings.samples=1;
+            fixture.bridge->SetSettings(settings);
+            const auto a=GridMesh(96), b=GridMesh(96,.01f);
+            fixture.scene->AddPrims({{SdfPath("/A"),HdPrimTypeTokens->mesh,a},
+                {SdfPath("/B"),HdPrimTypeTokens->mesh,HdOverlayContainerDataSource::New(Visible(false),b)}});
+            fixture.Render();
+            fixture.scene->AddPrims({{SdfPath("/A"),HdPrimTypeTokens->mesh,
+                    HdOverlayContainerDataSource::New(Visible(false),a)},
+                {SdfPath("/B"),HdPrimTypeTokens->mesh,b}});
+            fixture.bridge->MarkScenePathsDirty(SceneDirtyKind::Placement,{SdfPath("/A"),SdfPath("/B")});
+            fixture.Render();
+            settings.hiddenGeometryBudgetMiB=1; fixture.bridge->SetSettings(settings);
+            fixture.scene->AddPrims({{SdfPath("/B"),HdPrimTypeTokens->mesh,
+                HdOverlayContainerDataSource::New(Visible(false),b)}});
+            fixture.bridge->MarkSceneDirty(SceneDirtyKind::Placement,SdfPath("/B")); fixture.Render();
+            const auto hidden=fixture.bridge->GetStats();
+            Require(Stat(hidden,"evictedPrototypeCount")==1 && Stat(hidden,"meshCount")==1,
+                    "LRU budget did not retain one recently enabled prototype");
+            fixture.scene->AddPrims({{SdfPath("/B"),HdPrimTypeTokens->mesh,b}});
+            fixture.bridge->MarkSceneDirty(SceneDirtyKind::Placement,SdfPath("/B")); fixture.Render();
+            Require(Stat(fixture.bridge->GetStats(),"hiddenGeometryRestorations")==
+                    Stat(hidden,"hiddenGeometryRestorations"),
+                    "LRU policy evicted the most recently enabled storage");
         }
         std::cout << "Retained visibility/purpose/instance tests passed\n"; return 0;
     } catch(std::exception const& error) { std::cerr << error.what() << '\n'; return 1; }

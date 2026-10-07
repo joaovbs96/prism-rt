@@ -4,6 +4,7 @@
 #include "materials.h"
 #include "environment_cache.h"
 #include "render_buffer.h"
+#include "refinement_tiles.h"
 #include "triangulation.h"
 
 #include "../environment.h"
@@ -54,10 +55,13 @@
 
 #include <tbb/blocked_range2d.h>
 #include <tbb/parallel_for.h>
+#include <tbb/task_arena.h>
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <chrono>
+#include <condition_variable>
 #include <cctype>
 #include <cmath>
 #include <cstring>
@@ -413,6 +417,7 @@ private:
 struct PrototypeStorage {
     std::unique_ptr<Geometry> geometry;
     RTCScene scene = nullptr;
+    std::atomic<uint64_t> lastEnabled{0};
     ~PrototypeStorage() {
         if (scene) rtcReleaseScene(scene);
         if (geometry) {
@@ -478,6 +483,26 @@ struct PrototypePool {
     };
     std::unordered_map<HdDataSourceBase const *, ConversionEntry> conversions;
     uint64_t conversionBuilds = 0;
+    std::atomic<uint64_t> residencyClock{0};
+    std::atomic<uint64_t> hiddenGeometryBudgetBytes{0};
+    std::atomic<uint64_t> hiddenGeometryEvictions{0};
+    std::atomic<uint64_t> hiddenGeometryRestorations{0};
+    struct Residency {
+        std::weak_ptr<PrototypeStorage> storage;
+        size_t bytes = 0;
+        bool enabled = false;
+        std::vector<SdfPath> paths;
+    };
+    // Immutable manifests allow accounting across banks and pinned historical
+    // frames without reading a snapshot while a worker is editing it.
+    using ResidencyManifest = std::unordered_map<PrototypeStorage *, Residency>;
+    std::unordered_map<void const *, ResidencyManifest> residencyManifests;
+    std::unordered_set<SdfPath, SdfPath::Hash> evictedPaths;
+    std::unordered_set<PrototypeStorage *> currentEnabledStorage;
+    std::unordered_map<PrototypeStorage *, std::weak_ptr<PrototypeStorage>> selectedEvictions;
+    mutable uint64_t usageRevision = ~uint64_t{0};
+    mutable uint64_t cachedHiddenResidentBytes = 0;
+    mutable uint64_t cachedHiddenPinnedBytes = 0;
 };
 
 // A mesh prim's conversion resolved to prototype storage. Snapshot builds
@@ -543,6 +568,7 @@ struct Snapshot {
         geomToInstanceChain;
     std::unordered_map<unsigned int, bool> placementEnabled;
     uint64_t enabledPlacementCount = 0;
+    std::unordered_map<SdfPath, uint64_t, SdfPath::Hash> enabledPrototypePlacements;
     std::unordered_map<unsigned int, GfMatrix4d> placementMatrices;
     bool sphereBatching = false;
     std::vector<PendingSphere> pendingSpheres;
@@ -557,6 +583,7 @@ struct Snapshot {
     std::shared_ptr<const PickingTable> picking;
     CanonicalPrimIds primIds;
     std::shared_ptr<const CanonicalPrimIds> canonicalIds;
+    bool primIdentityDirty = true;
     size_t estimatedGeometryBytes = 0;
     uint64_t instanceCount = 0;
     uint64_t prototypeBuildCount = 0;
@@ -570,6 +597,9 @@ struct Snapshot {
     std::unordered_set<std::string> warnedFeatures;
     std::unordered_set<SdfPath, SdfPath::Hash> warnedMotionPaths;
     std::unordered_map<SdfPath, Prototype, SdfPath::Hash> prototypes;
+    // Canonical prim identities survive eviction; resident Prototype records
+    // and every owning geometry alias are removed together.
+    std::unordered_set<SdfPath, SdfPath::Hash> evictedPrototypes;
     // Values are paths, not pointers: unordered-map growth and prototype edits
     // cannot invalidate bucket references. Stale paths are checked on lookup.
     std::unordered_map<size_t, std::vector<SdfPath>> prototypeHashBuckets;
@@ -581,9 +611,35 @@ struct Snapshot {
         prototypeMaterials;
     std::unordered_map<SdfPath, std::unordered_set<unsigned int>, SdfPath::Hash>
         placementDependencies;
+    // Persistent identities avoid reconstructing a hash table for every
+    // position-array notice. Input snapshots belong to this bank's generation.
+    std::unordered_map<PlacementKey, unsigned int, PlacementKeyHash> placementIds;
+    std::unordered_map<SdfPath, std::unordered_map<int, std::unordered_set<unsigned int>>,
+        SdfPath::Hash> instanceSourcePlacements;
+    std::unordered_map<SdfPath, HdContainerDataSourceHandle, SdfPath::Hash> instancerInputs;
+    std::unordered_map<SdfPath, std::unordered_set<SdfPath, SdfPath::Hash>, SdfPath::Hash>
+        prototypeDependencies;
+    std::unordered_map<SdfPath, std::unordered_set<SdfPath, SdfPath::Hash>, SdfPath::Hash>
+        prototypeDependencyPaths, prototypeInstancerPaths, instancerPrototypeUsers;
     uint64_t materialPrototypesVisited = 0;
     uint64_t materialBindingsUpdated = 0;
+    uint64_t lastCanonicalRecordsVisited = 0;
+    uint64_t lastPickingRecordsVisited = 0;
+    std::unordered_set<int> changedPickingPrims;
+    uint64_t lastCountRecordsVisited = 0;
+    uint64_t lastInputMetadataPrototypesVisited = 0;
+    uint64_t lastDependencyPlacementsVisited = 0;
+    double lastCanonicalMilliseconds = 0;
+    double lastPickingMilliseconds = 0;
+    double lastCountsMilliseconds = 0;
+    double lastDependencyMilliseconds = 0;
+    double lastInputMetadataMilliseconds = 0;
+    double lastInputComparisonMilliseconds = 0;
+    double lastPlacementReconcileMilliseconds = 0;
     uint64_t lastPlacementRecordsVisited = 0;
+    uint64_t lastInstanceArrayElementsScanned = 0;
+    uint64_t lastPlacementTopologyAttached = 0;
+    uint64_t lastPlacementTopologyDetached = 0;
     uint64_t lastVisibilityPlacementsUpdated = 0;
     uint64_t lastPlacementTransformsUpdated = 0;
     uint64_t lastPrototypePlacementsRepointed = 0;
@@ -598,6 +654,11 @@ struct Snapshot {
 
     ~Snapshot()
     {
+        {
+            std::lock_guard lock(prototypePool->mutex);
+            prototypePool->residencyManifests.erase(this);
+            ++prototypePool->residencyClock;
+        }
         if (scene) {
             scene->geometry.clear();
             scene->intersection_geometry.clear();
@@ -610,10 +671,21 @@ struct Snapshot {
     }
 };
 
+struct AccumulateMilliseconds {
+    double &total;
+    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    ~AccumulateMilliseconds() {
+        total += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - start).count();
+    }
+};
+
 int _EnsurePrimId(Snapshot *snapshot, PrimKey const &key)
 {
     auto existing = snapshot->primIds.find(key);
     int id = existing == snapshot->primIds.end() ? -1 : existing->second;
+    if (existing != snapshot->primIds.end()) return id;
+    snapshot->primIdentityDirty = true;
     if (id < 0 && snapshot->canonicalIds) {
         auto canonical = snapshot->canonicalIds->find(key);
         if (canonical != snapshot->canonicalIds->end()) id = canonical->second;
@@ -623,12 +695,16 @@ int _EnsurePrimId(Snapshot *snapshot, PrimKey const &key)
     snapshot->primPaths.resize(slots); snapshot->instancerPaths.resize(slots);
     snapshot->primPaths[id] = key.path; snapshot->instancerPaths[id] = key.instancerPath;
     snapshot->primIds[key] = id;
+    snapshot->livePrimCount = snapshot->primIds.size();
+    snapshot->primPathSlotCount = snapshot->primPaths.size();
     return id;
 }
 
 void _RefreshCachedCounts(Snapshot *snapshot)
 {
     if (!snapshot) return;
+    AccumulateMilliseconds timing{snapshot->lastCountsMilliseconds};
+    snapshot->lastCountRecordsVisited += snapshot->geometries.size() + snapshot->primPaths.size();
     snapshot->meshCount = 0;
     snapshot->triangleCount = 0;
     for (auto const &geometry : snapshot->geometries) {
@@ -644,9 +720,20 @@ void _RefreshCachedCounts(Snapshot *snapshot)
     snapshot->primPathSlotCount = snapshot->primPaths.size();
 }
 
-bool _CanonicalizePrimIds(Snapshot *snapshot, CanonicalPrimIds *registry)
+bool _CanonicalizePrimIds(Snapshot *snapshot, CanonicalPrimIds *registry,
+    std::shared_ptr<const CanonicalPrimIds> const &registryView = {})
 {
     if (!snapshot) return false;
+    // Registry IDs are append-only. A bank whose identities did not change
+    // already uses those IDs, even when another generation reserved more slots.
+    if (!snapshot->primIdentityDirty && snapshot->canonicalIds &&
+        snapshot->canonicalIds->size() == registry->size()) {
+        snapshot->primPathSlotCount = snapshot->primPaths.size();
+        return false;
+    }
+    AccumulateMilliseconds timing{snapshot->lastCanonicalMilliseconds};
+    snapshot->lastCanonicalRecordsVisited += snapshot->primIds.size() +
+        snapshot->geomToPrimId.size();
     if (registry->empty()) {
         *registry = snapshot->primIds;
     } else {
@@ -672,8 +759,11 @@ bool _CanonicalizePrimIds(Snapshot *snapshot, CanonicalPrimIds *registry)
     for (auto &entry : snapshot->pendingSpheres) entry.primId = mapId(entry.primId);
     const bool changed = paths != snapshot->primPaths || instancers != snapshot->instancerPaths;
     snapshot->primPaths = std::move(paths); snapshot->instancerPaths = std::move(instancers);
-    snapshot->canonicalIds = std::make_shared<const CanonicalPrimIds>(*registry);
-    if (changed) _RefreshCachedCounts(snapshot);
+    snapshot->canonicalIds = registryView && registryView->size() == registry->size()
+        ? registryView : std::make_shared<const CanonicalPrimIds>(*registry);
+    snapshot->primIdentityDirty = false;
+    snapshot->livePrimCount = snapshot->primIds.size();
+    snapshot->primPathSlotCount = snapshot->primPaths.size();
     return changed;
 }
 
@@ -766,6 +856,7 @@ unsigned int _AttachPrototype(Snapshot *snapshot, SdfPath const &path,
     for (SdfPath ancestor = path; !ancestor.IsEmpty() && ancestor != SdfPath::AbsoluteRootPath();
          ancestor = ancestor.GetParentPath()) snapshot->placementDependencies[ancestor].insert(id);
     ++snapshot->enabledPlacementCount;
+    ++snapshot->enabledPrototypePlacements[path];
     snapshot->embreeGeometryCommitSeconds += std::chrono::duration<double>(
         std::chrono::steady_clock::now() - commitStart).count();
     return id;
@@ -803,6 +894,19 @@ void _SetInstanceTransform(Snapshot *snapshot, unsigned int id,
     ++snapshot->lastPlacementTransformsUpdated;
 }
 
+void _TrackPrototypeEnabled(Snapshot *snapshot, unsigned int id, bool enabled)
+{
+    auto prim = snapshot->geomToPrimId.find(id);
+    if (prim == snapshot->geomToPrimId.end() || prim->second < 0 ||
+        static_cast<size_t>(prim->second) >= snapshot->primPaths.size()) return;
+    SdfPath const &path = snapshot->primPaths[prim->second];
+    if (enabled) ++snapshot->enabledPrototypePlacements[path];
+    else if (auto count = snapshot->enabledPrototypePlacements.find(path);
+             count != snapshot->enabledPrototypePlacements.end()) {
+        if (--count->second == 0) snapshot->enabledPrototypePlacements.erase(count);
+    }
+}
+
 void _SetInstanceEnabled(Snapshot *snapshot, unsigned int id, bool enabled)
 {
     auto state = snapshot->placementEnabled.find(id);
@@ -814,33 +918,271 @@ void _SetInstanceEnabled(Snapshot *snapshot, unsigned int id, bool enabled)
     if (enabled) rtcEnableGeometry(instance);
     else rtcDisableGeometry(instance);
     rtcCommitGeometry(instance);
-    if (enabled) ++snapshot->enabledPlacementCount;
-    else if (state != snapshot->placementEnabled.end() && state->second)
+    if (enabled) {
+        ++snapshot->enabledPlacementCount;
+        _TrackPrototypeEnabled(snapshot, id, true);
+    } else if (state != snapshot->placementEnabled.end() && state->second) {
         --snapshot->enabledPlacementCount;
+        _TrackPrototypeEnabled(snapshot, id, false);
+    }
     snapshot->placementEnabled[id] = enabled;
     if (changed) ++snapshot->lastVisibilityPlacementsUpdated;
+}
+
+// Update only one placement's memberships, using its old maps before removal.
+void _IndexPlacementDependency(Snapshot *snapshot, unsigned int id, bool attach)
+{
+    auto prim = snapshot->geomToPrimId.find(id);
+    if (prim == snapshot->geomToPrimId.end() || prim->second < 0 ||
+        static_cast<size_t>(prim->second) >= snapshot->primPaths.size()) return;
+    AccumulateMilliseconds timing{snapshot->lastDependencyMilliseconds};
+    ++snapshot->lastDependencyPlacementsVisited;
+    const int primId = prim->second;
+    auto ancestors = [&](SdfPath path) {
+        while (!path.IsEmpty() && path != SdfPath::AbsoluteRootPath()) {
+            if (attach) snapshot->placementDependencies[path].insert(id);
+            else if (auto it = snapshot->placementDependencies.find(path);
+                     it != snapshot->placementDependencies.end()) {
+                it->second.erase(id);
+                if (it->second.empty()) snapshot->placementDependencies.erase(it);
+            }
+            path = path.GetParentPath();
+        }
+    };
+    ancestors(snapshot->primPaths[primId]);
+    ancestors(snapshot->instancerPaths[primId]);
+    auto chain = snapshot->geomToInstanceChain.find(id);
+    auto key = _PlacementKey(snapshot->primPaths[primId],
+        chain == snapshot->geomToInstanceChain.end() ? std::vector<InstanceLevel>{} : chain->second);
+    if (attach) snapshot->placementIds[key] = id;
+    else snapshot->placementIds.erase(key);
+    if (chain != snapshot->geomToInstanceChain.end())
+        for (InstanceLevel const &level : chain->second) {
+            ancestors(level.instancerPath);
+            if (attach)
+                snapshot->instanceSourcePlacements[level.instancerPath][level.sourceIndex].insert(id);
+            else if (auto instancer = snapshot->instanceSourcePlacements.find(level.instancerPath);
+                     instancer != snapshot->instanceSourcePlacements.end()) {
+                auto source = instancer->second.find(level.sourceIndex);
+                if (source != instancer->second.end()) {
+                    source->second.erase(id);
+                    if (source->second.empty()) instancer->second.erase(source);
+                }
+                if (instancer->second.empty()) snapshot->instanceSourcePlacements.erase(instancer);
+            }
+        }
 }
 
 void _IndexPlacementDependencies(Snapshot *snapshot)
 {
     snapshot->placementDependencies.clear();
-    auto addAncestors = [&](SdfPath path, unsigned int id) {
-        while (!path.IsEmpty() && path != SdfPath::AbsoluteRootPath()) {
-            snapshot->placementDependencies[path].insert(id);
-            path = path.GetParentPath();
-        }
-    };
-    for (auto const &[id, primId] : snapshot->geomToPrimId) {
-        if (primId < 0 || static_cast<size_t>(primId) >=
-                snapshot->primPaths.size()) continue;
-        addAncestors(snapshot->primPaths[primId], id);
-        if (static_cast<size_t>(primId) < snapshot->instancerPaths.size())
-            addAncestors(snapshot->instancerPaths[primId], id);
-        auto chain = snapshot->geomToInstanceChain.find(id);
-        if (chain != snapshot->geomToInstanceChain.end())
-            for (InstanceLevel const &level : chain->second)
-                addAncestors(level.instancerPath, id);
+    snapshot->placementIds.clear();
+    snapshot->instanceSourcePlacements.clear();
+    snapshot->instancerInputs.clear();
+    snapshot->prototypeDependencies.clear();
+    for (auto const &[id, primId] : snapshot->geomToPrimId)
+        _IndexPlacementDependency(snapshot, id, true);
+}
+
+size_t _RetainedGeometryBytes(Geometry const *geometry)
+{
+    if (auto const *mesh = dynamic_cast<Mesh const *>(geometry))
+        return mesh->vertices.size() * sizeof(Float3) +
+            mesh->normals.size() * sizeof(Float3) +
+            mesh->texcoords.size() * sizeof(Float2) +
+            mesh->indices.size() * sizeof(unsigned int) +
+            mesh->tangents.size() * sizeof(float);
+    return dynamic_cast<Sphere const *>(geometry) ? 4 * sizeof(float) : 0;
+}
+
+PrototypePool::ResidencyManifest _ResidencyManifest(Snapshot const &snapshot)
+{
+    PrototypePool::ResidencyManifest result;
+    for (auto const &[path, prototype] : snapshot.prototypes) {
+        auto &entry = result[prototype.storage.get()];
+        entry.storage = prototype.storage;
+        entry.bytes = _RetainedGeometryBytes(prototype.geometry);
+        entry.paths.push_back(path);
+        entry.enabled |= snapshot.enabledPrototypePlacements.contains(path);
     }
+    return result;
+}
+
+struct HiddenGeometryUsage {
+    uint64_t residentBytes = 0;
+    uint64_t pinnedBytes = 0;
+};
+
+std::unordered_set<PrototypeStorage *> _EnabledPrototypeStorage(Snapshot const &snapshot)
+{
+    std::unordered_set<PrototypeStorage *> result;
+    for (auto const &[path, prototype] : snapshot.prototypes)
+        if (snapshot.enabledPrototypePlacements.contains(path))
+            result.insert(prototype.storage.get());
+    return result;
+}
+
+void _SetCurrentResidency(Snapshot const &snapshot)
+{
+    auto enabled = _EnabledPrototypeStorage(snapshot);
+    std::lock_guard lock(snapshot.prototypePool->mutex);
+    snapshot.prototypePool->currentEnabledStorage = std::move(enabled);
+    ++snapshot.prototypePool->residencyClock;
+}
+
+// Caller holds the pool mutex. Weak entries do not extend any geometry lifetime.
+PrototypePool::ResidencyManifest _CombinedResidency(PrototypePool const &pool,
+    std::unordered_set<PrototypeStorage *> const &enabledStorage)
+{
+    PrototypePool::ResidencyManifest result;
+    for (auto const &[owner, manifest] : pool.residencyManifests)
+        for (auto const &[storage, entry] : manifest) {
+            if (entry.storage.expired()) continue;
+            auto &combined = result[storage];
+            combined.storage = entry.storage;
+            combined.bytes = entry.bytes;
+            combined.enabled = enabledStorage.contains(storage);
+            combined.paths.insert(combined.paths.end(), entry.paths.begin(), entry.paths.end());
+        }
+    return result;
+}
+
+HiddenGeometryUsage _HiddenGeometryUsage(PrototypePool const &pool)
+{
+    const uint64_t revision = pool.residencyClock.load();
+    if (pool.usageRevision == revision)
+        return {pool.cachedHiddenResidentBytes, pool.cachedHiddenPinnedBytes};
+    HiddenGeometryUsage usage;
+    for (auto const &[storage, entry] : _CombinedResidency(pool, pool.currentEnabledStorage)) {
+        if (entry.enabled) continue;
+        usage.residentBytes += entry.bytes;
+        auto selected = pool.selectedEvictions.find(storage);
+        if (selected != pool.selectedEvictions.end() && !selected->second.expired())
+            usage.pinnedBytes += entry.bytes;
+    }
+    pool.cachedHiddenResidentBytes = usage.residentBytes;
+    pool.cachedHiddenPinnedBytes = usage.pinnedBytes;
+    pool.usageRevision = revision;
+    return usage;
+}
+
+// Only call on an unpublished bank. Detachment releases Embree's instance
+// ownership before removing the last C++ aliases to a prototype scene.
+bool _ApplyHiddenGeometryBudget(Snapshot *snapshot, bool useCurrentEligibility = false)
+{
+    if (!snapshot || !snapshot->scene) return false;
+    auto manifest = _ResidencyManifest(*snapshot);
+    auto enabledStorage = _EnabledPrototypeStorage(*snapshot);
+    PrototypePool &pool = *snapshot->prototypePool;
+    std::unordered_set<PrototypeStorage *> evictions;
+    std::vector<std::shared_ptr<PrototypeStorage>> evictionOwners;
+    {
+        std::lock_guard lock(pool.mutex);
+        if (useCurrentEligibility) enabledStorage = pool.currentEnabledStorage;
+        const uint64_t tick = ++pool.residencyClock;
+        pool.residencyManifests[snapshot] = manifest;
+        auto combined = _CombinedResidency(pool, enabledStorage);
+        for (auto const &[storage, entry] : manifest)
+            if (combined.at(storage).enabled)
+                storage->lastEnabled.store(tick, std::memory_order_relaxed);
+        const uint64_t budget = pool.hiddenGeometryBudgetBytes.load();
+        if (!budget) return false;
+        uint64_t hiddenBytes = 0;
+        for (auto const &[storage, entry] : combined)
+            if (!entry.enabled) hiddenBytes += entry.bytes;
+        struct Candidate {
+            PrototypeStorage *storage;
+            size_t bytes;
+            uint64_t lastEnabled;
+            SdfPath path;
+            bool alreadyEvicted;
+        };
+        std::vector<Candidate> candidates;
+        for (auto const &[storage, entry] : manifest) {
+            if (combined.at(storage).enabled) continue;
+            auto const path = *std::min_element(entry.paths.begin(), entry.paths.end());
+            const bool alreadyEvicted = std::any_of(entry.paths.begin(), entry.paths.end(),
+                [&](SdfPath const &p) { return pool.evictedPaths.contains(p); });
+            candidates.push_back({storage, entry.bytes,
+                storage->lastEnabled.load(std::memory_order_relaxed), path, alreadyEvicted});
+        }
+        std::sort(candidates.begin(), candidates.end(), [](auto const &a, auto const &b) {
+            if (a.alreadyEvicted != b.alreadyEvicted) return a.alreadyEvicted;
+            return a.lastEnabled != b.lastEnabled ? a.lastEnabled < b.lastEnabled : a.path < b.path;
+        });
+        for (auto const &candidate : candidates) {
+            if (hiddenBytes <= budget && !candidate.alreadyEvicted) continue;
+            evictions.insert(candidate.storage);
+            evictionOwners.push_back(manifest.at(candidate.storage).storage.lock());
+            pool.selectedEvictions[candidate.storage] = manifest.at(candidate.storage).storage;
+            hiddenBytes -= std::min<uint64_t>(hiddenBytes, candidate.bytes);
+            for (auto const &path : manifest.at(candidate.storage).paths)
+                pool.evictedPaths.insert(path);
+        }
+    }
+    if (evictions.empty()) return false;
+    std::unordered_set<SdfPath, SdfPath::Hash> paths;
+    for (auto *storage : evictions)
+        for (auto const &path : manifest.at(storage).paths) paths.insert(path);
+    std::vector<unsigned int> detach;
+    for (auto const &[id, primId] : snapshot->geomToPrimId)
+        if (primId >= 0 && static_cast<size_t>(primId) < snapshot->primPaths.size() &&
+            paths.contains(snapshot->primPaths[primId])) detach.push_back(id);
+    for (unsigned int id : detach) {
+        rtcDetachGeometry(snapshot->scene->scene, id);
+        if (auto enabled = snapshot->placementEnabled.find(id);
+            enabled != snapshot->placementEnabled.end() && enabled->second) {
+            --snapshot->enabledPlacementCount;
+            _TrackPrototypeEnabled(snapshot, id, false);
+        }
+        snapshot->scene->geometry.erase(id);
+        snapshot->scene->intersection_geometry.erase(id);
+        snapshot->scene->placement_materials.erase(id);
+        snapshot->scene->placement_transforms.erase(id);
+        auto instance = snapshot->geomToInstanceId.find(id);
+        if (instance != snapshot->geomToInstanceId.end() && instance->second >= 0)
+            --snapshot->instanceCount;
+        snapshot->geomToPrimId.erase(id);
+        snapshot->geomToCoarseFaces.erase(id);
+        snapshot->geomToInstanceId.erase(id);
+        snapshot->geomToInstanceChain.erase(id);
+        snapshot->placementEnabled.erase(id);
+        snapshot->placementMatrices.erase(id);
+    }
+    for (SdfPath const &path : paths) {
+        auto prototype = snapshot->prototypes.find(path);
+        auto bucket = snapshot->prototypeHashBuckets.find(prototype->second.geometryHash);
+        if (bucket != snapshot->prototypeHashBuckets.end()) {
+            std::erase(bucket->second, path);
+            if (bucket->second.empty()) snapshot->prototypeHashBuckets.erase(bucket);
+        }
+        snapshot->prototypes.erase(prototype);
+        snapshot->evictedPrototypes.insert(path);
+        snapshot->displayMaterialsByPath.erase(path);
+    }
+    for (auto *storage : evictions) {
+        Geometry const *const retainedGeometry = storage->geometry.get();
+        snapshot->estimatedGeometryBytes -= std::min(snapshot->estimatedGeometryBytes,
+            manifest.at(storage).bytes);
+        std::erase_if(snapshot->geometries, [retainedGeometry](auto const &geometry) {
+            return geometry.get() == retainedGeometry;
+        });
+    }
+    pool.hiddenGeometryEvictions.fetch_add(paths.size());
+    _IndexPlacementDependencies(snapshot);
+    _RefreshCachedCounts(snapshot);
+    {
+        std::lock_guard lock(pool.mutex);
+        std::erase_if(pool.conversions, [&](auto const &entry) {
+            auto storage = entry.second.storage.lock();
+            return !storage || evictions.contains(storage.get());
+        });
+        std::erase_if(pool.selectedEvictions, [](auto const &entry) {
+            return entry.second.expired();
+        });
+        pool.residencyManifests[snapshot] = _ResidencyManifest(*snapshot);
+    }
+    return !detach.empty();
 }
 
 // Pure: reads only the prim's data source and touches no Snapshot, pool,
@@ -1588,18 +1930,40 @@ size_t _EnvironmentImportanceBytes(Snapshot const *snapshot)
 }
 
 void _BuildPickingInstanceTopologies(Snapshot *snapshot,
-                                     PickingTable *picking)
+                                     PickingTable *picking,
+                                     std::unordered_set<int> const *affected = nullptr)
 {
-    picking->instanceTopologies.resize(picking->primPaths.size());
-    picking->logicalPlacementCountsByPrim.assign(
-        picking->primPaths.size(), 0);
-    for (auto const &[geomId, primId] : snapshot->geomToPrimId) {
-        (void)geomId;
+    AccumulateMilliseconds timing{snapshot->lastPickingMilliseconds};
+    std::vector<unsigned int> geometryIds;
+    if (affected) {
+        picking->instanceTopologies.resize(picking->primPaths.size());
+        picking->logicalPlacementCountsByPrim.resize(picking->primPaths.size(), 0);
+        for (int primId : *affected) {
+            if (primId < 0 || static_cast<size_t>(primId) >= picking->primPaths.size()) continue;
+            picking->instanceTopologies[primId].clear();
+            picking->logicalPlacementCountsByPrim[primId] = 0;
+            auto dependencies = snapshot->placementDependencies.find(picking->primPaths[primId]);
+            if (dependencies == snapshot->placementDependencies.end()) continue;
+            for (unsigned int id : dependencies->second) {
+                auto prim = snapshot->geomToPrimId.find(id);
+                if (prim != snapshot->geomToPrimId.end() && prim->second == primId)
+                    geometryIds.push_back(id);
+            }
+        }
+    } else {
+        picking->instanceTopologies.resize(picking->primPaths.size());
+        picking->logicalPlacementCountsByPrim.assign(picking->primPaths.size(), 0);
+        for (auto const &[id, prim] : snapshot->geomToPrimId) geometryIds.push_back(id);
+    }
+    snapshot->lastPickingRecordsVisited += geometryIds.size() +
+        (affected ? affected->size() : snapshot->primPaths.size());
+    for (unsigned int geomId : geometryIds) {
+        const int primId = snapshot->geomToPrimId.at(geomId);
         if (primId >= 0 && static_cast<size_t>(primId) <
                 picking->logicalPlacementCountsByPrim.size())
             ++picking->logicalPlacementCountsByPrim[primId];
     }
-    for (auto const &[geomId, primIds] : snapshot->sphereBatchPrimIds) {
+    if (!affected) for (auto const &[geomId, primIds] : snapshot->sphereBatchPrimIds) {
         (void)geomId;
         for (int primId : primIds)
             if (primId >= 0 && static_cast<size_t>(primId) <
@@ -1607,7 +1971,10 @@ void _BuildPickingInstanceTopologies(Snapshot *snapshot,
                 ++picking->logicalPlacementCountsByPrim[primId];
     }
     std::vector<bool> incompatible(picking->primPaths.size(), false);
-    for (auto const &[geomId, chain] : snapshot->geomToInstanceChain) {
+    for (unsigned int geomId : geometryIds) {
+        auto chainIt = snapshot->geomToInstanceChain.find(geomId);
+        if (chainIt == snapshot->geomToInstanceChain.end()) continue;
+        auto const &chain = chainIt->second;
         auto prim = snapshot->geomToPrimId.find(geomId);
         if (prim == snapshot->geomToPrimId.end() || prim->second < 0 ||
             static_cast<size_t>(prim->second) >=
@@ -2016,6 +2383,221 @@ std::vector<InstancePlacement> _InstancePlacements(
     return result;
 }
 
+// Cache the captured instancers and the prototype relationships, including
+// zero-placement prototypes. Only retained data sources reach this worker.
+void _CachePlacementInputs(HdSceneIndexBaseRefPtr const &index, Snapshot *snapshot,
+    std::unordered_set<SdfPath, SdfPath::Hash> const *affected = nullptr)
+{
+    AccumulateMilliseconds timing{snapshot->lastInputMetadataMilliseconds};
+    std::unordered_set<SdfPath, SdfPath::Hash> all;
+    if (!affected) {
+        snapshot->instancerInputs.clear();
+        snapshot->prototypeDependencies.clear();
+        snapshot->prototypeDependencyPaths.clear();
+        snapshot->prototypeInstancerPaths.clear();
+        snapshot->instancerPrototypeUsers.clear();
+        for (auto const &[path, storage] : snapshot->prototypes) all.insert(path);
+        affected = &all;
+    }
+    std::unordered_map<SdfPath, HdContainerDataSourceHandle, SdfPath::Hash> captured;
+    auto input = [&](SdfPath const &path) {
+        auto [it, added] = captured.try_emplace(path);
+        if (added) it->second = index->GetPrim(path).dataSource;
+        return it->second;
+    };
+    for (auto const &prototype : *affected) {
+        ++snapshot->lastInputMetadataPrototypesVisited;
+        if (auto previous = snapshot->prototypeDependencyPaths.find(prototype);
+            previous != snapshot->prototypeDependencyPaths.end()) {
+            for (auto const &path : previous->second) {
+                auto it = snapshot->prototypeDependencies.find(path);
+                if (it == snapshot->prototypeDependencies.end()) continue;
+                it->second.erase(prototype);
+                if (it->second.empty()) snapshot->prototypeDependencies.erase(it);
+            }
+            snapshot->prototypeDependencyPaths.erase(previous);
+        }
+        if (auto previous = snapshot->prototypeInstancerPaths.find(prototype);
+            previous != snapshot->prototypeInstancerPaths.end()) {
+            for (auto const &path : previous->second) {
+                auto it = snapshot->instancerPrototypeUsers.find(path);
+                if (it == snapshot->instancerPrototypeUsers.end()) continue;
+                it->second.erase(prototype);
+                if (it->second.empty()) {
+                    snapshot->instancerPrototypeUsers.erase(it);
+                    snapshot->instancerInputs.erase(path);
+                }
+            }
+            snapshot->prototypeInstancerPaths.erase(previous);
+        }
+        if (!snapshot->prototypes.contains(prototype)) continue;
+        auto ancestors = [&](SdfPath path) {
+            while (!path.IsEmpty() && path != SdfPath::AbsoluteRootPath()) {
+                snapshot->prototypeDependencies[path].insert(prototype);
+                snapshot->prototypeDependencyPaths[prototype].insert(path);
+                path = path.GetParentPath();
+            }
+        };
+        ancestors(prototype);
+        std::unordered_set<SdfPath, SdfPath::Hash> visited;
+        std::function<void(SdfPath const &, int)> collect = [&](SdfPath const &path, int depth) {
+            if (depth > 16 || !visited.insert(path).second) return;
+            auto const by = HdInstancedBySchema::GetFromParent(input(path));
+            if (!by || !by.GetPaths()) return;
+            for (auto const &instancer : by.GetPaths()->GetTypedValue(0.0f)) {
+                snapshot->instancerInputs[instancer] = input(instancer);
+                snapshot->instancerPrototypeUsers[instancer].insert(prototype);
+                snapshot->prototypeInstancerPaths[prototype].insert(instancer);
+                ancestors(instancer);
+                collect(instancer, depth + 1);
+            }
+        };
+        collect(prototype, 0);
+    }
+}
+
+bool _SamePlacementData(HdDataSourceBaseHandle const &a, HdDataSourceBaseHandle const &b,
+    uint64_t *scanned)
+{
+    if (a == b) return true;
+    if (!a || !b) return false;
+    if (auto ac = HdContainerDataSource::Cast(a)) {
+        auto bc = HdContainerDataSource::Cast(b);
+        if (!bc) return false;
+        auto names = ac->GetNames(), other = bc->GetNames();
+        std::sort(names.begin(), names.end()); std::sort(other.begin(), other.end());
+        if (names != other) return false;
+        for (auto const &name : names)
+            if (!_SamePlacementData(ac->Get(name), bc->Get(name), scanned)) return false;
+        return true;
+    }
+    if (auto av = HdVectorDataSource::Cast(a)) {
+        auto bv = HdVectorDataSource::Cast(b);
+        if (!bv || av->GetNumElements() != bv->GetNumElements()) return false;
+        for (size_t i = 0; i < av->GetNumElements(); ++i)
+            if (!_SamePlacementData(av->GetElement(i), bv->GetElement(i), scanned)) return false;
+        return true;
+    }
+    auto av = HdSampledDataSource::Cast(a), bv = HdSampledDataSource::Cast(b);
+    if (!av || !bv) return false;
+    auto const left = av->GetValue(0.0f), right = bv->GetValue(0.0f);
+    if (left.IsArrayValued()) *scanned += left.GetArraySize();
+    return left == right;
+}
+
+bool _InstanceTransformToken(TfToken const &name)
+{
+    return name == HdInstancerTokens->instanceTranslations ||
+        name == HdInstancerTokens->instanceRotations ||
+        name == HdInstancerTokens->instanceScales ||
+        name == HdInstancerTokens->instanceTransforms;
+}
+
+template<class T>
+bool _ChangedInstanceArray(VtValue const &a, VtValue const &b,
+    std::unordered_set<int> *changed, uint64_t *scanned)
+{
+    if (!a.IsHolding<VtArray<T>>() || !b.IsHolding<VtArray<T>>()) return false;
+    auto const &left = a.UncheckedGet<VtArray<T>>(), &right = b.UncheckedGet<VtArray<T>>();
+    const size_t count = std::max(left.size(), right.size());
+    *scanned += count;
+    for (size_t i = 0; i < count; ++i)
+        if (i >= left.size() || i >= right.size() || left[i] != right[i])
+            changed->insert(static_cast<int>(i));
+    return true;
+}
+
+bool _ChangedInstanceInputs(HdContainerDataSourceHandle const &oldSource,
+    HdContainerDataSourceHandle const &newSource, std::unordered_set<int> *changed,
+    uint64_t *scanned)
+{
+    if (!oldSource || !newSource) return false;
+    auto names = oldSource->GetNames(), other = newSource->GetNames();
+    std::sort(names.begin(), names.end()); std::sort(other.begin(), other.end());
+    if (names != other) return false;
+    for (auto const &name : names)
+        if (name != HdPrimvarsSchemaTokens->primvars &&
+            !_SamePlacementData(oldSource->Get(name), newSource->Get(name), scanned)) return false;
+    auto oldVars = HdPrimvarsSchema::GetFromParent(oldSource);
+    auto newVars = HdPrimvarsSchema::GetFromParent(newSource);
+    if (!oldVars || !newVars) return false;
+    names = oldVars.GetContainer()->GetNames(); other = newVars.GetContainer()->GetNames();
+    std::sort(names.begin(), names.end()); std::sort(other.begin(), other.end());
+    if (names != other) return false;
+    for (auto const &name : names) {
+        if (!_InstanceTransformToken(name)) {
+            if (!_SamePlacementData(oldVars.GetContainer()->Get(name),
+                    newVars.GetContainer()->Get(name), scanned)) return false;
+            continue;
+        }
+        auto const a = _Primvar(oldVars, name), b = _Primvar(newVars, name);
+        if (a.interpolation != b.interpolation) return false;
+        if (a.value.IsEmpty() && b.value.IsEmpty()) continue;
+        if (!(_ChangedInstanceArray<GfVec3f>(a.value, b.value, changed, scanned) ||
+              _ChangedInstanceArray<GfVec3d>(a.value, b.value, changed, scanned) ||
+              _ChangedInstanceArray<GfQuatf>(a.value, b.value, changed, scanned) ||
+              _ChangedInstanceArray<GfQuath>(a.value, b.value, changed, scanned) ||
+              _ChangedInstanceArray<GfQuatd>(a.value, b.value, changed, scanned) ||
+              _ChangedInstanceArray<GfVec4f>(a.value, b.value, changed, scanned) ||
+              _ChangedInstanceArray<GfMatrix4f>(a.value, b.value, changed, scanned) ||
+              _ChangedInstanceArray<GfMatrix4d>(a.value, b.value, changed, scanned))) return false;
+    }
+    return true;
+}
+
+GfMatrix4d _InstanceSourceTransform(HdContainerDataSourceHandle const &source, int index)
+{
+    auto primvars = HdPrimvarsSchema::GetFromParent(source);
+    auto translations = _Primvar(primvars, HdInstancerTokens->instanceTranslations).value;
+    auto rotations = _Primvar(primvars, HdInstancerTokens->instanceRotations).value;
+    auto scales = _Primvar(primvars, HdInstancerTokens->instanceScales).value;
+    auto transforms = _Primvar(primvars, HdInstancerTokens->instanceTransforms).value;
+    GfMatrix4d result(1.0), matrix(1.0);
+    GfVec3f v; GfVec3d vd;
+    if (_ArrayValue(translations, index, &v) ||
+        (_ArrayValue(translations, index, &vd) && (v = GfVec3f(vd), true))) {
+        matrix.SetTranslate(GfVec3d(v)); result = matrix * result;
+    }
+    GfQuatf q; GfQuath qh; GfQuatd qd; GfVec4f qv;
+    matrix.SetIdentity();
+    if (_ArrayValue(rotations, index, &q)) matrix.SetRotate(GfQuatd(q));
+    else if (_ArrayValue(rotations, index, &qh)) matrix.SetRotate(GfQuatd(qh));
+    else if (_ArrayValue(rotations, index, &qd)) matrix.SetRotate(qd);
+    else if (_ArrayValue(rotations, index, &qv))
+        matrix.SetRotate(GfQuatd(qv[0], qv[1], qv[2], qv[3]));
+    result = matrix * result;
+    if (_ArrayValue(scales, index, &v) ||
+        (_ArrayValue(scales, index, &vd) && (v = GfVec3f(vd), true))) {
+        matrix.SetScale(GfVec3d(v)); result = matrix * result;
+    }
+    GfMatrix4d md; GfMatrix4f mf;
+    if (_ArrayValue(transforms, index, &md)) result = md * result;
+    else if (_ArrayValue(transforms, index, &mf)) result = GfMatrix4d(mf) * result;
+    return result;
+}
+
+bool _PlacementTransformFromChain(HdSceneIndexBaseRefPtr const &index,
+    SdfPath prototype, std::vector<InstanceLevel> const &chain, GfMatrix4d *result)
+{
+    *result = GfMatrix4d(1.0);
+    if (chain.empty()) { *result = _WorldTransform(index, prototype); return true; }
+    for (auto level = chain.rbegin(); level != chain.rend(); ++level) {
+        auto by = HdInstancedBySchema::GetFromParent(index->GetPrim(prototype).dataSource);
+        if (!by || !by.GetPaths()) return false;
+        auto const paths = by.GetPaths()->GetTypedValue(0.0f);
+        auto const roots = by.GetPrototypeRoots() ? by.GetPrototypeRoots()->GetTypedValue(0.0f) : VtArray<SdfPath>();
+        auto found = std::find(paths.begin(), paths.end(), level->instancerPath);
+        if (found == paths.end()) return false;
+        size_t const slot = static_cast<size_t>(found - paths.begin());
+        SdfPath const root = slot < roots.size() && !roots[slot].IsEmpty() ? roots[slot] : prototype;
+        *result *= _RelativeTransform(index, prototype, root.GetParentPath()) *
+            _InstanceSourceTransform(index->GetPrim(level->instancerPath).dataSource, level->sourceIndex);
+        prototype = level->instancerPath;
+    }
+    *result *= _WorldTransform(index, chain.front().instancerPath);
+    return true;
+}
+
 template<class T>
 T _ContainerValue(HdContainerDataSourceHandle const &container,
                   TfToken const &name, T const &fallback)
@@ -2087,16 +2669,34 @@ struct MeshPreparation {
         placements;
 };
 
+bool _HasEligiblePlacement(HdSceneIndexBaseRefPtr const &scene,
+    SdfPath const &path, HdSceneIndexPrim const &prim, TfTokenVector const &tags)
+{
+    if (!_PlacementEligible(scene, path, prim.dataSource, {}, tags)) return false;
+    if (!HdInstancedBySchema::GetFromParent(prim.dataSource)) return true;
+    auto const placements = _InstancePlacements(scene, path, prim.dataSource);
+    return std::any_of(placements.begin(), placements.end(), [&](auto const &placement) {
+        return _PlacementEligible(scene, path, prim.dataSource, placement.chain, tags);
+    });
+}
+
 void _CollectMeshes(HdSceneIndexBaseRefPtr const &scene, SdfPath const &path,
                     TfTokenVector const &renderTags,
                     std::function<bool()> const &cancelled,
                     MeshPreparation *preparation,
                     std::vector<std::pair<SdfPath, HdContainerDataSourceHandle>>
-                        *candidates)
+                        *candidates, Snapshot *snapshot)
 {
     if (cancelled && cancelled()) return;
     HdSceneIndexPrim const prim = scene->GetPrim(path);
     if (prim.primType == HdPrimTypeTokens->mesh) {
+        if (snapshot->evictedPrototypes.contains(path) &&
+            !_HasEligiblePlacement(scene, path, prim, renderTags)) {
+            for (SdfPath const &child : scene->GetChildPrimPaths(path))
+                _CollectMeshes(scene, child, renderTags, cancelled, preparation,
+                               candidates, snapshot);
+            return;
+        }
         // Preparation owns supported prototypes even without enabled placements.
         if (HdInstancedBySchema::GetFromParent(prim.dataSource))
             preparation->placements.emplace(path,
@@ -2109,7 +2709,7 @@ void _CollectMeshes(HdSceneIndexBaseRefPtr const &scene, SdfPath const &path,
     }
     for (SdfPath const &child : scene->GetChildPrimPaths(path))
         _CollectMeshes(scene, child, renderTags, cancelled, preparation,
-                       candidates);
+                       candidates, snapshot);
 }
 
 // Conversion and Embree prototype builds are independent per prim, so they
@@ -2123,7 +2723,7 @@ MeshPreparation _PrepareMeshes(HdSceneIndexBaseRefPtr const &scene,
     MeshPreparation preparation;
     std::vector<std::pair<SdfPath, HdContainerDataSourceHandle>> candidates;
     _CollectMeshes(scene, SdfPath::AbsoluteRootPath(), renderTags, cancelled,
-                   &preparation, &candidates);
+                   &preparation, &candidates, snapshot);
     if (cancelled && cancelled()) return preparation;
 
     PrototypePool &pool = *snapshot->prototypePool;
@@ -2246,7 +2846,7 @@ void _Walk(HdSceneIndexBaseRefPtr const &scene, SdfPath const &path,
            MaterialService *materials, Snapshot *snapshot,
            TfTokenVector const &renderTags,
            std::function<bool()> const &cancelled,
-           MeshPreparation *preparation = nullptr)
+           MeshPreparation *preparation = nullptr, bool traverseChildren = true)
 {
     if (cancelled && cancelled()) return;
     HdSceneIndexPrim prim = scene->GetPrim(path);
@@ -2270,6 +2870,29 @@ void _Walk(HdSceneIndexBaseRefPtr const &scene, SdfPath const &path,
         }
         if (!placementsPrepared)
             placements = _InstancePlacements(scene, path, prim.dataSource);
+        if (snapshot->evictedPrototypes.contains(path)) {
+            const bool enabled = placements.empty()
+                ? !isInstanced && _PlacementEligible(scene, path, prim.dataSource, {}, renderTags)
+                : std::any_of(placements.begin(), placements.end(), [&](auto const &placement) {
+                    return _PlacementEligible(scene, path, prim.dataSource, placement.chain, renderTags);
+                });
+            if (!enabled) {
+                if (!isInstanced) _EnsurePrimId(snapshot, {path, {}});
+                for (auto const &placement : placements)
+                    _EnsurePrimId(snapshot, {path, placement.instancerPath});
+                if (traverseChildren)
+                    for (SdfPath const &child : scene->GetChildPrimPaths(path))
+                        _Walk(scene, child, materials, snapshot, renderTags, cancelled,
+                              preparation);
+                return;
+            }
+            snapshot->evictedPrototypes.erase(path);
+            {
+                std::lock_guard lock(snapshot->prototypePool->mutex);
+                snapshot->prototypePool->evictedPaths.erase(path);
+            }
+            ++snapshot->prototypePool->hiddenGeometryRestorations;
+        }
         if (placements.empty() && !isInstanced) {
             if (prim.primType == HdPrimTypeTokens->mesh)
                 _AppendMesh(scene, path, prim, materials, snapshot,
@@ -2313,9 +2936,37 @@ void _Walk(HdSceneIndexBaseRefPtr const &scene, SdfPath const &path,
         TF_WARN("PrismRT: prim type '%s' is not supported and will be skipped",
                 type.c_str());
     }
-    for (SdfPath const &child : scene->GetChildPrimPaths(path))
-        _Walk(scene, child, materials, snapshot, renderTags, cancelled,
-              preparation);
+    if (traverseChildren)
+        for (SdfPath const &child : scene->GetChildPrimPaths(path))
+            _Walk(scene, child, materials, snapshot, renderTags, cancelled,
+                  preparation);
+}
+
+bool _RestoreEvictedPrototypes(HdSceneIndexBaseRefPtr const &scene,
+    MaterialService *materials, Snapshot *snapshot, TfTokenVector const &tags,
+    std::function<bool()> const &cancelled)
+{
+    std::vector<SdfPath> paths(snapshot->evictedPrototypes.begin(),
+                               snapshot->evictedPrototypes.end());
+    std::sort(paths.begin(), paths.end());
+    bool restored = false;
+    for (SdfPath const &path : paths) {
+        if (cancelled && cancelled()) return restored;
+        auto const prim = scene->GetPrim(path);
+        if ((prim.primType != HdPrimTypeTokens->mesh &&
+             prim.primType != HdPrimTypeTokens->sphere) ||
+            !_HasEligiblePlacement(scene, path, prim, tags)) continue;
+        snapshot->displayMaterialsByPath.erase(path);
+        _Walk(scene, path, materials, snapshot, tags, cancelled, nullptr, false);
+        restored = true;
+    }
+    if (restored) {
+        _FlushSphereBatches(snapshot);
+        _IndexPlacementDependencies(snapshot);
+        _CachePlacementInputs(scene, snapshot);
+        _RefreshCachedCounts(snapshot);
+    }
+    return restored;
 }
 
 void _CollectMaterialRequests(HdSceneIndexBaseRefPtr const &scene,
@@ -2364,6 +3015,14 @@ std::shared_ptr<Snapshot> _BuildSnapshot(HdSceneIndexBaseRefPtr const &scene,
     auto result = std::make_shared<Snapshot>();
     result->device = sharedDevice;
     if (pool) result->prototypePool = pool;
+    {
+        std::lock_guard lock(result->prototypePool->mutex);
+        result->evictedPrototypes = result->prototypePool->evictedPaths;
+    }
+    std::erase_if(result->evictedPrototypes, [&](SdfPath const &path) {
+        auto const type = scene->GetPrim(path).primType;
+        return type != HdPrimTypeTokens->mesh && type != HdPrimTypeTokens->sphere;
+    });
     if (seedMaterials) {
         result->resolvedMaterials = *seedMaterials;
         result->materialsSeeded = true;
@@ -2401,6 +3060,8 @@ std::shared_ptr<Snapshot> _BuildSnapshot(HdSceneIndexBaseRefPtr const &scene,
     if (cancelled && cancelled()) return {};
     _FlushSphereBatches(result.get());
     _IndexPlacementDependencies(result.get());
+    _ApplyHiddenGeometryBudget(result.get());
+    _CachePlacementInputs(scene, result.get());
     result->sceneTraversalSeconds += std::chrono::duration<double>(
         std::chrono::steady_clock::now() - traversalStart).count();
     const auto sceneCommitStart = std::chrono::steady_clock::now();
@@ -2426,179 +3087,213 @@ bool _UpdatePlacements(HdSceneIndexBaseRefPtr const &index, Snapshot *snapshot,
                        std::string *fallbackReason = nullptr)
 {
     if (!snapshot || !snapshot->scene) return false;
+    AccumulateMilliseconds timing{snapshot->lastPlacementReconcileMilliseconds};
     if (rebuiltAll) *rebuiltAll = false;
     if (needsFullSnapshot) *needsFullSnapshot = false;
     if (topologyChanged) *topologyChanged = false;
-    snapshot->lastPlacementRecordsVisited = 0;
-    snapshot->lastVisibilityPlacementsUpdated = 0;
-    snapshot->lastPlacementTransformsUpdated = 0;
-    if (!forceRebuild) {
-        std::unordered_set<unsigned int> affected;
-        if (dirtyPaths.empty())
-            for (auto const &[id, primId] : snapshot->geomToPrimId) {
-                (void)primId; affected.insert(id);
-            }
-        for (SdfPath const &path : dirtyPaths) {
-            auto found = snapshot->placementDependencies.find(path);
-            if (found != snapshot->placementDependencies.end())
-                affected.insert(found->second.begin(), found->second.end());
+    auto fail = [&](char const *reason) {
+        if (needsFullSnapshot) *needsFullSnapshot = true;
+        if (rebuiltAll) *rebuiltAll = true;
+        if (fallbackReason) *fallbackReason = reason;
+        return false;
+    };
+    if (forceRebuild) return fail("placement topology requires coherent rebuild");
+    auto commit = [&] {
+        if (cancelled && cancelled()) return false;
+        if (!deferCommit) {
+            auto const start = std::chrono::steady_clock::now();
+            rtcCommitScene(snapshot->scene->scene);
+            ++snapshot->prototypePool->topLevelSceneCommits;
+            snapshot->embreeSceneCommitSeconds += std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - start).count();
         }
-        if (!affected.empty()) {
-            std::unordered_map<SdfPath, std::vector<unsigned int>, SdfPath::Hash>
-                idsByPrototype;
-            for (unsigned int id : affected) {
-                auto prim = snapshot->geomToPrimId.find(id);
-                if (prim == snapshot->geomToPrimId.end() || prim->second < 0 ||
-                    static_cast<size_t>(prim->second) >= snapshot->primPaths.size())
-                    return _UpdatePlacements(index, snapshot, renderTags, {}, cancelled,
-                                             rebuiltAll, needsFullSnapshot,
-                                             topologyChanged, true, deferCommit, fallbackReason);
-                idsByPrototype[snapshot->primPaths[prim->second]].push_back(id);
-            }
-            bool canUpdateInPlace = true;
-            for (auto &[prototypePath, ids] : idsByPrototype) {
-                if (cancelled && cancelled()) return false;
-                HdSceneIndexPrim const prim = index->GetPrim(prototypePath);
-                std::vector<InstancePlacement> placements;
-                placements = _InstancePlacements(index, prototypePath, prim.dataSource);
-                if (placements.empty() &&
-                    !HdInstancedBySchema::GetFromParent(prim.dataSource))
-                    placements.push_back({_WorldTransform(index, prototypePath), {}, -1, {}});
-                auto prototype = snapshot->prototypes.find(prototypePath);
-                if (prototype == snapshot->prototypes.end()) {
-                    if (needsFullSnapshot) *needsFullSnapshot = true;
-                    if (fallbackReason) *fallbackReason = "placement prototype missing";
-                    return false;
+        return true;
+    };
+
+    // Hydra array notices carry no element ranges. Compare captured values once,
+    // then compose matrices only for changed source indices and their dependents.
+    bool arrayOnly = !dirtyPaths.empty();
+    std::unordered_set<unsigned int> changedIds;
+    for (auto const &path : dirtyPaths) {
+        auto old = snapshot->instancerInputs.find(path);
+        auto current = index->GetPrim(path);
+        std::unordered_set<int> sources;
+        if (old == snapshot->instancerInputs.end() ||
+            current.primType != HdPrimTypeTokens->instancer ||
+            ![&] {
+                AccumulateMilliseconds comparison{snapshot->lastInputComparisonMilliseconds};
+                return _ChangedInstanceInputs(old->second, current.dataSource, &sources,
+                    &snapshot->lastInstanceArrayElementsScanned);
+            }()) {
+            arrayOnly = false; break;
+        }
+        auto dependencies = snapshot->instanceSourcePlacements.find(path);
+        if (dependencies == snapshot->instanceSourcePlacements.end()) continue;
+        for (int source : sources)
+            if (auto ids = dependencies->second.find(source); ids != dependencies->second.end())
+                changedIds.insert(ids->second.begin(), ids->second.end());
+    }
+    if (arrayOnly) {
+        std::vector<std::pair<unsigned int, GfMatrix4d>> matrices;
+        matrices.reserve(changedIds.size());
+        for (unsigned int id : changedIds) {
+            if (cancelled && cancelled()) return false;
+            auto const prim = snapshot->geomToPrimId.find(id);
+            auto const chain = snapshot->geomToInstanceChain.find(id);
+            if (prim == snapshot->geomToPrimId.end() || prim->second < 0 ||
+                static_cast<size_t>(prim->second) >= snapshot->primPaths.size() ||
+                chain == snapshot->geomToInstanceChain.end()) return fail("placement cache identity missing");
+            GfMatrix4d matrix(1.0);
+            if (!_PlacementTransformFromChain(index, snapshot->primPaths[prim->second], chain->second, &matrix))
+                return fail("placement cache hierarchy changed");
+            matrices.emplace_back(id, matrix);
+        }
+        for (auto const &[id, matrix] : matrices) {
+            auto prototype = snapshot->prototypes.find(snapshot->primPaths[snapshot->geomToPrimId.at(id)]);
+            if (prototype == snapshot->prototypes.end() || !rtcGetGeometry(snapshot->scene->scene, id))
+                return fail("placement cache geometry missing");
+            ++snapshot->lastPlacementRecordsVisited;
+            _SetInstanceTransform(snapshot, id, matrix, prototype->second);
+        }
+        for (auto const &path : dirtyPaths)
+            snapshot->instancerInputs[path] = index->GetPrim(path).dataSource;
+        return commit();
+    }
+
+    if (snapshot->prototypeDependencies.empty()) _CachePlacementInputs(index, snapshot);
+    std::unordered_set<SdfPath, SdfPath::Hash> prototypes;
+    if (dirtyPaths.empty()) {
+        for (auto const &[path, prototype] : snapshot->prototypes) prototypes.insert(path);
+    } else {
+        for (auto const &path : dirtyPaths) {
+            auto dependencies = snapshot->prototypeDependencies.find(path);
+            if (dependencies != snapshot->prototypeDependencies.end())
+                prototypes.insert(dependencies->second.begin(), dependencies->second.end());
+            if (snapshot->prototypes.contains(path)) prototypes.insert(path);
+            auto affected = snapshot->placementDependencies.find(path);
+            if (affected != snapshot->placementDependencies.end())
+                for (unsigned int id : affected->second) {
+                    auto prim = snapshot->geomToPrimId.find(id);
+                    if (prim != snapshot->geomToPrimId.end() && prim->second >= 0 &&
+                        static_cast<size_t>(prim->second) < snapshot->primPaths.size())
+                        prototypes.insert(snapshot->primPaths[prim->second]);
                 }
-                snapshot->lastPlacementRecordsVisited += ids.size();
-                if (ids.size() != placements.size()) {
-                    canUpdateInPlace = false;
-                    if (fallbackReason) *fallbackReason = "placement count changed";
-                    break;
-                }
-                std::unordered_map<PlacementKey, unsigned int, PlacementKeyHash> oldIds;
-                for (unsigned int id : ids) {
-                    auto chain = snapshot->geomToInstanceChain.find(id);
-                    auto key = _PlacementKey(prototypePath, chain == snapshot->geomToInstanceChain.end()
-                        ? std::vector<InstanceLevel>{} : chain->second);
-                    if (!oldIds.emplace(std::move(key), id).second) {
-                        canUpdateInPlace = false; break;
-                    }
-                }
-                std::vector<unsigned int> matched;
-                for (auto const &placement : placements) {
-                    auto found = oldIds.find(_PlacementKey(prototypePath, placement.chain));
-                    if (found == oldIds.end()) { canUpdateInPlace = false; break; }
-                    matched.push_back(found->second); oldIds.erase(found);
-                }
-                if (!canUpdateInPlace || !oldIds.empty()) {
-                    canUpdateInPlace = false;
-                    if (fallbackReason) *fallbackReason = "placement source-chain key set changed";
-                    break;
-                }
-                for (size_t i = 0; i < placements.size(); ++i) {
-                    unsigned int const id = matched[i];
-                    if (!rtcGetGeometry(snapshot->scene->scene, id)) {
-                        if (needsFullSnapshot) *needsFullSnapshot = true;
-                        if (fallbackReason) *fallbackReason = "placement instance geometry missing";
-                        return false;
-                    }
-                    auto const &placement = placements[i];
-                    if (snapshot->geomToInstanceId[id] != placement.instanceId ||
-                        snapshot->geomToInstanceChain[id] != placement.chain)
-                        if (topologyChanged) *topologyChanged = true;
-                    snapshot->geomToInstanceId[id] = placement.instanceId;
-                    snapshot->geomToInstanceChain[id] = placement.chain;
-                    _SetInstanceEnabled(snapshot, id, _PlacementEligible(
-                        index, prototypePath, prim.dataSource, placement.chain, renderTags));
-                    _SetInstanceTransform(snapshot, id, placement.transform, prototype->second);
-                }
-            }
-            if (canUpdateInPlace) {
-                if (cancelled && cancelled()) return false;
-                auto const commitStart = std::chrono::steady_clock::now();
-                if (!deferCommit) {
-                    rtcCommitScene(snapshot->scene->scene);
-                    ++snapshot->prototypePool->topLevelSceneCommits;
-                }
-                snapshot->embreeSceneCommitSeconds +=
-                    std::chrono::duration<double>(
-                        std::chrono::steady_clock::now() - commitStart).count();
-                return true;
-            }
         }
     }
-    if (topologyChanged) *topologyChanged = true;
-    if (fallbackReason && fallbackReason->empty())
-        *fallbackReason = "placement topology requires coherent rebuild";
-    if (rebuiltAll) *rebuiltAll = true;
-    RTCScene replacement = rtcNewScene(snapshot->device);
-    if (!replacement) return false;
-    ++snapshot->prototypePool->topLevelSceneBuilds;
-    auto oldPrim = snapshot->geomToPrimId;
-    auto oldFaces = snapshot->geomToCoarseFaces;
-    auto oldInstances = snapshot->geomToInstanceId;
-    auto oldChains = snapshot->geomToInstanceChain;
-    auto oldGeometry = snapshot->scene->geometry;
-    snapshot->geomToPrimId.clear();
-    snapshot->geomToCoarseFaces.clear();
-    snapshot->geomToInstanceId.clear();
-    snapshot->geomToInstanceChain.clear();
-    snapshot->placementEnabled.clear();
-    snapshot->placementMatrices.clear();
-    snapshot->enabledPlacementCount = 0;
-    snapshot->scene->geometry.clear();
-    snapshot->scene->intersection_geometry.clear();
-    snapshot->scene->placement_transforms.clear();
-    snapshot->scene->placement_materials.clear();
-    snapshot->instanceCount = 0;
 
-    RTCScene oldScene = snapshot->scene->scene;
-    struct SceneRelease {
-        RTCScene scene = nullptr;
-        ~SceneRelease() { if (scene) rtcReleaseScene(scene); }
-    } oldSceneRelease{oldScene};
-    snapshot->scene->scene = replacement;
-    for (auto &[path, prototype] : snapshot->prototypes) {
+    bool changedTopology = false;
+    for (auto const &path : prototypes) {
         if (cancelled && cancelled()) return false;
-        HdSceneIndexPrim prim = index->GetPrim(path);
-        std::vector<InstancePlacement> placements =
-            _InstancePlacements(index, path, prim.dataSource);
-        if (placements.empty() &&
-            !HdInstancedBySchema::GetFromParent(prim.dataSource)) {
+        auto prototype = snapshot->prototypes.find(path);
+        // Evicted prototypes have logical records but no physical placements;
+        // the residency pass restores them before updates when they become visible.
+        if (prototype == snapshot->prototypes.end()) continue;
+        auto const prim = index->GetPrim(path);
+        auto placements = _InstancePlacements(index, path, prim.dataSource);
+        if (placements.empty() && !HdInstancedBySchema::GetFromParent(prim.dataSource))
             placements.push_back({_WorldTransform(index, path), {}, -1, {}});
-        }
-        for (InstancePlacement const &placement : placements) {
+        std::unordered_set<unsigned int> oldIds, surviving;
+        if (auto dependencies = snapshot->placementDependencies.find(path);
+            dependencies != snapshot->placementDependencies.end())
+            for (unsigned int id : dependencies->second) {
+                auto existing = snapshot->geomToPrimId.find(id);
+                if (existing != snapshot->geomToPrimId.end() && existing->second >= 0 &&
+                    static_cast<size_t>(existing->second) < snapshot->primPaths.size() &&
+                    snapshot->primPaths[existing->second] == path) oldIds.insert(id);
+            }
+        std::unordered_set<PlacementKey, PlacementKeyHash> desired;
+        for (auto const &placement : placements)
+            if (!desired.insert(_PlacementKey(path, placement.chain)).second)
+                return fail("ambiguous duplicate placement identity");
+
+        for (auto const &placement : placements) {
             if (cancelled && cancelled()) return false;
-            const unsigned int id = _AttachPrototype(
-                snapshot, path, prototype, placement.transform);
-            PrimKey key{path, placement.instancerPath};
-            const int primId = _EnsurePrimId(snapshot, key);
-            snapshot->geomToPrimId.emplace(id, primId);
-            snapshot->geomToCoarseFaces.emplace(id, prototype.coarseFaces);
-            snapshot->geomToInstanceId.emplace(id, placement.instanceId);
-            snapshot->geomToInstanceChain.emplace(id, placement.chain);
+            auto key = _PlacementKey(path, placement.chain);
+            auto match = snapshot->placementIds.find(key);
+            unsigned int id;
+            if (match != snapshot->placementIds.end() && oldIds.contains(match->second)) {
+                id = match->second;
+                if (!rtcGetGeometry(snapshot->scene->scene, id))
+                    return fail("placement instance geometry missing");
+                surviving.insert(id);
+            } else {
+                id = _AttachPrototype(snapshot, path, prototype->second, placement.transform);
+                snapshot->geomToCoarseFaces[id] = prototype->second.coarseFaces;
+                snapshot->placementIds[std::move(key)] = id;
+                if (placement.instanceId >= 0) ++snapshot->instanceCount;
+                ++snapshot->lastPlacementTopologyAttached;
+                changedTopology = true;
+            }
+            ++snapshot->lastPlacementRecordsVisited;
+            const int primId = _EnsurePrimId(snapshot, {path, placement.instancerPath});
+            auto oldInstance = snapshot->geomToInstanceId.find(id);
+            auto oldChain = snapshot->geomToInstanceChain.find(id);
+            const bool membershipChanged = oldInstance == snapshot->geomToInstanceId.end() ||
+                oldInstance->second != placement.instanceId ||
+                oldChain == snapshot->geomToInstanceChain.end() || oldChain->second != placement.chain;
+            const bool dependencyChanged = oldChain == snapshot->geomToInstanceChain.end() ||
+                _PlacementKey(path, oldChain->second) != _PlacementKey(path, placement.chain);
+            if (membershipChanged) {
+                if (auto old = snapshot->geomToPrimId.find(id); old != snapshot->geomToPrimId.end())
+                    snapshot->changedPickingPrims.insert(old->second);
+                snapshot->changedPickingPrims.insert(primId);
+                if (dependencyChanged) _IndexPlacementDependency(snapshot, id, false);
+                changedTopology = true;
+            }
+            snapshot->geomToPrimId[id] = primId;
+            snapshot->geomToInstanceId[id] = placement.instanceId;
+            snapshot->geomToInstanceChain[id] = placement.chain;
+            if (dependencyChanged) _IndexPlacementDependency(snapshot, id, true);
             _SetInstanceEnabled(snapshot, id, _PlacementEligible(
                 index, path, prim.dataSource, placement.chain, renderTags));
-            if (placement.instanceId >= 0) ++snapshot->instanceCount;
+            _SetInstanceTransform(snapshot, id, placement.transform, prototype->second);
+        }
+        for (unsigned int id : oldIds) {
+            if (surviving.contains(id)) continue;
+            if (snapshot->placementEnabled[id]) {
+                --snapshot->enabledPlacementCount;
+                _TrackPrototypeEnabled(snapshot, id, false);
+            }
+            if (snapshot->geomToInstanceId[id] >= 0) --snapshot->instanceCount;
+            snapshot->changedPickingPrims.insert(snapshot->geomToPrimId.at(id));
+            _IndexPlacementDependency(snapshot, id, false);
+            rtcDetachGeometry(snapshot->scene->scene, id);
+            snapshot->scene->geometry.erase(id);
+            snapshot->scene->intersection_geometry.erase(id);
+            snapshot->scene->placement_transforms.erase(id);
+            snapshot->scene->placement_materials.erase(id);
+            snapshot->geomToPrimId.erase(id);
+            snapshot->geomToCoarseFaces.erase(id);
+            snapshot->geomToInstanceId.erase(id);
+            snapshot->geomToInstanceChain.erase(id);
+            snapshot->placementEnabled.erase(id);
+            snapshot->placementMatrices.erase(id);
+            ++snapshot->lastPlacementTopologyDetached;
+            changedTopology = true;
         }
     }
-    _AttachSphereBatches(snapshot);
-    const auto commitStart = std::chrono::steady_clock::now();
-    if (cancelled && cancelled()) return false;
-    if (!deferCommit) {
-        rtcCommitScene(replacement);
-        ++snapshot->prototypePool->topLevelSceneCommits;
+    if (changedTopology) {
+        if (topologyChanged) *topologyChanged = true;
+        _CachePlacementInputs(index, snapshot, &prototypes);
+    } else {
+        // Topology and dependency membership are unchanged. Retain the bank's
+        // metadata and refresh only captured inputs named by this notice.
+        for (auto const &path : dirtyPaths)
+            if (snapshot->instancerInputs.contains(path))
+                snapshot->instancerInputs[path] = index->GetPrim(path).dataSource;
     }
-    _IndexPlacementDependencies(snapshot);
-    _RefreshCachedCounts(snapshot);
-    snapshot->embreeSceneCommitSeconds += std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - commitStart).count();
-    return true;
+    return commit();
 }
 
 bool _GeometryLeafType(TfToken const &type) {
     return type == HdPrimTypeTokens->mesh || type == HdPrimTypeTokens->sphere;
+}
+
+bool _StructuralType(TfToken const &type)
+{
+    return type.IsEmpty() || type == TfToken("scope") || type == TfToken("xform") ||
+        type == HdPrimTypeTokens->instancer || type == HdPrimTypeTokens->geomSubset ||
+        _GeometryLeafType(type);
 }
 
 bool _EligibleStructuralChanges(HdSceneIndexBaseRefPtr const &oldScene,
@@ -2606,57 +3301,162 @@ bool _EligibleStructuralChanges(HdSceneIndexBaseRefPtr const &oldScene,
     bool sphereBatching, std::string *reason,
     std::unordered_set<SdfPath,SdfPath::Hash> const *nativeRoots = nullptr)
 {
+    (void)nativeRoots;
     auto fail = [&](char const *why) { if (reason) *reason = why; return false; };
     if (changes.empty()) return fail("untyped structural notice");
     for (auto const &change : changes) {
-        if (change.operation == StructuralChange::Operation::Rename ||
-            change.operation == StructuralChange::Operation::Unknown)
-            return fail("structural rename or unknown operation");
+        if (change.operation == StructuralChange::Operation::Unknown)
+            return fail("structural unknown operation");
+        if (change.operation == StructuralChange::Operation::Rename &&
+            (change.newPath.IsEmpty() || change.newPath == SdfPath::AbsoluteRootPath() ||
+             change.newPath.HasPrefix(change.path) || change.path.HasPrefix(change.newPath)))
+            return fail("structural rename lacks a valid old/new path pair");
         if ((change.operation == StructuralChange::Operation::Remove ||
-             change.operation == StructuralChange::Operation::Replace) && change.previousType.IsEmpty())
+             change.operation == StructuralChange::Operation::Replace) &&
+            change.previousType.IsEmpty() && !change.previousHadChildren)
             return fail("structural previous type is unknown");
-        auto const path = change.path;
-        if (path.IsEmpty() || path == SdfPath::AbsoluteRootPath() || change.previousHadChildren)
-            return fail("structural ancestor or nonleaf edit");
-        if ((!change.previousType.IsEmpty() && !_GeometryLeafType(change.previousType)) ||
-            (!change.newType.IsEmpty() && !_GeometryLeafType(change.newType)))
+        if (change.path.IsEmpty() || change.path == SdfPath::AbsoluteRootPath())
+            return fail("structural root edit");
+        if (!_StructuralType(change.previousType) || !_StructuralType(change.newType))
             return fail("structural unsupported prim type");
-        const auto oldPrim = oldScene ? oldScene->GetPrim(path) : HdSceneIndexPrim{};
-        const auto newPrim = newScene->GetPrim(path);
-        if (!newPrim.primType.IsEmpty() && !_GeometryLeafType(newPrim.primType))
-            return fail("structural final prim type changed");
-        if ((oldScene && !oldScene->GetChildPrimPaths(path).empty()) ||
-            !newScene->GetChildPrimPaths(path).empty())
-            return fail("structural leaf has children or subsets");
-        const auto parent = path.GetParentPath();
-        if (parent != SdfPath::AbsoluteRootPath()) {
-            const auto before = oldScene ? oldScene->GetPrim(parent) : HdSceneIndexPrim{};
-            const auto after = newScene->GetPrim(parent);
-            if ((!before.dataSource && before.primType.IsEmpty()) ||
-                (!after.dataSource && after.primType.IsEmpty()))
-                return fail("structural parent is missing or newly added");
+        if (!change.previousType.IsEmpty() && !change.newType.IsEmpty() &&
+            change.previousType != change.newType &&
+            !(_GeometryLeafType(change.previousType) && _GeometryLeafType(change.newType)))
+            return fail("structural unsupported primitive transition");
+        for (auto const &scene : {oldScene, newScene}) {
+            if (!scene) continue;
+            std::vector<SdfPath> pending{change.path};
+            if (change.operation == StructuralChange::Operation::Rename) pending.push_back(change.newPath);
+            while (!pending.empty()) {
+                const auto path = pending.back(); pending.pop_back();
+                const auto prim = scene->GetPrim(path);
+                if (!_StructuralType(prim.primType))
+                    return fail("structural subtree contains unsupported prim type");
+                if (sphereBatching && prim.primType == HdPrimTypeTokens->sphere &&
+                    _WorldVisible(scene,path)) {
+                    Float3 center; float scale;
+                    if (_BatchableSphereTransform(_WorldTransform(scene,path),&center,&scale))
+                        return fail("structural sphere batch membership requires full rebuild");
+                }
+                const auto children = scene->GetChildPrimPaths(path);
+                pending.insert(pending.end(),children.begin(),children.end());
+            }
         }
-        for (SdfPath ancestor = path; ancestor != SdfPath::AbsoluteRootPath() && !ancestor.IsEmpty();
-             ancestor = ancestor.GetParentPath()) {
-            if (nativeRoots && nativeRoots->contains(ancestor))
-                return fail("structural edit belongs to a native prototype root");
-            const auto before = oldScene ? oldScene->GetPrim(ancestor) : HdSceneIndexPrim{};
-            const auto after = newScene->GetPrim(ancestor);
-            if (HdInstancedBySchema::GetFromParent(before.dataSource) ||
-                HdInstancedBySchema::GetFromParent(after.dataSource))
-                return fail("structural edit belongs to an instanced prototype");
+        if (change.previousType == HdPrimTypeTokens->geomSubset ||
+            change.newType == HdPrimTypeTokens->geomSubset) {
+            const auto parent = change.path.GetParentPath();
+            const bool parentTransaction = std::any_of(changes.begin(),changes.end(),
+                [&](auto const &other) { return parent.HasPrefix(other.path) && other.path != change.path; });
+            const auto parentType = newScene->GetPrim(parent).primType;
+            if (parentType != HdPrimTypeTokens->mesh && (!parentTransaction || !parentType.IsEmpty()))
+                return fail("structural subset parent missing or unsupported");
         }
-        auto batchEligible = [&](HdSceneIndexBaseRefPtr const &scene,HdSceneIndexPrim const &prim) {
-            if (!scene || prim.primType != HdPrimTypeTokens->sphere || !_WorldVisible(scene,path)) return false;
-            Float3 center; float scale;
-            if (!_BatchableSphereTransform(_WorldTransform(scene,path),&center,&scale)) return false;
-            auto sphere = HdSphereSchema::GetFromParent(prim.dataSource);
-            const double radius = sphere.GetRadius() ? sphere.GetRadius()->GetTypedValue(0.0f) : 1.0;
-            return radius > 0 && std::isfinite(radius);
-        };
-        if (sphereBatching && (batchEligible(oldScene,oldPrim) || batchEligible(newScene,newPrim)))
-            return fail("structural sphere batch membership requires full rebuild");
     }
+    return true;
+}
+
+void _RefreshMaterials(HdSceneIndexBaseRefPtr const &index, MaterialService *materials,
+    Snapshot *snapshot, std::unordered_set<SdfPath, SdfPath::Hash> const &paths);
+
+bool _RefreshPrototypes(HdSceneIndexBaseRefPtr const &index,
+    std::unordered_set<SdfPath, SdfPath::Hash> const &paths, MaterialService *materials,
+    Snapshot *snapshot, TfTokenVector const &renderTags,
+    std::vector<std::shared_ptr<PrototypeStorage>> *displacedStorage);
+
+bool _RekeyStructuralRenames(HdSceneIndexBaseRefPtr const &index,
+    std::vector<StructuralChange> const &changes, Snapshot *snapshot,
+    MaterialService *materials, TfTokenVector const &tags,
+    std::vector<std::shared_ptr<PrototypeStorage>> *retired,
+    std::function<bool()> const &cancel, bool preflightOnly = false)
+{
+    if (std::none_of(changes.begin(),changes.end(),[](auto const &change) {
+            return change.operation == StructuralChange::Operation::Rename;
+        })) return true;
+    auto remapPath = [&](SdfPath path) {
+        for (auto const &change : changes)
+            if (change.operation == StructuralChange::Operation::Rename && path.HasPrefix(change.path))
+                path = path.ReplacePrefix(change.path,change.newPath);
+        return path;
+    };
+    struct IdentityMove { PrimKey oldKey, newKey; int oldId; };
+    std::vector<IdentityMove> moves;
+    std::unordered_set<PrimKey,PrimKeyHash> destinations;
+    std::unordered_set<SdfPath,SdfPath::Hash> movedPrototypes, affected;
+    // Preflight every identity and destination before changing the inactive bank.
+    for (auto const &[key,id] : snapshot->primIds) {
+        PrimKey destination{remapPath(key.path),remapPath(key.instancerPath)};
+        if (!destinations.insert(destination).second) return false;
+        if (destination != key) moves.push_back({key,destination,id});
+    }
+    std::unordered_set<SdfPath,SdfPath::Hash> prototypeDestinations;
+    for (auto const &[path,prototype] : snapshot->prototypes) {
+        const auto destination = remapPath(path);
+        if (!prototypeDestinations.insert(destination).second) return false;
+        if (destination == path) continue;
+        if (!_GeometryLeafType(index->GetPrim(destination).primType)) return false;
+        movedPrototypes.insert(destination);
+    }
+    if (preflightOnly || (moves.empty() && movedPrototypes.empty())) return true;
+    if (cancel && cancel()) return false;
+    for (auto const &move : moves) {
+        snapshot->primIds.erase(move.oldKey);
+        snapshot->primPaths[move.oldId] = {};
+        snapshot->instancerPaths[move.oldId] = {};
+        affected.insert(move.newKey.path);
+    }
+    snapshot->primIdentityDirty = true;
+    std::unordered_map<int,int> remapIds;
+    for (auto const &move : moves)
+        remapIds.emplace(move.oldId,_EnsurePrimId(snapshot,move.newKey));
+    for (auto &[id,primId] : snapshot->geomToPrimId)
+        if (auto found = remapIds.find(primId); found != remapIds.end()) primId = found->second;
+    for (auto &[id,chain] : snapshot->geomToInstanceChain)
+        for (auto &level : chain) {
+            const auto destination = remapPath(level.instancerPath);
+            if (destination != level.instancerPath) {
+                level.instancerPath = destination;
+                affected.insert(snapshot->primPaths[snapshot->geomToPrimId.at(id)]);
+            }
+        }
+    auto rekeyMap = [&](auto &map) {
+        auto previous = std::move(map);
+        map.clear();
+        for (auto &[path,value] : previous) map.emplace(remapPath(path),std::move(value));
+    };
+    rekeyMap(snapshot->prototypes);
+    rekeyMap(snapshot->enabledPrototypePlacements);
+    rekeyMap(snapshot->displayMaterialsByPath);
+    rekeyMap(snapshot->resolvedMaterials);
+    rekeyMap(snapshot->prototypeMaterials);
+    rekeyMap(snapshot->materialUsers);
+    auto rekeySet = [&](auto &paths) {
+        auto previous = std::move(paths); paths.clear();
+        for (auto const &path : previous) paths.insert(remapPath(path));
+    };
+    for (auto &[path,users] : snapshot->materialUsers) rekeySet(users);
+    for (auto &[path,materials] : snapshot->prototypeMaterials) rekeySet(materials);
+    rekeySet(snapshot->evictedPrototypes);
+    {
+        std::lock_guard lock(snapshot->prototypePool->mutex);
+        rekeySet(snapshot->prototypePool->evictedPaths);
+        for (auto const &path : snapshot->evictedPrototypes)
+            snapshot->prototypePool->evictedPaths.insert(path);
+    }
+    for (auto &[hash,paths] : snapshot->prototypeHashBuckets)
+        for (auto &path : paths) path = remapPath(path);
+    _IndexPlacementDependencies(snapshot);
+    _CachePlacementInputs(index,snapshot);
+    // Conversion compatibility uses the existing pool's exact geometry check;
+    // compatible storage and Embree placement handles survive the path move.
+    if (!movedPrototypes.empty() && !_RefreshPrototypes(index,movedPrototypes,
+            materials,snapshot,tags,retired)) return false;
+    affected.insert(movedPrototypes.begin(),movedPrototypes.end());
+    if (!affected.empty()) {
+        _RefreshMaterials(index,materials,snapshot,affected);
+        if (!_UpdatePlacements(index,snapshot,tags,affected,cancel,
+                nullptr,nullptr,nullptr,false,true)) return false;
+    }
+    snapshot->lastStructuralPathsUpdated += moves.size();
     return true;
 }
 
@@ -2666,24 +3466,87 @@ bool _UpdateStructuralLeaves(HdSceneIndexBaseRefPtr const &retained,
     std::vector<std::shared_ptr<PrototypeStorage>> *retired, std::function<bool()> const &cancel)
 {
     std::unordered_set<SdfPath, SdfPath::Hash> paths;
-    for (auto const &change : changes) paths.insert(change.path);
+    std::unordered_set<SdfPath, SdfPath::Hash> subsetParents;
+    std::unordered_set<SdfPath, SdfPath::Hash> externalPrototypes;
+    const bool hasRenames = std::any_of(changes.begin(),changes.end(),[](auto const &change) {
+        return change.operation == StructuralChange::Operation::Rename;
+    });
+    if (hasRenames) {
+        if (!_RekeyStructuralRenames(retained,changes,snapshot,materials,tags,retired,cancel)) return false;
+        // Bank replay can combine a cold rename with a later visibility edit.
+        // The pre-transaction restore saw the old path; resolve eligibility
+        // again after rekeying, against the final captured destination.
+        _RestoreEvictedPrototypes(retained,materials,snapshot,tags,cancel);
+        if (cancel && cancel()) return false;
+    }
+    for (auto const &change : changes) {
+        const bool rename = change.operation == StructuralChange::Operation::Rename;
+        auto root = rename ? change.newPath : change.path;
+        if (rename) for (auto const &later : changes)
+            if (later.operation == StructuralChange::Operation::Rename && root.HasPrefix(later.path))
+                root = root.ReplacePrefix(later.path,later.newPath);
+        if (!rename) {
+            if (auto deps = snapshot->prototypeDependencies.find(root);
+                deps != snapshot->prototypeDependencies.end())
+                externalPrototypes.insert(deps->second.begin(),deps->second.end());
+        }
+        // Removed descendants no longer exist in the captured index. Their
+        // retained identity records are the authoritative removal inventory.
+        if (!rename) {
+            for (auto const &[key,id] : snapshot->primIds)
+                if (key.path.HasPrefix(root)) paths.insert(key.path);
+            for (auto const &[path,prototype] : snapshot->prototypes)
+                if (path.HasPrefix(root)) paths.insert(path);
+            for (auto const &path : snapshot->evictedPrototypes)
+                if (path.HasPrefix(root)) paths.insert(path);
+        }
+        std::vector<SdfPath> pending{root};
+        while (!pending.empty()) {
+            const auto path = pending.back(); pending.pop_back();
+            const auto prim = retained->GetPrim(path);
+            if (_GeometryLeafType(prim.primType) && (!rename ||
+                (!snapshot->prototypes.contains(path) && !snapshot->evictedPrototypes.contains(path))))
+                paths.insert(path);
+            if (prim.primType == HdPrimTypeTokens->geomSubset)
+                subsetParents.insert(path.GetParentPath());
+            const auto children = retained->GetChildPrimPaths(path);
+            pending.insert(pending.end(),children.begin(),children.end());
+        }
+        if (change.previousType == HdPrimTypeTokens->geomSubset ||
+            change.newType == HdPrimTypeTokens->geomSubset)
+        {
+            subsetParents.insert(root.GetParentPath());
+            ++snapshot->lastStructuralPathsUpdated;
+        }
+    }
+    for (auto const &path : paths) externalPrototypes.erase(path);
     for (auto const &path : paths) {
         if (cancel && cancel()) return false;
         ++snapshot->lastStructuralPathsUpdated;
-        auto key = PrimKey{path,{}};
-        auto oldId = snapshot->primIds.find(key);
-        const int primId = oldId == snapshot->primIds.end() ? -1 : oldId->second;
+        snapshot->evictedPrototypes.erase(path);
+        {
+            std::lock_guard lock(snapshot->prototypePool->mutex);
+            snapshot->prototypePool->evictedPaths.erase(path);
+        }
+        std::vector<PrimKey> removedKeys;
+        for (auto const &[key, id] : snapshot->primIds)
+            if (key.path == path) removedKeys.push_back(key);
         std::vector<unsigned int> ids;
         if (auto deps = snapshot->placementDependencies.find(path); deps != snapshot->placementDependencies.end())
             for (unsigned int id : deps->second) {
                 auto found = snapshot->geomToPrimId.find(id);
-                if (found != snapshot->geomToPrimId.end() && found->second == primId) ids.push_back(id);
+                if (found != snapshot->geomToPrimId.end() && found->second >= 0 &&
+                    snapshot->primPaths[found->second] == path) ids.push_back(id);
             }
         if (snapshot->sphereBatchLocations.contains(path)) return false;
         for (unsigned int id : ids) {
+            _IndexPlacementDependency(snapshot, id, false);
+            if (snapshot->geomToInstanceId[id] >= 0) --snapshot->instanceCount;
             rtcDetachGeometry(snapshot->scene->scene, id);
-            if (snapshot->placementEnabled.contains(id) && snapshot->placementEnabled[id])
+            if (snapshot->placementEnabled.contains(id) && snapshot->placementEnabled[id]) {
                 --snapshot->enabledPlacementCount;
+                _TrackPrototypeEnabled(snapshot, id, false);
+            }
             snapshot->scene->geometry.erase(id); snapshot->scene->intersection_geometry.erase(id);
             snapshot->scene->placement_materials.erase(id); snapshot->scene->placement_transforms.erase(id);
             snapshot->geomToPrimId.erase(id); snapshot->geomToCoarseFaces.erase(id);
@@ -2700,9 +3563,11 @@ bool _UpdateStructuralLeaves(HdSceneIndexBaseRefPtr const &retained,
             ++snapshot->lastStructuralPlacementsDetached;
             ++snapshot->prototypePool->structuralPlacementDetachCalls;
         }
-        if (primId >= 0) {
+        for (auto const &key : removedKeys) {
+            const int primId = snapshot->primIds.at(key);
             snapshot->primPaths[primId] = {}; snapshot->instancerPaths[primId] = {};
             snapshot->primIds.erase(key);
+            snapshot->primIdentityDirty = true;
         }
         auto prototype = snapshot->prototypes.find(path);
         if (prototype != snapshot->prototypes.end()) {
@@ -2740,14 +3605,17 @@ bool _UpdateStructuralLeaves(HdSceneIndexBaseRefPtr const &retained,
         snapshot->displayMaterialsByPath.erase(path);
         const auto prim = retained->GetPrim(path);
         const size_t before = snapshot->geomToPrimId.size();
-        if (prim.primType == HdPrimTypeTokens->mesh)
-            _AppendMesh(retained,path,prim,materials,snapshot,_WorldTransform(retained,path),{},-1,{},tags);
-        else if (prim.primType == HdPrimTypeTokens->sphere)
-            _AppendSphere(retained,path,prim,materials,snapshot,_WorldTransform(retained,path),{},-1,{},tags);
+        if (_GeometryLeafType(prim.primType))
+            _Walk(retained, path, materials, snapshot, tags, cancel, nullptr, false);
         const size_t attached = snapshot->geomToPrimId.size()-before;
         snapshot->lastStructuralPlacementsAttached += attached;
 
     }
+    if (!subsetParents.empty()) _RefreshMaterials(retained, materials, snapshot, subsetParents);
+    _IndexPlacementDependencies(snapshot);
+    _CachePlacementInputs(retained, snapshot);
+    if (!externalPrototypes.empty() && !_UpdatePlacements(retained,snapshot,tags,
+            externalPrototypes,cancel,nullptr,nullptr,nullptr,false,true)) return false;
     return true;
 }
 
@@ -2759,6 +3627,9 @@ bool _RefreshPrototypes(HdSceneIndexBaseRefPtr const &index,
 {
     if (!snapshot || !snapshot->scene || paths.empty()) return false;
     for (SdfPath const &path : paths) {
+        // The retained source has already been recaptured. Keep cold geometry
+        // cold until its first eligible placement, then convert the latest data.
+        if (snapshot->evictedPrototypes.contains(path)) continue;
         std::vector<unsigned int> dependentIds;
         if (auto dependencies = snapshot->placementDependencies.find(path);
             dependencies != snapshot->placementDependencies.end())
@@ -3092,6 +3963,15 @@ private:
     RTCDevice device;
 };
 
+// Count actual ray work once per task, including work abandoned by a stop.
+struct PixelWorkCounter {
+    std::atomic<uint64_t> &total;
+    uint64_t pixels = 0;
+    ~PixelWorkCounter() {
+        if (pixels) total.fetch_add(pixels, std::memory_order_relaxed);
+    }
+};
+
 struct PreviewResult {
     unsigned int width = 0;
     unsigned int height = 0;
@@ -3102,11 +3982,89 @@ struct PreviewResult {
     uint64_t boundAovCount = 0;
 };
 
+enum class AovKind { Color, Depth, CameraDepth, Normal, Neye, Peye, St, PrimId, ElementId, InstanceId, Unknown };
+
+AovKind _AovKind(TfToken const &name)
+{
+    if (name == HdAovTokens->color) return AovKind::Color;
+    if (name == HdAovTokens->depth) return AovKind::Depth;
+    if (name == HdAovTokens->cameraDepth) return AovKind::CameraDepth;
+    if (name == HdAovTokens->normal) return AovKind::Normal;
+    if (name == HdAovTokens->Neye) return AovKind::Neye;
+    if (name == HdAovTokens->Peye) return AovKind::Peye;
+    if (name == TfToken("primvars:st")) return AovKind::St;
+    if (name == HdAovTokens->primId) return AovKind::PrimId;
+    if (name == HdAovTokens->elementId) return AovKind::ElementId;
+    if (name == HdAovTokens->instanceId) return AovKind::InstanceId;
+    return AovKind::Unknown;
+}
+
+bool _IntegerAov(AovKind kind)
+{
+    return kind == AovKind::PrimId || kind == AovKind::ElementId || kind == AovKind::InstanceId;
+}
+
+size_t _AovComponents(AovKind kind)
+{
+    if (kind == AovKind::Color) return 4;
+    if (kind == AovKind::Normal || kind == AovKind::Neye || kind == AovKind::Peye) return 3;
+    if (kind == AovKind::St) return 2;
+    return kind == AovKind::Unknown ? 0 : 1;
+}
+
+// Convert while the center-ray hit is local; only requested final outputs are
+// retained. Preview and full resolution deliberately share these semantics.
+void _ResolvePrimaryAov(AovKind kind, RayHit const &hit, CameraState const &camera,
+                       Snapshot const *snapshot, float *values, int *id)
+{
+    const bool valid = hit.geomid != RTC_INVALID_GEOMETRY_ID;
+    if (_IntegerAov(kind)) {
+        *id = -1;
+        if (!valid) return;
+        if (kind == AovKind::PrimId) *id = _PrimIdForHit(snapshot, hit);
+        else if (kind == AovKind::InstanceId) {
+            auto it = snapshot->geomToInstanceId.find(hit.geomid);
+            if (it != snapshot->geomToInstanceId.end()) *id = it->second;
+        } else {
+            auto it = snapshot->geomToCoarseFaces.find(hit.geomid);
+            if (it != snapshot->geomToCoarseFaces.end() && hit.primid >= 0 &&
+                static_cast<size_t>(hit.primid) < it->second.size()) *id = it->second[hit.primid];
+        }
+    } else if (kind == AovKind::Depth || kind == AovKind::CameraDepth) {
+        values[0] = kind == AovKind::Depth ? 1.0f : std::numeric_limits<float>::infinity();
+        if (!valid) return;
+        GfVec4d view(hit.p.x(), hit.p.y(), hit.p.z(), 1.0);
+        view = view * camera.worldToView;
+        if (kind == AovKind::CameraDepth) values[0] = static_cast<float>(-view[2]);
+        else {
+            const GfVec4d clip = view * camera.projection;
+            if (std::abs(clip[3]) > 1e-12) values[0] = static_cast<float>(.5 * clip[2] / clip[3] + .5);
+        }
+    } else if (kind == AovKind::Peye) {
+        values[0] = values[1] = values[2] = 0;
+        if (valid) {
+            const GfVec3d eye = camera.worldToView.Transform(GfVec3d(hit.p.x(), hit.p.y(), hit.p.z()));
+            for (size_t i = 0; i < 3; ++i) values[i] = static_cast<float>(eye[i]);
+        }
+    } else if (kind == AovKind::St) {
+        values[0] = valid ? hit.u : 0; values[1] = valid ? hit.v : 0;
+    } else if (kind == AovKind::Normal || kind == AovKind::Neye) {
+        Float3 normal = hit.n;
+        if (kind == AovKind::Neye && valid) {
+            const GfVec3d eye = camera.worldToView.TransformDir(
+                GfVec3d(normal.x(), normal.y(), normal.z())).GetNormalized();
+            normal = Float3(static_cast<float>(eye[0]), static_cast<float>(eye[1]), static_cast<float>(eye[2]));
+        }
+        values[0] = normal.x(); values[1] = normal.y(); values[2] = normal.z();
+    }
+}
+
 PreviewResult _RenderPreview(std::shared_ptr<Snapshot> const &snapshot,
     CameraState const &camera, RenderSettings const &settings,
     HdRenderPassAovBindingVector const &bindings,
     unsigned int width, unsigned int height, HdRenderThread *renderThread,
-    std::shared_ptr<const PublishedFrame> const &frame)
+    std::shared_ptr<const PublishedFrame> const &frame,
+    std::atomic<uint64_t> &colorTracedPixels)
 {
     PreviewResult result;
     if (!snapshot || !snapshot->scene || width == 0 || height == 0)
@@ -3178,6 +4136,7 @@ PreviewResult _RenderPreview(std::shared_ptr<Snapshot> const &snapshot,
         tbb::blocked_range2d<unsigned int>(
             0, result.height, 4, 0, result.width, 8),
         [&](tbb::blocked_range2d<unsigned int> const &range) {
+    PixelWorkCounter colorWork{colorTracedPixels};
     if (cancelled.load(std::memory_order_relaxed)) return;
     for (unsigned int py = range.rows().begin();
          py != range.rows().end(); ++py) {
@@ -3202,6 +4161,7 @@ PreviewResult _RenderPreview(std::shared_ptr<Snapshot> const &snapshot,
             Color3 color = snapshot->scene->trace(
                 prism::PathRay{rays.sampled, rays.footprint},
                 0, Color3(1.0f), seed, &outcome);
+            ++colorWork.pixels;
             const float coverage = (snapshot->domeCount == 0 || !settings.domeLightCameraVisibility) &&
                 outcome == SceneManager::PrimaryOutcome::Escaped ? 0.0f : 1.0f;
             if (coverage == 0.0f) color = Color3(0.0f);
@@ -3225,66 +4185,10 @@ PreviewResult _RenderPreview(std::shared_ptr<Snapshot> const &snapshot,
                     continue;
                 }
                 if (!primary) continue;
-                const bool hit = primary->geomid != RTC_INVALID_GEOMETRY_ID;
-                if (target.name == HdAovTokens->depth ||
-                    target.name == HdAovTokens->cameraDepth) {
-                    float value = target.name == HdAovTokens->depth
-                        ? 1.0f : std::numeric_limits<float>::infinity();
-                    if (hit) {
-                        GfVec4d view(primary->p.x(), primary->p.y(),
-                                     primary->p.z(), 1.0);
-                        view = view * camera.worldToView;
-                        if (target.name == HdAovTokens->cameraDepth) {
-                            value = static_cast<float>(-view[2]);
-                        } else {
-                            GfVec4d clip = view * camera.projection;
-                            if (std::abs(clip[3]) > 1e-12)
-                                value = static_cast<float>(
-                                    0.5 * clip[2] / clip[3] + 0.5);
-                        }
-                    }
-                    target.floats[pixel] = value;
-                } else if (target.name == HdAovTokens->normal ||
-                           target.name == HdAovTokens->Neye ||
-                           target.name == HdAovTokens->Peye ||
-                           target.name == TfToken("primvars:st")) {
-                    Float3 normal = primary->n;
-                    if (target.name == HdAovTokens->Neye && hit) {
-                        GfVec3d eye = camera.worldToView.TransformDir(
-                            GfVec3d(normal.x(), normal.y(), normal.z())).GetNormalized();
-                        normal = Float3(static_cast<float>(eye[0]),
-                                        static_cast<float>(eye[1]),
-                                        static_cast<float>(eye[2]));
-                    }
-                    float *dst = target.floats.data() + pixel * target.components;
-                    if (target.name == HdAovTokens->Peye && hit) {
-                        GfVec3d eye = camera.worldToView.Transform(
-                            GfVec3d(primary->p.x(), primary->p.y(), primary->p.z()));
-                        dst[0] = static_cast<float>(eye[0]);
-                        dst[1] = static_cast<float>(eye[1]);
-                        dst[2] = static_cast<float>(eye[2]);
-                    } else if (target.name == TfToken("primvars:st")) {
-                        dst[0] = hit ? primary->u : 0.0f;
-                        dst[1] = hit ? primary->v : 0.0f;
-                    } else {
-                        dst[0] = normal.x(); dst[1] = normal.y(); dst[2] = normal.z();
-                    }
-                } else {
-                    int value = -1;
-                    if (hit && target.name == HdAovTokens->primId) {
-                        value = _PrimIdForHit(snapshot.get(), *primary);
-                    } else if (hit && target.name == HdAovTokens->elementId) {
-                        auto it = snapshot->geomToCoarseFaces.find(primary->geomid);
-                        if (it != snapshot->geomToCoarseFaces.end() &&
-                            primary->primid >= 0 &&
-                            static_cast<size_t>(primary->primid) < it->second.size())
-                            value = it->second[primary->primid];
-                    } else if (hit && target.name == HdAovTokens->instanceId) {
-                        auto it = snapshot->geomToInstanceId.find(primary->geomid);
-                        if (it != snapshot->geomToInstanceId.end()) value = it->second;
-                    }
-                    target.ints[pixel] = value;
-                }
+                const AovKind kind = _AovKind(target.name);
+                _ResolvePrimaryAov(kind, *primary, camera, snapshot.get(),
+                    target.floats.empty() ? nullptr : target.floats.data() + pixel * target.components,
+                    target.ints.empty() ? nullptr : target.ints.data() + pixel);
             }
         }
     }
@@ -3343,6 +4247,7 @@ public:
         double seconds = 0.0;
         std::string error;
         bool reusedBank = false;
+        bool residencyUnchanged = false;
         bool pinnedBankFallback = false;
         bool visibilityRecoveryRebuild = false;
         bool sphereBatchFallback = false;
@@ -3434,6 +4339,24 @@ public:
             });
     }
 
+    void MaintainHiddenGeometryLocked()
+    {
+        // Published snapshots (including frame-owned picking scenes) remain
+        // immutable. Policy changes wait for an exclusive inactive bank.
+        const auto budget = prototypePool->hiddenGeometryBudgetBytes.load();
+        const auto revision = prototypePool->residencyClock.load();
+        if (!budget || !inactiveSnapshot || inactiveSnapshot.use_count() != 1 ||
+            (hiddenMaintenanceBank == inactiveSnapshot.get() &&
+             hiddenMaintenanceBudget == budget && hiddenMaintenanceRevision == revision)) return;
+        if (_ApplyHiddenGeometryBudget(inactiveSnapshot.get(), true)) {
+            rtcCommitScene(inactiveSnapshot->scene->scene);
+            ++prototypePool->topLevelSceneCommits;
+        }
+        hiddenMaintenanceBank = inactiveSnapshot.get();
+        hiddenMaintenanceBudget = budget;
+        hiddenMaintenanceRevision = prototypePool->residencyClock.load();
+    }
+
     ~Impl()
     {
         if (buildCancel) buildCancel->store(true, std::memory_order_relaxed);
@@ -3468,10 +4391,15 @@ public:
     HdRenderPassAovBindingVector bindings;
     std::vector<uint64_t> bindingAllocationRevisions;
     std::vector<unsigned int> committedRngStates;
+    unsigned tileWidth = 0, tileHeight = 0;
+    std::vector<RefinementTile> refinementTiles;
     TfTokenVector renderTags;
     unsigned int width = 0, height = 0;
     std::shared_ptr<Snapshot> snapshot;
     std::shared_ptr<Snapshot> inactiveSnapshot;
+    Snapshot const *hiddenMaintenanceBank = nullptr;
+    uint64_t hiddenMaintenanceBudget = 0;
+    uint64_t hiddenMaintenanceRevision = 0;
     std::shared_ptr<const PublishedFrame> lastPublishedFrame;
     uint64_t activeGeneration = 0;
     uint64_t inactiveGeneration = 0;
@@ -3485,6 +4413,7 @@ public:
     std::deque<DirtyRecord> dirtyJournal;
     std::vector<StructuralChange> dirtyStructuralChanges;
     CanonicalPrimIds canonicalPrimIds;
+    std::shared_ptr<const CanonicalPrimIds> canonicalRegistryView;
     bool canonicalIdsInitialized = false;
     bool dirtyStructuralSafe = true;
     std::unordered_set<SdfPath,SdfPath::Hash> nativePrototypeRoots;
@@ -3497,6 +4426,7 @@ public:
     HdRetainedSceneIndexRefPtr captureScene;
     HdRetainedSceneIndexRefPtr retainedSceneCache;
     std::deque<SdfPath> captureQueue;
+    std::unordered_set<SdfPath,SdfPath::Hash> captureQueued;
     struct StaticPrimRecord {
         TfToken primType;
         HdContainerDataSourceHandle dataSource;
@@ -3540,8 +4470,17 @@ public:
     uint64_t previewPublishes = 0;
     uint64_t refinementPublishes = 0;
     uint64_t firstPassPrimaryScratchBytes = 0;
+    std::atomic<uint64_t> colorTracedPixels{0};
+    std::atomic<uint64_t> geometricOnlyPixels{0};
+    uint64_t colorPassScratchBytes = 0;
+    uint64_t colorRngStorageBytes = 0;
     double lastPassTraceMilliseconds = 0;
     double lastPassCommitMilliseconds = 0;
+    double lastPassRayWorkerMilliseconds = 0;
+    double lastPassAovWorkerMilliseconds = 0;
+    double lastPassWaitMilliseconds = 0;
+    double lastPassPayloadMilliseconds = 0;
+    double lastPassPublicationMilliseconds = 0;
     double previewMilliseconds = 0.0;
     double previewRayWorkMilliseconds = 0.0;
     double previewPublicationMilliseconds = 0.0;
@@ -3642,7 +4581,8 @@ void SceneBridge::MarkSceneDirtyBatch(std::vector<SceneDirtyNotice> const &notic
             if (_impl->canonicalIdsInitialized) {
                 SdfPathVector reserve;
                 for (auto const &change : group.structuralChanges)
-                    if (_GeometryLeafType(change.newType)) reserve.push_back(change.path);
+                    if (_GeometryLeafType(change.newType)) reserve.push_back(
+                        change.operation == StructuralChange::Operation::Rename ? change.newPath : change.path);
                 std::sort(reserve.begin(),reserve.end());
                 for (auto const &path : reserve) {
                     PrimKey key{path,{}};
@@ -3698,6 +4638,10 @@ void SceneBridge::RestartAccumulation()
 
 void SceneBridge::SetSettings(RenderSettings const &settings)
 {
+    if (settings.hiddenGeometryBudgetMiB < 0) {
+        TF_WARN("PrismRT: hidden geometry budget must be non-negative; retaining the previous settings");
+        return;
+    }
     bool imageChanged = false;
     bool budgetChanged = false;
     {
@@ -3714,6 +4658,7 @@ void SceneBridge::SetSettings(RenderSettings const &settings)
             current.refinementDelayMs == settings.refinementDelayMs &&
             current.resourceRevision == settings.resourceRevision &&
             current.sphereBatching == settings.sphereBatching &&
+            current.hiddenGeometryBudgetMiB == settings.hiddenGeometryBudgetMiB &&
             current.textureFiltering == settings.textureFiltering &&
             current.domeLightCameraVisibility == settings.domeLightCameraVisibility &&
             current.environmentSampling == settings.environmentSampling)
@@ -3728,6 +4673,16 @@ void SceneBridge::SetSettings(RenderSettings const &settings)
             current.environmentSampling != settings.environmentSampling ||
             current.domeLightCameraVisibility != settings.domeLightCameraVisibility;
         budgetChanged = current.samples != settings.samples;
+        if (budgetChanged && !imageChanged && _converged.load() &&
+            _impl->samples.load() != 0 &&
+            std::none_of(_impl->bindings.begin(), _impl->bindings.end(),
+                [](auto const &binding) {
+                    return binding.aovName == HdAovTokens->color &&
+                        dynamic_cast<PrismRenderBuffer *>(binding.renderBuffer);
+                })) {
+            // A completed deterministic output pass has no color sample budget.
+            budgetChanged = false;
+        }
     }
     // Budget changes quiesce a staged pass without discarding committed work.
     // Presentation controls are read at preview boundaries and need no stop.
@@ -3768,6 +4723,9 @@ void SceneBridge::SetSettings(RenderSettings const &settings)
         _impl->lastRebuildReason = "sphere batching changed";
     }
     _impl->settings = settings;
+    _impl->prototypePool->hiddenGeometryBudgetBytes.store(
+        static_cast<uint64_t>(settings.hiddenGeometryBudgetMiB) * 1024u * 1024u);
+    _impl->MaintainHiddenGeometryLocked();
     _impl->stateDirty |= imageChanged;
     _impl->resumeRequested |= budgetChanged;
     if (imageChanged || budgetChanged) {
@@ -3810,6 +4768,7 @@ bool SceneBridge::Prepare(CameraState const &camera,
             clearNeeded |= buffer->NeedsInitialClear();
     {
         std::lock_guard lock(_impl->mutex);
+        _impl->MaintainHiddenGeometryLocked();
         cameraChanged = _impl->camera.worldToView != camera.worldToView ||
             _impl->camera.projection != camera.projection ||
             _impl->camera.nearClip != camera.nearClip ||
@@ -3981,7 +4940,9 @@ bool SceneBridge::Prepare(CameraState const &camera,
                 _impl->inactiveSnapshot = std::move(_impl->snapshot);
                 _impl->inactiveGeneration = _impl->activeGeneration;
             }
-            const bool idsChanged = _CanonicalizePrimIds(completed.snapshot.get(),&_impl->canonicalPrimIds);
+            const bool idsChanged = _CanonicalizePrimIds(completed.snapshot.get(),&_impl->canonicalPrimIds,
+                _impl->canonicalRegistryView);
+            _impl->canonicalRegistryView = completed.snapshot->canonicalIds;
             _impl->canonicalIdsInitialized = true;
             if (idsChanged) {
                 auto picking = std::make_shared<PickingTable>();
@@ -3993,6 +4954,7 @@ bool SceneBridge::Prepare(CameraState const &camera,
                 else completed.snapshot->picking = std::move(picking);
             }
             _impl->snapshot = std::move(completed.snapshot);
+            if (!completed.residencyUnchanged) _SetCurrentResidency(*_impl->snapshot);
             _impl->activeGeneration = completed.generation;
             while (!_impl->dirtyJournal.empty() &&
                    _impl->dirtyJournal.front().generation <=
@@ -4056,6 +5018,7 @@ bool SceneBridge::Prepare(CameraState const &camera,
             _impl->captureActive = true;
             _impl->captureGeneration = _impl->requestedGeneration;
             _impl->captureQueue.clear();
+            _impl->captureQueued.clear();
             _impl->captureNativeRootsDirty = false;
             std::string structuralReason;
             const bool leafStructure = (_impl->dirtyKinds & static_cast<unsigned int>(SceneDirtyKind::Structure)) != 0 &&
@@ -4072,12 +5035,13 @@ bool SceneBridge::Prepare(CameraState const &camera,
                 _impl->captureScene = HdRetainedSceneIndex::New();
                 _impl->staticPrims.clear();
                 _impl->staticPrimsComplete = false;
-                _impl->captureQueue.push_back(
-                    SdfPath::AbsoluteRootPath());
+                _impl->captureQueue.push_back(SdfPath::AbsoluteRootPath());
+                _impl->captureQueued.insert(SdfPath::AbsoluteRootPath());
             } else {
                 _impl->captureScene = _impl->retainedSceneCache;
                 for (SdfPath const &path : _impl->dirtyPaths)
-                    _impl->captureQueue.push_back(path);
+                    if (_impl->captureQueued.insert(path).second)
+                        _impl->captureQueue.push_back(path);
             }
             _impl->captureRenderTags = _impl->renderTags;
             _impl->captureDirtyKinds = _impl->dirtyKinds;
@@ -4095,6 +5059,7 @@ bool SceneBridge::Prepare(CameraState const &camera,
             _impl->captureActive = false;
             _impl->captureScene.Reset();
             _impl->captureQueue.clear();
+            _impl->captureQueued.clear();
             break;
         }
         if (!_impl->captureQueue.empty()) {
@@ -4119,16 +5084,21 @@ bool SceneBridge::Prepare(CameraState const &camera,
                     path, record.primType, record.dataSource}});
                 ++_impl->capturedPrims;
             } else {
-                _impl->staticPrims.erase(path);
+                std::erase_if(_impl->staticPrims, [&](auto const &record) {
+                    return record.first.HasPrefix(path);
+                });
+                _impl->captureNativeRootsDirty = true;
                 // HdRetainedSceneIndex owns its own prim table. Erasing the
                 // parallel record cache alone leaves the removed subtree
                 // visible to the background converter.
                 _impl->captureScene->RemovePrims({path});
             }
-            if (_impl->captureFull) {
+            if (_impl->captureFull ||
+                (_impl->captureDirtyKinds & static_cast<unsigned int>(SceneDirtyKind::Structure))) {
                 for (SdfPath const &child :
                      _impl->sceneIndex->GetChildPrimPaths(path))
-                    _impl->captureQueue.push_back(child);
+                    if (_impl->captureQueued.insert(child).second)
+                        _impl->captureQueue.push_back(child);
             }
         } else break;
         if (std::chrono::duration<double, std::milli>(
@@ -4172,7 +5142,10 @@ bool SceneBridge::Prepare(CameraState const &camera,
             std::vector<StructuralChange> jobStructuralChanges;
             bool jobStructuralSafe = true;
             std::string jobStructuralReason;
-            auto canonicalSeed = std::make_shared<const CanonicalPrimIds>(_impl->canonicalPrimIds);
+            if (!_impl->canonicalRegistryView ||
+                _impl->canonicalRegistryView->size() != _impl->canonicalPrimIds.size())
+                _impl->canonicalRegistryView = std::make_shared<const CanonicalPrimIds>(_impl->canonicalPrimIds);
+            auto canonicalSeed = _impl->canonicalRegistryView;
             ArResolverContext resolverContext = _impl->captureResolverContext;
             RTCDevice device = _impl->device;
             std::shared_ptr<PrototypePool> prototypePool =
@@ -4309,9 +5282,14 @@ bool SceneBridge::Prepare(CameraState const &camera,
                             _EligibleStructuralChanges(retained,retained,jobStructuralChanges,
                                 jobSettings.sphereBatching,&structuralReason);
                         if (leafStructure && bank) for (auto const &change : jobStructuralChanges) {
-                            if (bank->sphereBatchLocations.contains(change.path)) leafStructure = false;
-                            for (auto const &[key,id] : bank->primIds)
-                                if (key.path == change.path && !key.instancerPath.IsEmpty()) leafStructure = false;
+                            for (auto const &[path,location] : bank->sphereBatchLocations)
+                                if (path.HasPrefix(change.path) ||
+                                    (!change.newPath.IsEmpty() && path.HasPrefix(change.newPath))) leafStructure = false;
+                        }
+                        if (leafStructure && bank && !_RekeyStructuralRenames(retained,
+                                jobStructuralChanges,bank.get(),nullptr,tags,nullptr,{},true)) {
+                            leafStructure = false;
+                            structuralReason = "structural rename destination conflicts with retained identities";
                         }
                         const unsigned int unsafeKinds = static_cast<unsigned int>(SceneDirtyKind::Unknown) |
                             (leafStructure ? 0u : static_cast<unsigned int>(SceneDirtyKind::Structure));
@@ -4329,11 +5307,30 @@ bool SceneBridge::Prepare(CameraState const &camera,
                             bank->lastStructuralPathsUpdated = 0;
                             bank->lastStructuralPlacementsAttached = 0;
                             bank->lastStructuralPlacementsDetached = 0;
+                            bank->lastCanonicalRecordsVisited = 0;
+                            bank->lastPickingRecordsVisited = 0;
+                            bank->changedPickingPrims.clear();
+                            bank->lastCountRecordsVisited = 0;
+                            bank->lastInputMetadataPrototypesVisited = 0;
+                            bank->lastDependencyPlacementsVisited = 0;
+                            bank->lastCanonicalMilliseconds = 0;
+                            bank->lastPickingMilliseconds = 0;
+                            bank->lastCountsMilliseconds = 0;
+                            bank->lastDependencyMilliseconds = 0;
+                            bank->lastInputMetadataMilliseconds = 0;
+                            bank->lastInputComparisonMilliseconds = 0;
+                            bank->lastPlacementReconcileMilliseconds = 0;
                             bank->lastPlacementRecordsVisited = 0;
+                            bank->lastInstanceArrayElementsScanned = 0;
+                            bank->lastPlacementTopologyAttached = 0;
+                            bank->lastPlacementTopologyDetached = 0;
                             bank->lastVisibilityPlacementsUpdated = 0;
                             bank->lastPlacementTransformsUpdated = 0;
                             bank->lastPrototypePlacementsRepointed = 0;
                             bank->lastPrototypePathsUpdated = 0;
+                            const bool restoredPrototypes = _RestoreEvictedPrototypes(
+                                retained, result.materialService.get(), bank.get(), tags,
+                                [cancel] { return cancel->load(std::memory_order_relaxed); });
                             std::vector<std::shared_ptr<PrototypeStorage>> displacedStorage;
                             struct BankCleanup {
                                 std::shared_ptr<Snapshot> *bank;
@@ -4482,10 +5479,19 @@ bool SceneBridge::Prepare(CameraState const &camera,
                                 _RefreshEnvironment(
                                     retained, SdfPath::AbsoluteRootPath(), bank.get());
                             }
+                            result.residencyUnchanged =
+                                jobDirtyKinds == static_cast<unsigned int>(SceneDirtyKind::Placement) &&
+                                !restoredPrototypes && !placementTopologyChanged && !sphereBatchTopologyChanged &&
+                                !placementNeedsFullSnapshot && !batchNeedsFullSnapshot &&
+                                bank->lastVisibilityPlacementsUpdated == 0 &&
+                                prototypePool->hiddenGeometryBudgetBytes.load() == 0;
+                            const bool retentionDetached = !result.residencyUnchanged &&
+                                _ApplyHiddenGeometryBudget(bank.get());
+                            placementTopologyChanged |= restoredPrototypes || retentionDetached;
                             if (!batchNeedsFullSnapshot && !placementNeedsFullSnapshot &&
-                                (jobDirtyKinds & (static_cast<unsigned int>(SceneDirtyKind::Prototype) |
+                                (retentionDetached || (jobDirtyKinds & (static_cast<unsigned int>(SceneDirtyKind::Prototype) |
                                     static_cast<unsigned int>(SceneDirtyKind::Placement) |
-                                    static_cast<unsigned int>(SceneDirtyKind::Structure))) != 0) {
+                                    static_cast<unsigned int>(SceneDirtyKind::Structure))) != 0)) {
                                 if (cancel->load(std::memory_order_relaxed)) return result;
                                 auto const commitStart = std::chrono::steady_clock::now();
                                 rtcCommitScene(bank->scene->scene);
@@ -4559,12 +5565,17 @@ bool SceneBridge::Prepare(CameraState const &camera,
                             if (canReusePickingDirectly) {
                                 result.snapshot->picking = fallbackPicking;
                             } else {
-                                auto picking = std::make_shared<PickingTable>();
+                                const bool partialPicking = result.reusedBank && placementOnly &&
+                                    !sphereBatchTopologyChanged && fallbackPicking;
+                                auto picking = partialPicking
+                                    ? std::make_shared<PickingTable>(*fallbackPicking)
+                                    : std::make_shared<PickingTable>();
                                 picking->primPaths = result.snapshot->primPaths;
                                 picking->instancerPaths =
                                     result.snapshot->instancerPaths;
                                 _BuildPickingInstanceTopologies(
-                                    result.snapshot.get(), picking.get());
+                                    result.snapshot.get(), picking.get(), partialPicking
+                                        ? &result.snapshot->changedPickingPrims : nullptr);
                                 if (publishedPicking &&
                                     *publishedPicking == *picking)
                                     result.snapshot->picking = publishedPicking;
@@ -4656,6 +5667,27 @@ void SceneBridge::Render()
         preparing = _impl->sceneDirty || _impl->captureActive ||
             (_impl->buildFuture.valid() && !_impl->buildIsSpare);
     }
+    // A host can bind one destination more than once. Each physical output
+    // must be accumulated and published once: a second Publish would swap in
+    // recycled old pixels. Distinct destinations still share AOV staging.
+    HdRenderPassAovBindingVector uniqueBindings;
+    uniqueBindings.reserve(bindings.size());
+    for (auto const &binding : bindings) {
+        if (binding.renderBuffer && std::any_of(uniqueBindings.begin(), uniqueBindings.end(),
+                [&](auto const &other) {
+                    return binding.renderBuffer == other.renderBuffer && binding.aovName == other.aovName;
+                })) continue;
+        uniqueBindings.push_back(binding);
+    }
+    bindings = std::move(uniqueBindings);
+    bool hasColor = false, hasGeometric = false;
+    for (auto const &binding : bindings) {
+        if (!dynamic_cast<PrismRenderBuffer *>(binding.renderBuffer)) continue;
+        const AovKind kind = _AovKind(binding.aovName);
+        hasColor |= kind == AovKind::Color;
+        hasGeometric |= kind != AovKind::Color && kind != AovKind::Unknown;
+    }
+    const int sampleCount = hasColor ? std::max(1, settings.samples) : 1;
     if (!snapshot || !snapshot->scene || width == 0 || height == 0) {
         for (HdRenderPassAovBinding const &binding : bindings)
             if (auto *buffer = dynamic_cast<PrismRenderBuffer *>(binding.renderBuffer))
@@ -4695,7 +5727,7 @@ void SceneBridge::Render()
         initialFrame->height = height;
         frame = std::move(initialFrame);
     }
-    if (firstSample == 0) {
+    if (firstSample == 0 && hasColor) {
         // Preview rendering runs on Hydra's render worker.  Prepare only captures
         // the raw AOV bindings after StopRender has quiesced their previous user;
         // buffer destruction and resize also stop this worker before changing
@@ -4717,7 +5749,7 @@ void SceneBridge::Render()
         auto const previewStart = std::chrono::steady_clock::now();
         PreviewResult const preview = _RenderPreview(
             snapshot, camera, previewSettings, bindings, width, height,
-            _impl->renderThread, frame);
+            _impl->renderThread, frame, _impl->colorTracedPixels);
         if (_impl->renderThread->IsStopRequested()) return;
         {
             std::lock_guard lock(_impl->mutex);
@@ -4754,68 +5786,99 @@ void SceneBridge::Render()
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
         if (_impl->renderThread->IsStopRequested()) return;
+    }
+    if (firstSample == 0) {
         for (HdRenderPassAovBinding const &binding : bindings)
             if (auto *buffer = dynamic_cast<PrismRenderBuffer *>(binding.renderBuffer))
-                buffer->BeginFrame(binding.clearValue);
+                buffer->BeginFrame(binding.clearValue, _AovKind(binding.aovName) == AovKind::Unknown);
         // Full-resolution RNG setup belongs to the render worker.  Camera motion
         // only pays for the bounded preview above on the UI/Execute thread.
-        _impl->committedRngStates.resize(static_cast<size_t>(width) * height);
+        if (hasColor)
+            _impl->committedRngStates.resize(static_cast<size_t>(width) * height);
+        else
+            std::vector<unsigned int>().swap(_impl->committedRngStates);
     }
     prism::CameraRayParameters const cameraParameters =
         _CameraParameters(camera);
     prism::DumpCameraRayDiagnostics(
         cameraParameters, width, height, settings.seed, "hydra");
-    enum class AovKind { Color, Depth, CameraDepth, Normal, Neye, Peye, St, PrimId, ElementId, InstanceId, Unknown };
-    struct ResolvedBinding { PrismRenderBuffer *buffer; AovKind kind; };
-    std::vector<ResolvedBinding> resolvedBindings;
-    const TfToken stToken("primvars:st");
-    for (auto const &binding : bindings) {
-        AovKind kind = AovKind::Unknown;
-        const auto &name = binding.aovName;
-        if (name == HdAovTokens->color) kind = AovKind::Color;
-        else if (name == HdAovTokens->depth) kind = AovKind::Depth;
-        else if (name == HdAovTokens->cameraDepth) kind = AovKind::CameraDepth;
-        else if (name == HdAovTokens->normal) kind = AovKind::Normal;
-        else if (name == HdAovTokens->Neye) kind = AovKind::Neye;
-        else if (name == HdAovTokens->Peye) kind = AovKind::Peye;
-        else if (name == stToken) kind = AovKind::St;
-        else if (name == HdAovTokens->primId) kind = AovKind::PrimId;
-        else if (name == HdAovTokens->elementId) kind = AovKind::ElementId;
-        else if (name == HdAovTokens->instanceId) kind = AovKind::InstanceId;
-        resolvedBindings.push_back({dynamic_cast<PrismRenderBuffer *>(binding.renderBuffer), kind});
-    }
-    const int sampleCount = std::max(1, settings.samples);
-    const size_t scratchPixels = firstSample < sampleCount
-        ? static_cast<size_t>(width) * height : 0;
-    std::vector<Color3> passColors(scratchPixels);
-    std::vector<float> passCoverage(scratchPixels);
-    std::vector<unsigned int> rngStates(scratchPixels);
-    // Retain only deterministic AOV attributes, never path differential payloads.
-    struct PrimaryAttributes {
-        Float3 p, n;
-        float u, v;
-        int geomid, primid;
-        explicit PrimaryAttributes(RayHit const &h)
-            : p(h.p), n(h.n), u(h.u), v(h.v), geomid(h.geomid), primid(h.primid) {}
+    struct ResolvedBinding { PrismRenderBuffer *buffer; AovKind kind; size_t plane; };
+    struct AovPlane {
+        AovKind kind;
+        size_t components;
+        std::vector<float> floats;
+        std::vector<int> ints;
     };
-    const bool needsPrimary = std::any_of(bindings.begin(), bindings.end(),
-        [](auto const &b) { return b.aovName != HdAovTokens->color; });
-    std::vector<std::optional<PrimaryAttributes>> passPrimary;
-    if (firstSample == 0 && needsPrimary) passPrimary.resize(passColors.size());
+    std::vector<ResolvedBinding> resolvedBindings;
+    std::vector<AovPlane> primaryPlanes;
+    const size_t scratchPixels = firstSample < sampleCount && (hasColor || hasGeometric)
+        ? static_cast<size_t>(width) * height : 0;
+    for (auto const &binding : bindings) {
+        auto *buffer = dynamic_cast<PrismRenderBuffer *>(binding.renderBuffer);
+        const AovKind kind = _AovKind(binding.aovName);
+        size_t plane = 0;
+        if (firstSample == 0 && buffer && kind != AovKind::Color && kind != AovKind::Unknown) {
+            auto found = std::find_if(primaryPlanes.begin(), primaryPlanes.end(),
+                [kind](auto const &p) { return p.kind == kind; });
+            plane = static_cast<size_t>(found - primaryPlanes.begin());
+            if (found == primaryPlanes.end()) {
+                AovPlane staging{kind, _AovComponents(kind), {}, {}};
+                if (_IntegerAov(kind)) staging.ints.resize(scratchPixels);
+                else staging.floats.resize(scratchPixels * staging.components);
+                primaryPlanes.push_back(std::move(staging));
+            }
+        }
+        resolvedBindings.push_back({buffer, kind, plane});
+    }
+    std::vector<Color3> passColors(hasColor ? scratchPixels : 0);
+    std::vector<float> passCoverage(hasColor ? scratchPixels : 0);
+    std::vector<unsigned int> rngStates(hasColor ? scratchPixels : 0);
     {
         std::lock_guard lock(_impl->mutex);
-        _impl->firstPassPrimaryScratchBytes = passPrimary.capacity() * sizeof(passPrimary[0]);
+        _impl->firstPassPrimaryScratchBytes = 0;
+        for (auto const &plane : primaryPlanes)
+            _impl->firstPassPrimaryScratchBytes += plane.floats.capacity() * sizeof(float) +
+                plane.ints.capacity() * sizeof(int);
+        _impl->colorPassScratchBytes = passColors.capacity() * sizeof(Color3) +
+            passCoverage.capacity() * sizeof(float);
+        _impl->colorRngStorageBytes = (rngStates.capacity() +
+            _impl->committedRngStates.capacity()) * sizeof(unsigned int);
+    }
+    if (!hasColor && !hasGeometric) {
+        if (_impl->renderThread->IsStopRequested()) return;
+        if (firstSample == 0) {
+            for (auto const &binding : resolvedBindings)
+                if (binding.buffer) binding.buffer->Publish(frame);
+            _impl->samples.store(1);
+        }
+        if (_impl->renderThread->IsStopRequested()) return;
+        for (auto const &binding : resolvedBindings)
+            if (binding.buffer) binding.buffer->SetConverged(!preparing);
+        {
+            std::lock_guard lock(_impl->mutex);
+            _impl->lastPublishedFrame = frame;
+            _impl->renderSeconds = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - _impl->startTime).count();
+        }
+        _converged.store(!preparing);
+        return;
     }
     struct DisplayTarget {
         PrismRenderBuffer *buffer;
         PrismRenderBuffer::ReadView base;
-        std::shared_ptr<std::vector<uint8_t>> pixels;
+        std::vector<std::shared_ptr<const PrismRenderBuffer::PresentationTile>> tiles;
     };
     std::vector<DisplayTarget> displays;
     struct DisplayCleanup {
         std::vector<ResolvedBinding> const &targets;
         ~DisplayCleanup() { for (auto &t : targets) if (t.buffer) t.buffer->ClearPresentationPixels(); }
     } displayCleanup{resolvedBindings};
+    if (_impl->tileWidth != width || _impl->tileHeight != height) {
+        _impl->refinementTiles = MakeRefinementTiles(width, height);
+        _impl->tileWidth = width; _impl->tileHeight = height;
+    }
+    auto const &tiles = _impl->refinementTiles;
+    uint64_t presentationRevision = 0;
     for (int sample = firstSample; sample < sampleCount; ++sample) {
         if (_impl->renderThread->IsStopRequested()) return;
         while (_impl->renderThread->IsPauseRequested()) {
@@ -4829,89 +5892,200 @@ void SceneBridge::Render()
         for (auto const &binding : bindings) {
             if (binding.aovName != HdAovTokens->color) continue;
             auto *buffer = dynamic_cast<PrismRenderBuffer *>(binding.renderBuffer);
-            if (!buffer) continue;
+            if (!buffer || std::any_of(displays.begin(), displays.end(),
+                    [buffer](auto const &t) { return t.buffer == buffer; })) continue;
             auto base = buffer->CapturePublished();
             if (base.format != HdFormatFloat32Vec4 || base.frame != frame || !base.pixels) continue;
-            displays.push_back({buffer, base, std::make_shared<std::vector<uint8_t>>(*base.pixels)});
+            displays.push_back({buffer, base, {}});
+            displays.back().tiles.resize(tiles.size());
         }
         const auto traceStart = std::chrono::steady_clock::now();
-        auto nextDisplay = traceStart + std::chrono::milliseconds(100);
-        bool publishedPartial = false;
-        constexpr unsigned int rowBatch = 16;
-        for (unsigned int rowStart = 0; rowStart < height; rowStart += rowBatch) {
-            const unsigned int rowEnd = std::min(height, rowStart + rowBatch);
-            tbb::parallel_for(tbb::blocked_range2d<unsigned int>(rowStart, rowEnd, 8, 0, width, 8),
-                [&](tbb::blocked_range2d<unsigned int> const &range) {
-                    for (unsigned int y = range.rows().begin(); y != range.rows().end(); ++y) {
-                        if (_impl->renderThread->IsStopRequested()) return;
-                        for (unsigned int x = range.cols().begin(); x != range.cols().end(); ++x) {
-                            const size_t pixel = static_cast<size_t>(y) * width + x;
-                            unsigned int &seed = rngStates[pixel];
-                            if (sample == 0) seed = tea<64>((y * width) ^ settings.seed, x);
-                            RayPair rays = prism::GenerateCameraRays(
-                                cameraParameters, x, y, width, height, seed);
-                            SceneManager::PrimaryOutcome outcome = SceneManager::PrimaryOutcome::Unresolved;
-                            Color3 c = snapshot->scene->trace(
-                                prism::PathRay{rays.sampled, rays.footprint},
-                                0, Color3(1.0f), seed, &outcome);
-                            const float coverage = (snapshot->domeCount == 0 || !settings.domeLightCameraVisibility) &&
-                                outcome == SceneManager::PrimaryOutcome::Escaped ? 0.0f : 1.0f;
-                            if (coverage == 0.0f) c = Color3(0.0f);
-                            if (settings.sampleClamp > 0.0f) {
-                                const float peak = c.max_component();
-                                if (peak > settings.sampleClamp) c *= settings.sampleClamp / peak;
+        using Clock = std::chrono::steady_clock;
+        const auto milliseconds = [](auto duration) {
+            return std::chrono::duration<double, std::milli>(duration).count();
+        };
+        std::vector<std::atomic<bool>> ready(tiles.size());
+        for (auto &flag : ready) flag.store(false, std::memory_order_relaxed);
+        std::vector<bool> emitted(tiles.size(), false);
+        std::atomic<uint64_t> rayNanoseconds{0}, aovNanoseconds{0};
+        std::atomic<bool> abandonPass{false};
+        std::mutex completionMutex;
+        std::condition_variable completion;
+        bool finished = false;
+        double waitMilliseconds = 0, payloadMilliseconds = 0, publicationMilliseconds = 0;
+        // One pass-wide TBB job replaces the barrier after each 64 tiles.
+        // The coordinator alone owns presentation packets. Acquire/release
+        // completion flags make only fully written tiles visible to it.
+        auto worker = std::async(std::launch::async, [&] {
+            auto finish = [&] {
+                { std::lock_guard lock(completionMutex); finished = true; }
+                completion.notify_one();
+            };
+            try {
+                // Reserve execution capacity for the host and coordinator.
+                // A private arena also prevents publication waits from
+                // borrowing long-running ray tasks from this pass.
+                const int concurrency = std::max(1, tbb::this_task_arena::max_concurrency() - 2);
+                tbb::task_arena renderArena(concurrency);
+                renderArena.execute([&] {
+                    tbb::parallel_for(tbb::blocked_range<size_t>(0, tiles.size(), 1),
+                        [&](tbb::blocked_range<size_t> const &range) {
+                            PixelWorkCounter colorWork{_impl->colorTracedPixels};
+                            PixelWorkCounter geometricWork{_impl->geometricOnlyPixels};
+                            uint64_t rayNs = 0, aovNs = 0;
+                            std::array<RTCRay, RefinementTileSize * RefinementTileSize> centers;
+                            for (size_t tileIndex = range.begin(); tileIndex != range.end(); ++tileIndex) {
+                                while (_impl->renderThread->IsPauseRequested()) {
+                                    if (abandonPass.load(std::memory_order_relaxed) ||
+                                        _impl->renderThread->IsStopRequested()) return;
+                                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                                }
+                                auto const &tile = tiles[tileIndex];
+                                auto rayStart = Clock::now();
+                                for (unsigned y = tile.y; y < tile.y + tile.height; ++y) {
+                                    if (abandonPass.load(std::memory_order_relaxed) ||
+                                        _impl->renderThread->IsStopRequested()) return;
+                                    for (unsigned x = tile.x; x < tile.x + tile.width; ++x) {
+                                        const size_t pixel = static_cast<size_t>(y) * width + x;
+                                        if (!hasColor) {
+                                            centers[(y-tile.y)*tile.width+x-tile.x] =
+                                                prism::MakeCameraRayWithLens(cameraParameters,
+                                                    static_cast<float>(x) + 0.5f,
+                                                    static_cast<float>(y) + 0.5f,
+                                                    width, height, nullptr);
+                                            continue;
+                                        }
+                                        unsigned int &seed = rngStates[pixel];
+                                        if (sample == 0) seed = tea<64>((y * width) ^ settings.seed, x);
+                                        RayPair rays = prism::GenerateCameraRays(
+                                            cameraParameters, x, y, width, height, seed);
+                                        if (sample == 0 && !primaryPlanes.empty())
+                                            centers[(y-tile.y)*tile.width+x-tile.x] = rays.center;
+                                        SceneManager::PrimaryOutcome outcome = SceneManager::PrimaryOutcome::Unresolved;
+                                        Color3 c = snapshot->scene->trace(
+                                            prism::PathRay{rays.sampled, rays.footprint},
+                                            0, Color3(1.0f), seed, &outcome);
+                                        ++colorWork.pixels;
+                                        const float coverage = (snapshot->domeCount == 0 || !settings.domeLightCameraVisibility) &&
+                                            outcome == SceneManager::PrimaryOutcome::Escaped ? 0.0f : 1.0f;
+                                        if (coverage == 0.0f) c = Color3(0.0f);
+                                        if (settings.sampleClamp > 0.0f) {
+                                            const float peak = c.max_component();
+                                            if (peak > settings.sampleClamp) c *= settings.sampleClamp / peak;
+                                        }
+                                        c *= camera.linearExposureScale;
+                                        passColors[pixel] = c;
+                                        passCoverage[pixel] = coverage;
+                                    }
+                                }
+                                auto aovStart = Clock::now();
+                                rayNs += std::chrono::duration_cast<std::chrono::nanoseconds>(aovStart-rayStart).count();
+                                if (sample == 0 && !primaryPlanes.empty()) {
+                                    for (unsigned y = tile.y; y < tile.y + tile.height; ++y) {
+                                        if (abandonPass.load(std::memory_order_relaxed) ||
+                                            _impl->renderThread->IsStopRequested()) return;
+                                        for (unsigned x = tile.x; x < tile.x + tile.width; ++x) {
+                                            const size_t pixel = static_cast<size_t>(y)*width+x;
+                                            const auto hit = snapshot->scene->cast_ray(centers[(y-tile.y)*tile.width+x-tile.x]);
+                                            if (!hasColor) ++geometricWork.pixels;
+                                            for (auto &plane : primaryPlanes)
+                                                _ResolvePrimaryAov(plane.kind, hit, camera, snapshot.get(),
+                                                    plane.floats.empty() ? nullptr : plane.floats.data()+pixel*plane.components,
+                                                    plane.ints.empty() ? nullptr : plane.ints.data()+pixel);
+                                        }
+                                    }
+                                }
+                                aovNs += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-aovStart).count();
+                                ready[tileIndex].store(true, std::memory_order_release);
                             }
-                            c *= camera.linearExposureScale;
-                            passColors[pixel] = c;
-                            passCoverage[pixel] = coverage;
-                            if (sample == 0 && needsPrimary) {
-                                auto hit = snapshot->scene->cast_ray(rays.center);
-                                passPrimary[pixel].emplace(hit);
+                            rayNanoseconds.fetch_add(rayNs, std::memory_order_relaxed);
+                            aovNanoseconds.fetch_add(aovNs, std::memory_order_relaxed);
+                        });
+                });
+            } catch (...) { finish(); throw; }
+            finish();
+        });
+        struct DrainPass {
+            std::atomic<bool> &abandon;
+            std::future<void> &worker;
+            ~DrainPass() {
+                // Packing/allocation can throw while workers are paused.
+                // Unblock them before the future's destructor waits, and
+                // before any of the captured pass storage is destroyed.
+                abandon.store(true, std::memory_order_relaxed);
+                if (worker.valid()) worker.wait();
+            }
+        } drainPass{abandonPass, worker};
+        auto nextDisplay = traceStart + std::chrono::milliseconds(100);
+        for (;;) {
+            const auto waitStart = Clock::now();
+            bool done;
+            {
+                std::unique_lock lock(completionMutex);
+                completion.wait_until(lock, nextDisplay, [&] { return finished; });
+                done = finished;
+            }
+            waitMilliseconds += milliseconds(Clock::now()-waitStart);
+            if (done) break;
+            if (!_impl->renderThread->IsStopRequested() && !displays.empty()) {
+                const auto payloadStart = Clock::now();
+                std::vector<size_t> completed;
+                for (size_t i = 0; i < tiles.size(); ++i)
+                    if (!emitted[i] && ready[i].load(std::memory_order_acquire)) {
+                        completed.push_back(i); emitted[i] = true;
+                    }
+                // Packing a publication is bounded memory work. Running it
+                // here avoids entering the render scheduler while the host
+                // is waiting for the next immutable display packet.
+                for (size_t j = 0; j != completed.size(); ++j) {
+                    auto const &tile = tiles[completed[j]];
+                    for (auto &target : displays) {
+                        auto payload = std::make_shared<PrismRenderBuffer::PresentationTile>();
+                        payload->x = tile.x; payload->y = height - tile.y - tile.height;
+                        payload->width = tile.width; payload->height = tile.height;
+                        payload->rgba.resize(static_cast<size_t>(tile.width) * tile.height * 4);
+                        auto const *previous = reinterpret_cast<float const *>(target.base.pixels->data());
+                        for (unsigned y = 0; y < tile.height; ++y) {
+                            for (unsigned x = 0; x < tile.width; ++x) {
+                                const size_t pixel = static_cast<size_t>(tile.y + y) * width + tile.x + x;
+                                const size_t offset = (static_cast<size_t>(height - 1 - tile.y - y) * width + tile.x + x) * 4;
+                                float *dst = payload->rgba.data() + (static_cast<size_t>(tile.height - 1 - y) * tile.width + x) * 4;
+                                auto const &c = passColors[pixel];
+                                const float values[4] = {c.x(), c.y(), c.z(), passCoverage[pixel]};
+                                for (size_t component = 0; component < 4; ++component)
+                                    dst[component] = sample == 0 ? values[component] :
+                                        (previous[offset + component] * sample + values[component]) / (sample + 1);
                             }
                         }
+                        target.tiles[tile.index] = std::move(payload);
                     }
-                });
-            if (_impl->renderThread->IsStopRequested()) return;
-            for (auto &target : displays) {
-                float *dst = reinterpret_cast<float *>(target.pixels->data());
-                float const *previous = reinterpret_cast<float const *>(target.base.pixels->data());
-                for (unsigned int y = rowStart; y < rowEnd; ++y) {
-                    for (unsigned int x = 0; x < width; ++x) {
-                        const size_t pixel = static_cast<size_t>(y) * width + x;
-                        const size_t offset = (static_cast<size_t>(height - 1 - y) * width + x) * 4;
-                        const auto &c = passColors[pixel];
-                        const float values[4] = {c.x(), c.y(), c.z(), passCoverage[pixel]};
-                        for (size_t component = 0; component < 4; ++component)
-                            dst[offset + component] = sample == 0 ? values[component] :
-                                (previous[offset + component] * sample + values[component]) / (sample + 1);
+                }
+                payloadMilliseconds += milliseconds(Clock::now()-payloadStart);
+                if (!completed.empty() && !_impl->renderThread->IsStopRequested()) {
+                    const auto publicationStart = Clock::now();
+                    ++presentationRevision;
+                    for (auto &target : displays) {
+                        auto packet = std::make_shared<PrismRenderBuffer::PresentationSnapshot>();
+                        packet->base = target.base;
+                        packet->pass = static_cast<uint64_t>(sample);
+                        packet->revision = presentationRevision;
+                        packet->tiles = target.tiles;
+                        target.buffer->SetPresentationSnapshot(std::move(packet));
                     }
+                    { std::lock_guard lock(_impl->mutex); ++_impl->refinementPublishes; }
+                    publicationMilliseconds += milliseconds(Clock::now()-publicationStart);
                 }
             }
-            if (std::chrono::steady_clock::now() >= nextDisplay && rowEnd < height) {
-                for (auto &target : displays) {
-                    target.buffer->SetPresentationPixels(target.pixels, frame);
-                    // Published pixels are immutable while the UI uploads them.
-                    target.pixels = std::make_shared<std::vector<uint8_t>>(*target.pixels);
-                }
-                {
-                    std::lock_guard lock(_impl->mutex);
-                    if (!displays.empty()) {
-                        ++_impl->refinementPublishes;
-                        publishedPartial = true;
-                    }
-                }
-                nextDisplay = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
-            }
+            // Keep cadence anchored to the pass, rather than adding payload
+            // construction time to every interval. If packing overran an
+            // interval, consume new completions immediately instead of queuing
+            // a backlog of timer events.
+            nextDisplay = std::max(nextDisplay + std::chrono::milliseconds(100), Clock::now());
         }
+        // Also propagates worker errors; never release worker-owned memory
+        // while cancellation or an exception is still draining the TBB job.
+        worker.get();
         if (_impl->renderThread->IsStopRequested()) return;
-        // Complete the display before the atomic raw-buffer commit, so a slow
-        // geometric-AOV commit cannot leave the final rows at preview quality.
-        if (publishedPartial) {
-            for (auto &target : displays)
-                target.buffer->SetPresentationPixels(target.pixels, frame);
-            std::lock_guard lock(_impl->mutex);
-            ++_impl->refinementPublishes;
-        }
         const auto commitStart = std::chrono::steady_clock::now();
         // Release previous raw image references so publication can recycle its storage.
         // The buffer keeps the immutable display override alive until Publish.
@@ -4925,9 +6099,6 @@ void SceneBridge::Render()
                 for (unsigned int y = range.rows().begin(); y != range.rows().end(); ++y) {
                     for (unsigned int x = range.cols().begin(); x != range.cols().end(); ++x) {
                         const size_t pixel = static_cast<size_t>(y) * width + x;
-                        Color3 const &c = passColors[pixel];
-                        std::optional<PrimaryAttributes> primary;
-                        if (sample == 0 && needsPrimary) primary = passPrimary[pixel];
                         // Hydra's render buffers are addressed bottom-up. Camera sampling
                         // remains top-down so the generated rays match standalone PrismRT.
                         const unsigned int bufferY = height - 1 - y;
@@ -4943,75 +6114,16 @@ void SceneBridge::Render()
                                 ? std::chrono::steady_clock::now()
                                 : std::chrono::steady_clock::time_point{};
                             if (kind == AovKind::Color) {
+                                Color3 const &c = passColors[pixel];
                                 float v[4] = {c.x(), c.y(), c.z(), passCoverage[pixel]};
                                 buffer->WriteFloat(x, bufferY, v, 4, true);
-                            } else if (!primary) {
-                                continue;
-                            } else if (kind == AovKind::Depth ||
-                                       kind == AovKind::CameraDepth) {
-                                float v = kind == AovKind::Depth
-                                    ? 1.0f : std::numeric_limits<float>::infinity();
-                                if (primary->geomid != RTC_INVALID_GEOMETRY_ID) {
-                                    GfVec4d view(primary->p.x(), primary->p.y(),
-                                                 primary->p.z(), 1.0);
-                                    view = view * camera.worldToView;
-                                    if (kind == AovKind::CameraDepth) {
-                                        v = static_cast<float>(-view[2]);
-                                    } else {
-                                        GfVec4d clip = view * camera.projection;
-                                        if (std::abs(clip[3]) > 1e-12)
-                                            v = static_cast<float>(
-                                                0.5 * clip[2] / clip[3] + 0.5);
-                                    }
-                                }
-                                buffer->WriteFloat(x, bufferY, &v, 1, false);
-                            } else if (kind == AovKind::Normal ||
-                                       kind == AovKind::Neye) {
-                                Float3 n = primary->n;
-                                if (kind == AovKind::Neye &&
-                                    primary->geomid != RTC_INVALID_GEOMETRY_ID) {
-                                    GfVec3d eye = camera.worldToView.TransformDir(
-                                        GfVec3d(n.x(), n.y(), n.z())).GetNormalized();
-                                    n = Float3(static_cast<float>(eye[0]),
-                                               static_cast<float>(eye[1]),
-                                               static_cast<float>(eye[2]));
-                                }
-                                float v[3] = {n.x(), n.y(), n.z()};
-                                buffer->WriteFloat(x, bufferY, v, 3, false);
-                            } else if (kind == AovKind::Peye) {
-                                float v[3] = {0, 0, 0};
-                                if (primary->geomid != RTC_INVALID_GEOMETRY_ID) {
-                                    GfVec3d eye = camera.worldToView.Transform(
-                                        GfVec3d(primary->p.x(), primary->p.y(), primary->p.z()));
-                                    v[0] = static_cast<float>(eye[0]);
-                                    v[1] = static_cast<float>(eye[1]);
-                                    v[2] = static_cast<float>(eye[2]);
-                                }
-                                buffer->WriteFloat(x, bufferY, v, 3, false);
-                            } else if (kind == AovKind::St) {
-                                float v[2] = {0, 0};
-                                if (primary->geomid != RTC_INVALID_GEOMETRY_ID) {
-                                    v[0] = primary->u;
-                                    v[1] = primary->v;
-                                }
-                                buffer->WriteFloat(x, bufferY, v, 2, false);
-                            } else if (kind == AovKind::PrimId) {
-                                int id = _PrimIdForHit(snapshot.get(), *primary);
-                                buffer->WriteInt(x, bufferY, &id, 1);
-                            } else if (kind == AovKind::ElementId) {
-                                int id = -1;
-                                auto it = snapshot->geomToCoarseFaces.find(primary->geomid);
-                                if (it != snapshot->geomToCoarseFaces.end() &&
-                                    primary->primid >= 0 &&
-                                    static_cast<size_t>(primary->primid) < it->second.size()) {
-                                    id = it->second[primary->primid];
-                                }
-                                buffer->WriteInt(x, bufferY, &id, 1);
-                            } else if (kind == AovKind::InstanceId) {
-                                int id = -1;
-                                auto it = snapshot->geomToInstanceId.find(primary->geomid);
-                                if (it != snapshot->geomToInstanceId.end()) id = it->second;
-                                buffer->WriteInt(x, bufferY, &id, 1);
+                            } else if (kind != AovKind::Unknown && sample == 0) {
+                                auto const &plane = primaryPlanes[resolved.plane];
+                                if (_IntegerAov(kind))
+                                    buffer->WriteInt(x, bufferY, plane.ints.data() + pixel, 1);
+                                else
+                                    buffer->WriteFloat(x, bufferY,
+                                        plane.floats.data() + pixel * plane.components, plane.components, false);
                             }
                             if (_impl->profileBufferWrites) {
                                 tileWriteNanoseconds[bindingIndex] +=
@@ -5042,12 +6154,18 @@ void SceneBridge::Render()
             _impl->lastPublishedFrame = frame;
             _impl->lastPassTraceMilliseconds = std::chrono::duration<double,std::milli>(commitStart-traceStart).count();
             _impl->lastPassCommitMilliseconds = std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-commitStart).count();
+            _impl->lastPassRayWorkerMilliseconds = rayNanoseconds.load()*1e-6;
+            _impl->lastPassAovWorkerMilliseconds = aovNanoseconds.load()*1e-6;
+            _impl->lastPassWaitMilliseconds = waitMilliseconds;
+            _impl->lastPassPayloadMilliseconds = payloadMilliseconds;
+            _impl->lastPassPublicationMilliseconds = publicationMilliseconds;
         }
         _impl->committedRngStates.swap(rngStates);
         _impl->samples.store(static_cast<uint64_t>(sample + 1));
         if (sample == 0)
-            std::vector<std::optional<PrimaryAttributes>>().swap(passPrimary);
+            std::vector<AovPlane>().swap(primaryPlanes);
     }
+    if (_impl->renderThread->IsStopRequested()) return;
     for (HdRenderPassAovBinding const &binding : bindings)
         if (auto *buffer = dynamic_cast<PrismRenderBuffer *>(binding.renderBuffer))
             buffer->SetConverged(!preparing);
@@ -5112,8 +6230,17 @@ VtDictionary SceneBridge::GetStats() const
     std::lock_guard lock(_impl->mutex);
     result["refinementPublishes"] = VtValue(static_cast<int64_t>(_impl->refinementPublishes));
     result["firstPassPrimaryScratchBytes"] = VtValue(static_cast<int64_t>(_impl->firstPassPrimaryScratchBytes));
+    result["colorTracedPixels"] = VtValue(static_cast<int64_t>(_impl->colorTracedPixels.load()));
+    result["geometricOnlyPixels"] = VtValue(static_cast<int64_t>(_impl->geometricOnlyPixels.load()));
+    result["colorPassScratchBytes"] = VtValue(static_cast<int64_t>(_impl->colorPassScratchBytes));
+    result["colorRngStorageBytes"] = VtValue(static_cast<int64_t>(_impl->colorRngStorageBytes));
     result["lastPassTraceMilliseconds"] = VtValue(_impl->lastPassTraceMilliseconds);
     result["lastPassCommitMilliseconds"] = VtValue(_impl->lastPassCommitMilliseconds);
+    result["lastPassPublicationMilliseconds"] = VtValue(_impl->lastPassPublicationMilliseconds);
+    result["lastPassPayloadMilliseconds"] = VtValue(_impl->lastPassPayloadMilliseconds);
+    result["lastPassWaitMilliseconds"] = VtValue(_impl->lastPassWaitMilliseconds);
+    result["lastPassAovWorkerMilliseconds"] = VtValue(_impl->lastPassAovWorkerMilliseconds);
+    result["lastPassRayWorkerMilliseconds"] = VtValue(_impl->lastPassRayWorkerMilliseconds);
     result["meshCount"] = VtValue(static_cast<int64_t>(
         _impl->snapshot ? _impl->snapshot->meshCount : 0));
     result["triangleCount"] = VtValue(
@@ -5128,6 +6255,30 @@ VtDictionary SceneBridge::GetStats() const
         _impl->prototypePool->topLevelSceneBuilds.load()));
     result["topLevelSceneCommits"] = VtValue(static_cast<int64_t>(
         _impl->prototypePool->topLevelSceneCommits.load()));
+    result["lastCanonicalRecordsVisited"] = VtValue(static_cast<int64_t>(
+        _impl->snapshot ? _impl->snapshot->lastCanonicalRecordsVisited : 0));
+    result["lastPickingRecordsVisited"] = VtValue(static_cast<int64_t>(
+        _impl->snapshot ? _impl->snapshot->lastPickingRecordsVisited : 0));
+    result["lastCountRecordsVisited"] = VtValue(static_cast<int64_t>(
+        _impl->snapshot ? _impl->snapshot->lastCountRecordsVisited : 0));
+    result["lastInputMetadataPrototypesVisited"] = VtValue(static_cast<int64_t>(
+        _impl->snapshot ? _impl->snapshot->lastInputMetadataPrototypesVisited : 0));
+    result["lastDependencyPlacementsVisited"] = VtValue(static_cast<int64_t>(
+        _impl->snapshot ? _impl->snapshot->lastDependencyPlacementsVisited : 0));
+    result["lastCanonicalMilliseconds"] = VtValue(
+        _impl->snapshot ? _impl->snapshot->lastCanonicalMilliseconds : 0.0);
+    result["lastPickingMilliseconds"] = VtValue(
+        _impl->snapshot ? _impl->snapshot->lastPickingMilliseconds : 0.0);
+    result["lastCountsMilliseconds"] = VtValue(
+        _impl->snapshot ? _impl->snapshot->lastCountsMilliseconds : 0.0);
+    result["lastDependencyMilliseconds"] = VtValue(
+        _impl->snapshot ? _impl->snapshot->lastDependencyMilliseconds : 0.0);
+    result["lastInputMetadataMilliseconds"] = VtValue(
+        _impl->snapshot ? _impl->snapshot->lastInputMetadataMilliseconds : 0.0);
+    result["lastInputComparisonMilliseconds"] = VtValue(
+        _impl->snapshot ? _impl->snapshot->lastInputComparisonMilliseconds : 0.0);
+    result["lastPlacementReconcileMilliseconds"] = VtValue(
+        _impl->snapshot ? _impl->snapshot->lastPlacementReconcileMilliseconds : 0.0);
     result["lastPlacementTransformsUpdated"] = VtValue(static_cast<int64_t>(
         _impl->snapshot ? _impl->snapshot->lastPlacementTransformsUpdated : 0));
     result["lastPrototypePlacementsRepointed"] = VtValue(static_cast<int64_t>(
@@ -5145,6 +6296,22 @@ VtDictionary SceneBridge::GetStats() const
     result["prototypeUpdateFallbacks"] = VtValue(static_cast<int64_t>(_impl->prototypeUpdateFallbacks));
     result["enabledPlacementCount"] = VtValue(static_cast<int64_t>(
         _impl->snapshot ? _impl->snapshot->enabledPlacementCount : 0));
+    {
+        std::lock_guard poolLock(_impl->prototypePool->mutex);
+        auto const usage = _HiddenGeometryUsage(*_impl->prototypePool);
+        const uint64_t budget = _impl->prototypePool->hiddenGeometryBudgetBytes.load();
+        result["hiddenGeometryBudgetBytes"] = VtValue(static_cast<int64_t>(budget));
+        result["hiddenGeometryResidentBytes"] = VtValue(static_cast<int64_t>(usage.residentBytes));
+        result["hiddenGeometryPinnedBytes"] = VtValue(static_cast<int64_t>(usage.pinnedBytes));
+        result["hiddenGeometryBudgetOverageBytes"] = VtValue(static_cast<int64_t>(
+            budget && usage.residentBytes > budget ? usage.residentBytes - budget : 0));
+    }
+    result["hiddenGeometryEvictions"] = VtValue(static_cast<int64_t>(
+        _impl->prototypePool->hiddenGeometryEvictions.load()));
+    result["hiddenGeometryRestorations"] = VtValue(static_cast<int64_t>(
+        _impl->prototypePool->hiddenGeometryRestorations.load()));
+    result["evictedPrototypeCount"] = VtValue(static_cast<int64_t>(
+        _impl->snapshot ? _impl->snapshot->evictedPrototypes.size() : 0));
     result["snapshotBuildSeconds"] = VtValue(_impl->snapshotBuildSeconds);
     result["firstPublishSeconds"] = VtValue(_impl->firstPublishSeconds);
     result["spareSnapshotSeconds"] = VtValue(_impl->spareSnapshotSeconds);
@@ -5271,6 +6438,12 @@ VtDictionary SceneBridge::GetStats() const
         _impl->snapshot ? _impl->snapshot->materialBindingsUpdated : 0));
     result["lastPlacementRecordsVisited"] = VtValue(static_cast<int64_t>(
         _impl->snapshot ? _impl->snapshot->lastPlacementRecordsVisited : 0));
+    result["lastInstanceArrayElementsScanned"] = VtValue(static_cast<int64_t>(
+        _impl->snapshot ? _impl->snapshot->lastInstanceArrayElementsScanned : 0));
+    result["lastPlacementTopologyAttached"] = VtValue(static_cast<int64_t>(
+        _impl->snapshot ? _impl->snapshot->lastPlacementTopologyAttached : 0));
+    result["lastPlacementTopologyDetached"] = VtValue(static_cast<int64_t>(
+        _impl->snapshot ? _impl->snapshot->lastPlacementTopologyDetached : 0));
     result["lastVisibilityPlacementsUpdated"] = VtValue(static_cast<int64_t>(
         _impl->snapshot ?
             _impl->snapshot->lastVisibilityPlacementsUpdated : 0));
@@ -5327,16 +6500,20 @@ VtDictionary SceneBridge::GetStats() const
     result["visibilityRecoveryRebuilds"] = VtValue(static_cast<int64_t>(
         _impl->visibilityRecoveryRebuilds));
     result["lastRebuildReason"] = VtValue(_impl->lastRebuildReason);
-    uint64_t writeNs = 0, publishNs = 0, mapNs = 0;
+    uint64_t writeNs = 0, publishNs = 0, mapNs = 0, presentationCopyBytes = 0;
+    std::unordered_set<PrismRenderBuffer *> measuredBuffers;
     for (auto const &binding : _impl->bindings) {
         if (auto *buffer = dynamic_cast<PrismRenderBuffer *>(binding.renderBuffer)) {
+            if (!measuredBuffers.insert(buffer).second) continue;
             writeNs += buffer->GetWriteNanoseconds();
             publishNs += buffer->GetPublishNanoseconds();
             mapNs += buffer->GetMapWaitNanoseconds();
+            presentationCopyBytes += buffer->GetPresentationCopyBytes();
         }
     }
     result["bufferWriteProfilingEnabled"] = VtValue(
         _impl->profileBufferWrites);
+    result["presentationCopyBytes"] = VtValue(static_cast<int64_t>(presentationCopyBytes));
     result["bufferWriteMilliseconds"] = VtValue(writeNs / 1.0e6);
     result["bufferPublicationMilliseconds"] = VtValue(publishNs / 1.0e6);
     result["bufferMapWaitMilliseconds"] = VtValue(mapNs / 1.0e6);

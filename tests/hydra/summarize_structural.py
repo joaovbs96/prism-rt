@@ -179,6 +179,8 @@ def main():
         "lastStructuralPathsUpdated", "lastStructuralPlacementsAttached",
         "lastStructuralPlacementsDetached", "capturedPrims",
         "lastPlacementRecordsVisited", "lastPlacementTransformsUpdated",
+        "lastInstanceArrayElementsScanned", "lastPlacementTopologyAttached",
+        "lastPlacementTopologyDetached",
         "lastPrototypePathsUpdated", "lastPrototypePlacementsRepointed",
         "prototypeBuildCount", "snapshotBuilds", "topLevelSceneBuilds",
         "topLevelSceneCommits", "placementTopologyFallbacks",

@@ -39,6 +39,9 @@ struct RenderSettings {
     int refinementDelayMs = 100;
     int resourceRevision = 0;
     bool sphereBatching = false;
+    // Soft target for converted geometry retained only by hidden prototypes.
+    // Zero preserves unlimited retention; source data and Embree are excluded.
+    int hiddenGeometryBudgetMiB = 0;
     prism::TextureFiltering textureFiltering =
         prism::TextureFiltering::Filtered;
     enum class EnvironmentSampling { Mis, Bsdf } environmentSampling =
@@ -62,6 +65,7 @@ struct StructuralChange {
     pxr::TfToken previousType;
     pxr::TfToken newType;
     bool previousHadChildren = false;
+    pxr::SdfPath newPath; // Explicit destination for Rename; path is the source.
 };
 
 struct SceneDirtyNotice {

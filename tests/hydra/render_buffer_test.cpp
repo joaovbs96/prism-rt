@@ -323,6 +323,79 @@ int main() {
         if (resizedPresentation.width != 1 || resizedPresentation.frame ||
             resizedPresentation.pixels != presentation.CapturePublished().pixels)
             throw std::runtime_error("resize accepted stale refinement dimensions or frame metadata");
+        {
+            PrismRenderBuffer tiled(SdfPath("/tiled"),nullptr);
+            tiled.Allocate(GfVec3i(65,35,1),HdFormatFloat32Vec4,false);
+            tiled.Clear(VtValue(GfVec4f(0)));
+            tiled.Publish(frame);
+            const auto base=tiled.CapturePublished();
+            auto tile=std::make_shared<PrismRenderBuffer::PresentationTile>();
+            tile->x=64; tile->y=32; tile->width=1; tile->height=3;
+            tile->rgba={.1f,.2f,.3f,.5f,.4f,.5f,.6f,.75f,.7f,.8f,.9f,1};
+            auto packet=std::make_shared<PrismRenderBuffer::PresentationSnapshot>();
+            packet->base=base; packet->pass=0; packet->revision=1;
+            packet->tiles.resize(9); packet->tiles[8]=tile;
+            tiled.SetPresentationSnapshot(packet);
+            auto state=tiled.CapturePresentationState();
+            if (state.snapshot!=packet || state.raw.pixels!=base.pixels ||
+                tiled.GetPresentationCopyBytes()!=0)
+                throw std::runtime_error("native tile capture materialized or changed raw storage");
+            const auto materialized=tiled.CapturePresentation();
+            auto const *values=reinterpret_cast<float const *>(materialized.pixels->data());
+            for(unsigned y=0;y<35;++y) for(unsigned x=0;x<65;++x) {
+                const size_t offset=(size_t(y)*65+x)*4;
+                for(size_t c=0;c<4;++c) {
+                    float expected=x==64 && y>=32 ? tile->rgba[(y-32)*4+c] : 0;
+                    if(values[offset+c]!=expected)
+                        throw std::runtime_error("tile materialization changed edges or row orientation");
+                }
+            }
+            const uint64_t copyBytes=tiled.GetPresentationCopyBytes();
+            if (copyBytes!=size_t(65)*35*4*sizeof(float) ||
+                tiled.CapturePresentation().pixels!=materialized.pixels ||
+                tiled.GetPresentationCopyBytes()!=copyBytes)
+                throw std::runtime_error("unchanged tile packet was copied more than once");
+            auto newer=std::make_shared<PrismRenderBuffer::PresentationSnapshot>(*packet);
+            newer->revision=3;
+            auto added=std::make_shared<PrismRenderBuffer::PresentationTile>();
+            added->x=0; added->y=0; added->width=1; added->height=1;
+            added->rgba={1,0,0,1}; newer->tiles[0]=added;
+            tiled.SetPresentationSnapshot(newer);
+            tiled.SetPresentationSnapshot(packet);
+            if (tiled.CapturePresentationState().snapshot!=newer || values[0]!=0)
+                throw std::runtime_error("old tile revision replaced or mutated an immutable packet");
+            auto malformed=std::make_shared<PrismRenderBuffer::PresentationSnapshot>(*newer);
+            malformed->revision=4;
+            auto outside=std::make_shared<PrismRenderBuffer::PresentationTile>(*added);
+            outside->x=65; malformed->tiles[0]=outside;
+            tiled.SetPresentationSnapshot(malformed);
+            if (tiled.CapturePresentationState().snapshot!=newer)
+                throw std::runtime_error("out-of-bounds tile packet was accepted");
+            auto const *mapped=static_cast<float const *>(tiled.Map());
+            if (mapped[0]!=0) throw std::runtime_error("tile presentation changed raw Map export");
+            tiled.WriteFloat(0,0,opaque,4,false);
+            tiled.Publish(frame); // Same camera/frame, different sample publication.
+            auto nextPacket=std::make_shared<PrismRenderBuffer::PresentationSnapshot>(*newer);
+            nextPacket->base=tiled.CapturePublished(); nextPacket->pass=1;
+            tiled.SetPresentationSnapshot(nextPacket);
+            if (tiled.CapturePresentationState().snapshot || tiled.CapturePresentation().pixels!=base.pixels)
+                throw std::runtime_error("new-sample tiles were applied to a pinned older raw sample");
+            tiled.Unmap();
+            if(tiled.CapturePresentationState().snapshot!=nextPacket)
+                throw std::runtime_error("latest tile packet missing after unmap");
+            tiled.ClearPresentationPixels();
+            if(tiled.CapturePresentationState().snapshot ||
+               tiled.CapturePresentation().pixels!=nextPacket->base.pixels || values[0]!=0)
+                throw std::runtime_error("tile cancellation changed a retained immutable view");
+            tiled.SetPresentationSnapshot(packet);
+            if(tiled.CapturePresentationState().snapshot)
+                throw std::runtime_error("stale raw-base tile packet accepted");
+            tiled.SetPresentationSnapshot(nextPacket);
+            tiled.Allocate(GfVec3i(2,2,1),HdFormatFloat32Vec4,false);
+            tiled.SetPresentationSnapshot(nextPacket);
+            if(tiled.CapturePresentationState().snapshot)
+                throw std::runtime_error("resize retained incompatible tile packet");
+        }
         std::cout << "Mapped storage survives publication, nested maps, and resize\n";
     } catch(const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
 }
