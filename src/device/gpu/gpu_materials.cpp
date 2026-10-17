@@ -2,6 +2,7 @@
 
 #include "../../mdl_material.h"
 #include "../../mdl/texture_runtime.h"
+#include "../../resource_limits.h"
 
 #include <chrono>
 #include <cmath>
@@ -251,6 +252,28 @@ std::string StructuralKey(mi::neuraylib::IMdl_backend* backend, mi::neuraylib::I
     return key;
 }
 
+// A 128-bit digest of a structural key; equal digests mean equal programs.
+std::string Digest(std::string const& text)
+{
+    uint64_t a = 1469598103934665603ull, b = 0x9e3779b97f4a7c15ull;
+    for (unsigned char c : text) {
+        a = (a ^ c) * 1099511628211ull;
+        b = (b + c) * 0x100000001b3ull ^ (b >> 29);
+    }
+    return std::format("{:016x}{:016x}{:x}", a, b, text.size());
+}
+
+// Digests persist across runs, keyed by the program's class identity (the
+// context address prefix is per process).
+std::filesystem::path StructuralKeyFile(std::string const& identity, ShadingLanguage language)
+{
+    const size_t colon = identity.find(':');
+    const std::string stable = colon == std::string::npos ? identity : identity.substr(colon + 1);
+    return prism::PersistentCacheRoot() / "gpu-structure" /
+        (Digest(stable + (language == ShadingLanguage::Hlsl ? "|hlsl" : "|glsl") +
+                "|mdl-" MI_NEURAYLIB_PRODUCT_VERSION_STRING "|v1") + ".key");
+}
+
 std::mutex gStructuralKeysMutex;
 // (program identity, language) -> structural key. Programs are immutable.
 auto& gStructuralKeys = *new std::map<std::pair<std::string, int>, std::string>();
@@ -347,6 +370,16 @@ MdlShaderCode GenerateMdlShaderCode(std::vector<MDLMaterial const*> const& mater
                 if (auto found = gStructuralKeys.find(cacheKey); found != gStructuralKeys.end())
                     key = found->second;
             }
+            const auto keyFile = StructuralKeyFile(programs[p]->identity, language);
+            const bool persistent = programs[p]->identity.find(':') != std::string::npos;
+            if (key.empty() && persistent) {
+                std::ifstream file(keyFile);
+                std::getline(file, key);
+                if (!key.empty()) {
+                    std::lock_guard lock(gStructuralKeysMutex);
+                    gStructuralKeys.emplace(cacheKey, key);
+                }
+            }
             if (key.empty()) {
                 mi::base::Handle<const mi::neuraylib::ICompiled_material> compiled(
                     transaction->access<mi::neuraylib::ICompiled_material>(
@@ -354,10 +387,18 @@ MdlShaderCode GenerateMdlShaderCode(std::vector<MDLMaterial const*> const& mater
                 if (compiled)
                     key = StructuralKey(backend.get(), transaction.get(), executionContext.get(),
                                         compiled.get(), TraitsOf(compiled.get()));
-                if (key.empty()) key = "unique:" + programs[p]->compiled_material_name;
                 if (const char* dir = std::getenv("PRISM_GPU_DUMP_PROGRAMS"); dir && *dir)
                     std::ofstream(std::filesystem::path(dir) / std::format("program{}.{}", p,
                         language == ShadingLanguage::Hlsl ? "hlsl" : "glsl")) << key;
+                if (key.empty()) key = "unique:" + programs[p]->compiled_material_name;
+                else {
+                    key = Digest(key);
+                    if (persistent) {
+                        std::error_code ignored;
+                        std::filesystem::create_directories(keyFile.parent_path(), ignored);
+                        std::ofstream(keyFile) << key << '\n';
+                    }
+                }
                 std::lock_guard lock(gStructuralKeysMutex);
                 gStructuralKeys.emplace(cacheKey, key);
             }

@@ -88,10 +88,10 @@ bool RewriteHlslToFp32(std::string const& code, std::string* result, std::string
                 }
             }
             out.append(code, i, j - i);
-            // Suffixes: drop l/L on floating literals, keep the rest.
+            // Suffixes: double literals (l/L) become float literals (f).
             while (j < n && IdentifierChar(code[j])) {
                 const char s = code[j];
-                if (!(floating && (s == 'l' || s == 'L'))) out.push_back(s);
+                out.push_back(floating && (s == 'l' || s == 'L') ? 'f' : s);
                 ++j;
             }
             i = j;
