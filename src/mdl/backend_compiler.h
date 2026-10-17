@@ -79,6 +79,10 @@ struct CompiledProgram {
     const Context* owner_identity = nullptr;
     std::string identity;
     bool builtin_resources = false;
+    // Database name of the compiled class this program was generated from.
+    // GPU devices compile it again for their shading language; argument
+    // blocks share the layout. Empty if the class could not be stored.
+    std::string compiled_material_name;
 };
 
 struct MaterialBinding {

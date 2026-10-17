@@ -160,6 +160,8 @@ file(GLOB_RECURSE PRISM_CORE_SOURCES CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp")
 list(FILTER PRISM_CORE_SOURCES EXCLUDE REGEX "/(main|standalone_cli)\\.cpp$")
 list(FILTER PRISM_CORE_SOURCES EXCLUDE REGEX "/hydra/")
+# Device backends are added below when enabled.
+list(FILTER PRISM_CORE_SOURCES EXCLUDE REGEX "/device/(vulkan|metal)/")
 
 add_library(prism_core STATIC ${PRISM_CORE_SOURCES})
 add_library(PrismRT::core ALIAS prism_core)
@@ -394,6 +396,9 @@ if(PRISM_BUILD_HYDRA)
     target_link_libraries(prism_texture_cache_benchmark PRIVATE PrismRT::core)
     add_executable(prism_texture_digest tests/texture_digest.cpp)
     target_link_libraries(prism_texture_digest PRIVATE PrismRT::core)
+
+    add_executable(prism_gpu_codegen_dump tests/gpu_codegen_dump.cpp)
+    target_link_libraries(prism_gpu_codegen_dump PRIVATE PrismRT::core)
 
     add_executable(prism_device_selection_test tests/device_selection.cpp)
     target_link_libraries(prism_device_selection_test PRIVATE PrismRT::core)

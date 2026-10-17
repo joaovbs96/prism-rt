@@ -1,0 +1,344 @@
+#include "gpu_materials.h"
+
+#include "../../mdl_material.h"
+#include "../../mdl/texture_runtime.h"
+
+#include <chrono>
+#include <cstring>
+#include <format>
+#include <map>
+#include <unordered_map>
+
+namespace prism::device::gpu {
+
+namespace {
+
+// Entry points generated for every program, as in the native backend.
+struct EntryPoint { const char* path; const char* name; };
+constexpr EntryPoint kEntryPoints[] = {
+    {"init", "init"},
+    {"surface.scattering", "bsdf"},
+    {"surface.emission.emission", "edf"},
+    {"surface.emission.intensity", "emission_intensity"},
+    {"geometry.cutout_opacity", "cutout"},
+    {"thin_walled", "thin_walled"},
+    {"backface.scattering", "backface_bsdf"},
+    {"backface.emission.emission", "backface_edf"},
+    {"backface.emission.intensity", "backface_emission_intensity"},
+};
+constexpr size_t kEntryPointCount = std::size(kEntryPoints);
+enum EntryIndex {
+    E_INIT, E_BSDF, E_EDF, E_INTENSITY, E_CUTOUT, E_THIN_WALLED,
+    E_BACK_BSDF, E_BACK_EDF, E_BACK_INTENSITY
+};
+
+std::string MessagesOf(mi::neuraylib::IMdl_execution_context* context)
+{
+    std::string text;
+    for (mi::Size i = 0; i < context->get_messages_count(); ++i) {
+        mi::base::Handle<const mi::neuraylib::IMessage> message(context->get_message(i));
+        if (message->get_severity() <= mi::base::MESSAGE_SEVERITY_ERROR) {
+            if (!text.empty()) text += "; ";
+            text += message->get_string();
+        }
+    }
+    return text;
+}
+
+// Applies `remap` to every resource index stored in an argument block.
+template <class Remap>
+void RemapResources(mi::neuraylib::ITarget_value_layout const* layout,
+                    mi::neuraylib::Target_value_layout_state state,
+                    char* block, size_t size, Remap const& remap)
+{
+    mi::neuraylib::IValue::Kind kind;
+    mi::Size elementSize = 0;
+    const mi::Size offset = layout->get_layout(kind, elementSize, state);
+    using K = mi::neuraylib::IValue;
+    if (kind == K::VK_TEXTURE || kind == K::VK_LIGHT_PROFILE ||
+        kind == K::VK_BSDF_MEASUREMENT) {
+        if (offset + sizeof(uint32_t) > size) return;
+        uint32_t index = 0;
+        std::memcpy(&index, block + offset, sizeof(index));
+        index = remap(kind, index);
+        std::memcpy(block + offset, &index, sizeof(index));
+        return;
+    }
+    const mi::Size count = layout->get_num_elements(state);
+    for (mi::Size i = 0; i < count; ++i)
+        RemapResources(layout, layout->get_nested_state(i, state), block, size, remap);
+}
+
+std::string ProgramFunction(uint32_t program, EntryIndex entry)
+{
+    return std::format("prism_p{}_{}", program, kEntryPoints[entry].name);
+}
+
+// The prism_mdl_* dispatch functions. Types are spelled the same in both
+// languages through the shader prelude (float3 maps to vec3 in GLSL).
+std::string GenerateDispatch(std::vector<std::array<bool, kEntryPointCount>> const& present,
+                             ShadingLanguage language)
+{
+    const char* state = language == ShadingLanguage::Hlsl ? "Shading_state_material" : "State";
+    const char* inoutState = "inout";
+    std::string s;
+    auto cases = [&](EntryIndex entry, const char* call, const char* fallback) {
+        std::string body = "    switch (program) {\n";
+        for (size_t p = 0; p < present.size(); ++p) {
+            if (!present[p][entry]) continue;
+            const std::string function = ProgramFunction(uint32_t(p), entry);
+            body += std::format("    case {}u: {}\n", p,
+                std::vformat(call, std::make_format_args(function)));
+        }
+        body += std::format("    default: {}\n    }}\n", fallback);
+        return body;
+    };
+    s += std::format("void prism_mdl_init(uint program, {} {} state)\n{{\n", inoutState, state);
+    s += cases(E_INIT, "{}(state); break;", "break;");
+    s += "}\n\n";
+    s += std::format("bool prism_mdl_thin_walled(uint program, {} {} state)\n{{\n", inoutState, state);
+    s += cases(E_THIN_WALLED, "return {}(state);", "return false;");
+    s += "}\n\n";
+    s += std::format("float prism_mdl_cutout(uint program, {} {} state)\n{{\n", inoutState, state);
+    s += cases(E_CUTOUT, "return {}(state);", "return 1.0;");
+    s += "}\n\n";
+    s += std::format("float3 prism_mdl_emission_intensity(uint program, bool backface, {} {} state)\n{{\n",
+                     inoutState, state);
+    s += "    if (backface) {\n" + cases(E_BACK_INTENSITY, "return {}(state);", "break;") + "    }\n";
+    s += "    else {\n" + cases(E_INTENSITY, "return {}(state);", "break;") + "    }\n";
+    s += "    return float3(0.0, 0.0, 0.0);\n}\n\n";
+    // DF entry points report whether the selected side has a function.
+    auto dfDispatch = [&](const char* name, const char* dataType, EntryIndex front,
+                          EntryIndex back, const char* suffix) {
+        std::string call = std::string("{}") + suffix + "(data, state); return true;";
+        s += std::format("bool {}(uint program, bool backface, inout {} data, {} {} state)\n{{\n",
+                         name, dataType, inoutState, state);
+        s += "    if (backface) {\n" + cases(back, call.c_str(), "break;") + "    }\n";
+        s += "    else {\n" + cases(front, call.c_str(), "break;") + "    }\n";
+        s += "    return false;\n}\n\n";
+    };
+    dfDispatch("prism_mdl_bsdf_sample", "Bsdf_sample_data", E_BSDF, E_BACK_BSDF, "_sample");
+    dfDispatch("prism_mdl_bsdf_evaluate", "Bsdf_evaluate_data", E_BSDF, E_BACK_BSDF, "_evaluate");
+    dfDispatch("prism_mdl_edf_evaluate", "Edf_evaluate_data", E_EDF, E_BACK_EDF, "_evaluate");
+    return s;
+}
+
+} // namespace
+
+MdlShaderCode GenerateMdlShaderCode(std::vector<MDLMaterial const*> const& materials,
+                                    ShadingLanguage language)
+{
+    MdlShaderCode result;
+    result.materials.resize(materials.size());
+    result.textures.resize(1); // invalid texture
+    result.textureResults = kGpuTextureResults;
+
+    // Distinct programs, in first-use order.
+    std::vector<mdl::CompiledProgram const*> programs;
+    std::unordered_map<mdl::CompiledProgram const*, uint32_t> programIndex;
+    mdl::Context const* context = nullptr;
+    for (size_t i = 0; i < materials.size(); ++i) {
+        auto& record = result.materials[i];
+        MDLMaterial const* material = materials[i];
+        if (!material || !material->is_valid()) { record.error = "invalid MDL material"; continue; }
+        auto const& target = material->get_target_code();
+        auto const* program = target.program.get();
+        if (!program || program->compiled_material_name.empty()) {
+            record.error = "program has no compiled class";
+            continue;
+        }
+        if (program->builtin_resources) {
+            record.error = "program uses the SDK resource handler";
+            continue;
+        }
+        if (context && program->owner_identity != context) {
+            record.error = "materials of different MDL contexts";
+            continue;
+        }
+        context = program->owner_identity;
+        auto [found, inserted] = programIndex.emplace(program, uint32_t(programs.size()));
+        if (inserted) programs.push_back(program);
+        record.program = found->second;
+        record.valid = true;
+        if (target.binding) record.constantCutout = target.binding->constant_cutout_opacity;
+    }
+    result.programCount = uint32_t(programs.size());
+    if (programs.empty()) {
+        std::vector<std::array<bool, kEntryPointCount>> none;
+        result.code = GenerateDispatch(none, language);
+        result.success = true;
+        return result;
+    }
+
+    mi::base::Handle<mi::neuraylib::IScope> scope(context->get_database()->get_global_scope());
+    mi::base::Handle<mi::neuraylib::ITransaction> transaction(scope->create_transaction());
+    mi::base::Handle<mi::neuraylib::IMdl_execution_context> executionContext(
+        context->get_factory()->create_execution_context());
+    mi::base::Handle<mi::neuraylib::IMdl_backend_api> backendApi(
+        context->get_neuray()->get_api_component<mi::neuraylib::IMdl_backend_api>());
+    mi::base::Handle<mi::neuraylib::IMdl_backend> backend(backendApi->get_backend(
+        language == ShadingLanguage::Hlsl ? mi::neuraylib::IMdl_backend_api::MB_HLSL
+                                          : mi::neuraylib::IMdl_backend_api::MB_GLSL));
+    auto fail = [&](std::string message) {
+        result.success = false;
+        result.error = std::move(message);
+        transaction->abort();
+        return result;
+    };
+    if (!backend) return fail("shading-language backend unavailable");
+    backend->set_option("num_texture_spaces", "1");
+    backend->set_option("num_texture_results", std::to_string(kGpuTextureResults).c_str());
+    backend->set_option("enable_auxiliary", "off");
+    backend->set_option("texture_runtime_with_derivs", "on");
+    backend->set_option("enable_ro_segment", "on");
+    backend->set_option("max_const_data", "0");
+    backend->set_option("df_handle_slot_mode", "none");
+    backend->set_option("libbsdf_flags_in_bsdf_data", "off");
+    if (language == ShadingLanguage::Glsl) backend->set_option("glsl_version", "460");
+
+    mi::base::Handle<mi::neuraylib::ILink_unit> linkUnit(
+        backend->create_link_unit(transaction.get(), executionContext.get()));
+    if (!linkUnit) return fail("cannot create link unit: " + MessagesOf(executionContext.get()));
+
+    std::vector<std::array<bool, kEntryPointCount>> present(programs.size());
+    std::vector<std::string> names(programs.size() * kEntryPointCount);
+    for (size_t p = 0; p < programs.size(); ++p) {
+        std::vector<mi::neuraylib::Target_function_description> descs;
+        for (size_t e = 0; e < kEntryPointCount; ++e) {
+            names[p * kEntryPointCount + e] = ProgramFunction(uint32_t(p), EntryIndex(e));
+            descs.emplace_back(kEntryPoints[e].path, names[p * kEntryPointCount + e].c_str());
+        }
+        mi::base::Handle<const mi::neuraylib::ICompiled_material> compiled(
+            transaction->access<mi::neuraylib::ICompiled_material>(
+                programs[p]->compiled_material_name.c_str()));
+        if (!compiled) return fail("compiled class missing for program " + std::to_string(p));
+        if (linkUnit->add_material(compiled.get(), descs.data(),
+                                   descs.size(), executionContext.get()) != 0)
+            return fail(std::format("add_material failed for program {}: {}", p,
+                                    MessagesOf(executionContext.get())));
+        for (size_t e = 0; e < kEntryPointCount; ++e)
+            present[p][e] = descs[e].function_index != ~mi::Size(0);
+    }
+
+    const auto translateStart = std::chrono::steady_clock::now();
+    mi::base::Handle<const mi::neuraylib::ITarget_code> code(
+        backend->translate_link_unit(linkUnit.get(), executionContext.get()));
+    result.translateSeconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - translateStart).count();
+    linkUnit.reset();
+    if (!code) return fail("translate_link_unit failed: " + MessagesOf(executionContext.get()));
+    if (code->get_light_profile_count() > 1 || code->get_bsdf_measurement_count() > 1)
+        return fail("light profiles and measured BSDFs are not supported on GPU devices");
+
+    // Textures of the link unit itself come first, so its indices are used as is.
+    for (mi::Size i = 1; i < code->get_texture_count(); ++i) {
+        MdlTexture texture;
+        const auto shape = code->get_texture_shape(i);
+        if (shape == mi::neuraylib::ITarget_code::Texture_shape_bsdf_data) {
+            mi::Size w = 0, h = 0, d = 0;
+            const char* pixelType = nullptr;
+            const float* data = code->get_texture_df_data(i, w, h, d, pixelType);
+            const size_t components = pixelType && std::strcmp(pixelType, "Float32<3>") == 0 ? 3 : 1;
+            auto values = std::make_shared<std::vector<float>>(
+                data, data + (data ? size_t(w) * h * d * components : 0));
+            texture.kind = MdlTexture::Kind::BsdfData;
+            texture.values = values->data();
+            texture.owner = values;
+            texture.width = w; texture.height = h; texture.depth = d;
+            texture.components = components;
+        } else if (shape == mi::neuraylib::ITarget_code::Texture_shape_2d) {
+            mdl::NativeTextureRuntime::ResourceView view;
+            std::string error;
+            if (!mdl::NativeTextureRuntime::PrepareDatabaseTexture(
+                    code->get_texture(i), transaction.get(), &view, &error))
+                return fail("texture " + std::to_string(i) + ": " + error);
+            texture.kind = MdlTexture::Kind::Image;
+            texture.tiled = view.tiled;
+            texture.tiles = std::move(view.tiles);
+        } else {
+            return fail("unsupported texture shape " + std::to_string(int(shape)));
+        }
+        result.textures.push_back(std::move(texture));
+    }
+
+    // Argument textures, deduplicated by their prepared resources.
+    std::map<std::vector<const void*>, uint32_t> textureIndex;
+    auto addTexture = [&](mdl::NativeTextureRuntime::ResourceView const& view) -> uint32_t {
+        std::vector<const void*> key;
+        if (view.values) key.push_back(view.owner.get());
+        for (auto const& [tile, resource] : view.tiles) key.push_back(resource.get());
+        if (key.empty()) return 0;
+        auto [found, inserted] = textureIndex.emplace(key, uint32_t(result.textures.size()));
+        if (inserted) {
+            MdlTexture texture;
+            if (view.values) {
+                texture.kind = MdlTexture::Kind::BsdfData;
+                texture.owner = view.owner; texture.values = view.values;
+                texture.width = view.width; texture.height = view.height;
+                texture.depth = view.depth; texture.components = view.components;
+            } else {
+                texture.kind = MdlTexture::Kind::Image;
+                texture.tiled = view.tiled;
+                texture.tiles = view.tiles;
+            }
+            result.textures.push_back(std::move(texture));
+        }
+        return found->second;
+    };
+
+    for (size_t i = 0; i < materials.size(); ++i) {
+        auto& record = result.materials[i];
+        if (!record.valid) continue;
+        auto const& target = materials[i]->get_target_code();
+        // Argument blocks start 16-byte aligned so every element keeps its
+        // native alignment relative to the block start.
+        result.argumentBlocks.resize((result.argumentBlocks.size() + 15) & ~size_t(15));
+        record.argBlockOffset = uint32_t(result.argumentBlocks.size());
+        auto const* block = target.argument_data();
+        if (!block || block->get_size() == 0) continue;
+        std::vector<char> bytes(block->get_data(), block->get_data() + block->get_size());
+        mi::base::Handle<mi::neuraylib::ITarget_value_layout const> layout(
+            target.program->target_code->get_argument_block_layout(0));
+        auto const* runtime = target.binding ? target.binding->texture_runtime.get() : nullptr;
+        bool resourcesOk = true;
+        if (layout) {
+            RemapResources(layout.get(), mi::neuraylib::Target_value_layout_state(),
+                bytes.data(), bytes.size(),
+                [&](mi::neuraylib::IValue::Kind kind, uint32_t index) -> uint32_t {
+                    if (index == 0) return 0;
+                    if (kind != mi::neuraylib::IValue::VK_TEXTURE || !runtime ||
+                        index >= runtime->resourceCount()) {
+                        resourcesOk = false;
+                        return 0;
+                    }
+                    const uint32_t mapped = addTexture(runtime->resource(index));
+                    if (!mapped) resourcesOk = false;
+                    return mapped;
+                });
+        }
+        if (!resourcesOk) {
+            record.valid = false;
+            record.error = "argument resource without a prepared texture";
+            continue;
+        }
+        result.argumentBlocks.insert(result.argumentBlocks.end(), bytes.begin(), bytes.end());
+    }
+    // Shaders read the blocks as 32-bit words.
+    result.argumentBlocks.resize(std::max<size_t>(16, (result.argumentBlocks.size() + 15) & ~size_t(15)));
+
+    for (mi::Size i = 0; i < code->get_ro_data_segment_count(); ++i) {
+        if (i > 0) return fail("multiple read-only data segments");
+        const char* data = code->get_ro_data_segment_data(i);
+        result.roData.assign(data, data + code->get_ro_data_segment_size(i));
+    }
+    result.roData.resize(std::max<size_t>(16, (result.roData.size() + 15) & ~size_t(15)));
+
+    result.code = code->get_code();
+    result.code += "\n// ---- Prism material dispatch ----\n";
+    result.code += GenerateDispatch(present, language);
+    transaction->commit();
+    result.success = true;
+    return result;
+}
+
+} // namespace prism::device::gpu

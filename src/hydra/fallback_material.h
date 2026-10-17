@@ -21,6 +21,7 @@ public:
 
     float cutoutOpacity(const RayHit &) override { return _opacity; }
     bool provenOpaque() const override { return _opacity >= 1.0f; }
+    float opacity() const { return _opacity; }
 
     BRDFSample sample(const RayHit hit, unsigned int &seed) override
     {

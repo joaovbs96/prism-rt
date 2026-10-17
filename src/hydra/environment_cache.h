@@ -89,6 +89,11 @@ public:
 
     size_t importanceBytes() const { return local->importanceBytes(); }
     const LocalEnvironment* distributionIdentity() const { return local.get(); }
+    // Read-only views for render devices that mirror the environment.
+    const EnvironmentMap& localMap() const { return local->map; }
+    const std::array<float, 9>& worldToEnvironment() const { return m; }
+    const std::array<float, 9>& environmentToWorld() const { return inv; }
+    float transformDeterminant() const { return det; }
 
     Color3 radiance(const Float3& world) const override {
         return this->local->map.radiance(apply(m, world).normalize());

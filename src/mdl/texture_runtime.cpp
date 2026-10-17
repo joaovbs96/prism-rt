@@ -231,6 +231,44 @@ void NativeTextureRuntime::lookupForTesting(float s,float t,float dsdx,float dtd
         wrapS,wrapT,cropS,cropT,0);
 }
 
+NativeTextureRuntime::ResourceView NativeTextureRuntime::resource(size_t index) const
+{
+    ResourceView view;
+    if (index >= m_textures.size()) return view;
+    auto const& entry = m_textures[index];
+    view.tiled = entry.tiled;
+    view.tiles.assign(entry.tiles.begin(), entry.tiles.end());
+    if (entry.dfData) {
+        view.owner = entry.dfData;
+        view.values = entry.dfData->values.data();
+        view.width = entry.dfData->width;
+        view.height = entry.dfData->height;
+        view.depth = entry.dfData->depth;
+        view.components = entry.dfData->components;
+    }
+    return view;
+}
+
+bool NativeTextureRuntime::PrepareDatabaseTexture(const char* dbName,
+    mi::neuraylib::ITransaction* transaction, ResourceView* result, std::string* error)
+{
+    if (!dbName || !transaction || !result) {
+        if (error) *error = "invalid texture request";
+        return false;
+    }
+    mi::base::Handle<const mi::neuraylib::ITexture> texture(
+        transaction->access<const mi::neuraylib::ITexture>(dbName));
+    mi::base::Handle<const mi::neuraylib::IImage> image(texture
+        ? transaction->access<const mi::neuraylib::IImage>(texture->get_image()) : nullptr);
+    Texture entry;
+    if (!prepareImage(texture.get(), image.get(), prism::TextureService::Acquire(),
+                      entry, error)) return false;
+    *result = {};
+    result->tiled = entry.tiled;
+    result->tiles.assign(entry.tiles.begin(), entry.tiles.end());
+    return true;
+}
+
 std::shared_ptr<NativeTextureRuntime> NativeTextureRuntime::clone() const
 {
     auto copy=std::shared_ptr<NativeTextureRuntime>(new NativeTextureRuntime);

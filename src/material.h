@@ -325,6 +325,11 @@ public:
         return s;
     }
 
+    // IORs at the d (reference), F (blue) and C (red) lines.
+    float iorD() const { return n_d; }
+    float iorF() const { return n_F; }
+    float iorC() const { return n_C; }
+
 private:
     float n_d;  // IOR at d-line (587nm, yellow - reference)
     float n_F;  // IOR at F-line (486nm, blue)

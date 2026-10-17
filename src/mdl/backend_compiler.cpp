@@ -3,6 +3,7 @@
 
 #include <format>
 #include <algorithm>
+#include <atomic>
 #include <condition_variable>
 #include <cstring>
 #include <functional>
@@ -730,6 +731,15 @@ TargetCode BackendCompiler::generate_target_code(const CompiledMaterial& compile
 
     program->resource_prefix = binding->texture_runtime;
     program->resource_interface = requirements.capabilities;
+    {
+        // Store the class for GPU devices. The caller releases its handle and
+        // commits right after target generation, so it is not used again.
+        static std::atomic<uint64_t> storedClasses{0};
+        std::string name = std::format("prism::gpu_class::{}", ++storedClasses);
+        if (compiled.transaction->store(const_cast<mi::neuraylib::ICompiled_material*>(
+                compiled.compiled_material.get()), name.c_str()) == 0)
+            program->compiled_material_name = std::move(name);
+    }
     program->builtin_resources = !binding->texture_runtime;
     program->identity = cacheKey;
     result.success = true;

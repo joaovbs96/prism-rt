@@ -59,6 +59,26 @@ public:
                             float const cropS[2],float const cropT[2],
                             float const cropR[2]) const;
 
+    // Read-only view of one entry of the resource table (index 0 is the
+    // invalid resource), for render devices that upload the same resources.
+    struct ResourceView {
+        bool tiled = false;
+        // UDIM tile (u, v) -> prepared image; a single (0, 0) tile otherwise.
+        std::vector<std::pair<std::pair<int,int>,
+                              std::shared_ptr<const prism::TextureResource>>> tiles;
+        // BSDF data table, when the resource is one; values are retained by owner.
+        std::shared_ptr<const void> owner;
+        const float* values = nullptr;
+        size_t width = 0, height = 0, depth = 0, components = 0;
+    };
+    size_t resourceCount() const { return m_textures.size(); }
+    ResourceView resource(size_t index) const;
+    // Prepares the 2D texture (or UDIM set) stored under a database name, as
+    // the runtime does for the textures of its own target code.
+    static bool PrepareDatabaseTexture(const char* dbName,
+        mi::neuraylib::ITransaction* transaction, ResourceView* result,
+        std::string* error = nullptr);
+
     mi::neuraylib::Texture_handler_base *handler() const {
         return const_cast<mi::neuraylib::Texture_handler_base *>(
             reinterpret_cast<mi::neuraylib::Texture_handler_base const *>(&m_handler));

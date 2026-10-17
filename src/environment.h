@@ -240,6 +240,11 @@ public:
         std::array<float, 9> worldToEnvironment)
         : EnvironmentMap(texture, multiplier), m(worldToEnvironment) { invert(); }
 
+    // Read-only views for render devices that mirror the environment.
+    const std::array<float, 9>& worldToEnvironment() const { return m; }
+    const std::array<float, 9>& environmentToWorld() const { return inv; }
+    float transformDeterminant() const { return det; }
+
     Color3 radiance(const Float3& world) const override {
         return EnvironmentMap::radiance(apply(m, world).normalize());
     }
