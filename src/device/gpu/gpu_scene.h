@@ -6,6 +6,7 @@
 // textures and the environment become records that the kernels evaluate with
 // the same mathematics as the CPU classes.
 
+#include "../hlsl_math.h"
 #include "../../../shaders/shared/prism_gpu_types.h"
 #include "gpu_materials.h"
 
@@ -19,33 +20,31 @@ class MDLMaterial;
 
 namespace prism::device::gpu {
 
-using prism::gpu::float4;
-using prism::gpu::uint4;
 
 struct GpuSceneData {
     // Geometry. Positions are packed float3 (bottom-level vertex input).
     std::vector<float> positions, normals, texcoords, tangents;
     std::vector<uint32_t> indices; // per prototype, relative to its first vertex
-    std::vector<prism::gpu::GpuPrototype> prototypes;
+    std::vector<GpuPrototype> prototypes;
     std::vector<float4> spheres;   // center, radius
-    std::vector<prism::gpu::GpuInstance> instances;
+    std::vector<GpuInstance> instances;
     // Row-major 3x4 object-to-world matrix per instance.
     std::vector<std::array<float, 12>> instanceTransforms;
     std::vector<uint32_t> primitiveMaterials;
 
     // Shading.
-    std::vector<prism::gpu::GpuMaterial> materials;
-    std::vector<prism::gpu::GpuLegacyTexture> legacyTextures;
+    std::vector<GpuMaterial> materials;
+    std::vector<GpuLegacyTexture> legacyTextures;
     std::vector<std::shared_ptr<const prism::TextureResource>> images;
     // MDL materials referenced by materials of kind MDL (info.y indexes this
     // list until ApplyMdlShaderCode replaces it by the dispatch index).
     std::vector<MDLMaterial const*> mdlMaterials;
-    std::vector<prism::gpu::GpuMdlTexture> mdlTextures; // index 0 invalid
+    std::vector<GpuMdlTexture> mdlTextures; // index 0 invalid
     std::vector<uint32_t> mdlTiles;
     std::vector<float> bsdfData;
 
     // Environment.
-    prism::gpu::GpuEnvironment environment{};
+    GpuEnvironment environment{};
     std::vector<float> environmentTexelPdf, environmentAliasProbability;
     std::vector<uint32_t> environmentAlias;
 

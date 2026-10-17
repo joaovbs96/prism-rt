@@ -26,18 +26,18 @@ protected:
     virtual bool PrepareScene(SceneManager& scene, std::string* error) = 0;
     virtual GpuSceneData const& Data() const = 0;
     virtual uint32_t MdlTextureCount() const = 0;
-    // Host-visible storage for PRISM_SLOT_RNG / OUTPUT / ACCUMULATION /
+    // Host-visible storage for kSlotRng / OUTPUT / ACCUMULATION /
     // TILES of at least `bytes`, bound for the next dispatch.
     virtual void* RenderBuffer(int slot, size_t bytes) = 0;
     // Runs the kernel over `threads` threads and waits for completion.
-    virtual bool Dispatch(prism::gpu::GpuFrame const& frame, uint32_t threads, double* gpuSeconds,
+    virtual bool Dispatch(GpuFrame const& frame, uint32_t threads, double* gpuSeconds,
                           std::string* error) = 0;
     virtual const char* LogPrefix() const = 0;
 
     std::mutex m_renderMutex; // one render at a time
 
 private:
-    prism::gpu::GpuFrame BaseFrame(prism::CameraRayParameters const& camera, unsigned width,
+    GpuFrame BaseFrame(prism::CameraRayParameters const& camera, unsigned width,
                                    unsigned height) const;
 };
 

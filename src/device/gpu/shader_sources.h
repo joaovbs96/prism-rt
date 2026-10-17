@@ -7,6 +7,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace prism::device::gpu {
 
@@ -22,10 +23,10 @@ std::span<const EmbeddedShader> EmbeddedShaders();
 // takes precedence over the embedded copy (shader development).
 bool LoadShaderSource(std::string_view path, std::string* source);
 
-// Expands `#include "..."` (each file once) starting at `top` and replaces the
-// line `//@PRISM_MDL_CODE@` by mdlCode. A leading #version line of mdlCode
-// is dropped; the top file supplies its own.
-bool AssembleShader(std::string_view top, std::string const& mdlCode, std::string* source,
-                    std::string* error);
+// Expands `#include "..."` starting at `top` (each file once) and inserts
+// mdlCode at the line `//@PRISM_MDL_CODE@`. Includes resolve next to the
+// including file, then in searchDirectories (e.g. "gpu/metal").
+bool AssembleShader(std::string_view top, std::vector<std::string> const& searchDirectories,
+                    std::string const& mdlCode, std::string* source, std::string* error);
 
 } // namespace prism::device::gpu

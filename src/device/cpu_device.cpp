@@ -3,7 +3,7 @@
 // as before; the default variant runs the shared integrator per sample.
 
 #include "cpu_device.h"
-#include "cpu_integrator.h"
+#include "cpu_backend.h"
 
 #include "../rng.h"
 #include "../scene.h"
@@ -44,6 +44,18 @@ Color3 ShadeSample(Color3 color, SceneManager::PrimaryOutcome outcome,
     return color;
 }
 
+// One sample of the shared path tracer; seed carries the pixel's random state.
+SampleResult TraceSample(SceneManager& scene, CameraParams const& camera, SampleSettings const& settings,
+                         unsigned x, unsigned y, unsigned width, unsigned height, unsigned& seed)
+{
+    CpuPathTracer tracer;
+    tracer.backend.scene = &scene;
+    tracer.backend.rng.state = seed;
+    const SampleResult result = tracer.renderSample(camera, x, y, width, height, settings);
+    seed = tracer.backend.rng.state;
+    return result;
+}
+
 } // namespace
 
 DeviceInfo CpuDevice::Info() const
@@ -62,18 +74,17 @@ std::vector<float> CpuDevice::RenderImage(SceneManager& scene, ImageRequest cons
     const int width = static_cast<int>(request.width);
     const int height = static_cast<int>(request.height);
     std::vector<float> pixels(size_t(width)*height*3);
-    cpu::Integrator integrator(scene);
-    const auto camera = cpu::ToCameraParams(request.camera);
-    cpu::Integrator::SampleSettings settings{request.sampleClamp, 1.0f, false};
+    const CameraParams camera = ToCameraParams(request.camera);
+    const SampleSettings settings = {request.sampleClamp, 1.0f, false};
     tbb::parallel_for(0, height, [&](int y) {
         for (int x = 0; x < width; ++x) {
             unsigned seed = tea<64>(unsigned(y*width) ^ request.seed, unsigned(x));
             Color3 sum(0);
             if (!m_reference) {
                 for (int sample = 0; sample < request.samples; ++sample) {
-                    const auto result = integrator.prism_render_sample(camera, unsigned(x),
-                        unsigned(y), unsigned(width), unsigned(height), settings, seed);
-                    sum += cpu::ToFloat3(result.color);
+                    const auto result = TraceSample(scene, camera, settings, unsigned(x),
+                        unsigned(y), unsigned(width), unsigned(height), seed);
+                    sum += ToFloat3(result.color);
                 }
             }
             for (int sample = 0; m_reference && sample < request.samples; ++sample) {
@@ -107,9 +118,8 @@ void CpuDevice::RenderPass(SceneManager& scene, PassRequest const& request)
     const bool tracePrimary = request.tracePrimary && request.resolvePrimary;
     auto abandoned = [&] { return request.abandoned && request.abandoned(); };
     auto paused = [&] { return request.paused && request.paused(); };
-    cpu::Integrator integrator(scene);
-    const auto camera = cpu::ToCameraParams(request.camera);
-    const cpu::Integrator::SampleSettings settings{request.shading.sampleClamp,
+    const CameraParams camera = ToCameraParams(request.camera);
+    const SampleSettings settings = {request.shading.sampleClamp,
         request.shading.exposureScale, request.shading.transparentEscapes};
 
     tbb::task_arena renderArena(std::max(1, request.concurrency));
@@ -150,10 +160,9 @@ void CpuDevice::RenderPass(SceneManager& scene, PassRequest const& request)
                                             static_cast<float>(x) + 0.5f,
                                             static_cast<float>(y) + 0.5f,
                                             width, height, nullptr);
-                                const auto result = integrator.prism_render_sample(
-                                    camera, x, y, width, height, settings, seed);
+                                const auto result = TraceSample(scene, camera, settings, x, y, width, height, seed);
                                 ++colorWork.value;
-                                request.colors[pixel] = cpu::ToFloat3(result.color);
+                                request.colors[pixel] = ToFloat3(result.color);
                                 request.coverage[pixel] = result.coverage;
                                 continue;
                             }
@@ -199,9 +208,8 @@ bool CpuDevice::RenderPreview(SceneManager& scene, PreviewRequest const& request
     const unsigned previewWidth = request.previewWidth, previewHeight = request.previewHeight;
     std::atomic<bool> cancelled{false};
     auto stopRequested = [&] { return request.stopRequested && request.stopRequested(); };
-    cpu::Integrator integrator(scene);
-    const auto camera = cpu::ToCameraParams(request.camera);
-    const cpu::Integrator::SampleSettings settings{request.shading.sampleClamp,
+    const CameraParams camera = ToCameraParams(request.camera);
+    const SampleSettings settings = {request.shading.sampleClamp,
         request.shading.exposureScale, request.shading.transparentEscapes};
     tbb::parallel_for(
         tbb::blocked_range2d<unsigned int>(
@@ -239,9 +247,8 @@ bool CpuDevice::RenderPreview(SceneManager& scene, PreviewRequest const& request
                 color = ShadeSample(color, outcome, request.shading, &coverage);
                 center = rays.center;
             } else {
-                const auto result = integrator.prism_render_sample(
-                    camera, x, y, width, height, settings, seed);
-                color = cpu::ToFloat3(result.color);
+                const auto result = TraceSample(scene, camera, settings, x, y, width, height, seed);
+                color = ToFloat3(result.color);
                 coverage = result.coverage;
                 center = prism::MakeCameraRayWithLens(request.camera,
                     static_cast<float>(x) + 0.5f, static_cast<float>(y) + 0.5f,

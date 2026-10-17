@@ -1,9 +1,9 @@
 #pragma once
 
 // MDL materials for GPU devices. Every distinct compiled MDL class of a scene
-// is translated into one GLSL or HLSL link unit, together with a generated
+// is translated into one HLSL link unit, together with a generated
 // dispatch function per material entry point. Materials keep the argument
-// blocks of their native (CPU) programs: the shading-language backends lay
+// blocks of their native (CPU) programs: the HLSL backend lays
 // arguments out exactly like the native backend, so only resource indices
 // are rewritten into the link unit's single texture index space.
 
@@ -19,8 +19,6 @@
 class MDLMaterial;
 
 namespace prism::device::gpu {
-
-enum class ShadingLanguage { Glsl, Hlsl };
 
 // One entry of the GPU texture index space used by generated MDL code.
 // Index 0 is the invalid texture.
@@ -64,7 +62,6 @@ struct MdlShaderCode {
 // trades registers for recomputation; results do not depend on it.
 constexpr int kGpuTextureResults = 16;
 
-MdlShaderCode GenerateMdlShaderCode(std::vector<MDLMaterial const*> const& materials,
-                                    ShadingLanguage language);
+MdlShaderCode GenerateMdlShaderCode(std::vector<MDLMaterial const*> const& materials);
 
 } // namespace prism::device::gpu

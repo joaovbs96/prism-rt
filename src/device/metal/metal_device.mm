@@ -1,4 +1,4 @@
-// Metal render device. The kernel is shaders/gpu/hlsl/kernel.hlsl with the
+// Metal render device. The kernel is shaders/gpu/kernel.hlsl with the
 // scene's MDL code, compiled DXC (HLSL -> DXIL) -> Metal shader converter
 // (DXIL -> metallib) and cached by source hash. Resources are bound through
 // Metal shader converter's descriptor heaps; the host mirrors the scene with
@@ -15,6 +15,7 @@
 #include "../gpu/gpu_device.h"
 #include "../gpu/gpu_materials.h"
 #include "../gpu/gpu_scene.h"
+#include "../gpu/hlsl_compiler.h"
 #include "../gpu/hlsl_fp32_rewrite.h"
 #include "../gpu/shader_sources.h"
 #include "../../scene.h"
@@ -40,7 +41,6 @@
 
 namespace prism::device {
 
-using namespace prism::gpu;
 using prism::device::gpu::GpuSceneData;
 
 namespace {
@@ -56,58 +56,6 @@ bool Verbose()
 {
     const char* value = std::getenv("PRISM_GPU_VERBOSE");
     return value && *value && std::string_view(value) != "0";
-}
-
-std::filesystem::path CacheDirectory()
-{
-    std::filesystem::path root;
-    if (const char* dir = std::getenv("PRISM_CACHE_DIR"); dir && *dir) root = dir;
-    else if (const char* home = std::getenv("HOME")) root = std::filesystem::path(home) / "Library/Caches/PrismRT";
-    else root = std::filesystem::temp_directory_path() / "PrismRT";
-    root /= "metal";
-    std::error_code ignored;
-    std::filesystem::create_directories(root, ignored);
-    return root;
-}
-
-std::string Hash(std::string const& text)
-{
-    // FNV-1a over the source, plus its length.
-    uint64_t a = 1469598103934665603ull, b = 0x9e3779b97f4a7c15ull;
-    for (unsigned char c : text) {
-        a = (a ^ c) * 1099511628211ull;
-        b = (b + c) * 0x100000001b3ull ^ (b >> 29);
-    }
-    return std::format("{:016x}{:016x}-{}", a, b, text.size());
-}
-
-std::string DxcExecutable()
-{
-    if (const char* path = std::getenv("PRISM_DXC"); path && *path) return path;
-#ifdef PRISM_DXC_EXECUTABLE
-    return PRISM_DXC_EXECUTABLE;
-#else
-    return "dxc";
-#endif
-}
-
-bool RunDxc(std::filesystem::path const& hlsl, std::filesystem::path const& dxil, std::string* error)
-{
-    // -Od: Metal's own compiler optimizes; DXC's optimizer on these very large
-    // kernels is slow and its output can exceed what Metal compiles.
-    const std::string command = std::format(
-        "\"{}\" -T cs_6_6 -E main -HV 2021 -Od -Qstrip_debug -Qstrip_reflect -Fo \"{}\" \"{}\" 2>&1",
-        DxcExecutable(), dxil.string(), hlsl.string());
-    FILE* pipe = popen(command.c_str(), "r");
-    std::string output;
-    char buffer[4096];
-    while (pipe && fgets(buffer, sizeof(buffer), pipe)) output += buffer;
-    const int status = pipe ? pclose(pipe) : -1;
-    if (status != 0) {
-        if (error) *error = "DXC failed: " + output.substr(0, 4000);
-        return false;
-    }
-    return true;
 }
 
 bool ConvertToMetallib(std::vector<char> const& dxil, std::vector<char>* metallib, std::string* error)
@@ -174,7 +122,7 @@ struct MetalDevice::Impl {
     uint32_t mdlTextureCount = 1;
     id<MTLComputePipelineState> pipeline = nil;
     std::unordered_map<std::string, id<MTLComputePipelineState>> pipelines;
-    id<MTLBuffer> buffers[PRISM_SLOT_COUNT] = {};
+    id<MTLBuffer> buffers[kSlotCount] = {};
     std::vector<id<MTLTexture>> images;
     // Uploaded images by prepared resource, reused across scene rebuilds.
     struct CachedImage {
@@ -230,27 +178,27 @@ static size_t Bytes(std::vector<T> const& v) { return v.size() * sizeof(T); }
 void MetalDevice::Impl::uploadBuffers()
 {
     GpuSceneData const& d = *data;
-    setBuffer(PRISM_SLOT_POSITIONS, buffer(d.positions.data(), Bytes(d.positions)));
-    setBuffer(PRISM_SLOT_NORMALS, buffer(d.normals.data(), Bytes(d.normals)));
-    setBuffer(PRISM_SLOT_TEXCOORDS, buffer(d.texcoords.data(), Bytes(d.texcoords)));
-    setBuffer(PRISM_SLOT_TANGENTS, buffer(d.tangents.data(), Bytes(d.tangents)));
-    setBuffer(PRISM_SLOT_INDICES, buffer(d.indices.data(), Bytes(d.indices)));
-    setBuffer(PRISM_SLOT_PROTOTYPES, buffer(d.prototypes.data(), Bytes(d.prototypes)));
-    setBuffer(PRISM_SLOT_INSTANCES, buffer(d.instances.data(), Bytes(d.instances)));
-    setBuffer(PRISM_SLOT_PRIMITIVE_MATERIALS, buffer(d.primitiveMaterials.data(), Bytes(d.primitiveMaterials)));
-    setBuffer(PRISM_SLOT_MATERIALS, buffer(d.materials.data(), Bytes(d.materials)));
-    setBuffer(PRISM_SLOT_LEGACY_TEXTURES, buffer(d.legacyTextures.data(), Bytes(d.legacyTextures)));
-    setBuffer(PRISM_SLOT_SPHERES, buffer(d.spheres.data(), Bytes(d.spheres)));
-    setBuffer(PRISM_SLOT_ENVIRONMENT, buffer(&d.environment, sizeof(d.environment)));
-    setBuffer(PRISM_SLOT_ENV_TEXEL_PDF, buffer(d.environmentTexelPdf.data(), Bytes(d.environmentTexelPdf)));
-    setBuffer(PRISM_SLOT_ENV_ALIAS_PROBABILITY,
+    setBuffer(kSlotPositions, buffer(d.positions.data(), Bytes(d.positions)));
+    setBuffer(kSlotNormals, buffer(d.normals.data(), Bytes(d.normals)));
+    setBuffer(kSlotTexcoords, buffer(d.texcoords.data(), Bytes(d.texcoords)));
+    setBuffer(kSlotTangents, buffer(d.tangents.data(), Bytes(d.tangents)));
+    setBuffer(kSlotIndices, buffer(d.indices.data(), Bytes(d.indices)));
+    setBuffer(kSlotPrototypes, buffer(d.prototypes.data(), Bytes(d.prototypes)));
+    setBuffer(kSlotInstances, buffer(d.instances.data(), Bytes(d.instances)));
+    setBuffer(kSlotPrimitiveMaterials, buffer(d.primitiveMaterials.data(), Bytes(d.primitiveMaterials)));
+    setBuffer(kSlotMaterials, buffer(d.materials.data(), Bytes(d.materials)));
+    setBuffer(kSlotLegacyTextures, buffer(d.legacyTextures.data(), Bytes(d.legacyTextures)));
+    setBuffer(kSlotSpheres, buffer(d.spheres.data(), Bytes(d.spheres)));
+    setBuffer(kSlotEnvironment, buffer(&d.environment, sizeof(d.environment)));
+    setBuffer(kSlotEnvTexelPdf, buffer(d.environmentTexelPdf.data(), Bytes(d.environmentTexelPdf)));
+    setBuffer(kSlotEnvAliasProbability,
               buffer(d.environmentAliasProbability.data(), Bytes(d.environmentAliasProbability)));
-    setBuffer(PRISM_SLOT_ENV_ALIAS, buffer(d.environmentAlias.data(), Bytes(d.environmentAlias)));
-    setBuffer(PRISM_SLOT_MDL_TEXTURES, buffer(d.mdlTextures.data(), Bytes(d.mdlTextures)));
-    setBuffer(PRISM_SLOT_MDL_TILES, buffer(d.mdlTiles.data(), Bytes(d.mdlTiles)));
-    setBuffer(PRISM_SLOT_BSDF_DATA, buffer(d.bsdfData.data(), Bytes(d.bsdfData)));
-    if (!buffers[PRISM_SLOT_FRAME]) setBuffer(PRISM_SLOT_FRAME, buffer(nullptr, sizeof(GpuFrame)));
-    for (int slot : {PRISM_SLOT_TILES, PRISM_SLOT_RNG, PRISM_SLOT_OUTPUT, PRISM_SLOT_ACCUMULATION})
+    setBuffer(kSlotEnvAlias, buffer(d.environmentAlias.data(), Bytes(d.environmentAlias)));
+    setBuffer(kSlotMdlTextures, buffer(d.mdlTextures.data(), Bytes(d.mdlTextures)));
+    setBuffer(kSlotMdlTiles, buffer(d.mdlTiles.data(), Bytes(d.mdlTiles)));
+    setBuffer(kSlotBsdfData, buffer(d.bsdfData.data(), Bytes(d.bsdfData)));
+    if (!buffers[kSlotFrame]) setBuffer(kSlotFrame, buffer(nullptr, sizeof(GpuFrame)));
+    for (int slot : {kSlotTiles, kSlotRng, kSlotOutput, kSlotAccumulation})
         if (!buffers[slot]) setBuffer(slot, buffer(nullptr, 16));
 }
 
@@ -316,7 +264,7 @@ void MetalDevice::Impl::uploadImages()
     images.assign(d.images.size(), nil);
     std::vector<GpuImage> info(d.images.size());
     std::vector<bool> floatPrecision(d.images.size(), false);
-    if (d.environment.info.y != PRISM_IMAGE_NONE && d.environment.info.y < d.images.size())
+    if (d.environment.info.y != kImageNone && d.environment.info.y < d.images.size())
         floatPrecision[d.environment.info.y] = true;
     std::vector<size_t> missing;
     for (size_t i = 0; i < d.images.size(); ++i) {
@@ -351,7 +299,7 @@ void MetalDevice::Impl::uploadImages()
         it = it->second.resource.expired() ? imageCache.erase(it) : std::next(it);
     for (size_t i : missing)
         imageCache[d.images[i].get()] = {d.images[i], images[i], floatPrecision[i]};
-    setBuffer(PRISM_SLOT_IMAGES, buffer(info.data(), Bytes(info)));
+    setBuffer(kSlotImages, buffer(info.data(), Bytes(info)));
     if (Verbose()) {
         size_t bytes = 0;
         for (id<MTLTexture> t : images) bytes += t.allocatedSize;
@@ -387,7 +335,7 @@ bool MetalDevice::Impl::buildAccelerationStructures(std::string* error)
         GpuPrototype const& proto = d.prototypes[p];
         if (proto.info.w == 0) continue;
         MTLAccelerationStructureGeometryDescriptor* geometry = nil;
-        if (proto.info.x == PRISM_PROTO_SPHERES) {
+        if (proto.info.x == kProtoSpheres) {
             std::vector<MTLAxisAlignedBoundingBox> bounds(proto.info.w);
             for (uint32_t s = 0; s < proto.info.w; ++s) {
                 float4 const& sphere = d.spheres[proto.info.z + s];
@@ -405,14 +353,14 @@ bool MetalDevice::Impl::buildAccelerationStructures(std::string* error)
             geometry = box;
         } else {
             auto* triangles = [MTLAccelerationStructureTriangleGeometryDescriptor descriptor];
-            triangles.vertexBuffer = buffers[PRISM_SLOT_POSITIONS];
+            triangles.vertexBuffer = buffers[kSlotPositions];
             triangles.vertexBufferOffset = NSUInteger(proto.info.y) * 12;
             triangles.vertexStride = 12;
             triangles.vertexFormat = MTLAttributeFormatFloat3;
-            triangles.indexBuffer = buffers[PRISM_SLOT_INDICES];
+            triangles.indexBuffer = buffers[kSlotIndices];
             triangles.indexBufferOffset = NSUInteger(proto.info.z) * 12;
             triangles.indexType = MTLIndexTypeUInt32;
-            triangles.triangleCount = proto.info.x == PRISM_PROTO_QUADS ? 2 * proto.info.w : proto.info.w;
+            triangles.triangleCount = proto.info.x == kProtoQuads ? 2 * proto.info.w : proto.info.w;
             triangles.opaque = YES;
             geometry = triangles;
         }
@@ -484,21 +432,21 @@ bool MetalDevice::Impl::buildAccelerationStructures(std::string* error)
 
 void MetalDevice::Impl::writeHeap()
 {
-    const size_t entries = PRISM_SLOT_IMAGE_BASE + std::max<size_t>(1, images.size());
+    const size_t entries = kSlotImageBase + std::max<size_t>(1, images.size());
     if (!resourceHeap || resourceHeap.length < entries * sizeof(IRDescriptorTableEntry))
         resourceHeap = buffer(nullptr, entries * sizeof(IRDescriptorTableEntry));
     auto* heap = static_cast<IRDescriptorTableEntry*>(resourceHeap.contents);
     std::memset(heap, 0, entries * sizeof(IRDescriptorTableEntry));
-    for (int slot = 0; slot < PRISM_SLOT_COUNT; ++slot) {
-        if (slot == PRISM_SLOT_ACCEL || !buffers[slot]) continue;
+    for (int slot = 0; slot < kSlotCount; ++slot) {
+        if (slot == kSlotAccel || !buffers[slot]) continue;
         IRDescriptorTableSetBuffer(&heap[slot], buffers[slot].gpuAddress, buffers[slot].length);
     }
-    if (accelerationHeader) IRDescriptorTableSetAccelerationStructure(&heap[PRISM_SLOT_ACCEL], accelerationHeader.gpuAddress);
+    if (accelerationHeader) IRDescriptorTableSetAccelerationStructure(&heap[kSlotAccel], accelerationHeader.gpuAddress);
     for (size_t i = 0; i < images.size(); ++i)
-        IRDescriptorTableSetTexture(&heap[PRISM_SLOT_IMAGE_BASE + i], images[i], 0.0f, 0);
+        IRDescriptorTableSetTexture(&heap[kSlotImageBase + i], images[i], 0.0f, 0);
 
     readResources = [NSMutableArray array];
-    for (int slot = 0; slot < PRISM_SLOT_COUNT; ++slot)
+    for (int slot = 0; slot < kSlotCount; ++slot)
         if (buffers[slot]) [readResources addObject:buffers[slot]];
     for (id<MTLTexture> t : images) [readResources addObject:t];
     for (id<MTLAccelerationStructure> s : primitiveStructures) [readResources addObject:s];
@@ -509,7 +457,7 @@ void MetalDevice::Impl::writeHeap()
 bool MetalDevice::Impl::buildPipeline(std::string* error)
 {
     auto const start = Clock::now();
-    gpu::MdlShaderCode code = gpu::GenerateMdlShaderCode(data->mdlMaterials, gpu::ShadingLanguage::Hlsl);
+    gpu::MdlShaderCode code = gpu::GenerateMdlShaderCode(data->mdlMaterials);
     if (!code.success)
         std::cerr << "PrismRT Metal: MDL materials unavailable on the GPU (" << code.error << ")\n";
     for (size_t i = 0; i < code.materials.size(); ++i)
@@ -517,42 +465,31 @@ bool MetalDevice::Impl::buildPipeline(std::string* error)
             std::cerr << "PrismRT Metal: MDL material rendered as invalid: " << code.materials[i].error << '\n';
     gpu::ApplyMdlShaderCode(*data, code);
     mdlTextureCount = uint32_t(data->mdlTextures.size());
-    setBuffer(PRISM_SLOT_ARGUMENT_BLOCKS, buffer(code.argumentBlocks.data(), code.argumentBlocks.size()));
-    setBuffer(PRISM_SLOT_RO_DATA, buffer(code.roData.data(), code.roData.size()));
+    setBuffer(kSlotArgumentBlocks, buffer(code.argumentBlocks.data(), code.argumentBlocks.size()));
+    setBuffer(kSlotRoData, buffer(code.roData.data(), code.roData.size()));
 
     std::string mdlCode;
     if (!gpu::RewriteHlslToFp32(code.code, &mdlCode, error)) return false;
     std::string source;
-    if (!gpu::AssembleShader("gpu/hlsl/kernel.hlsl", mdlCode, &source, error)) return false;
-    const std::string key = Hash(source);
+    if (!gpu::AssembleShader("gpu/kernel.hlsl", {"gpu/metal"}, mdlCode, &source, error)) return false;
+    const std::string key = gpu::SourceDigest(source);
     if (auto found = pipelines.find(key); found != pipelines.end()) {
         pipeline = found->second;
         return true;
     }
-    const auto cached = CacheDirectory() / (key + ".metallib");
+    const auto cacheDirectory = gpu::ShaderCacheDirectory("metal");
+    const auto cached = cacheDirectory / (key + ".metallib");
     std::vector<char> metallib;
     if (!ReadFile(cached, &metallib)) {
         std::cerr << "PrismRT Metal: compiling the GPU kernel (" << code.programCount
                   << " MDL programs); this happens once per material set\n";
-        const auto hlsl = CacheDirectory() / (key + ".hlsl");
-        const auto dxil = CacheDirectory() / (key + ".dxil");
-        WriteFileAtomically(hlsl, source.data(), source.size());
         auto const dxcStart = Clock::now();
-        const bool compiled = RunDxc(hlsl, dxil, error);
+        std::vector<char> dxil;
+        if (!gpu::CompileHlsl(source, gpu::HlslTarget::Dxil, cacheDirectory, &dxil, error)) return false;
         const double dxcSeconds = SecondsSince(dxcStart);
-        std::vector<char> bytes;
-        if (!compiled || !ReadFile(dxil, &bytes)) {
-            if (error && error->empty()) *error = "DXC produced no output";
-            return false;
-        }
         auto const convertStart = Clock::now();
-        if (!ConvertToMetallib(bytes, &metallib, error)) return false;
+        if (!ConvertToMetallib(dxil, &metallib, error)) return false;
         WriteFileAtomically(cached, metallib.data(), metallib.size());
-        std::error_code ignored;
-        if (!Verbose()) {
-            std::filesystem::remove(hlsl, ignored);
-        }
-        std::filesystem::remove(dxil, ignored);
         std::cerr << std::format("PrismRT Metal: DXC {:.1f} s, shader converter {:.1f} s\n", dxcSeconds,
                                  SecondsSince(convertStart));
     }
@@ -603,7 +540,7 @@ bool MetalDevice::Impl::ensureScene(SceneManager& scene, std::string* error)
 bool MetalDevice::Impl::dispatch(GpuFrame const& frame, uint32_t threads, double* gpuSeconds, std::string* error)
 {
     if (threads == 0) return true;
-    std::memcpy(buffers[PRISM_SLOT_FRAME].contents, &frame, sizeof(frame));
+    std::memcpy(buffers[kSlotFrame].contents, &frame, sizeof(frame));
     @autoreleasepool {
         id<MTLCommandBuffer> commands = [queue commandBuffer];
         id<MTLComputeCommandEncoder> encoder = [commands computeCommandEncoder];
@@ -644,7 +581,7 @@ std::unique_ptr<MetalDevice> MetalDevice::Create(std::string* reason)
         return nullptr;
     }
     std::string source;
-    if (!gpu::LoadShaderSource("gpu/hlsl/kernel.hlsl", &source)) {
+    if (!gpu::LoadShaderSource("gpu/kernel.hlsl", &source)) {
         if (reason) *reason = "the Metal kernel sources are missing";
         return nullptr;
     }
@@ -654,7 +591,7 @@ std::unique_ptr<MetalDevice> MetalDevice::Create(std::string* reason)
     // Samplers: index = wrapS * 3 + wrapT, wraps clamp / repeat / mirror.
     const MTLSamplerAddressMode modes[3] = {MTLSamplerAddressModeClampToEdge, MTLSamplerAddressModeRepeat,
                                             MTLSamplerAddressModeMirrorRepeat};
-    impl->samplerHeap = impl->buffer(nullptr, PRISM_SAMPLER_COUNT * sizeof(IRDescriptorTableEntry));
+    impl->samplerHeap = impl->buffer(nullptr, kSamplerCount * sizeof(IRDescriptorTableEntry));
     auto* samplerTable = static_cast<IRDescriptorTableEntry*>(impl->samplerHeap.contents);
     for (int s = 0; s < 3; ++s) for (int t = 0; t < 3; ++t) {
         MTLSamplerDescriptor* descriptor = [MTLSamplerDescriptor new];
@@ -680,7 +617,9 @@ DeviceInfo MetalDevice::Info() const
     DeviceInfo info;
     info.kind = DeviceKind::Metal;
     info.name = std::string(m_impl->device.name.UTF8String) + " (Metal)";
-    info.hardwareRayTracing = true;
+    // Apple9 GPUs (M3, A17 and newer) have ray-tracing hardware; earlier
+    // ones run the same Metal ray-tracing API in software.
+    info.hardwareRayTracing = [m_impl->device supportsFamily:MTLGPUFamilyApple9];
     return info;
 }
 

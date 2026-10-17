@@ -145,11 +145,10 @@ std::string ProgramFunction(uint32_t program, EntryIndex entry)
 }
 
 // The prism_mdl_* dispatch functions. Types are spelled the same in both
-// languages through the shader prelude (float3 maps to vec3 in GLSL).
 std::string GenerateDispatch(std::vector<std::array<bool, kEntryPointCount>> const& present,
-                             std::vector<ProgramTraits> const& traits, ShadingLanguage language)
+                             std::vector<ProgramTraits> const& traits)
 {
-    const char* state = language == ShadingLanguage::Hlsl ? "Shading_state_material" : "State";
+    const char* state = "Shading_state_material";
     const char* inoutState = "inout";
     std::string s;
     auto cases = [&](EntryIndex entry, const char* call, const char* fallback) {
@@ -265,23 +264,22 @@ std::string Digest(std::string const& text)
 
 // Digests persist across runs, keyed by the program's class identity (the
 // context address prefix is per process).
-std::filesystem::path StructuralKeyFile(std::string const& identity, ShadingLanguage language)
+std::filesystem::path StructuralKeyFile(std::string const& identity)
 {
     const size_t colon = identity.find(':');
     const std::string stable = colon == std::string::npos ? identity : identity.substr(colon + 1);
     return prism::PersistentCacheRoot() / "gpu-structure" /
-        (Digest(stable + (language == ShadingLanguage::Hlsl ? "|hlsl" : "|glsl") +
+        (Digest(stable + "|hlsl" +
                 "|mdl-" MI_NEURAYLIB_PRODUCT_VERSION_STRING "|v1") + ".key");
 }
 
 std::mutex gStructuralKeysMutex;
-// (program identity, language) -> structural key. Programs are immutable.
+// Program identity -> structural key. Programs are immutable.
 auto& gStructuralKeys = *new std::map<std::pair<std::string, int>, std::string>();
 
 } // namespace
 
-MdlShaderCode GenerateMdlShaderCode(std::vector<MDLMaterial const*> const& materials,
-                                    ShadingLanguage language)
+MdlShaderCode GenerateMdlShaderCode(std::vector<MDLMaterial const*> const& materials)
 {
     MdlShaderCode result;
     result.materials.resize(materials.size());
@@ -319,7 +317,7 @@ MdlShaderCode GenerateMdlShaderCode(std::vector<MDLMaterial const*> const& mater
     }
     result.programCount = uint32_t(programs.size());
     if (programs.empty()) {
-        result.code = GenerateDispatch({}, {}, language);
+        result.code = GenerateDispatch({}, {});
         result.success = true;
         return result;
     }
@@ -331,17 +329,16 @@ MdlShaderCode GenerateMdlShaderCode(std::vector<MDLMaterial const*> const& mater
     mi::base::Handle<mi::neuraylib::IMdl_backend_api> backendApi(
         context->get_neuray()->get_api_component<mi::neuraylib::IMdl_backend_api>());
     mi::base::Handle<mi::neuraylib::IMdl_backend> backend(backendApi->get_backend(
-        language == ShadingLanguage::Hlsl ? mi::neuraylib::IMdl_backend_api::MB_HLSL
-                                          : mi::neuraylib::IMdl_backend_api::MB_GLSL));
+        mi::neuraylib::IMdl_backend_api::MB_HLSL));
     auto fail = [&](std::string message) {
         result.success = false;
         result.error = std::move(message);
         // Shaders still need the dispatch functions; every material is invalid.
-        result.code = GenerateDispatch({}, {}, language);
+        result.code = GenerateDispatch({}, {});
         transaction->abort();
         return result;
     };
-    if (!backend) return fail("shading-language backend unavailable");
+    if (!backend) return fail("HLSL backend unavailable");
     backend->set_option("num_texture_spaces", "1");
     backend->set_option("num_texture_results", std::to_string(kGpuTextureResults).c_str());
     backend->set_option("enable_auxiliary", "off");
@@ -350,11 +347,6 @@ MdlShaderCode GenerateMdlShaderCode(std::vector<MDLMaterial const*> const& mater
     backend->set_option("max_const_data", "0");
     backend->set_option("df_handle_slot_mode", "none");
     backend->set_option("libbsdf_flags_in_bsdf_data", "off");
-    if (language == ShadingLanguage::Glsl) {
-        backend->set_option("glsl_version", "460");
-        // Prism's complete API types, independent of what a material uses.
-        backend->set_option("glsl_include_for_api_types", "gpu/glsl/mdl_types.glsl");
-    }
 
     // Merge structurally identical programs.
     {
@@ -363,14 +355,14 @@ MdlShaderCode GenerateMdlShaderCode(std::vector<MDLMaterial const*> const& mater
         std::vector<mdl::CompiledProgram const*> unique;
         for (size_t p = 0; p < programs.size(); ++p) {
             const auto cacheKey = std::make_pair(programs[p]->identity + "|" +
-                programs[p]->compiled_material_name, int(language));
+                programs[p]->compiled_material_name, 0);
             std::string key;
             {
                 std::lock_guard lock(gStructuralKeysMutex);
                 if (auto found = gStructuralKeys.find(cacheKey); found != gStructuralKeys.end())
                     key = found->second;
             }
-            const auto keyFile = StructuralKeyFile(programs[p]->identity, language);
+            const auto keyFile = StructuralKeyFile(programs[p]->identity);
             const bool persistent = programs[p]->identity.find(':') != std::string::npos;
             if (key.empty() && persistent) {
                 std::ifstream file(keyFile);
@@ -388,8 +380,7 @@ MdlShaderCode GenerateMdlShaderCode(std::vector<MDLMaterial const*> const& mater
                     key = StructuralKey(backend.get(), transaction.get(), executionContext.get(),
                                         compiled.get(), TraitsOf(compiled.get()));
                 if (const char* dir = std::getenv("PRISM_GPU_DUMP_PROGRAMS"); dir && *dir)
-                    std::ofstream(std::filesystem::path(dir) / std::format("program{}.{}", p,
-                        language == ShadingLanguage::Hlsl ? "hlsl" : "glsl")) << key;
+                    std::ofstream(std::filesystem::path(dir) / std::format("program{}.hlsl", p)) << key;
                 if (key.empty()) key = "unique:" + programs[p]->compiled_material_name;
                 else {
                     key = Digest(key);
@@ -557,7 +548,7 @@ MdlShaderCode GenerateMdlShaderCode(std::vector<MDLMaterial const*> const& mater
 
     result.code = code->get_code();
     result.code += "\n// ---- Prism material dispatch ----\n";
-    result.code += GenerateDispatch(present, traits, language);
+    result.code += GenerateDispatch(present, traits);
     transaction->commit();
     result.success = true;
     return result;

@@ -1,0 +1,64 @@
+// Vulkan device resources: descriptor set 0, one binding per slot (see
+// kSlot* in shaders/shared/prism_gpu_types.h).
+
+#pragma once
+
+[[vk::binding(kSlotFrame, 0)]] StructuredBuffer<GpuFrame> g_frame;
+[[vk::binding(kSlotPositions, 0)]] StructuredBuffer<float> g_positions;
+[[vk::binding(kSlotNormals, 0)]] StructuredBuffer<float> g_normals;
+[[vk::binding(kSlotTexcoords, 0)]] StructuredBuffer<float> g_texcoords;
+[[vk::binding(kSlotTangents, 0)]] StructuredBuffer<float> g_tangents;
+[[vk::binding(kSlotIndices, 0)]] StructuredBuffer<uint> g_indices;
+[[vk::binding(kSlotPrototypes, 0)]] StructuredBuffer<GpuPrototype> g_prototypes;
+[[vk::binding(kSlotInstances, 0)]] StructuredBuffer<GpuInstance> g_instances;
+[[vk::binding(kSlotPrimitiveMaterials, 0)]] StructuredBuffer<uint> g_primitiveMaterials;
+[[vk::binding(kSlotMaterials, 0)]] StructuredBuffer<GpuMaterial> g_materials;
+[[vk::binding(kSlotLegacyTextures, 0)]] StructuredBuffer<GpuLegacyTexture> g_legacyTextures;
+[[vk::binding(kSlotSpheres, 0)]] StructuredBuffer<float4> g_spheres;
+[[vk::binding(kSlotEnvironment, 0)]] StructuredBuffer<GpuEnvironment> g_environment;
+[[vk::binding(kSlotEnvTexelPdf, 0)]] StructuredBuffer<float> g_envTexelPdf;
+[[vk::binding(kSlotEnvAliasProbability, 0)]] StructuredBuffer<float> g_envAliasProbability;
+[[vk::binding(kSlotEnvAlias, 0)]] StructuredBuffer<uint> g_envAlias;
+[[vk::binding(kSlotArgumentBlocks, 0)]] StructuredBuffer<uint> g_argumentBlocks;
+[[vk::binding(kSlotRoData, 0)]] StructuredBuffer<uint> g_roData;
+[[vk::binding(kSlotMdlTextures, 0)]] StructuredBuffer<GpuMdlTexture> g_mdlTextures;
+[[vk::binding(kSlotMdlTiles, 0)]] StructuredBuffer<uint> g_mdlTiles;
+[[vk::binding(kSlotBsdfData, 0)]] StructuredBuffer<float> g_bsdfData;
+[[vk::binding(kSlotImages, 0)]] StructuredBuffer<GpuImage> g_images;
+[[vk::binding(kSlotTiles, 0)]] StructuredBuffer<GpuTile> g_tiles;
+[[vk::binding(kSlotRng, 0)]] RWStructuredBuffer<uint> g_rng;
+[[vk::binding(kSlotOutput, 0)]] RWStructuredBuffer<float4> g_output;
+[[vk::binding(kSlotAccumulation, 0)]] RWStructuredBuffer<float4> g_accumulation;
+[[vk::binding(kSlotAccel, 0)]] RaytracingAccelerationStructure g_scene;
+[[vk::binding(kSlotImageBase, 0)]] Texture2D<float4> g_textures[];
+[[vk::binding(kSlotImageBase + 1, 0)]] SamplerState g_samplers[kSamplerCount];
+
+StructuredBuffer<GpuFrame> frameBuffer() { return g_frame; }
+StructuredBuffer<float> positionsBuffer() { return g_positions; }
+StructuredBuffer<float> normalsBuffer() { return g_normals; }
+StructuredBuffer<float> texcoordsBuffer() { return g_texcoords; }
+StructuredBuffer<float> tangentsBuffer() { return g_tangents; }
+StructuredBuffer<uint> indicesBuffer() { return g_indices; }
+StructuredBuffer<GpuPrototype> prototypesBuffer() { return g_prototypes; }
+StructuredBuffer<GpuInstance> instancesBuffer() { return g_instances; }
+StructuredBuffer<uint> primitiveMaterialsBuffer() { return g_primitiveMaterials; }
+StructuredBuffer<GpuMaterial> materialsBuffer() { return g_materials; }
+StructuredBuffer<GpuLegacyTexture> legacyTexturesBuffer() { return g_legacyTextures; }
+StructuredBuffer<float4> spheresBuffer() { return g_spheres; }
+StructuredBuffer<GpuEnvironment> environmentBuffer() { return g_environment; }
+StructuredBuffer<float> envTexelPdfBuffer() { return g_envTexelPdf; }
+StructuredBuffer<float> envAliasProbabilityBuffer() { return g_envAliasProbability; }
+StructuredBuffer<uint> envAliasBuffer() { return g_envAlias; }
+StructuredBuffer<uint> argumentBlocksBuffer() { return g_argumentBlocks; }
+StructuredBuffer<uint> roDataBuffer() { return g_roData; }
+StructuredBuffer<GpuMdlTexture> mdlTexturesBuffer() { return g_mdlTextures; }
+StructuredBuffer<uint> mdlTilesBuffer() { return g_mdlTiles; }
+StructuredBuffer<float> bsdfDataBuffer() { return g_bsdfData; }
+StructuredBuffer<GpuImage> imagesBuffer() { return g_images; }
+StructuredBuffer<GpuTile> tilesBuffer() { return g_tiles; }
+RWStructuredBuffer<uint> rngBuffer() { return g_rng; }
+RWStructuredBuffer<float4> outputBuffer() { return g_output; }
+RWStructuredBuffer<float4> accumulationBuffer() { return g_accumulation; }
+RaytracingAccelerationStructure sceneStructure() { return g_scene; }
+Texture2D<float4> imageTexture(uint image) { return g_textures[NonUniformResourceIndex(image)]; }
+SamplerState imageSampler(uint index) { return g_samplers[NonUniformResourceIndex(index)]; }

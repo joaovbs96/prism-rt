@@ -177,7 +177,13 @@ add_custom_command(
 add_library(prism_core STATIC ${PRISM_CORE_SOURCES} "${PRISM_EMBEDDED_SHADERS}")
 add_library(PrismRT::core ALIAS prism_core)
 
-# Metal device: HLSL kernels compiled with DXC and Metal shader converter.
+# GPU devices compile their HLSL kernel with DXC at run time.
+find_program(PRISM_DXC_EXECUTABLE dxc HINTS "$ENV{VULKAN_SDK}/bin" DOC "DXC compiler for the GPU devices")
+if(PRISM_DXC_EXECUTABLE)
+    target_compile_definitions(prism_core PRIVATE PRISM_DXC_EXECUTABLE="${PRISM_DXC_EXECUTABLE}")
+endif()
+
+# Metal device: DXIL from DXC, converted by Metal shader converter.
 if(APPLE)
     set(_prism_metal_default ON)
 else()
@@ -186,7 +192,6 @@ endif()
 option(PRISM_ENABLE_METAL "Build the Metal render device (macOS)" ${_prism_metal_default})
 if(PRISM_ENABLE_METAL)
     set(PRISM_METAL_SHADER_CONVERTER_DIR "/usr/local" CACHE PATH "Metal shader converter root (include, lib)")
-    find_program(PRISM_DXC_EXECUTABLE dxc HINTS "$ENV{VULKAN_SDK}/bin" DOC "DXC compiler for the Metal device")
     find_library(PRISM_METAL_IRCONVERTER_LIBRARY metalirconverter
         PATHS "${PRISM_METAL_SHADER_CONVERTER_DIR}/lib" NO_DEFAULT_PATH)
     if(NOT PRISM_METAL_IRCONVERTER_LIBRARY OR NOT PRISM_DXC_EXECUTABLE)
@@ -198,8 +203,7 @@ if(PRISM_ENABLE_METAL)
         LANGUAGE CXX COMPILE_FLAGS "-x objective-c++ -fobjc-arc")
     target_sources(prism_core PRIVATE ${_prism_metal_sources})
     target_include_directories(prism_core PRIVATE "${PRISM_METAL_SHADER_CONVERTER_DIR}/include")
-    target_compile_definitions(prism_core PRIVATE
-        PRISM_HAS_METAL=1 PRISM_DXC_EXECUTABLE="${PRISM_DXC_EXECUTABLE}")
+    target_compile_definitions(prism_core PRIVATE PRISM_HAS_METAL=1)
     target_link_libraries(prism_core PUBLIC ${PRISM_METAL_IRCONVERTER_LIBRARY}
         "-framework Metal" "-framework Foundation")
     get_filename_component(_prism_msc_lib_dir "${PRISM_METAL_IRCONVERTER_LIBRARY}" DIRECTORY)
@@ -207,21 +211,24 @@ if(PRISM_ENABLE_METAL)
     list(APPEND CMAKE_INSTALL_RPATH "${_prism_msc_lib_dir}")
 endif()
 
-# Vulkan device: GLSL kernels compiled to SPIR-V with shaderc, ray queries.
+# Vulkan device: SPIR-V from DXC, ray queries.
 # On macOS no driver exposes ray queries; the device then builds (as a
 # compile check) and reports itself unavailable.
-find_package(Vulkan QUIET COMPONENTS shaderc_combined)
-if(Vulkan_FOUND AND TARGET Vulkan::shaderc_combined)
+find_package(Vulkan QUIET)
+if(Vulkan_FOUND AND PRISM_DXC_EXECUTABLE)
     set(_prism_vulkan_default ON)
 else()
     set(_prism_vulkan_default OFF)
 endif()
 option(PRISM_ENABLE_VULKAN "Build the Vulkan render device" ${_prism_vulkan_default})
 if(PRISM_ENABLE_VULKAN)
-    find_package(Vulkan REQUIRED COMPONENTS shaderc_combined)
+    find_package(Vulkan REQUIRED)
+    if(NOT PRISM_DXC_EXECUTABLE)
+        message(FATAL_ERROR "The Vulkan device needs DXC (PRISM_DXC_EXECUTABLE); or set PRISM_ENABLE_VULKAN=OFF.")
+    endif()
     target_sources(prism_core PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/device/vulkan/vulkan_device.cpp")
     target_compile_definitions(prism_core PRIVATE PRISM_HAS_VULKAN=1)
-    target_link_libraries(prism_core PUBLIC Vulkan::Vulkan Vulkan::shaderc_combined)
+    target_link_libraries(prism_core PUBLIC Vulkan::Vulkan)
 endif()
 target_include_directories(prism_core PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/external/tinygltf"

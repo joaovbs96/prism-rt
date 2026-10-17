@@ -1,17 +1,17 @@
-// Vulkan render device. The kernel is shaders/gpu/glsl/kernel.comp with the
-// scene's MDL code, compiled to SPIR-V with shaderc and cached by source
-// hash. Every resource slot is a binding of one descriptor set; the scene is
+// Vulkan render device. The kernel is shaders/gpu/kernel.hlsl with the
+// scene's MDL code, compiled to SPIR-V with DXC and cached by source hash
+// (the same source the Metal device compiles to DXIL). Every resource slot is a binding of one descriptor set; the scene is
 // mirrored with one bottom-level acceleration structure per prototype and
 // one top-level structure. The structure follows the Metal device.
 
 #include "vulkan_device.h"
 
 #include "../gpu/gpu_materials.h"
+#include "../gpu/hlsl_compiler.h"
 #include "../gpu/shader_sources.h"
 #include "../../scene.h"
 #include "../../texture_service.h"
 
-#include <shaderc/shaderc.h>
 #include <tbb/parallel_for.h>
 #include <vulkan/vulkan.h>
 
@@ -27,7 +27,6 @@
 
 namespace prism::device {
 
-using namespace prism::gpu;
 using prism::device::gpu::GpuSceneData;
 
 namespace {
@@ -38,29 +37,6 @@ constexpr uint32_t kMaxImages = 4096;
 double SecondsSince(Clock::time_point start)
 {
     return std::chrono::duration<double>(Clock::now() - start).count();
-}
-
-std::filesystem::path CacheDirectory()
-{
-    std::filesystem::path root;
-    if (const char* dir = std::getenv("PRISM_CACHE_DIR"); dir && *dir) root = dir;
-    else if (const char* local = std::getenv("LOCALAPPDATA"); local && *local) root = std::filesystem::path(local) / "PrismRT";
-    else if (const char* home = std::getenv("HOME")) root = std::filesystem::path(home) / ".cache/PrismRT";
-    else root = std::filesystem::temp_directory_path() / "PrismRT";
-    root /= "vulkan";
-    std::error_code ignored;
-    std::filesystem::create_directories(root, ignored);
-    return root;
-}
-
-std::string Hash(std::string const& text)
-{
-    uint64_t a = 1469598103934665603ull, b = 0x9e3779b97f4a7c15ull;
-    for (unsigned char c : text) {
-        a = (a ^ c) * 1099511628211ull;
-        b = (b + c) * 0x100000001b3ull ^ (b >> 29);
-    }
-    return std::format("{:016x}{:016x}-{}", a, b, text.size());
 }
 
 const char* ResultText(VkResult result)
@@ -103,39 +79,19 @@ struct AccelerationStructure {
 bool CompileVulkanKernel(std::string const& mdlCode, std::vector<uint32_t>* spirv, std::string* error)
 {
     std::string source;
-    if (!gpu::AssembleShader("gpu/glsl/kernel.comp", mdlCode, &source, error)) return false;
-    const auto cached = CacheDirectory() / (Hash(source) + ".spv");
-    if (std::ifstream file{cached, std::ios::binary}) {
-        std::vector<char> bytes((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
-        if (!bytes.empty() && bytes.size() % 4 == 0) {
-            spirv->resize(bytes.size() / 4);
-            std::memcpy(spirv->data(), bytes.data(), bytes.size());
-            return true;
-        }
+    if (!gpu::AssembleShader("gpu/kernel.hlsl", {"gpu/vulkan"}, mdlCode, &source, error)) return false;
+    const auto cacheDirectory = gpu::ShaderCacheDirectory("vulkan");
+    const auto cached = cacheDirectory / (gpu::SourceDigest(source) + ".spv");
+    std::vector<char> bytes;
+    if (std::ifstream file{cached, std::ios::binary})
+        bytes.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+    if (bytes.empty() || bytes.size() % 4 != 0) {
+        if (!gpu::CompileHlsl(source, gpu::HlslTarget::Spirv, cacheDirectory, &bytes, error)) return false;
+        std::ofstream(cached, std::ios::binary).write(bytes.data(), std::streamsize(bytes.size()));
     }
-    shaderc_compiler_t compiler = shaderc_compiler_initialize();
-    shaderc_compile_options_t options = shaderc_compile_options_initialize();
-    shaderc_compile_options_set_target_env(options, shaderc_target_env_vulkan, shaderc_env_version_vulkan_1_3);
-    shaderc_compile_options_set_target_spirv(options, shaderc_spirv_version_1_6);
-    // Drivers optimize; spirv-opt on these large kernels only adds time.
-    shaderc_compile_options_set_optimization_level(options, shaderc_optimization_level_zero);
-    shaderc_compilation_result_t result = shaderc_compile_into_spv(
-        compiler, source.data(), source.size(), shaderc_compute_shader, "kernel.comp", "main", options);
-    const bool ok = shaderc_result_get_compilation_status(result) == shaderc_compilation_status_success;
-    if (ok) {
-        const size_t bytes = shaderc_result_get_length(result);
-        spirv->resize(bytes / 4);
-        std::memcpy(spirv->data(), shaderc_result_get_bytes(result), bytes);
-        std::ofstream(cached, std::ios::binary).write(shaderc_result_get_bytes(result), std::streamsize(bytes));
-    } else {
-        if (error) *error = std::string("GLSL compilation failed: ") + shaderc_result_get_error_message(result);
-        // Keep the source for inspection.
-        std::ofstream(CacheDirectory() / "failed_kernel.comp") << source;
-    }
-    shaderc_result_release(result);
-    shaderc_compile_options_release(options);
-    shaderc_compiler_release(compiler);
-    return ok;
+    spirv->resize(bytes.size() / 4);
+    std::memcpy(spirv->data(), bytes.data(), bytes.size());
+    return true;
 }
 
 struct VulkanDevice::Impl {
@@ -162,7 +118,7 @@ struct VulkanDevice::Impl {
     std::unique_ptr<GpuSceneData> data;
     uint32_t mdlTextureCount = 1;
 
-    Buffer buffers[PRISM_SLOT_COUNT];
+    Buffer buffers[kSlotCount];
     std::vector<VkImageView> imageViews;
     struct CachedImage {
         std::weak_ptr<const prism::TextureResource> resource;
@@ -172,7 +128,7 @@ struct VulkanDevice::Impl {
     std::unordered_map<const prism::TextureResource*, CachedImage> imageCache;
     std::vector<AccelerationStructure> bottomLevel;
     AccelerationStructure topLevel;
-    VkSampler samplers[PRISM_SAMPLER_COUNT] = {};
+    VkSampler samplers[kSamplerCount] = {};
     VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
     VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
     VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
@@ -380,24 +336,24 @@ bool VulkanDevice::Impl::initialize(std::string* reason)
     // One set: a storage buffer per slot, the acceleration structure, and
     // the image and sampler arrays.
     std::vector<VkDescriptorSetLayoutBinding> bindings;
-    for (uint32_t slot = 0; slot < PRISM_SLOT_COUNT; ++slot) {
+    for (uint32_t slot = 0; slot < kSlotCount; ++slot) {
         VkDescriptorSetLayoutBinding binding{};
         binding.binding = slot;
-        binding.descriptorType = slot == PRISM_SLOT_ACCEL ? VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR
+        binding.descriptorType = slot == kSlotAccel ? VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR
                                                           : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         binding.descriptorCount = 1;
         binding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
         bindings.push_back(binding);
     }
     VkDescriptorSetLayoutBinding samplerBinding{};
-    samplerBinding.binding = PRISM_SLOT_IMAGE_BASE + 1;
+    samplerBinding.binding = kSlotImageBase + 1;
     samplerBinding.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
-    samplerBinding.descriptorCount = PRISM_SAMPLER_COUNT;
+    samplerBinding.descriptorCount = kSamplerCount;
     samplerBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     samplerBinding.pImmutableSamplers = samplers;
     bindings.push_back(samplerBinding);
     VkDescriptorSetLayoutBinding imageBinding{};
-    imageBinding.binding = PRISM_SLOT_IMAGE_BASE;
+    imageBinding.binding = kSlotImageBase;
     imageBinding.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
     imageBinding.descriptorCount = kMaxImages;
     imageBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -419,9 +375,9 @@ bool VulkanDevice::Impl::initialize(std::string* reason)
     pipelineLayoutInfo.pSetLayouts = &setLayout;
     vkCreatePipelineLayout(device, &pipelineLayoutInfo, nullptr, &pipelineLayout);
     const VkDescriptorPoolSize sizes[] = {
-        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, PRISM_SLOT_COUNT},
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, kSlotCount},
         {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1},
-        {VK_DESCRIPTOR_TYPE_SAMPLER, PRISM_SAMPLER_COUNT},
+        {VK_DESCRIPTOR_TYPE_SAMPLER, kSamplerCount},
         {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kMaxImages},
     };
     VkDescriptorPoolCreateInfo poolCreate{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
@@ -530,16 +486,16 @@ bool VulkanDevice::Impl::submit(VkCommandBuffer commands, std::string* error)
 bool VulkanDevice::Impl::buildPipeline(std::string* error)
 {
     auto const start = Clock::now();
-    gpu::MdlShaderCode code = gpu::GenerateMdlShaderCode(data->mdlMaterials, gpu::ShadingLanguage::Glsl);
+    gpu::MdlShaderCode code = gpu::GenerateMdlShaderCode(data->mdlMaterials);
     if (!code.success)
         std::cerr << "PrismRT Vulkan: MDL materials unavailable on the GPU (" << code.error << ")\n";
     gpu::ApplyMdlShaderCode(*data, code);
     mdlTextureCount = uint32_t(data->mdlTextures.size());
-    upload(PRISM_SLOT_ARGUMENT_BLOCKS, code.argumentBlocks.data(), code.argumentBlocks.size());
-    upload(PRISM_SLOT_RO_DATA, code.roData.data(), code.roData.size());
+    upload(kSlotArgumentBlocks, code.argumentBlocks.data(), code.argumentBlocks.size());
+    upload(kSlotRoData, code.roData.data(), code.roData.size());
     std::vector<uint32_t> spirv;
     if (!CompileVulkanKernel(code.code, &spirv, error)) return false;
-    const std::string key = Hash(std::string(reinterpret_cast<const char*>(spirv.data()), spirv.size() * 4));
+    const std::string key = gpu::SourceDigest(std::string(reinterpret_cast<const char*>(spirv.data()), spirv.size() * 4));
     if (auto found = pipelines.find(key); found != pipelines.end()) {
         pipeline = found->second;
         return true;
@@ -725,7 +681,7 @@ bool VulkanDevice::Impl::uploadImages(std::string* error)
         vkFreeMemory(device, it->second.image.memory, nullptr);
         it = imageCache.erase(it);
     }
-    return upload(PRISM_SLOT_IMAGES, info.data(), info.size() * sizeof(GpuImage));
+    return upload(kSlotImages, info.data(), info.size() * sizeof(GpuImage));
 }
 
 bool VulkanDevice::Impl::buildAccelerationStructures(std::string* error)
@@ -750,7 +706,7 @@ bool VulkanDevice::Impl::buildAccelerationStructures(std::string* error)
     std::vector<size_t> boxOffsets(d.prototypes.size(), 0);
     for (size_t p = 0; p < d.prototypes.size(); ++p) {
         GpuPrototype const& proto = d.prototypes[p];
-        if (proto.info.x != PRISM_PROTO_SPHERES || proto.info.w == 0) continue;
+        if (proto.info.x != kProtoSpheres || proto.info.w == 0) continue;
         boxOffsets[p] = boxes.size();
         for (uint32_t s = 0; s < proto.info.w; ++s) {
             float4 const& sphere = d.spheres[proto.info.z + s];
@@ -770,7 +726,7 @@ bool VulkanDevice::Impl::buildAccelerationStructures(std::string* error)
         if (proto.info.w == 0) continue;
         Build build;
         uint32_t primitives = proto.info.w;
-        if (proto.info.x == PRISM_PROTO_SPHERES) {
+        if (proto.info.x == kProtoSpheres) {
             build.geometry.geometryType = VK_GEOMETRY_TYPE_AABBS_KHR;
             auto& aabbs = build.geometry.geometry.aabbs;
             aabbs.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_AABBS_DATA_KHR;
@@ -778,7 +734,7 @@ bool VulkanDevice::Impl::buildAccelerationStructures(std::string* error)
             aabbs.stride = sizeof(VkAabbPositionsKHR);
             build.geometry.flags = 0; // procedural hits are resolved by the ray query
         } else {
-            if (proto.info.x == PRISM_PROTO_QUADS) primitives *= 2;
+            if (proto.info.x == kProtoQuads) primitives *= 2;
             uint32_t maxVertex = 0;
             for (size_t i = size_t(proto.info.z) * 3; i < size_t(proto.info.z + primitives) * 3; ++i)
                 maxVertex = std::max(maxVertex, d.indices[i]);
@@ -786,11 +742,11 @@ bool VulkanDevice::Impl::buildAccelerationStructures(std::string* error)
             auto& triangles = build.geometry.geometry.triangles;
             triangles.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
             triangles.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
-            triangles.vertexData.deviceAddress = buffers[PRISM_SLOT_POSITIONS].address + VkDeviceSize(proto.info.y) * 12;
+            triangles.vertexData.deviceAddress = buffers[kSlotPositions].address + VkDeviceSize(proto.info.y) * 12;
             triangles.vertexStride = 12;
             triangles.maxVertex = maxVertex;
             triangles.indexType = VK_INDEX_TYPE_UINT32;
-            triangles.indexData.deviceAddress = buffers[PRISM_SLOT_INDICES].address + VkDeviceSize(proto.info.z) * 12;
+            triangles.indexData.deviceAddress = buffers[kSlotIndices].address + VkDeviceSize(proto.info.z) * 12;
             build.geometry.flags = VK_GEOMETRY_OPAQUE_BIT_KHR;
         }
         build.info.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
@@ -915,9 +871,9 @@ bool VulkanDevice::Impl::writeDescriptors(std::string* error)
         return false;
     }
     std::vector<VkWriteDescriptorSet> writes;
-    std::vector<VkDescriptorBufferInfo> bufferInfos(PRISM_SLOT_COUNT);
-    for (uint32_t slot = 0; slot < PRISM_SLOT_COUNT; ++slot) {
-        if (slot == PRISM_SLOT_ACCEL || !buffers[slot].buffer) continue;
+    std::vector<VkDescriptorBufferInfo> bufferInfos(kSlotCount);
+    for (uint32_t slot = 0; slot < kSlotCount; ++slot) {
+        if (slot == kSlotAccel || !buffers[slot].buffer) continue;
         bufferInfos[slot] = {buffers[slot].buffer, 0, VK_WHOLE_SIZE};
         VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
         write.dstSet = descriptorSet;
@@ -934,7 +890,7 @@ bool VulkanDevice::Impl::writeDescriptors(std::string* error)
     VkWriteDescriptorSet accel{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     accel.pNext = &structureWrite;
     accel.dstSet = descriptorSet;
-    accel.dstBinding = PRISM_SLOT_ACCEL;
+    accel.dstBinding = kSlotAccel;
     accel.descriptorCount = 1;
     accel.descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
     writes.push_back(accel);
@@ -944,7 +900,7 @@ bool VulkanDevice::Impl::writeDescriptors(std::string* error)
     if (!imageInfos.empty()) {
         VkWriteDescriptorSet images{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
         images.dstSet = descriptorSet;
-        images.dstBinding = PRISM_SLOT_IMAGE_BASE;
+        images.dstBinding = kSlotImageBase;
         images.descriptorCount = uint32_t(imageInfos.size());
         images.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
         images.pImageInfo = imageInfos.data();
@@ -966,26 +922,26 @@ bool VulkanDevice::Impl::ensureScene(SceneManager& scene, std::string* error)
     if (!buildPipeline(error)) return fail();
     GpuSceneData const& d = *data;
     auto bytes = [](auto const& v) { return v.size() * sizeof(v[0]); };
-    upload(PRISM_SLOT_POSITIONS, d.positions.data(), bytes(d.positions));
-    upload(PRISM_SLOT_NORMALS, d.normals.data(), bytes(d.normals));
-    upload(PRISM_SLOT_TEXCOORDS, d.texcoords.data(), bytes(d.texcoords));
-    upload(PRISM_SLOT_TANGENTS, d.tangents.data(), bytes(d.tangents));
-    upload(PRISM_SLOT_INDICES, d.indices.data(), bytes(d.indices));
-    upload(PRISM_SLOT_PROTOTYPES, d.prototypes.data(), bytes(d.prototypes));
-    upload(PRISM_SLOT_INSTANCES, d.instances.data(), bytes(d.instances));
-    upload(PRISM_SLOT_PRIMITIVE_MATERIALS, d.primitiveMaterials.data(), bytes(d.primitiveMaterials));
-    upload(PRISM_SLOT_MATERIALS, d.materials.data(), bytes(d.materials));
-    upload(PRISM_SLOT_LEGACY_TEXTURES, d.legacyTextures.data(), bytes(d.legacyTextures));
-    upload(PRISM_SLOT_SPHERES, d.spheres.data(), bytes(d.spheres));
-    upload(PRISM_SLOT_ENVIRONMENT, &d.environment, sizeof(d.environment));
-    upload(PRISM_SLOT_ENV_TEXEL_PDF, d.environmentTexelPdf.data(), bytes(d.environmentTexelPdf));
-    upload(PRISM_SLOT_ENV_ALIAS_PROBABILITY, d.environmentAliasProbability.data(), bytes(d.environmentAliasProbability));
-    upload(PRISM_SLOT_ENV_ALIAS, d.environmentAlias.data(), bytes(d.environmentAlias));
-    upload(PRISM_SLOT_MDL_TEXTURES, d.mdlTextures.data(), bytes(d.mdlTextures));
-    upload(PRISM_SLOT_MDL_TILES, d.mdlTiles.data(), bytes(d.mdlTiles));
-    upload(PRISM_SLOT_BSDF_DATA, d.bsdfData.data(), bytes(d.bsdfData));
-    if (!buffers[PRISM_SLOT_FRAME].buffer) upload(PRISM_SLOT_FRAME, nullptr, sizeof(GpuFrame));
-    for (int slot : {PRISM_SLOT_TILES, PRISM_SLOT_RNG, PRISM_SLOT_OUTPUT, PRISM_SLOT_ACCUMULATION})
+    upload(kSlotPositions, d.positions.data(), bytes(d.positions));
+    upload(kSlotNormals, d.normals.data(), bytes(d.normals));
+    upload(kSlotTexcoords, d.texcoords.data(), bytes(d.texcoords));
+    upload(kSlotTangents, d.tangents.data(), bytes(d.tangents));
+    upload(kSlotIndices, d.indices.data(), bytes(d.indices));
+    upload(kSlotPrototypes, d.prototypes.data(), bytes(d.prototypes));
+    upload(kSlotInstances, d.instances.data(), bytes(d.instances));
+    upload(kSlotPrimitiveMaterials, d.primitiveMaterials.data(), bytes(d.primitiveMaterials));
+    upload(kSlotMaterials, d.materials.data(), bytes(d.materials));
+    upload(kSlotLegacyTextures, d.legacyTextures.data(), bytes(d.legacyTextures));
+    upload(kSlotSpheres, d.spheres.data(), bytes(d.spheres));
+    upload(kSlotEnvironment, &d.environment, sizeof(d.environment));
+    upload(kSlotEnvTexelPdf, d.environmentTexelPdf.data(), bytes(d.environmentTexelPdf));
+    upload(kSlotEnvAliasProbability, d.environmentAliasProbability.data(), bytes(d.environmentAliasProbability));
+    upload(kSlotEnvAlias, d.environmentAlias.data(), bytes(d.environmentAlias));
+    upload(kSlotMdlTextures, d.mdlTextures.data(), bytes(d.mdlTextures));
+    upload(kSlotMdlTiles, d.mdlTiles.data(), bytes(d.mdlTiles));
+    upload(kSlotBsdfData, d.bsdfData.data(), bytes(d.bsdfData));
+    if (!buffers[kSlotFrame].buffer) upload(kSlotFrame, nullptr, sizeof(GpuFrame));
+    for (int slot : {kSlotTiles, kSlotRng, kSlotOutput, kSlotAccumulation})
         if (!buffers[slot].buffer) upload(slot, nullptr, 16);
     if (!uploadImages(error) || !buildAccelerationStructures(error) || !writeDescriptors(error)) return fail();
     return true;
@@ -1013,7 +969,7 @@ void* VulkanDevice::Impl::renderBuffer(int slot, size_t bytes)
 bool VulkanDevice::Impl::dispatch(GpuFrame const& frame, uint32_t threads, double* gpuSeconds, std::string* error)
 {
     if (threads == 0) return true;
-    std::memcpy(buffers[PRISM_SLOT_FRAME].mapped, &frame, sizeof(frame));
+    std::memcpy(buffers[kSlotFrame].mapped, &frame, sizeof(frame));
     VkCommandBuffer commands = beginCommands();
     vkCmdResetQueryPool(commands, timestamps, 0, 2);
     vkCmdWriteTimestamp(commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, timestamps, 0);
@@ -1038,7 +994,7 @@ std::unique_ptr<VulkanDevice> VulkanDevice::Create(std::string* reason)
         return nullptr;
     }
     std::string source;
-    if (!gpu::LoadShaderSource("gpu/glsl/kernel.comp", &source)) {
+    if (!gpu::LoadShaderSource("gpu/kernel.hlsl", &source)) {
         if (reason) *reason = "the Vulkan kernel sources are missing";
         return nullptr;
     }

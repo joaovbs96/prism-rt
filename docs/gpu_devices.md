@@ -1,12 +1,12 @@
 # Render devices: CPU, Metal and Vulkan
 
 PrismRT renders through a *device*. Every device runs the same path tracer,
-`shaders/integrator/path_tracer.inc`, against its own backend:
+`shaders/integrator/path_tracer.h`, against its own backend:
 
 | Device | Select with | Backend | Status |
 | --- | --- | --- | --- |
-| `metal` | `--device metal`, `PRISM_DEVICE=metal`, `prism:device` | HLSL kernel, DXC + Metal shader converter, hardware ray tracing (inline ray queries) | macOS, Apple GPUs with ray tracing |
-| `vulkan` | `--device vulkan`, ... | GLSL kernel, shaderc, `VK_KHR_ray_query` | Builds and compiles its kernel on macOS; needs a ray-query driver (Windows/Linux) to run, untested so far |
+| `metal` | `--device metal`, `PRISM_DEVICE=metal`, `prism:device` | HLSL kernel: DXC to DXIL, Metal shader converter; inline ray queries | macOS on Apple GPUs; ray-tracing hardware from M3 (M1/M2 run the same API in software) |
+| `vulkan` | `--device vulkan`, ... | The same HLSL kernel, compiled to SPIR-V by DXC; `VK_KHR_ray_query` | Windows/Linux with NVIDIA RTX, AMD RX 6000+ or Intel Arc. Builds and compiles its kernel on macOS; not yet run-tested |
 | `cpu` | `--device cpu`, ... | The same integrator compiled as C++, on Embree and the CPU materials (native MDL) | All platforms |
 | `cpu-reference` | `--device cpu-reference`, ... | The original `SceneManager::trace` | Validation reference, bit-identical to the renderer before devices existed |
 
@@ -16,14 +16,22 @@ back to the CPU device with a message when no GPU device is usable.
 
 ## How it fits together
 
-- **One integrator.** `path_tracer.inc` is written in a C++/GLSL/HLSL subset
-  (`shaders/integrator/prism_sl.h`) against a small backend interface
-  (intersect, prepare/sample/evaluate a material, cutout, environment
-  radiance/sample/pdf). The CPU device includes it into C++
-  (`src/device/cpu_integrator.h`); the GPU devices include it into their
-  kernels with `shaders/gpu/gpu_backend.inc`. Random numbers are drawn in
-  the original order, so devices agree sample for sample up to floating-point
-  and intersection differences.
+- **One integrator.** [`shaders/integrator/path_tracer.h`](../shaders/integrator/path_tracer.h)
+  is `PathTracer<Backend, Hit, Shading>`, written in the common subset of
+  C++ and HLSL 2021 (structs without constructors, aggregate
+  initialization, `(float3)x` for scalar-to-vector conversion, no swizzles,
+  references or pointers; see `types.h`). The CPU device instantiates it with
+  `CpuBackend` (`src/device/cpu_backend.h`; HLSL types and intrinsics for
+  C++ come from `src/device/hlsl_math.h`), the GPU kernel
+  (`shaders/gpu/kernel.hlsl`) with `GpuBackend`
+  (`shaders/gpu/gpu_backend.hlsl`). Random numbers are drawn in the original
+  order, so devices agree sample for sample up to floating-point and
+  intersection differences. The CPU device matches `cpu-reference` far
+  below the noise floor; the remaining difference comes from its
+  single-precision camera rays.
+- **One GPU kernel.** Metal and Vulkan compile the same HLSL; only
+  `shaders/gpu/metal/resources.hlsl` (descriptor heaps) and
+  `shaders/gpu/vulkan/resources.hlsl` (descriptor set bindings) differ.
 - **GPU scene.** `src/device/gpu/gpu_scene.*` flattens a `SceneManager` into
   shared records (`shaders/shared/prism_gpu_types.h`): one bottom-level
   acceleration structure per prototype (triangles; analytic spheres as
@@ -31,10 +39,11 @@ back to the CPU device with a message when no GPU device is usable.
   legacy materials and textures, and the environment with its importance
   tables.
 - **MDL on the GPU.** `src/device/gpu/gpu_materials.*` compiles the scene's
-  MDL classes again with the GLSL or HLSL backend into one link unit, with a
+  MDL classes again with the HLSL backend into one link unit, with a
   generated dispatch function per entry point. Materials keep their native
   argument blocks (the shading-language backends use the native layout);
-  only texture indices are remapped. Classes that differ only in names
+  only texture indices are remapped. The MDL code comes from the SDK's HLSL
+  backend for both devices. Classes that differ only in names
   (MaterialX node names become parameter names) share one program: the 15
   OpenChessSet materials compile as 4.
 - **No SDK fork.** Apple GPUs lack FP64. `hlsl_fp32_rewrite.*` rewrites the
@@ -54,7 +63,7 @@ material entry point from exactly one place.
 | First run: MDL codegen + DXC (`-Od`) + Metal shader converter + Metal pipeline | about 30 s |
 | Later runs (metallib cached in `~/Library/Caches/PrismRT/metal`, pipeline in Metal's system cache) | about 1.2 s shader setup, 2.3 s scene setup in total |
 
-The SPIR-V of the Vulkan device is cached the same way. Uploaded textures
+The Vulkan device caches its SPIR-V the same way (`.../PrismRT/vulkan`). Uploaded textures
 are reused across Hydra scene rebuilds.
 
 ## Mac GPU vs CPU
@@ -105,4 +114,5 @@ setup; see `prism_env.sh`).
   coordinates, material, distance).
 - `PRISM_SHADER_DIR=<repo>/shaders`: load shader sources from disk instead
   of the embedded copies.
+- `PRISM_DXC=<path>`: the DXC executable to use.
 - `PRISM_DISABLE_METAL=1`, `PRISM_DISABLE_VULKAN=1`: hide a device.

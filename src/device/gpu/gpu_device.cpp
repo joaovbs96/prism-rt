@@ -13,7 +13,6 @@
 
 namespace prism::device::gpu {
 
-using namespace prism::gpu;
 
 bool GpuVerbose()
 {
@@ -35,9 +34,9 @@ GpuFrame GpuRenderDevice::BaseFrame(prism::CameraRayParameters const& camera, un
     frame.camera = {camera.nearClip, camera.farClip, float(camera.apertureRadius), float(camera.focusDistance)};
     frame.size = {width, height, 0, 0};
     uint32_t flags = 0;
-    if (camera.orthographic) flags |= PRISM_FRAME_ORTHOGRAPHIC;
-    if (data.environmentMis) flags |= PRISM_FRAME_ENVIRONMENT_MIS;
-    if (data.filteredTextures) flags |= PRISM_FRAME_FILTERED;
+    if (camera.orthographic) flags |= kFrameOrthographic;
+    if (data.environmentMis) flags |= kFrameEnvironmentMis;
+    if (data.filteredTextures) flags |= kFrameFiltered;
     frame.settings = {uint32_t(std::max(0, data.maxDepth)), uint32_t(std::max(0, data.rouletteDepth)), flags, 0};
     frame.counts = {MdlTextureCount(), 0, 0, 0};
     // Debug views of the primary hit (see gpu_kernel.inc).
@@ -55,17 +54,17 @@ std::vector<float> GpuRenderDevice::RenderImage(SceneManager& scene, ImageReques
         return pixels;
     }
     const uint32_t count = request.width * request.height;
-    RenderBuffer(PRISM_SLOT_RNG, size_t(count) * 4);
-    auto* sums = static_cast<float*>(RenderBuffer(PRISM_SLOT_ACCUMULATION, size_t(count) * 16));
+    RenderBuffer(kSlotRng, size_t(count) * 4);
+    auto* sums = static_cast<float*>(RenderBuffer(kSlotAccumulation, size_t(count) * 16));
     std::memset(sums, 0, size_t(count) * 16);
     GpuFrame frame = BaseFrame(request.camera, request.width, request.height);
     frame.shading = {request.sampleClamp, 1.0f, 0.0f, 0.0f};
     frame.settings.w = request.seed;
-    frame.work = {count, 0, PRISM_MODE_IMAGE, 0};
+    frame.work = {count, 0, kModeImage, 0};
     double gpuSeconds = 0.0;
     for (int sample = 0; sample < request.samples; ++sample) {
         GpuFrame f = frame;
-        if (sample == 0) f.settings.z |= PRISM_FRAME_SEED_RNG;
+        if (sample == 0) f.settings.z |= kFrameSeedRng;
         if (!Dispatch(f, count, &gpuSeconds, &error)) {
             std::cerr << LogPrefix() << error << '\n';
             break;
@@ -96,13 +95,13 @@ void GpuRenderDevice::RenderPass(SceneManager& scene, PassRequest const& request
     float* output = nullptr;
     GpuFrame frame{};
     if (traceColor) {
-        rng = static_cast<uint32_t*>(RenderBuffer(PRISM_SLOT_RNG, pixels * 4));
-        output = static_cast<float*>(RenderBuffer(PRISM_SLOT_OUTPUT, pixels * 16));
+        rng = static_cast<uint32_t*>(RenderBuffer(kSlotRng, pixels * 4));
+        output = static_cast<float*>(RenderBuffer(kSlotOutput, pixels * 16));
         std::memcpy(rng, request.rngStates, pixels * 4);
         frame = BaseFrame(request.camera, width, height);
         frame.shading = {request.shading.sampleClamp, request.shading.exposureScale, 0.0f, 0.0f};
-        if (request.shading.transparentEscapes) frame.settings.z |= PRISM_FRAME_TRANSPARENT_ESCAPES;
-        if (request.sample == 0) frame.settings.z |= PRISM_FRAME_SEED_RNG;
+        if (request.shading.transparentEscapes) frame.settings.z |= kFrameTransparentEscapes;
+        if (request.sample == 0) frame.settings.z |= kFrameSeedRng;
         frame.settings.w = request.seed;
     }
 
@@ -129,13 +128,13 @@ void GpuRenderDevice::RenderPass(SceneManager& scene, PassRequest const& request
         }
         auto const rayStart = Clock::now();
         if (traceColor) {
-            std::memcpy(RenderBuffer(PRISM_SLOT_TILES, tiles.size() * sizeof(GpuTile)), tiles.data(),
+            std::memcpy(RenderBuffer(kSlotTiles, tiles.size() * sizeof(GpuTile)), tiles.data(),
                         tiles.size() * sizeof(GpuTile));
             // Buffers may move when resized; fetch them again after the tiles.
-            rng = static_cast<uint32_t*>(RenderBuffer(PRISM_SLOT_RNG, pixels * 4));
-            output = static_cast<float*>(RenderBuffer(PRISM_SLOT_OUTPUT, pixels * 16));
+            rng = static_cast<uint32_t*>(RenderBuffer(kSlotRng, pixels * 4));
+            output = static_cast<float*>(RenderBuffer(kSlotOutput, pixels * 16));
             GpuFrame f = frame;
-            f.work = {uint32_t(threads), uint32_t(tiles.size()), PRISM_MODE_PASS, 0};
+            f.work = {uint32_t(threads), uint32_t(tiles.size()), kModePass, 0};
             if (!Dispatch(f, uint32_t(threads), nullptr, &error)) {
                 std::cerr << LogPrefix() << error << '\n';
                 return;
@@ -190,20 +189,20 @@ bool GpuRenderDevice::RenderPreview(SceneManager& scene, PreviewRequest const& r
         return false;
     }
     const uint32_t count = request.previewWidth * request.previewHeight;
-    RenderBuffer(PRISM_SLOT_OUTPUT, size_t(count) * 16);
+    RenderBuffer(kSlotOutput, size_t(count) * 16);
     GpuFrame frame = BaseFrame(request.camera, request.width, request.height);
     frame.size.z = request.previewWidth;
     frame.size.w = request.previewHeight;
     frame.shading = {request.shading.sampleClamp, request.shading.exposureScale, 0.0f, 0.0f};
-    if (request.shading.transparentEscapes) frame.settings.z |= PRISM_FRAME_TRANSPARENT_ESCAPES;
+    if (request.shading.transparentEscapes) frame.settings.z |= kFrameTransparentEscapes;
     frame.settings.w = request.seed;
-    frame.work = {count, 0, PRISM_MODE_PREVIEW, 0};
+    frame.work = {count, 0, kModePreview, 0};
     if (!Dispatch(frame, count, nullptr, &error)) {
         std::cerr << LogPrefix() << error << '\n';
         return false;
     }
     if (request.colorPixels) request.colorPixels->fetch_add(count, std::memory_order_relaxed);
-    auto const* values = static_cast<const float*>(RenderBuffer(PRISM_SLOT_OUTPUT, size_t(count) * 16));
+    auto const* values = static_cast<const float*>(RenderBuffer(kSlotOutput, size_t(count) * 16));
     const unsigned width = request.width, height = request.height;
     const unsigned previewWidth = request.previewWidth, previewHeight = request.previewHeight;
     tbb::parallel_for(0u, previewHeight, [&](unsigned py) {

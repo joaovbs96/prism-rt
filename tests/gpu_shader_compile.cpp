@@ -1,8 +1,10 @@
-// GPU kernels compile for a scene with an MDL material: the GLSL kernel to
-// SPIR-V (Vulkan device; runs everywhere the device builds, including macOS
-// where no driver can execute it), and the HLSL double-precision rewrite.
+// The GPU kernel compiles for a scene with an MDL material: to SPIR-V for the
+// Vulkan device (also on macOS, where no driver can execute it) and to DXIL
+// for the Metal device; plus the HLSL double-precision rewrite.
 //   prism_gpu_shader_compile_test <scene.usda>
 #include "../src/device/gpu/gpu_scene.h"
+#include "../src/device/gpu/hlsl_compiler.h"
+#include "../src/device/gpu/shader_sources.h"
 #include "../src/device/gpu/hlsl_fp32_rewrite.h"
 #include "../src/mesh/usd_mesh.h"
 #include "../src/scene.h"
@@ -69,18 +71,22 @@ int main(int argc, char** argv)
         scene.commitScene();
         GpuSceneData data = BuildGpuScene(scene);
         check(!data.mdlMaterials.empty(), "the scene has MDL materials");
-        MdlShaderCode code = GenerateMdlShaderCode(data.mdlMaterials, ShadingLanguage::Glsl);
-        check(code.success, "GLSL MDL code: " + code.error);
-        for (auto const& m : code.materials) check(m.valid, "GLSL material: " + m.error);
+        MdlShaderCode code = GenerateMdlShaderCode(data.mdlMaterials);
+        check(code.success, "MDL code: " + code.error);
+        for (auto const& m : code.materials) check(m.valid, "material: " + m.error);
 #ifdef PRISM_HAS_VULKAN
         std::vector<uint32_t> spirv;
         check(prism::device::CompileVulkanKernel(code.code, &spirv, &error) && spirv.size() > 1000 &&
                   spirv[0] == 0x07230203u,
               "Vulkan kernel compiles to SPIR-V: " + error);
 #endif
-        MdlShaderCode hlsl = GenerateMdlShaderCode(data.mdlMaterials, ShadingLanguage::Hlsl);
-        check(hlsl.success && RewriteHlslToFp32(hlsl.code, &rewritten, &error),
-              "HLSL MDL code rewrites to single precision: " + error);
+        std::string source;
+        std::vector<char> dxil;
+        check(RewriteHlslToFp32(code.code, &rewritten, &error) &&
+                  AssembleShader("gpu/kernel.hlsl", {"gpu/metal"}, rewritten, &source, &error) &&
+                  CompileHlsl(source, HlslTarget::Dxil, ShaderCacheDirectory("test"), &dxil, &error) &&
+                  dxil.size() > 1000,
+              "Metal kernel compiles to DXIL: " + error);
     }
     rtcReleaseDevice(device);
     if (failures) return 1;

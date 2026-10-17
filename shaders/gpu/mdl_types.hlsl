@@ -2,8 +2,11 @@
 // generated with texture derivatives, one texture space, no auxiliary
 // output and no DF handle slots.
 
-#ifndef PRISM_MDL_TYPES_HLSL
-#define PRISM_MDL_TYPES_HLSL
+#pragma once
+
+// Texture results cached by generated init functions (backend option
+// num_texture_results; see gpu_materials.h).
+static const int kMdlTextureResults = 16;
 
 struct Derived_float { float val; float dx; float dy; };
 struct Derived_float2 { float2 val; float2 dx; float2 dy; };
@@ -18,7 +21,7 @@ struct Shading_state_material {
     Derived_float3 text_coords[1];
     float3 tangent_u[1];
     float3 tangent_v[1];
-    float4 text_results[PRISM_MDL_TEXTURE_RESULTS];
+    float4 text_results[kMdlTextureResults];
     uint ro_data_segment_offset;
     float4x4 world_to_object;
     float4x4 object_to_world;
@@ -27,15 +30,6 @@ struct Shading_state_material {
     uint arg_block_offset;
 };
 
-#define Tex_wrap_mode int
-#define TEX_WRAP_CLAMP 0
-#define TEX_WRAP_REPEAT 1
-#define TEX_WRAP_MIRRORED_REPEAT 2
-#define TEX_WRAP_CLIP 3
-#define Bsdf_event_type int
-#define Edf_event_type int
-#define Mbsdf_part int
-#define Df_flags int
 
 struct Bsdf_sample_data {
     float3 ior1;
@@ -106,8 +100,8 @@ struct Edf_auxiliary_data {
     float3 k1;
 };
 
-#define MdlState Shading_state_material
-#define PRISM_IDENTITY_MATRIX float4x4(1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, \
-                                       0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f)
+float4x4 identityMatrix()
+{
+    return float4x4(1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f);
+}
 
-#endif // PRISM_MDL_TYPES_HLSL
