@@ -20,8 +20,16 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 
 namespace {
+
+// Element types of the MDL state's matrix and texture-result pointers
+// (tct_float4_a16 in MDL SDK 2026, tct_float4 before).
+using MdlStateFloat4 = std::remove_const_t<std::remove_pointer_t<
+    decltype(mi::neuraylib::Shading_state_material_with_derivs::text_results)>>;
+using MdlStateMatrixRow = std::remove_const_t<std::remove_pointer_t<
+    decltype(mi::neuraylib::Shading_state_material_with_derivs::world_to_object)>>;
 
 void require(bool condition, std::string const &message)
 {
@@ -234,8 +242,8 @@ struct State {
     mi::neuraylib::Shading_state_material_with_derivs derivative{};
     mi::neuraylib::tct_deriv_float3 uv{};
     mi::Float32_3 tangentU{1, 0, 0}, tangentV{0, 1, 0};
-    mi::neuraylib::tct_float4 identity[4]{};
-    alignas(16) mi::neuraylib::tct_float4 results[128]{};
+    MdlStateMatrixRow identity[4]{};
+    alignas(16) MdlStateFloat4 results[128]{};
 
     explicit State(mdl::TargetCode const &target, float u, float v,
                    float dudx=0,float dvdx=0,float dudy=0,float dvdy=0)
@@ -299,7 +307,7 @@ SampleResult sample(mdl::TargetCode const& target,std::array<float,4> xi)
     mi::neuraylib::Bsdf_sample_data data{};
     data.k1=mi::Float32_3(0,0,1);data.ior1=mi::Float32_3(1);
     data.ior2=mi::Float32_3(MI_NEURAYLIB_BSDF_USE_MATERIAL_IOR);
-    data.xi=mi::Float32_4(xi[0],xi[1],xi[2],xi[3]);
+    data.xi.x=xi[0]; data.xi.y=xi[1]; data.xi.z=xi[2]; data.xi.w=xi[3];
     require(target.program->target_code->execute_bsdf_sample(
         target.program->functions.surface_bsdf_function_index,&data,state.base(),
         target.texture_handler(),target.argument_data())==0,"BSDF sample failed");

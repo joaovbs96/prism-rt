@@ -578,8 +578,10 @@ mi::neuraylib::Texture_handler_deriv_vtable const &NativeTextureRuntime::Vtable(
             out[2]=static_cast<int>(table->depth);
         };
         v.m_tex_frame=[](int out[2],Base const*,unsigned){out[0]=out[1]=0;};
+        // The state parameter type differs between MDL SDK releases; the
+        // generic lambda converts to either function-pointer signature.
         v.m_adapt_normal=[](float out[3],Base const*,
-            mi::neuraylib::Shading_state_material*,float const n[3]) {
+            auto* /*state*/,float const n[3]) {
             out[0]=n[0];out[1]=n[1];out[2]=n[2]; };
         v.m_scene_data_isvalid=[](Base const*,
             mi::neuraylib::Shading_state_material*,unsigned id){

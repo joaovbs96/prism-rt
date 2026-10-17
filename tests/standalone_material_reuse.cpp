@@ -22,8 +22,8 @@ std::array<float,3> evaluate(const mdl::TargetCode& target) {
     auto& state=reinterpret_cast<mi::neuraylib::Shading_state_material&>(derivatives);
     mi::neuraylib::tct_deriv_float3 uv{}; uv.val=mi::Float32_3(.37f,.61f,0);
     mi::Float32_3 tangentU(1,0,0),tangentV(0,1,0);
-    mi::neuraylib::tct_float4 identity[4]{{1,0,0,0},{0,1,0,0},{0,0,1,0},{0,0,0,1}};
-    alignas(16) mi::neuraylib::tct_float4 results[128]{};
+    MdlStateMatrixRow identity[4]{{1,0,0,0},{0,1,0,0},{0,0,1,0},{0,0,0,1}};
+    alignas(16) MdlStateFloat4 results[128]{};
     derivatives.normal=derivatives.geom_normal=mi::Float32_3(0,0,1);
     derivatives.tangent_u=&tangentU; derivatives.tangent_v=&tangentV;
     derivatives.text_coords=&uv;

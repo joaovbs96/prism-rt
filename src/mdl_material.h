@@ -11,6 +11,14 @@
 #include <mi/mdl_sdk.h>
 #include <memory>
 #include <string>
+#include <type_traits>
+
+// Element types of the MDL state's matrix and texture-result pointers. MDL SDK
+// 2026 uses the aligned tct_float4_a16 here, earlier releases tct_float4.
+using MdlStateFloat4 = std::remove_const_t<std::remove_pointer_t<
+    decltype(mi::neuraylib::Shading_state_material_with_derivs::text_results)>>;
+using MdlStateMatrixRow = std::remove_const_t<std::remove_pointer_t<
+    decltype(mi::neuraylib::Shading_state_material_with_derivs::world_to_object)>>;
 #include <iostream>
 #include <algorithm>
 #include <cmath>
@@ -458,8 +466,8 @@ private:
         mi::neuraylib::tct_deriv_float3 tex_coord;
         mi::Float32_3 tangent_u;
         mi::Float32_3 tangent_v;
-        mi::neuraylib::tct_float4 identity[4];
-        alignas(16) mi::neuraylib::tct_float4 text_results[128];
+        MdlStateMatrixRow identity[4];
+        alignas(16) MdlStateFloat4 text_results[128];
         mi::neuraylib::Shading_state_material &base() {
             return reinterpret_cast<mi::neuraylib::Shading_state_material &>(state);
         }
