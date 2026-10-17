@@ -1,8 +1,9 @@
-// CPU render device: the original Embree/TBB integrator. The loops below are
-// the former standalone and Hydra render loops, moved here unchanged so that
-// CPU renders stay bit-identical.
+// CPU render device. The loops below are the former standalone and Hydra
+// render loops. The reference variant traces with SceneManager::trace exactly
+// as before; the default variant runs the shared integrator per sample.
 
 #include "cpu_device.h"
+#include "cpu_integrator.h"
 
 #include "../rng.h"
 #include "../scene.h"
@@ -48,9 +49,10 @@ Color3 ShadeSample(Color3 color, SceneManager::PrimaryOutcome outcome,
 DeviceInfo CpuDevice::Info() const
 {
     DeviceInfo info;
-    info.kind = DeviceKind::Cpu;
+    info.kind = m_reference ? DeviceKind::CpuReference : DeviceKind::Cpu;
     const unsigned threads = std::max(1u, std::thread::hardware_concurrency());
-    info.name = "CPU (Embree, " + std::to_string(threads) + " threads)";
+    info.name = std::string(m_reference ? "CPU reference integrator" : "CPU") +
+        " (Embree, " + std::to_string(threads) + " threads)";
     info.hardwareRayTracing = false;
     return info;
 }
@@ -60,11 +62,21 @@ std::vector<float> CpuDevice::RenderImage(SceneManager& scene, ImageRequest cons
     const int width = static_cast<int>(request.width);
     const int height = static_cast<int>(request.height);
     std::vector<float> pixels(size_t(width)*height*3);
+    cpu::Integrator integrator(scene);
+    const auto camera = cpu::ToCameraParams(request.camera);
+    cpu::Integrator::SampleSettings settings{request.sampleClamp, 1.0f, false};
     tbb::parallel_for(0, height, [&](int y) {
         for (int x = 0; x < width; ++x) {
             unsigned seed = tea<64>(unsigned(y*width) ^ request.seed, unsigned(x));
             Color3 sum(0);
-            for (int sample = 0; sample < request.samples; ++sample) {
+            if (!m_reference) {
+                for (int sample = 0; sample < request.samples; ++sample) {
+                    const auto result = integrator.prism_render_sample(camera, unsigned(x),
+                        unsigned(y), unsigned(width), unsigned(height), settings, seed);
+                    sum += cpu::ToFloat3(result.color);
+                }
+            }
+            for (int sample = 0; m_reference && sample < request.samples; ++sample) {
                 const auto pair = prism::GenerateCameraRays(
                     request.camera, static_cast<unsigned int>(x),
                     static_cast<unsigned int>(y), static_cast<unsigned int>(width),
@@ -95,6 +107,10 @@ void CpuDevice::RenderPass(SceneManager& scene, PassRequest const& request)
     const bool tracePrimary = request.tracePrimary && request.resolvePrimary;
     auto abandoned = [&] { return request.abandoned && request.abandoned(); };
     auto paused = [&] { return request.paused && request.paused(); };
+    cpu::Integrator integrator(scene);
+    const auto camera = cpu::ToCameraParams(request.camera);
+    const cpu::Integrator::SampleSettings settings{request.shading.sampleClamp,
+        request.shading.exposureScale, request.shading.transparentEscapes};
 
     tbb::task_arena renderArena(std::max(1, request.concurrency));
     renderArena.execute([&] {
@@ -127,6 +143,20 @@ void CpuDevice::RenderPass(SceneManager& scene, PassRequest const& request)
                             }
                             unsigned int &seed = request.rngStates[pixel];
                             if (request.sample == 0) seed = tea<64>((y * width) ^ request.seed, x);
+                            if (!m_reference) {
+                                if (tracePrimary)
+                                    centers[(y-tile.y)*tile.width+x-tile.x] =
+                                        prism::MakeCameraRayWithLens(request.camera,
+                                            static_cast<float>(x) + 0.5f,
+                                            static_cast<float>(y) + 0.5f,
+                                            width, height, nullptr);
+                                const auto result = integrator.prism_render_sample(
+                                    camera, x, y, width, height, settings, seed);
+                                ++colorWork.value;
+                                request.colors[pixel] = cpu::ToFloat3(result.color);
+                                request.coverage[pixel] = result.coverage;
+                                continue;
+                            }
                             prism::CameraRayPair rays = prism::GenerateCameraRays(
                                 request.camera, x, y, width, height, seed);
                             if (tracePrimary)
@@ -169,6 +199,10 @@ bool CpuDevice::RenderPreview(SceneManager& scene, PreviewRequest const& request
     const unsigned previewWidth = request.previewWidth, previewHeight = request.previewHeight;
     std::atomic<bool> cancelled{false};
     auto stopRequested = [&] { return request.stopRequested && request.stopRequested(); };
+    cpu::Integrator integrator(scene);
+    const auto camera = cpu::ToCameraParams(request.camera);
+    const cpu::Integrator::SampleSettings settings{request.shading.sampleClamp,
+        request.shading.exposureScale, request.shading.transparentEscapes};
     tbb::parallel_for(
         tbb::blocked_range2d<unsigned int>(
             0, previewHeight, 4, 0, previewWidth, 8),
@@ -192,17 +226,30 @@ bool CpuDevice::RenderPreview(SceneManager& scene, PreviewRequest const& request
             unsigned int seed = tea<64>(
                 ((py * previewWidth + px) ^ request.seed) ^ 0x9e3779b9u,
                 (px + 0x85ebca6bu) ^ (py * 0xc2b2ae35u));
-            prism::CameraRayPair rays = prism::GenerateCameraRays(
-                request.camera, x, y, width, height, seed);
-            SceneManager::PrimaryOutcome outcome = SceneManager::PrimaryOutcome::Unresolved;
-            Color3 color = scene.trace(
-                prism::PathRay{rays.sampled, rays.footprint},
-                0, Color3(1.0f), seed, &outcome);
-            ++colorWork.value;
+            Color3 color;
             float coverage;
-            color = ShadeSample(color, outcome, request.shading, &coverage);
+            RTCRay center;
+            if (m_reference) {
+                prism::CameraRayPair rays = prism::GenerateCameraRays(
+                    request.camera, x, y, width, height, seed);
+                SceneManager::PrimaryOutcome outcome = SceneManager::PrimaryOutcome::Unresolved;
+                color = scene.trace(
+                    prism::PathRay{rays.sampled, rays.footprint},
+                    0, Color3(1.0f), seed, &outcome);
+                color = ShadeSample(color, outcome, request.shading, &coverage);
+                center = rays.center;
+            } else {
+                const auto result = integrator.prism_render_sample(
+                    camera, x, y, width, height, settings, seed);
+                color = cpu::ToFloat3(result.color);
+                coverage = result.coverage;
+                center = prism::MakeCameraRayWithLens(request.camera,
+                    static_cast<float>(x) + 0.5f, static_cast<float>(y) + 0.5f,
+                    width, height, nullptr);
+            }
+            ++colorWork.value;
             if (request.tracePrimary) {
-                const RayHit primary = scene.cast_ray(rays.center);
+                const RayHit primary = scene.cast_ray(center);
                 request.writePixel(px, py, color, coverage, &primary);
             } else {
                 request.writePixel(px, py, color, coverage, nullptr);

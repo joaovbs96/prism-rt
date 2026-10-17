@@ -5,6 +5,8 @@
 #include <array>
 #include <algorithm>
 #include <cmath>
+#include <unordered_map>
+#include <unordered_set>
 
 #include <embree4/rtcore.h>
 #include <embree4/rtcore_common.h>
@@ -618,6 +620,9 @@ public:
         std::unordered_map<int, Material *> triangles;
     };
     std::unordered_map<int, PlacementMaterialBinding> placement_materials;
+    // Placements disabled in the Embree scene (Hydra visibility). Embree
+    // cannot be queried for this; GPU devices mirror the scene from here.
+    std::unordered_set<int> disabled_placements;
     Environment *environment;
     Camera cam;
     int image_width = 1280;

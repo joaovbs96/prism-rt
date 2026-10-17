@@ -1,8 +1,10 @@
 #pragma once
 
 // Render devices execute the per-pixel path tracing work for both frontends.
-// The CPU device runs the original Embree/TBB integrator on a SceneManager;
-// GPU devices (Vulkan, Metal) mirror the same integrator in shading languages.
+// Every device runs the shared integrator (shaders/integrator) on its own
+// backend: the CPU device on Embree and the CPU materials, the GPU devices
+// (Vulkan, Metal) in shading languages. The CPU reference device runs the
+// original SceneManager::trace for validation.
 // Frontends keep ownership of scene ingestion, accumulation, tiling policy and
 // presentation, and describe each unit of work with a request struct.
 
@@ -23,10 +25,11 @@ class SceneManager;
 
 namespace prism::device {
 
-enum class DeviceKind { Cpu, Vulkan, Metal };
+// CpuReference runs the original CPU integrator (validation reference).
+enum class DeviceKind { Cpu, CpuReference, Vulkan, Metal };
 
 // Auto prefers the platform GPU device and falls back to the CPU device.
-enum class DevicePreference { Auto, Cpu, Vulkan, Metal };
+enum class DevicePreference { Auto, Cpu, CpuReference, Vulkan, Metal };
 
 struct DeviceInfo {
     DeviceKind kind = DeviceKind::Cpu;

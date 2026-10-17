@@ -45,7 +45,8 @@ void help() {
         "  --max-sample-radiance 10 --output output.exr\n"
         "  --environment-sampling mis|bsdf (default mis)\n"
         "  --texture-filtering filtered|bilinear (default filtered)\n"
-        "  --device auto|cpu|vulkan|metal (default auto: GPU if available, else CPU)\n"
+        "  --device auto|cpu|cpu-reference|vulkan|metal (default auto: GPU if available, else CPU;\n"
+        "                 cpu-reference runs the original CPU integrator)\n"
         "PrismRT --list-devices\n"
         "EXR output is linear after the sample clamp; other formats use gamma 2.2.\n"
         "The environment option follows the original EnvironmentMap radiance convention.\n"
@@ -95,7 +96,7 @@ Options parse(int argc, char** argv) {
         else if (key == "--texture-filtering") o.textureFiltering = value;
         else if (key == "--device") {
             if (!prism::device::ParseDevicePreference(value, &o.device))
-                throw std::runtime_error("--device must be auto, cpu, vulkan or metal");
+                throw std::runtime_error("--device must be auto, cpu, cpu-reference, vulkan or metal");
         }
         else if (key == "--env") o.environment = value;
         else if (key == "--env-color") o.environmentColor = triple(value);

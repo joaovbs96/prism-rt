@@ -851,6 +851,7 @@ unsigned int _AttachPrototype(Snapshot *snapshot, SdfPath const &path,
         prototype.geometry->type == RTC_GEOMETRY_TYPE_TRIANGLE;
     snapshot->scene->placement_transforms.emplace(id, placement);
     snapshot->scene->placement_materials.emplace(id, prototype.binding);
+    snapshot->scene->disabled_placements.erase(id);
     snapshot->placementEnabled[id] = true;
     snapshot->placementMatrices[id] = world;
     for (SdfPath ancestor = path; !ancestor.IsEmpty() && ancestor != SdfPath::AbsoluteRootPath();
@@ -918,6 +919,8 @@ void _SetInstanceEnabled(Snapshot *snapshot, unsigned int id, bool enabled)
     if (enabled) rtcEnableGeometry(instance);
     else rtcDisableGeometry(instance);
     rtcCommitGeometry(instance);
+    if (enabled) snapshot->scene->disabled_placements.erase(id);
+    else snapshot->scene->disabled_placements.insert(id);
     if (enabled) {
         ++snapshot->enabledPlacementCount;
         _TrackPrototypeEnabled(snapshot, id, true);
@@ -4237,7 +4240,7 @@ public:
         // overrides it.
         if (const char *value = std::getenv("PRISM_DEVICE"); value && *value) {
             if (!prism::device::ParseDevicePreference(value, &settings.device))
-                TF_WARN("PrismRT: ignoring PRISM_DEVICE=%s (expected auto, cpu, vulkan or metal)", value);
+                TF_WARN("PrismRT: ignoring PRISM_DEVICE=%s (expected auto, cpu, cpu-reference, vulkan or metal)", value);
         }
         if (const char *value = std::getenv("PRISM_PROFILE_BUFFERS"))
             profileBufferWrites = value[0] != '\0' && std::strcmp(value, "0") != 0;
@@ -4367,6 +4370,7 @@ public:
     std::shared_ptr<prism::device::RenderDevice> renderDevice;
     prism::device::DevicePreference renderDevicePreference = prism::device::DevicePreference::Auto;
     SceneManager const *renderDeviceScene = nullptr;
+    uint64_t renderDeviceGeneration = 0;
     std::atomic<int64_t> embreeLiveBytes{0};
     std::atomic<int64_t> embreePeakBytes{0};
     mutable std::mutex mutex;
@@ -5653,10 +5657,14 @@ void SceneBridge::Render()
         snapshot = _impl->snapshot; camera = _impl->camera;
         bindings = _impl->bindings; settings = _impl->settings;
         renderDevice = _impl->RenderDeviceLocked(settings.device);
+        // Published edits replace the snapshot or advance its generation;
+        // camera changes do neither.
         if (snapshot && snapshot->scene &&
-            _impl->renderDeviceScene != snapshot->scene.get()) {
+            (_impl->renderDeviceScene != snapshot->scene.get() ||
+             _impl->renderDeviceGeneration != _impl->activeGeneration)) {
             renderDevice->SceneChanged(*snapshot->scene);
             _impl->renderDeviceScene = snapshot->scene.get();
+            _impl->renderDeviceGeneration = _impl->activeGeneration;
         }
         width = _impl->width; height = _impl->height;
         generation = _impl->activeGeneration;

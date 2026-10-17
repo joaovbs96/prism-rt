@@ -192,7 +192,7 @@ HdRenderSettingDescriptorList PrismTaskDelegate::GetRenderSettingDescriptors() c
             {"Refinement delay (ms)", _refinementDelayMs, VtValue(100)},
             {"Environment sampling", _environmentSampling, VtValue(std::string("mis"))},
             {"Texture filtering", _textureFiltering, VtValue(std::string("filtered"))},
-            {"Device (auto, cpu, vulkan, metal)", _device, VtValue(std::string("auto"))},
+            {"Device (auto, cpu, cpu-reference, vulkan, metal)", _device, VtValue(std::string("auto"))},
             {"Resource revision", _resourceRevision, VtValue(0)},
             {"Selection outline", _selectionOutline, VtValue(true)},
             {"Selection outline radius", _selectionOutlineRadius, VtValue(2)},
@@ -347,7 +347,7 @@ void PrismTaskDelegate::SetRenderSetting(TfToken const &key, VtValue const &valu
             ? value.UncheckedGet<std::string>()
             : value.UncheckedGet<TfToken>().GetString();
         if (!prism::device::ParseDevicePreference(name, &s.device)) {
-            TF_WARN("PrismRT: prism:device must be auto, cpu, vulkan or metal; retaining the previous device");
+            TF_WARN("PrismRT: prism:device must be auto, cpu, cpu-reference, vulkan or metal; retaining the previous device");
             return;
         }
     }
