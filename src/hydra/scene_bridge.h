@@ -1,5 +1,6 @@
 #pragma once
 
+#include "../device/device.h"
 #include "../texture_service.h"
 #include "published_pick_scene.h"
 
@@ -46,6 +47,8 @@ struct RenderSettings {
         prism::TextureFiltering::Filtered;
     enum class EnvironmentSampling { Mis, Bsdf } environmentSampling =
         EnvironmentSampling::Mis;
+    // Requested render device; unavailable GPU devices fall back to the CPU.
+    prism::device::DevicePreference device = prism::device::DevicePreference::Auto;
 };
 
 enum class SceneDirtyKind : unsigned int {

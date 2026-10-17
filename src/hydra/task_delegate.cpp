@@ -41,6 +41,7 @@ TfToken const _previewMaxDimension("prism:previewMaxDimension");
 TfToken const _refinementDelayMs("prism:refinementDelayMs");
 TfToken const _environmentSampling("prism:environmentSampling");
 TfToken const _textureFiltering("prism:textureFiltering");
+TfToken const _device("prism:device");
 TfToken const _resourceRevision("prism:resourceRevision");
 TfToken const _selectionOutline("prism:selectionOutline");
 TfToken const _selectionOutlineRadius("prism:selectionOutlineRadius");
@@ -191,6 +192,7 @@ HdRenderSettingDescriptorList PrismTaskDelegate::GetRenderSettingDescriptors() c
             {"Refinement delay (ms)", _refinementDelayMs, VtValue(100)},
             {"Environment sampling", _environmentSampling, VtValue(std::string("mis"))},
             {"Texture filtering", _textureFiltering, VtValue(std::string("filtered"))},
+            {"Device (auto, cpu, vulkan, metal)", _device, VtValue(std::string("auto"))},
             {"Resource revision", _resourceRevision, VtValue(0)},
             {"Selection outline", _selectionOutline, VtValue(true)},
             {"Selection outline radius", _selectionOutlineRadius, VtValue(2)},
@@ -220,6 +222,7 @@ VtValue PrismTaskDelegate::GetRenderSetting(TfToken const &key) const
         s.textureFiltering == prism::TextureFiltering::Filtered
             ? "filtered" : "bilinear"));
     if (key == _resourceRevision) return VtValue(s.resourceRevision);
+    if (key == _device) return VtValue(std::string(prism::device::ToString(s.device)));
     if (key == _selectionOutline)
         return VtValue(_selectionSettings->enableOutline.load());
     if (key == _selectionOutlineRadius)
@@ -338,6 +341,16 @@ void PrismTaskDelegate::SetRenderSetting(TfToken const &key, VtValue const &valu
     }
     else if (key == _resourceRevision)
         s.resourceRevision = _Get(value, s.resourceRevision);
+    else if (key == _device &&
+             (value.IsHolding<std::string>() || value.IsHolding<TfToken>())) {
+        const std::string name = value.IsHolding<std::string>()
+            ? value.UncheckedGet<std::string>()
+            : value.UncheckedGet<TfToken>().GetString();
+        if (!prism::device::ParseDevicePreference(name, &s.device)) {
+            TF_WARN("PrismRT: prism:device must be auto, cpu, vulkan or metal; retaining the previous device");
+            return;
+        }
+    }
     else return;
     if (_bridge) _bridge->SetSettings(s);
 }

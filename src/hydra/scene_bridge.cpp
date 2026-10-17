@@ -3866,8 +3866,6 @@ void _RefreshMaterials(HdSceneIndexBaseRefPtr const &index,
     }
 }
 
-using RayPair = prism::CameraRayPair;
-
 prism::CameraRayParameters _CameraParameters(CameraState const &camera)
 {
     prism::CameraRayParameters parameters;
@@ -3888,10 +3886,12 @@ prism::CameraRayParameters _CameraParameters(CameraState const &camera)
 class PublishedSnapshotPickScene final : public PublishedPickScene {
 public:
     PublishedSnapshotPickScene(std::shared_ptr<const Snapshot> snapshot,
-        CameraState const& camera, unsigned int width, unsigned int height)
+        CameraState const& camera, unsigned int width, unsigned int height,
+        std::shared_ptr<prism::device::RenderDevice> renderDevice)
         : snapshot(std::move(snapshot)), camera(camera),
           parameters(_CameraParameters(camera)), width(width), height(height),
-          device(this->snapshot->device) { rtcRetainDevice(device); }
+          device(this->snapshot->device), renderDevice(std::move(renderDevice))
+    { rtcRetainDevice(device); }
     ~PublishedSnapshotPickScene() override {
         // Release all Embree scenes/geometries before the explicit device pin.
         snapshot.reset();
@@ -3901,7 +3901,7 @@ public:
         if (!result || x>=width || y>=height) return false;
         const RTCRay ray=prism::MakeCameraRayWithLens(parameters,
             static_cast<float>(x)+.5f,static_cast<float>(y)+.5f,width,height,nullptr);
-        RTCRayHit raw=snapshot->scene->intersectRaw(prism::PathRay{ray,{}});
+        RTCRayHit raw=renderDevice->Intersect(*snapshot->scene, prism::PathRay{ray,{}});
         if(raw.hit.geomID==RTC_INVALID_GEOMETRY_ID) return false;
         const unsigned int placementId=raw.hit.instID[0]!=RTC_INVALID_GEOMETRY_ID
             ? raw.hit.instID[0] : raw.hit.geomID;
@@ -3961,15 +3961,7 @@ private:
     prism::CameraRayParameters parameters;
     unsigned int width,height;
     RTCDevice device;
-};
-
-// Count actual ray work once per task, including work abandoned by a stop.
-struct PixelWorkCounter {
-    std::atomic<uint64_t> &total;
-    uint64_t pixels = 0;
-    ~PixelWorkCounter() {
-        if (pixels) total.fetch_add(pixels, std::memory_order_relaxed);
-    }
+    std::shared_ptr<prism::device::RenderDevice> renderDevice;
 };
 
 struct PreviewResult {
@@ -4064,7 +4056,8 @@ PreviewResult _RenderPreview(std::shared_ptr<Snapshot> const &snapshot,
     HdRenderPassAovBindingVector const &bindings,
     unsigned int width, unsigned int height, HdRenderThread *renderThread,
     std::shared_ptr<const PublishedFrame> const &frame,
-    std::atomic<uint64_t> &colorTracedPixels)
+    std::atomic<uint64_t> &colorTracedPixels,
+    prism::device::RenderDevice &renderDevice)
 {
     PreviewResult result;
     if (!snapshot || !snapshot->scene || width == 0 || height == 0)
@@ -4129,73 +4122,41 @@ PreviewResult _RenderPreview(std::shared_ptr<Snapshot> const &snapshot,
         result.publishedBytes += static_cast<uint64_t>(width) * height *
             HdDataSizeOfFormat(target.buffer->GetFormat());
 
-    prism::CameraRayParameters const cameraParameters =
-        _CameraParameters(camera);
-    std::atomic<bool> cancelled{false};
-    tbb::parallel_for(
-        tbb::blocked_range2d<unsigned int>(
-            0, result.height, 4, 0, result.width, 8),
-        [&](tbb::blocked_range2d<unsigned int> const &range) {
-    PixelWorkCounter colorWork{colorTracedPixels};
-    if (cancelled.load(std::memory_order_relaxed)) return;
-    for (unsigned int py = range.rows().begin();
-         py != range.rows().end(); ++py) {
-        if (renderThread && renderThread->IsStopRequested()) {
-            cancelled.store(true, std::memory_order_relaxed);
-            return;
-        }
-        const unsigned int y = std::min(height - 1,
-            static_cast<unsigned int>((static_cast<uint64_t>(2 * py + 1) *
-                                       height) / (2 * result.height)));
-        for (unsigned int px = range.cols().begin();
-             px != range.cols().end(); ++px) {
-            const unsigned int x = std::min(width - 1,
-                static_cast<unsigned int>((static_cast<uint64_t>(2 * px + 1) *
-                                           width) / (2 * result.width)));
-            unsigned int seed = tea<64>(
-                ((py * result.width + px) ^ settings.seed) ^ 0x9e3779b9u,
-                (px + 0x85ebca6bu) ^ (py * 0xc2b2ae35u));
-            RayPair rays = prism::GenerateCameraRays(
-                cameraParameters, x, y, width, height, seed);
-            SceneManager::PrimaryOutcome outcome = SceneManager::PrimaryOutcome::Unresolved;
-            Color3 color = snapshot->scene->trace(
-                prism::PathRay{rays.sampled, rays.footprint},
-                0, Color3(1.0f), seed, &outcome);
-            ++colorWork.pixels;
-            const float coverage = (snapshot->domeCount == 0 || !settings.domeLightCameraVisibility) &&
-                outcome == SceneManager::PrimaryOutcome::Escaped ? 0.0f : 1.0f;
-            if (coverage == 0.0f) color = Color3(0.0f);
-            if (settings.sampleClamp > 0.0f) {
-                const float peak = color.max_component();
-                if (peak > settings.sampleClamp)
-                    color *= settings.sampleClamp / peak;
+    prism::device::PreviewRequest request;
+    request.camera = _CameraParameters(camera);
+    request.width = width;
+    request.height = height;
+    request.previewWidth = result.width;
+    request.previewHeight = result.height;
+    request.seed = static_cast<unsigned int>(settings.seed);
+    request.shading.sampleClamp = settings.sampleClamp;
+    request.shading.exposureScale = camera.linearExposureScale;
+    request.shading.transparentEscapes =
+        snapshot->domeCount == 0 || !settings.domeLightCameraVisibility;
+    request.tracePrimary = needPrimary;
+    request.colorPixels = &colorTracedPixels;
+    request.stopRequested = [renderThread] {
+        return renderThread && renderThread->IsStopRequested();
+    };
+    request.writePixel = [&](unsigned int px, unsigned int py, Color3 const &color,
+                             float coverage, RayHit const *primary) {
+        const size_t pixel =
+            (static_cast<size_t>(result.height - 1 - py) * result.width + px);
+        for (Target &target : targets) {
+            if (target.name == HdAovTokens->color) {
+                float *dst = target.floats.data() + pixel * 4;
+                dst[0] = color.x(); dst[1] = color.y();
+                dst[2] = color.z(); dst[3] = coverage;
+                continue;
             }
-            color *= camera.linearExposureScale;
-            std::optional<RayHit> primary;
-            if (needPrimary)
-                primary.emplace(snapshot->scene->cast_ray(rays.center));
-            const size_t pixel =
-                (static_cast<size_t>(result.height - 1 - py) * result.width + px);
-
-            for (Target &target : targets) {
-                if (target.name == HdAovTokens->color) {
-                    float *dst = target.floats.data() + pixel * 4;
-                    dst[0] = color.x(); dst[1] = color.y();
-                    dst[2] = color.z(); dst[3] = coverage;
-                    continue;
-                }
-                if (!primary) continue;
-                const AovKind kind = _AovKind(target.name);
-                _ResolvePrimaryAov(kind, *primary, camera, snapshot.get(),
-                    target.floats.empty() ? nullptr : target.floats.data() + pixel * target.components,
-                    target.ints.empty() ? nullptr : target.ints.data() + pixel);
-            }
+            if (!primary) continue;
+            const AovKind kind = _AovKind(target.name);
+            _ResolvePrimaryAov(kind, *primary, camera, snapshot.get(),
+                target.floats.empty() ? nullptr : target.floats.data() + pixel * target.components,
+                target.ints.empty() ? nullptr : target.ints.data() + pixel);
         }
-    }
-        });
-
-    if (cancelled.load(std::memory_order_relaxed) ||
-        (renderThread && renderThread->IsStopRequested())) return result;
+    };
+    if (!renderDevice.RenderPreview(*snapshot->scene, request)) return result;
     auto const publicationStart = std::chrono::steady_clock::now();
     for (Target const &target : targets) {
         if (!target.ints.empty())
@@ -4272,6 +4233,12 @@ public:
     {
         if (device)
             rtcSetDeviceMemoryMonitorFunction(device, &Impl::MemoryMonitor, this);
+        // PRISM_DEVICE selects the initial device; a prism:device render setting
+        // overrides it.
+        if (const char *value = std::getenv("PRISM_DEVICE"); value && *value) {
+            if (!prism::device::ParseDevicePreference(value, &settings.device))
+                TF_WARN("PrismRT: ignoring PRISM_DEVICE=%s (expected auto, cpu, vulkan or metal)", value);
+        }
         if (const char *value = std::getenv("PRISM_PROFILE_BUFFERS"))
             profileBufferWrites = value[0] != '\0' && std::strcmp(value, "0") != 0;
         try {
@@ -4289,6 +4256,24 @@ public:
         } catch (std::exception const &e) {
             TF_WARN("PrismRT: MDL initialization failed: %s", e.what());
         }
+    }
+
+    // Returns the render device for the requested preference, creating it on
+    // first use or when the preference changed. Caller holds mutex.
+    std::shared_ptr<prism::device::RenderDevice> RenderDeviceLocked(
+        prism::device::DevicePreference preference)
+    {
+        if (!renderDevice || renderDevicePreference != preference) {
+            std::string note;
+            renderDevice = prism::device::CreateDevice(preference, &note);
+            renderDevicePreference = preference;
+            renderDeviceScene = nullptr;
+            if (!note.empty()) TF_WARN("PrismRT: %s", note.c_str());
+            const auto info = renderDevice->Info();
+            TF_STATUS("PrismRT: rendering on %s device: %s",
+                prism::device::ToString(info.kind), info.name.c_str());
+        }
+        return renderDevice;
     }
 
     // Builds the second bank for the snapshot just published, from the same
@@ -4378,6 +4363,10 @@ public:
     HdSceneIndexBaseRefPtr sceneIndex;
     HdRenderThread *renderThread;
     RTCDevice device = nullptr;
+    // Executes the per-pixel work; recreated when the device setting changes.
+    std::shared_ptr<prism::device::RenderDevice> renderDevice;
+    prism::device::DevicePreference renderDevicePreference = prism::device::DevicePreference::Auto;
+    SceneManager const *renderDeviceScene = nullptr;
     std::atomic<int64_t> embreeLiveBytes{0};
     std::atomic<int64_t> embreePeakBytes{0};
     mutable std::mutex mutex;
@@ -4661,7 +4650,8 @@ void SceneBridge::SetSettings(RenderSettings const &settings)
             current.hiddenGeometryBudgetMiB == settings.hiddenGeometryBudgetMiB &&
             current.textureFiltering == settings.textureFiltering &&
             current.domeLightCameraVisibility == settings.domeLightCameraVisibility &&
-            current.environmentSampling == settings.environmentSampling)
+            current.environmentSampling == settings.environmentSampling &&
+            current.device == settings.device)
             return;
         imageChanged = current.maxDepth != settings.maxDepth ||
             current.rouletteDepth != settings.rouletteDepth ||
@@ -4671,7 +4661,8 @@ void SceneBridge::SetSettings(RenderSettings const &settings)
             current.sphereBatching != settings.sphereBatching ||
             current.textureFiltering != settings.textureFiltering ||
             current.environmentSampling != settings.environmentSampling ||
-            current.domeLightCameraVisibility != settings.domeLightCameraVisibility;
+            current.domeLightCameraVisibility != settings.domeLightCameraVisibility ||
+            current.device != settings.device;
         budgetChanged = current.samples != settings.samples;
         if (budgetChanged && !imageChanged && _converged.load() &&
             _impl->samples.load() != 0 &&
@@ -5656,10 +5647,17 @@ void SceneBridge::Render()
     uint64_t generation = 0;
     uint64_t cameraRevision = 0;
     unsigned int width, height;
+    std::shared_ptr<prism::device::RenderDevice> renderDevice;
     {
         std::lock_guard lock(_impl->mutex);
         snapshot = _impl->snapshot; camera = _impl->camera;
         bindings = _impl->bindings; settings = _impl->settings;
+        renderDevice = _impl->RenderDeviceLocked(settings.device);
+        if (snapshot && snapshot->scene &&
+            _impl->renderDeviceScene != snapshot->scene.get()) {
+            renderDevice->SceneChanged(*snapshot->scene);
+            _impl->renderDeviceScene = snapshot->scene.get();
+        }
         width = _impl->width; height = _impl->height;
         generation = _impl->activeGeneration;
         cameraRevision = _impl->cameraRevision;
@@ -5721,7 +5719,7 @@ void SceneBridge::Render()
         initialFrame->cameraRevision = cameraRevision;
         initialFrame->picking = snapshot->picking;
         initialFrame->pickScene = std::make_shared<PublishedSnapshotPickScene>(
-            snapshot, camera, width, height);
+            snapshot, camera, width, height, renderDevice);
         initialFrame->camera = camera;
         initialFrame->width = width;
         initialFrame->height = height;
@@ -5749,7 +5747,7 @@ void SceneBridge::Render()
         auto const previewStart = std::chrono::steady_clock::now();
         PreviewResult const preview = _RenderPreview(
             snapshot, camera, previewSettings, bindings, width, height,
-            _impl->renderThread, frame, _impl->colorTracedPixels);
+            _impl->renderThread, frame, _impl->colorTracedPixels, *renderDevice);
         if (_impl->renderThread->IsStopRequested()) return;
         {
             std::lock_guard lock(_impl->mutex);
@@ -5878,6 +5876,10 @@ void SceneBridge::Render()
         _impl->tileWidth = width; _impl->tileHeight = height;
     }
     auto const &tiles = _impl->refinementTiles;
+    std::vector<prism::device::PixelTile> deviceTiles;
+    deviceTiles.reserve(tiles.size());
+    for (auto const &tile : tiles)
+        deviceTiles.push_back({tile.x, tile.y, tile.width, tile.height, tile.index});
     uint64_t presentationRevision = 0;
     for (int sample = firstSample; sample < sampleCount; ++sample) {
         if (_impl->renderThread->IsStopRequested()) return;
@@ -5913,7 +5915,44 @@ void SceneBridge::Render()
         std::condition_variable completion;
         bool finished = false;
         double waitMilliseconds = 0, payloadMilliseconds = 0, publicationMilliseconds = 0;
-        // One pass-wide TBB job replaces the barrier after each 64 tiles.
+        prism::device::PassRequest passRequest;
+        passRequest.camera = cameraParameters;
+        passRequest.width = width;
+        passRequest.height = height;
+        passRequest.seed = static_cast<unsigned int>(settings.seed);
+        passRequest.sample = sample;
+        passRequest.shading.sampleClamp = settings.sampleClamp;
+        passRequest.shading.exposureScale = camera.linearExposureScale;
+        passRequest.shading.transparentEscapes =
+            snapshot->domeCount == 0 || !settings.domeLightCameraVisibility;
+        passRequest.tiles = deviceTiles;
+        passRequest.traceColor = hasColor;
+        passRequest.tracePrimary = sample == 0 && !primaryPlanes.empty();
+        passRequest.rngStates = rngStates.data();
+        passRequest.colors = passColors.data();
+        passRequest.coverage = passCoverage.data();
+        passRequest.abandoned = [&] {
+            return abandonPass.load(std::memory_order_relaxed) ||
+                _impl->renderThread->IsStopRequested();
+        };
+        passRequest.paused = [&] { return _impl->renderThread->IsPauseRequested(); };
+        passRequest.resolvePrimary = [&](unsigned x, unsigned y, RayHit const &hit) {
+            const size_t pixel = static_cast<size_t>(y)*width+x;
+            for (auto &plane : primaryPlanes)
+                _ResolvePrimaryAov(plane.kind, hit, camera, snapshot.get(),
+                    plane.floats.empty() ? nullptr : plane.floats.data()+pixel*plane.components,
+                    plane.ints.empty() ? nullptr : plane.ints.data()+pixel);
+        };
+        passRequest.tileFinished = [&](size_t position) {
+            ready[position].store(true, std::memory_order_release);
+        };
+        // Reserve execution capacity for the host and coordinator.
+        passRequest.concurrency = std::max(1, tbb::this_task_arena::max_concurrency() - 2);
+        passRequest.colorPixels = &_impl->colorTracedPixels;
+        passRequest.geometricOnlyPixels = &_impl->geometricOnlyPixels;
+        passRequest.rayNanoseconds = &rayNanoseconds;
+        passRequest.primaryNanoseconds = &aovNanoseconds;
+        // One pass-wide device job replaces the barrier after each 64 tiles.
         // The coordinator alone owns presentation packets. Acquire/release
         // completion flags make only fully written tiles visible to it.
         auto worker = std::async(std::launch::async, [&] {
@@ -5922,86 +5961,7 @@ void SceneBridge::Render()
                 completion.notify_one();
             };
             try {
-                // Reserve execution capacity for the host and coordinator.
-                // A private arena also prevents publication waits from
-                // borrowing long-running ray tasks from this pass.
-                const int concurrency = std::max(1, tbb::this_task_arena::max_concurrency() - 2);
-                tbb::task_arena renderArena(concurrency);
-                renderArena.execute([&] {
-                    tbb::parallel_for(tbb::blocked_range<size_t>(0, tiles.size(), 1),
-                        [&](tbb::blocked_range<size_t> const &range) {
-                            PixelWorkCounter colorWork{_impl->colorTracedPixels};
-                            PixelWorkCounter geometricWork{_impl->geometricOnlyPixels};
-                            uint64_t rayNs = 0, aovNs = 0;
-                            std::array<RTCRay, RefinementTileSize * RefinementTileSize> centers;
-                            for (size_t tileIndex = range.begin(); tileIndex != range.end(); ++tileIndex) {
-                                while (_impl->renderThread->IsPauseRequested()) {
-                                    if (abandonPass.load(std::memory_order_relaxed) ||
-                                        _impl->renderThread->IsStopRequested()) return;
-                                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
-                                }
-                                auto const &tile = tiles[tileIndex];
-                                auto rayStart = Clock::now();
-                                for (unsigned y = tile.y; y < tile.y + tile.height; ++y) {
-                                    if (abandonPass.load(std::memory_order_relaxed) ||
-                                        _impl->renderThread->IsStopRequested()) return;
-                                    for (unsigned x = tile.x; x < tile.x + tile.width; ++x) {
-                                        const size_t pixel = static_cast<size_t>(y) * width + x;
-                                        if (!hasColor) {
-                                            centers[(y-tile.y)*tile.width+x-tile.x] =
-                                                prism::MakeCameraRayWithLens(cameraParameters,
-                                                    static_cast<float>(x) + 0.5f,
-                                                    static_cast<float>(y) + 0.5f,
-                                                    width, height, nullptr);
-                                            continue;
-                                        }
-                                        unsigned int &seed = rngStates[pixel];
-                                        if (sample == 0) seed = tea<64>((y * width) ^ settings.seed, x);
-                                        RayPair rays = prism::GenerateCameraRays(
-                                            cameraParameters, x, y, width, height, seed);
-                                        if (sample == 0 && !primaryPlanes.empty())
-                                            centers[(y-tile.y)*tile.width+x-tile.x] = rays.center;
-                                        SceneManager::PrimaryOutcome outcome = SceneManager::PrimaryOutcome::Unresolved;
-                                        Color3 c = snapshot->scene->trace(
-                                            prism::PathRay{rays.sampled, rays.footprint},
-                                            0, Color3(1.0f), seed, &outcome);
-                                        ++colorWork.pixels;
-                                        const float coverage = (snapshot->domeCount == 0 || !settings.domeLightCameraVisibility) &&
-                                            outcome == SceneManager::PrimaryOutcome::Escaped ? 0.0f : 1.0f;
-                                        if (coverage == 0.0f) c = Color3(0.0f);
-                                        if (settings.sampleClamp > 0.0f) {
-                                            const float peak = c.max_component();
-                                            if (peak > settings.sampleClamp) c *= settings.sampleClamp / peak;
-                                        }
-                                        c *= camera.linearExposureScale;
-                                        passColors[pixel] = c;
-                                        passCoverage[pixel] = coverage;
-                                    }
-                                }
-                                auto aovStart = Clock::now();
-                                rayNs += std::chrono::duration_cast<std::chrono::nanoseconds>(aovStart-rayStart).count();
-                                if (sample == 0 && !primaryPlanes.empty()) {
-                                    for (unsigned y = tile.y; y < tile.y + tile.height; ++y) {
-                                        if (abandonPass.load(std::memory_order_relaxed) ||
-                                            _impl->renderThread->IsStopRequested()) return;
-                                        for (unsigned x = tile.x; x < tile.x + tile.width; ++x) {
-                                            const size_t pixel = static_cast<size_t>(y)*width+x;
-                                            const auto hit = snapshot->scene->cast_ray(centers[(y-tile.y)*tile.width+x-tile.x]);
-                                            if (!hasColor) ++geometricWork.pixels;
-                                            for (auto &plane : primaryPlanes)
-                                                _ResolvePrimaryAov(plane.kind, hit, camera, snapshot.get(),
-                                                    plane.floats.empty() ? nullptr : plane.floats.data()+pixel*plane.components,
-                                                    plane.ints.empty() ? nullptr : plane.ints.data()+pixel);
-                                        }
-                                    }
-                                }
-                                aovNs += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-aovStart).count();
-                                ready[tileIndex].store(true, std::memory_order_release);
-                            }
-                            rayNanoseconds.fetch_add(rayNs, std::memory_order_relaxed);
-                            aovNanoseconds.fetch_add(aovNs, std::memory_order_relaxed);
-                        });
-                });
+                renderDevice->RenderPass(*snapshot->scene, passRequest);
             } catch (...) { finish(); throw; }
             finish();
         });

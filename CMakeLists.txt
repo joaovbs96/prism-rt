@@ -395,6 +395,10 @@ if(PRISM_BUILD_HYDRA)
     add_executable(prism_texture_digest tests/texture_digest.cpp)
     target_link_libraries(prism_texture_digest PRIVATE PrismRT::core)
 
+    add_executable(prism_device_selection_test tests/device_selection.cpp)
+    target_link_libraries(prism_device_selection_test PRIVATE PrismRT::core)
+    add_test(NAME prism_device_selection_test COMMAND prism_device_selection_test)
+
     add_executable(prism_ray_footprint_test tests/ray_footprint.cpp)
     target_link_libraries(prism_ray_footprint_test PRIVATE PrismRT::core)
     add_test(NAME prism_ray_footprint_test COMMAND prism_ray_footprint_test)

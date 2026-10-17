@@ -2,6 +2,7 @@
 #include "scene.h"
 #include "camera_rays.h"
 #include "camera_ray_diagnostics.h"
+#include "device/device.h"
 #include <pxr/usd/usdGeom/camera.h>
 #include <pxr/usd/usdLux/domeLight.h>
 #include <pxr/usd/usdRender/settings.h>
@@ -21,6 +22,7 @@ namespace {
 struct Options {
     std::string scene, camera, environment, output = "output.exr";
     std::string exportScene, environmentSampling = "mis", textureFiltering = "filtered";
+    prism::device::DevicePreference device = prism::device::DevicePreference::Auto;
     std::optional<Float3> cameraPosition, cameraTarget;
     std::optional<Color3> environmentColor;
     Float3 cameraUp{0, 1, 0};
@@ -43,6 +45,8 @@ void help() {
         "  --max-sample-radiance 10 --output output.exr\n"
         "  --environment-sampling mis|bsdf (default mis)\n"
         "  --texture-filtering filtered|bilinear (default filtered)\n"
+        "  --device auto|cpu|vulkan|metal (default auto: GPU if available, else CPU)\n"
+        "PrismRT --list-devices\n"
         "EXR output is linear after the sample clamp; other formats use gamma 2.2.\n"
         "The environment option follows the original EnvironmentMap radiance convention.\n"
         "Without --env, USD scenes use their authored dome lighting.\n";
@@ -89,6 +93,10 @@ Options parse(int argc, char** argv) {
         else if (key == "--defocus-angle") { o.defocusAngle = number(value); o.explicitLens = true; }
         else if (key == "--environment-sampling") o.environmentSampling = value;
         else if (key == "--texture-filtering") o.textureFiltering = value;
+        else if (key == "--device") {
+            if (!prism::device::ParseDevicePreference(value, &o.device))
+                throw std::runtime_error("--device must be auto, cpu, vulkan or metal");
+        }
         else if (key == "--env") o.environment = value;
         else if (key == "--env-color") o.environmentColor = triple(value);
         else if (key == "--output") o.output = value;
@@ -154,18 +162,11 @@ struct UsdCameraRays {
             c.GetFocalLength() * GfCamera::FOCAL_LENGTH_UNIT, c.GetFStop());
         parameters.focusDistance = c.GetFocusDistance();
     }
-    prism::PathRay ray(int x, int y, int width, int height, unsigned& seed) const {
-        const auto pair = prism::GenerateCameraRays(
-            parameters, static_cast<unsigned int>(x),
-            static_cast<unsigned int>(y), static_cast<unsigned int>(width),
-            static_cast<unsigned int>(height), seed);
-        return {pair.sampled, pair.footprint};
-    }
 };
 
-struct Device {
+struct EmbreeDevice {
     RTCDevice value = rtcNewDevice(nullptr);
-    ~Device() { if (value) rtcReleaseDevice(value); }
+    ~EmbreeDevice() { if (value) rtcReleaseDevice(value); }
 };
 struct SceneRelease {
     SceneManager& manager;
@@ -187,8 +188,14 @@ int runStandaloneCli(int argc, char** argv) {
             help();
             return 0;
         }
+        if (argc == 2 && std::string(argv[1]) == "--list-devices") {
+            for (auto const& info : prism::device::AvailableDevices())
+                std::cout << prism::device::ToString(info.kind) << ": " << info.name
+                          << (info.hardwareRayTracing ? " (hardware ray tracing)" : "") << '\n';
+            return 0;
+        }
         Options o = parse(argc, argv);
-        Device device;
+        EmbreeDevice device;
         if (!device.value) throw std::runtime_error("Cannot create Embree device");
         if (!o.exportScene.empty()) {
             unsigned seed = o.seed;
@@ -311,24 +318,22 @@ int runStandaloneCli(int argc, char** argv) {
             }
         }
         scene.commitScene();
+        std::string deviceNote;
+        auto renderDevice = prism::device::CreateDevice(o.device, &deviceNote);
+        if (!deviceNote.empty()) std::cerr << "PrismRT: " << deviceNote << '\n';
+        const auto deviceInfo = renderDevice->Info();
+        std::cout << "Rendering on " << prism::device::ToString(deviceInfo.kind) << " device: "
+                  << deviceInfo.name << '\n';
+        renderDevice->SceneChanged(scene);
         const double loadSeconds = seconds();
-        std::vector<float> pixels(size_t(o.width)*o.height*3);
-        tbb::parallel_for(0, o.height, [&](int y) {
-            for (int x = 0; x < o.width; ++x) {
-                unsigned seed = tea<64>(unsigned(y*o.width) ^ o.seed, unsigned(x));
-                Color3 sum(0);
-                for (int sample = 0; sample < o.samples; ++sample) {
-                    const auto r = rays.ray(x, y, o.width, o.height, seed);
-                    Color3 value = scene.trace(r, 0, Float3(1), seed);
-                    const float peak = value.max_component();
-                    if (o.clamp > 0 && peak > o.clamp) value *= o.clamp / peak;
-                    sum += value;
-                }
-                sum /= float(o.samples);
-                const size_t offset = (size_t(y)*o.width+x)*3;
-                for (int c = 0; c < 3; ++c) pixels[offset+c] = sum[c];
-            }
-        });
+        prism::device::ImageRequest imageRequest;
+        imageRequest.camera = rays.parameters;
+        imageRequest.width = static_cast<unsigned>(o.width);
+        imageRequest.height = static_cast<unsigned>(o.height);
+        imageRequest.samples = o.samples;
+        imageRequest.seed = o.seed;
+        imageRequest.sampleClamp = o.clamp;
+        const std::vector<float> pixels = renderDevice->RenderImage(scene, imageRequest);
         const double renderSeconds = seconds() - loadSeconds;
         OIIO::ImageSpec spec(o.width, o.height, 3, OIIO::TypeDesc::FLOAT);
         OIIO::ImageBuf image(spec);
