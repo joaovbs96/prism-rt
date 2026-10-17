@@ -25,6 +25,11 @@
 // SceneManager::traceEnvironmentMis, which this file replaces by loops.
 // Another integrator can replace this file as long as it uses the same
 // backend interface and provides prism_render_sample.
+//
+// GPU shading languages inline every call, and each material entry point
+// expands to the code of every MDL program in the scene. Keep exactly one
+// call site per backend material function (prepare, sample, evaluate,
+// cutout) in an integrator, or the kernel grows and compiles accordingly.
 
 #ifndef PRISM_PATH_TRACER_INC
 #define PRISM_PATH_TRACER_INC
@@ -80,11 +85,16 @@ PRISM_INLINE bool prism_environment_visible(PathRay shadow, INOUT(uint) seed)
     return false;
 }
 
-// SceneManager::traceEnvironmentMis: BSDF sampling and environment NEE with
-// the power heuristic, Russian roulette, and cutout null events (which do
-// not count as bounces, at most 64 in a row).
-PRISM_INLINE float3 prism_trace_mis(PathRay ray, INOUT(uint) seed, INOUT(uint) primaryOutcome)
+// SceneManager::traceEnvironmentMis and SceneManager::trace as one loop, so
+// that GPU backends inline every material entry point once.
+//
+// With environment MIS: BSDF sampling and environment NEE with the power
+// heuristic; cutout null events do not count as bounces (at most 64 in a
+// row). Without it: BSDF sampling only, and null events are bounces. Both
+// use Russian roulette from the roulette depth on.
+PRISM_INLINE float3 prism_trace(PathRay ray, INOUT(uint) seed, INOUT(uint) primaryOutcome)
 {
+    bool mis = backend_environment_mis();
     int maxDepth = backend_max_depth();
     int rouletteDepth = backend_roulette_depth();
     float3 radiance = splat3(0.0f);
@@ -102,15 +112,17 @@ PRISM_INLINE float3 prism_trace_mis(PathRay ray, INOUT(uint) seed, INOUT(uint) p
             if (tracking) primaryOutcome = PRISM_PRIMARY_ESCAPED;
             float3 direction = normalize(ray.ray.direction);
             float3 li = backend_environment_radiance(direction, prism_angular_radius(ray.footprint));
-            float lightPdf = backend_environment_pdf(direction);
-            radiance += weight * li * (previousNee ? prism_power_heuristic(previousPdf, lightPdf) : 1.0f);
+            float misWeight = 1.0f;
+            if (mis && previousNee)
+                misWeight = prism_power_heuristic(previousPdf, backend_environment_pdf(direction));
+            radiance += weight * li * misWeight;
             break;
         }
         MaterialContext context;
         backend_prepare_material(hit, context);
         BsdfSample bs = backend_sample_material(hit, context, seed);
         radiance += weight * bs.emission;
-        if (bs.null_event) {
+        if (mis && bs.null_event) {
             if (!bs.scattered) tracking = false;
             if (nullCrossings >= 64) break;
             weight *= bs.color;
@@ -119,12 +131,12 @@ PRISM_INLINE float3 prism_trace_mis(PathRay ray, INOUT(uint) seed, INOUT(uint) p
             ++nullCrossings;
             continue;
         }
-        if (tracking) {
+        if (!bs.null_event && tracking) {
             primaryOutcome = PRISM_PRIMARY_ACCEPTED;
             tracking = false;
         }
         // At the depth boundary the competing continuation is truncated too.
-        bool canNee = depth + 1 < maxDepth && backend_supports_nee(hit, context);
+        bool canNee = mis && depth + 1 < maxDepth && backend_supports_nee(hit, context);
         if (canNee) {
             EnvironmentSample light = backend_environment_sample(
                 seed, prism_angular_radius(hit.ray_footprint));
@@ -149,57 +161,11 @@ PRISM_INLINE float3 prism_trace_mis(PathRay ray, INOUT(uint) seed, INOUT(uint) p
         previousNee = canNee && !bs.delta && !bs.null_event && bs.pdf > 0.0f;
         previousPdf = bs.pdf;
         weight *= bs.color * rouletteWeight;
-        ray = prism_spawn_ray(hit, bs.wi, false);
+        ray = prism_spawn_ray(hit, bs.wi, bs.null_event);
         ++depth;
         nullCrossings = 0;
     }
     return radiance;
-}
-
-// SceneManager::trace without environment sampling (BSDF sampling only).
-PRISM_INLINE float3 prism_trace_bsdf(PathRay ray, INOUT(uint) seed, INOUT(uint) primaryOutcome)
-{
-    int maxDepth = backend_max_depth();
-    int rouletteDepth = backend_roulette_depth();
-    float3 radiance = splat3(0.0f);
-    float3 weight = splat3(1.0f);
-    float3 throughput = splat3(1.0f);
-    bool tracking = true;
-    for (int depth = 0; depth < maxDepth; ++depth) {
-        Hit hit = backend_intersect(ray);
-        if (!hit.hit) {
-            if (tracking) primaryOutcome = PRISM_PRIMARY_ESCAPED;
-            radiance += weight * backend_environment_radiance(
-                normalize(hit.d), prism_angular_radius(ray.footprint));
-            break;
-        }
-        MaterialContext context;
-        backend_prepare_material(hit, context);
-        BsdfSample bs = backend_sample_material(hit, context, seed);
-        if (!bs.null_event && tracking) {
-            primaryOutcome = PRISM_PRIMARY_ACCEPTED;
-            tracking = false;
-        }
-        radiance += weight * bs.emission;
-        if (!bs.scattered) break;
-        throughput *= bs.color;
-        float rouletteWeight = 1.0f;
-        if (depth >= rouletteDepth) {
-            float q = clamp(prism_max_component(throughput), 0.05f, 0.95f);
-            if (prism_rnd(seed) >= q) break;
-            rouletteWeight = 1.0f / q;
-        }
-        ray = prism_spawn_ray(hit, bs.wi, bs.null_event);
-        throughput *= rouletteWeight;
-        weight *= bs.color * rouletteWeight;
-    }
-    return radiance;
-}
-
-PRISM_INLINE float3 prism_trace(PathRay ray, INOUT(uint) seed, INOUT(uint) primaryOutcome)
-{
-    if (backend_environment_mis()) return prism_trace_mis(ray, seed, primaryOutcome);
-    return prism_trace_bsdf(ray, seed, primaryOutcome);
 }
 
 // ---------------------------------------------------------------------------

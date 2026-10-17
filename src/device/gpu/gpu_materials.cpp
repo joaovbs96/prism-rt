@@ -4,9 +4,14 @@
 #include "../../mdl/texture_runtime.h"
 
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <format>
+#include <filesystem>
+#include <fstream>
 #include <map>
+#include <mutex>
+#include <regex>
 #include <unordered_map>
 
 namespace prism::device::gpu {
@@ -69,6 +74,70 @@ void RemapResources(mi::neuraylib::ITarget_value_layout const* layout,
         RemapResources(layout, layout->get_nested_state(i, state), block, size, remap);
 }
 
+// What a compiled class can be specialized on: entry points whose
+// expression is constant need no generated code at all.
+struct ProgramTraits {
+    bool cutoutConstant = false;     // materials carry the constant opacity
+    int thinWalled = -1;             // -1: varying, else the constant value
+    bool emissionZero = false;
+    bool backfaceEmissionZero = false;
+};
+
+mi::base::Handle<const mi::neuraylib::IValue> ConstantValue(
+    mi::neuraylib::ICompiled_material const* material, const char* path)
+{
+    mi::base::Handle<const mi::neuraylib::IExpression> expression(material->lookup_sub_expression(path));
+    if (!expression || expression->get_kind() != mi::neuraylib::IExpression::EK_CONSTANT) return {};
+    mi::base::Handle<const mi::neuraylib::IExpression_constant> constant(
+        expression->get_interface<mi::neuraylib::IExpression_constant>());
+    return mi::base::Handle<const mi::neuraylib::IValue>(constant->get_value());
+}
+
+bool IsConstantBlack(mi::neuraylib::ICompiled_material const* material, const char* path)
+{
+    auto value = ConstantValue(material, path);
+    mi::base::Handle<const mi::neuraylib::IValue_compound> compound(
+        value ? value->get_interface<mi::neuraylib::IValue_compound>() : nullptr);
+    if (!compound) return false;
+    for (mi::Size i = 0; i < compound->get_size(); ++i) {
+        mi::base::Handle<const mi::neuraylib::IValue_float> component(
+            compound->get_value<mi::neuraylib::IValue_float>(i));
+        if (!component || component->get_value() != 0.0f) return false;
+    }
+    return true;
+}
+
+ProgramTraits TraitsOf(mi::neuraylib::ICompiled_material const* material)
+{
+    ProgramTraits traits;
+    if (auto value = ConstantValue(material, "geometry.cutout_opacity")) {
+        mi::base::Handle<const mi::neuraylib::IValue_float> opacity(
+            value->get_interface<mi::neuraylib::IValue_float>());
+        traits.cutoutConstant = opacity && std::isfinite(opacity->get_value());
+    }
+    if (auto value = ConstantValue(material, "thin_walled")) {
+        mi::base::Handle<const mi::neuraylib::IValue_bool> thin(
+            value->get_interface<mi::neuraylib::IValue_bool>());
+        if (thin) traits.thinWalled = thin->get_value() ? 1 : 0;
+    }
+    traits.emissionZero = IsConstantBlack(material, "surface.emission.intensity");
+    traits.backfaceEmissionZero = IsConstantBlack(material, "backface.emission.intensity");
+    return traits;
+}
+
+// Entry points a program needs, given its traits.
+bool NeedsEntry(ProgramTraits const& t, size_t entry)
+{
+    switch (entry) {
+    case E_EDF: case E_INTENSITY: return !t.emissionZero;
+    case E_CUTOUT: return !t.cutoutConstant;
+    case E_THIN_WALLED: return t.thinWalled < 0;
+    case E_BACK_BSDF: return t.thinWalled != 0;
+    case E_BACK_EDF: case E_BACK_INTENSITY: return t.thinWalled != 0 && !t.backfaceEmissionZero;
+    default: return true;
+    }
+}
+
 std::string ProgramFunction(uint32_t program, EntryIndex entry)
 {
     return std::format("prism_p{}_{}", program, kEntryPoints[entry].name);
@@ -77,7 +146,7 @@ std::string ProgramFunction(uint32_t program, EntryIndex entry)
 // The prism_mdl_* dispatch functions. Types are spelled the same in both
 // languages through the shader prelude (float3 maps to vec3 in GLSL).
 std::string GenerateDispatch(std::vector<std::array<bool, kEntryPointCount>> const& present,
-                             ShadingLanguage language)
+                             std::vector<ProgramTraits> const& traits, ShadingLanguage language)
 {
     const char* state = language == ShadingLanguage::Hlsl ? "Shading_state_material" : "State";
     const char* inoutState = "inout";
@@ -96,9 +165,26 @@ std::string GenerateDispatch(std::vector<std::array<bool, kEntryPointCount>> con
     s += std::format("void prism_mdl_init(uint program, {} {} state)\n{{\n", inoutState, state);
     s += cases(E_INIT, "{}(state); break;", "break;");
     s += "}\n\n";
+    // The cutout path's own init: only programs with a varying cutout.
+    s += std::format("void prism_mdl_init_cutout(uint program, {} {} state)\n{{\n", inoutState, state);
+    {
+        std::string body = "    switch (program) {\n";
+        for (size_t p = 0; p < present.size(); ++p)
+            if (present[p][E_CUTOUT])
+                body += std::format("    case {}u: {}(state); break;\n", p, ProgramFunction(uint32_t(p), E_INIT));
+        s += body + "    default: break;\n    }\n}\n\n";
+    }
     s += std::format("bool prism_mdl_thin_walled(uint program, {} {} state)\n{{\n", inoutState, state);
-    s += cases(E_THIN_WALLED, "return {}(state);", "return false;");
-    s += "}\n\n";
+    {
+        std::string body = "    switch (program) {\n";
+        for (size_t p = 0; p < present.size(); ++p) {
+            if (present[p][E_THIN_WALLED])
+                body += std::format("    case {}u: return {}(state);\n", p, ProgramFunction(uint32_t(p), E_THIN_WALLED));
+            else if (traits[p].thinWalled == 1)
+                body += std::format("    case {}u: return true;\n", p);
+        }
+        s += body + "    default: return false;\n    }\n}\n\n";
+    }
     s += std::format("float prism_mdl_cutout(uint program, {} {} state)\n{{\n", inoutState, state);
     s += cases(E_CUTOUT, "return {}(state);", "return 1.0;");
     s += "}\n\n";
@@ -122,6 +208,52 @@ std::string GenerateDispatch(std::vector<std::array<bool, kEntryPointCount>> con
     dfDispatch("prism_mdl_edf_evaluate", "Edf_evaluate_data", E_EDF, E_BACK_EDF, "_evaluate");
     return s;
 }
+
+// The code of one program translated alone, with its entry points named
+// as program 0, plus its own resources and read-only data. Programs whose
+// MDL classes differ only in names (MaterialX node names become parameter
+// names) produce equal keys and can share one program in the link unit:
+// their argument blocks then have the same layout.
+std::string StructuralKey(mi::neuraylib::IMdl_backend* backend, mi::neuraylib::ITransaction* transaction,
+                          mi::neuraylib::IMdl_execution_context* context,
+                          mi::neuraylib::ICompiled_material const* compiled, ProgramTraits const& traits)
+{
+    mi::base::Handle<mi::neuraylib::ILink_unit> unit(backend->create_link_unit(transaction, context));
+    if (!unit) return {};
+    std::vector<std::string> names;
+    std::vector<mi::neuraylib::Target_function_description> descs;
+    names.reserve(kEntryPointCount);
+    for (size_t e = 0; e < kEntryPointCount; ++e) {
+        if (!NeedsEntry(traits, e)) continue;
+        names.push_back(ProgramFunction(0, EntryIndex(e)));
+        descs.emplace_back(kEntryPoints[e].path, names.back().c_str());
+    }
+    if (unit->add_material(compiled, descs.data(), descs.size(), context) != 0) return {};
+    mi::base::Handle<const mi::neuraylib::ITarget_code> code(backend->translate_link_unit(unit.get(), context));
+    if (!code) return {};
+    std::string key = code->get_code();
+    for (size_t e = 0; e < descs.size(); ++e) key += std::format("|{}", descs[e].function_index);
+    // Image textures reached through arguments are rebound per material;
+    // only images the code names by a literal index identify the program.
+    static const std::regex literalTexture(
+        R"(tex_[a-z0-9_]*_2d\(\s*\d)");
+    const bool literalImages = std::regex_search(key, literalTexture);
+    for (mi::Size i = 1; i < code->get_texture_count(); ++i) {
+        const auto shape = code->get_texture_shape(i);
+        const char* name = code->get_texture(i);
+        const bool image = shape == mi::neuraylib::ITarget_code::Texture_shape_2d;
+        key += std::format("|t{}:{}", int(shape), image && !literalImages ? "" : (name ? name : ""));
+    }
+    for (mi::Size i = 0; i < code->get_ro_data_segment_count(); ++i)
+        key.append(code->get_ro_data_segment_data(i), code->get_ro_data_segment_size(i));
+    mi::base::Handle<mi::neuraylib::ITarget_value_layout const> layout(code->get_argument_block_layout(0));
+    key += std::format("|args{}", layout ? layout->get_size() : 0);
+    return key;
+}
+
+std::mutex gStructuralKeysMutex;
+// (program identity, language) -> structural key. Programs are immutable.
+auto& gStructuralKeys = *new std::map<std::pair<std::string, int>, std::string>();
 
 } // namespace
 
@@ -164,8 +296,7 @@ MdlShaderCode GenerateMdlShaderCode(std::vector<MDLMaterial const*> const& mater
     }
     result.programCount = uint32_t(programs.size());
     if (programs.empty()) {
-        std::vector<std::array<bool, kEntryPointCount>> none;
-        result.code = GenerateDispatch(none, language);
+        result.code = GenerateDispatch({}, {}, language);
         result.success = true;
         return result;
     }
@@ -182,6 +313,8 @@ MdlShaderCode GenerateMdlShaderCode(std::vector<MDLMaterial const*> const& mater
     auto fail = [&](std::string message) {
         result.success = false;
         result.error = std::move(message);
+        // Shaders still need the dispatch functions; every material is invalid.
+        result.code = GenerateDispatch({}, {}, language);
         transaction->abort();
         return result;
     };
@@ -196,28 +329,72 @@ MdlShaderCode GenerateMdlShaderCode(std::vector<MDLMaterial const*> const& mater
     backend->set_option("libbsdf_flags_in_bsdf_data", "off");
     if (language == ShadingLanguage::Glsl) backend->set_option("glsl_version", "460");
 
+    // Merge structurally identical programs.
+    {
+        std::map<std::string, uint32_t> canonical;
+        std::vector<uint32_t> remap(programs.size());
+        std::vector<mdl::CompiledProgram const*> unique;
+        for (size_t p = 0; p < programs.size(); ++p) {
+            const auto cacheKey = std::make_pair(programs[p]->identity + "|" +
+                programs[p]->compiled_material_name, int(language));
+            std::string key;
+            {
+                std::lock_guard lock(gStructuralKeysMutex);
+                if (auto found = gStructuralKeys.find(cacheKey); found != gStructuralKeys.end())
+                    key = found->second;
+            }
+            if (key.empty()) {
+                mi::base::Handle<const mi::neuraylib::ICompiled_material> compiled(
+                    transaction->access<mi::neuraylib::ICompiled_material>(
+                        programs[p]->compiled_material_name.c_str()));
+                if (compiled)
+                    key = StructuralKey(backend.get(), transaction.get(), executionContext.get(),
+                                        compiled.get(), TraitsOf(compiled.get()));
+                if (key.empty()) key = "unique:" + programs[p]->compiled_material_name;
+                if (const char* dir = std::getenv("PRISM_GPU_DUMP_PROGRAMS"); dir && *dir)
+                    std::ofstream(std::filesystem::path(dir) / std::format("program{}.{}", p,
+                        language == ShadingLanguage::Hlsl ? "hlsl" : "glsl")) << key;
+                std::lock_guard lock(gStructuralKeysMutex);
+                gStructuralKeys.emplace(cacheKey, key);
+            }
+            auto [found, inserted] = canonical.emplace(std::move(key), uint32_t(unique.size()));
+            if (inserted) unique.push_back(programs[p]);
+            remap[p] = found->second;
+        }
+        for (auto& record : result.materials)
+            if (record.valid) record.program = remap[record.program];
+        programs = std::move(unique);
+        result.programCount = uint32_t(programs.size());
+    }
+
     mi::base::Handle<mi::neuraylib::ILink_unit> linkUnit(
         backend->create_link_unit(transaction.get(), executionContext.get()));
     if (!linkUnit) return fail("cannot create link unit: " + MessagesOf(executionContext.get()));
 
     std::vector<std::array<bool, kEntryPointCount>> present(programs.size());
+    std::vector<ProgramTraits> traits(programs.size());
     std::vector<std::string> names(programs.size() * kEntryPointCount);
     for (size_t p = 0; p < programs.size(); ++p) {
-        std::vector<mi::neuraylib::Target_function_description> descs;
-        for (size_t e = 0; e < kEntryPointCount; ++e) {
-            names[p * kEntryPointCount + e] = ProgramFunction(uint32_t(p), EntryIndex(e));
-            descs.emplace_back(kEntryPoints[e].path, names[p * kEntryPointCount + e].c_str());
-        }
         mi::base::Handle<const mi::neuraylib::ICompiled_material> compiled(
             transaction->access<mi::neuraylib::ICompiled_material>(
                 programs[p]->compiled_material_name.c_str()));
         if (!compiled) return fail("compiled class missing for program " + std::to_string(p));
+        traits[p] = TraitsOf(compiled.get());
+        std::vector<mi::neuraylib::Target_function_description> descs;
+        std::vector<size_t> entries;
+        for (size_t e = 0; e < kEntryPointCount; ++e) {
+            present[p][e] = false;
+            if (!NeedsEntry(traits[p], e)) continue;
+            names[p * kEntryPointCount + e] = ProgramFunction(uint32_t(p), EntryIndex(e));
+            descs.emplace_back(kEntryPoints[e].path, names[p * kEntryPointCount + e].c_str());
+            entries.push_back(e);
+        }
         if (linkUnit->add_material(compiled.get(), descs.data(),
                                    descs.size(), executionContext.get()) != 0)
             return fail(std::format("add_material failed for program {}: {}", p,
                                     MessagesOf(executionContext.get())));
-        for (size_t e = 0; e < kEntryPointCount; ++e)
-            present[p][e] = descs[e].function_index != ~mi::Size(0);
+        for (size_t i = 0; i < entries.size(); ++i)
+            present[p][entries[i]] = descs[i].function_index != ~mi::Size(0);
     }
 
     const auto translateStart = std::chrono::steady_clock::now();
@@ -335,7 +512,7 @@ MdlShaderCode GenerateMdlShaderCode(std::vector<MDLMaterial const*> const& mater
 
     result.code = code->get_code();
     result.code += "\n// ---- Prism material dispatch ----\n";
-    result.code += GenerateDispatch(present, language);
+    result.code += GenerateDispatch(present, traits, language);
     transaction->commit();
     result.success = true;
     return result;

@@ -1,5 +1,8 @@
 #include "device.h"
 #include "cpu_device.h"
+#ifdef PRISM_HAS_METAL
+#include "metal/metal_device.h"
+#endif
 
 #include <cctype>
 
@@ -55,8 +58,12 @@ std::unique_ptr<RenderDevice> TryCreate(DeviceKind kind, std::string* reason)
         if (reason) *reason = "the Vulkan device is not part of this build";
         return nullptr;
     case DeviceKind::Metal:
+#ifdef PRISM_HAS_METAL
+        return MetalDevice::Create(reason);
+#else
         if (reason) *reason = "the Metal device is not part of this build";
         return nullptr;
+#endif
     }
     return nullptr;
 }

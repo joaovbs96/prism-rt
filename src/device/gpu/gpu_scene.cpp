@@ -124,8 +124,8 @@ public:
                 record.textures.x = texture(pbr->base_color);
                 record.textures.y = texture(pbr->orm);
                 record.textures.z = texture(pbr->transmission);
-                record.textures2.y = texture(pbr->emissive_color);
-                record.params.x = pbr->emissive_multiplier;
+                // gltfPBR::sample returns its lobes' samples, which carry no
+                // emission; the emission texture is never sampled.
             } else {
                 m_data.warnings.push_back("unsupported material type rendered as invalid");
             }

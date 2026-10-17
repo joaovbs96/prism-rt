@@ -11,8 +11,8 @@
 
 int main(int argc, char** argv)
 {
-    if (argc != 3) {
-        std::cerr << "usage: prism_gpu_codegen_dump <scene.usd> <output-directory>\n";
+    if (argc != 3 && argc != 4) {
+        std::cerr << "usage: prism_gpu_codegen_dump <scene.usd> <output-directory> [max MDL materials]\n";
         return 2;
     }
     using namespace prism::device::gpu;
@@ -38,6 +38,8 @@ int main(int argc, char** argv)
                   << ", materials " << data.materials.size() << " (MDL " << data.mdlMaterials.size()
                   << "), images " << data.images.size() << '\n';
         for (auto const& warning : data.warnings) std::cout << "warning: " << warning << '\n';
+        if (argc == 4 && data.mdlMaterials.size() > size_t(std::atoi(argv[3])))
+            data.mdlMaterials.resize(size_t(std::atoi(argv[3])));
         for (auto language : {ShadingLanguage::Hlsl, ShadingLanguage::Glsl}) {
             MdlShaderCode code = GenerateMdlShaderCode(data.mdlMaterials, language);
             const char* name = language == ShadingLanguage::Hlsl ? "hlsl" : "glsl";

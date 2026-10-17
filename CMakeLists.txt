@@ -163,8 +163,49 @@ list(FILTER PRISM_CORE_SOURCES EXCLUDE REGEX "/hydra/")
 # Device backends are added below when enabled.
 list(FILTER PRISM_CORE_SOURCES EXCLUDE REGEX "/device/(vulkan|metal)/")
 
-add_library(prism_core STATIC ${PRISM_CORE_SOURCES})
+# GPU shader sources, embedded into the core library.
+file(GLOB_RECURSE PRISM_SHADER_FILES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/*")
+set(PRISM_EMBEDDED_SHADERS "${CMAKE_CURRENT_BINARY_DIR}/generated/prism_embedded_shaders.cpp")
+add_custom_command(
+    OUTPUT "${PRISM_EMBEDDED_SHADERS}"
+    COMMAND ${CMAKE_COMMAND} -DROOT=${CMAKE_CURRENT_SOURCE_DIR}/shaders
+            -DOUTPUT=${PRISM_EMBEDDED_SHADERS}
+            -DHEADER=${CMAKE_CURRENT_SOURCE_DIR}/src/device/gpu/shader_sources.h -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedShaders.cmake
+    DEPENDS ${PRISM_SHADER_FILES} "${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedShaders.cmake"
+    COMMENT "Embedding GPU shader sources")
+
+add_library(prism_core STATIC ${PRISM_CORE_SOURCES} "${PRISM_EMBEDDED_SHADERS}")
 add_library(PrismRT::core ALIAS prism_core)
+
+# Metal device: HLSL kernels compiled with DXC and Metal shader converter.
+if(APPLE)
+    set(_prism_metal_default ON)
+else()
+    set(_prism_metal_default OFF)
+endif()
+option(PRISM_ENABLE_METAL "Build the Metal render device (macOS)" ${_prism_metal_default})
+if(PRISM_ENABLE_METAL)
+    set(PRISM_METAL_SHADER_CONVERTER_DIR "/usr/local" CACHE PATH "Metal shader converter root (include, lib)")
+    find_program(PRISM_DXC_EXECUTABLE dxc HINTS "$ENV{VULKAN_SDK}/bin" DOC "DXC compiler for the Metal device")
+    find_library(PRISM_METAL_IRCONVERTER_LIBRARY metalirconverter
+        PATHS "${PRISM_METAL_SHADER_CONVERTER_DIR}/lib" NO_DEFAULT_PATH)
+    if(NOT PRISM_METAL_IRCONVERTER_LIBRARY OR NOT PRISM_DXC_EXECUTABLE)
+        message(FATAL_ERROR "The Metal device needs Metal shader converter (PRISM_METAL_SHADER_CONVERTER_DIR) "
+            "and DXC (PRISM_DXC_EXECUTABLE); or set PRISM_ENABLE_METAL=OFF.")
+    endif()
+    set(_prism_metal_sources "${CMAKE_CURRENT_SOURCE_DIR}/src/device/metal/metal_device.mm")
+    set_source_files_properties(${_prism_metal_sources} PROPERTIES
+        LANGUAGE CXX COMPILE_FLAGS "-x objective-c++ -fobjc-arc")
+    target_sources(prism_core PRIVATE ${_prism_metal_sources})
+    target_include_directories(prism_core PRIVATE "${PRISM_METAL_SHADER_CONVERTER_DIR}/include")
+    target_compile_definitions(prism_core PRIVATE
+        PRISM_HAS_METAL=1 PRISM_DXC_EXECUTABLE="${PRISM_DXC_EXECUTABLE}")
+    target_link_libraries(prism_core PUBLIC ${PRISM_METAL_IRCONVERTER_LIBRARY}
+        "-framework Metal" "-framework Foundation")
+    get_filename_component(_prism_msc_lib_dir "${PRISM_METAL_IRCONVERTER_LIBRARY}" DIRECTORY)
+    list(APPEND CMAKE_BUILD_RPATH "${_prism_msc_lib_dir}")
+    list(APPEND CMAKE_INSTALL_RPATH "${_prism_msc_lib_dir}")
+endif()
 target_include_directories(prism_core PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/external/tinygltf"
     "${CMAKE_CURRENT_SOURCE_DIR}/external/tinyobj")
