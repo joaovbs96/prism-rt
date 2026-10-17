@@ -34,9 +34,13 @@ std::string fnv1a_hex(const std::string& text) {
 // The generator names modules after the material alone, so two documents that
 // both define e.g. "Gold" would collide in the MDL database -- and the SDK
 // reports a duplicate module as success, silently reusing the first shader.
-// Suffix the name with a hash of the source document path + material name.
+// Suffix the name with a hash of the source document path + material name +
+// generated source. The selected material is renamed before generation, so
+// several materials of one document share a module name; the source keeps
+// them apart while identical sources still share one definition.
 std::string make_unique_module_name(const std::string& module_name,
-                                    const std::string& mtlx_path) {
+                                    const std::string& mtlx_path,
+                                    const std::string& mdl_source) {
     if (mtlx_path.empty())
         return module_name;
 
@@ -45,7 +49,7 @@ std::string make_unique_module_name(const std::string& module_name,
     const std::string path_key = error ? mtlx_path : canonical.generic_string();
 
     const std::string simple_name = module_name.substr(module_name.rfind("::") + 2);
-    return module_name + "_" + fnv1a_hex(path_key + "\n" + simple_name);
+    return module_name + "_" + fnv1a_hex(path_key + "\n" + simple_name + "\n" + mdl_source);
 }
 
 // Produces a structural identity for a generated material module by replacing
@@ -556,7 +560,8 @@ CompiledMaterial MaterialCompiler::compile(const GeneratedMDL& generated_mdl,
 
     // The module_name from GeneratedMDL is like "::materialx::test_material";
     // make it unique per source document.
-    std::string module_name = make_unique_module_name(generated_mdl.module_name, mtlx_path);
+    std::string module_name = make_unique_module_name(
+        generated_mdl.module_name, mtlx_path, generated_mdl.mdl_source);
 
     // Sanitize texture paths in the generated MDL source.
     // MaterialX fileprefix="./" produces paths like "./texture.jpg" in the MDL code,
