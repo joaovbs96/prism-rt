@@ -15,6 +15,13 @@ static const uint kProtoSpheres = 2u;
 static const uint kInstancePlacement = 1u;   // has a placement transform (normal/tangent matrices)
 static const uint kInstanceFlip = 2u;        // orientation flip of the geometric and shading normals
 static const uint kInstanceMirrored = 4u;    // reflection: negates the bitangent sign
+static const uint kInstanceOpaque = 8u;      // every material always blocks shadow rays
+
+// Instance masks of the acceleration structure: shadow rays first query the
+// opaque instances for any hit, then walk the others for cutouts.
+static const uint kMaskOpaque = 1u;
+static const uint kMaskNonOpaque = 2u;
+static const uint kMaskAll = 0xFFu;
 
 // Material kinds, mirroring the CPU Material classes.
 static const uint kMaterialInvalid = 0u;     // magenta emission, no scattering
@@ -59,6 +66,7 @@ static const uint kFrameTransparentEscapes = 4u;
 static const uint kFrameFiltered = 8u;
 static const uint kFrameSeedRng = 16u;
 static const uint kFrameLens = 32u;
+static const uint kFrameCutouts = 64u;       // some instances are not opaque
 
 // Work modes.
 static const uint kModePass = 0u;      // one sample per pixel of the listed tiles

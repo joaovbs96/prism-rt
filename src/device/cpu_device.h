@@ -2,6 +2,8 @@
 
 #include "device.h"
 
+#include <mutex>
+
 namespace prism::device {
 
 // CPU rendering (Embree intersection, TBB parallelism, MDL native code).
@@ -17,9 +19,17 @@ public:
     void RenderPass(SceneManager& scene, PassRequest const& request) override;
     bool RenderPreview(SceneManager& scene, PreviewRequest const& request) override;
     RTCRayHit Intersect(SceneManager& scene, prism::PathRay const& ray) override;
+    void SceneChanged(SceneManager& scene) override;
 
 private:
+    // Whether every material of the scene always blocks shadow rays, cached
+    // per scene until it changes.
+    bool OpaqueScene(SceneManager& scene);
+
     bool m_reference;
+    std::mutex m_opaqueMutex;
+    SceneManager const* m_opaqueSceneOf = nullptr;
+    bool m_opaqueScene = false;
 };
 
 } // namespace prism::device

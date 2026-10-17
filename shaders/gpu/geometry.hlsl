@@ -34,7 +34,8 @@ float gpu_intersect_sphere(float3 origin, float3 direction, float4 sphere,
 
 
 
-GpuRawHit gpu_trace(Ray ray)
+// Closest hit among the instances selected by `mask`.
+GpuRawHit gpu_trace(Ray ray, uint mask)
 {
     RaytracingAccelerationStructure scene = sceneStructure();
     RayDesc desc;
@@ -43,7 +44,7 @@ GpuRawHit gpu_trace(Ray ray)
     desc.TMin = ray.tnear;
     desc.TMax = ray.tfar;
     RayQuery<RAY_FLAG_NONE> query;
-    query.TraceRayInline(scene, RAY_FLAG_NONE, 0xFF, desc);
+    query.TraceRayInline(scene, RAY_FLAG_NONE, mask, desc);
     while (query.Proceed()) {
         if (query.CandidateType() == CANDIDATE_PROCEDURAL_PRIMITIVE) {
             GpuInstance inst = gpu_instance(query.CandidateInstanceIndex());
@@ -82,3 +83,28 @@ GpuRawHit gpu_trace(Ray ray)
     return hit;
 }
 
+
+// Any hit among the opaque instances: the query ends at the first one.
+bool gpu_occluded_by_opaque(Ray ray)
+{
+    RayDesc desc;
+    desc.Origin = ray.origin;
+    desc.Direction = ray.direction;
+    desc.TMin = ray.tnear;
+    desc.TMax = ray.tfar;
+    RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> query;
+    query.TraceRayInline(sceneStructure(), RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, kMaskOpaque, desc);
+    while (query.Proceed()) {
+        if (query.CandidateType() == CANDIDATE_PROCEDURAL_PRIMITIVE) {
+            GpuInstance inst = gpu_instance(query.CandidateInstanceIndex());
+            GpuPrototype proto = gpu_prototype(inst.info.x);
+            float4 sphere = gpu_sphere(proto.info.z + query.CandidatePrimitiveIndex());
+            float t = gpu_intersect_sphere(query.CandidateObjectRayOrigin(), query.CandidateObjectRayDirection(),
+                                           sphere, query.RayTMin(), query.CommittedRayT());
+            if (t >= 0.0f) query.CommitProceduralPrimitiveHit(t);
+        } else {
+            query.CommitNonOpaqueTriangleHit();
+        }
+    }
+    return query.CommittedStatus() != COMMITTED_NOTHING;
+}

@@ -406,7 +406,7 @@ bool MetalDevice::Impl::buildAccelerationStructures(std::string* error)
         for (int c = 0; c < 4; ++c)
             instance.transformationMatrix.columns[c] = MTLPackedFloat3Make(m[c], m[4 + c], m[8 + c]);
         instance.options = MTLAccelerationStructureInstanceOptionDisableTriangleCulling;
-        instance.mask = 0xFF;
+        instance.mask = (d.instances[i].info.y & kInstanceOpaque) != 0u ? kMaskOpaque : kMaskNonOpaque;
         instance.accelerationStructureIndex = structureOfPrototype[d.instances[i].info.x];
     }
     NSMutableArray<id<MTLAccelerationStructure>>* structures = [NSMutableArray array];

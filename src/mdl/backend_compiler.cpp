@@ -158,6 +158,43 @@ std::string ClassProgramHash(
     return key;
 }
 
+// True if an expression of a compiled material depends only on its arguments:
+// constants, parameters and calls of uniform functions (state and texture
+// functions are varying, as are functions using them).
+bool IsUniformExpression(const mi::neuraylib::IExpression* expression,
+                         const mi::neuraylib::ICompiled_material* material,
+                         mi::neuraylib::ITransaction* transaction, int depth = 0)
+{
+    if (!expression || depth > 256) return false;
+    using E = mi::neuraylib::IExpression;
+    switch (expression->get_kind()) {
+    case E::EK_CONSTANT:
+    case E::EK_PARAMETER:
+        return true;
+    case E::EK_TEMPORARY: {
+        mi::base::Handle<const mi::neuraylib::IExpression_temporary> temporary(
+            expression->get_interface<mi::neuraylib::IExpression_temporary>());
+        mi::base::Handle<const E> value(material->get_temporary(temporary->get_index()));
+        return IsUniformExpression(value.get(), material, transaction, depth + 1);
+    }
+    case E::EK_DIRECT_CALL: {
+        mi::base::Handle<const mi::neuraylib::IExpression_direct_call> call(
+            expression->get_interface<mi::neuraylib::IExpression_direct_call>());
+        mi::base::Handle<const mi::neuraylib::IFunction_definition> definition(
+            transaction->access<mi::neuraylib::IFunction_definition>(call->get_definition()));
+        if (!definition || !definition->is_uniform()) return false;
+        mi::base::Handle<const mi::neuraylib::IExpression_list> arguments(call->get_arguments());
+        for (mi::Size i = 0; arguments && i < arguments->get_size(); ++i) {
+            mi::base::Handle<const E> argument(arguments->get_expression(i));
+            if (!IsUniformExpression(argument.get(), material, transaction, depth + 1)) return false;
+        }
+        return true;
+    }
+    default:
+        return false;
+    }
+}
+
 class KnownResourceCallback final : public mi::base::Interface_implement<
     mi::neuraylib::ITarget_resource_callback> {
 public:
@@ -360,6 +397,8 @@ TargetCode BackendCompiler::generate_target_code(const CompiledMaterial& compile
     }
 
     if (VerboseMdl()) std::cout << std::format("  thin_walled: {}\n", binding->is_thin_walled ? "true" : "false");
+    const bool uniformCutout = cutoutExpr && !binding->constant_cutout_opacity &&
+        IsUniformExpression(cutoutExpr.get(), compiled.compiled_material.get(), compiled.transaction.get());
 
     const std::string materialHash = std::format("{}:{}",
         static_cast<const void*>(&m_ctx),
@@ -740,6 +779,7 @@ TargetCode BackendCompiler::generate_target_code(const CompiledMaterial& compile
                 compiled.compiled_material.get()), name.c_str()) == 0)
             program->compiled_material_name = std::move(name);
     }
+    program->uniform_cutout = uniformCutout;
     program->builtin_resources = !binding->texture_runtime;
     program->identity = cacheKey;
     result.success = true;

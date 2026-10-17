@@ -49,6 +49,8 @@ struct GpuSceneData {
     std::vector<uint32_t> environmentAlias;
 
     // Integrator settings of the SceneManager.
+    // Some instance has a material that may transmit shadow rays.
+    bool hasCutouts = true;
     int maxDepth = 32;
     int rouletteDepth = 4;
     bool environmentMis = true;

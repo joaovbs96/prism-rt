@@ -783,7 +783,7 @@ bool VulkanDevice::Impl::buildAccelerationStructures(std::string* error)
         auto& instance = instances[i];
         std::memcpy(instance.transform.matrix, d.instanceTransforms[i].data(), sizeof(instance.transform.matrix));
         instance.instanceCustomIndex = uint32_t(i);
-        instance.mask = 0xFF;
+        instance.mask = (d.instances[i].info.y & kInstanceOpaque) != 0u ? kMaskOpaque : kMaskNonOpaque;
         instance.instanceShaderBindingTableRecordOffset = 0;
         instance.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
         instance.accelerationStructureReference = bottomLevel[structureOfPrototype[d.instances[i].info.x]].address;

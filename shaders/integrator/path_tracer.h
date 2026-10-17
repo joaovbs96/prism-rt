@@ -13,6 +13,11 @@
 //   bool     backend.supportsNee(Shading)
 //   bool     backend.provenOpaque(Hit)
 //   float    backend.cutoutOpacity(Hit)
+//   bool     backend.occludedByOpaque(PathRay)   any hit on always-opaque geometry
+//                                                 (may conservatively return false)
+//   bool     backend.mayHaveCutouts()             false: occludedByOpaque is exact
+//   Hit      backend.intersectNonOpaque(PathRay)  closest hit on geometry that may
+//                                                 transmit (may include opaque geometry)
 //   float3   backend.environmentRadiance(float3 direction, float angularRadius)
 //   EnvironmentLightSample backend.sampleEnvironment(float angularRadius)   draws from backend.rng
 //   float    backend.environmentPdf(float3 direction)
@@ -150,11 +155,15 @@ struct PathTracer {
     Backend backend;
 
     // SceneManager::environmentVisible: stochastic transmission through cutouts.
+    // Opaque geometry anywhere on the ray blocks it whatever cutouts lie in
+    // front, so a cheap any-hit query on opaque geometry comes first.
     bool environmentVisible(PathRay shadow)
     {
+        if (backend.occludedByOpaque(shadow)) return false;
+        if (!backend.mayHaveCutouts()) return true;
         const float3 direction = shadow.ray.direction;
         for (int crossings = 0; crossings < 64; ++crossings) {
-            const Hit hit = backend.intersect(shadow);
+            const Hit hit = backend.intersectNonOpaque(shadow);
             if (!hit.surface.valid) return true;
             if (backend.provenOpaque(hit)) return false;
             const float opacity = saturate(backend.cutoutOpacity(hit));
@@ -214,12 +223,16 @@ struct PathTracer {
             const bool canNee = mis && depth + 1 < maxDepth && backend.supportsNee(shading);
             if (canNee) {
                 const EnvironmentLightSample light = backend.sampleEnvironment(angularRadius(hit.surface.ray_footprint));
-                const PathRay lightRay = spawnRay(hit.surface, light.wi, false);
-                if (light.pdf > 0.0f && isfinite(light.pdf) && environmentVisible(lightRay)) {
+                if (light.pdf > 0.0f && isfinite(light.pdf)) {
+                    // The shadow ray is traced only for a nonzero contribution.
                     const BsdfEvaluation f = backend.evaluate(shading, light.wi);
-                    if (f.valid && f.pdf >= 0.0f && isfinite(f.pdf))
-                        result.radiance += weight * f.value * light.radiance *
+                    if (f.valid && f.pdf >= 0.0f && isfinite(f.pdf)) {
+                        const float3 contribution = weight * f.value * light.radiance *
                             (powerHeuristic(light.pdf, f.pdf) / light.pdf);
+                        if (maxComponent(contribution) > 0.0f &&
+                            environmentVisible(spawnRay(hit.surface, light.wi, false)))
+                            result.radiance += contribution;
+                    }
                 }
             }
             if (!bs.scattered) break;

@@ -4,6 +4,9 @@
 
 #include "cpu_device.h"
 #include "cpu_backend.h"
+#include "../batched_spheres.h"
+#include "../hydra/fallback_material.h"
+#include "../mdl_material.h"
 
 #include "../rng.h"
 #include "../scene.h"
@@ -16,6 +19,7 @@
 #include <algorithm>
 #include <chrono>
 #include <thread>
+#include <unordered_set>
 
 namespace prism::device {
 
@@ -44,12 +48,59 @@ Color3 ShadeSample(Color3 color, SceneManager::PrimaryOutcome outcome,
     return color;
 }
 
+// A material whose cutout opacity is 1 everywhere: shadow rays stop at it.
+bool AlwaysBlocks(Material* material)
+{
+    if (!material) return true;
+    if (auto* mdl = dynamic_cast<MDLMaterial*>(material)) {
+        const auto cutout = mdl->constant_cutout();
+        return !mdl->is_valid() || (cutout && *cutout >= 1.0f);
+    }
+    if (auto* fallback = dynamic_cast<prism::hydra::FallbackMaterial*>(material))
+        return fallback->opacity() >= 1.0f;
+    return true; // Material::cutoutOpacity is 1
+}
+
+bool AllMaterialsBlock(SceneManager& scene)
+{
+    std::unordered_set<Material*> checked;
+    auto blocks = [&](Material* material) {
+        return !checked.insert(material).second || AlwaysBlocks(material);
+    };
+    for (auto const& [id, geometry] : scene.geometry) {
+        if (auto binding = scene.placement_materials.find(id); binding != scene.placement_materials.end()) {
+            if (!blocks(binding->second.fallback)) return false;
+            for (auto const& [primitive, material] : binding->second.triangles)
+                if (!blocks(material)) return false;
+        }
+        if (auto* mesh = dynamic_cast<Mesh*>(geometry)) {
+            if (!blocks(mesh->material_override)) return false;
+            for (auto const& [index, material] : mesh->materials)
+                if (!blocks(material)) return false;
+        } else if (auto* sphere = dynamic_cast<Sphere*>(geometry)) {
+            if (!blocks(sphere->material)) return false;
+        } else if (auto* quad = dynamic_cast<Quad*>(geometry)) {
+            if (!blocks(quad->material)) return false;
+        } else if (auto* box = dynamic_cast<Box*>(geometry)) {
+            if (!blocks(box->material)) return false;
+        } else if (auto* batch = dynamic_cast<BatchedSpheres*>(geometry)) {
+            for (auto const& entry : batch->entries)
+                if (!blocks(entry.material)) return false;
+        } else {
+            return false; // unknown geometry: keep the general shadow loop
+        }
+    }
+    return true;
+}
+
 // One sample of the shared path tracer; seed carries the pixel's random state.
-SampleResult TraceSample(SceneManager& scene, CameraParams const& camera, SampleSettings const& settings,
-                         unsigned x, unsigned y, unsigned width, unsigned height, unsigned& seed)
+SampleResult TraceSample(SceneManager& scene, bool opaqueScene, CameraParams const& camera,
+                         SampleSettings const& settings, unsigned x, unsigned y, unsigned width,
+                         unsigned height, unsigned& seed)
 {
     CpuPathTracer tracer;
     tracer.backend.scene = &scene;
+    tracer.backend.opaqueScene = opaqueScene;
     tracer.backend.rng.state = seed;
     const SampleResult result = tracer.renderSample(camera, x, y, width, height, settings);
     seed = tracer.backend.rng.state;
@@ -57,6 +108,22 @@ SampleResult TraceSample(SceneManager& scene, CameraParams const& camera, Sample
 }
 
 } // namespace
+
+void CpuDevice::SceneChanged(SceneManager&)
+{
+    std::lock_guard lock(m_opaqueMutex);
+    m_opaqueSceneOf = nullptr;
+}
+
+bool CpuDevice::OpaqueScene(SceneManager& scene)
+{
+    std::lock_guard lock(m_opaqueMutex);
+    if (m_opaqueSceneOf != &scene) {
+        m_opaqueScene = AllMaterialsBlock(scene);
+        m_opaqueSceneOf = &scene;
+    }
+    return m_opaqueScene;
+}
 
 DeviceInfo CpuDevice::Info() const
 {
@@ -75,6 +142,7 @@ std::vector<float> CpuDevice::RenderImage(SceneManager& scene, ImageRequest cons
     const int height = static_cast<int>(request.height);
     std::vector<float> pixels(size_t(width)*height*3);
     const CameraParams camera = ToCameraParams(request.camera);
+    const bool opaqueScene = !m_reference && OpaqueScene(scene);
     const SampleSettings settings = {request.sampleClamp, 1.0f, false};
     tbb::parallel_for(0, height, [&](int y) {
         for (int x = 0; x < width; ++x) {
@@ -82,7 +150,7 @@ std::vector<float> CpuDevice::RenderImage(SceneManager& scene, ImageRequest cons
             Color3 sum(0);
             if (!m_reference) {
                 for (int sample = 0; sample < request.samples; ++sample) {
-                    const auto result = TraceSample(scene, camera, settings, unsigned(x),
+                    const auto result = TraceSample(scene, opaqueScene, camera, settings, unsigned(x),
                         unsigned(y), unsigned(width), unsigned(height), seed);
                     sum += ToFloat3(result.color);
                 }
@@ -119,6 +187,7 @@ void CpuDevice::RenderPass(SceneManager& scene, PassRequest const& request)
     auto abandoned = [&] { return request.abandoned && request.abandoned(); };
     auto paused = [&] { return request.paused && request.paused(); };
     const CameraParams camera = ToCameraParams(request.camera);
+    const bool opaqueScene = !m_reference && OpaqueScene(scene);
     const SampleSettings settings = {request.shading.sampleClamp,
         request.shading.exposureScale, request.shading.transparentEscapes};
 
@@ -160,7 +229,7 @@ void CpuDevice::RenderPass(SceneManager& scene, PassRequest const& request)
                                             static_cast<float>(x) + 0.5f,
                                             static_cast<float>(y) + 0.5f,
                                             width, height, nullptr);
-                                const auto result = TraceSample(scene, camera, settings, x, y, width, height, seed);
+                                const auto result = TraceSample(scene, opaqueScene, camera, settings, x, y, width, height, seed);
                                 ++colorWork.value;
                                 request.colors[pixel] = ToFloat3(result.color);
                                 request.coverage[pixel] = result.coverage;
@@ -209,6 +278,7 @@ bool CpuDevice::RenderPreview(SceneManager& scene, PreviewRequest const& request
     std::atomic<bool> cancelled{false};
     auto stopRequested = [&] { return request.stopRequested && request.stopRequested(); };
     const CameraParams camera = ToCameraParams(request.camera);
+    const bool opaqueScene = !m_reference && OpaqueScene(scene);
     const SampleSettings settings = {request.shading.sampleClamp,
         request.shading.exposureScale, request.shading.transparentEscapes};
     tbb::parallel_for(
@@ -247,7 +317,7 @@ bool CpuDevice::RenderPreview(SceneManager& scene, PreviewRequest const& request
                 color = ShadeSample(color, outcome, request.shading, &coverage);
                 center = rays.center;
             } else {
-                const auto result = TraceSample(scene, camera, settings, x, y, width, height, seed);
+                const auto result = TraceSample(scene, opaqueScene, camera, settings, x, y, width, height, seed);
                 color = ToFloat3(result.color);
                 coverage = result.coverage;
                 center = prism::MakeCameraRayWithLens(request.camera,

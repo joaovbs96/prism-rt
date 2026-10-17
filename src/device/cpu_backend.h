@@ -34,6 +34,35 @@ inline float3 FromFloat3(Float3 const& v) { return float3(v.x(), v.y(), v.z()); 
 struct CpuBackend {
     SceneManager* scene = nullptr;
     Rng rng = {0u};
+    // Every material of the scene always blocks shadow rays (no cutouts).
+    bool opaqueScene = false;
+
+    static prism::PathRay ToQuery(::PathRay const& ray)
+    {
+        prism::PathRay query;
+        query.ray.org_x = ray.ray.origin.x;
+        query.ray.org_y = ray.ray.origin.y;
+        query.ray.org_z = ray.ray.origin.z;
+        query.ray.dir_x = ray.ray.direction.x;
+        query.ray.dir_y = ray.ray.direction.y;
+        query.ray.dir_z = ray.ray.direction.z;
+        query.ray.tnear = ray.ray.tnear;
+        query.ray.tfar = ray.ray.tfar;
+        query.ray.mask = -1;
+        query.footprint = ToFootprint(ray.footprint);
+        return query;
+    }
+
+    bool occludedByOpaque(::PathRay const& ray)
+    {
+        if (!opaqueScene) return false;
+        RTCRay query = ToQuery(ray).ray;
+        rtcOccluded1(scene->scene, &query);
+        return query.tfar < 0.0f;
+    }
+
+    bool mayHaveCutouts() { return !opaqueScene; }
+    CpuHit intersectNonOpaque(::PathRay const& ray) { return intersect(ray); }
 
     CpuHit intersect(::PathRay const& ray)
     {

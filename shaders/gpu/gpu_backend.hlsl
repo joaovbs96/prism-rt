@@ -176,12 +176,12 @@ struct GpuHit {
 
 // SceneManager::cast_ray: intersection plus RayHit construction and the
 // placement handling of prepareHit.
-GpuHit gpu_intersect(PathRay ray)
+GpuHit gpu_intersect(PathRay ray, uint mask)
 {
     GpuHit result;
     result.material = 0u;
     SurfaceHit hit = gpu_empty_hit(ray);
-    GpuRawHit raw = gpu_trace(ray.ray);
+    GpuRawHit raw = gpu_trace(ray.ray, mask);
     if (!raw.hit) {
         result.surface = hit;
         return result;
@@ -890,7 +890,10 @@ float gpu_environment_pdf(GpuEnvironment env, float3 direction)
 struct GpuBackend {
     Rng rng;
 
-    GpuHit intersect(PathRay ray) { return gpu_intersect(ray); }
+    GpuHit intersect(PathRay ray) { return gpu_intersect(ray, kMaskAll); }
+    GpuHit intersectNonOpaque(PathRay ray) { return gpu_intersect(ray, kMaskNonOpaque); }
+    bool occludedByOpaque(PathRay ray) { return gpu_occluded_by_opaque(ray.ray); }
+    bool mayHaveCutouts() { return (gpu_frame().settings.z & kFrameCutouts) != 0u; }
 
     // Material::perturbNormal + Material::prepare
     GpuShading prepare(GpuHit hit)

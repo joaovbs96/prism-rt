@@ -403,6 +403,22 @@ void ApplyMdlShaderCode(GpuSceneData& data, MdlShaderCode const& code)
             material.params.w = *record.constantCutout;
         }
     }
+    // Instances whose every material always blocks shadow rays.
+    auto blocks = [](GpuMaterial const& m) {
+        if (m.info.x == kMaterialMdl) return (m.info.w & kMaterialConstantCutout) != 0u && m.params.w >= 1.0f;
+        if (m.info.x == kMaterialFallback) return m.params.x >= 1.0f;
+        return true; // legacy materials and invalid MDL materials are opaque
+    };
+    data.hasCutouts = false;
+    for (auto& instance : data.instances) {
+        const uint32_t primitives = data.prototypes[instance.info.x].info.w;
+        bool opaque = true;
+        for (uint32_t p = 0; p < primitives && opaque; ++p)
+            opaque = blocks(data.materials[data.primitiveMaterials[instance.info.z + p]]);
+        if (opaque) instance.info.y |= kInstanceOpaque;
+        else data.hasCutouts = true;
+    }
+
     data.mdlTextures.assign(1, GpuMdlTexture{});
     data.mdlTiles.clear();
     data.bsdfData.clear();

@@ -37,6 +37,7 @@ GpuFrame GpuRenderDevice::BaseFrame(prism::CameraRayParameters const& camera, un
     if (camera.orthographic) flags |= kFrameOrthographic;
     if (data.environmentMis) flags |= kFrameEnvironmentMis;
     if (data.filteredTextures) flags |= kFrameFiltered;
+    if (data.hasCutouts) flags |= kFrameCutouts;
     frame.settings = {uint32_t(std::max(0, data.maxDepth)), uint32_t(std::max(0, data.rouletteDepth)), flags, 0};
     frame.counts = {MdlTextureCount(), 0, 0, 0};
     // Debug views of the primary hit (see gpu_kernel.inc).

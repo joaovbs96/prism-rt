@@ -83,6 +83,9 @@ struct CompiledProgram {
     // GPU devices compile it again for their shading language; argument
     // blocks share the layout. Empty if the class could not be stored.
     std::string compiled_material_name;
+    // geometry.cutout_opacity depends only on the arguments (no state or
+    // textures): each binding can evaluate it once.
+    bool uniform_cutout = false;
 };
 
 struct MaterialBinding {

@@ -313,7 +313,7 @@ MdlShaderCode GenerateMdlShaderCode(std::vector<MDLMaterial const*> const& mater
         if (inserted) programs.push_back(program);
         record.program = found->second;
         record.valid = true;
-        if (target.binding) record.constantCutout = target.binding->constant_cutout_opacity;
+        record.constantCutout = material->constant_cutout();
     }
     result.programCount = uint32_t(programs.size());
     if (programs.empty()) {

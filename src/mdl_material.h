@@ -10,6 +10,7 @@
 
 #include <mi/mdl_sdk.h>
 #include <memory>
+#include <optional>
 #include <string>
 #include <type_traits>
 
@@ -57,7 +58,7 @@ public:
     // and a freshly bound argument/resource block. The binding retains its
     // program and runtime, so no generator or SDK transaction is needed here.
     explicit MDLMaterial(mdl::TargetCode boundTarget)
-        : m_target(std::move(boundTarget)), m_valid(m_target.success) {}
+        : m_target(std::move(boundTarget)), m_valid(m_target.success) { evaluateUniformCutout(); }
     // Compiles a .mtlx file into a callable MDL material.
     //   mtlx_path:         path to the .mtlx file
     //   mdl_context:       initialized MDL SDK context (from main)
@@ -171,6 +172,7 @@ public:
         // retaining one SDK transaction for every live scene material.
         m_compiled.release();
         m_valid = true;
+        evaluateUniformCutout();
         // NOTE: prints the *resolved* name (material_name may be empty)
         if (PrismMdlVerbose())
             std::cout << "[MDLMaterial] OK: " << m_target.program->target_code->get_callable_function_count()
@@ -389,16 +391,23 @@ public:
 
     float cutoutOpacity(const RayHit& ray_hit) override {
         if (!m_valid) return 1.0f;
-        if (m_target.binding->constant_cutout_opacity)
-            return *m_target.binding->constant_cutout_opacity;
+        if (auto constant = constant_cutout()) return *constant;
         ShadingStateData ss; build_shading_state(ray_hit, ss);
         if (m_target.program->target_code->execute_init(m_target.program->functions.init_function_index,
             ss.base(), m_target.texture_handler(), m_target.argument_data()) != 0) return 1.0f;
         return get_opacity(ss.base());
     }
     bool provenOpaque() const override {
-        return m_target.binding->constant_cutout_opacity &&
-            *m_target.binding->constant_cutout_opacity >= 1.0f;
+        const auto constant = constant_cutout();
+        return constant && *constant >= 1.0f;
+    }
+
+    // The cutout opacity when it is the same everywhere on the material:
+    // constant in the class, or depending only on the material's arguments.
+    std::optional<float> constant_cutout() const {
+        if (m_target.binding && m_target.binding->constant_cutout_opacity)
+            return m_target.binding->constant_cutout_opacity;
+        return m_uniformCutout;
     }
 
     // Required stubs (issue 7 — needed for NEE, not in scope here)
@@ -450,8 +459,7 @@ private:
     }
 
     float get_opacity(mi::neuraylib::Shading_state_material& state) const {
-        if (m_target.binding->constant_cutout_opacity)
-            return *m_target.binding->constant_cutout_opacity;
+        if (auto constant = constant_cutout()) return *constant;
         mi::Float32 opacity = 1.0f;
         const mi::Sint32 result = m_target.program->target_code->execute(
             m_target.program->functions.cutout_opacity_function_index,
@@ -617,6 +625,31 @@ private:
 
         return Color3(ei.x * ed.edf.x, ei.y * ed.edf.y, ei.z * ed.edf.z);
     }
+
+    // A cutout depending only on the arguments is evaluated once, at an
+    // arbitrary shading point.
+    void evaluateUniformCutout() {
+        if (!m_valid || !m_target.program || !m_target.program->uniform_cutout ||
+            (m_target.binding && m_target.binding->constant_cutout_opacity)) return;
+        RTCRayHit miss{};
+        miss.hit.geomID = RTC_INVALID_GEOMETRY_ID;
+        RayHit hit(miss);
+        hit.n = hit.n_g = Float3(0.0f, 0.0f, 1.0f);
+        hit.tangent = Float3(1.0f, 0.0f, 0.0f);
+        hit.u = hit.v = 0.0f;
+        hit.front_face = true;
+        ShadingStateData ss;
+        build_shading_state(hit, ss);
+        if (m_target.program->target_code->execute_init(m_target.program->functions.init_function_index,
+                ss.base(), m_target.texture_handler(), m_target.argument_data()) != 0) return;
+        mi::Float32 opacity = 1.0f;
+        if (m_target.program->target_code->execute(m_target.program->functions.cutout_opacity_function_index,
+                ss.base(), m_target.texture_handler(), m_target.argument_data(), &opacity) == 0 &&
+            std::isfinite(opacity))
+            m_uniformCutout = std::clamp(opacity, 0.0f, 1.0f);
+    }
+
+    std::optional<float> m_uniformCutout;
 
     // MDL pipeline objects — kept alive for the material's lifetime
     std::unique_ptr<mdl::MaterialCompiler> m_compiler;
