@@ -36,6 +36,21 @@
       "displayName": "PrismRT Hydra clean validation",
       "inherits": "prism-hydra",
       "binaryDir": "${sourceDir}/build-fresh-validation"
+    },
+    {
+      "name": "prism-hydra-mac",
+      "displayName": "PrismRT Hydra delegate (macOS, Ninja)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-mac",
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Darwin" },
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_OSX_ARCHITECTURES": "arm64",
+        "VCPKG_MANIFEST_INSTALL": "OFF",
+        "CMAKE_INSTALL_PREFIX": "${sourceDir}/install-mac",
+        "PRISM_BUILD_HYDRA": "ON",
+        "PRISM_COPY_ASSETS": "ON"
+      }
     }
   ],
   "buildPresets": [
@@ -57,6 +72,10 @@
       "configurePreset": "prism-hydra-fresh",
       "configuration": "RelWithDebInfo",
       "jobs": 8
+    },
+    {
+      "name": "prism-hydra-mac",
+      "configurePreset": "prism-hydra-mac"
     }
   ],
   "testPresets": [
@@ -68,6 +87,18 @@
         "PXR_PLUGINPATH_NAME": "${sourceDir}/build/hydra/resources",
         "PXR_USD_WINDOWS_DLL_PATH": "$penv{PXR_USD_WINDOWS_DLL_PATH}",
         "PATH": "${sourceDir}/build/hydra/plugin;$penv{PATH}",
+        "PRISM_MATERIALX_LIBRARY_PATH": "$penv{PRISM_MATERIALX_LIBRARY_PATH}",
+        "PRISM_MATERIALX_MDL": "$penv{PRISM_MATERIALX_MDL}",
+        "MDL_SDK_ROOT": "$penv{PRISM_MDL_SDK_ROOT}"
+      },
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "prism-hydra-mac",
+      "configurePreset": "prism-hydra-mac",
+      "environment": {
+        "PXR_PLUGINPATH_NAME": "${sourceDir}/build-mac/hydra/resources",
+        "DYLD_LIBRARY_PATH": "$penv{DYLD_LIBRARY_PATH}",
         "PRISM_MATERIALX_LIBRARY_PATH": "$penv{PRISM_MATERIALX_LIBRARY_PATH}",
         "PRISM_MATERIALX_MDL": "$penv{PRISM_MATERIALX_MDL}",
         "MDL_SDK_ROOT": "$penv{PRISM_MDL_SDK_ROOT}"

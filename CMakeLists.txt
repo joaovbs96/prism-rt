@@ -19,12 +19,26 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED YES)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+if(APPLE)
+    # Installed binaries resolve dependencies through the directories they were
+    # linked against, plus the install prefix library directory.
+    set(CMAKE_INSTALL_RPATH_USE_LINK_PATH ON)
+    set(CMAKE_INSTALL_RPATH "@loader_path/../lib")
+endif()
+
 # Keep multi-config consumers aligned with the installed RelWithDebInfo
 # dependency builds while allowing their Release libraries as a fallback.
 set(CMAKE_MAP_IMPORTED_CONFIG_MINSIZEREL "RelWithDebInfo;Release")
 set(CMAKE_MAP_IMPORTED_CONFIG_RELEASE "RelWithDebInfo;Release")
 set(CMAKE_MAP_IMPORTED_CONFIG_DEBUG "Debug;RelWithDebInfo;Release")
 set(CMAKE_MAP_IMPORTED_CONFIG_RELWITHDEBINFO "RelWithDebInfo;Release")
+if(NOT MSVC)
+    # System packages such as Apple's OpenGL framework only provide a
+    # configuration-less location; an empty entry selects it as last resort.
+    foreach(_config MINSIZEREL RELEASE DEBUG RELWITHDEBINFO)
+        set(CMAKE_MAP_IMPORTED_CONFIG_${_config} "${CMAKE_MAP_IMPORTED_CONFIG_${_config}};")
+    endforeach()
+endif()
 
 # Optional per-machine hints live in the ignored cmake/PrismLocalDependencies.cmake.
 # Normal package discovery through CMAKE_PREFIX_PATH remains the portable default.
@@ -51,6 +65,26 @@ find_package(OpenGL REQUIRED)
 find_package(pxr REQUIRED)
 find_package(MaterialX REQUIRED)
 find_package(Python3 COMPONENTS Development Interpreter REQUIRED)
+
+# OpenUSD built against a Python whose interpreter statically links libpython
+# (PXR_PY_UNDEFINED_DYNAMIC_LOOKUP) leaves Python symbols unresolved in its
+# libraries. Executables must then provide libpython themselves, while the
+# hdPrism plugin must not, since usdview's interpreter already provides it.
+if(APPLE)
+    set(_prism_link_python_default ON)
+else()
+    set(_prism_link_python_default OFF)
+endif()
+option(PRISM_LINK_PYTHON_IN_EXECUTABLES
+    "Link libpython into executables (OpenUSD built with undefined dynamic Python lookup)"
+    ${_prism_link_python_default})
+if(PRISM_LINK_PYTHON_IN_EXECUTABLES AND NOT WIN32 AND Python3_LIBRARIES)
+    foreach(_python_library IN LISTS Python3_LIBRARIES)
+        get_filename_component(_python_library_dir "${_python_library}" DIRECTORY)
+        string(APPEND CMAKE_EXE_LINKER_FLAGS
+            " \"${_python_library}\" -Wl,-rpath,\"${_python_library_dir}\"")
+    endforeach()
+endif()
 
 set(PRISM_USD_ROOT "${pxr_DIR}")
 set(PRISM_OPENSUBDIV_ROOT "" CACHE PATH "OpenSubdiv runtime installation prefix used by OpenUSD")
@@ -113,7 +147,7 @@ configure_file(cmake/PrismRuntime.json.in "${CMAKE_BINARY_DIR}/prism-runtime.jso
 # may expose only the active RelWithDebInfo configuration, while Visual Studio
 # generators validate every configuration during generation. Map the missing
 # configurations to the same Python installation used to build OpenUSD.
-if(TARGET Python3::Python)
+if(WIN32 AND TARGET Python3::Python)
     foreach(_config DEBUG RELEASE MINSIZEREL RELWITHDEBINFO)
         set_property(TARGET Python3::Python PROPERTY
             IMPORTED_IMPLIB_${_config} "${Python3_LIBRARY_RELEASE}")
@@ -443,8 +477,9 @@ endforeach()
 
 include(GNUInstallDirs)
 install(TARGETS PrismRT RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
-install(FILES prism_env.ps1 run_usdview.ps1
+install(FILES prism_env.ps1 run_usdview.ps1 prism_env.sh
     DESTINATION "${CMAKE_INSTALL_BINDIR}")
+install(PROGRAMS run_usdview.sh DESTINATION "${CMAKE_INSTALL_BINDIR}")
 install(FILES "${CMAKE_BINARY_DIR}/prism-runtime.json"
     DESTINATION "${CMAKE_INSTALL_BINDIR}")
 if(PRISM_INSTALL_ASSETS)

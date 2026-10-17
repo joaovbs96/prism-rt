@@ -1,4 +1,6 @@
 build/
+build-mac/
+install-mac/
 build-fresh-validation/
 build-round3-clean/
 local/

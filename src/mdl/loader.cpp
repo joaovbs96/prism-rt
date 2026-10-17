@@ -1,9 +1,25 @@
 #include "loader.h"
 
+#include <cstdlib>
 #include <format>
 #include <vector>
 
 namespace mdl {
+
+namespace {
+
+// Directories below MDL_SDK_ROOT that may contain the SDK library and plugins.
+std::vector<std::string> SdkRootCandidates(const std::string& name) {
+    std::vector<std::string> paths;
+    const char* root = std::getenv("MDL_SDK_ROOT");
+    if (root && root[0] != '\0') {
+        paths.push_back(std::string(root) + "/lib/" + name);
+        paths.push_back(std::string(root) + "/bin/" + name);
+    }
+    return paths;
+}
+
+} // namespace
 
 Loader::Loader(bool auto_load) {
     if (auto_load) {
@@ -55,7 +71,10 @@ mi::neuraylib::INeuray* Loader::load(const char* library_path) {
         "../../../bin/" + lib_name,    // Install layout (examples)
         "../../bin/" + lib_name,       // Install layout (vcpkg tools)
     };
-    
+    for (const auto& path : SdkRootCandidates(lib_name)) {
+        search_paths.push_back(path);  // MDL_SDK_ROOT install layout
+    }
+
     bool loaded = false;
     for (const auto& path : search_paths) {
         if (try_load_library(path)) {
@@ -150,7 +169,10 @@ mi::Sint32 Loader::load_plugin(const char* plugin_name) {
         "../../bin/" + std::string(plugin_name),
 #endif
     };
-    
+    for (const auto& path : SdkRootCandidates(plugin_name)) {
+        search_paths.push_back(path);  // MDL_SDK_ROOT install layout
+    }
+
     mi::Sint32 result = -1;
     for (const auto& path : search_paths) {
         result = plugin_config->load_plugin_library(path.c_str());

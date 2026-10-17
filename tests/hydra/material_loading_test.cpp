@@ -419,12 +419,15 @@ ChildRun RunPrewarmChild(const std::filesystem::path& self, const std::string& m
                          int index=0)
 {
     ChildRun run;
+#ifdef _WIN32
     // cmd.exe drops the outermost quotes, keeping the quoted executable path.
     const std::string command="\"\""+self.string()+"\" --prewarm-child "+mode+" "+
         std::to_string(index)+" 2>&1\"";
-#ifdef _WIN32
     FILE* pipe=_popen(command.c_str(),"r");
 #else
+    // /bin/sh keeps all quotes, so only the executable path is quoted.
+    const std::string command="\""+self.string()+"\" --prewarm-child "+mode+" "+
+        std::to_string(index)+" 2>&1";
     FILE* pipe=popen(command.c_str(),"r");
 #endif
     if (!pipe) return run;

@@ -9,11 +9,11 @@
 #include <tiny_gltf.h>
 
 // internal deps
-#include "geometry.h"
-#include "float3.h"
-#include "float2.h"
-#include "transforms.h"
-#include "material.h"
+#include "../geometry.h"
+#include "../float3.h"
+#include "../float2.h"
+#include "../transforms.h"
+#include "../material.h"
 
 class glTFMesh : public Mesh {
     private:

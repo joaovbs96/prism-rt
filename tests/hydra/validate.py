@@ -1,9 +1,19 @@
-"""Run from an environment initialized by prism_env.ps1; no Python USD package needed."""
+"""Run from an environment initialized by prism_env.ps1 (or prism_env.sh); no Python USD
+package needed."""
 import argparse
 import json
 from pathlib import Path
 import subprocess
+import sys
 import time
+
+EXE = ".exe" if sys.platform == "win32" else ""
+
+
+def standalone_path(build, config):
+    """PrismRT in multi-config (Visual Studio) or single-config (Ninja) build layouts."""
+    multi = build / config / ("PrismRT" + EXE)
+    return multi if multi.exists() else build / ("PrismRT" + EXE)
 
 
 def main():
@@ -26,9 +36,9 @@ def main():
     fixture = root / "tests/hydra/fixtures/parity.usda"
     preview = fixture.with_name("preview_parity.usda")
     preview_mtlx = fixture.with_name("preview_mtlx_parity.usda")
-    standalone = args.standalone.resolve() if args.standalone else build / args.config / "PrismRT.exe"
-    hydra = args.hydra.resolve() if args.hydra else build / "hydra/plugin/prism_hydra_render.exe"
-    compare = args.compare.resolve() if args.compare else build / "hydra/plugin/prism_compare_images.exe"
+    standalone = args.standalone.resolve() if args.standalone else standalone_path(build, args.config)
+    hydra = args.hydra.resolve() if args.hydra else build / ("hydra/plugin/prism_hydra_render" + EXE)
+    compare = args.compare.resolve() if args.compare else build / ("hydra/plugin/prism_compare_images" + EXE)
     results = []
 
     def run(name, command):

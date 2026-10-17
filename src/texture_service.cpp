@@ -154,6 +154,13 @@ std::string contentKey(std::filesystem::path const &path,
     return hash.digest();
 }
 
+// File time ticks as a 64-bit integer. libc++ stores file times as __int128
+// nanoseconds, which streams and std::to_string do not accept.
+long long fileTimeTicks(std::filesystem::file_time_type const &time)
+{
+    return static_cast<long long>(time.time_since_epoch().count());
+}
+
 std::string sourceStamp(std::filesystem::path const &path,
                         TexturePrepareOptions const &options, uint64_t generation)
 {
@@ -165,7 +172,7 @@ std::string sourceStamp(std::filesystem::path const &path,
     std::ostringstream out;
     out << std::filesystem::weakly_canonical(path).generic_string() << '\n'
         << options.resolverIdentity << '\n' << options.sourceVersion << '\n'
-        << size << '\n' << modified.time_since_epoch().count() << '\n' << generation << '\n'
+        << size << '\n' << fileTimeTicks(modified) << '\n' << generation << '\n'
         << std::setprecision(9) << options.gamma << ',' << options.exposure << ','
         << options.firstChannel << ',' << options.channelCount << ','
         << static_cast<int>(options.wrapS) << ',' << static_cast<int>(options.wrapT) << ','
@@ -182,7 +189,7 @@ std::string fileMetadataKey(std::filesystem::path const &path)
     const auto modified = std::filesystem::last_write_time(canonical, ec);
     if (ec) throw std::runtime_error("cannot stat trusted texture source time: " + canonical.string());
     return canonical.generic_string() + "\n" + std::to_string(size) + "\n" +
-        std::to_string(modified.time_since_epoch().count());
+        std::to_string(fileTimeTicks(modified));
 }
 
 std::string trustedFingerprintToken(TrustedTextureFingerprint const &fingerprint)
