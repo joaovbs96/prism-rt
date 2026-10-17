@@ -206,6 +206,23 @@ if(PRISM_ENABLE_METAL)
     list(APPEND CMAKE_BUILD_RPATH "${_prism_msc_lib_dir}")
     list(APPEND CMAKE_INSTALL_RPATH "${_prism_msc_lib_dir}")
 endif()
+
+# Vulkan device: GLSL kernels compiled to SPIR-V with shaderc, ray queries.
+# On macOS no driver exposes ray queries; the device then builds (as a
+# compile check) and reports itself unavailable.
+find_package(Vulkan QUIET COMPONENTS shaderc_combined)
+if(Vulkan_FOUND AND TARGET Vulkan::shaderc_combined)
+    set(_prism_vulkan_default ON)
+else()
+    set(_prism_vulkan_default OFF)
+endif()
+option(PRISM_ENABLE_VULKAN "Build the Vulkan render device" ${_prism_vulkan_default})
+if(PRISM_ENABLE_VULKAN)
+    find_package(Vulkan REQUIRED COMPONENTS shaderc_combined)
+    target_sources(prism_core PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/device/vulkan/vulkan_device.cpp")
+    target_compile_definitions(prism_core PRIVATE PRISM_HAS_VULKAN=1)
+    target_link_libraries(prism_core PUBLIC Vulkan::Vulkan Vulkan::shaderc_combined)
+endif()
 target_include_directories(prism_core PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/external/tinygltf"
     "${CMAKE_CURRENT_SOURCE_DIR}/external/tinyobj")
@@ -437,6 +454,15 @@ if(PRISM_BUILD_HYDRA)
     target_link_libraries(prism_texture_cache_benchmark PRIVATE PrismRT::core)
     add_executable(prism_texture_digest tests/texture_digest.cpp)
     target_link_libraries(prism_texture_digest PRIVATE PrismRT::core)
+
+    add_executable(prism_gpu_shader_compile_test tests/gpu_shader_compile.cpp)
+    target_link_libraries(prism_gpu_shader_compile_test PRIVATE PrismRT::core)
+    if(PRISM_ENABLE_VULKAN)
+        target_compile_definitions(prism_gpu_shader_compile_test PRIVATE PRISM_HAS_VULKAN=1)
+    endif()
+    add_test(NAME prism_gpu_shader_compile_test COMMAND prism_gpu_shader_compile_test
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/parity.usda")
+    set_tests_properties(prism_gpu_shader_compile_test PROPERTIES ENVIRONMENT "${_prism_test_environment}")
 
     add_executable(prism_gpu_codegen_dump tests/gpu_codegen_dump.cpp)
     target_link_libraries(prism_gpu_codegen_dump PRIVATE PrismRT::core)

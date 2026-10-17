@@ -30,6 +30,9 @@ bool LoadShaderSource(std::string_view path, std::string* source)
 
 namespace {
 
+bool ExpandText(std::string const& text, std::string_view path, std::string const& mdlCode,
+                std::set<std::string>& seen, std::string& out, std::string* error);
+
 bool Expand(std::string_view path, std::string const& mdlCode, std::set<std::string>& seen,
             std::string& out, std::string* error)
 {
@@ -39,6 +42,12 @@ bool Expand(std::string_view path, std::string const& mdlCode, std::set<std::str
         if (error) *error = "missing shader source: " + std::string(path);
         return false;
     }
+    return ExpandText(text, path, mdlCode, seen, out, error);
+}
+
+bool ExpandText(std::string const& text, std::string_view path, std::string const& mdlCode,
+                std::set<std::string>& seen, std::string& out, std::string* error)
+{
     std::istringstream lines(text);
     std::string line;
     while (std::getline(lines, line)) {
@@ -55,11 +64,11 @@ bool Expand(std::string_view path, std::string const& mdlCode, std::set<std::str
             continue;
         }
         if (trimmed.starts_with("//@PRISM_MDL_CODE@")) {
+            // Generated code may include Prism's API type headers.
             std::string_view code = mdlCode;
             if (code.starts_with("// GLSL version")) code = code.substr(code.find('\n') + 1);
             if (code.starts_with("#version")) code = code.substr(code.find('\n') + 1);
-            out.append(code);
-            out.push_back('\n');
+            if (!ExpandText(std::string(code), "generated MDL code", {}, seen, out, error)) return false;
             continue;
         }
         out.append(line);

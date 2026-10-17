@@ -327,7 +327,11 @@ MdlShaderCode GenerateMdlShaderCode(std::vector<MDLMaterial const*> const& mater
     backend->set_option("max_const_data", "0");
     backend->set_option("df_handle_slot_mode", "none");
     backend->set_option("libbsdf_flags_in_bsdf_data", "off");
-    if (language == ShadingLanguage::Glsl) backend->set_option("glsl_version", "460");
+    if (language == ShadingLanguage::Glsl) {
+        backend->set_option("glsl_version", "460");
+        // Prism's complete API types, independent of what a material uses.
+        backend->set_option("glsl_include_for_api_types", "gpu/glsl/mdl_types.glsl");
+    }
 
     // Merge structurally identical programs.
     {

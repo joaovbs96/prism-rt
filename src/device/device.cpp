@@ -3,6 +3,9 @@
 #ifdef PRISM_HAS_METAL
 #include "metal/metal_device.h"
 #endif
+#ifdef PRISM_HAS_VULKAN
+#include "vulkan/vulkan_device.h"
+#endif
 
 #include <cctype>
 
@@ -55,8 +58,12 @@ std::unique_ptr<RenderDevice> TryCreate(DeviceKind kind, std::string* reason)
     case DeviceKind::CpuReference:
         return std::make_unique<CpuDevice>(true);
     case DeviceKind::Vulkan:
+#ifdef PRISM_HAS_VULKAN
+        return VulkanDevice::Create(reason);
+#else
         if (reason) *reason = "the Vulkan device is not part of this build";
         return nullptr;
+#endif
     case DeviceKind::Metal:
 #ifdef PRISM_HAS_METAL
         return MetalDevice::Create(reason);

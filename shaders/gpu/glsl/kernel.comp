@@ -1,0 +1,32 @@
+#version 460
+// Vulkan device kernel (GLSL, compiled to SPIR-V). The host substitutes the
+// generated MDL code at the marker below. The generated code includes
+// gpu/glsl/mdl_types.glsl and declares the runtime prototypes itself, so
+// the runtime definitions follow it.
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_nonuniform_qualifier : require
+
+#define PRISM_GLSL 1
+#define PRISM_MDL_TEXTURE_RESULTS 16
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+#include "integrator/prism_sl.h"
+#include "shared/prism_gpu_types.h"
+#define MaterialHandle uint
+#include "integrator/integrator_types.inc"
+#include "gpu/glsl/resources.glsl"
+#include "gpu/gpu_geometry.inc"
+#include "gpu/glsl/trace.glsl"
+//@PRISM_MDL_CODE@
+#define MdlState State
+#define PRISM_IDENTITY_MATRIX mat4(1.0)
+#include "gpu/mdl_runtime_common.inc"
+#include "gpu/mdl_runtime.inc"
+#include "gpu/gpu_backend.inc"
+#include "integrator/path_tracer.inc"
+#include "gpu/gpu_kernel.inc"
+
+void main()
+{
+    prism_kernel(gl_GlobalInvocationID.x);
+}

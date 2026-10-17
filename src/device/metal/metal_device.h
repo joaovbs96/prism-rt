@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../device.h"
+#include "../gpu/gpu_device.h"
 
 #include <memory>
 #include <string>
@@ -10,7 +10,7 @@ namespace prism::device {
 // Metal render device: the shared integrator in HLSL, compiled with DXC and
 // Metal shader converter, tracing with hardware ray tracing (inline ray
 // queries). Geometric outputs (primary AOVs, picking) use the CPU scene.
-class MetalDevice final : public RenderDevice {
+class MetalDevice final : public gpu::GpuRenderDevice {
 public:
     // Null (with a reason) if no Metal GPU with ray tracing is available.
     static std::unique_ptr<MetalDevice> Create(std::string* reason);
@@ -18,12 +18,17 @@ public:
 
     DeviceInfo Info() const override;
     void SceneChanged(SceneManager& scene) override;
-    std::vector<float> RenderImage(SceneManager& scene, ImageRequest const& request) override;
-    void RenderPass(SceneManager& scene, PassRequest const& request) override;
-    bool RenderPreview(SceneManager& scene, PreviewRequest const& request) override;
-    RTCRayHit Intersect(SceneManager& scene, prism::PathRay const& ray) override;
 
     struct Impl;
+
+protected:
+    bool PrepareScene(SceneManager& scene, std::string* error) override;
+    gpu::GpuSceneData const& Data() const override;
+    uint32_t MdlTextureCount() const override;
+    void* RenderBuffer(int slot, size_t bytes) override;
+    bool Dispatch(prism::gpu::GpuFrame const& frame, uint32_t threads, double* gpuSeconds,
+                  std::string* error) override;
+    const char* LogPrefix() const override { return "PrismRT Metal: "; }
 
 private:
     explicit MetalDevice(std::unique_ptr<Impl> impl);
