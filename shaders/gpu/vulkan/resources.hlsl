@@ -37,6 +37,22 @@
 [[vk::binding(kSlotImageBase, 0)]] Texture2D<float4> g_textures[];
 [[vk::binding(kSlotImageBase + 1, 0)]] SamplerState g_samplers[kSamplerCount];
 
+// Vulkan drivers implement normalize, sqrt and division approximately (the
+// spec allows several ULP); NVIDIA's normalize of an interpolated constant
+// normal varies by an ULP with the barycentrics, so geometric outputs of a
+// cropped render differed from the full frame. One Newton step on the length
+// and on the quotient makes it (nearly) correctly rounded, as on the CPU.
+template<typename T> T prism_normalize(T v)
+{
+    const float d = dot(v, v);
+    float len = sqrt(d);
+    len += mad(-len, len, d) / (2.0f * len);
+    T q = v / len;
+    q += mad(-q, len, v) / len;
+    return q;
+}
+#define normalize prism_normalize
+
 StructuredBuffer<GpuFrame> frameBuffer() { return g_frame; }
 StructuredBuffer<float> positionsBuffer() { return g_positions; }
 StructuredBuffer<float> normalsBuffer() { return g_normals; }
