@@ -4,6 +4,7 @@
 #include "mdl/context.h"
 #include "mdl/material_compiler.h"
 #include "mdl/backend_compiler.h"
+#include "mdl/texture_runtime.h"
 #include "materialx/loader.h"
 #include "materialx/mdl_generator.h"
 #include "resource_limits.h"
@@ -547,6 +548,9 @@ private:
     void build_shading_state(const RayHit& hit, ShadingStateData& ss) const
     {
         memset(&ss, 0, sizeof(ss));
+        mdl::NativeTextureRuntime::viewOrigin[0] = hit.o.x();
+        mdl::NativeTextureRuntime::viewOrigin[1] = hit.o.y();
+        mdl::NativeTextureRuntime::viewOrigin[2] = hit.o.z();
 
         // UV
         ss.tex_coord.val = mi::Float32_3(hit.u, hit.v, 0.0f);

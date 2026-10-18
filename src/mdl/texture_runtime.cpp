@@ -277,11 +277,17 @@ bool NativeTextureRuntime::IsTexcoordPrimvarName(const char* name)
     return false;
 }
 
+bool NativeTextureRuntime::IsCameraPositionName(const char* name)
+{
+    return name && std::strcmp(name,"CAMERA_POSITION")==0;
+}
+
 std::shared_ptr<NativeTextureRuntime> NativeTextureRuntime::clone() const
 {
     auto copy=std::shared_ptr<NativeTextureRuntime>(new NativeTextureRuntime);
     copy->m_textures=m_textures;
     copy->m_texcoordSceneData=m_texcoordSceneData;
+    copy->m_cameraPositionSceneData=m_cameraPositionSceneData;
     return copy;
 }
 
@@ -432,8 +438,11 @@ std::shared_ptr<NativeTextureRuntime> NativeTextureRuntime::Create(
     if (code->get_bsdf_measurement_count()>1) return unsupported("measured-BSDF resource");
     auto result = std::shared_ptr<NativeTextureRuntime>(new NativeTextureRuntime);
     result->m_texcoordSceneData.assign(code->get_string_constant_count(), false);
-    for (mi::Size i=1; i<code->get_string_constant_count(); ++i)
+    result->m_cameraPositionSceneData.assign(code->get_string_constant_count(), false);
+    for (mi::Size i=1; i<code->get_string_constant_count(); ++i) {
         result->m_texcoordSceneData[i]=IsTexcoordPrimvarName(code->get_string_constant(i));
+        result->m_cameraPositionSceneData[i]=IsCameraPositionName(code->get_string_constant(i));
+    }
     result->m_textures.resize(code->get_texture_count());
     for (mi::Size i=1; i<code->get_texture_count(); ++i) {
         const auto shape=code->get_texture_shape(i);
@@ -637,7 +646,7 @@ mi::neuraylib::Texture_handler_deriv_vtable const &NativeTextureRuntime::Vtable(
         // names; other primvars return the defaults. States carry derivatives.
         v.m_scene_data_isvalid=[](Base const* base,
             mi::neuraylib::Shading_state_material*,unsigned id){
-            return Self(base)->isTexcoordSceneData(id);};
+            return Self(base)->isTexcoordSceneData(id) || Self(base)->isCameraPositionSceneData(id);};
         v.m_scene_data_lookup_float=[](Base const*,
             mi::neuraylib::Shading_state_material*,unsigned,float d,bool){return d;};
         v.m_scene_data_lookup_float2=[](float out[2],Base const* base,
@@ -648,9 +657,10 @@ mi::neuraylib::Texture_handler_deriv_vtable const &NativeTextureRuntime::Vtable(
                 out[0]=uv[0].val.x;out[1]=uv[0].val.y;return;
             }
             out[0]=d[0];out[1]=d[1];};
-        v.m_scene_data_lookup_float3=[](float out[3],Base const*,
-            mi::neuraylib::Shading_state_material*,unsigned,float const d[3],bool){
-            for(int i=0;i<3;++i)out[i]=d[i];};
+        v.m_scene_data_lookup_float3=[](float out[3],Base const* base,
+            mi::neuraylib::Shading_state_material*,unsigned id,float const d[3],bool){
+            const bool view=Self(base)->isCameraPositionSceneData(id);
+            for(int i=0;i<3;++i)out[i]=view?viewOrigin[i]:d[i];};
         v.m_scene_data_lookup_float4=[](float out[4],Base const*,
             mi::neuraylib::Shading_state_material*,unsigned,float const d[4],bool){
             for(int i=0;i<4;++i)out[i]=d[i];};
@@ -688,9 +698,12 @@ mi::neuraylib::Texture_handler_deriv_vtable const &NativeTextureRuntime::Vtable(
             }
             *out=*d;};
         v.m_scene_data_lookup_deriv_float3=[](
-            mi::neuraylib::tct_deriv_arr_float_3 *out,Base const*,
-            mi::neuraylib::Shading_state_material_with_derivs*,unsigned,
-            mi::neuraylib::tct_deriv_arr_float_3 const *d,bool){*out=*d;};
+            mi::neuraylib::tct_deriv_arr_float_3 *out,Base const* base,
+            mi::neuraylib::Shading_state_material_with_derivs*,unsigned id,
+            mi::neuraylib::tct_deriv_arr_float_3 const *d,bool){
+            *out=*d;
+            if(Self(base)->isCameraPositionSceneData(id))
+                for(int i=0;i<3;++i){out->val[i]=viewOrigin[i];out->dx[i]=0.0f;out->dy[i]=0.0f;}};
         v.m_scene_data_lookup_deriv_float4=[](
             mi::neuraylib::tct_deriv_arr_float_4 *out,Base const*,
             mi::neuraylib::Shading_state_material_with_derivs*,unsigned,

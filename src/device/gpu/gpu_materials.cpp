@@ -165,6 +165,10 @@ std::string GenerateSceneData(mi::neuraylib::ITarget_code const* code)
     for (mi::Size i = 1; code && i < code->get_string_constant_count(); ++i)
         if (mdl::NativeTextureRuntime::IsTexcoordPrimvarName(code->get_string_constant(i)))
             s += std::format("    if (id == {}) return true;\n", i);
+    s += "    return false;\n}\n\nbool prism_scene_data_is_camera_position(int id)\n{\n";
+    for (mi::Size i = 1; code && i < code->get_string_constant_count(); ++i)
+        if (mdl::NativeTextureRuntime::IsCameraPositionName(code->get_string_constant(i)))
+            s += std::format("    if (id == {}) return true;\n", i);
     return s + "    return false;\n}\n\n";
 }
 

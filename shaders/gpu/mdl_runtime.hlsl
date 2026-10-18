@@ -494,16 +494,21 @@ float df_bsdf_measurement_pdf(int bm_idx, float2 theta_phi_in, float2 theta_phi_
 float4 df_bsdf_measurement_albedos(int bm_idx, float2 theta_phi) { return float4(0.0f, 0.0f, 0.0f, 0.0f); }
 
 bool prism_scene_data_is_texcoord(int id);
+bool prism_scene_data_is_camera_position(int id);
 
 // Scene data: the texture coordinates under their usual primvar names
 // (prism_scene_data_is_texcoord, generated per link unit); other lookups
 // return their defaults, as in the native runtime.
 bool scene_data_isvalid(inout Shading_state_material state, int scene_data_id)
 {
-    return prism_scene_data_is_texcoord(scene_data_id);
+    return prism_scene_data_is_texcoord(scene_data_id) || prism_scene_data_is_camera_position(scene_data_id);
 }
 float4 scene_data_lookup_float4(inout Shading_state_material state, int id, float4 value, bool uniform_lookup) { return value; }
-float3 scene_data_lookup_float3(inout Shading_state_material state, int id, float3 value, bool uniform_lookup) { return value; }
+// MaterialX viewdirection: the view point of a path tracer is the origin of the ray that hit.
+float3 scene_data_lookup_float3(inout Shading_state_material state, int id, float3 value, bool uniform_lookup)
+{
+    return prism_scene_data_is_camera_position(id) ? state.view_origin : value;
+}
 float3 scene_data_lookup_color(inout Shading_state_material state, int id, float3 value, bool uniform_lookup) { return value; }
 float2 scene_data_lookup_float2(inout Shading_state_material state, int id, float2 value, bool uniform_lookup)
 {
@@ -524,7 +529,15 @@ Derived_float2 scene_data_lookup_deriv_float2(inout Shading_state_material state
 Derived_float scene_data_lookup_deriv_float(inout Shading_state_material state, int id, Derived_float value,
                                             bool uniform_lookup) { return value; }
 Derived_float3 scene_data_lookup_deriv_float3(inout Shading_state_material state, int id, Derived_float3 value,
-                                              bool uniform_lookup) { return value; }
+                                              bool uniform_lookup)
+{
+    if (!prism_scene_data_is_camera_position(id)) return value;
+    Derived_float3 result;
+    result.val = state.view_origin;
+    result.dx = (float3)0.0f;
+    result.dy = (float3)0.0f;
+    return result;
+}
 Derived_float4 scene_data_lookup_deriv_float4(inout Shading_state_material state, int id, Derived_float4 value,
                                               bool uniform_lookup) { return value; }
 Derived_float3 scene_data_lookup_deriv_color(inout Shading_state_material state, int id, Derived_float3 value,

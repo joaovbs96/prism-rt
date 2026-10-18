@@ -78,6 +78,13 @@ public:
         return id < m_texcoordSceneData.size() && m_texcoordSceneData[id];
     }
     static bool IsTexcoordPrimvarName(const char* name);
+    bool isCameraPositionSceneData(unsigned id) const {
+        return id < m_cameraPositionSceneData.size() && m_cameraPositionSceneData[id];
+    }
+    static bool IsCameraPositionName(const char* name);
+    // The origin of the ray being shaded on this thread (MDLMaterial sets it
+    // with the shading state): scene data CAMERA_POSITION.
+    static inline thread_local float viewOrigin[3] = {0.0f, 0.0f, 0.0f};
     ResourceView resource(size_t index) const;
     // Prepares the 2D texture (or UDIM set) stored under a database name, as
     // the runtime does for the textures of its own target code.
@@ -121,6 +128,7 @@ private:
     std::shared_ptr<prism::TextureService> m_service;
     std::vector<Texture> m_textures; // index 0 is invalid
     std::vector<bool> m_texcoordSceneData; // by string constant index
+    std::vector<bool> m_cameraPositionSceneData;
     mutable std::atomic<bool> m_reportedLookupFailure{false};
     // Most graphs use a single constant crop. Keep a bounded set of prepared
     // crop views; no source pixel arrays survive preparation.

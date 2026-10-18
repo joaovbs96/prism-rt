@@ -533,6 +533,7 @@ struct GpuShading {
 // MDLMaterial::build_shading_state
 void gpu_build_mdl_state(SurfaceHit hit, GpuMaterial material, out Shading_state_material state)
 {
+    state.view_origin = hit.o;
     state.text_coords[0].val = float3(hit.u, hit.v, 0.0f);
     bool filtered = hit.texture_footprint.filtered;
     state.text_coords[0].dx = filtered ? float3(hit.texture_footprint.dudx, hit.texture_footprint.dvdx, 0.0f)

@@ -217,6 +217,57 @@ void FixConnectionTypes(const MaterialX::DocumentPtr& doc)
     }
 }
 
+// MaterialX's MDL generator layers a BSDF over a base by handing the base to
+// the top lobe; a mix as the top passes nothing on and the base is lost. A
+// layer distributes over a mix of its top:
+//   layer(mix(fg, bg, m), base) = mix(layer(fg, base), layer(bg, base), m).
+void DistributeLayersOverMixes(const MaterialX::DocumentPtr& doc)
+{
+    std::vector<MaterialX::NodePtr> work;
+    for (auto element : doc->traverseTree())
+        if (auto node = element->asA<MaterialX::Node>(); node && node->getCategory() == "layer") work.push_back(node);
+    size_t guard = 0;
+    while (!work.empty() && ++guard < 4096) {
+        auto layer = work.back();
+        work.pop_back();
+        auto graph = layer->getParent() ? layer->getParent()->asA<MaterialX::GraphElement>() : nullptr;
+        auto topInput = layer->getInput("top");
+        auto baseInput = layer->getInput("base");
+        if (!graph || !topInput || !topInput->hasNodeName()) continue;
+        auto mix = graph->getNode(topInput->getNodeName());
+        if (!mix || mix->getCategory() != "mix" || mix->getType() != "BSDF") continue;
+        auto makeLayer = [&](const char* side) -> MaterialX::NodePtr {
+            auto source = mix->getInput(side);
+            auto result = graph->addNode("layer", graph->createValidChildName(layer->getName() + "_" + side), "BSDF");
+            auto top = result->addInput("top", "BSDF");
+            if (source && source->hasNodeName()) top->setNodeName(source->getNodeName());
+            if (baseInput) {
+                auto base = result->addInput("base", "BSDF");
+                if (baseInput->hasNodeName()) base->setNodeName(baseInput->getNodeName());
+            }
+            return result;
+        };
+        auto fg = makeLayer("fg");
+        auto bg = makeLayer("bg");
+        // The layer becomes the mix, so its consumers are unchanged.
+        layer->removeInput("top");
+        layer->removeInput("base");
+        layer->setCategory("mix");
+        if (layer->hasNodeDefString()) layer->setNodeDefString("ND_mix_bsdf");
+        layer->addInput("fg", "BSDF")->setNodeName(fg->getName());
+        layer->addInput("bg", "BSDF")->setNodeName(bg->getName());
+        if (auto weight = mix->getInput("mix")) {
+            auto copy = layer->addInput("mix", "float");
+            copy->copyContentFrom(weight);
+        }
+        work.push_back(fg);
+        work.push_back(bg);
+        if (VerboseMdl())
+            std::cout << "[MaterialX] layer " << layer->getNamePath() << " distributed over mix "
+                      << mix->getNamePath() << "\n";
+    }
+}
+
 void NormalizeColorSpaces(const MaterialX::DocumentPtr& doc)
 {
     const std::string& attribute = MaterialX::Element::COLOR_SPACE_ATTRIBUTE;
@@ -261,6 +312,7 @@ MaterialX::DocumentPtr DocumentLoader::load(const std::string& filepath)
         NormalizeColorSpaces(doc);
         FixDeclaredInputTypes(doc, m_stdlib);
         FixConnectionTypes(doc);
+        DistributeLayersOverMixes(doc);
         if (m_fallback_sss_to_diffuse) {
             // Collect first: adding an absent weight input mutates the tree.
             std::vector<MaterialX::NodePtr> surface_nodes;

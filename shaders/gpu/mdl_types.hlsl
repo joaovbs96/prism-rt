@@ -28,6 +28,7 @@ struct Shading_state_material {
     uint object_id;
     float meters_per_scene_unit;
     uint arg_block_offset;
+    float3 view_origin;   // origin of the ray that hit: scene data CAMERA_POSITION
 };
 
 
