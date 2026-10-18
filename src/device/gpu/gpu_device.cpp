@@ -65,6 +65,7 @@ std::vector<float> GpuRenderDevice::RenderImage(SceneManager& scene, ImageReques
     double gpuSeconds = 0.0;
     for (int sample = 0; sample < request.samples; ++sample) {
         GpuFrame f = frame;
+        f.counts.z = uint32_t(sample);
         if (sample == 0) f.settings.z |= kFrameSeedRng;
         if (!Dispatch(f, count, &gpuSeconds, &error)) {
             std::cerr << LogPrefix() << error << '\n';
@@ -104,6 +105,7 @@ void GpuRenderDevice::RenderPass(SceneManager& scene, PassRequest const& request
         if (request.shading.transparentEscapes) frame.settings.z |= kFrameTransparentEscapes;
         if (request.sample == 0) frame.settings.z |= kFrameSeedRng;
         frame.settings.w = request.seed;
+        frame.counts.z = uint32_t(std::max(0, request.sample));
     }
 
     // Tiles are dispatched in chunks so callers see progress and can stop.

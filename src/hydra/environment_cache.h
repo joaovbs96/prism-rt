@@ -127,6 +127,14 @@ public:
         s.pdf *= localPerWorldJacobian(s.wi);
         return s;
     }
+    EnvironmentSample sampleDirectionUniform(const float u[4],
+                                             const prism::DirectionFootprint& footprint) const override {
+        EnvironmentSample s = this->local->map.sampleLocalDirection(u);
+        s.wi = apply(inv, s.wi).normalize();
+        s.radiance = radiance(s.wi, footprint);
+        s.pdf *= localPerWorldJacobian(s.wi);
+        return s;
+    }
     float directionPdf(const Float3& world) const override {
         const Float3 transformed = apply(m, world);
         if (transformed.is_zero()) return 0.0f;

@@ -219,12 +219,12 @@ public:
     {
         auto* ss=context.owner==this&&context.valid
             ? reinterpret_cast<ShadingStateData*>(context.storage):nullptr;
-        return sampleWithState(hit,seed,ss);
+        return sampleWithState(hit,seed,ss,context.hasXi?context.xi:nullptr);
     }
 
 private:
     BRDFSample sampleWithState(const RayHit ray_hit, unsigned int& seed,
-                               ShadingStateData* prepared)
+                               ShadingStateData* prepared, const float* xi = nullptr)
     {
         BRDFSample s;
 
@@ -300,10 +300,14 @@ private:
             sd.ior2 = mi::Float32_3(1.0f, 1.0f, 1.0f);
         }
 
-        sd.xi.x = rnd(seed);
-        sd.xi.y = rnd(seed);
-        sd.xi.z = rnd(seed);
-        sd.xi.w = rnd(seed);
+        if (xi) {
+            sd.xi.x = xi[0]; sd.xi.y = xi[1]; sd.xi.z = xi[2]; sd.xi.w = xi[3];
+        } else {
+            sd.xi.x = rnd(seed);
+            sd.xi.y = rnd(seed);
+            sd.xi.z = rnd(seed);
+            sd.xi.w = rnd(seed);
+        }
 
         const mi::Size bsdf_index = backface && thinWalled
             ? m_target.program->functions.backface_bsdf_function_index

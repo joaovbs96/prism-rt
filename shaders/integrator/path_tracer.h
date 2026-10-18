@@ -8,7 +8,8 @@
 //
 //   Hit      backend.intersect(PathRay)        prepared closest hit; hit.surface.valid
 //   Shading  backend.prepare(Hit)              Material::perturbNormal + prepare
-//   BsdfSample     backend.sample(Shading)     draws from backend.rng
+//   BsdfSample     backend.sample(Shading, float4 xi)   xi: the BSDF's sample point; materials
+//                                               without one draw from backend.rng
 //   BsdfEvaluation backend.evaluate(Shading, float3 wi)
 //   bool     backend.supportsNee(Shading)
 //   bool     backend.provenOpaque(Hit)
@@ -19,13 +20,15 @@
 //   Hit      backend.intersectNonOpaque(PathRay)  closest hit on geometry that may
 //                                                 transmit (may include opaque geometry)
 //   float3   backend.environmentRadiance(float3 direction, float angularRadius)
-//   EnvironmentLightSample backend.sampleEnvironment(float angularRadius)   draws from backend.rng
+//   EnvironmentLightSample backend.sampleEnvironment(float4 u, float angularRadius)
 //   float    backend.environmentPdf(float3 direction)
 //   int      backend.maxDepth(), backend.rouletteDepth()
 //   bool     backend.environmentMis()
-//   Rng      backend.rng
+//   Rng      backend.rng                          white noise for materials and cutouts
 //
-// Random numbers are drawn in the order of SceneManager::trace and
+// The integrator's own dimensions (pixel, lens, BSDF, light and roulette
+// samples) come from the low-discrepancy `sampler`, set up per pixel and
+// sample by the device; the decisions are those of SceneManager::trace and
 // SceneManager::traceEnvironmentMis, which this replaces with one loop.
 //
 // GPU compilers inline every call, and each material call expands to the code
@@ -153,6 +156,7 @@ struct TraceResult {
 template <typename Backend, typename Hit, typename Shading>
 struct PathTracer {
     Backend backend;
+    Sampler sampler;
 
     // SceneManager::environmentVisible: stochastic transmission through cutouts.
     // Opaque geometry anywhere on the ray blocks it whatever cutouts lie in
@@ -204,7 +208,7 @@ struct PathTracer {
                 break;
             }
             const Shading shading = backend.prepare(hit);
-            const BsdfSample bs = backend.sample(shading);
+            const BsdfSample bs = backend.sample(shading, sampler.next4());
             result.radiance += weight * bs.emission;
             if (mis && bs.null_event) {
                 if (!bs.scattered) tracking = false;
@@ -222,7 +226,8 @@ struct PathTracer {
             // At the depth boundary the competing continuation is truncated too.
             const bool canNee = mis && depth + 1 < maxDepth && backend.supportsNee(shading);
             if (canNee) {
-                const EnvironmentLightSample light = backend.sampleEnvironment(angularRadius(hit.surface.ray_footprint));
+                const EnvironmentLightSample light =
+                    backend.sampleEnvironment(sampler.next4(), angularRadius(hit.surface.ray_footprint));
                 if (light.pdf > 0.0f && isfinite(light.pdf)) {
                     // The shadow ray is traced only for a nonzero contribution.
                     const BsdfEvaluation f = backend.evaluate(shading, light.wi);
@@ -240,7 +245,7 @@ struct PathTracer {
             float rouletteWeight = 1.0f;
             if (depth >= rouletteDepth) {
                 const float q = clamp(maxComponent(throughput), 0.05f, 0.95f);
-                if (backend.rng.next() >= q) break;
+                if (sampler.next1() >= q) break;
                 rouletteWeight = 1.0f / q;
                 throughput *= rouletteWeight;
             }
@@ -256,14 +261,15 @@ struct PathTracer {
     // GenerateCameraRays: jittered sample ray with exact pixel differentials.
     PathRay cameraSample(CameraParams camera, uint x, uint y, uint width, uint height)
     {
-        const float sx = float(x) + backend.rng.next();
-        const float sy = float(y) + backend.rng.next();
+        const float4 u = sampler.next4();
+        const float sx = float(x) + u.x;
+        const float sy = float(y) + u.y;
         float2 lens = 0.0f;
         const bool useLens = hasLens(camera);
         if (useLens) {
             // random_in_unit_disk
-            const float a = backend.rng.next() * (2.0f * kPi);
-            const float r = sqrt(backend.rng.next());
+            const float a = u.z * (2.0f * kPi);
+            const float r = sqrt(u.w);
             lens = float2(sin(a) * r, cos(a) * r);
         }
         PathRay result;

@@ -48,6 +48,21 @@ class Environment {
         return s;
     }
     virtual float directionPdf(const Float3&) const { return 1.0f / (4.0f * PI); }
+
+    // sampleDirection(seed, footprint) for the sample point u in [0,1)^4
+    // instead of the generator; uses as many coordinates as the generator
+    // version draws numbers, in the same order.
+    virtual EnvironmentSample sampleDirectionUniform(const float u[4],
+                                                     const prism::DirectionFootprint& footprint) const {
+        const float y = 1.0f - 2.0f * u[0];
+        const float phi = 2.0f * PI * u[1];
+        const float r = std::sqrt(std::max(0.0f, 1.0f - y * y));
+        EnvironmentSample s;
+        s.wi = Float3(r * std::cos(phi), y, r * std::sin(phi));
+        s.radiance = radiance(s.wi, footprint);
+        s.pdf = 1.0f / (4.0f * PI);
+        return s;
+    }
 };
 
 class ConstantColorBackground : public Environment {
@@ -145,25 +160,38 @@ class EnvironmentMap : public Environment {
         s.radiance = radiance(s.wi, footprint);
         return s;
     }
+    EnvironmentSample sampleDirectionUniform(const float u[4],
+                                             const prism::DirectionFootprint& footprint) const override {
+        auto s = sampleLocalDirection(u);
+        s.radiance = radiance(s.wi, footprint);
+        return s;
+    }
 
     // Sampling remains independent of texture filtering and its memory cache.
     EnvironmentSample sampleLocalDirection(unsigned int& seed) const {
+        float u[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        const int count = probability.empty() ? 2 : 4;
+        for (int i = 0; i < count; ++i) u[i] = rnd(seed);
+        return sampleLocalDirection(u);
+    }
+
+    EnvironmentSample sampleLocalDirection(const float u[4]) const {
         if (probability.empty()) {
-            const float y = 1.0f - 2.0f * rnd(seed);
-            const float phi = 2.0f * PI * rnd(seed);
+            const float y = 1.0f - 2.0f * u[0];
+            const float phi = 2.0f * PI * u[1];
             const float r = std::sqrt(std::max(0.0f, 1.0f-y*y));
             return {Float3(r*std::cos(phi),y,r*std::sin(phi)), Color3(0), 1.0f/(4.0f*PI)};
         }
         const size_t n = probability.size();
-        const double x = (double(rnd(seed)) + double(rnd(seed)) / 16777216.0) * n;
+        const double x = (double(u[0]) + double(u[1]) / 16777216.0) * n;
         const size_t column = std::min(static_cast<size_t>(x), n - 1);
         const size_t index = (x - std::floor(x) < probability[column]) ? column : alias[column];
         const int px = static_cast<int>(index % width), py = static_cast<int>(index / width);
-        const float phi = 2.0f * PI * (static_cast<float>(px) + rnd(seed)) / width;
+        const float phi = 2.0f * PI * (static_cast<float>(px) + u[2]) / width;
         constexpr double pi = 3.14159265358979323846;
         const double theta0 = pi * py / height;
         const double theta1 = pi * (py + 1) / height;
-        const double cosTheta = std::cos(theta0) + rnd(seed) * (std::cos(theta1) - std::cos(theta0));
+        const double cosTheta = std::cos(theta0) + u[3] * (std::cos(theta1) - std::cos(theta0));
         // Keep polar angular detail even when the float y component rounds to
         // +/-1. atan2(xz,y) below can still recover the correct HDR texel row.
         const float sinTheta = float(std::sqrt(std::max(0.0, 1.0 - cosTheta * cosTheta)));
@@ -272,6 +300,14 @@ public:
     }
     EnvironmentSample sampleDirection(unsigned int& seed, const prism::DirectionFootprint& footprint) const override {
         EnvironmentSample s = sampleLocalDirection(seed);
+        s.wi = apply(inv, s.wi).normalize();
+        s.radiance = radiance(s.wi, footprint);
+        s.pdf *= localPerWorldJacobian(s.wi);
+        return s;
+    }
+    EnvironmentSample sampleDirectionUniform(const float u[4],
+                                             const prism::DirectionFootprint& footprint) const override {
+        EnvironmentSample s = sampleLocalDirection(u);
         s.wi = apply(inv, s.wi).normalize();
         s.radiance = radiance(s.wi, footprint);
         s.pdf *= localPerWorldJacobian(s.wi);

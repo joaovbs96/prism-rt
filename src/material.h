@@ -31,6 +31,10 @@ class Material {
             alignas(16) std::byte storage[3072];
             const Material* owner = nullptr;
             bool valid = false;
+            // Optional sample point for the BSDF sample of materials that
+            // take one (MDL); otherwise they draw from the generator.
+            bool hasXi = false;
+            float xi[4] = {0.0f, 0.0f, 0.0f, 0.0f};
         };
         static_assert(alignof(PreparedShadingContext) >= 16);
         Material() {}

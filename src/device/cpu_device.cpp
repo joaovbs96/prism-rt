@@ -94,14 +94,16 @@ bool AllMaterialsBlock(SceneManager& scene)
 }
 
 // One sample of the shared path tracer; seed carries the pixel's random state.
+// The sampler's sequence is indexed by `sample`, scrambled per pixel.
 SampleResult TraceSample(SceneManager& scene, bool opaqueScene, CameraParams const& camera,
                          SampleSettings const& settings, unsigned x, unsigned y, unsigned width,
-                         unsigned height, unsigned& seed)
+                         unsigned height, unsigned& seed, unsigned sample, unsigned pixelSeed)
 {
     CpuPathTracer tracer;
     tracer.backend.scene = &scene;
     tracer.backend.opaqueScene = opaqueScene;
     tracer.backend.rng.state = seed;
+    tracer.sampler = {sample, pixelSeed, 0u};
     const SampleResult result = tracer.renderSample(camera, x, y, width, height, settings);
     seed = tracer.backend.rng.state;
     return result;
@@ -151,7 +153,8 @@ std::vector<float> CpuDevice::RenderImage(SceneManager& scene, ImageRequest cons
             if (!m_reference) {
                 for (int sample = 0; sample < request.samples; ++sample) {
                     const auto result = TraceSample(scene, opaqueScene, camera, settings, unsigned(x),
-                        unsigned(y), unsigned(width), unsigned(height), seed);
+                        unsigned(y), unsigned(width), unsigned(height), seed, unsigned(sample),
+                        seedImage(unsigned(x), unsigned(y), unsigned(width), request.seed));
                     sum += ToFloat3(result.color);
                 }
             }
@@ -229,7 +232,8 @@ void CpuDevice::RenderPass(SceneManager& scene, PassRequest const& request)
                                             static_cast<float>(x) + 0.5f,
                                             static_cast<float>(y) + 0.5f,
                                             width, height, nullptr);
-                                const auto result = TraceSample(scene, opaqueScene, camera, settings, x, y, width, height, seed);
+                                const auto result = TraceSample(scene, opaqueScene, camera, settings, x, y, width,
+                                    height, seed, unsigned(request.sample), seedPass(x, y, width, request.seed));
                                 ++colorWork.value;
                                 request.colors[pixel] = ToFloat3(result.color);
                                 request.coverage[pixel] = result.coverage;
@@ -317,7 +321,8 @@ bool CpuDevice::RenderPreview(SceneManager& scene, PreviewRequest const& request
                 color = ShadeSample(color, outcome, request.shading, &coverage);
                 center = rays.center;
             } else {
-                const auto result = TraceSample(scene, opaqueScene, camera, settings, x, y, width, height, seed);
+                const auto result = TraceSample(scene, opaqueScene, camera, settings, x, y, width, height,
+                                                seed, 0u, seed);
                 color = ToFloat3(result.color);
                 coverage = result.coverage;
                 center = prism::MakeCameraRayWithLens(request.camera,

@@ -591,7 +591,7 @@ float3 gpu_mdl_emission(GpuMaterial material, inout Shading_state_material state
 
 // MDLMaterial::sampleWithState
 BsdfSample gpu_mdl_sample(SurfaceHit hit, GpuMaterial material, inout Shading_state_material state,
-                                       inout Rng rng)
+                          inout Rng rng, float4 xi)
 {
     bool backface = !hit.front_face;
     float3 wo = -normalize(hit.d);
@@ -608,10 +608,7 @@ BsdfSample gpu_mdl_sample(SurfaceHit hit, GpuMaterial material, inout Shading_st
     }
     data.k1 = wo;
     data.k2 = (float3)0.0f;
-    data.xi.x = rng.next();
-    data.xi.y = rng.next();
-    data.xi.z = rng.next();
-    data.xi.w = rng.next();
+    data.xi = xi;
     data.pdf = 0.0f;
     data.bsdf_over_pdf = (float3)0.0f;
     data.event_type = 0;
@@ -781,15 +778,15 @@ void gpu_mul_wide(uint a, uint b, out uint lo, out uint hi)
 }
 
 // EnvironmentMap::sampleLocalDirection
-EnvironmentLightSample gpu_latlong_sample_local(GpuEnvironment env, inout Rng rng)
+EnvironmentLightSample gpu_latlong_sample_local(GpuEnvironment env, float4 u)
 {
     EnvironmentLightSample s;
     s.radiance = (float3)0.0f;
     uint width = env.info.z;
     uint height = env.info2.x;
     if (width == 0u) {
-        float y = 1.0f - 2.0f * rng.next();
-        float phi = 2.0f * kPi * rng.next();
+        float y = 1.0f - 2.0f * u.x;
+        float phi = 2.0f * kPi * u.y;
         float r = sqrt(max(0.0f, 1.0f - y * y));
         s.wi = float3(r * cos(phi), y, r * sin(phi));
         s.pdf = 1.0f / (4.0f * kPi);
@@ -798,8 +795,8 @@ EnvironmentLightSample gpu_latlong_sample_local(GpuEnvironment env, inout Rng rn
     uint n = width * height;
     // x = (r1 + r2 / 2^24) * n with r1, r2 24-bit fractions, evaluated in
     // fixed point (the CPU uses double precision here).
-    float r1 = rng.next();
-    float r2 = rng.next();
+    float r1 = u.x;
+    float r2 = u.y;
     uint k1 = uint(r1 * 16777216.0f);
     uint k2 = uint(r2 * 16777216.0f);
     uint lo;
@@ -815,10 +812,10 @@ EnvironmentLightSample gpu_latlong_sample_local(GpuEnvironment env, inout Rng rn
     uint index = fraction < gpu_env_alias_probability(column) ? column : gpu_env_alias(column);
     uint px = index % width;
     uint py = index / width;
-    float phi = 2.0f * kPi * (float(px) + rng.next()) / float(width);
+    float phi = 2.0f * kPi * (float(px) + u.z) / float(width);
     float theta0 = kPi * float(py) / float(height);
     float theta1 = kPi * float(py + 1u) / float(height);
-    float r = rng.next();
+    float r = u.w;
     // cos(theta) between the rows' bounds, kept accurate near both poles.
     float s0 = sin(0.5f * theta0);
     float s1 = sin(0.5f * theta1);
@@ -853,18 +850,18 @@ float gpu_env_jacobian(GpuEnvironment env, float3 world)
 }
 
 // Environment::sampleDirection and its overrides.
-EnvironmentLightSample gpu_environment_sample(GpuEnvironment env, inout Rng rng, float angularRadius)
+EnvironmentLightSample gpu_environment_sample(GpuEnvironment env, float4 u, float angularRadius)
 {
     EnvironmentLightSample s;
     if (env.info.x != kEnvLatlong) {
         // Environment::sampleDirection: uniform sphere.
-        float y = 1.0f - 2.0f * rng.next();
-        float phi = 2.0f * kPi * rng.next();
+        float y = 1.0f - 2.0f * u.x;
+        float phi = 2.0f * kPi * u.y;
         float r = sqrt(max(0.0f, 1.0f - y * y));
         s.wi = float3(r * cos(phi), y, r * sin(phi));
         s.pdf = 1.0f / (4.0f * kPi);
     } else {
-        s = gpu_latlong_sample_local(env, rng);
+        s = gpu_latlong_sample_local(env, u);
         if ((env.info.w & kEnvTransformed) != 0u) {
             s.wi = normalize(gpu_row_transform(env.toWorld[0], env.toWorld[1], env.toWorld[2], s.wi));
             s.pdf *= gpu_env_jacobian(env, s.wi);
@@ -921,10 +918,10 @@ struct GpuBackend {
         return shading;
     }
 
-    BsdfSample sample(GpuShading shading)
+    BsdfSample sample(GpuShading shading, float4 xi)
     {
         const GpuMaterial material = gpu_material(shading.material);
-        if (material.info.x == kMaterialMdl) return gpu_mdl_sample(shading.surface, material, shading.state, rng);
+        if (material.info.x == kMaterialMdl) return gpu_mdl_sample(shading.surface, material, shading.state, rng, xi);
         return gpu_legacy_sample(shading.surface, material, rng);
     }
 
@@ -978,9 +975,9 @@ struct GpuBackend {
         return gpu_environment_radiance(gpu_environment(), direction, angularRadius);
     }
 
-    EnvironmentLightSample sampleEnvironment(float angularRadius)
+    EnvironmentLightSample sampleEnvironment(float4 u, float angularRadius)
     {
-        return gpu_environment_sample(gpu_environment(), rng, angularRadius);
+        return gpu_environment_sample(gpu_environment(), u, angularRadius);
     }
 
     float environmentPdf(float3 direction) { return gpu_environment_pdf(gpu_environment(), direction); }

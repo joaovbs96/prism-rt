@@ -163,7 +163,7 @@ struct GpuFrame {
     uint4 size;                  // x: width, y: height, z: preview width, w: preview height
     uint4 settings;              // x: max depth, y: roulette depth, z: flags, w: seed
     uint4 work;                  // x: thread count, y: tile count, z: mode, w: first thread
-    uint4 counts;                // x: MDL texture count
+    uint4 counts;                // x: MDL texture count, y: debug view, z: sample number
 };
 
 struct GpuTile {

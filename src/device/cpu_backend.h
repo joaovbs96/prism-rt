@@ -94,8 +94,13 @@ struct CpuBackend {
         return shading;
     }
 
-    BsdfSample sample(CpuShading const& shading)
+    BsdfSample sample(CpuShading const& shading, float4 xi)
     {
+        shading.prepared.hasXi = true;
+        shading.prepared.xi[0] = xi.x;
+        shading.prepared.xi[1] = xi.y;
+        shading.prepared.xi[2] = xi.z;
+        shading.prepared.xi[3] = xi.w;
         const BRDFSample s = shading.material->samplePrepared(*shading.hit, rng.state, shading.prepared);
         const BsdfSample result = {FromFloat3(s.wi), FromFloat3(s.color), FromFloat3(s.emission), s.scattered,
                                    s.pdf, s.delta, s.null_event};
@@ -119,10 +124,11 @@ struct CpuBackend {
             ToFloat3(direction), prism::DirectionFootprint{angular, scene->textureFiltering}));
     }
 
-    EnvironmentLightSample sampleEnvironment(float angular)
+    EnvironmentLightSample sampleEnvironment(float4 u, float angular)
     {
-        const ::EnvironmentSample s = scene->environment->sampleDirection(
-            rng.state, prism::DirectionFootprint{angular, scene->textureFiltering});
+        const float point[4] = {u.x, u.y, u.z, u.w};
+        const ::EnvironmentSample s = scene->environment->sampleDirectionUniform(
+            point, prism::DirectionFootprint{angular, scene->textureFiltering});
         const EnvironmentLightSample result = {FromFloat3(s.wi), FromFloat3(s.radiance), s.pdf};
         return result;
     }

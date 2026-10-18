@@ -68,6 +68,8 @@ void main(uint3 id : SV_DispatchThreadID)
         const uint y = min(height - 1u, ((2u * py + 1u) * height) / (2u * previewHeight));
         const uint x = min(width - 1u, ((2u * px + 1u) * width) / (2u * previewWidth));
         tracer.backend.rng.state = seedPreview(px, py, previewWidth, frame.settings.w);
+        const Sampler previewSampler = {0u, tracer.backend.rng.state, 0u};
+        tracer.sampler = previewSampler;
         const SampleResult preview = tracer.renderSample(camera, x, y, width, height, settings);
         gpu_store_output(thread, float4(preview.color, preview.coverage));
         return;
@@ -93,6 +95,12 @@ void main(uint3 id : SV_DispatchThreadID)
         y = thread / width;
     }
     const uint pixel = y * width + x;
+    // The sampler's sequence is indexed by the sample number, scrambled per pixel.
+    const Sampler sampler = {frame.counts.z,
+                             mode == kModeImage ? seedImage(x, y, width, frame.settings.w)
+                                                : seedPass(x, y, width, frame.settings.w),
+                             0u};
+    tracer.sampler = sampler;
     if ((flags & kFrameSeedRng) != 0u)
         tracer.backend.rng.state = mode == kModeImage ? seedImage(x, y, width, frame.settings.w)
                                                       : seedPass(x, y, width, frame.settings.w);
