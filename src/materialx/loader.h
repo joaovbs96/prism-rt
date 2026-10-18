@@ -11,12 +11,15 @@ public:
     // (upstream MaterialX conductor-IOR bug). Other shading models and inputs
     // are left untouched, so HDR emission etc. is preserved.
     //
-    // Until the integrator supports volume transport, replace the SSS weight
-    // with zero before code generation. This restores the shader's diffuse lobe;
-    // ignoring MDL volume expressions alone leaves a transmitting surface.
-    // Pass false only when testing real SSS support. Independent of color clamp.
+    // fallback_sss_to_diffuse replaces the SSS weight with zero before code
+    // generation, restoring the shader's diffuse lobe instead of the random
+    // walk through the MDL volume (shaders/integrator/path_tracer.h). Off by
+    // default; PRISM_SSS_FALLBACK=1 turns it on (DefaultSssFallback). Independent
+    // of the color clamp.
     explicit DocumentLoader(MaterialX::DocumentPtr stdlib, bool clamp = false,
-                            bool fallback_sss_to_diffuse = true);
+                            bool fallback_sss_to_diffuse = DefaultSssFallback());
+
+    static bool DefaultSssFallback();
 
     MaterialX::DocumentPtr load(const std::string& filepath);
     MaterialX::DocumentPtr create_empty();

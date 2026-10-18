@@ -54,6 +54,13 @@ struct MaterialFunctions {
     // thin_walled (scalar bool, no offsets)
     mi::Size thin_walled_function_index = ~mi::Size(0);
 
+    // volume.absorption_coefficient / volume.scattering_coefficient (colors,
+    // per scene unit) and the anisotropy of the volume's phase function when
+    // it is a single anisotropic_vdf (else isotropic).
+    mi::Size volume_absorption_function_index = ~mi::Size(0);
+    mi::Size volume_scattering_function_index = ~mi::Size(0);
+    mi::Size volume_anisotropy_function_index = ~mi::Size(0);
+
     // Convenience: DF sub-function offset constants
     static constexpr mi::Size DF_SAMPLE    = 0;
     static constexpr mi::Size DF_EVALUATE  = 1;

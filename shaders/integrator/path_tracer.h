@@ -11,6 +11,8 @@
 //   BsdfSample     backend.sample(Shading, float4 xi)   xi: the BSDF's sample point; materials
 //                                               without one draw from backend.rng
 //   BsdfEvaluation backend.evaluate(Shading, float3 wi)
+//   MediumCoefficients backend.medium(Shading)    the medium behind the front face
+//                                                 (valid false: none, or thin-walled)
 //   bool     backend.supportsNee(Shading)
 //   bool     backend.provenOpaque(Hit)
 //   float    backend.cutoutOpacity(Hit)
@@ -177,6 +179,31 @@ inline uint seedPreview(uint px, uint py, uint previewWidth, uint seed)
     return tea64(((py * previewWidth + px) ^ seed) ^ 0x9e3779b9u, (px + 0x85ebca6bu) ^ (py * 0xc2b2ae35u));
 }
 
+// Henyey-Greenstein phase function: a direction around the forward
+// direction `w` (the direction of travel), sampled exactly (weight one).
+inline float3 sampleHenyeyGreenstein(float3 w, float g, float2 u)
+{
+    float cosTheta;
+    if (abs(g) < 1e-3f) {
+        cosTheta = 1.0f - 2.0f * u.x;
+    } else {
+        const float square = (1.0f - g * g) / (1.0f + g - 2.0f * g * u.x);
+        cosTheta = (1.0f + g * g - square * square) / (2.0f * g);
+    }
+    cosTheta = clamp(cosTheta, -1.0f, 1.0f);
+    const float sinTheta = sqrt(max(0.0f, 1.0f - cosTheta * cosTheta));
+    const float phi = 2.0f * kPi * u.y;
+    const Frame f = frameAround(w);
+    return normalize(f.t * (sinTheta * cos(phi)) + f.b * (sinTheta * sin(phi)) + w * cosTheta);
+}
+
+inline float average(float3 v) { return (v.x + v.y + v.z) / 3.0f; }
+
+inline float component(float3 v, uint i) { return i == 0u ? v.x : (i == 1u ? v.y : v.z); }
+
+// Random walks end after this many scattering events.
+static const int kMaxVolumeEvents = 1024;
+
 struct TraceResult {
     float3 radiance;
     uint outcome;      // kPrimary*
@@ -277,11 +304,67 @@ struct PathTracer {
         float previousNeeProbability = 1.0f;
         bool previousNee = false;
         bool tracking = true;      // primary outcome still unresolved
+        // The medium the path travels in (entered through a front face),
+        // traced as a random walk with spectral (hero channel) MIS.
+        bool inMedium = false;
+        MediumCoefficients medium = {(float3)0.0f, (float3)0.0f, 0.0f, false};
+        int volumeEvents = 0;
         for (;;) {
             if (depth >= maxDepth) break;
+            float scatterDistance = infinity();
+            if (inMedium) {
+                ray.ray.direction = normalize(ray.ray.direction);
+                if (maxComponent(medium.sigmaS) > 0.0f) {
+                    const float4 u = sampler.next4();
+                    const float sigmaT = component(medium.sigmaA + medium.sigmaS, min(uint(u.x * 3.0f), 2u));
+                    if (sigmaT > 0.0f) scatterDistance = -log(1.0f - u.y) / sigmaT;
+                    ray.ray.tfar = min(ray.ray.tfar, scatterDistance);
+                }
+            }
             const Hit hit = backend.intersect(ray);
+            if (inMedium) {
+                const float3 sigmaT = medium.sigmaA + medium.sigmaS;
+                if (!hit.surface.valid && !isfinite(scatterDistance)) break; // open surface: lost inside
+                if (!hit.surface.valid) {
+                    // A scattering event inside the medium.
+                    const float3 transmittance = exp(-sigmaT * scatterDistance);
+                    const float pdf = average(sigmaT * transmittance);
+                    if (!(pdf > 0.0f)) break;
+                    const float3 factor = medium.sigmaS * transmittance / pdf;
+                    weight *= factor;
+                    throughput *= factor;
+                    if (++volumeEvents > kMaxVolumeEvents) break;
+                    if (volumeEvents > 8) {
+                        const float q = clamp(maxComponent(throughput), 0.05f, 0.95f);
+                        if (sampler.next1() >= q) break;
+                        weight *= 1.0f / q;
+                        throughput *= 1.0f / q;
+                    }
+                    const float3 position = ray.ray.origin + ray.ray.direction * scatterDistance;
+                    const float4 u = sampler.next4();
+                    const float3 direction = sampleHenyeyGreenstein(ray.ray.direction, medium.g, float2(u.x, u.y));
+                    const RayFootprint footprint = ray.footprint;
+                    ray.ray = makeRay(position, direction);
+                    ray.ray.tnear = 0.0f;
+                    ray.footprint = footprint;
+                    ray.footprint.exact = false;
+                    previousNee = false;
+                    continue;
+                }
+                // Reached the boundary (or another surface) without scattering.
+                const float3 transmittance = exp(-sigmaT * hit.surface.t);
+                if (maxComponent(medium.sigmaS) > 0.0f) {
+                    const float pdf = average(transmittance);
+                    if (!(pdf > 0.0f)) break;
+                    weight *= transmittance / pdf;
+                    throughput *= transmittance / pdf;
+                } else {
+                    weight *= transmittance;
+                    throughput *= transmittance;
+                }
+            }
             const bool weighted = mis && previousNee;
-            if (backend.analyticLightCount() > 0u) {
+            if (!inMedium && backend.analyticLightCount() > 0u) {
                 const float3 crossed = crossedLights(ray, hit.surface.valid ? hit.surface.t : ray.ray.tfar,
                                                      !hit.surface.valid, depth == 0, weighted, previousPdf,
                                                      previousNeeProbability);
@@ -371,6 +454,15 @@ struct PathTracer {
                 }
             }
             if (!bs.scattered) break;
+            if (bs.transmitted && !bs.null_event) {
+                if (hit.surface.front_face) {
+                    medium = backend.medium(shading);
+                    inMedium = medium.valid && (maxComponent(medium.sigmaA) > 0.0f ||
+                                                maxComponent(medium.sigmaS) > 0.0f);
+                } else {
+                    inMedium = false;
+                }
+            }
             throughput *= bs.color;
             float rouletteWeight = 1.0f;
             if (depth >= rouletteDepth) {

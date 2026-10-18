@@ -57,7 +57,7 @@ inline bool IsCompatibleTemplateValue(const CapturedNode& node,
         type.find("UsdUVTexture")==std::string::npos &&
         type.find("image_")==std::string::npos)
         return false;
-    // DocumentLoader deliberately forces unsupported SSS to zero. Keeping the
+    // DocumentLoader may force SSS to zero (PRISM_SSS_FALLBACK). Keeping the
     // authored value structural prevents a bound variant from bypassing that
     // preprocessing rule.
     if ((type.find("standard_surface")!=std::string::npos && name=="subsurface") ||

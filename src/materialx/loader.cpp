@@ -35,6 +35,12 @@ void AttachLibrary(const MaterialX::DocumentPtr& doc,
 }
 }
 
+bool DocumentLoader::DefaultSssFallback()
+{
+    const char* value = std::getenv("PRISM_SSS_FALLBACK");
+    return value && *value && std::string(value) != "0";
+}
+
 DocumentLoader::DocumentLoader(MaterialX::DocumentPtr stdlib, bool clamp,
                                bool fallback_sss_to_diffuse)
     : m_stdlib(stdlib), m_clamp(clamp),

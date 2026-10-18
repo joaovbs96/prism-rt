@@ -31,11 +31,15 @@ constexpr EntryPoint kEntryPoints[] = {
     {"backface.scattering", "backface_bsdf"},
     {"backface.emission.emission", "backface_edf"},
     {"backface.emission.intensity", "backface_emission_intensity"},
+    {"volume.absorption_coefficient", "volume_absorption"},
+    {"volume.scattering_coefficient", "volume_scattering"},
+    {"volume.scattering.directional_bias", "volume_anisotropy"},
 };
 constexpr size_t kEntryPointCount = std::size(kEntryPoints);
 enum EntryIndex {
     E_INIT, E_BSDF, E_EDF, E_INTENSITY, E_CUTOUT, E_THIN_WALLED,
-    E_BACK_BSDF, E_BACK_EDF, E_BACK_INTENSITY
+    E_BACK_BSDF, E_BACK_EDF, E_BACK_INTENSITY,
+    E_VOLUME_ABSORPTION, E_VOLUME_SCATTERING, E_VOLUME_ANISOTROPY
 };
 
 std::string MessagesOf(mi::neuraylib::IMdl_execution_context* context)
@@ -82,6 +86,8 @@ struct ProgramTraits {
     int thinWalled = -1;             // -1: varying, else the constant value
     bool emissionZero = false;
     bool backfaceEmissionZero = false;
+    bool volumeZero = false;          // no medium behind the surface
+    bool volumeAnisotropy = false;    // the phase function's anisotropy is addressable
 };
 
 mi::base::Handle<const mi::neuraylib::IValue> ConstantValue(
@@ -123,6 +129,11 @@ ProgramTraits TraitsOf(mi::neuraylib::ICompiled_material const* material)
     }
     traits.emissionZero = IsConstantBlack(material, "surface.emission.intensity");
     traits.backfaceEmissionZero = IsConstantBlack(material, "backface.emission.intensity");
+    traits.volumeZero = IsConstantBlack(material, "volume.absorption_coefficient") &&
+        IsConstantBlack(material, "volume.scattering_coefficient");
+    mi::base::Handle<const mi::neuraylib::IExpression> bias(
+        material->lookup_sub_expression("volume.scattering.directional_bias"));
+    traits.volumeAnisotropy = bias.is_valid_interface();
     return traits;
 }
 
@@ -135,6 +146,8 @@ bool NeedsEntry(ProgramTraits const& t, size_t entry)
     case E_THIN_WALLED: return t.thinWalled < 0;
     case E_BACK_BSDF: return t.thinWalled != 0;
     case E_BACK_EDF: case E_BACK_INTENSITY: return t.thinWalled != 0 && !t.backfaceEmissionZero;
+    case E_VOLUME_ABSORPTION: case E_VOLUME_SCATTERING: return !t.volumeZero && t.thinWalled != 1;
+    case E_VOLUME_ANISOTROPY: return !t.volumeZero && t.thinWalled != 1 && t.volumeAnisotropy;
     default: return true;
     }
 }
@@ -203,6 +216,15 @@ std::string GenerateDispatch(std::vector<std::array<bool, kEntryPointCount>> con
         s += "    else {\n" + cases(front, call.c_str(), "break;") + "    }\n";
         s += "    return false;\n}\n\n";
     };
+    s += std::format("float3 prism_mdl_volume_absorption(uint program, {} {} state)\n{{\n", inoutState, state);
+    s += cases(E_VOLUME_ABSORPTION, "return {}(state);", "return float3(0.0, 0.0, 0.0);");
+    s += "}\n\n";
+    s += std::format("float3 prism_mdl_volume_scattering(uint program, {} {} state)\n{{\n", inoutState, state);
+    s += cases(E_VOLUME_SCATTERING, "return {}(state);", "return float3(0.0, 0.0, 0.0);");
+    s += "}\n\n";
+    s += std::format("float prism_mdl_volume_anisotropy(uint program, {} {} state)\n{{\n", inoutState, state);
+    s += cases(E_VOLUME_ANISOTROPY, "return {}(state);", "return 0.0;");
+    s += "}\n\n";
     dfDispatch("prism_mdl_bsdf_sample", "Bsdf_sample_data", E_BSDF, E_BACK_BSDF, "_sample");
     dfDispatch("prism_mdl_bsdf_evaluate", "Bsdf_evaluate_data", E_BSDF, E_BACK_BSDF, "_evaluate");
     dfDispatch("prism_mdl_edf_evaluate", "Edf_evaluate_data", E_EDF, E_BACK_EDF, "_evaluate");
@@ -270,7 +292,7 @@ std::filesystem::path StructuralKeyFile(std::string const& identity)
     const std::string stable = colon == std::string::npos ? identity : identity.substr(colon + 1);
     return prism::PersistentCacheRoot() / "gpu-structure" /
         (Digest(stable + "|hlsl" +
-                "|mdl-" MI_NEURAYLIB_PRODUCT_VERSION_STRING "|v1") + ".key");
+                "|mdl-" MI_NEURAYLIB_PRODUCT_VERSION_STRING "|v2") + ".key");
 }
 
 std::mutex gStructuralKeysMutex;

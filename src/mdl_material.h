@@ -339,9 +339,8 @@ private:
         s.delta = (sd.event_type & mi::neuraylib::BSDF_EVENT_SPECULAR) != 0;
         s.nee_compatible = !s.delta && s.pdf > 0.0f;
 
-        // Hook for later (volume absorption, issue 6): the sampled event
-        // tells us whether the ray crossed the interface.
-        // bool transmitted = (sd.event_type & mi::neuraylib::BSDF_EVENT_TRANSMISSION) != 0;
+        // Crossing the interface enters or leaves the material's volume.
+        s.transmitted = (sd.event_type & mi::neuraylib::BSDF_EVENT_TRANSMISSION) != 0;
 
         s.emission = get_emission(ss.base(), wo, backface);
         return s;
@@ -414,6 +413,43 @@ public:
     // The cutout opacity when it is the same everywhere on the material:
     // constant in the class, or depending only on the material's arguments.
     std::optional<ConstantEmission> constantEmission() const override { return m_uniformEmission; }
+
+    std::optional<SurfaceMedium> medium(const RayHit& hit, PreparedShadingContext& context) const override
+    {
+        if (!m_valid) return std::nullopt;
+        auto const& functions = m_target.program->functions;
+        if (functions.volume_absorption_function_index == ~mi::Size(0) &&
+            functions.volume_scattering_function_index == ~mi::Size(0)) return std::nullopt;
+        ShadingStateData local;
+        ShadingStateData* ss = context.owner == this && context.valid
+            ? reinterpret_cast<ShadingStateData*>(context.storage) : nullptr;
+        if (!ss) {
+            build_shading_state(hit, local);
+            if (m_target.program->target_code->execute_init(functions.init_function_index, local.base(),
+                    m_target.texture_handler(), m_target.argument_data()) != 0) return std::nullopt;
+            ss = &local;
+        }
+        if (get_thin_walled(ss->base())) return std::nullopt;
+        auto color = [&](mi::Size index) {
+            mi::Float32_3 value(0.0f, 0.0f, 0.0f);
+            if (index == ~mi::Size(0) || m_target.program->target_code->execute(index, ss->base(),
+                    m_target.texture_handler(), m_target.argument_data(), &value) != 0) return Color3(0.0f);
+            Color3 c(value.x, value.y, value.z);
+            for (int i = 0; i < 3; ++i) if (!std::isfinite(c[i]) || c[i] < 0.0f) c[i] = 0.0f;
+            return c;
+        };
+        SurfaceMedium medium;
+        medium.absorption = color(functions.volume_absorption_function_index);
+        medium.scattering = color(functions.volume_scattering_function_index);
+        if (medium.absorption.is_zero() && medium.scattering.is_zero()) return std::nullopt;
+        if (functions.volume_anisotropy_function_index != ~mi::Size(0)) {
+            mi::Float32 g = 0.0f;
+            if (m_target.program->target_code->execute(functions.volume_anisotropy_function_index, ss->base(),
+                    m_target.texture_handler(), m_target.argument_data(), &g) == 0 && std::isfinite(g))
+                medium.anisotropy = std::clamp(g, -0.99f, 0.99f);
+        }
+        return medium;
+    }
 
     std::optional<float> constant_cutout() const {
         if (m_target.binding && m_target.binding->constant_cutout_opacity)

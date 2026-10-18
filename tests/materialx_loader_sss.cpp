@@ -40,7 +40,7 @@ int main() {
     auto library = MaterialX::createDocument();
     auto library_node = library->addNode("standard_surface", "library_surface", "surfaceshader");
     library_node->addInput("subsurface", "float")->setValue(0.8f);
-    DocumentLoader loader(library);
+    DocumentLoader loader(library, /*clamp=*/false, /*fallback_sss_to_diffuse=*/true);
     auto doc = loader.load(path.string());
     require(bool(doc), "load failed");
     for (const char* name : {"constant", "connected", "graph_connected", "default_weight", "nested/openpbr"}) {

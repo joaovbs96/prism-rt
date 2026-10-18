@@ -1,0 +1,53 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    upAxis = "Y"
+)
+
+# White furnace for the random walk: a subsurface-only sphere without
+# absorption under a uniform dome must look like the dome.
+def Xform "World"
+{
+    def Sphere "Ball" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        double radius = 1
+        rel material:binding = </World/Looks/Sss>
+    }
+
+    def Scope "Looks"
+    {
+        def Material "Sss"
+        {
+            token outputs:mtlx:surface.connect = </World/Looks/Sss/Surface.outputs:out>
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_standard_surface_surfaceshader"
+                float inputs:base = 0
+                float inputs:specular = 0
+                float inputs:subsurface = 1
+                color3f inputs:subsurface_color = (1, 1, 1)
+                color3f inputs:subsurface_radius = (1, 1, 1)
+                float inputs:subsurface_scale = 0.5
+                token outputs:out
+            }
+        }
+    }
+
+    def DomeLight "Dome"
+    {
+        color3f inputs:color = (1, 1, 1)
+        float inputs:intensity = 1
+    }
+
+    def Camera "Camera"
+    {
+        float focalLength = 50
+        float horizontalAperture = 36
+        float verticalAperture = 36
+        double3 xformOp:translate = (0, 0, 4)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+}

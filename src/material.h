@@ -18,6 +18,14 @@ struct BRDFSample {
     bool delta = false;
     bool null_event = false;
     bool nee_compatible = false;
+    bool transmitted = false;   // crossed the interface (enters or leaves the medium)
+};
+
+// The homogeneous medium behind a surface, per scene unit (MDL material_volume).
+struct SurfaceMedium {
+    Color3 absorption = Color3(0.0f);
+    Color3 scattering = Color3(0.0f);
+    float anisotropy = 0.0f;    // Henyey-Greenstein g
 };
 
 struct BRDFEvaluation {
@@ -74,6 +82,10 @@ class Material {
         virtual float cutoutOpacity(const RayHit&) { return 1.0f; }
         virtual bool provenOpaque() const { return false; }
         virtual std::optional<ConstantEmission> constantEmission() const { return std::nullopt; }
+        // The medium entered by transmission through the front face (after prepare).
+        virtual std::optional<SurfaceMedium> medium(const RayHit&, PreparedShadingContext&) const {
+            return std::nullopt;
+        }
 
         virtual Float3 sample_direction(const RayHit ray_hit, unsigned int &seed) = 0;
 

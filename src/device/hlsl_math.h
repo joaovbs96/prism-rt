@@ -68,6 +68,8 @@ using std::abs;
 using std::acos;
 using std::atan2;
 using std::cos;
+using std::exp;
+using std::log;
 using std::floor;
 using std::pow;
 using std::round;
@@ -84,6 +86,7 @@ inline uint max(uint a, uint b) { return std::max(a, b); }
 inline float clamp(float v, float lo, float hi) { return std::min(std::max(v, lo), hi); }
 inline float saturate(float v) { return clamp(v, 0.0f, 1.0f); }
 inline float lerp(float a, float b, float t) { return a + (b - a) * t; }
+inline float3 exp(float3 v) { return {std::exp(v.x), std::exp(v.y), std::exp(v.z)}; }
 inline float frac(float v) { return v - std::floor(v); }
 inline float asfloat(uint v) { return std::bit_cast<float>(v); }
 inline uint asuint(float v) { return std::bit_cast<uint>(v); }

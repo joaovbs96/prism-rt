@@ -105,7 +105,19 @@ struct CpuBackend {
         shading.prepared.xi[3] = xi.w;
         const BRDFSample s = shading.material->samplePrepared(*shading.hit, rng.state, shading.prepared);
         const BsdfSample result = {FromFloat3(s.wi), FromFloat3(s.color), FromFloat3(s.emission), s.scattered,
-                                   s.pdf, s.delta, s.null_event};
+                                   s.pdf, s.delta, s.null_event, s.transmitted};
+        return result;
+    }
+
+    MediumCoefficients medium(CpuShading const& shading)
+    {
+        MediumCoefficients result = {float3(0.0f), float3(0.0f), 0.0f, false};
+        const auto medium = shading.material->medium(*shading.hit, shading.prepared);
+        if (!medium) return result;
+        result.sigmaA = FromFloat3(medium->absorption);
+        result.sigmaS = FromFloat3(medium->scattering);
+        result.g = medium->anisotropy;
+        result.valid = true;
         return result;
     }
 

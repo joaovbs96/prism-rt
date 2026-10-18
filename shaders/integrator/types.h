@@ -201,6 +201,15 @@ struct BsdfSample {
     float pdf;
     bool delta;
     bool null_event;   // cutout crossing: continue unchanged
+    bool transmitted;  // crossed the interface: enters or leaves the medium
+};
+
+// The homogeneous medium behind a surface, per scene unit.
+struct MediumCoefficients {
+    float3 sigmaA;
+    float3 sigmaS;
+    float g;           // Henyey-Greenstein anisotropy
+    bool valid;
 };
 
 struct BsdfEvaluation {

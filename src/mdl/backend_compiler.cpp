@@ -455,7 +455,7 @@ TargetCode BackendCompiler::generate_target_code(const CompiledMaterial& compile
         ClassProgramHash(compiled.compiled_material.get(), m_ctx.get_factory(),
                          compiled.transaction.get())) +
         ":native-deriv-textures-v3:mdl-" MI_NEURAYLIB_PRODUCT_VERSION_STRING
-        ":callables-init-bsdf-edf-cutout-thin-v2:spaces-1:results-128";
+        ":callables-init-bsdf-edf-cutout-thin-volume-v3:spaces-1:results-128";
     if (VerboseMdl())
         std::cout << "  class cache key: " << materialHash
                   << " reusable=" << compiled.allowTargetCodeReuse << "\n";
@@ -634,6 +634,20 @@ TargetCode BackendCompiler::generate_target_code(const CompiledMaterial& compile
     // Index 5: thin_walled
     descs.push_back(mi::neuraylib::Target_function_description("thin_walled"));
 
+    // Index 6, 7: the volume coefficients (subsurface scattering, absorbing
+    // transmission); 8: the phase function's anisotropy, when addressable.
+    descs.push_back(mi::neuraylib::Target_function_description("volume.absorption_coefficient"));
+    descs.push_back(mi::neuraylib::Target_function_description("volume.scattering_coefficient"));
+    size_t volume_anisotropy_idx = 0;
+    {
+        mi::base::Handle<const mi::neuraylib::IExpression> bias(
+            compiled.compiled_material->lookup_sub_expression("volume.scattering.directional_bias"));
+        if (bias) {
+            volume_anisotropy_idx = descs.size();
+            descs.push_back(mi::neuraylib::Target_function_description("volume.scattering.directional_bias"));
+        }
+    }
+
     // Conditionally add backface expressions if the material is thin-walled
     // Class arguments may change thin_walled without changing the compiled
     // class hash. Generate both sides and select at runtime per argument block.
@@ -683,6 +697,10 @@ TargetCode BackendCompiler::generate_target_code(const CompiledMaterial& compile
     program->functions.surface_emission_intensity_function_index = descs[3].function_index;
     program->functions.cutout_opacity_function_index = descs[4].function_index;
     program->functions.thin_walled_function_index = descs[5].function_index;
+    program->functions.volume_absorption_function_index = descs[6].function_index;
+    program->functions.volume_scattering_function_index = descs[7].function_index;
+    if (volume_anisotropy_idx)
+        program->functions.volume_anisotropy_function_index = descs[volume_anisotropy_idx].function_index;
 
     if (has_backface) {
         program->functions.backface_bsdf_function_index = descs[backface_bsdf_idx].function_index;

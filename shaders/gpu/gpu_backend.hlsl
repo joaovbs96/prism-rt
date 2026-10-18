@@ -384,6 +384,7 @@ BsdfSample gpu_bsdf_sample_empty()
     s.pdf = 0.0f;
     s.delta = false;
     s.null_event = false;
+    s.transmitted = false;
     return s;
 }
 
@@ -626,6 +627,7 @@ BsdfSample gpu_mdl_sample(SurfaceHit hit, GpuMaterial material, inout Shading_st
         s.color = data.bsdf_over_pdf;
         s.pdf = data.pdf;
         s.delta = (data.event_type & 4) != 0;
+        s.transmitted = (data.event_type & 16) != 0; // BSDF_EVENT_TRANSMISSION
     }
     s.emission = gpu_mdl_emission(material, state, wo, backface);
     return s;
@@ -942,6 +944,25 @@ struct GpuBackend {
             e.valid = cosine > 0.0f;
         }
         return e;
+    }
+
+    MediumCoefficients medium(GpuShading shading)
+    {
+        MediumCoefficients m;
+        m.sigmaA = (float3)0.0f;
+        m.sigmaS = (float3)0.0f;
+        m.g = 0.0f;
+        m.valid = false;
+        const GpuMaterial material = gpu_material(shading.material);
+        if (material.info.x != kMaterialMdl) return m;
+        Shading_state_material state = shading.state;
+        if (prism_mdl_thin_walled(material.info.y, state)) return m;
+        m.sigmaA = max(prism_mdl_volume_absorption(material.info.y, state), (float3)0.0f);
+        m.sigmaS = max(prism_mdl_volume_scattering(material.info.y, state), (float3)0.0f);
+        const float g = prism_mdl_volume_anisotropy(material.info.y, state);
+        m.g = isfinite(g) ? clamp(g, -0.99f, 0.99f) : 0.0f;
+        m.valid = isfinite(m.sigmaA.x + m.sigmaA.y + m.sigmaA.z + m.sigmaS.x + m.sigmaS.y + m.sigmaS.z);
+        return m;
     }
 
     bool supportsNee(GpuShading shading)
