@@ -1970,7 +1970,10 @@ int main()
                         "second edit did not reuse the installed spare bank");
             ok &= Check(renderFrame(bridge), "returned grid frame did not converge");
             std::vector<int> const prims = ReadBuffer<int>(&primBuffer);
-            const size_t center = (resolution / 2) * resolution + resolution / 2;
+            // The center ray grazes the edge of /Subset's apex face, where
+            // Embree and hardware ray tracing break the tie differently; two
+            // pixels to the left only the moved grid is in view.
+            const size_t center = (resolution / 2) * resolution + resolution / 2 - 2;
             ok &= Check(prims.size() == resolution * resolution &&
                             prims[center] >= 0 &&
                             bridge.GetPrimPath(prims[center]).GetParentPath() ==
@@ -2138,7 +2141,10 @@ int main()
                         "finished spare was discarded instead of taking the edit");
             ok &= Check(renderFrame(bridge), "idle-host edit frame did not converge");
             std::vector<int> const prims = ReadBuffer<int>(&primBuffer);
-            const size_t center = (resolution / 2) * resolution + resolution / 2;
+            // The center ray grazes the edge of /Subset's apex face, where
+            // Embree and hardware ray tracing break the tie differently; two
+            // pixels to the left only the moved grid is in view.
+            const size_t center = (resolution / 2) * resolution + resolution / 2 - 2;
             ok &= Check(prims.size() == resolution * resolution &&
                             prims[center] >= 0 &&
                             bridge.GetPrimPath(prims[center]).GetParentPath() ==
