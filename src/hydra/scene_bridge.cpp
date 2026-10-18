@@ -6,6 +6,7 @@
 #include "render_buffer.h"
 #include "refinement_tiles.h"
 #include "triangulation.h"
+#include "../mesh/subdivision.h"
 
 #include "../environment.h"
 #include "../lights.h"
@@ -43,6 +44,7 @@
 #include "pxr/imaging/hd/instancedBySchema.h"
 #include "pxr/imaging/hd/instancerTopologySchema.h"
 #include "pxr/imaging/hd/meshSchema.h"
+#include "pxr/imaging/hd/subdivisionTagsSchema.h"
 #include "pxr/imaging/hd/sphereSchema.h"
 #include "pxr/imaging/hd/primvarSchema.h"
 #include "pxr/imaging/hd/primvarsSchema.h"
@@ -457,6 +459,7 @@ struct MeshConversionInfo {
     bool motionBlur = false;
     bool multipleUvSets = false;
     bool subdivisionControlHull = false;
+    int subdivisionLevel = 0;
     bool missingPoints = false;
     bool unsupportedPoints = false;
 };
@@ -1206,6 +1209,27 @@ bool _ApplyHiddenGeometryBudget(Snapshot *snapshot, bool useCurrentEligibility =
     return !detach.empty();
 }
 
+// Uniform subdivision level of subdivision surfaces, and the most faces one
+// mesh may refine to (lower levels are used beyond it). PRISM_SUBDIVISION_LEVEL
+// (0 renders control hulls) and PRISM_SUBDIVISION_MAX_FACES override them.
+struct _SubdivisionSettings {
+    int level = 2;
+    size_t maxFaces = size_t(1) << 21;
+};
+
+_SubdivisionSettings const &_Subdivision()
+{
+    static const _SubdivisionSettings settings = [] {
+        _SubdivisionSettings result;
+        if (const char *value = std::getenv("PRISM_SUBDIVISION_LEVEL"); value && *value)
+            result.level = std::clamp(std::atoi(value), 0, 6);
+        if (const char *value = std::getenv("PRISM_SUBDIVISION_MAX_FACES"); value && *value)
+            result.maxFaces = size_t(std::max(1ll, std::atoll(value)));
+        return result;
+    }();
+    return settings;
+}
+
 // Pure: reads only the prim's data source and touches no Snapshot, pool,
 // Embree or material state, so snapshot builds run it on TBB workers. The
 // caller emits the warnings recorded in MeshConversionInfo.
@@ -1240,28 +1264,148 @@ MeshConversion _ConvertMesh(HdContainerDataSourceHandle const &dataSource)
         info.unsupportedPoints = !pointsPv.value.IsEmpty();
         return result;
     }
-    const size_t pointCount = pointsFloat ? pointsFloat->size() : pointsDouble->size();
+    size_t pointCount = pointsFloat ? pointsFloat->size() : pointsDouble->size();
     auto pointAt = [&](size_t i) -> GfVec3d {
         return pointsFloat ? GfVec3d((*pointsFloat)[i])
                            : GfVec3d(GfVec3f((*pointsDouble)[i]));
     };
     // Const views: indexing a non-const VtArray detaches (copies) the buffer
     // it still shares with the captured data source.
-    VtIntArray const counts = std::move(readCounts);
-    VtIntArray const indices = std::move(readIndices);
-    VtIntArray const holes = std::move(readHoles);
+    VtIntArray const coarseCounts = std::move(readCounts);
+    VtIntArray const coarseIndices = std::move(readIndices);
+    VtIntArray const coarseHoles = std::move(readHoles);
     if (pointCount == 0) {
         info.missingPoints = true;
         return result;
     }
     info.topologyRead = true;
-    info.faceCount = counts.size();
+    info.faceCount = coarseCounts.size();
 
     PrimvarData normalPv = _Primvar(primvars, HdPrimvarsSchemaTokens->normals);
     PrimvarData uvPv = _Primvar(primvars, TfToken("st"));
     PrimvarData const alternateUvPv = _Primvar(primvars, TfToken("uv"));
     info.multipleUvSets = !uvPv.value.IsEmpty() && !alternateUvPv.value.IsEmpty();
     if (uvPv.value.IsEmpty()) uvPv = alternateUvPv;
+
+    // Subdivision surfaces become their limit surface at a uniform level;
+    // their normals come from the limit (authored ones do not apply).
+    // UsdImaging always provides the scheme (USD's fallback is catmullClark);
+    // scene indices that omit it describe polygon meshes.
+    TfToken scheme("none");
+    if (auto authored = meshSchema.GetSubdivisionScheme()) {
+        TfToken const value = authored->GetTypedValue(0.0f);
+        if (!value.IsEmpty()) scheme = value;
+    }
+    prism::subdivision::Output refined;
+    VtIntArray refinedCounts, refinedIndices;
+    VtVec3fArray refinedPoints;
+    if (scheme != TfToken("none")) {
+        _SubdivisionSettings const &subdivision = _Subdivision();
+        prism::subdivision::Input input;
+        input.scheme = scheme == TfToken("loop") ? prism::subdivision::Scheme::Loop
+            : scheme == TfToken("bilinear") ? prism::subdivision::Scheme::Bilinear
+                                            : prism::subdivision::Scheme::CatmullClark;
+        input.level = subdivision.level;
+        std::span<const int> countSpan(coarseCounts.cdata(), coarseCounts.size());
+        while (input.level > 0 &&
+               prism::subdivision::RefinedFaceCount(countSpan, input.scheme, input.level) > subdivision.maxFaces)
+            --input.level;
+        info.subdivisionLevel = input.level;
+        if (input.level > 0) {
+            std::vector<float> points(pointCount * 3);
+            for (size_t i = 0; i < pointCount; ++i) {
+                const GfVec3d p = pointAt(i);
+                points[3 * i] = float(p[0]); points[3 * i + 1] = float(p[1]); points[3 * i + 2] = float(p[2]);
+            }
+            input.points = points;
+            input.faceVertexCounts = countSpan;
+            input.faceVertexIndices = std::span<const int>(coarseIndices.cdata(), coarseIndices.size());
+            input.holes = std::span<const int>(coarseHoles.cdata(), coarseHoles.size());
+            HdSubdivisionTagsSchema const tags = meshSchema.GetSubdivisionTags();
+            VtIntArray creaseIndices, creaseLengths, cornerIndices;
+            VtFloatArray creaseSharpnesses, cornerSharpnesses;
+            if (tags) {
+                _ReadArray(tags.GetCreaseIndices(), &creaseIndices);
+                _ReadArray(tags.GetCreaseLengths(), &creaseLengths);
+                _ReadArray(tags.GetCreaseSharpnesses(), &creaseSharpnesses);
+                _ReadArray(tags.GetCornerIndices(), &cornerIndices);
+                _ReadArray(tags.GetCornerSharpnesses(), &cornerSharpnesses);
+                if (auto boundary = tags.GetInterpolateBoundary()) {
+                    TfToken const value = boundary->GetTypedValue(0.0f);
+                    if (value == TfToken("none")) input.boundary = prism::subdivision::BoundaryInterpolation::None;
+                    else if (value == TfToken("edgeOnly"))
+                        input.boundary = prism::subdivision::BoundaryInterpolation::EdgeOnly;
+                }
+                if (auto rule = tags.GetFaceVaryingLinearInterpolation()) {
+                    using F = prism::subdivision::FaceVaryingInterpolation;
+                    TfToken const value = rule->GetTypedValue(0.0f);
+                    if (value == TfToken("none")) input.faceVarying = F::None;
+                    else if (value == TfToken("cornersOnly")) input.faceVarying = F::CornersOnly;
+                    else if (value == TfToken("cornersPlus2")) input.faceVarying = F::CornersPlus2;
+                    else if (value == TfToken("boundaries")) input.faceVarying = F::Boundaries;
+                    else if (value == TfToken("all")) input.faceVarying = F::All;
+                }
+                if (auto rule = tags.GetTriangleSubdivisionRule())
+                    input.smoothTriangles = rule->GetTypedValue(0.0f) == TfToken("smooth");
+            }
+            input.creaseIndices = std::span<const int>(creaseIndices.cdata(), creaseIndices.size());
+            input.creaseLengths = std::span<const int>(creaseLengths.cdata(), creaseLengths.size());
+            input.creaseSharpnesses = std::span<const float>(creaseSharpnesses.cdata(), creaseSharpnesses.size());
+            input.cornerIndices = std::span<const int>(cornerIndices.cdata(), cornerIndices.size());
+            input.cornerSharpnesses = std::span<const float>(cornerSharpnesses.cdata(), cornerSharpnesses.size());
+            std::vector<float> uvs;
+            const bool faceVaryingUvs = uvPv.interpolation == HdPrimvarSchemaTokens->faceVarying;
+            const bool vertexUvs = uvPv.interpolation == HdPrimvarSchemaTokens->vertex ||
+                uvPv.interpolation == HdPrimvarSchemaTokens->varying;
+            auto appendUvs = [&](auto const &values, size_t expected) {
+                if (values.size() != expected) return;
+                uvs.reserve(expected * 2);
+                for (auto const &uv : values) {
+                    uvs.push_back(float(uv[0]));
+                    uvs.push_back(float(uv[1]));
+                }
+            };
+            if (faceVaryingUvs || vertexUvs) {
+                const size_t expected = faceVaryingUvs ? coarseIndices.size() : pointCount;
+                if (uvPv.value.IsHolding<VtVec2fArray>()) appendUvs(uvPv.value.UncheckedGet<VtVec2fArray>(), expected);
+                else if (uvPv.value.IsHolding<VtVec2dArray>())
+                    appendUvs(uvPv.value.UncheckedGet<VtVec2dArray>(), expected);
+            }
+            input.uvs = uvs;
+            input.uvPerPoint = vertexUvs;
+            refined = prism::subdivision::Refine(input);
+        }
+        if (refined.valid) {
+            refinedCounts.assign(refined.faceVertexCounts.begin(), refined.faceVertexCounts.end());
+            refinedIndices.assign(refined.faceVertexIndices.begin(), refined.faceVertexIndices.end());
+            refinedPoints.resize(refined.points.size() / 3);
+            for (size_t i = 0; i < refinedPoints.size(); ++i)
+                refinedPoints[i] = GfVec3f(refined.points[3 * i], refined.points[3 * i + 1], refined.points[3 * i + 2]);
+            pointsFloat = &refinedPoints;
+            pointsDouble = nullptr;
+            pointCount = refinedPoints.size();
+            normalPv = PrimvarData();
+            if (!refined.uvs.empty()) {
+                VtVec2fArray refinedUvs(refined.uvs.size() / 2);
+                for (size_t i = 0; i < refinedUvs.size(); ++i)
+                    refinedUvs[i] = GfVec2f(refined.uvs[2 * i], refined.uvs[2 * i + 1]);
+                uvPv.value = VtValue(std::move(refinedUvs));
+                uvPv.interpolation = HdPrimvarSchemaTokens->faceVarying;
+            } else if (uvPv.interpolation != HdPrimvarSchemaTokens->constant) {
+                uvPv = PrimvarData();
+            }
+        } else {
+            info.subdivisionControlHull = true;
+        }
+    }
+    VtIntArray const &counts = refined.valid ? refinedCounts : coarseCounts;
+    VtIntArray const &indices = refined.valid ? refinedIndices : coarseIndices;
+    static const VtIntArray noHoles;
+    VtIntArray const &holes = refined.valid ? noHoles : coarseHoles;
+    // The authored face of a (refined) face.
+    auto coarseFace = [&](size_t face) {
+        return refined.valid ? size_t(refined.coarseFaces[face]) : face;
+    };
     VtVec3fArray const *authoredNormalsFloat = nullptr;
     VtVec3dArray const *authoredNormalsDouble = nullptr;
     if (normalPv.value.IsHolding<VtVec3fArray>()) {
@@ -1287,10 +1431,6 @@ MeshConversion _ConvertMesh(HdContainerDataSourceHandle const &dataSource)
 
     TfToken orientation = HdMeshTopologySchemaTokens->rightHanded;
     if (auto o = topology.GetOrientation()) orientation = o->GetTypedValue(0.0f);
-    if (auto scheme = meshSchema.GetSubdivisionScheme()) {
-        TfToken const value = scheme->GetTypedValue(0.0f);
-        info.subdivisionControlHull = !value.IsEmpty() && value != TfToken("none");
-    }
     const bool flip = orientation == HdMeshTopologySchemaTokens->leftHanded;
     const GfMatrix4d geometryTransform(1.0);
     const bool mirrored = geometryTransform.GetDeterminant() < 0.0;
@@ -1331,6 +1471,13 @@ MeshConversion _ConvertMesh(HdContainerDataSourceHandle const &dataSource)
                 generatedNormals[indices[generatedCorner + k]] += contribution;
         }
         generatedCorner += count;
+    }
+    if (refined.valid) {
+        // Limit normals follow the winding of the authored faces.
+        for (size_t i = 0; i < pointCount && 3 * i + 2 < refined.normals.size(); ++i) {
+            GfVec3d n(refined.normals[3 * i], refined.normals[3 * i + 1], refined.normals[3 * i + 2]);
+            if (n.GetLengthSq() > 1e-20) generatedNormals[i] = flip ? -n : n;
+        }
     }
 
     std::unique_ptr<Mesh, ConvertedMeshDeleter> mesh(new Mesh());
@@ -1388,7 +1535,7 @@ MeshConversion _ConvertMesh(HdContainerDataSourceHandle const &dataSource)
                 mesh->vertices.emplace_back(static_cast<float>(wp[v][0]),
                                             static_cast<float>(wp[v][1]),
                                             static_cast<float>(wp[v][2]));
-                const size_t ui = _PrimvarIndex(uvPv.interpolation, pi, ci, face);
+                const size_t ui = _PrimvarIndex(uvPv.interpolation, pi, ci, coarseFace(face));
                 if (ui < authoredUvCount) {
                     if (authoredUvsFloat) {
                         mesh->texcoords.emplace_back((*authoredUvsFloat)[ui][0],
@@ -1405,7 +1552,7 @@ MeshConversion _ConvertMesh(HdContainerDataSourceHandle const &dataSource)
             for (int v = 0; v < 3; ++v) {
                 const size_t ci = corner + local[v];
                 const int pi = indices[ci];
-                const size_t ni = _PrimvarIndex(normalPv.interpolation, pi, ci, face);
+                const size_t ni = _PrimvarIndex(normalPv.interpolation, pi, ci, coarseFace(face));
                 GfVec3d n = geometric;
                 if (ni < authoredNormalCount) {
                     GfVec3d authored = authoredNormalAt(ni);
@@ -1428,7 +1575,7 @@ MeshConversion _ConvertMesh(HdContainerDataSourceHandle const &dataSource)
             mesh->indices.push_back(static_cast<unsigned int>(first));
             mesh->indices.push_back(static_cast<unsigned int>(first + 1));
             mesh->indices.push_back(static_cast<unsigned int>(first + 2));
-            coarseFaces.push_back(static_cast<int>(face));
+            coarseFaces.push_back(static_cast<int>(coarseFace(face)));
         }
         corner += count;
     }
@@ -1643,8 +1790,9 @@ bool _AppendMesh(HdSceneIndexBaseRefPtr const &sceneIndex,
     }
     if (info.subdivisionControlHull &&
         snapshot->warnedFeatures.insert("subdivisionControlHull").second)
-        TF_WARN("PrismRT: subdivision refinement is unsupported; subdivision meshes are rendered as control hulls (first seen at <%s>)",
-                path.GetText());
+        TF_WARN("PrismRT: some subdivision surfaces are rendered as control hulls "
+                "(PRISM_SUBDIVISION_LEVEL 0, over PRISM_SUBDIVISION_MAX_FACES, or invalid topology; "
+                "first seen at <%s>)", path.GetText());
     if (info.malformedFaceCount)
         TF_WARN("PrismRT: mesh <%s> skipped %zu malformed faces",
                 path.GetText(), info.malformedFaceCount);

@@ -63,6 +63,7 @@ find_package(embree 4 REQUIRED)
 find_package(TBB REQUIRED CONFIG)
 find_package(OpenGL REQUIRED)
 find_package(pxr REQUIRED)
+find_package(OpenSubdiv CONFIG REQUIRED)
 find_package(MaterialX REQUIRED)
 find_package(Python3 COMPONENTS Development Interpreter REQUIRED)
 
@@ -245,6 +246,7 @@ target_link_libraries(prism_core PUBLIC
     embree
     TBB::tbb
     ${PXR_LIBRARIES}
+    OpenSubdiv::osdCPU
     MaterialXCore
     MaterialXFormat
     MaterialXGenShader
@@ -530,6 +532,11 @@ if(PRISM_BUILD_HYDRA)
         add_executable(prism_environment_sampling_test tests/environment_sampling.cpp)
         target_link_libraries(prism_environment_sampling_test PRIVATE PrismRT::core)
         add_test(NAME prism_environment_sampling_test COMMAND prism_environment_sampling_test)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/subdivision.cpp")
+        add_executable(prism_subdivision_test tests/subdivision.cpp)
+        target_link_libraries(prism_subdivision_test PRIVATE PrismRT::core)
+        add_test(NAME prism_subdivision_test COMMAND prism_subdivision_test)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/lights.cpp")
         add_executable(prism_lights_test tests/lights.cpp)
