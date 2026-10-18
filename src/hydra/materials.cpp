@@ -322,6 +322,45 @@ TfToken SurfaceTerminalName(HdMaterialNetworkInterface& net)
     return {};
 }
 
+// hdMtlx converts one terminal; a displacement terminal is converted on its
+// own and merged into the surface document, its shader bound to the
+// material's displacementshader input.
+void AddDisplacementShader(HdMaterialNetworkInterface& net, const mx::DocumentPtr& doc)
+{
+    TfToken terminal;
+    for (const TfToken& name : net.GetTerminalNames())
+        if (name == TfToken("displacement")) terminal = name;
+    if (terminal.IsEmpty()) return;
+    const auto connection = net.GetTerminalConnection(terminal);
+    if (!connection.first) return;
+    HdMtlxTexturePrimvarData data;
+    mx::DocumentPtr displacement = HdMtlxCreateMtlxDocumentFromHdMaterialNetworkInterface(
+        &net, connection.second.upstreamNodeName,
+        net.GetNodeInputConnectionNames(connection.second.upstreamNodeName), HdMtlxStdLibraries(), &data);
+    if (!displacement) return;
+    auto sourceMaterials = displacement->getMaterialNodes();
+    auto materials = doc->getMaterialNodes();
+    if (sourceMaterials.empty() || materials.empty()) return;
+    auto shaderInput = sourceMaterials.front()->getInput("displacementshader");
+    if (!shaderInput || !shaderInput->hasNodeName()) return;
+    for (const auto& child : displacement->getChildren()) {
+        if (child == sourceMaterials.front()) continue;
+        auto existing = doc->getChild(child->getName());
+        if (!existing) {
+            doc->addChildOfCategory(child->getCategory(), child->getName())->copyContentFrom(child);
+        } else if (auto graph = child->asA<mx::NodeGraph>()) {
+            auto target = existing->asA<mx::NodeGraph>();
+            if (!target) continue;
+            for (const auto& node : graph->getChildren())
+                if (!target->getChild(node->getName()))
+                    target->addChildOfCategory(node->getCategory(), node->getName())->copyContentFrom(node);
+        }
+    }
+    auto input = materials.front()->getInput("displacementshader");
+    if (!input) input = materials.front()->addInput("displacementshader", "displacementshader");
+    input->setNodeName(shaderInput->getNodeName());
+}
+
 bool IsPreviewSurfaceNetwork(HdMaterialNetworkInterface& net)
 {
     const TfToken terminalName = SurfaceTerminalName(net);
@@ -1138,6 +1177,7 @@ public:
             return result;
         }
         if (previewSurface) FixPreviewSurfaceNormalOutput(doc);
+        else AddDisplacementShader(netInterface, doc);
 
         // hdMtlx derives the terminal material name from the USD prim path.
         // That makes otherwise identical M0/M1 graphs generate different MDL

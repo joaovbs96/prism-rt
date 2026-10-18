@@ -416,6 +416,27 @@ public:
     // constant in the class, or depending only on the material's arguments.
     std::optional<ConstantEmission> constantEmission() const override { return m_uniformEmission; }
 
+    // geometry.displacement: the offset of a surface point (in the space of
+    // the hit, which is the geometry's own space when building it).
+    bool hasDisplacement() const override {
+        return m_valid && m_target.program && m_target.program->has_displacement &&
+            m_target.program->functions.displacement_function_index != ~mi::Size(0);
+    }
+    Float3 displacement(const RayHit& hit) const override {
+        if (!hasDisplacement()) return Float3(0.0f);
+        ShadingStateData ss;
+        build_shading_state(hit, ss);
+        if (m_target.program->target_code->execute_init(m_target.program->functions.init_function_index,
+                ss.base(), m_target.texture_handler(), m_target.argument_data()) != 0) return Float3(0.0f);
+        mi::Float32_3 offset(0.0f, 0.0f, 0.0f);
+        if (m_target.program->target_code->execute(m_target.program->functions.displacement_function_index,
+                ss.base(), m_target.texture_handler(), m_target.argument_data(), &offset) != 0)
+            return Float3(0.0f);
+        const Float3 result(offset.x, offset.y, offset.z);
+        return std::isfinite(result.x()) && std::isfinite(result.y()) && std::isfinite(result.z())
+            ? result : Float3(0.0f);
+    }
+
     std::optional<SurfaceMedium> medium(const RayHit& hit, PreparedShadingContext& context) const override
     {
         if (!m_valid) return std::nullopt;

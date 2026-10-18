@@ -499,6 +499,8 @@ struct PrototypePool {
         std::weak_ptr<PrototypeStorage> storage;
         MeshConversionInfo info;
         uint64_t lastBuild = 0;
+        // The material that displaced the geometry (null: none).
+        Material const *displacer = nullptr;
     };
     std::unordered_map<HdDataSourceBase const *, ConversionEntry> conversions;
     uint64_t conversionBuilds = 0;
@@ -836,6 +838,18 @@ std::shared_ptr<Material> _ResolveMaterial(
         materialPrim.dataSource, materialPath);
     snapshot->resolvedMaterials.emplace(materialPath, resolved);
     return resolved;
+}
+
+// The material bound to a mesh when it displaces it (the geometry then
+// depends on it). Serial: resolution fills the snapshot's material table.
+Material const *_DisplacingMaterial(HdSceneIndexBaseRefPtr const &sceneIndex,
+                                    HdContainerDataSourceHandle const &ds,
+                                    MaterialService *materials, Snapshot *snapshot)
+{
+    const SdfPath materialPath = _MaterialPath(ds);
+    if (materialPath.IsEmpty()) return nullptr;
+    std::shared_ptr<Material> material = _ResolveMaterial(sceneIndex, materialPath, materials, snapshot);
+    return material && material->hasDisplacement() ? material.get() : nullptr;
 }
 
 Float3 _ToFloat3(GfVec3f const &v) { return {v[0], v[1], v[2]}; }
@@ -1295,6 +1309,10 @@ std::vector<_ExtraPrimvar> _ExtraPrimvars(HdPrimvarsSchema const &primvars, size
 struct _SubdivisionSettings {
     int level = 2;
     size_t maxFaces = size_t(1) << 16;
+    // Meshes whose material displaces them (PRISM_DISPLACEMENT_LEVEL,
+    // PRISM_DISPLACEMENT_MAX_FACES).
+    int displacementLevel = 4;
+    size_t displacementMaxFaces = size_t(1) << 18;
 };
 
 _SubdivisionSettings const &_Subdivision()
@@ -1305,15 +1323,99 @@ _SubdivisionSettings const &_Subdivision()
             result.level = std::clamp(std::atoi(value), 0, 6);
         if (const char *value = std::getenv("PRISM_SUBDIVISION_MAX_FACES"); value && *value)
             result.maxFaces = size_t(std::max(1ll, std::atoll(value)));
+        if (const char *value = std::getenv("PRISM_DISPLACEMENT_LEVEL"); value && *value)
+            result.displacementLevel = std::clamp(std::atoi(value), 0, 6);
+        if (const char *value = std::getenv("PRISM_DISPLACEMENT_MAX_FACES"); value && *value)
+            result.displacementMaxFaces = size_t(std::max(1ll, std::atoll(value)));
         return result;
     }();
     return settings;
 }
 
+// Moves the vertices of a converted mesh by its material's displacement.
+// Vertices at one position (seams of normals or texture coordinates) move
+// together, so the surface stays closed; normals and tangents are rebuilt.
+void _Displace(Mesh &mesh, Material const &material, bool flip)
+{
+    const size_t count = mesh.vertices.size();
+    if (!count) return;
+    // A triangle and corner per vertex, for primvar lookups at the vertex.
+    std::vector<std::pair<unsigned, int>> corner(count, {0u, -1});
+    for (size_t t = 0; t * 3 + 2 < mesh.indices.size(); ++t)
+        for (int k = 0; k < 3; ++k)
+            if (corner[mesh.indices[3 * t + k]].second < 0) corner[mesh.indices[3 * t + k]] = {unsigned(t), k};
+    std::vector<Float3> offsets(count, Float3(0.0f));
+    tbb::parallel_for(size_t(0), count, [&](size_t i) {
+        RTCRayHit miss{};
+        miss.hit.geomID = RTC_INVALID_GEOMETRY_ID;
+        RayHit hit(miss);
+        hit.p = mesh.vertices[i];
+        hit.n = hit.n_g = mesh.normals[i].is_zero() ? Float3(0.0f, 0.0f, 1.0f) : mesh.normals[i].normalize();
+        hit.o = hit.p + hit.n;
+        hit.d = -hit.n;
+        hit.front_face = true;
+        hit.u = mesh.texcoords.size() == count ? mesh.texcoords[i].u() : 0.0f;
+        hit.v = mesh.texcoords.size() == count ? mesh.texcoords[i].v() : 0.0f;
+        if (mesh.tangents.size() == 4 * count) {
+            hit.tangent = Float3(mesh.tangents[4 * i], mesh.tangents[4 * i + 1], mesh.tangents[4 * i + 2]);
+            hit.bitangent_sign = mesh.tangents[4 * i + 3] < 0.0f ? -1.0f : 1.0f;
+        }
+        if (corner[i].second >= 0) {
+            hit.primvarMesh = &mesh;
+            hit.primid = int(corner[i].first);
+            hit.bary_u = corner[i].second == 1 ? 1.0f : 0.0f;
+            hit.bary_v = corner[i].second == 2 ? 1.0f : 0.0f;
+        }
+        offsets[i] = material.displacement(hit);
+    });
+    struct PositionHash {
+        size_t operator()(std::array<uint32_t, 3> const &p) const {
+            return (size_t(p[0]) * 73856093u) ^ (size_t(p[1]) * 19349663u) ^ (size_t(p[2]) * 83492791u);
+        }
+    };
+    std::unordered_map<std::array<uint32_t, 3>, unsigned, PositionHash> groupOf;
+    std::vector<unsigned> group(count);
+    std::vector<Float3> sum;
+    std::vector<int> members;
+    for (size_t i = 0; i < count; ++i) {
+        const Float3 &p = mesh.vertices[i];
+        const std::array<uint32_t, 3> key{std::bit_cast<uint32_t>(p.x()), std::bit_cast<uint32_t>(p.y()),
+                                         std::bit_cast<uint32_t>(p.z())};
+        auto [found, inserted] = groupOf.emplace(key, unsigned(sum.size()));
+        if (inserted) { sum.push_back(Float3(0.0f)); members.push_back(0); }
+        group[i] = found->second;
+        sum[found->second] += offsets[i];
+        ++members[found->second];
+    }
+    for (size_t i = 0; i < count; ++i) mesh.vertices[i] += sum[group[i]] / float(members[group[i]]);
+    // Smooth area-weighted normals per position (the winding faces outward
+    // after the conversion's orientation handling).
+    std::vector<Float3> normals(sum.size(), Float3(0.0f));
+    for (size_t t = 0; t * 3 + 2 < mesh.indices.size(); ++t) {
+        const unsigned *tri = &mesh.indices[3 * t];
+        const Float3 n = cross(mesh.vertices[tri[1]] - mesh.vertices[tri[0]],
+                               mesh.vertices[tri[2]] - mesh.vertices[tri[0]]);
+        for (int k = 0; k < 3; ++k) normals[group[tri[k]]] += n;
+    }
+    (void)flip;
+    for (size_t i = 0; i < count; ++i) {
+        const Float3 n = normals[group[i]];
+        if (n.length() > 0.0f) {
+            Float3 unit = n.normalize();
+            // Keep the side of the original normal.
+            if (dot(unit, mesh.normals[i]) < 0.0f) unit = -unit;
+            mesh.normals[i] = unit;
+        }
+    }
+    mesh.tangents.clear();
+    mesh.ensureTangents();
+}
+
 // Pure: reads only the prim's data source and touches no Snapshot, pool,
 // Embree or material state, so snapshot builds run it on TBB workers. The
 // caller emits the warnings recorded in MeshConversionInfo.
-MeshConversion _ConvertMesh(HdContainerDataSourceHandle const &dataSource)
+MeshConversion _ConvertMesh(HdContainerDataSourceHandle const &dataSource,
+                            Material const *displacer = nullptr)
 {
     MeshConversion result;
     MeshConversionInfo &info = result.info;
@@ -1392,16 +1494,20 @@ MeshConversion _ConvertMesh(HdContainerDataSourceHandle const &dataSource)
     prism::subdivision::Output refined;
     VtIntArray refinedCounts, refinedIndices;
     VtVec3fArray refinedPoints;
+    // Displaced surfaces are diced finer; polygon meshes then refine bilinearly.
+    const bool displaced = displacer && displacer->hasDisplacement();
+    if (displaced && scheme == TfToken("none")) scheme = TfToken("bilinear");
     if (scheme != TfToken("none")) {
         _SubdivisionSettings const &subdivision = _Subdivision();
         prism::subdivision::Input input;
         input.scheme = scheme == TfToken("loop") ? prism::subdivision::Scheme::Loop
             : scheme == TfToken("bilinear") ? prism::subdivision::Scheme::Bilinear
                                             : prism::subdivision::Scheme::CatmullClark;
-        input.level = subdivision.level;
+        input.level = displaced ? subdivision.displacementLevel : subdivision.level;
+        const size_t maxFaces = displaced ? subdivision.displacementMaxFaces : subdivision.maxFaces;
         std::span<const int> countSpan(coarseCounts.cdata(), coarseCounts.size());
         while (input.level > 0 &&
-               prism::subdivision::RefinedFaceCount(countSpan, input.scheme, input.level) > subdivision.maxFaces)
+               prism::subdivision::RefinedFaceCount(countSpan, input.scheme, input.level) > maxFaces)
             --input.level;
         info.subdivisionLevel = input.level;
         if (input.level > 0) {
@@ -1787,6 +1893,7 @@ MeshConversion _ConvertMesh(HdContainerDataSourceHandle const &dataSource)
     mesh->vertices=std::move(compactPositions); mesh->normals=std::move(compactNormals);
     mesh->texcoords=std::move(compactUvs); mesh->tangents=std::move(compactTangents);
     mesh->primvarValues=std::move(compactExtras);
+    if (displaced) _Displace(*mesh, *displacer, flip);
     auto hashCombine = [](size_t &seed, auto const &value) {
         const size_t valueHash = std::hash<std::decay_t<decltype(value)>>{}(value);
         seed ^= valueHash + size_t{0x9e3779b9} + (seed << 6) + (seed >> 2);
@@ -1909,7 +2016,8 @@ bool _AppendMesh(HdSceneIndexBaseRefPtr const &sceneIndex,
     if (!prepared) {
         // Prototype refreshes touch a few prims, so they convert inline.
         const auto conversionStart = std::chrono::steady_clock::now();
-        MeshConversion conversion = _ConvertMesh(prim.dataSource);
+        MeshConversion conversion = _ConvertMesh(
+            prim.dataSource, _DisplacingMaterial(sceneIndex, prim.dataSource, materials, snapshot));
         snapshot->meshConversionSeconds += std::chrono::duration<double>(
             std::chrono::steady_clock::now() - conversionStart).count();
         inlineMesh.info = conversion.info;
@@ -3126,6 +3234,7 @@ void _CollectMeshes(HdSceneIndexBaseRefPtr const &scene, SdfPath const &path,
 // run on TBB workers. Sharing is resolved serially in traversal order, which
 // keeps storage choice, prim ids and statistics identical to a serial walk.
 MeshPreparation _PrepareMeshes(HdSceneIndexBaseRefPtr const &scene,
+                               MaterialService *materials,
                                Snapshot *snapshot,
                                TfTokenVector const &renderTags,
                                std::function<bool()> const &cancelled)
@@ -3137,6 +3246,10 @@ MeshPreparation _PrepareMeshes(HdSceneIndexBaseRefPtr const &scene,
     if (cancelled && cancelled()) return preparation;
 
     PrototypePool &pool = *snapshot->prototypePool;
+    // Displacing materials, resolved before the parallel conversion.
+    std::vector<Material const *> displacers(candidates.size(), nullptr);
+    for (size_t i = 0; i < candidates.size(); ++i)
+        displacers[i] = _DisplacingMaterial(scene, candidates[i].second, materials, snapshot);
     uint64_t build = 0;
     std::vector<size_t> misses;
     {
@@ -3145,7 +3258,7 @@ MeshPreparation _PrepareMeshes(HdSceneIndexBaseRefPtr const &scene,
         for (size_t i = 0; i < candidates.size(); ++i) {
             auto const entry = pool.conversions.find(candidates[i].second.get());
             std::shared_ptr<PrototypeStorage> storage =
-                entry != pool.conversions.end()
+                entry != pool.conversions.end() && entry->second.displacer == displacers[i]
                     ? entry->second.storage.lock() : nullptr;
             if (!storage) {
                 misses.push_back(i);
@@ -3163,7 +3276,7 @@ MeshPreparation _PrepareMeshes(HdSceneIndexBaseRefPtr const &scene,
     const auto conversionStart = std::chrono::steady_clock::now();
     tbb::parallel_for(size_t(0), misses.size(), [&](size_t i) {
         if (cancelled && cancelled()) return;
-        conversions[i] = _ConvertMesh(candidates[misses[i]].second);
+        conversions[i] = _ConvertMesh(candidates[misses[i]].second, displacers[misses[i]]);
     });
     // Wall time of the parallel phase, covering the whole pure conversion
     // including tangents, vertex de-duplication and hashing.
@@ -3239,7 +3352,7 @@ MeshPreparation _PrepareMeshes(HdSceneIndexBaseRefPtr const &scene,
         PreparedMesh const &prepared = preparation.meshes[path];
         if (!prepared.storage) continue;
         pool.conversions[source.get()] =
-            {source, prepared.storage, prepared.info, build};
+            {source, prepared.storage, prepared.info, build, displacers[i]};
     }
     // Keep only what this build used; a full re-capture creates new handles,
     // so older entries could never hit again.
@@ -3461,7 +3574,7 @@ std::shared_ptr<Snapshot> _BuildSnapshot(HdSceneIndexBaseRefPtr const &scene,
     if (cancelled && cancelled()) return {};
     const auto traversalStart = std::chrono::steady_clock::now();
     MeshPreparation preparation = _PrepareMeshes(
-        scene, result.get(), renderTags, cancelled);
+        scene, materials, result.get(), renderTags, cancelled);
     if (cancelled && cancelled()) return {};
     _Walk(scene, SdfPath::AbsoluteRootPath(), materials, result.get(),
           renderTags, cancelled, &preparation);

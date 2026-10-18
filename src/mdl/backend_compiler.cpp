@@ -437,6 +437,27 @@ TargetCode BackendCompiler::generate_target_code(const CompiledMaterial& compile
     const bool uniformCutout = cutoutExpr && !binding->constant_cutout_opacity &&
         IsUniformExpression(cutoutExpr.get(), compiled.compiled_material.get(), compiled.transaction.get());
 
+    // Displacement other than the constant zero.
+    bool hasDisplacement = false;
+    {
+        mi::base::Handle<const mi::neuraylib::IExpression> displacement(
+            compiled.compiled_material->lookup_sub_expression("geometry.displacement"));
+        hasDisplacement = bool(displacement);
+        if (displacement && displacement->get_kind() == mi::neuraylib::IExpression::EK_CONSTANT) {
+            mi::base::Handle<const mi::neuraylib::IExpression_constant> constant(
+                displacement->get_interface<mi::neuraylib::IExpression_constant>());
+            mi::base::Handle<const mi::neuraylib::IValue_compound> value(
+                constant->get_value<mi::neuraylib::IValue_compound>());
+            bool zero = bool(value);
+            for (mi::Size i = 0; value && i < value->get_size(); ++i) {
+                mi::base::Handle<const mi::neuraylib::IValue_float> component(
+                    value->get_value<mi::neuraylib::IValue_float>(i));
+                zero = zero && component && component->get_value() == 0.0f;
+            }
+            hasDisplacement = !zero;
+        }
+    }
+
     // Emission that is the same everywhere: emissive triangles become lights.
     mi::base::Handle<const mi::neuraylib::IExpression> emissionIntensity(
         compiled.compiled_material->lookup_sub_expression("surface.emission.intensity"));
@@ -455,7 +476,7 @@ TargetCode BackendCompiler::generate_target_code(const CompiledMaterial& compile
         ClassProgramHash(compiled.compiled_material.get(), m_ctx.get_factory(),
                          compiled.transaction.get())) +
         ":native-deriv-textures-v3:mdl-" MI_NEURAYLIB_PRODUCT_VERSION_STRING
-        ":callables-init-bsdf-edf-cutout-thin-volume-v3:spaces-1:results-128";
+        ":callables-init-bsdf-edf-cutout-thin-volume-displacement-v4:spaces-1:results-128";
     if (VerboseMdl())
         std::cout << "  class cache key: " << materialHash
                   << " reusable=" << compiled.allowTargetCodeReuse << "\n";
@@ -648,6 +669,10 @@ TargetCode BackendCompiler::generate_target_code(const CompiledMaterial& compile
         }
     }
 
+    // Index 9 (or 8): geometry.displacement.
+    const size_t displacement_idx = descs.size();
+    descs.push_back(mi::neuraylib::Target_function_description("geometry.displacement"));
+
     // Conditionally add backface expressions if the material is thin-walled
     // Class arguments may change thin_walled without changing the compiled
     // class hash. Generate both sides and select at runtime per argument block.
@@ -701,6 +726,7 @@ TargetCode BackendCompiler::generate_target_code(const CompiledMaterial& compile
     program->functions.volume_scattering_function_index = descs[7].function_index;
     if (volume_anisotropy_idx)
         program->functions.volume_anisotropy_function_index = descs[volume_anisotropy_idx].function_index;
+    program->functions.displacement_function_index = descs[displacement_idx].function_index;
 
     if (has_backface) {
         program->functions.backface_bsdf_function_index = descs[backface_bsdf_idx].function_index;
@@ -849,6 +875,7 @@ TargetCode BackendCompiler::generate_target_code(const CompiledMaterial& compile
     }
     program->uniform_cutout = uniformCutout;
     program->uniform_emission = uniformEmission;
+    program->has_displacement = hasDisplacement;
     program->builtin_resources = !binding->texture_runtime;
     program->identity = cacheKey;
     result.success = true;

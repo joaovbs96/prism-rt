@@ -61,6 +61,10 @@ struct MaterialFunctions {
     mi::Size volume_scattering_function_index = ~mi::Size(0);
     mi::Size volume_anisotropy_function_index = ~mi::Size(0);
 
+    // geometry.displacement (float3 offset of the position; CPU only, applied
+    // to geometry at load time).
+    mi::Size displacement_function_index = ~mi::Size(0);
+
     // Convenience: DF sub-function offset constants
     static constexpr mi::Size DF_SAMPLE    = 0;
     static constexpr mi::Size DF_EVALUATE  = 1;
@@ -96,6 +100,8 @@ struct CompiledProgram {
     // surface.emission is a diffuse EDF and intensity depending only on the
     // arguments: the front-face radiance is one constant per binding.
     bool uniform_emission = false;
+    // geometry.displacement is not the constant zero.
+    bool has_displacement = false;
 };
 
 struct MaterialBinding {

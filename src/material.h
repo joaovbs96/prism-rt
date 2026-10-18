@@ -82,6 +82,9 @@ class Material {
         virtual float cutoutOpacity(const RayHit&) { return 1.0f; }
         virtual bool provenOpaque() const { return false; }
         virtual std::optional<ConstantEmission> constantEmission() const { return std::nullopt; }
+        // Displacement of the surface (applied to the geometry when it is built).
+        virtual bool hasDisplacement() const { return false; }
+        virtual Float3 displacement(const RayHit&) const { return Float3(0.0f); }
         // The medium entered by transmission through the front face (after prepare).
         virtual std::optional<SurfaceMedium> medium(const RayHit&, PreparedShadingContext&) const {
             return std::nullopt;
