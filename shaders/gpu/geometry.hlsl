@@ -42,9 +42,12 @@ GpuRawHit gpu_trace(Ray ray, uint mask)
     desc.Origin = ray.origin;
     desc.Direction = ray.direction;
     desc.TMin = ray.tnear;
-    desc.TMax = ray.tfar;
+    // An empty interval (a medium scatter distance below the transport
+    // epsilon) misses, as in Embree; ray queries require TMin <= TMax.
+    const bool empty = !(ray.tnear <= ray.tfar);
+    desc.TMax = empty ? ray.tnear : ray.tfar;
     RayQuery<RAY_FLAG_NONE> query;
-    query.TraceRayInline(scene, RAY_FLAG_NONE, mask, desc);
+    query.TraceRayInline(scene, RAY_FLAG_NONE, empty ? 0u : mask, desc);
     while (query.Proceed()) {
         if (query.CandidateType() == CANDIDATE_PROCEDURAL_PRIMITIVE) {
             GpuInstance inst = gpu_instance(query.CandidateInstanceIndex());
@@ -91,9 +94,11 @@ bool gpu_occluded_by_opaque(Ray ray)
     desc.Origin = ray.origin;
     desc.Direction = ray.direction;
     desc.TMin = ray.tnear;
-    desc.TMax = ray.tfar;
+    const bool empty = !(ray.tnear <= ray.tfar);
+    desc.TMax = empty ? ray.tnear : ray.tfar;
     RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> query;
-    query.TraceRayInline(sceneStructure(), RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, kMaskOpaque, desc);
+    query.TraceRayInline(sceneStructure(), RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH,
+                         empty ? 0u : kMaskOpaque, desc);
     while (query.Proceed()) {
         if (query.CandidateType() == CANDIDATE_PROCEDURAL_PRIMITIVE) {
             GpuInstance inst = gpu_instance(query.CandidateInstanceIndex());
