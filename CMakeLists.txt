@@ -32,6 +32,10 @@ set(CMAKE_MAP_IMPORTED_CONFIG_MINSIZEREL "RelWithDebInfo;Release")
 set(CMAKE_MAP_IMPORTED_CONFIG_RELEASE "RelWithDebInfo;Release")
 set(CMAKE_MAP_IMPORTED_CONFIG_DEBUG "Debug;RelWithDebInfo;Release")
 set(CMAKE_MAP_IMPORTED_CONFIG_RELWITHDEBINFO "RelWithDebInfo;Release")
+if(MSVC)
+    # OpenSubdiv headers use M_PI.
+    add_compile_definitions(_USE_MATH_DEFINES)
+endif()
 if(NOT MSVC)
     # System packages such as Apple's OpenGL framework only provide a
     # configuration-less location; an empty entry selects it as last resort.
