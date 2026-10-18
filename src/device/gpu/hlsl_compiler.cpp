@@ -10,6 +10,15 @@ namespace prism::device::gpu {
 
 namespace {
 
+int PCloseProcess(FILE* pipe)
+{
+#ifdef _WIN32
+    return _pclose(pipe);
+#else
+    return pclose(pipe);
+#endif
+}
+
 std::string DxcExecutable()
 {
     if (const char* path = std::getenv("PRISM_DXC"); path && *path) return path;
@@ -65,11 +74,16 @@ bool CompileHlsl(std::string const& source, HlslTarget target, std::filesystem::
         : "-spirv -fspv-target-env=vulkan1.3 -O0";
     const std::string command = std::format("\"{}\" -T cs_6_6 -E main -HV 2021 {} -Fo \"{}\" \"{}\" 2>&1",
                                             DxcExecutable(), targetOptions, output.string(), input.string());
+#ifdef _WIN32
+    // cmd.exe drops the outer quotes of a command that starts with a quote.
+    FILE* pipe = _popen(("\"" + command + "\"").c_str(), "r");
+#else
     FILE* pipe = popen(command.c_str(), "r");
+#endif
     std::string log;
     char buffer[4096];
     while (pipe && fgets(buffer, sizeof(buffer), pipe)) log += buffer;
-    const int status = pipe ? pclose(pipe) : -1;
+    const int status = pipe ? PCloseProcess(pipe) : -1;
     std::ifstream file(output, std::ios::binary);
     binary->assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
     file.close();
