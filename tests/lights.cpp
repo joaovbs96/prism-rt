@@ -134,9 +134,9 @@ int main()
     // Normalized lights keep their power when their size changes.
     params.shape = prism::LightShape::Rect;
     params.normalize = true;
-    const auto small = prism::MakeSceneLight(params, Transform(0, 0, 0));
-    const auto large = prism::MakeSceneLight(params, Transform(0, 0, 0, 3.0f));
-    Check(std::abs(prism::LightPower(small, 1.0f) / prism::LightPower(large, 1.0f) - 1.0f) < 1e-4f,
+    const auto narrowLight = prism::MakeSceneLight(params, Transform(0, 0, 0));
+    const auto wideLight = prism::MakeSceneLight(params, Transform(0, 0, 0, 3.0f));
+    Check(std::abs(prism::LightPower(narrowLight, 1.0f) / prism::LightPower(wideLight, 1.0f) - 1.0f) < 1e-4f,
           "normalize keeps the power");
 
     // Two constant domes: radiance sums, the mixture density integrates to one.
