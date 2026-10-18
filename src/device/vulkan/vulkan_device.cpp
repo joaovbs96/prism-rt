@@ -404,9 +404,11 @@ bool VulkanDevice::Impl::initialize(std::string* reason)
     imageBinding.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
     imageBinding.descriptorCount = kMaxImages;
     imageBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    bindings.push_back(imageBinding); // the variable-count binding must be last
+    bindings.push_back(imageBinding);
+    // The image array is partially bound: only the scene's images are written.
+    // (A variable count would have to be on the highest binding, the samplers'.)
     std::vector<VkDescriptorBindingFlags> flags(bindings.size(), 0);
-    flags.back() = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT;
+    flags.back() = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;
     VkDescriptorSetLayoutBindingFlagsCreateInfo flagInfo{
         VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO};
     flagInfo.bindingCount = uint32_t(flags.size());
@@ -934,13 +936,7 @@ bool VulkanDevice::Impl::writeDescriptors(std::string* error)
 {
     if (descriptorSet) vkFreeDescriptorSets(device, descriptorPool, 1, &descriptorSet);
     descriptorSet = VK_NULL_HANDLE;
-    const uint32_t imageCount = uint32_t(std::max<size_t>(1, imageViews.size()));
-    VkDescriptorSetVariableDescriptorCountAllocateInfo variable{
-        VK_STRUCTURE_TYPE_DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_ALLOCATE_INFO};
-    variable.descriptorSetCount = 1;
-    variable.pDescriptorCounts = &imageCount;
     VkDescriptorSetAllocateInfo allocate{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-    allocate.pNext = &variable;
     allocate.descriptorPool = descriptorPool;
     allocate.descriptorSetCount = 1;
     allocate.pSetLayouts = &setLayout;
