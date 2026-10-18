@@ -272,25 +272,25 @@ inline LightTable BuildLightTable(SceneManager& scene, size_t maxEmitterTriangle
     // Vose's alias method.
     table.alias.assign(n, float4(1.0f, 0.0f, 0.0f, 0.0f));
     std::vector<double> scaled(n);
-    std::vector<uint32_t> small, large;
+    std::vector<uint32_t> smallBin, largeBin;
     for (size_t i = 0; i < n; ++i) {
         scaled[i] = pmf[i] * double(n);
-        (scaled[i] < 1.0 ? small : large).push_back(uint32_t(i));
+        (scaled[i] < 1.0 ? smallBin : largeBin).push_back(uint32_t(i));
         table.alias[i].y = asfloat(uint32_t(i));
         table.alias[i].z = float(pmf[i]);
     }
-    while (!small.empty() && !large.empty()) {
-        const uint32_t s = small.back();
-        small.pop_back();
-        const uint32_t l = large.back();
-        large.pop_back();
+    while (!smallBin.empty() && !largeBin.empty()) {
+        const uint32_t s = smallBin.back();
+        smallBin.pop_back();
+        const uint32_t l = largeBin.back();
+        largeBin.pop_back();
         table.alias[s].x = float(scaled[s]);
         table.alias[s].y = asfloat(l);
         scaled[l] -= 1.0 - scaled[s];
-        (scaled[l] < 1.0 ? small : large).push_back(l);
+        (scaled[l] < 1.0 ? smallBin : largeBin).push_back(l);
     }
-    for (uint32_t i : large) table.alias[i].x = 1.0f;
-    for (uint32_t i : small) table.alias[i].x = 1.0f;
+    for (uint32_t i : largeBin) table.alias[i].x = 1.0f;
+    for (uint32_t i : smallBin) table.alias[i].x = 1.0f;
     return table;
 }
 
