@@ -628,6 +628,10 @@ public:
     Environment *environment;
     // Analytic lights (UsdLux shapes); domes are the environment.
     std::vector<prism::SceneLight> lights;
+    // Light/shadow-link categories of placements (bits, see SceneLight);
+    // empty without linking. Placements missing here belong to none.
+    std::unordered_map<int, std::pair<uint32_t, uint32_t>> placement_link_masks;
+    bool lightLinking = false;
     Camera cam;
     int image_width = 1280;
     int image_height = 720;

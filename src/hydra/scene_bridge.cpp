@@ -38,6 +38,7 @@
 #include "pxr/usd/sdf/assetPath.h"
 #include "pxr/imaging/hd/light.h"
 #include "pxr/imaging/hd/lightSchema.h"
+#include "pxr/imaging/hd/categoriesSchema.h"
 #include "pxr/base/tf/diagnostic.h"
 #include "pxr/imaging/hd/materialBindingsSchema.h"
 #include "pxr/imaging/hd/geomSubsetSchema.h"
@@ -230,7 +231,8 @@ HdContainerDataSourceHandle _MakeStaticPrimCopy(
             HdLightTokens->textureFormat, HdLightTokens->normalize,
             HdLightTokens->enableColorTemperature, HdLightTokens->colorTemperature,
             HdLightTokens->radius, HdLightTokens->width, HdLightTokens->height,
-            HdLightTokens->length, HdLightTokens->angle, _LightTokens().treatAsPoint};
+            HdLightTokens->length, HdLightTokens->angle, _LightTokens().treatAsPoint,
+            HdTokens->lightLink, HdTokens->shadowLink};
         for (TfToken const &token : consumed) {
             if (light->Get(token) &&
                 std::find(lightNames.begin(), lightNames.end(), token) ==
@@ -584,6 +586,8 @@ struct Snapshot {
     std::unique_ptr<Environment> environment;
     // With several domes: each of them; `environment` is then their composite.
     std::vector<std::unique_ptr<Environment>> domeEnvironments;
+    // Light/shadow-link categories of the lights, as bits (SceneLight).
+    std::unordered_map<TfToken, uint32_t, TfToken::HashFunctor> lightLinkBits, shadowLinkBits;
     std::unordered_map<unsigned int, int> geomToPrimId;
     std::unordered_map<unsigned int, SharedFaceTable> geomToCoarseFaces;
     std::unordered_map<unsigned int, int> geomToInstanceId;
@@ -3161,6 +3165,25 @@ void _AddAnalyticLight(HdSceneIndexBaseRefPtr const &scene,
     for (int row = 0; row < 4; ++row)
         for (int column = 0; column < 4; ++column) matrix[row * 4 + column] = world[row][column];
     prism::SceneLight result = prism::MakeSceneLight(params, matrix);
+    // Light linking (HdsiLightLinkingSceneIndex): a category per non-trivial
+    // collection, at most 32 of each kind.
+    auto categoryBit = [&](TfToken const &category, auto &bits) -> uint32_t {
+        if (category.IsEmpty()) return 0u;
+        auto found = bits.find(category);
+        if (found != bits.end()) return found->second;
+        if (bits.size() >= 32) {
+            if (snapshot->warnedFeatures.insert("linkCategories").second)
+                TF_WARN("PrismRT: more than 32 light or shadow link collections; further ones are ignored");
+            return 0u;
+        }
+        const uint32_t bit = 1u << bits.size();
+        bits.emplace(category, bit);
+        return bit;
+    };
+    result.lightLinkBit = categoryBit(_ContainerValue(light, HdTokens->lightLink, TfToken()),
+                                      snapshot->lightLinkBits);
+    result.shadowLinkBit = categoryBit(_ContainerValue(light, HdTokens->shadowLink, TfToken()),
+                                       snapshot->shadowLinkBits);
     if (params.shape == prism::LightShape::Rect) {
         const SdfAssetPath asset = _ContainerValue(light, HdLightTokens->textureFile, SdfAssetPath());
         std::string resolved = asset.GetResolvedPath();
@@ -3523,6 +3546,8 @@ void _CollectMaterialRequests(HdSceneIndexBaseRefPtr const &scene,
         _CollectMaterialRequests(scene, child, seen, requests, renderTags, cancelled);
 }
 
+void _ApplyLinkMasks(HdSceneIndexBaseRefPtr const &index, Snapshot *snapshot);
+
 std::shared_ptr<Snapshot> _BuildSnapshot(HdSceneIndexBaseRefPtr const &scene,
                                          MaterialService *materials,
                                          RenderSettings const &settings,
@@ -3580,6 +3605,7 @@ std::shared_ptr<Snapshot> _BuildSnapshot(HdSceneIndexBaseRefPtr const &scene,
           renderTags, cancelled, &preparation);
     if (cancelled && cancelled()) return {};
     _FlushSphereBatches(result.get());
+    _ApplyLinkMasks(scene, result.get());
     _IndexPlacementDependencies(result.get());
     _ApplyHiddenGeometryBudget(result.get());
     _CachePlacementInputs(scene, result.get());
@@ -4237,6 +4263,34 @@ bool _RefreshPrototypes(HdSceneIndexBaseRefPtr const &index,
         }
     }
     return true;
+}
+
+// The light/shadow-link categories of every placement, from the categories
+// HdsiLightLinkingSceneIndex gives geometry.
+void _ApplyLinkMasks(HdSceneIndexBaseRefPtr const &index, Snapshot *snapshot)
+{
+    SceneManager &scene = *snapshot->scene;
+    scene.placement_link_masks.clear();
+    scene.lightLinking = !snapshot->lightLinkBits.empty() || !snapshot->shadowLinkBits.empty();
+    if (!scene.lightLinking) return;
+    std::unordered_map<SdfPath, std::pair<uint32_t, uint32_t>, SdfPath::Hash> byPath;
+    for (auto const &[id, primId] : snapshot->geomToPrimId) {
+        if (primId < 0 || size_t(primId) >= snapshot->primPaths.size()) continue;
+        SdfPath const &path = snapshot->primPaths[primId];
+        auto cached = byPath.find(path);
+        if (cached == byPath.end()) {
+            std::pair<uint32_t, uint32_t> masks{0u, 0u};
+            HdCategoriesSchema categories = HdCategoriesSchema::GetFromParent(index->GetPrim(path).dataSource);
+            if (categories) {
+                for (auto const &[category, bit] : snapshot->lightLinkBits)
+                    if (categories.IsIncludedInCategory(category)) masks.first |= bit;
+                for (auto const &[category, bit] : snapshot->shadowLinkBits)
+                    if (categories.IsIncludedInCategory(category)) masks.second |= bit;
+            }
+            cached = byPath.emplace(path, masks).first;
+        }
+        scene.placement_link_masks[int(id)] = cached->second;
+    }
 }
 
 void _RefreshEnvironment(HdSceneIndexBaseRefPtr const &index,
@@ -6021,8 +6075,11 @@ bool SceneBridge::Prepare(CameraState const &camera,
                                 bank->scene->environment = bank->environment.get();
                                 bank->domeEnvironments.clear();
                                 bank->scene->lights.clear();
+                                bank->lightLinkBits.clear();
+                                bank->shadowLinkBits.clear();
                                 _RefreshEnvironment(
                                     retained, SdfPath::AbsoluteRootPath(), bank.get());
+                                _ApplyLinkMasks(retained, bank.get());
                             }
                             result.residencyUnchanged =
                                 jobDirtyKinds == static_cast<unsigned int>(SceneDirtyKind::Placement) &&

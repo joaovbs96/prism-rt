@@ -68,6 +68,7 @@ static const uint kFrameSeedRng = 16u;
 static const uint kFrameLens = 32u;
 static const uint kFrameCutouts = 64u;       // some instances are not opaque
 static const uint kFramePrimaryHits = 128u;  // preview, pass: also store each pixel's center-ray hit
+static const uint kFrameLightLinking = 256u; // instances carry light/shadow-link categories
 
 // Work modes.
 static const uint kModePass = 0u;      // one sample per listed pixel
@@ -136,6 +137,7 @@ struct GpuInstance {
     float4 normalColumns[3];
     float4 tangentColumns[3];
     uint4 info;   // x: prototype, y: flags, z: first primitive material, w: placement id
+    uint4 links;  // x: light-link categories, y: shadow-link categories (~0u without linking)
 };
 
 struct GpuMaterial {

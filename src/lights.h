@@ -33,7 +33,10 @@ struct SceneLight {
     Color3 radiance = Color3(0.0f); // point light: intensity; parallel distant light: irradiance
     bool cameraVisible = false;
     std::shared_ptr<Texture<Color3>> texture; // rect lights
-    uint32_t linkMask = ~0u;
+    // Light and shadow linking: the category bit of the surfaces the light
+    // illuminates, and of those casting its shadows (0: every surface).
+    uint32_t lightLinkBit = 0;
+    uint32_t shadowLinkBit = 0;
 };
 
 // The UsdLux inputs of one light. `color` already includes any color

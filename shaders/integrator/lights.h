@@ -38,9 +38,11 @@ static const uint kLightTextureNone = 0xffffffffu;
 //   point     p0 position; radiance is the intensity
 //   triangle  p0, u, v vertices; n front normal
 // v.w is the area of area lights, n.w the selection probability, radiance
-// the emitted radiance (irradiance for a parallel distant light).
+// the emitted radiance (irradiance for a parallel distant light); radiance.w
+// is 1 + the index of the shadow-link category bit (0: every surface casts
+// shadows).
 struct LightRecord {
-    uint4 info;      // x: type, y: flags, z: texture (rect), w: light-link mask
+    uint4 info;      // x: type, y: flags, z: texture (rect), w: light-link category bit (0: all)
     float4 p0;
     float4 u;
     float4 v;
@@ -66,6 +68,11 @@ struct LightHit {
 };
 
 inline float3 xyz(float4 v) { return float3(v.x, v.y, v.z); }
+
+inline uint shadowLinkBit(LightRecord light)
+{
+    return light.radiance.w >= 1.0f ? (1u << (uint(light.radiance.w) - 1u)) : 0u;
+}
 
 inline LightSample invalidLightSample()
 {

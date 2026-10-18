@@ -124,7 +124,11 @@ std::shared_ptr<const CpuSceneState> CpuDevice::PreparedScene(SceneManager& scen
     std::lock_guard lock(m_stateMutex);
     if (m_stateOf != &scene || !m_state) {
         auto state = std::make_shared<CpuSceneState>();
-        state->opaque = AllMaterialsBlock(scene);
+        // Shadow links let some surfaces pass some lights: every shadow
+        // ray then takes the per-hit path.
+        bool shadowLinks = false;
+        for (auto const& light : scene.lights) shadowLinks |= light.shadowLinkBit != 0u;
+        state->opaque = !(scene.lightLinking && shadowLinks) && AllMaterialsBlock(scene);
         state->lights = std::make_shared<LightTable>(BuildLightTable(scene));
         m_state = std::move(state);
         m_stateOf = &scene;

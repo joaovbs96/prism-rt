@@ -58,6 +58,7 @@ GpuFrame GpuRenderDevice::BaseFrame(prism::CameraRayParameters const& camera, un
     if (data.environmentMis) flags |= kFrameEnvironmentMis;
     if (data.filteredTextures) flags |= kFrameFiltered;
     if (data.hasCutouts) flags |= kFrameCutouts;
+    if (data.lightLinking) flags |= kFrameLightLinking;
     frame.settings = {uint32_t(std::max(0, data.maxDepth)), uint32_t(std::max(0, data.rouletteDepth)), flags, 0};
     frame.counts = {MdlTextureCount(), 0, 0, 0};
     frame.lights = {uint32_t(data.lights.size()), data.analyticLights, uint32_t(data.environments.size()), 0};

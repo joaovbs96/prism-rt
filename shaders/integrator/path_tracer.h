@@ -30,6 +30,9 @@
 //   float4   backend.lightAlias(uint i)           alias table over lightCount() + 1 entries
 //                                                 (the last one: the dome)
 //   float3   backend.lightTexture(uint texture, float2 st)
+//   uint     backend.lightLinkMask(Hit)           categories of the hit for light linking
+//   uint     backend.shadowLinkMask(Hit)          categories of the hit for shadow linking
+//                                                 (both ~0u without linking)
 //   float    backend.emitterPdfArea(Hit)          selection density per unit area of a hit
 //                                                 emissive triangle (0: not a light)
 //   int      backend.maxDepth(), backend.rouletteDepth()
@@ -218,7 +221,9 @@ struct PathTracer {
     // Opaque geometry anywhere on the ray blocks it whatever cutouts lie in
     // front, so a cheap any-hit query on opaque geometry comes first.
     // Shadow rays end at shadow.ray.tfar (lights at a finite distance).
-    bool visible(PathRay shadow)
+    // Surfaces outside a light's shadow-link category (shadowBit, 0: all
+    // surfaces) let its light through.
+    bool visible(PathRay shadow, uint shadowBit)
     {
         if (backend.occludedByOpaque(shadow)) return false;
         if (!backend.mayHaveCutouts()) return true;
@@ -227,9 +232,12 @@ struct PathTracer {
         for (int crossings = 0; crossings < 64; ++crossings) {
             const Hit hit = backend.intersectNonOpaque(shadow);
             if (!hit.surface.valid) return true;
-            if (backend.provenOpaque(hit)) return false;
-            const float opacity = saturate(backend.cutoutOpacity(hit));
-            if (opacity >= 1.0f || (opacity > 0.0f && backend.rng.next() < opacity)) return false;
+            const bool casts = shadowBit == 0u || (backend.shadowLinkMask(hit) & shadowBit) != 0u;
+            if (casts) {
+                if (backend.provenOpaque(hit)) return false;
+                const float opacity = saturate(backend.cutoutOpacity(hit));
+                if (opacity >= 1.0f || (opacity > 0.0f && backend.rng.next() < opacity)) return false;
+            }
             remaining -= hit.surface.t;
             shadow = spawnRay(hit.surface, direction, true);
             shadow.ray.tfar = remaining;
@@ -260,13 +268,15 @@ struct PathTracer {
     // Emission of the analytic lights a ray segment passes through, and of
     // distant lights for escaped rays (tmax infinite), weighted against NEE.
     float3 crossedLights(PathRay ray, float tmax, bool escaped, bool cameraRay, bool weighted,
-                         float bsdfPdf, float neeProbability)
+                         float bsdfPdf, float neeProbability, uint receiver)
     {
         float3 sum = (float3)0.0f;
         const uint count = backend.analyticLightCount();
         for (uint i = 0u; i < count; ++i) {
             const LightRecord light = backend.light(i);
             if (cameraRay && (light.info.y & kLightCameraVisible) == 0u) continue;
+            // Light linking: only the surfaces of its category see the light.
+            if (!cameraRay && light.info.w != 0u && (receiver & light.info.w) == 0u) continue;
             LightHit crossing;
             if (light.info.x == kLightDistant) {
                 if (!escaped) continue;
@@ -309,6 +319,7 @@ struct PathTracer {
         bool inMedium = false;
         MediumCoefficients medium = {(float3)0.0f, (float3)0.0f, 0.0f, false};
         int volumeEvents = 0;
+        uint receiver = ~0u;       // light-link categories of the last surface
         for (;;) {
             if (depth >= maxDepth) break;
             float scatterDistance = infinity();
@@ -367,7 +378,7 @@ struct PathTracer {
             if (!inMedium && backend.analyticLightCount() > 0u) {
                 const float3 crossed = crossedLights(ray, hit.surface.valid ? hit.surface.t : ray.ray.tfar,
                                                      !hit.surface.valid, depth == 0, weighted, previousPdf,
-                                                     previousNeeProbability);
+                                                     previousNeeProbability, receiver);
                 result.radiance += weight * crossed * contributionWeight(contributions, depth);
             }
             if (!hit.surface.valid) {
@@ -383,6 +394,7 @@ struct PathTracer {
             }
             const Shading shading = backend.prepare(hit);
             const BsdfSample bs = backend.sample(shading, sampler.next4());
+            const uint hitReceiver = backend.lightLinkMask(hit);
             float emissionWeight = 1.0f;
             if (weighted && !isZero(bs.emission)) {
                 // Emissive triangles are also sampled by NEE: area to solid angle.
@@ -422,6 +434,7 @@ struct PathTracer {
                 const uint lightCount = backend.lightCount();
                 if (lightCount > 0u) pick = pickLight(sampler.next1());
                 LightSample light = invalidLightSample();
+                uint shadowBit = 0u;
                 if (pick.index >= lightCount) {
                     const EnvironmentLightSample dome =
                         backend.sampleEnvironment(sampler.next4(), angularRadius(hit.surface.ray_footprint));
@@ -436,6 +449,8 @@ struct PathTracer {
                     const float4 u = sampler.next4();
                     const LightSampleTextured sampled = sampleLight(record, hit.surface.p, float2(u.x, u.y));
                     light = sampled.sample;
+                    shadowBit = shadowLinkBit(record);
+                    if (record.info.w != 0u && (hitReceiver & record.info.w) == 0u) light.valid = false;
                     if (light.valid && (record.info.y & kLightTextured) != 0u)
                         light.radiance *= backend.lightTexture(record.info.z, sampled.texcoord);
                 }
@@ -448,7 +463,7 @@ struct PathTracer {
                         const float3 contribution = weight * f.value * light.radiance * (misWeight / lightPdf);
                         PathRay shadow = spawnRay(hit.surface, light.wi, false);
                         if (isfinite(light.distance)) shadow.ray.tfar = light.distance * (1.0f - 1e-4f);
-                        if (maxComponent(contribution) > 0.0f && visible(shadow))
+                        if (maxComponent(contribution) > 0.0f && visible(shadow, shadowBit))
                             result.radiance += contribution * contributionWeight(contributions, depth + 1);
                     }
                 }
@@ -472,6 +487,7 @@ struct PathTracer {
                 throughput *= rouletteWeight;
             }
             previousNee = canNee && !bs.delta && !bs.null_event && bs.pdf > 0.0f;
+            receiver = hitReceiver;
             previousPdf = bs.pdf;
             previousNeeProbability = neeProbability;
             weight *= bs.color * rouletteWeight;

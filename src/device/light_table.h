@@ -10,6 +10,7 @@
 #include "../scene.h"
 
 #include <algorithm>
+#include <bit>
 #include <memory>
 #include <unordered_map>
 #include <vector>
@@ -103,8 +104,9 @@ inline LightTable BuildLightTable(SceneManager& scene, size_t maxEmitterTriangle
         LightRecord record{};
         record.info.y = (light.cameraVisible ? kLightCameraVisible : 0u);
         record.info.z = kLightTextureNone;
-        record.info.w = light.linkMask;
-        record.radiance = F4(light.radiance, 0.0f);
+        record.info.w = light.lightLinkBit;
+        record.radiance = F4(light.radiance,
+            light.shadowLinkBit ? float(std::countr_zero(light.shadowLinkBit) + 1) : 0.0f);
         switch (light.shape) {
         case prism::LightShape::Sphere:
             record.info.x = kLightSphere;

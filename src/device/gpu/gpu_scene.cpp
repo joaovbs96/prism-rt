@@ -459,6 +459,12 @@ GpuSceneData BuildGpuScene(SceneManager& scene)
         GpuInstance instance;
         instance.info.x = prototype;
         instance.info.w = uint32_t(id);
+        instance.links = {~0u, ~0u, 0u, 0u};
+        if (scene.lightLinking) {
+            auto masks = scene.placement_link_masks.find(id);
+            instance.links.x = masks != scene.placement_link_masks.end() ? masks->second.first : 0u;
+            instance.links.y = masks != scene.placement_link_masks.end() ? masks->second.second : 0u;
+        }
         std::array<float, 12> transform{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
         const bool instanced = scene.intersection_geometry.contains(id);
         if (instanced) {
@@ -509,6 +515,8 @@ GpuSceneData BuildGpuScene(SceneManager& scene)
     }
 
     BuildEnvironment(scene.environment, builder, data);
+    data.lightLinking = scene.lightLinking;
+    for (auto const& light : scene.lights) data.shadowLinks |= scene.lightLinking && light.shadowLinkBit != 0u;
 
     const LightTable lights = BuildLightTable(scene);
     data.lights = lights.records;
@@ -554,6 +562,7 @@ void ApplyMdlShaderCode(GpuSceneData& data, MdlShaderCode const& code)
         bool opaque = true;
         for (uint32_t p = 0; p < primitives && opaque; ++p)
             opaque = blocks(data.materials[data.primitiveMaterials[instance.info.z + p]]);
+        if (data.shadowLinks && instance.links.y != ~0u) opaque = false;
         if (opaque) instance.info.y |= kInstanceOpaque;
         else data.hasCutouts = true;
     }

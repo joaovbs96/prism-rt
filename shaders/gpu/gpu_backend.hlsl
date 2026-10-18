@@ -179,6 +179,7 @@ struct GpuHit {
     SurfaceHit surface;
     uint material;
     bool sphere;     // analytic sphere primitive
+    uint instanceIndex;
 };
 
 // SceneManager::cast_ray: intersection plus RayHit construction and the
@@ -188,6 +189,7 @@ GpuHit gpu_intersect(PathRay ray, uint mask)
     GpuHit result;
     result.material = 0u;
     result.sphere = false;
+    result.instanceIndex = 0u;
     SurfaceHit hit = gpu_empty_hit(ray);
     GpuRawHit raw = gpu_trace(ray.ray, mask);
     if (!raw.hit) {
@@ -208,6 +210,7 @@ GpuHit gpu_intersect(PathRay ray, uint mask)
     hit.primitive = localPrimitive;
     result.material = gpu_primitive_material(inst.info.z + localPrimitive);
     result.sphere = type == kProtoSpheres;
+    result.instanceIndex = raw.instance;
 
     // Geometric normal in the prototype's space (Embree conventions).
     float3 ng = (float3)0.0f;
@@ -1068,6 +1071,17 @@ struct GpuBackend {
         if (image == kImageNone) return (float3)1.0f;
         return gpu_xyz(gpu_image_sample(image, st, float2(0.0f, 0.0f), float2(0.0f, 0.0f), 0u, 0u));
     }
+    uint lightLinkMask(GpuHit hit)
+    {
+        if ((gpu_frame().settings.z & kFrameLightLinking) == 0u) return ~0u;
+        return gpu_instance(hit.instanceIndex).links.x;
+    }
+    uint shadowLinkMask(GpuHit hit)
+    {
+        if ((gpu_frame().settings.z & kFrameLightLinking) == 0u) return ~0u;
+        return gpu_instance(hit.instanceIndex).links.y;
+    }
+
     float emitterPdfArea(GpuHit hit)
     {
         const GpuMaterial material = gpu_material(hit.material);

@@ -166,6 +166,16 @@ struct CpuBackend {
         if (!lights || texture >= lights->textures.size()) return float3(1.0f);
         return FromFloat3(lights->textures[texture]->sampleInterp(st.x, st.y, Float3(0.0f)));
     }
+    uint lightLinkMask(CpuHit const& hit) { return linkMasks(hit).first; }
+    uint shadowLinkMask(CpuHit const& hit) { return linkMasks(hit).second; }
+    std::pair<uint32_t, uint32_t> linkMasks(CpuHit const& hit) const
+    {
+        if (!scene->lightLinking) return {~0u, ~0u};
+        auto found = scene->placement_link_masks.find(int(hit.surface.instance));
+        return found == scene->placement_link_masks.end() ? std::pair<uint32_t, uint32_t>{0u, 0u}
+                                                          : found->second;
+    }
+
     float emitterPdfArea(CpuHit const& hit)
     {
         if (!lights || lights->emitters.empty() || !hit.material) return 0.0f;

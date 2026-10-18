@@ -69,6 +69,10 @@ struct GpuSceneData {
     // Integrator settings of the SceneManager.
     // Some instance has a material that may transmit shadow rays.
     bool hasCutouts = true;
+    // Light/shadow linking (GpuInstance.links); shadow links keep the
+    // instances outside some shadow set off the opaque shadow query.
+    bool lightLinking = false;
+    bool shadowLinks = false;
     int maxDepth = 32;
     int rouletteDepth = 4;
     bool environmentMis = true;
