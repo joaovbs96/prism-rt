@@ -212,9 +212,11 @@ public:
     {
         static_assert(sizeof(ShadingStateData)<=sizeof(context.storage));
         static_assert(alignof(PreparedShadingContext)>=alignof(ShadingStateData));
+        context.owner=this;
+        context.valid=false;
+        if (!m_valid || !m_target.program) return false;
         auto* ss=new(context.storage) ShadingStateData;
         build_shading_state(hit,*ss);
-        context.owner=this;
         context.valid=m_valid && m_target.program->target_code->execute_init(
             m_target.program->functions.init_function_index,ss->base(),m_target.texture_handler(),
             m_target.argument_data())==0;
@@ -651,7 +653,7 @@ private:
         ss.state.text_coords     = &ss.tex_coord;
         ss.state.animation_time  = 0.0f;
         ss.state.text_results    = ss.text_results;
-        ss.state.ro_data_segment = m_target.program->ro_data_segment;
+        ss.state.ro_data_segment = m_target.program ? m_target.program->ro_data_segment : nullptr;
         ss.state.world_to_object = ss.identity;
         ss.state.object_to_world = ss.identity;
         ss.state.object_id       = 0;

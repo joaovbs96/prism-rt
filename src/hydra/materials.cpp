@@ -536,8 +536,24 @@ std::string ResolveTextureAssets(HdMaterialNetworkInterface& net,
                     TF_WARN("[Hydra Material] Cannot materialize UDIM texture '%s': %s",
                             authored.c_str(), error.what());
                 }
-                // Preserve the authored token for the stock SDK path when a
-                // custom resolver cannot enumerate an owned tile family.
+                // A file-system pattern without tiles (an optional texture
+                // package not installed) would fail the whole MDL module:
+                // drop the texture so the image node uses its default. Other
+                // patterns keep the authored token for the stock SDK path
+                // when a custom resolver cannot enumerate a tile family.
+                if (preResolved.empty() || std::filesystem::path(preResolved).is_absolute()) {
+                    static std::mutex warnedMutex;
+                    static std::unordered_set<std::string> warned;
+                    {
+                        std::lock_guard lock(warnedMutex);
+                        if (warned.insert(authored).second)
+                            TF_WARN("[Hydra Material] No UDIM tiles found for '%s'; the texture is skipped",
+                                    authored.c_str());
+                    }
+                    data.value = std::string();
+                    data.typeName = TfToken("asset");
+                    net.SetNodeParameterData(node, param, data);
+                }
                 continue;
             }
 

@@ -99,7 +99,7 @@ No arguments display CLI help. USD, glTF/GLB and OBJ scene files are supported; 
 🐛 Known Issues & Limitations
 ---------------------------------------
 
-* Curves, volumes, displacement, motion blur, subdivision refinement, and analytic-light/emissive-mesh sampling are not implemented.
+* Curves, VDB volumes, motion blur, light shaping/IES and an ACEScg rendering space are not implemented; see [the feature roadmap](docs/feature_roadmap.md).
 * Legacy rough-metal and glTF samplers remain BSDF-only when no matching PDF is available.
 * The setPosition method of AABBs doesn't set correctly the position, if it's not initially in zero.
 
