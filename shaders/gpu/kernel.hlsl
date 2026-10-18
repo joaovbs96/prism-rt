@@ -54,7 +54,8 @@ void main(uint3 id : SV_DispatchThreadID)
     const uint flags = frame.settings.z;
     const CameraParams camera = frameCamera(frame);
     const SampleSettings settings = {frame.shading.x, frame.shading.y,
-                                     (flags & kFrameTransparentEscapes) != 0u};
+                                     (flags & kFrameTransparentEscapes) != 0u,
+                                     frame.counts.w != 0u ? frame.counts.w : kContributionAll};
     const uint width = frame.size.x;
     const uint height = frame.size.y;
     const uint mode = frame.work.z;

@@ -69,6 +69,8 @@ struct ImageRequest {
     AdaptiveSettings adaptive;
     // Receives the mean number of samples per pixel (when non-null).
     double* meanSamples = nullptr;
+    // Light contributions to keep (kContribution* mask; noise analysis).
+    unsigned contributions = 7;
 };
 
 // One progressive pass: one sample per pixel over the given tiles. All

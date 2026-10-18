@@ -33,6 +33,7 @@ struct Options {
     float exposure = 0, clamp = 10;
     float adaptiveThreshold = 0;
     int adaptiveMinSamples = 16;
+    unsigned contributions = 7;
 };
 
 void help() {
@@ -47,6 +48,8 @@ void help() {
         "  --max-sample-radiance 10 --output output.exr\n"
         "  --adaptive-threshold 0 (e.g. 0.01; 0 disables) --adaptive-min-samples 16\n"
         "                 with adaptive sampling, --spp is the per-pixel maximum\n"
+        "  --debug-contributions all|visible|direct|indirect (noise analysis: keep only light seen\n"
+        "                 directly, reaching the first hit, or bounced more often; comma-separated)\n"
         "  --environment-sampling mis|bsdf (default mis)\n"
         "  --texture-filtering filtered|bilinear (default filtered)\n"
         "  --device auto|cpu|cpu-reference|vulkan|metal (default auto: GPU if available, else CPU;\n"
@@ -119,6 +122,17 @@ Options parse(int argc, char** argv) {
         else if (key == "--max-sample-radiance") o.clamp = number(value);
         else if (key == "--adaptive-threshold") o.adaptiveThreshold = number(value);
         else if (key == "--adaptive-min-samples") o.adaptiveMinSamples = integer(value);
+        else if (key == "--debug-contributions") {
+            o.contributions = 0;
+            std::stringstream list(value);
+            for (std::string part; std::getline(list, part, ',');) {
+                if (part == "all") o.contributions |= 7;
+                else if (part == "visible") o.contributions |= 1;
+                else if (part == "direct") o.contributions |= 2;
+                else if (part == "indirect") o.contributions |= 4;
+                else throw std::runtime_error("--debug-contributions takes all, visible, direct or indirect");
+            }
+        }
         else throw std::runtime_error("Unknown option: " + key);
     }
     if (!o.exportScene.empty()) {
@@ -344,6 +358,7 @@ int runStandaloneCli(int argc, char** argv) {
         imageRequest.sampleClamp = o.clamp;
         imageRequest.adaptive.threshold = o.adaptiveThreshold;
         imageRequest.adaptive.minSamples = o.adaptiveMinSamples;
+        imageRequest.contributions = o.contributions;
         double meanSamples = o.samples;
         imageRequest.meanSamples = &meanSamples;
         const std::vector<float> pixels = renderDevice->RenderImage(scene, imageRequest);

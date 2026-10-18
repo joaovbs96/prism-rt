@@ -67,6 +67,7 @@ std::vector<float> GpuRenderDevice::RenderImage(SceneManager& scene, ImageReques
     GpuFrame frame = BaseFrame(request.camera, request.width, request.height);
     frame.shading = {request.sampleClamp, 1.0f, 0.0f, 0.0f};
     frame.settings.w = request.seed;
+    frame.counts.w = request.contributions & 7u;
     double gpuSeconds = 0.0;
     for (int sample = 0; sample < request.samples && !list.empty(); ++sample) {
         std::memcpy(RenderBuffer(kSlotPixels, list.size() * 4), list.data(), list.size() * 4);

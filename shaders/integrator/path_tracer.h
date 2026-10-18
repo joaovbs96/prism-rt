@@ -129,10 +129,26 @@ inline Ray cameraRay(CameraParams camera, float sx, float sy, uint width, uint h
     return ray;
 }
 
+// Light contributions by the number of surface interactions before the
+// light (noise analysis): environment or emission seen directly, light
+// reaching the first hit, and everything that bounced more often.
+static const uint kContributionVisible = 1u;
+static const uint kContributionDirect = 2u;
+static const uint kContributionIndirect = 4u;
+static const uint kContributionAll = 7u;
+
+inline float contributionWeight(uint contributions, int bounces)
+{
+    const uint kind = bounces == 0 ? kContributionVisible
+                                   : (bounces == 1 ? kContributionDirect : kContributionIndirect);
+    return (contributions & kind) != 0u ? 1.0f : 0.0f;
+}
+
 struct SampleSettings {
     float sampleClamp;      // 0 disables
     float exposureScale;
     bool transparentEscapes;
+    uint contributions;     // kContribution* mask
 };
 
 struct SampleResult {
@@ -181,7 +197,7 @@ struct PathTracer {
     // heuristic; cutout null events do not count as bounces (at most 64 in a
     // row). Without: BSDF sampling only, and null events are bounces. Both use
     // Russian roulette from the roulette depth on.
-    TraceResult trace(PathRay ray)
+    TraceResult trace(PathRay ray, uint contributions)
     {
         const bool mis = backend.environmentMis();
         const int maxDepth = backend.maxDepth();
@@ -204,12 +220,12 @@ struct PathTracer {
                 float misWeight = 1.0f;
                 if (mis && previousNee)
                     misWeight = powerHeuristic(previousPdf, backend.environmentPdf(direction));
-                result.radiance += weight * li * misWeight;
+                result.radiance += weight * li * (misWeight * contributionWeight(contributions, depth));
                 break;
             }
             const Shading shading = backend.prepare(hit);
             const BsdfSample bs = backend.sample(shading, sampler.next4());
-            result.radiance += weight * bs.emission;
+            result.radiance += weight * bs.emission * contributionWeight(contributions, depth);
             if (mis && bs.null_event) {
                 if (!bs.scattered) tracking = false;
                 if (nullCrossings >= 64) break;
@@ -236,7 +252,7 @@ struct PathTracer {
                             (powerHeuristic(light.pdf, f.pdf) / light.pdf);
                         if (maxComponent(contribution) > 0.0f &&
                             environmentVisible(spawnRay(hit.surface, light.wi, false)))
-                            result.radiance += contribution;
+                            result.radiance += contribution * contributionWeight(contributions, depth + 1);
                     }
                 }
             }
@@ -291,7 +307,7 @@ struct PathTracer {
     SampleResult renderSample(CameraParams camera, uint x, uint y, uint width, uint height,
                               SampleSettings settings)
     {
-        const TraceResult traced = trace(cameraSample(camera, x, y, width, height));
+        const TraceResult traced = trace(cameraSample(camera, x, y, width, height), settings.contributions);
         SampleResult result;
         result.coverage = settings.transparentEscapes && traced.outcome == kPrimaryEscaped ? 0.0f : 1.0f;
         float3 color = result.coverage == 0.0f ? (float3)0.0f : traced.radiance;
