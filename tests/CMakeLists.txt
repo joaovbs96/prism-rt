@@ -14,3 +14,7 @@ add_executable(materialx_loader_library materialx_loader_library.cpp ../src/mate
 target_compile_features(materialx_loader_library PRIVATE cxx_std_20)
 target_link_libraries(materialx_loader_library PRIVATE MaterialXCore MaterialXFormat)
 add_test(NAME materialx_loader_library COMMAND materialx_loader_library)
+add_executable(materialx_loader_types materialx_loader_types.cpp ../src/materialx/loader.cpp)
+target_compile_features(materialx_loader_types PRIVATE cxx_std_20)
+target_link_libraries(materialx_loader_types PRIVATE MaterialXCore MaterialXFormat)
+add_test(NAME materialx_loader_types COMMAND materialx_loader_types)

@@ -72,6 +72,12 @@ public:
         size_t width = 0, height = 0, depth = 0, components = 0;
     };
     size_t resourceCount() const { return m_textures.size(); }
+    // Whether a scene data lookup (MaterialX geompropvalue, UsdPrimvarReader)
+    // names the texture coordinates: its id is a string constant of the target code.
+    bool isTexcoordSceneData(unsigned id) const {
+        return id < m_texcoordSceneData.size() && m_texcoordSceneData[id];
+    }
+    static bool IsTexcoordPrimvarName(const char* name);
     ResourceView resource(size_t index) const;
     // Prepares the 2D texture (or UDIM set) stored under a database name, as
     // the runtime does for the textures of its own target code.
@@ -114,6 +120,7 @@ private:
     Handler m_handler{};
     std::shared_ptr<prism::TextureService> m_service;
     std::vector<Texture> m_textures; // index 0 is invalid
+    std::vector<bool> m_texcoordSceneData; // by string constant index
     mutable std::atomic<bool> m_reportedLookupFailure{false};
     // Most graphs use a single constant crop. Keep a bounded set of prepared
     // crop views; no source pixel arrays survive preparation.

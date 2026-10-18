@@ -157,6 +157,17 @@ std::string ProgramFunction(uint32_t program, EntryIndex entry)
     return std::format("prism_p{}_{}", program, kEntryPoints[entry].name);
 }
 
+// Scene data ids (string constants of the link unit) naming the texture
+// coordinates (mdl_runtime.hlsl).
+std::string GenerateSceneData(mi::neuraylib::ITarget_code const* code)
+{
+    std::string s = "bool prism_scene_data_is_texcoord(int id)\n{\n";
+    for (mi::Size i = 1; code && i < code->get_string_constant_count(); ++i)
+        if (mdl::NativeTextureRuntime::IsTexcoordPrimvarName(code->get_string_constant(i)))
+            s += std::format("    if (id == {}) return true;\n", i);
+    return s + "    return false;\n}\n\n";
+}
+
 // The prism_mdl_* dispatch functions. Types are spelled the same in both
 std::string GenerateDispatch(std::vector<std::array<bool, kEntryPointCount>> const& present,
                              std::vector<ProgramTraits> const& traits)
@@ -339,7 +350,7 @@ MdlShaderCode GenerateMdlShaderCode(std::vector<MDLMaterial const*> const& mater
     }
     result.programCount = uint32_t(programs.size());
     if (programs.empty()) {
-        result.code = GenerateDispatch({}, {});
+        result.code = GenerateDispatch({}, {}) + GenerateSceneData(nullptr);
         result.success = true;
         return result;
     }
@@ -356,7 +367,7 @@ MdlShaderCode GenerateMdlShaderCode(std::vector<MDLMaterial const*> const& mater
         result.success = false;
         result.error = std::move(message);
         // Shaders still need the dispatch functions; every material is invalid.
-        result.code = GenerateDispatch({}, {});
+        result.code = GenerateDispatch({}, {}) + GenerateSceneData(nullptr);
         transaction->abort();
         return result;
     };
@@ -571,6 +582,7 @@ MdlShaderCode GenerateMdlShaderCode(std::vector<MDLMaterial const*> const& mater
     result.code = code->get_code();
     result.code += "\n// ---- Prism material dispatch ----\n";
     result.code += GenerateDispatch(present, traits);
+    result.code += GenerateSceneData(code.get());
     transaction->commit();
     result.success = true;
     return result;

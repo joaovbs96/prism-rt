@@ -269,10 +269,19 @@ bool NativeTextureRuntime::PrepareDatabaseTexture(const char* dbName,
     return true;
 }
 
+bool NativeTextureRuntime::IsTexcoordPrimvarName(const char* name)
+{
+    if(!name) return false;
+    static const char* const names[]={"st","uv","UV","st0","uv0","UV0","map1","UVMap","primvars:st"};
+    for(const char* candidate:names) if(std::strcmp(name,candidate)==0) return true;
+    return false;
+}
+
 std::shared_ptr<NativeTextureRuntime> NativeTextureRuntime::clone() const
 {
     auto copy=std::shared_ptr<NativeTextureRuntime>(new NativeTextureRuntime);
     copy->m_textures=m_textures;
+    copy->m_texcoordSceneData=m_texcoordSceneData;
     return copy;
 }
 
@@ -422,6 +431,9 @@ std::shared_ptr<NativeTextureRuntime> NativeTextureRuntime::Create(
     if (code->get_light_profile_count()>1) return unsupported("light-profile resource");
     if (code->get_bsdf_measurement_count()>1) return unsupported("measured-BSDF resource");
     auto result = std::shared_ptr<NativeTextureRuntime>(new NativeTextureRuntime);
+    result->m_texcoordSceneData.assign(code->get_string_constant_count(), false);
+    for (mi::Size i=1; i<code->get_string_constant_count(); ++i)
+        result->m_texcoordSceneData[i]=IsTexcoordPrimvarName(code->get_string_constant(i));
     result->m_textures.resize(code->get_texture_count());
     for (mi::Size i=1; i<code->get_texture_count(); ++i) {
         const auto shape=code->get_texture_shape(i);
@@ -621,13 +633,20 @@ mi::neuraylib::Texture_handler_deriv_vtable const &NativeTextureRuntime::Vtable(
         v.m_adapt_normal=[](float out[3],Base const*,
             auto* /*state*/,float const n[3]) {
             out[0]=n[0];out[1]=n[1];out[2]=n[2]; };
-        v.m_scene_data_isvalid=[](Base const*,
+        // Scene data: the texture coordinates under their usual primvar
+        // names; other primvars return the defaults. States carry derivatives.
+        v.m_scene_data_isvalid=[](Base const* base,
             mi::neuraylib::Shading_state_material*,unsigned id){
-            return false;};
+            return Self(base)->isTexcoordSceneData(id);};
         v.m_scene_data_lookup_float=[](Base const*,
             mi::neuraylib::Shading_state_material*,unsigned,float d,bool){return d;};
-        v.m_scene_data_lookup_float2=[](float out[2],Base const*,
-            mi::neuraylib::Shading_state_material*,unsigned,float const d[2],bool){
+        v.m_scene_data_lookup_float2=[](float out[2],Base const* base,
+            mi::neuraylib::Shading_state_material* state,unsigned id,float const d[2],bool){
+            if(state && Self(base)->isTexcoordSceneData(id)) {
+                auto const* uv=reinterpret_cast<mi::neuraylib::Shading_state_material_with_derivs*>(
+                    state)->text_coords;
+                out[0]=uv[0].val.x;out[1]=uv[0].val.y;return;
+            }
             out[0]=d[0];out[1]=d[1];};
         v.m_scene_data_lookup_float3=[](float out[3],Base const*,
             mi::neuraylib::Shading_state_material*,unsigned,float const d[3],bool){
@@ -657,9 +676,17 @@ mi::neuraylib::Texture_handler_deriv_vtable const &NativeTextureRuntime::Vtable(
             mi::neuraylib::Shading_state_material_with_derivs*,unsigned,
             mi::neuraylib::tct_deriv_float const *d,bool){*out=*d;};
         v.m_scene_data_lookup_deriv_float2=[](
-            mi::neuraylib::tct_deriv_arr_float_2 *out,Base const*,
-            mi::neuraylib::Shading_state_material_with_derivs*,unsigned,
-            mi::neuraylib::tct_deriv_arr_float_2 const *d,bool){*out=*d;};
+            mi::neuraylib::tct_deriv_arr_float_2 *out,Base const* base,
+            mi::neuraylib::Shading_state_material_with_derivs* state,unsigned id,
+            mi::neuraylib::tct_deriv_arr_float_2 const *d,bool){
+            if(state && Self(base)->isTexcoordSceneData(id)) {
+                auto const& uv=state->text_coords[0];
+                out->val[0]=uv.val.x;out->val[1]=uv.val.y;
+                out->dx[0]=uv.dx.x;out->dx[1]=uv.dx.y;
+                out->dy[0]=uv.dy.x;out->dy[1]=uv.dy.y;
+                return;
+            }
+            *out=*d;};
         v.m_scene_data_lookup_deriv_float3=[](
             mi::neuraylib::tct_deriv_arr_float_3 *out,Base const*,
             mi::neuraylib::Shading_state_material_with_derivs*,unsigned,

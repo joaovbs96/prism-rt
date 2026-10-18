@@ -1209,12 +1209,13 @@ bool _ApplyHiddenGeometryBudget(Snapshot *snapshot, bool useCurrentEligibility =
     return !detach.empty();
 }
 
-// Uniform subdivision level of subdivision surfaces, and the most faces one
-// mesh may refine to (lower levels are used beyond it). PRISM_SUBDIVISION_LEVEL
-// (0 renders control hulls) and PRISM_SUBDIVISION_MAX_FACES override them.
+// Uniform subdivision of subdivision surfaces: the highest level, and the
+// faces one mesh may refine to (meshes denser than that use lower levels, and
+// their control hulls beyond it). PRISM_SUBDIVISION_LEVEL (0 renders control
+// hulls) and PRISM_SUBDIVISION_MAX_FACES override them.
 struct _SubdivisionSettings {
     int level = 2;
-    size_t maxFaces = size_t(1) << 21;
+    size_t maxFaces = size_t(1) << 16;
 };
 
 _SubdivisionSettings const &_Subdivision()

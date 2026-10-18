@@ -493,12 +493,42 @@ float3 df_bsdf_measurement_sample(int bm_idx, float2 theta_phi_out, float3 xi, i
 float df_bsdf_measurement_pdf(int bm_idx, float2 theta_phi_in, float2 theta_phi_out, int part) { return 0.0f; }
 float4 df_bsdf_measurement_albedos(int bm_idx, float2 theta_phi) { return float4(0.0f, 0.0f, 0.0f, 0.0f); }
 
-// No scene data: lookups return their defaults, as in the native runtime.
-bool scene_data_isvalid(inout Shading_state_material state, int scene_data_id) { return false; }
+bool prism_scene_data_is_texcoord(int id);
+
+// Scene data: the texture coordinates under their usual primvar names
+// (prism_scene_data_is_texcoord, generated per link unit); other lookups
+// return their defaults, as in the native runtime.
+bool scene_data_isvalid(inout Shading_state_material state, int scene_data_id)
+{
+    return prism_scene_data_is_texcoord(scene_data_id);
+}
 float4 scene_data_lookup_float4(inout Shading_state_material state, int id, float4 value, bool uniform_lookup) { return value; }
 float3 scene_data_lookup_float3(inout Shading_state_material state, int id, float3 value, bool uniform_lookup) { return value; }
 float3 scene_data_lookup_color(inout Shading_state_material state, int id, float3 value, bool uniform_lookup) { return value; }
-float2 scene_data_lookup_float2(inout Shading_state_material state, int id, float2 value, bool uniform_lookup) { return value; }
+float2 scene_data_lookup_float2(inout Shading_state_material state, int id, float2 value, bool uniform_lookup)
+{
+    if (prism_scene_data_is_texcoord(id))
+        return float2(state.text_coords[0].val.x, state.text_coords[0].val.y);
+    return value;
+}
+Derived_float2 scene_data_lookup_deriv_float2(inout Shading_state_material state, int id, Derived_float2 value,
+                                              bool uniform_lookup)
+{
+    if (!prism_scene_data_is_texcoord(id)) return value;
+    Derived_float2 result;
+    result.val = float2(state.text_coords[0].val.x, state.text_coords[0].val.y);
+    result.dx = float2(state.text_coords[0].dx.x, state.text_coords[0].dx.y);
+    result.dy = float2(state.text_coords[0].dy.x, state.text_coords[0].dy.y);
+    return result;
+}
+Derived_float scene_data_lookup_deriv_float(inout Shading_state_material state, int id, Derived_float value,
+                                            bool uniform_lookup) { return value; }
+Derived_float3 scene_data_lookup_deriv_float3(inout Shading_state_material state, int id, Derived_float3 value,
+                                              bool uniform_lookup) { return value; }
+Derived_float4 scene_data_lookup_deriv_float4(inout Shading_state_material state, int id, Derived_float4 value,
+                                              bool uniform_lookup) { return value; }
+Derived_float3 scene_data_lookup_deriv_color(inout Shading_state_material state, int id, Derived_float3 value,
+                                             bool uniform_lookup) { return value; }
 float scene_data_lookup_float(inout Shading_state_material state, int id, float value, bool uniform_lookup) { return value; }
 int4 scene_data_lookup_int4(inout Shading_state_material state, int id, int4 value, bool uniform_lookup) { return value; }
 int3 scene_data_lookup_int3(inout Shading_state_material state, int id, int3 value, bool uniform_lookup) { return value; }

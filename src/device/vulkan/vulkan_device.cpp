@@ -7,6 +7,7 @@
 #include "vulkan_device.h"
 
 #include "../gpu/gpu_materials.h"
+#include "../gpu/texture_budget.h"
 #include "../gpu/hlsl_compiler.h"
 #include "../gpu/shader_sources.h"
 #include "../../scene.h"
@@ -22,6 +23,7 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <mutex>
 #include <iostream>
 #include <unordered_map>
 
@@ -86,7 +88,22 @@ bool CompileVulkanKernel(std::string const& mdlCode, std::vector<uint32_t>* spir
     if (std::ifstream file{cached, std::ios::binary})
         bytes.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
     if (bytes.empty() || bytes.size() % 4 != 0) {
-        if (!gpu::CompileHlsl(source, gpu::HlslTarget::Spirv, cacheDirectory, &bytes, error)) return false;
+        // A kernel that failed to compile fails again: do not retry it every frame.
+        static std::mutex failedMutex;
+        static std::unordered_map<std::string, std::string> failed;
+        const std::string key = cached.string();
+        {
+            std::lock_guard lock(failedMutex);
+            if (auto found = failed.find(key); found != failed.end()) {
+                if (error) *error = found->second;
+                return false;
+            }
+        }
+        if (!gpu::CompileHlsl(source, gpu::HlslTarget::Spirv, cacheDirectory, &bytes, error)) {
+            std::lock_guard lock(failedMutex);
+            failed[key] = error ? *error : std::string("GPU kernel compilation failed");
+            return false;
+        }
         std::ofstream(cached, std::ios::binary).write(bytes.data(), std::streamsize(bytes.size()));
     }
     spirv->resize(bytes.size() / 4);
@@ -124,6 +141,7 @@ struct VulkanDevice::Impl {
         std::weak_ptr<const prism::TextureResource> resource;
         Image image;
         bool floatPrecision = false;
+        int shift = 0;   // resolution halvings (texture budget)
     };
     std::unordered_map<const prism::TextureResource*, CachedImage> imageCache;
     std::vector<AccelerationStructure> bottomLevel;
@@ -545,24 +563,48 @@ bool VulkanDevice::Impl::uploadImages(std::string* error)
     }
     std::vector<GpuImage> info(d.images.size());
     auto service = prism::TextureService::Acquire();
+    // Images beyond the memory budget are uploaded at lower resolutions.
+    VkPhysicalDeviceMemoryProperties memory;
+    vkGetPhysicalDeviceMemoryProperties(physical, &memory);
+    uint64_t deviceLocal = 0;
+    for (uint32_t h = 0; h < memory.memoryHeapCount; ++h)
+        if (memory.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+            deviceLocal = std::max<uint64_t>(deviceLocal, memory.memoryHeaps[h].size);
+    std::vector<bool> isEnvironment(d.images.size(), false);
+    for (auto const& environment : d.environments)
+        if (environment.info.y < d.images.size()) isEnvironment[environment.info.y] = true;
+    std::vector<gpu::ImageFootprint> footprints(d.images.size());
+    for (size_t i = 0; i < d.images.size(); ++i) {
+        const int channels = std::clamp(d.images[i]->channels(), 1, 4);
+        footprints[i] = {d.images[i]->width(), d.images[i]->height(), channels == 3 ? 4 : channels,
+                         isEnvironment[i] ? 4 : 1, bool(isEnvironment[i])};
+    }
+    const std::vector<int> shift = gpu::FitImages(footprints, gpu::TextureBudget(deviceLocal));
     for (size_t i = 0; i < d.images.size(); ++i) {
         auto const& resource = d.images[i];
-        bool floatPrecision = false;
-        for (auto const& environment : d.environments) floatPrecision |= environment.info.y == i;
-        info[i].info = {uint32_t(resource->width()), uint32_t(resource->height()),
+        const bool floatPrecision = isEnvironment[i];
+        info[i].info = {uint32_t(std::max(1, resource->width() >> shift[i])),
+                        uint32_t(std::max(1, resource->height() >> shift[i])),
                         uint32_t(resource->channels()), uint32_t(i)};
         auto found = imageCache.find(resource.get());
         if (found != imageCache.end() && !found->second.resource.expired() &&
-            found->second.floatPrecision == floatPrecision) {
+            found->second.floatPrecision == floatPrecision && found->second.shift == shift[i]) {
             imageViews[i] = found->second.image.view;
             continue;
         }
+        if (found != imageCache.end()) {
+            vkDestroyImageView(device, found->second.image.view, nullptr);
+            vkDestroyImage(device, found->second.image.image, nullptr);
+            vkFreeMemory(device, found->second.image.memory, nullptr);
+            imageCache.erase(found);
+        }
         // Same storage policy as the Metal device (see UploadImage there).
-        const int width = resource->width(), height = resource->height();
+        int width = resource->width(), height = resource->height();
         const int channels = std::clamp(resource->channels(), 1, 4);
         std::vector<float> pixels(size_t(width) * height * channels);
         if (!service->readPixels(*resource, 0, 0, width, height, 0, channels, pixels.data()))
             std::fill(pixels.begin(), pixels.end(), 0.0f);
+        gpu::Downsample(pixels, width, height, channels, shift[i]);
         bool quantized = !floatPrecision;
         float peak = 0.0f;
         for (float v : pixels) {
@@ -680,7 +722,7 @@ bool VulkanDevice::Impl::uploadImages(std::string* error)
                                VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
         viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, levels, 0, 1};
         vkCreateImageView(device, &viewInfo, nullptr, &image.view);
-        imageCache[resource.get()] = {resource, image, floatPrecision};
+        imageCache[resource.get()] = {resource, image, floatPrecision, shift[i]};
         imageViews[i] = image.view;
     }
     for (auto it = imageCache.begin(); it != imageCache.end();) {

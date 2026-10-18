@@ -3,6 +3,7 @@
 #include <MaterialXFormat/Util.h>
 #include <MaterialXCore/Traversal.h>
 #include <algorithm>
+#include <cctype>
 #include <format>
 #include <iostream>
 #include <vector>
@@ -33,6 +34,139 @@ void AttachLibrary(const MaterialX::DocumentPtr& doc,
     }
     doc->setDataLibrary(library);
 }
+
+// MaterialX names for the color spaces assets spell after OCIO configs
+// (ACES studio config roles, Houdini, RenderMan); unknown names would leave
+// their textures unconverted.
+std::string CanonicalColorSpace(std::string const& name)
+{
+    std::string key;
+    for (char c : name) key += char(std::tolower(static_cast<unsigned char>(c)));
+    static const std::pair<const char*, const char*> aliases[] = {
+        {"srgb_tx", "srgb_texture"}, {"srgb", "srgb_texture"}, {"srgb - texture", "srgb_texture"},
+        {"utility - srgb - texture", "srgb_texture"}, {"srgb texture", "srgb_texture"},
+        {"srgb_rec709_scene", "srgb_texture"}, {"srgb encoded rec.709 (srgb)", "srgb_texture"},
+        {"raw", "lin_rec709"}, {"utility - raw", "lin_rec709"}, {"non-color", "lin_rec709"},
+        {"data", "lin_rec709"}, {"linear", "lin_rec709"}, {"lin_srgb", "lin_rec709"},
+        {"linear rec.709 (srgb)", "lin_rec709"}, {"lin_rec709_scene", "lin_rec709"},
+        {"utility - linear - srgb", "lin_rec709"}, {"scene-linear rec.709-srgb", "lin_rec709"},
+        {"acescg", "acescg"}, {"aces - acescg", "acescg"}, {"lin_ap1", "acescg"},
+        {"lin_ap1_scene", "acescg"}, {"acescg (lin_ap1)", "acescg"},
+        {"g22_rec709", "g22_rec709"}, {"g18_rec709", "g18_rec709"},
+        {"lin_displayp3", "lin_displayp3"}, {"srgb_displayp3", "srgb_displayp3"},
+    };
+    for (auto const& [alias, canonical] : aliases)
+        if (key == alias) return canonical;
+    return name;
+}
+
+// Inputs connected to a node output of another type (for example a color3
+// image driving open_pbr_surface.geometry_opacity) fail validation; insert
+// the extract/convert node the connection implies.
+MaterialX::NodePtr AddAdapter(MaterialX::GraphElementPtr const& graph, std::string const& from,
+                              std::string const& to, std::string const& upstream, std::string const& baseName)
+{
+    static const std::vector<std::string> vectors = {"color3", "color4", "vector2", "vector3", "vector4"};
+    const bool fromVector = std::find(vectors.begin(), vectors.end(), from) != vectors.end();
+    const bool extract = to == "float" && fromVector;
+    const bool convert = std::find(vectors.begin(), vectors.end(), to) != vectors.end() &&
+        (from == "float" || fromVector);
+    if (!extract && !convert) return nullptr;
+    auto adapter = graph->addNode(extract ? "extract" : "convert",
+                                  graph->createValidChildName(baseName + "_as_" + to), to);
+    adapter->addInput("in", from)->setNodeName(upstream);
+    if (extract) adapter->setInputValue("index", 0);
+    return adapter;
+}
+
+// Inputs whose type contradicts their node definition (hdMtlx types a
+// shader input after the graph output feeding it) are retyped, and the graph
+// output feeding them gets the extract/convert node the connection implies.
+void FixDeclaredInputTypes(const MaterialX::DocumentPtr& doc, const MaterialX::DocumentPtr& library)
+{
+    if (!library) return;
+    for (auto node : doc->getNodes()) {
+        std::vector<MaterialX::NodeDefPtr> candidates = library->getMatchingNodeDefs(node->getCategory());
+        auto local = doc->getMatchingNodeDefs(node->getCategory());
+        candidates.insert(candidates.end(), local.begin(), local.end());
+        MaterialX::NodeDefPtr nodedef;
+        for (auto const& candidate : candidates)
+            if (candidate->getType() == node->getType()) { nodedef = candidate; break; }
+        if (!nodedef) continue;
+        for (auto input : node->getInputs()) {
+            auto declared = nodedef->getActiveInput(input->getName());
+            if (!declared || declared->getType() == input->getType()) continue;
+            const std::string from = input->getType(), to = declared->getType();
+            auto graph = input->hasNodeGraphString() ? doc->getNodeGraph(input->getNodeGraphString()) : nullptr;
+            auto output = graph && input->hasOutputString() ? graph->getOutput(input->getOutputString()) : nullptr;
+            if (output && output->getType() == from && output->hasNodeName()) {
+                auto adapter = AddAdapter(graph, from, to, output->getNodeName(), output->getNodeName());
+                if (!adapter) continue;
+                output->setNodeName(adapter->getName());
+                output->setType(to);
+            } else if (input->hasValueString() && to == "float") {
+                // A vector value on a float input: keep its first component.
+                const std::string value = input->getValueString();
+                input->setValueString(value.substr(0, value.find(',')));
+            } else {
+                continue;
+            }
+            input->setType(to);
+            std::cerr << "[MaterialX] " << from << " input " << input->getNamePath()
+                      << " retyped to its declared " << to << "\n";
+        }
+    }
+}
+
+void FixConnectionTypes(const MaterialX::DocumentPtr& doc)
+{
+    struct Fix {
+        MaterialX::InputPtr input;
+        MaterialX::NodePtr upstream;
+        MaterialX::ElementPtr graph;
+    };
+    std::vector<Fix> fixes;
+    for (auto element : doc->traverseTree()) {
+        auto input = element->asA<MaterialX::Input>();
+        if (!input || !input->hasNodeName() || input->hasOutputString()) continue;
+        auto node = input->getParent() ? input->getParent()->asA<MaterialX::Node>() : nullptr;
+        if (!node) continue;
+        auto graph = node->getParent();
+        auto graphElement = graph ? graph->asA<MaterialX::GraphElement>() : nullptr;
+        auto upstream = graphElement ? graphElement->getNode(input->getNodeName()) : nullptr;
+        if (!upstream || upstream->getType() == input->getType() ||
+            upstream->getType() == MaterialX::MULTI_OUTPUT_TYPE_STRING) continue;
+        fixes.push_back({input, upstream, graph});
+    }
+    for (auto const& fix : fixes) {
+        const std::string from = fix.upstream->getType(), to = fix.input->getType();
+        auto adapter = AddAdapter(fix.graph->asA<MaterialX::GraphElement>(), from, to, fix.upstream->getName(),
+                                  fix.upstream->getName());
+        if (!adapter) continue;
+        fix.input->setNodeName(adapter->getName());
+        std::cerr << "[MaterialX] " << from << " output of " << fix.upstream->getNamePath() << " feeds "
+                  << to << " input " << fix.input->getNamePath() << "; inserted " << adapter->getCategory()
+                  << "\n";
+    }
+}
+
+void NormalizeColorSpaces(const MaterialX::DocumentPtr& doc)
+{
+    const std::string& attribute = MaterialX::Element::COLOR_SPACE_ATTRIBUTE;
+    if (doc->hasAttribute(attribute))
+        doc->setAttribute(attribute, CanonicalColorSpace(doc->getAttribute(attribute)));
+    for (auto element : doc->traverseTree()) {
+        if (!element->hasAttribute(attribute)) continue;
+        const std::string value = element->getAttribute(attribute);
+        const std::string canonical = CanonicalColorSpace(value);
+        if (canonical != value) {
+            element->setAttribute(attribute, canonical);
+            if (VerboseMdl())
+                std::cout << "[MaterialX] color space '" << value << "' read as '" << canonical
+                          << "' at " << element->getNamePath() << "\n";
+        }
+    }
+}
 }
 
 bool DocumentLoader::DefaultSssFallback()
@@ -57,6 +191,9 @@ MaterialX::DocumentPtr DocumentLoader::load(const std::string& filepath)
         // Renderer compatibility preprocessing, alongside the color workaround
         // below. Run before importing stdlib so library implementations are not
         // rewritten. Only this in-memory document changes, never the asset file.
+        NormalizeColorSpaces(doc);
+        FixConnectionTypes(doc);
+        FixDeclaredInputTypes(doc, m_stdlib);
         if (m_fallback_sss_to_diffuse) {
             // Collect first: adding an absent weight input mutates the tree.
             std::vector<MaterialX::NodePtr> surface_nodes;

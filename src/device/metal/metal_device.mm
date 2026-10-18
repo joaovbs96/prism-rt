@@ -15,6 +15,7 @@
 #include "../gpu/gpu_device.h"
 #include "../gpu/gpu_materials.h"
 #include "../gpu/gpu_scene.h"
+#include "../gpu/texture_budget.h"
 #include "../gpu/hlsl_compiler.h"
 #include "../gpu/hlsl_fp32_rewrite.h"
 #include "../gpu/shader_sources.h"
@@ -122,6 +123,7 @@ struct MetalDevice::Impl {
     uint32_t mdlTextureCount = 1;
     id<MTLComputePipelineState> pipeline = nil;
     std::unordered_map<std::string, id<MTLComputePipelineState>> pipelines;
+    std::unordered_map<std::string, std::string> failedPipelines; // source digest -> error
     // The generated MDL code `pipeline` was built from.
     std::shared_ptr<const gpu::MdlShaderCode> pipelineCode;
     id<MTLBuffer> buffers[kSlotCount] = {};
@@ -131,8 +133,10 @@ struct MetalDevice::Impl {
         std::weak_ptr<const prism::TextureResource> resource;
         id<MTLTexture> texture = nil;
         bool floatPrecision = false;
+        int shift = 0;   // resolution halvings (texture budget)
     };
     std::unordered_map<const prism::TextureResource*, CachedImage> imageCache;
+    size_t reportedReducedImages = 0;
     std::vector<id<MTLAccelerationStructure>> primitiveStructures;
     std::vector<uint32_t> structureOfPrototype; // prototype -> primitiveStructures index
     std::shared_ptr<const GpuSceneData::EnvironmentTables> uploadedEnvironmentTables;
@@ -219,13 +223,14 @@ void MetalDevice::Impl::uploadBuffers(bool keepGeometry)
 // floats and the environment as floats. Three channels are padded with a
 // zero alpha, matching lookups of absent channels.
 static id<MTLTexture> UploadImage(id<MTLDevice> device, prism::TextureService& service,
-                                  prism::TextureResource const& resource, bool floatPrecision)
+                                  prism::TextureResource const& resource, bool floatPrecision, int shift)
 {
-    const int width = resource.width(), height = resource.height();
+    int width = resource.width(), height = resource.height();
     const int channels = std::clamp(resource.channels(), 1, 4);
     std::vector<float> pixels(size_t(width) * height * channels);
     if (!service.readPixels(resource, 0, 0, width, height, 0, channels, pixels.data()))
         std::fill(pixels.begin(), pixels.end(), 0.0f);
+    gpu::Downsample(pixels, width, height, channels, shift);
     bool quantized = !floatPrecision;
     float peak = 0.0f;
     for (float v : pixels) {
@@ -279,23 +284,42 @@ void MetalDevice::Impl::uploadImages()
     for (auto const& environment : d.environments)
         if (environment.info.y != kImageNone && environment.info.y < d.images.size())
             floatPrecision[environment.info.y] = true;
+    // Images beyond the memory budget are uploaded at lower resolutions.
+    std::vector<gpu::ImageFootprint> footprints(d.images.size());
+    for (size_t i = 0; i < d.images.size(); ++i) {
+        const int channels = std::clamp(d.images[i]->channels(), 1, 4);
+        footprints[i] = {d.images[i]->width(), d.images[i]->height(), channels == 3 ? 4 : channels,
+                         floatPrecision[i] ? 4 : 1, floatPrecision[i]};
+    }
+    const std::vector<int> shift = gpu::FitImages(footprints, gpu::TextureBudget(device.recommendedMaxWorkingSetSize));
+    size_t reduced = 0;
+    for (int s : shift) reduced += s > 0 ? 1 : 0;
+    if (reduced && reduced != reportedReducedImages) {
+        std::cerr << "PrismRT Metal: " << reduced << " of " << d.images.size()
+                  << " images uploaded at reduced resolution to fit GPU memory "
+                     "(PRISM_GPU_TEXTURE_BUDGET_MIB)\n";
+        reportedReducedImages = reduced;
+    }
     std::vector<size_t> missing;
     for (size_t i = 0; i < d.images.size(); ++i) {
         auto const& resource = d.images[i];
-        info[i].info = {uint32_t(resource->width()), uint32_t(resource->height()),
+        info[i].info = {uint32_t(std::max(1, resource->width() >> shift[i])),
+                        uint32_t(std::max(1, resource->height() >> shift[i])),
                         uint32_t(resource->channels()), uint32_t(i)};
         auto found = imageCache.find(resource.get());
         if (found != imageCache.end() && !found->second.resource.expired() &&
-            found->second.floatPrecision == floatPrecision[i])
+            found->second.floatPrecision == floatPrecision[i] && found->second.shift == shift[i])
             images[i] = found->second.texture;
         else
             missing.push_back(i);
     }
+    // Drop superseded uploads before allocating their replacements.
+    for (size_t i : missing) imageCache.erase(d.images[i].get());
     auto service = prism::TextureService::Acquire();
     tbb::parallel_for(size_t(0), missing.size(), [&](size_t m) {
         @autoreleasepool {
             const size_t i = missing[m];
-            images[i] = UploadImage(device, *service, *d.images[i], floatPrecision[i]);
+            images[i] = UploadImage(device, *service, *d.images[i], floatPrecision[i], shift[i]);
         }
     });
     if (!missing.empty()) {
@@ -311,7 +335,7 @@ void MetalDevice::Impl::uploadImages()
     for (auto it = imageCache.begin(); it != imageCache.end();)
         it = it->second.resource.expired() ? imageCache.erase(it) : std::next(it);
     for (size_t i : missing)
-        imageCache[d.images[i].get()] = {d.images[i], images[i], floatPrecision[i]};
+        imageCache[d.images[i].get()] = {d.images[i], images[i], floatPrecision[i], shift[i]};
     setBuffer(kSlotImages, buffer(info.data(), Bytes(info)));
     if (Verbose()) {
         size_t bytes = 0;
@@ -497,6 +521,15 @@ bool MetalDevice::Impl::buildPipeline(std::string* error)
         pipelineCode = shared;
         return true;
     }
+    // A kernel that failed to compile fails again: do not retry it every frame.
+    if (auto failed = failedPipelines.find(key); failed != failedPipelines.end()) {
+        if (error) *error = failed->second;
+        return false;
+    }
+    auto remember = [&](bool ok) {
+        if (!ok) failedPipelines[key] = error ? *error : std::string("GPU kernel compilation failed");
+        return ok;
+    };
     const auto cacheDirectory = gpu::ShaderCacheDirectory("metal");
     const auto cached = cacheDirectory / (key + ".metallib");
     std::vector<char> metallib;
@@ -505,10 +538,11 @@ bool MetalDevice::Impl::buildPipeline(std::string* error)
                   << " MDL programs); this happens once per material set\n";
         auto const dxcStart = Clock::now();
         std::vector<char> dxil;
-        if (!gpu::CompileHlsl(source, gpu::HlslTarget::Dxil, cacheDirectory, &dxil, error)) return false;
+        if (!remember(gpu::CompileHlsl(source, gpu::HlslTarget::Dxil, cacheDirectory, &dxil, error)))
+            return false;
         const double dxcSeconds = SecondsSince(dxcStart);
         auto const convertStart = Clock::now();
-        if (!ConvertToMetallib(dxil, &metallib, error)) return false;
+        if (!remember(ConvertToMetallib(dxil, &metallib, error))) return false;
         WriteFileAtomically(cached, metallib.data(), metallib.size());
         std::cerr << std::format("PrismRT Metal: DXC {:.1f} s, shader converter {:.1f} s\n", dxcSeconds,
                                  SecondsSince(convertStart));
