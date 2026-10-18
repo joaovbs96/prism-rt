@@ -2,6 +2,7 @@
 
 #include "../../scene.h"
 
+#include <tbb/blocked_range.h>
 #include <tbb/parallel_for.h>
 
 #include <bit>
@@ -222,11 +223,16 @@ void GpuRenderDevice::RenderPass(SceneManager& scene, PassRequest const& request
             // Buffers may move when resized; fetch them again after the dispatch.
             rng = static_cast<uint32_t*>(RenderBuffer(kSlotRng, pixels * 4));
             output = static_cast<float*>(RenderBuffer(kSlotOutput, pixels * 16));
-            for (uint32_t pixel : list) {
-                request.rngStates[pixel] = rng[pixel];
-                request.colors[pixel] = Color3(output[4 * pixel], output[4 * pixel + 1], output[4 * pixel + 2]);
-                request.coverage[pixel] = output[4 * pixel + 3];
-            }
+            tbb::parallel_for(tbb::blocked_range<size_t>(0, list.size(), 4096),
+                [&](tbb::blocked_range<size_t> const& range) {
+                    for (size_t i = range.begin(); i != range.end(); ++i) {
+                        const uint32_t pixel = list[i];
+                        request.rngStates[pixel] = rng[pixel];
+                        request.colors[pixel] = Color3(output[4 * pixel], output[4 * pixel + 1],
+                                                       output[4 * pixel + 2]);
+                        request.coverage[pixel] = output[4 * pixel + 3];
+                    }
+                });
             if (request.colorPixels) request.colorPixels->fetch_add(list.size(), std::memory_order_relaxed);
         }
         auto const primaryStart = Clock::now();
