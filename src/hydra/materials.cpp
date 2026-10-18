@@ -410,6 +410,29 @@ bool RewritePreviewSurfaceNetwork(HdMaterialNetworkInterface& net)
     return true;
 }
 
+// RenderMan's own texture format (.tex files starting 0xFACE) cannot be
+// read: an image of the same name in another format, next to it or in a
+// sibling directory, stands in for it. Empty when none is needed or found.
+std::string ReadableImageSubstitute(const std::string& path)
+{
+    std::ifstream file(path, std::ios::binary);
+    unsigned char magic[2] = {0, 0};
+    if (!file.read(reinterpret_cast<char*>(magic), 2) || magic[0] != 0xce || magic[1] != 0xfa) return {};
+    const std::filesystem::path source(path);
+    const std::string stem = source.stem().string();
+    static const char* const extensions[] = {".exr", ".tx", ".tif", ".tiff", ".png", ".jpg", ".hdr"};
+    std::vector<std::filesystem::path> directories{source.parent_path()};
+    std::error_code error;
+    for (auto const& entry : std::filesystem::directory_iterator(source.parent_path().parent_path(), error))
+        if (entry.is_directory(error) && entry.path() != source.parent_path()) directories.push_back(entry.path());
+    for (auto const& directory : directories)
+        for (const char* extension : extensions) {
+            const auto candidate = directory / (stem + extension);
+            if (std::filesystem::is_regular_file(candidate, error)) return candidate.string();
+        }
+    return {};
+}
+
 std::string ResolveTextureAssets(HdMaterialNetworkInterface& net,
                                  const std::filesystem::path& cacheDir,
                                  const ArResolverContext& resolverContext,
@@ -479,12 +502,18 @@ std::string ResolveTextureAssets(HdMaterialNetworkInterface& net,
                 continue;
             }
 
-            const ArResolvedPath resolved = !preResolved.empty()
+            ArResolvedPath resolved = !preResolved.empty()
                 ? ArResolvedPath(preResolved) : resolver.Resolve(authored);
             if (resolved.empty()) {
                 TF_WARN("[Hydra Material] Could not resolve texture '%s' on node %s",
                         authored.c_str(), node.GetText());
                 continue;
+            }
+            if (auto substitute = ReadableImageSubstitute(resolved.GetPathString()); !substitute.empty()) {
+                TF_WARN("[Hydra Material] '%s' is a RenderMan texture, which cannot be read; using '%s'",
+                        resolved.GetPathString().c_str(), substitute.c_str());
+                resolved = ArResolvedPath(substitute);
+                extension = std::filesystem::path(substitute).extension().string();
             }
             prism::materialx::MaterialResourceResult preparedResource;
             try {

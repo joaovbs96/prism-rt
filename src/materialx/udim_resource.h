@@ -123,6 +123,8 @@ inline MaterialUdimResult PrepareMaterialUdimResource(
         prepared.emplace_back(source.tile, std::move(tile.resource));
     }
     const std::string digest = OIIO::SHA1::digest(family.data(), family.size());
+    // The tiles' content decides the extension (see ImageExtensionFor).
+    if (!prepared.empty()) extension = prepared.front().second->path.extension().string();
     const auto textures = prism::TextureService::Acquire();
     for (const auto& [tile, resource] : prepared) {
         const auto destination = cacheDir /

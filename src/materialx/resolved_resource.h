@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cctype>
+
 #include "../texture_service.h"
 #include <pxr/usd/ar/asset.h>
 #include <pxr/usd/ar/resolver.h>
@@ -128,6 +130,32 @@ struct MaterialResourceResult {
     uint64_t bytesRead = 0; // This request's work, zero on a retained-version hit.
 };
 
+// The extension image readers know a file by: the authored one, unless the
+// file is a common image format behind another name (RenderMan .tex files
+// are OpenEXR or TIFF images).
+inline std::string ImageExtensionFor(const std::string& authored, const char* bytes, size_t size)
+{
+    std::string lower;
+    for (char c : authored) lower += char(std::tolower(static_cast<unsigned char>(c)));
+    static const char* const known[] = {".exr", ".tif", ".tiff", ".tx", ".png", ".jpg", ".jpeg",
+                                        ".hdr", ".tga", ".bmp", ".psd", ".dds", ".webp", ".ppm"};
+    for (const char* extension : known)
+        if (lower == extension) return authored;
+    auto starts = [&](std::initializer_list<unsigned char> magic) {
+        if (size < magic.size()) return false;
+        size_t i = 0;
+        for (unsigned char c : magic)
+            if (static_cast<unsigned char>(bytes[i++]) != c) return false;
+        return true;
+    };
+    if (starts({0x76, 0x2f, 0x31, 0x01})) return ".exr";
+    if (starts({'I', 'I', 0x2a, 0x00}) || starts({'M', 'M', 0x00, 0x2a}) ||
+        starts({'I', 'I', 0x2b, 0x00}) || starts({'M', 'M', 0x00, 0x2b})) return ".tif";
+    if (starts({0x89, 'P', 'N', 'G'})) return ".png";
+    if (starts({0xff, 0xd8, 0xff})) return ".jpg";
+    return authored;
+}
+
 // Owned resolver inputs only. The registry never calls Hydra or traverses a
 // stage. Waiters release the map mutex before waiting or opening an asset.
 inline MaterialResourceResult PrepareMaterialResource(
@@ -209,7 +237,8 @@ inline MaterialResourceResult PrepareMaterialResource(
         if (fileBacked && textures->sourceIdentity(file, options) != version)
             throw std::runtime_error("material resource changed while reading: " + resolved.GetPathString());
         std::filesystem::create_directories(cacheDir);
-        resource->path = cacheDir / (resource->fingerprint + extension);
+        resource->path = cacheDir / (resource->fingerprint +
+            ImageExtensionFor(extension, reinterpret_cast<const char*>(bytes.get()), size));
         resource_detail::PublicationLock publication(resource->path);
         if (std::filesystem::exists(resource->path)) {
             const auto stamp = textures->sourceIdentity(resource->path);
