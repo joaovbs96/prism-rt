@@ -35,6 +35,8 @@ set(CMAKE_MAP_IMPORTED_CONFIG_RELWITHDEBINFO "RelWithDebInfo;Release")
 if(MSVC)
     # OpenSubdiv headers use M_PI.
     add_compile_definitions(_USE_MATH_DEFINES)
+    # USD template-heavy sources exceed the default object section limit.
+    add_compile_options(/bigobj)
 endif()
 if(NOT MSVC)
     # System packages such as Apple's OpenGL framework only provide a
