@@ -135,6 +135,8 @@ struct PreviewRequest {
     std::function<void(unsigned px, unsigned py, Color3 const& color, float coverage,
                        RayHit const* primary)> writePixel;
     std::atomic<uint64_t>* colorPixels = nullptr;
+    // Receives the time spent tracing, without scene preparation.
+    double* traceMilliseconds = nullptr;
 };
 
 class RenderDevice {

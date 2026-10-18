@@ -235,6 +235,7 @@ bool GpuRenderDevice::RenderPreview(SceneManager& scene, PreviewRequest const& r
         std::cerr << LogPrefix() << error << '\n';
         return false;
     }
+    auto const traceStart = std::chrono::steady_clock::now();
     const uint32_t count = request.previewWidth * request.previewHeight;
     RenderBuffer(kSlotOutput, size_t(count) * 16);
     GpuFrame frame = BaseFrame(request.camera, request.width, request.height);
@@ -268,6 +269,9 @@ bool GpuRenderDevice::RenderPreview(SceneManager& scene, PreviewRequest const& r
             }
         }
     });
+    if (request.traceMilliseconds)
+        *request.traceMilliseconds = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - traceStart).count();
     return !(request.stopRequested && request.stopRequested());
 }
 

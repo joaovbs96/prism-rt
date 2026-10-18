@@ -88,10 +88,13 @@ public:
     void SetPresentationClearColor(VtValue const &value);
     ReadView CapturePresentation() const;
     void Publish(Frame frame = {});
+    // smooth: bilinear magnification (color); otherwise each preview pixel
+    // fills its block (geometric outputs keep exact values).
     void PublishPreviewFloat(unsigned int previewWidth,
                              unsigned int previewHeight,
                              std::vector<float> const &values,
-                             size_t components, Frame frame = {});
+                             size_t components, Frame frame = {},
+                             bool smooth = false);
     void PublishPreviewInt(unsigned int previewWidth,
                            unsigned int previewHeight,
                            std::vector<int> const &values,

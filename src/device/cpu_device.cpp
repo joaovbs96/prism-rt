@@ -336,6 +336,16 @@ void CpuDevice::RenderPass(SceneManager& scene, PassRequest const& request)
 
 bool CpuDevice::RenderPreview(SceneManager& scene, PreviewRequest const& request)
 {
+    auto const traceStart = std::chrono::steady_clock::now();
+    struct ReportTime {
+        PreviewRequest const& request;
+        std::chrono::steady_clock::time_point start;
+        ~ReportTime() {
+            if (request.traceMilliseconds)
+                *request.traceMilliseconds = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - start).count();
+        }
+    } reportTime{request, traceStart};
     const unsigned width = request.width, height = request.height;
     const unsigned previewWidth = request.previewWidth, previewHeight = request.previewHeight;
     std::atomic<bool> cancelled{false};

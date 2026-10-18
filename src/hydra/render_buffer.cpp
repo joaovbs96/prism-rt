@@ -8,6 +8,8 @@
 #include "pxr/imaging/hd/renderThread.h"
 
 #include <algorithm>
+#include <cmath>
+#include <tbb/parallel_for.h>
 #include <cstring>
 #include <chrono>
 #include <cmath>
@@ -343,7 +345,7 @@ static void _StoreIntComponent(HdFormat format, uint8_t *dst, size_t c, int v)
 
 void PrismRenderBuffer::PublishPreviewFloat(
     unsigned int previewWidth, unsigned int previewHeight,
-    std::vector<float> const &values, size_t components, Frame frame)
+    std::vector<float> const &values, size_t components, Frame frame, bool smooth)
 {
     if (previewWidth == 0 || previewHeight == 0 || components == 0 ||
         values.size() < static_cast<size_t>(previewWidth) * previewHeight *
@@ -362,6 +364,42 @@ void PrismRenderBuffer::PublishPreviewFloat(
         for (size_t c = 0; c < arity; ++c)
             _StoreComponent(_format, dst, c,
                 c < components ? src[c] : (c == 3 ? 1.0f : 0.0f));
+    }
+    if (smooth) {
+        // Bilinear magnification between preview pixel centers.
+        const auto source = [&](unsigned int x, unsigned int y) {
+            return values.data() + (static_cast<size_t>(y) * previewWidth + x) * components;
+        };
+        tbb::parallel_for(0u, _height, [&](unsigned int y) {
+            const float fy = std::clamp((y + 0.5f) * previewHeight / _height - 0.5f,
+                                        0.0f, float(previewHeight - 1));
+            const unsigned int y0 = static_cast<unsigned int>(fy);
+            const unsigned int y1 = std::min(y0 + 1, previewHeight - 1);
+            const float ty = fy - float(y0);
+            std::vector<float> value(components);
+            for (unsigned int x = 0; x < _width; ++x) {
+                const float fx = std::clamp((x + 0.5f) * previewWidth / _width - 0.5f,
+                                            0.0f, float(previewWidth - 1));
+                const unsigned int x0 = static_cast<unsigned int>(fx);
+                const unsigned int x1 = std::min(x0 + 1, previewWidth - 1);
+                const float tx = fx - float(x0);
+                for (size_t c = 0; c < components; ++c) {
+                    const float top = std::lerp(source(x0, y0)[c], source(x1, y0)[c], tx);
+                    const float bottom = std::lerp(source(x0, y1)[c], source(x1, y1)[c], tx);
+                    value[c] = std::lerp(top, bottom, ty);
+                }
+                uint8_t *dst = published->data() + (static_cast<size_t>(y) * _width + x) * stride;
+                for (size_t c = 0; c < arity; ++c)
+                    _StoreComponent(_format, dst, c,
+                        c < components ? value[c] : (c == 3 ? 1.0f : 0.0f));
+            }
+        });
+        std::lock_guard lock(_mutex);
+        _pixels = std::move(published);
+        _frame = std::move(frame);
+        _ClearRefinement();
+        _hasPublished = true;
+        return;
     }
     std::vector<uint8_t> expandedRow(static_cast<size_t>(_width) * stride);
     for (unsigned int py = 0; py < previewHeight; ++py) {

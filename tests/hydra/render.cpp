@@ -2,6 +2,7 @@
 #include <pxr/usd/usd/stage.h>
 #include <pxr/usd/usdGeom/imageable.h>
 #include <pxr/usd/usdGeom/camera.h>
+#include <pxr/usd/usdGeom/xformable.h>
 #include <pxr/usdImaging/usdImagingGL/engine.h>
 #include <pxr/usdImaging/usdImagingGL/renderParams.h>
 #include <pxr/imaging/hd/renderBuffer.h>
@@ -253,6 +254,7 @@ int main(int argc, char** argv) {
         int maxDepth = 32;
         int changeDepth = 0;
         float neeProbabilityMin = 0.05f;
+        int previewSequence = 0;
         int seed = 0;
         for (int i = 7; i < argc; ++i) {
             const std::string option(argv[i]);
@@ -267,6 +269,9 @@ int main(int argc, char** argv) {
             else if (option == "--seed") seed = std::stoi(argv[i]);
             else if (option == "--adaptive-threshold") adaptiveThreshold = std::stof(argv[i]);
             else if (option == "--max-depth") maxDepth = std::stoi(argv[i]);
+            // Moves the camera this many times after the first render and
+            // reports each preview's size and cost (adaptive preview).
+            else if (option == "--preview-sequence") previewSequence = std::stoi(argv[i]);
             else if (option == "--nee-probability-min") neeProbabilityMin = std::stof(argv[i]);
             // Render, then change the maximum depth and render again: the saved
             // image must match a render made at the new depth from the start.
@@ -311,6 +316,23 @@ int main(int argc, char** argv) {
             return 0;
         }
         render(engine, stage, UsdTimeCode::Default(), !hideDomeBackground);
+        for (int step = 1; step <= previewSequence; ++step) {
+            UsdGeomXformable camera(stage->GetPrimAtPath(SdfPath(argv[2])));
+            bool resets = false;
+            GfMatrix4d transform;
+            camera.GetLocalTransformation(&transform, &resets);
+            transform.SetTranslateOnly(transform.ExtractTranslation() + GfVec3d(0.002, 0.0, 0.0));
+            camera.ClearXformOpOrder();
+            camera.AddTransformOp().Set(transform);
+            render(engine, stage, UsdTimeCode::Default(), !hideDomeBackground);
+            const auto stats = engine.GetRenderStats();
+            const auto stat = [&](const char* name) {
+                auto found = stats.find(name);
+                return found == stats.end() ? std::string("?") : TfStringify(found->second);
+            };
+            std::cout << "Preview " << step << ": " << stat("previewWidth") << "x" << stat("previewHeight")
+                      << ", cost " << stat("previewCostMilliseconds") << " ms\n";
+        }
         if (changeDepth > 0) {
             engine.SetRendererSetting(TfToken("prism:maxDepth"), VtValue(changeDepth));
             render(engine, stage, UsdTimeCode::Default(), !hideDomeBackground);

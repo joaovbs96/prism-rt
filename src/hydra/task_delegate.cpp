@@ -196,7 +196,7 @@ HdRenderSettingDescriptorList PrismTaskDelegate::GetRenderSettingDescriptors() c
             {"Sphere batching (experimental)", _sphereBatching, VtValue(false)},
             {"Hidden geometry budget (MiB, 0 unlimited)", _hiddenGeometryBudget, VtValue(0)},
             {"Preview target (ms)", _previewTargetMs, VtValue(33)},
-            {"Preview maximum dimension", _previewMaxDimension, VtValue(96)},
+            {"Preview maximum dimension", _previewMaxDimension, VtValue(512)},
             {"Refinement delay (ms)", _refinementDelayMs, VtValue(100)},
             {"Environment sampling", _environmentSampling, VtValue(std::string("mis"))},
             {"Texture filtering", _textureFiltering, VtValue(std::string("filtered"))},

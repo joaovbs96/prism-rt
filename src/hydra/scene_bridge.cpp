@@ -3973,6 +3973,9 @@ struct PreviewResult {
     unsigned int height = 0;
     bool published = false;
     double publicationMilliseconds = 0.0;
+    // Tracing time without scene preparation (GPU devices upload the scene
+    // on their first render).
+    double traceMilliseconds = 0.0;
     uint64_t publishedBytes = 0;
     uint64_t tracedPixels = 0;
     uint64_t boundAovCount = 0;
@@ -4143,6 +4146,7 @@ PreviewResult _RenderPreview(std::shared_ptr<Snapshot> const &snapshot,
     request.stopRequested = [renderThread] {
         return renderThread && renderThread->IsStopRequested();
     };
+    request.traceMilliseconds = &result.traceMilliseconds;
     request.writePixel = [&](unsigned int px, unsigned int py, Color3 const &color,
                              float coverage, RayHit const *primary) {
         const size_t pixel =
@@ -4169,7 +4173,8 @@ PreviewResult _RenderPreview(std::shared_ptr<Snapshot> const &snapshot,
                                               target.ints, target.components, frame);
         else
             target.buffer->PublishPreviewFloat(result.width, result.height,
-                                                target.floats, target.components, frame);
+                                                target.floats, target.components, frame,
+                                                target.name == HdAovTokens->color);
     }
     result.publicationMilliseconds = 1000.0 * std::chrono::duration<double>(
         std::chrono::steady_clock::now() - publicationStart).count();
@@ -4485,6 +4490,9 @@ public:
     double lastPassPayloadMilliseconds = 0;
     double lastPassPublicationMilliseconds = 0;
     double previewMilliseconds = 0.0;
+    // Tracing plus publication of the last preview: what adaptive preview
+    // sizes against.
+    double previewCostMilliseconds = 0.0;
     double previewRayWorkMilliseconds = 0.0;
     double previewPublicationMilliseconds = 0.0;
     uint64_t previewPublishedBytes = 0;
@@ -5765,10 +5773,18 @@ void SceneBridge::Render()
         RenderSettings previewSettings = settings;
         if (settings.adaptivePreview) {
             std::lock_guard lock(_impl->mutex);
-            if (_impl->previewMilliseconds > 0.0) {
+            if (_impl->previewCostMilliseconds <= 0.0) {
+                // Without a measurement, start small on the CPU; GPU devices
+                // trace a larger preview within the target.
+                const auto kind = renderDevice->Info().kind;
+                const bool gpu = kind == prism::device::DeviceKind::Metal ||
+                    kind == prism::device::DeviceKind::Vulkan;
+                previewSettings.previewMaxDimension = std::min(
+                    std::clamp(settings.previewMaxDimension, 16, 1024), gpu ? 256 : 96);
+            } else {
                 const double ratio = std::sqrt(
                     static_cast<double>(std::clamp(settings.previewTargetMs, 1, 1000)) /
-                    _impl->previewMilliseconds);
+                    _impl->previewCostMilliseconds);
                 previewSettings.previewMaxDimension = std::clamp(
                     static_cast<int>(std::lround(std::max(
                         _impl->previewWidth, _impl->previewHeight) *
@@ -5795,6 +5811,8 @@ void SceneBridge::Render()
             _impl->previewBoundAovCount = preview.boundAovCount;
             _impl->previewWidth = preview.width;
             _impl->previewHeight = preview.height;
+            if (preview.published)
+                _impl->previewCostMilliseconds = preview.traceMilliseconds + preview.publicationMilliseconds;
             if (preview.published) {
                 ++_impl->previewPublishes;
                 _impl->lastPublishedFrame = frame;
@@ -6421,6 +6439,7 @@ VtDictionary SceneBridge::GetStats() const
     result["previewPublishes"] = VtValue(static_cast<int64_t>(
         _impl->previewPublishes));
     result["previewMilliseconds"] = VtValue(_impl->previewMilliseconds);
+    result["previewCostMilliseconds"] = VtValue(_impl->previewCostMilliseconds);
     result["previewRayWorkMilliseconds"] = VtValue(
         _impl->previewRayWorkMilliseconds);
     result["previewPublicationMilliseconds"] = VtValue(
