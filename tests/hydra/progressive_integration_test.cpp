@@ -29,6 +29,10 @@ int RunProgressiveIntegrationTests()
         fixture.color.Allocate(GfVec3i(size,size,1), HdFormatFloat32Vec4,false);
         fixture.prim.Allocate(GfVec3i(size,size,1), HdFormatInt32,false);
         auto settings = fixture.bridge->GetSettings(); settings.samples = 2;
+        // Pausing mid-pass needs a pass that outlasts the display cadence; GPU
+        // devices finish this plane too quickly. The protocol under test is
+        // the same for every device.
+        settings.device = prism::device::DevicePreference::Cpu;
         fixture.bridge->SetSettings(settings);
         TfTokenVector tags{HdRenderTagTokens->geometry};
         Wait([&] {
