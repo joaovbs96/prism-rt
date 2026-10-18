@@ -35,6 +35,8 @@ TfToken const _sampleClamp("prism:maxSampleRadiance");
 TfToken const _adaptiveThreshold("prism:adaptiveThreshold");
 TfToken const _adaptiveMinSamples("prism:adaptiveMinSamples");
 TfToken const _adaptivePreview("prism:adaptivePreview");
+TfToken const _neeProbabilityMin("prism:neeProbabilityMin");
+TfToken const _neeFromDepth("prism:neeFromDepth");
 TfToken const _domeCameraVisibility("domeLightCameraVisibility");
 TfToken const _sphereBatching("prism:sphereBatching");
 TfToken const _hiddenGeometryBudget("prism:hiddenGeometryBudgetMiB");
@@ -187,6 +189,8 @@ HdRenderSettingDescriptorList PrismTaskDelegate::GetRenderSettingDescriptors() c
             {"Sample clamp", _sampleClamp, VtValue(10.0f)},
             {"Adaptive sampling threshold (0 off)", _adaptiveThreshold, VtValue(0.0f)},
             {"Adaptive sampling minimum samples", _adaptiveMinSamples, VtValue(16)},
+            {"Minimum NEE probability (0 always samples)", _neeProbabilityMin, VtValue(0.05f)},
+            {"Probabilistic NEE from depth", _neeFromDepth, VtValue(2)},
             {"Adaptive preview", _adaptivePreview, VtValue(true)},
             {"Dome light camera visibility", _domeCameraVisibility, VtValue(true)},
             {"Sphere batching (experimental)", _sphereBatching, VtValue(false)},
@@ -215,6 +219,8 @@ VtValue PrismTaskDelegate::GetRenderSetting(TfToken const &key) const
     if (key == _adaptiveThreshold) return VtValue(s.adaptiveThreshold);
     if (key == _adaptiveMinSamples) return VtValue(s.adaptiveMinSamples);
     if (key == _adaptivePreview) return VtValue(s.adaptivePreview);
+    if (key == _neeProbabilityMin) return VtValue(s.neeProbabilityMin);
+    if (key == _neeFromDepth) return VtValue(s.neeFromDepth);
     if (key == _domeCameraVisibility) return VtValue(s.domeLightCameraVisibility);
     if (key == _sphereBatching) return VtValue(s.sphereBatching);
     if (key == _hiddenGeometryBudget) return VtValue(s.hiddenGeometryBudgetMiB);
@@ -308,6 +314,10 @@ void PrismTaskDelegate::SetRenderSetting(TfToken const &key, VtValue const &valu
         s.adaptiveThreshold = std::max(0.0f, _Get(value, s.adaptiveThreshold));
     else if (key == _adaptiveMinSamples)
         s.adaptiveMinSamples = std::max(1, _Get(value, s.adaptiveMinSamples));
+    else if (key == _neeProbabilityMin)
+        s.neeProbabilityMin = std::clamp(_Get(value, s.neeProbabilityMin), 0.0f, 1.0f);
+    else if (key == _neeFromDepth)
+        s.neeFromDepth = std::max(0, _Get(value, s.neeFromDepth));
     else if (key == _adaptivePreview)
         s.adaptivePreview = _Get(value, s.adaptivePreview);
     else if (key == _domeCameraVisibility)

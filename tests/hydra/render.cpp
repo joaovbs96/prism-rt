@@ -252,6 +252,7 @@ int main(int argc, char** argv) {
         float adaptiveThreshold = 0.0f;
         int maxDepth = 32;
         int changeDepth = 0;
+        float neeProbabilityMin = 0.05f;
         int seed = 0;
         for (int i = 7; i < argc; ++i) {
             const std::string option(argv[i]);
@@ -266,6 +267,7 @@ int main(int argc, char** argv) {
             else if (option == "--seed") seed = std::stoi(argv[i]);
             else if (option == "--adaptive-threshold") adaptiveThreshold = std::stof(argv[i]);
             else if (option == "--max-depth") maxDepth = std::stoi(argv[i]);
+            else if (option == "--nee-probability-min") neeProbabilityMin = std::stof(argv[i]);
             // Render, then change the maximum depth and render again: the saved
             // image must match a render made at the new depth from the start.
             else if (option == "--change-depth") changeDepth = std::stoi(argv[i]);
@@ -297,6 +299,7 @@ int main(int argc, char** argv) {
         engine.SetRendererSetting(TfToken("prism:textureFiltering"), VtValue(TfToken(filtering)));
         engine.SetRendererSetting(TfToken("prism:seed"), VtValue(seed));
         engine.SetRendererSetting(TfToken("prism:adaptiveThreshold"), VtValue(adaptiveThreshold));
+        engine.SetRendererSetting(TfToken("prism:neeProbabilityMin"), VtValue(neeProbabilityMin));
         engine.SetRendererSetting(TfToken("prism:sphereBatching"), VtValue(sphereBatching));
         engine.SetRendererAovs({HdAovTokens->color, HdAovTokens->depth,
             HdAovTokens->cameraDepth, HdAovTokens->normal, HdAovTokens->Neye,

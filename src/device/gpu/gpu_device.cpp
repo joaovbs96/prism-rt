@@ -65,7 +65,7 @@ std::vector<float> GpuRenderDevice::RenderImage(SceneManager& scene, ImageReques
     ActivePixels active;
     active.Reset(request.width, request.height);
     GpuFrame frame = BaseFrame(request.camera, request.width, request.height);
-    frame.shading = {request.sampleClamp, 1.0f, 0.0f, 0.0f};
+    frame.shading = {request.sampleClamp, 1.0f, request.nee.probabilityMin, float(request.nee.fromDepth)};
     frame.settings.w = request.seed;
     frame.counts.w = request.contributions & 7u;
     double gpuSeconds = 0.0;
@@ -124,7 +124,8 @@ void GpuRenderDevice::RenderPass(SceneManager& scene, PassRequest const& request
         output = static_cast<float*>(RenderBuffer(kSlotOutput, pixels * 16));
         std::memcpy(rng, request.rngStates, pixels * 4);
         frame = BaseFrame(request.camera, width, height);
-        frame.shading = {request.shading.sampleClamp, request.shading.exposureScale, 0.0f, 0.0f};
+        frame.shading = {request.shading.sampleClamp, request.shading.exposureScale,
+                         request.shading.nee.probabilityMin, float(request.shading.nee.fromDepth)};
         if (request.shading.transparentEscapes) frame.settings.z |= kFrameTransparentEscapes;
         if (request.sample == 0) frame.settings.z |= kFrameSeedRng;
         frame.settings.w = request.seed;
@@ -213,7 +214,8 @@ bool GpuRenderDevice::RenderPreview(SceneManager& scene, PreviewRequest const& r
     GpuFrame frame = BaseFrame(request.camera, request.width, request.height);
     frame.size.z = request.previewWidth;
     frame.size.w = request.previewHeight;
-    frame.shading = {request.shading.sampleClamp, request.shading.exposureScale, 0.0f, 0.0f};
+    frame.shading = {request.shading.sampleClamp, request.shading.exposureScale,
+                         request.shading.nee.probabilityMin, float(request.shading.nee.fromDepth)};
     if (request.shading.transparentEscapes) frame.settings.z |= kFrameTransparentEscapes;
     frame.settings.w = request.seed;
     frame.work = {count, 0, kModePreview, 0};

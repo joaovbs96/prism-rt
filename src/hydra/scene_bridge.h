@@ -37,6 +37,9 @@ struct RenderSettings {
     // per-pixel maximum.
     float adaptiveThreshold = 0.0f;
     int adaptiveMinSamples = 16;
+    // Probabilistic NEE (see prism::device::NeeSettings; 0 always samples).
+    float neeProbabilityMin = 0.05f;
+    int neeFromDepth = 2;
     bool adaptivePreview = true;
     bool domeLightCameraVisibility = true;
     int previewTargetMs = 33;

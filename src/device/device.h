@@ -48,6 +48,15 @@ struct PixelTile {
     size_t index = 0;
 };
 
+// Probabilistic next-event estimation: from fromDepth on, environment light
+// is sampled with probability clamp(path weight, probabilityMin, 1), which
+// saves most NEE work on dim deep paths at a small noise cost. A
+// probabilityMin of 0 always samples it.
+struct NeeSettings {
+    float probabilityMin = 0.05f;
+    int fromDepth = 2;
+};
+
 // Per-sample post-processing shared by every render loop.
 struct SampleShading {
     // Samples whose brightest channel exceeds this are scaled down (0 disables).
@@ -55,6 +64,7 @@ struct SampleShading {
     float exposureScale = 1.0f;
     // Escaped primary rays get zero color and zero coverage.
     bool transparentEscapes = false;
+    NeeSettings nee;
 };
 
 // Whole-image render with all samples of a pixel accumulated at once
@@ -71,6 +81,7 @@ struct ImageRequest {
     double* meanSamples = nullptr;
     // Light contributions to keep (kContribution* mask; noise analysis).
     unsigned contributions = 7;
+    NeeSettings nee;
 };
 
 // One progressive pass: one sample per pixel over the given tiles. All

@@ -149,6 +149,10 @@ struct SampleSettings {
     float exposureScale;
     bool transparentEscapes;
     uint contributions;     // kContribution* mask
+    // Probabilistic NEE: from neeFromDepth on, NEE happens with probability
+    // clamp(path weight, neeProbabilityMin, 1). 0 disables.
+    float neeProbabilityMin;
+    int neeFromDepth;
 };
 
 struct SampleResult {
@@ -197,8 +201,9 @@ struct PathTracer {
     // heuristic; cutout null events do not count as bounces (at most 64 in a
     // row). Without: BSDF sampling only, and null events are bounces. Both use
     // Russian roulette from the roulette depth on.
-    TraceResult trace(PathRay ray, uint contributions)
+    TraceResult trace(PathRay ray, SampleSettings settings)
     {
+        const uint contributions = settings.contributions;
         const bool mis = backend.environmentMis();
         const int maxDepth = backend.maxDepth();
         const int rouletteDepth = backend.rouletteDepth();
@@ -208,6 +213,7 @@ struct PathTracer {
         int depth = 0;
         int nullCrossings = 0;
         float previousPdf = 0.0f;
+        float previousNeeProbability = 1.0f;
         bool previousNee = false;
         bool tracking = true;      // primary outcome still unresolved
         for (;;) {
@@ -219,7 +225,8 @@ struct PathTracer {
                 const float3 li = backend.environmentRadiance(direction, angularRadius(ray.footprint));
                 float misWeight = 1.0f;
                 if (mis && previousNee)
-                    misWeight = powerHeuristic(previousPdf, backend.environmentPdf(direction));
+                    misWeight = powerHeuristic(previousPdf,
+                                               previousNeeProbability * backend.environmentPdf(direction));
                 result.radiance += weight * li * (misWeight * contributionWeight(contributions, depth));
                 break;
             }
@@ -241,15 +248,21 @@ struct PathTracer {
             }
             // At the depth boundary the competing continuation is truncated too.
             const bool canNee = mis && depth + 1 < maxDepth && backend.supportsNee(shading);
-            if (canNee) {
+            // Light sampling is a strategy with density neeProbability * light pdf.
+            float neeProbability = 1.0f;
+            if (canNee && settings.neeProbabilityMin > 0.0f && depth >= settings.neeFromDepth)
+                neeProbability = clamp(maxComponent(weight), settings.neeProbabilityMin, 1.0f);
+            const bool doNee = canNee && (neeProbability >= 1.0f || sampler.next1() < neeProbability);
+            if (doNee) {
                 const EnvironmentLightSample light =
                     backend.sampleEnvironment(sampler.next4(), angularRadius(hit.surface.ray_footprint));
                 if (light.pdf > 0.0f && isfinite(light.pdf)) {
                     // The shadow ray is traced only for a nonzero contribution.
                     const BsdfEvaluation f = backend.evaluate(shading, light.wi);
                     if (f.valid && f.pdf >= 0.0f && isfinite(f.pdf)) {
+                        const float lightPdf = neeProbability * light.pdf;
                         const float3 contribution = weight * f.value * light.radiance *
-                            (powerHeuristic(light.pdf, f.pdf) / light.pdf);
+                            (powerHeuristic(lightPdf, f.pdf) / lightPdf);
                         if (maxComponent(contribution) > 0.0f &&
                             environmentVisible(spawnRay(hit.surface, light.wi, false)))
                             result.radiance += contribution * contributionWeight(contributions, depth + 1);
@@ -267,6 +280,7 @@ struct PathTracer {
             }
             previousNee = canNee && !bs.delta && !bs.null_event && bs.pdf > 0.0f;
             previousPdf = bs.pdf;
+            previousNeeProbability = neeProbability;
             weight *= bs.color * rouletteWeight;
             ray = spawnRay(hit.surface, bs.wi, bs.null_event);
             ++depth;
@@ -307,7 +321,7 @@ struct PathTracer {
     SampleResult renderSample(CameraParams camera, uint x, uint y, uint width, uint height,
                               SampleSettings settings)
     {
-        const TraceResult traced = trace(cameraSample(camera, x, y, width, height), settings.contributions);
+        const TraceResult traced = trace(cameraSample(camera, x, y, width, height), settings);
         SampleResult result;
         result.coverage = settings.transparentEscapes && traced.outcome == kPrimaryEscaped ? 0.0f : 1.0f;
         float3 color = result.coverage == 0.0f ? (float3)0.0f : traced.radiance;

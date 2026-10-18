@@ -34,6 +34,7 @@ struct Options {
     float adaptiveThreshold = 0;
     int adaptiveMinSamples = 16;
     unsigned contributions = 7;
+    prism::device::NeeSettings nee;
 };
 
 void help() {
@@ -51,6 +52,8 @@ void help() {
         "  --debug-contributions all|visible|direct|indirect (noise analysis: keep only light seen\n"
         "                 directly, reaching the first hit, or bounced more often; comma-separated)\n"
         "  --environment-sampling mis|bsdf (default mis)\n"
+        "  --nee-probability-min 0.05 --nee-from-depth 2 (from that depth on, environment light is\n"
+        "                 sampled with probability clamp(path weight, min, 1); min 0 always samples)\n"
         "  --texture-filtering filtered|bilinear (default filtered)\n"
         "  --device auto|cpu|cpu-reference|vulkan|metal (default auto: GPU if available, else CPU;\n"
         "                 cpu-reference runs the original CPU integrator)\n"
@@ -122,6 +125,8 @@ Options parse(int argc, char** argv) {
         else if (key == "--max-sample-radiance") o.clamp = number(value);
         else if (key == "--adaptive-threshold") o.adaptiveThreshold = number(value);
         else if (key == "--adaptive-min-samples") o.adaptiveMinSamples = integer(value);
+        else if (key == "--nee-probability-min") o.nee.probabilityMin = number(value);
+        else if (key == "--nee-from-depth") o.nee.fromDepth = integer(value);
         else if (key == "--debug-contributions") {
             o.contributions = 0;
             std::stringstream list(value);
@@ -160,6 +165,8 @@ Options parse(int argc, char** argv) {
         throw std::runtime_error("--env-color requires nonnegative linear RGB and conflicts with --env");
     if (o.width <= 0 || o.height <= 0 || o.samples <= 0 || o.depth <= 0 || o.roulette < 0 || o.clamp < 0)
         throw std::runtime_error("Dimensions, spp and depth must be positive; roulette depth and clamp must be nonnegative");
+    if (!(o.nee.probabilityMin >= 0 && o.nee.probabilityMin <= 1) || o.nee.fromDepth < 0)
+        throw std::runtime_error("--nee-probability-min must be in [0, 1] and --nee-from-depth nonnegative");
     if (o.adaptiveThreshold < 0 || o.adaptiveMinSamples < 1)
         throw std::runtime_error("--adaptive-threshold must be nonnegative and --adaptive-min-samples positive");
     if (static_cast<uint64_t>(o.width) * o.height > std::numeric_limits<unsigned>::max() / 4)
@@ -359,6 +366,7 @@ int runStandaloneCli(int argc, char** argv) {
         imageRequest.adaptive.threshold = o.adaptiveThreshold;
         imageRequest.adaptive.minSamples = o.adaptiveMinSamples;
         imageRequest.contributions = o.contributions;
+        imageRequest.nee = o.nee;
         double meanSamples = o.samples;
         imageRequest.meanSamples = &meanSamples;
         const std::vector<float> pixels = renderDevice->RenderImage(scene, imageRequest);

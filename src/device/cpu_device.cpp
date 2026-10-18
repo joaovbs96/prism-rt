@@ -171,7 +171,8 @@ std::vector<float> CpuDevice::RenderImage(SceneManager& scene, ImageRequest cons
 
     const CameraParams camera = ToCameraParams(request.camera);
     const bool opaqueScene = OpaqueScene(scene);
-    const SampleSettings settings = {request.sampleClamp, 1.0f, false, request.contributions};
+    const SampleSettings settings = {request.sampleClamp, 1.0f, false, request.contributions,
+        request.nee.probabilityMin, request.nee.fromDepth};
     const AdaptiveSettings& adaptive = request.adaptive;
     const size_t count = size_t(width) * height;
     std::vector<unsigned> seeds(count);
@@ -236,7 +237,8 @@ void CpuDevice::RenderPass(SceneManager& scene, PassRequest const& request)
     const CameraParams camera = ToCameraParams(request.camera);
     const bool opaqueScene = !m_reference && OpaqueScene(scene);
     const SampleSettings settings = {request.shading.sampleClamp,
-        request.shading.exposureScale, request.shading.transparentEscapes, kContributionAll};
+        request.shading.exposureScale, request.shading.transparentEscapes, kContributionAll,
+        request.shading.nee.probabilityMin, request.shading.nee.fromDepth};
 
     tbb::task_arena renderArena(std::max(1, request.concurrency));
     renderArena.execute([&] {
@@ -337,7 +339,8 @@ bool CpuDevice::RenderPreview(SceneManager& scene, PreviewRequest const& request
     const CameraParams camera = ToCameraParams(request.camera);
     const bool opaqueScene = !m_reference && OpaqueScene(scene);
     const SampleSettings settings = {request.shading.sampleClamp,
-        request.shading.exposureScale, request.shading.transparentEscapes, kContributionAll};
+        request.shading.exposureScale, request.shading.transparentEscapes, kContributionAll,
+        request.shading.nee.probabilityMin, request.shading.nee.fromDepth};
     tbb::parallel_for(
         tbb::blocked_range2d<unsigned int>(
             0, previewHeight, 4, 0, previewWidth, 8),

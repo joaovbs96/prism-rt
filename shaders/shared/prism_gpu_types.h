@@ -159,7 +159,8 @@ struct GpuFrame {
     float4 inverseProjection[4]; // rows, row-vector convention (p' = p * M)
     float4 cameraToWorld[4];     // rows, row-vector convention
     float4 camera;               // x: near clip, y: far clip, z: aperture radius, w: focus distance
-    float4 shading;              // x: sample clamp, y: exposure scale
+    float4 shading;              // x: sample clamp, y: exposure scale, z: minimum NEE probability,
+                                 // w: depth from which NEE is probabilistic
     uint4 size;                  // x: width, y: height, z: preview width, w: preview height
     uint4 settings;              // x: max depth, y: roulette depth, z: flags, w: seed
     uint4 work;                  // x: thread count, z: mode

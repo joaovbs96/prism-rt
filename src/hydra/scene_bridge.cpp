@@ -4134,6 +4134,7 @@ PreviewResult _RenderPreview(std::shared_ptr<Snapshot> const &snapshot,
     request.previewHeight = result.height;
     request.seed = static_cast<unsigned int>(settings.seed);
     request.shading.sampleClamp = settings.sampleClamp;
+    request.shading.nee = {settings.neeProbabilityMin, settings.neeFromDepth};
     request.shading.exposureScale = camera.linearExposureScale;
     request.shading.transparentEscapes =
         snapshot->domeCount == 0 || !settings.domeLightCameraVisibility;
@@ -4655,6 +4656,8 @@ void SceneBridge::SetSettings(RenderSettings const &settings)
             current.sampleClamp == settings.sampleClamp &&
             current.adaptiveThreshold == settings.adaptiveThreshold &&
             current.adaptiveMinSamples == settings.adaptiveMinSamples &&
+            current.neeProbabilityMin == settings.neeProbabilityMin &&
+            current.neeFromDepth == settings.neeFromDepth &&
             current.adaptivePreview == settings.adaptivePreview &&
             current.previewTargetMs == settings.previewTargetMs &&
             current.previewMaxDimension == settings.previewMaxDimension &&
@@ -4673,6 +4676,8 @@ void SceneBridge::SetSettings(RenderSettings const &settings)
             current.sampleClamp != settings.sampleClamp ||
             current.adaptiveThreshold != settings.adaptiveThreshold ||
             current.adaptiveMinSamples != settings.adaptiveMinSamples ||
+            current.neeProbabilityMin != settings.neeProbabilityMin ||
+            current.neeFromDepth != settings.neeFromDepth ||
             current.resourceRevision != settings.resourceRevision ||
             current.sphereBatching != settings.sphereBatching ||
             current.textureFiltering != settings.textureFiltering ||
@@ -5963,6 +5968,7 @@ void SceneBridge::Render()
         passRequest.seed = static_cast<unsigned int>(settings.seed);
         passRequest.sample = sample;
         passRequest.shading.sampleClamp = settings.sampleClamp;
+        passRequest.shading.nee = {settings.neeProbabilityMin, settings.neeFromDepth};
         passRequest.shading.exposureScale = camera.linearExposureScale;
         passRequest.shading.transparentEscapes =
             snapshot->domeCount == 0 || !settings.domeLightCameraVisibility;
