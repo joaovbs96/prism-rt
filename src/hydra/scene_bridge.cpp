@@ -4384,6 +4384,10 @@ public:
     HdRenderPassAovBindingVector bindings;
     std::vector<uint64_t> bindingAllocationRevisions;
     std::vector<unsigned int> committedRngStates;
+    // Adaptive sampling: per-pixel RGB sums of all and of even-numbered
+    // samples (6 floats per pixel) and the pixels still sampled.
+    std::vector<float> adaptiveSums;
+    prism::device::ActivePixels adaptiveActive;
     unsigned tileWidth = 0, tileHeight = 0;
     std::vector<RefinementTile> refinementTiles;
     TfTokenVector renderTags;
@@ -4645,6 +4649,8 @@ void SceneBridge::SetSettings(RenderSettings const &settings)
             current.rouletteDepth == settings.rouletteDepth &&
             current.seed == settings.seed &&
             current.sampleClamp == settings.sampleClamp &&
+            current.adaptiveThreshold == settings.adaptiveThreshold &&
+            current.adaptiveMinSamples == settings.adaptiveMinSamples &&
             current.adaptivePreview == settings.adaptivePreview &&
             current.previewTargetMs == settings.previewTargetMs &&
             current.previewMaxDimension == settings.previewMaxDimension &&
@@ -4661,6 +4667,8 @@ void SceneBridge::SetSettings(RenderSettings const &settings)
             current.rouletteDepth != settings.rouletteDepth ||
             current.seed != settings.seed ||
             current.sampleClamp != settings.sampleClamp ||
+            current.adaptiveThreshold != settings.adaptiveThreshold ||
+            current.adaptiveMinSamples != settings.adaptiveMinSamples ||
             current.resourceRevision != settings.resourceRevision ||
             current.sphereBatching != settings.sphereBatching ||
             current.textureFiltering != settings.textureFiltering ||
@@ -5803,6 +5811,13 @@ void SceneBridge::Render()
             _impl->committedRngStates.resize(static_cast<size_t>(width) * height);
         else
             std::vector<unsigned int>().swap(_impl->committedRngStates);
+        if (hasColor && settings.adaptiveThreshold > 0.0f) {
+            _impl->adaptiveSums.assign(static_cast<size_t>(width) * height * 6, 0.0f);
+            _impl->adaptiveActive.Reset(width, height);
+        } else {
+            std::vector<float>().swap(_impl->adaptiveSums);
+            _impl->adaptiveActive = {};
+        }
     }
     prism::CameraRayParameters const cameraParameters =
         _CameraParameters(camera);
@@ -5889,7 +5904,15 @@ void SceneBridge::Render()
     for (auto const &tile : tiles)
         deviceTiles.push_back({tile.x, tile.y, tile.width, tile.height, tile.index});
     uint64_t presentationRevision = 0;
+    prism::device::AdaptiveSettings adaptive;
+    adaptive.threshold = _impl->adaptiveSums.empty() ? 0.0f : settings.adaptiveThreshold;
+    adaptive.minSamples = settings.adaptiveMinSamples;
+    // Pixels traced by the current pass; converged pixels keep their value.
+    auto traced = [&](size_t pixel) {
+        return !adaptive.Enabled() || _impl->adaptiveActive.Active(pixel);
+    };
     for (int sample = firstSample; sample < sampleCount; ++sample) {
+        if (adaptive.Enabled() && _impl->adaptiveActive.Count() == 0) break;
         if (_impl->renderThread->IsStopRequested()) return;
         while (_impl->renderThread->IsPauseRequested()) {
             if (_impl->renderThread->IsStopRequested()) return;
@@ -5934,6 +5957,7 @@ void SceneBridge::Render()
         passRequest.shading.transparentEscapes =
             snapshot->domeCount == 0 || !settings.domeLightCameraVisibility;
         passRequest.tiles = deviceTiles;
+        passRequest.activePixels = adaptive.Enabled() ? _impl->adaptiveActive.Mask() : nullptr;
         passRequest.traceColor = hasColor;
         passRequest.tracePrimary = sample == 0 && !primaryPlanes.empty();
         passRequest.rngStates = rngStates.data();
@@ -6020,8 +6044,10 @@ void SceneBridge::Render()
                                 float *dst = payload->rgba.data() + (static_cast<size_t>(tile.height - 1 - y) * tile.width + x) * 4;
                                 auto const &c = passColors[pixel];
                                 const float values[4] = {c.x(), c.y(), c.z(), passCoverage[pixel]};
+                                const bool fresh = traced(pixel);
                                 for (size_t component = 0; component < 4; ++component)
-                                    dst[component] = sample == 0 ? values[component] :
+                                    dst[component] = !fresh ? previous[offset + component] :
+                                        sample == 0 ? values[component] :
                                         (previous[offset + component] * sample + values[component]) / (sample + 1);
                             }
                         }
@@ -6082,6 +6108,7 @@ void SceneBridge::Render()
                                 ? std::chrono::steady_clock::now()
                                 : std::chrono::steady_clock::time_point{};
                             if (kind == AovKind::Color) {
+                                if (!traced(pixel)) continue;
                                 Color3 const &c = passColors[pixel];
                                 float v[4] = {c.x(), c.y(), c.z(), passCoverage[pixel]};
                                 buffer->WriteFloat(x, bufferY, v, 4, true);
@@ -6127,6 +6154,21 @@ void SceneBridge::Render()
             _impl->lastPassWaitMilliseconds = waitMilliseconds;
             _impl->lastPassPayloadMilliseconds = payloadMilliseconds;
             _impl->lastPassPublicationMilliseconds = publicationMilliseconds;
+        }
+        if (adaptive.Enabled()) {
+            float *sums = _impl->adaptiveSums.data();
+            tbb::parallel_for(size_t(0), passColors.size(), [&](size_t pixel) {
+                if (!traced(pixel)) return;
+                Color3 const &c = passColors[pixel];
+                for (int channel = 0; channel < 3; ++channel) {
+                    sums[6 * pixel + channel] += c[channel];
+                    if (sample % 2 == 0) sums[6 * pixel + 3 + channel] += c[channel];
+                }
+            });
+            if (sample + 1 < sampleCount && adaptive.CheckAfter(sample + 1))
+                _impl->adaptiveActive.Update(adaptive.threshold, [&](size_t pixel) {
+                    return prism::device::AdaptiveError(sums + 6 * pixel, sums + 6 * pixel + 3, sample + 1);
+                });
         }
         _impl->committedRngStates.swap(rngStates);
         _impl->samples.store(static_cast<uint64_t>(sample + 1));

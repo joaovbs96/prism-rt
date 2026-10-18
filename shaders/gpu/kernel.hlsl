@@ -50,7 +50,7 @@ void main(uint3 id : SV_DispatchThreadID)
 {
     const GpuFrame frame = gpu_frame();
     if (id.x >= frame.work.x) return;
-    const uint thread = id.x + frame.work.w;
+    const uint thread = id.x;
     const uint flags = frame.settings.z;
     const CameraParams camera = frameCamera(frame);
     const SampleSettings settings = {frame.shading.x, frame.shading.y,
@@ -75,26 +75,9 @@ void main(uint3 id : SV_DispatchThreadID)
         return;
     }
 
-    uint x;
-    uint y;
-    if (mode == kModePass) {
-        // The last tile whose first thread is not after this one.
-        uint lo = 0u;
-        uint hi = frame.work.y - 1u;
-        while (lo < hi) {
-            const uint mid = (lo + hi + 1u) / 2u;
-            if (gpu_tile(mid).info.x <= thread) lo = mid;
-            else hi = mid - 1u;
-        }
-        const GpuTile tile = gpu_tile(lo);
-        const uint local = thread - tile.info.x;
-        x = tile.rect.x + local % tile.rect.z;
-        y = tile.rect.y + local / tile.rect.z;
-    } else {
-        x = thread % width;
-        y = thread / width;
-    }
-    const uint pixel = y * width + x;
+    const uint pixel = gpu_pixel(thread);
+    const uint x = pixel % width;
+    const uint y = pixel / width;
     // The sampler's sequence is indexed by the sample number, scrambled per pixel.
     const Sampler sampler = {frame.counts.z,
                              mode == kModeImage ? seedImage(x, y, width, frame.settings.w)
@@ -114,6 +97,6 @@ void main(uint3 id : SV_DispatchThreadID)
         result = tracer.renderSample(camera, x, y, width, height, settings);
     }
     gpu_store_rng(pixel, tracer.backend.rng.state);
-    if (mode == kModeImage) gpu_accumulate(pixel, result.color);
+    if (mode == kModeImage) gpu_accumulate(pixel, result.color, (frame.counts.z & 1u) == 0u);
     else gpu_store_output(pixel, float4(result.color, result.coverage));
 }

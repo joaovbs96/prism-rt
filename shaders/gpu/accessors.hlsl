@@ -42,7 +42,7 @@ uint gpu_mdl_texture_count() { return gpu_frame().counts.x; }
 uint gpu_mdl_tile(uint i) { return mdlTilesBuffer()[i]; }
 float gpu_bsdf_data(uint i) { return bsdfDataBuffer()[i]; }
 GpuImage gpu_image(uint i) { return imagesBuffer()[i]; }
-GpuTile gpu_tile(uint i) { return tilesBuffer()[i]; }
+uint gpu_pixel(uint i) { return pixelsBuffer()[i]; }
 
 uint gpu_load_rng(uint pixel) { return rngBuffer()[pixel]; }
 void gpu_store_rng(uint pixel, uint value)
@@ -55,10 +55,13 @@ void gpu_store_output(uint index, float4 value)
     RWStructuredBuffer<float4> b = outputBuffer();
     b[index] = value;
 }
-void gpu_accumulate(uint index, float3 value)
+// Two entries per pixel: the sum of all samples and of the even-numbered
+// ones (the adaptive sampling error estimate).
+void gpu_accumulate(uint pixel, float3 value, bool even)
 {
     RWStructuredBuffer<float4> b = accumulationBuffer();
-    b[index] = b[index] + float4(value, 0.0f);
+    b[2u * pixel] = b[2u * pixel] + float4(value, 0.0f);
+    if (even) b[2u * pixel + 1u] = b[2u * pixel + 1u] + float4(value, 0.0f);
 }
 
 // Top row first, mip level 0.

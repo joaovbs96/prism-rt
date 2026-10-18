@@ -26,8 +26,8 @@ protected:
     virtual bool PrepareScene(SceneManager& scene, std::string* error) = 0;
     virtual GpuSceneData const& Data() const = 0;
     virtual uint32_t MdlTextureCount() const = 0;
-    // Host-visible storage for kSlotRng / OUTPUT / ACCUMULATION /
-    // TILES of at least `bytes`, bound for the next dispatch.
+    // Host-visible storage for kSlotRng / Output / Accumulation / Pixels
+    // of at least `bytes`, bound for the next dispatch.
     virtual void* RenderBuffer(int slot, size_t bytes) = 0;
     // Runs the kernel over `threads` threads and waits for completion.
     virtual bool Dispatch(GpuFrame const& frame, uint32_t threads, double* gpuSeconds,

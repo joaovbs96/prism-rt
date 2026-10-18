@@ -33,6 +33,10 @@ struct RenderSettings {
     int rouletteDepth = 4;
     int seed = 0;
     float sampleClamp = 10.0f;
+    // Adaptive sampling error threshold (0 disables); `samples` is then the
+    // per-pixel maximum.
+    float adaptiveThreshold = 0.0f;
+    int adaptiveMinSamples = 16;
     bool adaptivePreview = true;
     bool domeLightCameraVisibility = true;
     int previewTargetMs = 33;

@@ -198,7 +198,7 @@ void MetalDevice::Impl::uploadBuffers()
     setBuffer(kSlotMdlTiles, buffer(d.mdlTiles.data(), Bytes(d.mdlTiles)));
     setBuffer(kSlotBsdfData, buffer(d.bsdfData.data(), Bytes(d.bsdfData)));
     if (!buffers[kSlotFrame]) setBuffer(kSlotFrame, buffer(nullptr, sizeof(GpuFrame)));
-    for (int slot : {kSlotTiles, kSlotRng, kSlotOutput, kSlotAccumulation})
+    for (int slot : {kSlotPixels, kSlotRng, kSlotOutput, kSlotAccumulation})
         if (!buffers[slot]) setBuffer(slot, buffer(nullptr, 16));
 }
 

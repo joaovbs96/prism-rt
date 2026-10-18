@@ -8,6 +8,7 @@
 // Frontends keep ownership of scene ingestion, accumulation, tiling policy and
 // presentation, and describe each unit of work with a request struct.
 
+#include "adaptive_sampling.h"
 #include "../camera_rays.h"
 #include "../float3.h"
 #include "../ray.h"
@@ -64,6 +65,10 @@ struct ImageRequest {
     int samples = 1;
     unsigned seed = 0;
     float sampleClamp = 0.0f;
+    // With adaptive sampling, `samples` is the per-pixel maximum.
+    AdaptiveSettings adaptive;
+    // Receives the mean number of samples per pixel (when non-null).
+    double* meanSamples = nullptr;
 };
 
 // One progressive pass: one sample per pixel over the given tiles. All
@@ -75,6 +80,9 @@ struct PassRequest {
     int sample = 0;
     SampleShading shading;
     std::span<const PixelTile> tiles;
+    // When set, color samples are traced only for pixels whose flag is
+    // nonzero (adaptive sampling); width*height flags, top row first.
+    const uint8_t* activePixels = nullptr;
     // Trace one color sample per pixel; false traces only primary hits.
     bool traceColor = true;
     // Resolve pixel-center primary hits (deterministic geometric outputs).

@@ -143,38 +143,82 @@ std::vector<float> CpuDevice::RenderImage(SceneManager& scene, ImageRequest cons
     const int width = static_cast<int>(request.width);
     const int height = static_cast<int>(request.height);
     std::vector<float> pixels(size_t(width)*height*3);
-    const CameraParams camera = ToCameraParams(request.camera);
-    const bool opaqueScene = !m_reference && OpaqueScene(scene);
-    const SampleSettings settings = {request.sampleClamp, 1.0f, false};
-    tbb::parallel_for(0, height, [&](int y) {
-        for (int x = 0; x < width; ++x) {
-            unsigned seed = tea<64>(unsigned(y*width) ^ request.seed, unsigned(x));
-            Color3 sum(0);
-            if (!m_reference) {
+    if (request.meanSamples) *request.meanSamples = request.samples;
+    if (m_reference) {
+        tbb::parallel_for(0, height, [&](int y) {
+            for (int x = 0; x < width; ++x) {
+                unsigned seed = tea<64>(unsigned(y*width) ^ request.seed, unsigned(x));
+                Color3 sum(0);
                 for (int sample = 0; sample < request.samples; ++sample) {
+                    const auto pair = prism::GenerateCameraRays(
+                        request.camera, static_cast<unsigned int>(x),
+                        static_cast<unsigned int>(y), static_cast<unsigned int>(width),
+                        static_cast<unsigned int>(height), seed);
+                    const prism::PathRay r{pair.sampled, pair.footprint};
+                    Color3 value = scene.trace(r, 0, Float3(1), seed);
+                    const float peak = value.max_component();
+                    if (request.sampleClamp > 0 && peak > request.sampleClamp)
+                        value *= request.sampleClamp / peak;
+                    sum += value;
+                }
+                sum /= float(request.samples);
+                const size_t offset = (size_t(y)*width+x)*3;
+                for (int c = 0; c < 3; ++c) pixels[offset+c] = sum[c];
+            }
+        });
+        return pixels;
+    }
+
+    const CameraParams camera = ToCameraParams(request.camera);
+    const bool opaqueScene = OpaqueScene(scene);
+    const SampleSettings settings = {request.sampleClamp, 1.0f, false};
+    const AdaptiveSettings& adaptive = request.adaptive;
+    const size_t count = size_t(width) * height;
+    std::vector<unsigned> seeds(count);
+    std::vector<Color3> sums(count, Color3(0));
+    std::vector<Color3> evenSums(adaptive.Enabled() ? count : 0, Color3(0));
+    std::vector<int> samples(count, 0);
+    ActivePixels active;
+    active.Reset(unsigned(width), unsigned(height));
+    // Without adaptive sampling this is one round of all samples per pixel.
+    int done = 0;
+    while (done < request.samples) {
+        const int next = adaptive.Enabled()
+            ? std::min(request.samples, done < adaptive.minSamples ? adaptive.minSamples : done + adaptive.step)
+            : request.samples;
+        tbb::parallel_for(0, height, [&](int y) {
+            for (int x = 0; x < width; ++x) {
+                const size_t pixel = size_t(y) * width + x;
+                if (!active.Active(pixel)) continue;
+                unsigned& seed = seeds[pixel];
+                if (done == 0) seed = tea<64>(unsigned(y*width) ^ request.seed, unsigned(x));
+                for (int sample = done; sample < next; ++sample) {
                     const auto result = TraceSample(scene, opaqueScene, camera, settings, unsigned(x),
                         unsigned(y), unsigned(width), unsigned(height), seed, unsigned(sample),
                         seedImage(unsigned(x), unsigned(y), unsigned(width), request.seed));
-                    sum += ToFloat3(result.color);
+                    sums[pixel] += ToFloat3(result.color);
+                    if (adaptive.Enabled() && sample % 2 == 0) evenSums[pixel] += ToFloat3(result.color);
                 }
+                samples[pixel] = next;
             }
-            for (int sample = 0; m_reference && sample < request.samples; ++sample) {
-                const auto pair = prism::GenerateCameraRays(
-                    request.camera, static_cast<unsigned int>(x),
-                    static_cast<unsigned int>(y), static_cast<unsigned int>(width),
-                    static_cast<unsigned int>(height), seed);
-                const prism::PathRay r{pair.sampled, pair.footprint};
-                Color3 value = scene.trace(r, 0, Float3(1), seed);
-                const float peak = value.max_component();
-                if (request.sampleClamp > 0 && peak > request.sampleClamp)
-                    value *= request.sampleClamp / peak;
-                sum += value;
-            }
-            sum /= float(request.samples);
-            const size_t offset = (size_t(y)*width+x)*3;
-            for (int c = 0; c < 3; ++c) pixels[offset+c] = sum[c];
-        }
-    });
+        });
+        done = next;
+        if (done < request.samples && adaptive.CheckAfter(done) &&
+            active.Update(adaptive.threshold, [&](size_t pixel) {
+                const float sum[3] = {sums[pixel].x(), sums[pixel].y(), sums[pixel].z()};
+                const float even[3] = {evenSums[pixel].x(), evenSums[pixel].y(), evenSums[pixel].z()};
+                return AdaptiveError(sum, even, done);
+            }) == 0)
+            break;
+    }
+    double total = 0.0;
+    for (size_t pixel = 0; pixel < count; ++pixel) {
+        Color3 value = sums[pixel];
+        value /= float(samples[pixel]);
+        for (int c = 0; c < 3; ++c) pixels[3 * pixel + c] = value[c];
+        total += samples[pixel];
+    }
+    if (request.meanSamples) *request.meanSamples = total / double(count);
     return pixels;
 }
 
@@ -221,6 +265,15 @@ void CpuDevice::RenderPass(SceneManager& scene, PassRequest const& request)
                                         static_cast<float>(x) + 0.5f,
                                         static_cast<float>(y) + 0.5f,
                                         width, height, nullptr);
+                                continue;
+                            }
+                            if (request.activePixels && !request.activePixels[pixel]) {
+                                if (tracePrimary)
+                                    centers[(y-tile.y)*tile.width+x-tile.x] =
+                                        prism::MakeCameraRayWithLens(request.camera,
+                                            static_cast<float>(x) + 0.5f,
+                                            static_cast<float>(y) + 0.5f,
+                                            width, height, nullptr);
                                 continue;
                             }
                             unsigned int &seed = request.rngStates[pixel];

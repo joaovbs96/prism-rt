@@ -31,6 +31,8 @@ struct Options {
     int width = 1280, height = 720, samples = 256, depth = 32, roulette = 4;
     unsigned seed = 0;
     float exposure = 0, clamp = 10;
+    float adaptiveThreshold = 0;
+    int adaptiveMinSamples = 16;
 };
 
 void help() {
@@ -43,6 +45,8 @@ void help() {
         "  --width 1280 --height 720 --spp 256\n"
         "  --max-depth 32 --rr-min-depth 4 --seed 0\n"
         "  --max-sample-radiance 10 --output output.exr\n"
+        "  --adaptive-threshold 0 (e.g. 0.01; 0 disables) --adaptive-min-samples 16\n"
+        "                 with adaptive sampling, --spp is the per-pixel maximum\n"
         "  --environment-sampling mis|bsdf (default mis)\n"
         "  --texture-filtering filtered|bilinear (default filtered)\n"
         "  --device auto|cpu|cpu-reference|vulkan|metal (default auto: GPU if available, else CPU;\n"
@@ -113,6 +117,8 @@ Options parse(int argc, char** argv) {
         }
         else if (key == "--env-exposure") o.exposure = number(value);
         else if (key == "--max-sample-radiance") o.clamp = number(value);
+        else if (key == "--adaptive-threshold") o.adaptiveThreshold = number(value);
+        else if (key == "--adaptive-min-samples") o.adaptiveMinSamples = integer(value);
         else throw std::runtime_error("Unknown option: " + key);
     }
     if (!o.exportScene.empty()) {
@@ -140,6 +146,8 @@ Options parse(int argc, char** argv) {
         throw std::runtime_error("--env-color requires nonnegative linear RGB and conflicts with --env");
     if (o.width <= 0 || o.height <= 0 || o.samples <= 0 || o.depth <= 0 || o.roulette < 0 || o.clamp < 0)
         throw std::runtime_error("Dimensions, spp and depth must be positive; roulette depth and clamp must be nonnegative");
+    if (o.adaptiveThreshold < 0 || o.adaptiveMinSamples < 1)
+        throw std::runtime_error("--adaptive-threshold must be nonnegative and --adaptive-min-samples positive");
     if (static_cast<uint64_t>(o.width) * o.height > std::numeric_limits<unsigned>::max() / 4)
         throw std::runtime_error("Image dimensions are too large");
     return o;
@@ -334,6 +342,10 @@ int runStandaloneCli(int argc, char** argv) {
         imageRequest.samples = o.samples;
         imageRequest.seed = o.seed;
         imageRequest.sampleClamp = o.clamp;
+        imageRequest.adaptive.threshold = o.adaptiveThreshold;
+        imageRequest.adaptive.minSamples = o.adaptiveMinSamples;
+        double meanSamples = o.samples;
+        imageRequest.meanSamples = &meanSamples;
         const std::vector<float> pixels = renderDevice->RenderImage(scene, imageRequest);
         const double renderSeconds = seconds() - loadSeconds;
         OIIO::ImageSpec spec(o.width, o.height, 3, OIIO::TypeDesc::FLOAT);
@@ -344,11 +356,14 @@ int runStandaloneCli(int argc, char** argv) {
             OIIO::ImageBufAlgo::pow(image, image, 1.0f/2.2f);
         }
         if (!image.write(o.output)) throw std::runtime_error("Cannot write image: " + image.geterror());
-        std::cout << "Rendered " << o.width << "x" << o.height << " at " << o.samples << " spp to " << o.output << '\n';
+        std::cout << "Rendered " << o.width << "x" << o.height << " at " << o.samples << " spp";
+        if (imageRequest.adaptive.Enabled()) std::cout << " (adaptive, mean " << meanSamples << ")";
+        std::cout << " to " << o.output << '\n';
         const auto textureStats = prism::TextureService::Acquire()->stats();
         std::cout << "[PrismProfile] {\"stageSeconds\":" << stageSeconds
                   << ",\"loadSeconds\":" << loadSeconds
                   << ",\"renderSeconds\":" << renderSeconds
+                  << ",\"meanSamples\":" << meanSamples
                   << ",\"outputSeconds\":" << seconds()-loadSeconds-renderSeconds
                   << ",\"textureFiltering\":\"" << o.textureFiltering << "\""
                   << ",\"texturePrepareCalls\":" << textureStats.prepareCalls

@@ -69,9 +69,9 @@ static const uint kFrameLens = 32u;
 static const uint kFrameCutouts = 64u;       // some instances are not opaque
 
 // Work modes.
-static const uint kModePass = 0u;      // one sample per pixel of the listed tiles
+static const uint kModePass = 0u;      // one sample per listed pixel
 static const uint kModePreview = 1u;   // one sample per preview pixel
-static const uint kModeImage = 2u;     // one sample per pixel, accumulated (standalone)
+static const uint kModeImage = 2u;     // one sample per listed pixel, accumulated (standalone)
 
 // Resource slots: descriptor-heap indices (HLSL) and set-0 bindings (GLSL).
 static const uint kSlotFrame = 0;
@@ -97,7 +97,7 @@ static const uint kSlotMdlTextures = 19;
 static const uint kSlotMdlTiles = 20;
 static const uint kSlotBsdfData = 21;
 static const uint kSlotImages = 22;
-static const uint kSlotTiles = 23;
+static const uint kSlotPixels = 23;   // pixel indices of the pass or image threads
 static const uint kSlotRng = 24;
 static const uint kSlotOutput = 25;
 static const uint kSlotAccumulation = 26;
@@ -162,13 +162,9 @@ struct GpuFrame {
     float4 shading;              // x: sample clamp, y: exposure scale
     uint4 size;                  // x: width, y: height, z: preview width, w: preview height
     uint4 settings;              // x: max depth, y: roulette depth, z: flags, w: seed
-    uint4 work;                  // x: thread count, y: tile count, z: mode, w: first thread
+    uint4 work;                  // x: thread count, z: mode
     uint4 counts;                // x: MDL texture count, y: debug view, z: sample number
 };
 
-struct GpuTile {
-    uint4 rect;   // x, y, width, height
-    uint4 info;   // x: first thread of the tile
-};
 
 

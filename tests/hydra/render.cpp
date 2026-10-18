@@ -249,6 +249,7 @@ int main(int argc, char** argv) {
         std::string sampling = "mis";
         std::string filtering = "filtered";
         float sampleClamp = 10.0f;
+        float adaptiveThreshold = 0.0f;
         int seed = 0;
         for (int i = 7; i < argc; ++i) {
             const std::string option(argv[i]);
@@ -261,6 +262,7 @@ int main(int argc, char** argv) {
             else if (option == "--texture-filtering") filtering = argv[i];
             else if (option == "--sample-clamp") sampleClamp = std::stof(argv[i]);
             else if (option == "--seed") seed = std::stoi(argv[i]);
+            else if (option == "--adaptive-threshold") adaptiveThreshold = std::stof(argv[i]);
             else throw std::runtime_error("Unknown option: " + option);
         }
         if ((sampling != "mis" && sampling != "bsdf") ||
@@ -288,6 +290,7 @@ int main(int argc, char** argv) {
         engine.SetRendererSetting(TfToken("prism:environmentSampling"), VtValue(TfToken(sampling)));
         engine.SetRendererSetting(TfToken("prism:textureFiltering"), VtValue(TfToken(filtering)));
         engine.SetRendererSetting(TfToken("prism:seed"), VtValue(seed));
+        engine.SetRendererSetting(TfToken("prism:adaptiveThreshold"), VtValue(adaptiveThreshold));
         engine.SetRendererSetting(TfToken("prism:sphereBatching"), VtValue(sphereBatching));
         engine.SetRendererAovs({HdAovTokens->color, HdAovTokens->depth,
             HdAovTokens->cameraDepth, HdAovTokens->normal, HdAovTokens->Neye,

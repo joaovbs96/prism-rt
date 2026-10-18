@@ -25,7 +25,7 @@
 [[vk::binding(kSlotMdlTiles, 0)]] StructuredBuffer<uint> g_mdlTiles;
 [[vk::binding(kSlotBsdfData, 0)]] StructuredBuffer<float> g_bsdfData;
 [[vk::binding(kSlotImages, 0)]] StructuredBuffer<GpuImage> g_images;
-[[vk::binding(kSlotTiles, 0)]] StructuredBuffer<GpuTile> g_tiles;
+[[vk::binding(kSlotPixels, 0)]] StructuredBuffer<uint> g_pixels;
 [[vk::binding(kSlotRng, 0)]] RWStructuredBuffer<uint> g_rng;
 [[vk::binding(kSlotOutput, 0)]] RWStructuredBuffer<float4> g_output;
 [[vk::binding(kSlotAccumulation, 0)]] RWStructuredBuffer<float4> g_accumulation;
@@ -55,7 +55,7 @@ StructuredBuffer<GpuMdlTexture> mdlTexturesBuffer() { return g_mdlTextures; }
 StructuredBuffer<uint> mdlTilesBuffer() { return g_mdlTiles; }
 StructuredBuffer<float> bsdfDataBuffer() { return g_bsdfData; }
 StructuredBuffer<GpuImage> imagesBuffer() { return g_images; }
-StructuredBuffer<GpuTile> tilesBuffer() { return g_tiles; }
+StructuredBuffer<uint> pixelsBuffer() { return g_pixels; }
 RWStructuredBuffer<uint> rngBuffer() { return g_rng; }
 RWStructuredBuffer<float4> outputBuffer() { return g_output; }
 RWStructuredBuffer<float4> accumulationBuffer() { return g_accumulation; }

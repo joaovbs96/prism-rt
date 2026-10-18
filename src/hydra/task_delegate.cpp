@@ -32,6 +32,8 @@ TfToken const _maxDepth("prism:maxDepth");
 TfToken const _rouletteDepth("prism:rrMinDepth");
 TfToken const _seed("prism:seed");
 TfToken const _sampleClamp("prism:maxSampleRadiance");
+TfToken const _adaptiveThreshold("prism:adaptiveThreshold");
+TfToken const _adaptiveMinSamples("prism:adaptiveMinSamples");
 TfToken const _adaptivePreview("prism:adaptivePreview");
 TfToken const _domeCameraVisibility("domeLightCameraVisibility");
 TfToken const _sphereBatching("prism:sphereBatching");
@@ -183,6 +185,8 @@ HdRenderSettingDescriptorList PrismTaskDelegate::GetRenderSettingDescriptors() c
             {"Roulette depth", _rouletteDepth, VtValue(4)},
             {"Seed", _seed, VtValue(0)},
             {"Sample clamp", _sampleClamp, VtValue(10.0f)},
+            {"Adaptive sampling threshold (0 off)", _adaptiveThreshold, VtValue(0.0f)},
+            {"Adaptive sampling minimum samples", _adaptiveMinSamples, VtValue(16)},
             {"Adaptive preview", _adaptivePreview, VtValue(true)},
             {"Dome light camera visibility", _domeCameraVisibility, VtValue(true)},
             {"Sphere batching (experimental)", _sphereBatching, VtValue(false)},
@@ -208,6 +212,8 @@ VtValue PrismTaskDelegate::GetRenderSetting(TfToken const &key) const
     if (key == _rouletteDepth) return VtValue(s.rouletteDepth);
     if (key == _seed) return VtValue(s.seed);
     if (key == _sampleClamp) return VtValue(s.sampleClamp);
+    if (key == _adaptiveThreshold) return VtValue(s.adaptiveThreshold);
+    if (key == _adaptiveMinSamples) return VtValue(s.adaptiveMinSamples);
     if (key == _adaptivePreview) return VtValue(s.adaptivePreview);
     if (key == _domeCameraVisibility) return VtValue(s.domeLightCameraVisibility);
     if (key == _sphereBatching) return VtValue(s.sphereBatching);
@@ -298,6 +304,10 @@ void PrismTaskDelegate::SetRenderSetting(TfToken const &key, VtValue const &valu
     else if (key == _rouletteDepth) s.rouletteDepth = std::max(0, _Get(value, s.rouletteDepth));
     else if (key == _seed) s.seed = _Get(value, s.seed);
     else if (key == _sampleClamp) s.sampleClamp = std::max(0.0f, _Get(value, s.sampleClamp));
+    else if (key == _adaptiveThreshold)
+        s.adaptiveThreshold = std::max(0.0f, _Get(value, s.adaptiveThreshold));
+    else if (key == _adaptiveMinSamples)
+        s.adaptiveMinSamples = std::max(1, _Get(value, s.adaptiveMinSamples));
     else if (key == _adaptivePreview)
         s.adaptivePreview = _Get(value, s.adaptivePreview);
     else if (key == _domeCameraVisibility)

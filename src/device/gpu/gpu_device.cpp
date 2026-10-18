@@ -49,32 +49,54 @@ std::vector<float> GpuRenderDevice::RenderImage(SceneManager& scene, ImageReques
 {
     std::lock_guard lock(m_renderMutex);
     std::vector<float> pixels(size_t(request.width) * request.height * 3, 0.0f);
+    if (request.meanSamples) *request.meanSamples = request.samples;
     std::string error;
     if (!PrepareScene(scene, &error)) {
         std::cerr << LogPrefix() << error << '\n';
         return pixels;
     }
+    const AdaptiveSettings& adaptive = request.adaptive;
     const uint32_t count = request.width * request.height;
     RenderBuffer(kSlotRng, size_t(count) * 4);
-    auto* sums = static_cast<float*>(RenderBuffer(kSlotAccumulation, size_t(count) * 16));
-    std::memset(sums, 0, size_t(count) * 16);
+    std::memset(RenderBuffer(kSlotAccumulation, size_t(count) * 32), 0, size_t(count) * 32);
+    std::vector<uint32_t> list(count);
+    for (uint32_t p = 0; p < count; ++p) list[p] = p;
+    std::vector<int> samples(count, 0);
+    ActivePixels active;
+    active.Reset(request.width, request.height);
     GpuFrame frame = BaseFrame(request.camera, request.width, request.height);
     frame.shading = {request.sampleClamp, 1.0f, 0.0f, 0.0f};
     frame.settings.w = request.seed;
-    frame.work = {count, 0, kModeImage, 0};
     double gpuSeconds = 0.0;
-    for (int sample = 0; sample < request.samples; ++sample) {
+    for (int sample = 0; sample < request.samples && !list.empty(); ++sample) {
+        std::memcpy(RenderBuffer(kSlotPixels, list.size() * 4), list.data(), list.size() * 4);
         GpuFrame f = frame;
+        f.work = {uint32_t(list.size()), 0, kModeImage, 0};
         f.counts.z = uint32_t(sample);
         if (sample == 0) f.settings.z |= kFrameSeedRng;
-        if (!Dispatch(f, count, &gpuSeconds, &error)) {
+        if (!Dispatch(f, uint32_t(list.size()), &gpuSeconds, &error)) {
             std::cerr << LogPrefix() << error << '\n';
             break;
         }
+        for (uint32_t p : list) samples[p] = sample + 1;
+        if (sample + 1 < request.samples && adaptive.CheckAfter(sample + 1)) {
+            auto const* sums = static_cast<const float*>(RenderBuffer(kSlotAccumulation, size_t(count) * 32));
+            active.Update(adaptive.threshold, [&](size_t p) {
+                return AdaptiveError(sums + 8 * p, sums + 8 * p + 4, sample + 1);
+            });
+            list.clear();
+            for (uint32_t p = 0; p < count; ++p)
+                if (active.Active(p)) list.push_back(p);
+        }
     }
-    const float scale = request.samples > 0 ? 1.0f / float(request.samples) : 0.0f;
-    for (size_t p = 0; p < count; ++p)
-        for (int c = 0; c < 3; ++c) pixels[3 * p + c] = sums[4 * p + c] * scale;
+    auto const* sums = static_cast<const float*>(RenderBuffer(kSlotAccumulation, size_t(count) * 32));
+    double total = 0.0;
+    for (size_t p = 0; p < count; ++p) {
+        const float scale = samples[p] > 0 ? 1.0f / float(samples[p]) : 0.0f;
+        for (int c = 0; c < 3; ++c) pixels[3 * p + c] = sums[8 * p + c] * scale;
+        total += samples[p];
+    }
+    if (request.meanSamples) *request.meanSamples = total / double(count);
     if (GpuVerbose())
         std::cerr << LogPrefix() << std::format("{} samples, GPU {:.3f} s\n", request.samples, gpuSeconds);
     return pixels;
@@ -110,6 +132,7 @@ void GpuRenderDevice::RenderPass(SceneManager& scene, PassRequest const& request
 
     // Tiles are dispatched in chunks so callers see progress and can stop.
     constexpr size_t chunkPixels = 1u << 18;
+    std::vector<uint32_t> list;
     size_t first = 0;
     while (first < request.tiles.size()) {
         while (paused()) {
@@ -118,41 +141,34 @@ void GpuRenderDevice::RenderPass(SceneManager& scene, PassRequest const& request
         }
         if (abandoned()) return;
         size_t last = first;
-        size_t threads = 0;
-        std::vector<GpuTile> tiles;
-        while (last < request.tiles.size() && (threads < chunkPixels || last == first)) {
+        list.clear();
+        while (last < request.tiles.size() && (list.size() < chunkPixels || last == first)) {
             PixelTile const& tile = request.tiles[last];
-            GpuTile record;
-            record.rect = {tile.x, tile.y, tile.width, tile.height};
-            record.info = {uint32_t(threads), 0, 0, 0};
-            tiles.push_back(record);
-            threads += size_t(tile.width) * tile.height;
+            for (unsigned y = tile.y; y < tile.y + tile.height; ++y)
+                for (unsigned x = tile.x; x < tile.x + tile.width; ++x) {
+                    const uint32_t pixel = y * width + x;
+                    if (!request.activePixels || request.activePixels[pixel]) list.push_back(pixel);
+                }
             ++last;
         }
         auto const rayStart = Clock::now();
-        if (traceColor) {
-            std::memcpy(RenderBuffer(kSlotTiles, tiles.size() * sizeof(GpuTile)), tiles.data(),
-                        tiles.size() * sizeof(GpuTile));
-            // Buffers may move when resized; fetch them again after the tiles.
+        if (traceColor && !list.empty()) {
+            std::memcpy(RenderBuffer(kSlotPixels, list.size() * 4), list.data(), list.size() * 4);
+            // Buffers may move when resized; fetch them again after the pixels.
             rng = static_cast<uint32_t*>(RenderBuffer(kSlotRng, pixels * 4));
             output = static_cast<float*>(RenderBuffer(kSlotOutput, pixels * 16));
             GpuFrame f = frame;
-            f.work = {uint32_t(threads), uint32_t(tiles.size()), kModePass, 0};
-            if (!Dispatch(f, uint32_t(threads), nullptr, &error)) {
+            f.work = {uint32_t(list.size()), 0, kModePass, 0};
+            if (!Dispatch(f, uint32_t(list.size()), nullptr, &error)) {
                 std::cerr << LogPrefix() << error << '\n';
                 return;
             }
-            for (size_t t = first; t < last; ++t) {
-                PixelTile const& tile = request.tiles[t];
-                for (unsigned y = tile.y; y < tile.y + tile.height; ++y)
-                    for (unsigned x = tile.x; x < tile.x + tile.width; ++x) {
-                        const size_t pixel = size_t(y) * width + x;
-                        request.rngStates[pixel] = rng[pixel];
-                        request.colors[pixel] = Color3(output[4 * pixel], output[4 * pixel + 1], output[4 * pixel + 2]);
-                        request.coverage[pixel] = output[4 * pixel + 3];
-                    }
+            for (uint32_t pixel : list) {
+                request.rngStates[pixel] = rng[pixel];
+                request.colors[pixel] = Color3(output[4 * pixel], output[4 * pixel + 1], output[4 * pixel + 2]);
+                request.coverage[pixel] = output[4 * pixel + 3];
             }
-            if (request.colorPixels) request.colorPixels->fetch_add(threads, std::memory_order_relaxed);
+            if (request.colorPixels) request.colorPixels->fetch_add(list.size(), std::memory_order_relaxed);
         }
         auto const primaryStart = Clock::now();
         if (request.rayNanoseconds)

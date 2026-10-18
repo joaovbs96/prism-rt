@@ -941,7 +941,7 @@ bool VulkanDevice::Impl::ensureScene(SceneManager& scene, std::string* error)
     upload(kSlotMdlTiles, d.mdlTiles.data(), bytes(d.mdlTiles));
     upload(kSlotBsdfData, d.bsdfData.data(), bytes(d.bsdfData));
     if (!buffers[kSlotFrame].buffer) upload(kSlotFrame, nullptr, sizeof(GpuFrame));
-    for (int slot : {kSlotTiles, kSlotRng, kSlotOutput, kSlotAccumulation})
+    for (int slot : {kSlotPixels, kSlotRng, kSlotOutput, kSlotAccumulation})
         if (!buffers[slot].buffer) upload(slot, nullptr, 16);
     if (!uploadImages(error) || !buildAccelerationStructures(error) || !writeDescriptors(error)) return fail();
     return true;

@@ -25,7 +25,7 @@ StructuredBuffer<GpuMdlTexture> mdlTexturesBuffer() { return ResourceDescriptorH
 StructuredBuffer<uint> mdlTilesBuffer() { return ResourceDescriptorHeap[kSlotMdlTiles]; }
 StructuredBuffer<float> bsdfDataBuffer() { return ResourceDescriptorHeap[kSlotBsdfData]; }
 StructuredBuffer<GpuImage> imagesBuffer() { return ResourceDescriptorHeap[kSlotImages]; }
-StructuredBuffer<GpuTile> tilesBuffer() { return ResourceDescriptorHeap[kSlotTiles]; }
+StructuredBuffer<uint> pixelsBuffer() { return ResourceDescriptorHeap[kSlotPixels]; }
 RWStructuredBuffer<uint> rngBuffer() { return ResourceDescriptorHeap[kSlotRng]; }
 RWStructuredBuffer<float4> outputBuffer() { return ResourceDescriptorHeap[kSlotOutput]; }
 RWStructuredBuffer<float4> accumulationBuffer() { return ResourceDescriptorHeap[kSlotAccumulation]; }
