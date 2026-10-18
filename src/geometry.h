@@ -1,5 +1,7 @@
 #pragma once
 
+#include <string>
+
 
 // STD Lib deps
 #include <iostream>
@@ -400,6 +402,39 @@ class Mesh : public Geometry {
         std::unordered_map<int, Material*> materials;
         std::unordered_map<int, int> material_mapping;
         Material* material_override = nullptr;
+
+        // Named primvars for materials (MaterialX geompropvalue), per vertex:
+        // primvarStride floats per vertex in primvarValues, each primvar at
+        // its offset.
+        struct Primvar {
+            std::string name;
+            int components = 0;
+            int offset = 0;
+        };
+        std::vector<Primvar> primvars;
+        int primvarStride = 0;
+        std::vector<float> primvarValues;
+
+        // The primvar at barycentrics (u, v) of triangle prim (Embree's
+        // convention: u weighs the second vertex, v the third). Absent
+        // components are zero; false if the mesh has no such primvar.
+        bool interpolatePrimvar(const char* name, unsigned prim, float u, float v, float* out, int count) const {
+            if (!name || !primvarStride || 3 * size_t(prim) + 2 >= indices.size()) return false;
+            for (auto const& primvar : primvars) {
+                if (primvar.name != name) continue;
+                const unsigned* tri = &indices[3 * size_t(prim)];
+                const float w[3] = {1.0f - u - v, u, v};
+                for (int c = 0; c < count; ++c) {
+                    float value = 0.0f;
+                    if (c < primvar.components)
+                        for (int k = 0; k < 3; ++k)
+                            value += w[k] * primvarValues[size_t(tri[k]) * primvarStride + primvar.offset + c];
+                    out[c] = value;
+                }
+                return true;
+            }
+            return false;
+        }
 
         // Finalize the vertex tangent stream before geometry fingerprinting.
         // setupEmbree() performs the same operation, but scene synchronization

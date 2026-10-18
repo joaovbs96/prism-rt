@@ -1209,6 +1209,85 @@ bool _ApplyHiddenGeometryBudget(Snapshot *snapshot, bool useCurrentEligibility =
     return !detach.empty();
 }
 
+// A named primvar of a mesh for materials (geompropvalue), as floats.
+struct _ExtraPrimvar {
+    std::string name;
+    int components = 0;
+    TfToken interpolation;
+    std::vector<float> values;
+};
+
+bool _PrimvarFloats(VtValue const &value, std::vector<float> *out, int *components)
+{
+    auto take = [&](auto const &array, int n) {
+        out->clear();
+        out->reserve(array.size() * size_t(n));
+        for (auto const &element : array) {
+            if constexpr (std::is_arithmetic_v<std::decay_t<decltype(element)>>) {
+                out->push_back(float(element));
+            } else {
+                for (int c = 0; c < n; ++c) out->push_back(float(element[c]));
+            }
+        }
+        *components = n;
+        return !out->empty();
+    };
+    if (value.IsHolding<VtFloatArray>()) return take(value.UncheckedGet<VtFloatArray>(), 1);
+    if (value.IsHolding<VtDoubleArray>()) return take(value.UncheckedGet<VtDoubleArray>(), 1);
+    if (value.IsHolding<VtIntArray>()) return take(value.UncheckedGet<VtIntArray>(), 1);
+    if (value.IsHolding<VtVec2fArray>()) return take(value.UncheckedGet<VtVec2fArray>(), 2);
+    if (value.IsHolding<VtVec2dArray>()) return take(value.UncheckedGet<VtVec2dArray>(), 2);
+    if (value.IsHolding<VtVec3fArray>()) return take(value.UncheckedGet<VtVec3fArray>(), 3);
+    if (value.IsHolding<VtVec3dArray>()) return take(value.UncheckedGet<VtVec3dArray>(), 3);
+    if (value.IsHolding<VtVec4fArray>()) return take(value.UncheckedGet<VtVec4fArray>(), 4);
+    if (value.IsHolding<VtVec4dArray>()) return take(value.UncheckedGet<VtVec4dArray>(), 4);
+    if (value.IsHolding<float>()) return take(std::array<float, 1>{value.UncheckedGet<float>()}, 1);
+    if (value.IsHolding<double>()) return take(std::array<double, 1>{value.UncheckedGet<double>()}, 1);
+    if (value.IsHolding<int>()) return take(std::array<int, 1>{value.UncheckedGet<int>()}, 1);
+    if (value.IsHolding<GfVec2f>()) return take(std::array<GfVec2f, 1>{value.UncheckedGet<GfVec2f>()}, 2);
+    if (value.IsHolding<GfVec3f>()) return take(std::array<GfVec3f, 1>{value.UncheckedGet<GfVec3f>()}, 3);
+    if (value.IsHolding<GfVec4f>()) return take(std::array<GfVec4f, 1>{value.UncheckedGet<GfVec4f>()}, 4);
+    return false;
+}
+
+// The primvars of a mesh other than its geometry (points, normals, texture
+// coordinates), whose size fits their interpolation.
+std::vector<_ExtraPrimvar> _ExtraPrimvars(HdPrimvarsSchema const &primvars, size_t points, size_t faces,
+                                          size_t corners)
+{
+    static const std::unordered_set<std::string> skipped = {
+        "points", "normals", "widths", "velocities", "accelerations", "angularVelocities"};
+    constexpr int kMaxComponents = 64;
+    std::vector<_ExtraPrimvar> result;
+    int total = 0;
+    TfTokenVector names = primvars.GetPrimvarNames();
+    std::sort(names.begin(), names.end());
+    for (TfToken const &name : names) {
+        const std::string text = name.GetString();
+        if (skipped.count(text) || text.find(':') != std::string::npos) continue;
+        PrimvarData data = _Primvar(primvars, name);
+        // Constant display colors drive the fallback material, so their edits
+        // stay material edits.
+        if ((text == "displayColor" || text == "displayOpacity") &&
+            data.interpolation == HdPrimvarSchemaTokens->constant) continue;
+        _ExtraPrimvar extra;
+        extra.name = text;
+        extra.interpolation = data.interpolation;
+        if (!_PrimvarFloats(data.value, &extra.values, &extra.components)) continue;
+        const size_t count = extra.values.size() / size_t(extra.components);
+        size_t expected = 0;
+        if (extra.interpolation == HdPrimvarSchemaTokens->constant) expected = 1;
+        else if (extra.interpolation == HdPrimvarSchemaTokens->uniform) expected = faces;
+        else if (extra.interpolation == HdPrimvarSchemaTokens->faceVarying) expected = corners;
+        else expected = points; // vertex, varying
+        if (extra.interpolation == HdPrimvarSchemaTokens->constant ? count < 1 : count != expected) continue;
+        if (total + extra.components > kMaxComponents) break;
+        total += extra.components;
+        result.push_back(std::move(extra));
+    }
+    return result;
+}
+
 // Uniform subdivision of subdivision surfaces: the highest level, and the
 // faces one mesh may refine to (meshes denser than that use lower levels, and
 // their control hulls beyond it). PRISM_SUBDIVISION_LEVEL (0 renders control
@@ -1287,6 +1366,19 @@ MeshConversion _ConvertMesh(HdContainerDataSourceHandle const &dataSource)
     PrimvarData const alternateUvPv = _Primvar(primvars, TfToken("uv"));
     info.multipleUvSets = !uvPv.value.IsEmpty() && !alternateUvPv.value.IsEmpty();
     if (uvPv.value.IsEmpty()) uvPv = alternateUvPv;
+    std::vector<_ExtraPrimvar> extras = _ExtraPrimvars(primvars, pointCount, coarseCounts.size(),
+                                                       coarseIndices.size());
+    int extraStride = 0;
+    int pointDataStride = 0;
+    std::vector<int> extraOffsets, extraPointOffsets;
+    for (auto const &extra : extras) {
+        extraOffsets.push_back(extraStride);
+        extraStride += extra.components;
+        const bool perPoint = extra.interpolation == HdPrimvarSchemaTokens->vertex ||
+            extra.interpolation == HdPrimvarSchemaTokens->varying;
+        extraPointOffsets.push_back(perPoint ? pointDataStride : -1);
+        if (perPoint) pointDataStride += extra.components;
+    }
 
     // Subdivision surfaces become their limit surface at a uniform level;
     // their normals come from the limit (authored ones do not apply).
@@ -1374,6 +1466,19 @@ MeshConversion _ConvertMesh(HdContainerDataSourceHandle const &dataSource)
             }
             input.uvs = uvs;
             input.uvPerPoint = vertexUvs;
+            std::vector<float> pointData;
+            if (pointDataStride) {
+                pointData.resize(pointCount * size_t(pointDataStride));
+                for (size_t e = 0; e < extras.size(); ++e) {
+                    if (extraPointOffsets[e] < 0) continue;
+                    const int n = extras[e].components;
+                    for (size_t p = 0; p < pointCount; ++p)
+                        for (int c = 0; c < n; ++c)
+                            pointData[p * pointDataStride + extraPointOffsets[e] + c] = extras[e].values[p * n + c];
+                }
+                input.pointData = pointData;
+                input.pointDataStride = pointDataStride;
+            }
             refined = prism::subdivision::Refine(input);
         }
         if (refined.valid) {
@@ -1406,6 +1511,44 @@ MeshConversion _ConvertMesh(HdContainerDataSourceHandle const &dataSource)
     // The authored face of a (refined) face.
     auto coarseFace = [&](size_t face) {
         return refined.valid ? size_t(refined.coarseFaces[face]) : face;
+    };
+    // Face-varying primvars of refined meshes: the mean of each authored face.
+    std::vector<std::vector<float>> faceMeans(extras.size());
+    if (refined.valid) {
+        for (size_t e = 0; e < extras.size(); ++e) {
+            if (extras[e].interpolation != HdPrimvarSchemaTokens->faceVarying) continue;
+            const int n = extras[e].components;
+            faceMeans[e].assign(coarseCounts.size() * size_t(n), 0.0f);
+            size_t corner = 0;
+            for (size_t f = 0; f < coarseCounts.size(); ++f) {
+                const int count = std::max(0, coarseCounts[f]);
+                for (int k = 0; k < count && corner + k < coarseIndices.size(); ++k)
+                    for (int c = 0; c < n; ++c)
+                        faceMeans[e][f * n + c] += extras[e].values[(corner + k) * n + c] / float(std::max(1, count));
+                corner += size_t(count);
+            }
+        }
+    }
+    // Values of every extra primvar at one corner of a (refined) face.
+    auto appendExtras = [&](std::vector<float> &out, size_t point, size_t cornerIndex, size_t face) {
+        for (size_t e = 0; e < extras.size(); ++e) {
+            auto const &extra = extras[e];
+            const int n = extra.components;
+            const float *source = nullptr;
+            if (extraPointOffsets[e] >= 0) {
+                source = refined.valid
+                    ? refined.pointData.data() + point * pointDataStride + extraPointOffsets[e]
+                    : extra.values.data() + point * n;
+            } else if (extra.interpolation == HdPrimvarSchemaTokens->faceVarying) {
+                source = refined.valid ? faceMeans[e].data() + coarseFace(face) * n
+                                       : extra.values.data() + cornerIndex * n;
+            } else if (extra.interpolation == HdPrimvarSchemaTokens->uniform) {
+                source = extra.values.data() + coarseFace(face) * n;
+            } else {
+                source = extra.values.data();
+            }
+            out.insert(out.end(), source, source + n);
+        }
     };
     VtVec3fArray const *authoredNormalsFloat = nullptr;
     VtVec3dArray const *authoredNormalsDouble = nullptr;
@@ -1482,6 +1625,9 @@ MeshConversion _ConvertMesh(HdContainerDataSourceHandle const &dataSource)
     }
 
     std::unique_ptr<Mesh, ConvertedMeshDeleter> mesh(new Mesh());
+    mesh->primvarStride = extraStride;
+    for (size_t e = 0; e < extras.size(); ++e)
+        mesh->primvars.push_back({extras[e].name, extras[e].components, extraOffsets[e]});
     mesh->vertices.reserve(3 * triangleEstimate);
     mesh->normals.reserve(3 * triangleEstimate);
     mesh->texcoords.reserve(3 * triangleEstimate);
@@ -1548,6 +1694,7 @@ MeshConversion _ConvertMesh(HdContainerDataSourceHandle const &dataSource)
                     }
                 }
                 else mesh->texcoords.emplace_back(0.0f, 0.0f);
+                if (extraStride) appendExtras(mesh->primvarValues, size_t(pi), ci, face);
             }
             const GfVec3d geometric = GfCross(wp[1] - wp[0], wp[2] - wp[0]).GetNormalized();
             for (int v = 0; v < 3; ++v) {
@@ -1587,13 +1734,18 @@ MeshConversion _ConvertMesh(HdContainerDataSourceHandle const &dataSource)
     // Keeping tangent sign in the key preserves mirrored UV seams and avoids
     // changing interpolated frames when positions/normals happen to match.
     struct VertexHash {
-        size_t operator()(std::array<uint32_t,12> const& value) const {
+        size_t operator()(std::array<uint32_t,14> const& value) const {
             size_t h = 0;
             for (auto bits : value) h ^= std::hash<uint32_t>{}(bits) + size_t{0x9e3779b9} + (h<<6) + (h>>2);
             return h;
         }
     };
-    std::unordered_map<std::array<uint32_t,12>, unsigned, VertexHash> uniqueVertices;
+    std::unordered_map<std::array<uint32_t,14>, unsigned, VertexHash> uniqueVertices;
+    // Named primvars take part in the merge through a 64-bit digest, checked
+    // against the values on a match.
+    const size_t extraCount = size_t(mesh->primvarStride);
+    std::vector<float> compactExtras;
+    compactExtras.reserve(extraCount * std::min(mesh->vertices.size(), pointCount));
     uniqueVertices.reserve(mesh->vertices.size());
     // Shared corners usually make the compact arrays far smaller than the
     // expanded ones; the authored point count is the closest cheap guess.
@@ -1611,18 +1763,30 @@ MeshConversion _ConvertMesh(HdContainerDataSourceHandle const &dataSource)
         const auto& uv=mesh->texcoords[i];
         const float values[12]={p.x(),p.y(),p.z(),n.x(),n.y(),n.z(),uv.u(),uv.v(),
             mesh->tangents[4*i],mesh->tangents[4*i+1],mesh->tangents[4*i+2],mesh->tangents[4*i+3]};
-        std::array<uint32_t,12> key{};
-        for (size_t c=0;c<key.size();++c) key[c]=std::bit_cast<uint32_t>(values[c]);
+        std::array<uint32_t,14> key{};
+        for (size_t c=0;c<12;++c) key[c]=std::bit_cast<uint32_t>(values[c]);
+        float const* extra = extraCount ? mesh->primvarValues.data() + i * extraCount : nullptr;
+        if (extra) {
+            uint64_t digest = 1469598103934665603ull;
+            for (size_t c=0;c<extraCount;++c) digest=(digest^std::bit_cast<uint32_t>(extra[c]))*1099511628211ull;
+            key[12]=uint32_t(digest); key[13]=uint32_t(digest>>32);
+        }
         auto [found,inserted]=uniqueVertices.emplace(key,static_cast<unsigned>(compactPositions.size()));
-        remap[i]=found->second;
-        if (inserted) {
+        bool fresh=inserted;
+        if (!inserted && extra &&
+            !std::equal(extra, extra + extraCount, compactExtras.data() + size_t(found->second) * extraCount))
+            fresh=true; // digest collision: keep the vertex apart
+        remap[i]=fresh ? static_cast<unsigned>(compactPositions.size()) : found->second;
+        if (fresh) {
             compactPositions.push_back(p); compactNormals.push_back(n); compactUvs.push_back(uv);
             compactTangents.insert(compactTangents.end(),values+8,values+12);
+            if (extra) compactExtras.insert(compactExtras.end(), extra, extra + extraCount);
         }
     }
     for (auto& index : mesh->indices) index=remap[index];
     mesh->vertices=std::move(compactPositions); mesh->normals=std::move(compactNormals);
     mesh->texcoords=std::move(compactUvs); mesh->tangents=std::move(compactTangents);
+    mesh->primvarValues=std::move(compactExtras);
     auto hashCombine = [](size_t &seed, auto const &value) {
         const size_t valueHash = std::hash<std::decay_t<decltype(value)>>{}(value);
         seed ^= valueHash + size_t{0x9e3779b9} + (seed << 6) + (seed >> 2);
@@ -1645,6 +1809,8 @@ MeshConversion _ConvertMesh(HdContainerDataSourceHandle const &dataSource)
         hashCombine(geometryHash, uv.u()); hashCombine(geometryHash, uv.v());
     }
     for (float const value : mesh->tangents) hashCombine(geometryHash, value);
+    for (auto const &primvar : mesh->primvars) hashCombine(geometryHash, primvar.name);
+    for (float const value : mesh->primvarValues) hashCombine(geometryHash, value);
     for (unsigned int const index : mesh->indices) hashCombine(geometryHash, index);
     info.geometryHash = geometryHash;
     info.coarseFaces = SharedFaceTable(std::move(coarseFaces));

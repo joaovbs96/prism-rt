@@ -21,6 +21,8 @@
 [[vk::binding(kSlotEnvAlias, 0)]] StructuredBuffer<uint> g_envAlias;
 [[vk::binding(kSlotLights, 0)]] StructuredBuffer<LightRecord> g_lights;
 [[vk::binding(kSlotLightAlias, 0)]] StructuredBuffer<float4> g_lightAlias;
+[[vk::binding(kSlotPrimvarValues, 0)]] StructuredBuffer<float> g_primvarValues;
+[[vk::binding(kSlotPrimvarDirectory, 0)]] StructuredBuffer<GpuPrimvar> g_primvarDirectory;
 [[vk::binding(kSlotArgumentBlocks, 0)]] StructuredBuffer<uint> g_argumentBlocks;
 [[vk::binding(kSlotRoData, 0)]] StructuredBuffer<uint> g_roData;
 [[vk::binding(kSlotMdlTextures, 0)]] StructuredBuffer<GpuMdlTexture> g_mdlTextures;
@@ -53,6 +55,8 @@ StructuredBuffer<float> envAliasProbabilityBuffer() { return g_envAliasProbabili
 StructuredBuffer<uint> envAliasBuffer() { return g_envAlias; }
 StructuredBuffer<LightRecord> lightsBuffer() { return g_lights; }
 StructuredBuffer<float4> lightAliasBuffer() { return g_lightAlias; }
+StructuredBuffer<float> primvarValuesBuffer() { return g_primvarValues; }
+StructuredBuffer<GpuPrimvar> primvarDirectoryBuffer() { return g_primvarDirectory; }
 StructuredBuffer<uint> argumentBlocksBuffer() { return g_argumentBlocks; }
 StructuredBuffer<uint> roDataBuffer() { return g_roData; }
 StructuredBuffer<GpuMdlTexture> mdlTexturesBuffer() { return g_mdlTextures; }

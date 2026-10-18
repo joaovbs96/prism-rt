@@ -51,6 +51,12 @@ SurfaceHit gpu_empty_hit(PathRay ray)
     h.texture_footprint.filtered = false;
     h.dpdx = (float3)0.0f;
     h.dpdy = (float3)0.0f;
+    h.bary_u = 0.0f;
+    h.bary_v = 0.0f;
+    h.vertex0 = 0u;
+    h.vertex1 = 0u;
+    h.vertex2 = 0u;
+    h.prototype = 0xffffffffu;
     return h;
 }
 
@@ -236,6 +242,12 @@ GpuHit gpu_intersect(PathRay ray, uint mask)
     if (type == kProtoTriangles) {
         float u = raw.barycentrics.x;
         float v = raw.barycentrics.y;
+        hit.bary_u = u;
+        hit.bary_v = v;
+        hit.vertex0 = i0;
+        hit.vertex1 = i1;
+        hit.vertex2 = i2;
+        hit.prototype = inst.info.x;
         float w = 1.0f - u - v;
         float3 n = w * gpu_vertex_normal(i0) + u * gpu_vertex_normal(i1) + v * gpu_vertex_normal(i2);
         float2 uv = gpu_texcoord(i0) * w + gpu_texcoord(i1) * u + gpu_texcoord(i2) * v;
@@ -534,6 +546,11 @@ struct GpuShading {
 void gpu_build_mdl_state(SurfaceHit hit, GpuMaterial material, out Shading_state_material state)
 {
     state.view_origin = hit.o;
+    state.primvar_prototype = hit.prototype;
+    state.primvar_vertex[0] = hit.vertex0;
+    state.primvar_vertex[1] = hit.vertex1;
+    state.primvar_vertex[2] = hit.vertex2;
+    state.primvar_bary = float2(hit.bary_u, hit.bary_v);
     state.text_coords[0].val = float3(hit.u, hit.v, 0.0f);
     bool filtered = hit.texture_footprint.filtered;
     state.text_coords[0].dx = filtered ? float3(hit.texture_footprint.dudx, hit.texture_footprint.dvdx, 0.0f)

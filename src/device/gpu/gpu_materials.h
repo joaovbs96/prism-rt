@@ -55,6 +55,8 @@ struct MdlShaderCode {
     std::vector<MdlMaterialRecord> materials; // parallel to the input
     uint32_t programCount = 0;
     int textureResults = 0;
+    // String constants of the link unit (scene data names are their indices).
+    std::vector<std::string> stringConstants;
     double translateSeconds = 0.0;
 };
 

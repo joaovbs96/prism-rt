@@ -191,6 +191,14 @@ struct SurfaceHit {
     TextureFootprint texture_footprint;
     float3 dpdx;
     float3 dpdy;
+    // Triangle barycentrics, and (GPU) the hit's vertices and prototype, for
+    // named primvar lookups.
+    float bary_u;
+    float bary_v;
+    uint vertex0;
+    uint vertex1;
+    uint vertex2;
+    uint prototype;
 };
 
 struct BsdfSample {

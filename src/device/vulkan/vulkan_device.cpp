@@ -987,6 +987,8 @@ bool VulkanDevice::Impl::ensureScene(SceneManager& scene, std::string* error)
     upload(kSlotEnvironment, d.environments.data(), bytes(d.environments));
     upload(kSlotLights, d.lights.data(), bytes(d.lights));
     upload(kSlotLightAlias, d.lightAlias.data(), bytes(d.lightAlias));
+    upload(kSlotPrimvarValues, d.primvarValues.data(), bytes(d.primvarValues));
+    upload(kSlotPrimvarDirectory, d.primvars.data(), bytes(d.primvars));
     static const GpuSceneData::EnvironmentTables noTables;
     auto const& tables = d.environmentTables ? *d.environmentTables : noTables;
     upload(kSlotEnvTexelPdf, tables.texelPdf.data(), bytes(tables.texelPdf));

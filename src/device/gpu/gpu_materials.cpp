@@ -584,6 +584,9 @@ MdlShaderCode GenerateMdlShaderCode(std::vector<MDLMaterial const*> const& mater
     result.roData.resize(std::max<size_t>(16, (result.roData.size() + 15) & ~size_t(15)));
 
     result.code = code->get_code();
+    result.stringConstants.assign(code->get_string_constant_count(), std::string());
+    for (mi::Size i = 1; i < code->get_string_constant_count(); ++i)
+        if (const char* name = code->get_string_constant(i)) result.stringConstants[i] = name;
     result.code += "\n// ---- Prism material dispatch ----\n";
     result.code += GenerateDispatch(present, traits);
     result.code += GenerateSceneData(code.get());

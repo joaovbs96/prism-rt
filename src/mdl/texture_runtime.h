@@ -16,6 +16,15 @@
 
 namespace mdl {
 
+// A surface point of a mesh and how to read its named primvars.
+struct PrimvarContext {
+    const void* mesh = nullptr;
+    unsigned primitive = 0;
+    float u = 0.0f, v = 0.0f;
+    bool (*lookup)(const void* mesh, const char* name, unsigned primitive, float u, float v,
+                   float* out, int count) = nullptr;
+};
+
 class NativeTextureRuntime {
 public:
     struct ArgumentResourcePreflight {
@@ -85,6 +94,15 @@ public:
     // The origin of the ray being shaded on this thread (MDLMaterial sets it
     // with the shading state): scene data CAMERA_POSITION.
     static inline thread_local float viewOrigin[3] = {0.0f, 0.0f, 0.0f};
+    // The surface point being shaded on this thread, for named primvar
+    // lookups (MDLMaterial sets it with the shading state).
+    static inline thread_local PrimvarContext primvarContext{};
+    // Scene data `id` (a string constant) of the current point into out[count].
+    bool lookupPrimvar(unsigned id, float* out, int count) const {
+        auto const& c = primvarContext;
+        if (!c.mesh || !c.lookup || id >= m_sceneDataNames.size() || m_sceneDataNames[id].empty()) return false;
+        return c.lookup(c.mesh, m_sceneDataNames[id].c_str(), c.primitive, c.u, c.v, out, count);
+    }
     ResourceView resource(size_t index) const;
     // Prepares the 2D texture (or UDIM set) stored under a database name, as
     // the runtime does for the textures of its own target code.
@@ -129,6 +147,7 @@ private:
     std::vector<Texture> m_textures; // index 0 is invalid
     std::vector<bool> m_texcoordSceneData; // by string constant index
     std::vector<bool> m_cameraPositionSceneData;
+    std::vector<std::string> m_sceneDataNames;  // by string constant index
     mutable std::atomic<bool> m_reportedLookupFailure{false};
     // Most graphs use a single constant crop. Keep a bounded set of prepared
     // crop views; no source pixel arrays survive preparation.

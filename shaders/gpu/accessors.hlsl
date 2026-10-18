@@ -38,6 +38,8 @@ float gpu_env_alias_probability(uint i) { return envAliasProbabilityBuffer()[i];
 uint gpu_env_alias(uint i) { return envAliasBuffer()[i]; }
 LightRecord gpu_light(uint i) { return lightsBuffer()[i]; }
 float4 gpu_light_alias(uint i) { return lightAliasBuffer()[i]; }
+float gpu_primvar_value(uint i) { return primvarValuesBuffer()[i]; }
+GpuPrimvar gpu_primvar(uint i) { return primvarDirectoryBuffer()[i]; }
 uint gpu_argblock_word(uint i) { return argumentBlocksBuffer()[i]; }
 uint gpu_rodata_word(uint i) { return roDataBuffer()[i]; }
 GpuMdlTexture gpu_mdl_texture(uint i) { return mdlTexturesBuffer()[i]; }

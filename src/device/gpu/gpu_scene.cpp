@@ -200,6 +200,21 @@ public:
                                   mesh->indices.begin() + triangles * 3);
             record.info.w = uint32_t(triangles);
             record.info2.x = mesh && mesh->texcoords.size() == vertexCount ? 1u : 0u;
+            if (mesh && mesh->primvarStride > 0 &&
+                mesh->primvarValues.size() == vertexCount * size_t(mesh->primvarStride)) {
+                record.info2.y = uint32_t(m_data.primvars.size());
+                record.info2.z = uint32_t(mesh->primvars.size());
+                record.info2.w = uint32_t(m_data.primvarValues.size());
+                m_data.primvarValues.insert(m_data.primvarValues.end(), mesh->primvarValues.begin(),
+                                            mesh->primvarValues.end());
+                for (auto const& primvar : mesh->primvars) {
+                    GpuPrimvar entry;
+                    entry.info = {0u, uint32_t(primvar.components), uint32_t(primvar.offset),
+                                  uint32_t(mesh->primvarStride)};
+                    m_data.primvars.push_back(entry);
+                    m_data.primvarNames.push_back(primvar.name);
+                }
+            }
         } else if (geometry->type == RTC_GEOMETRY_TYPE_QUAD) {
             // Embree splits quad (v0, v1, v2, v3) into (v0, v1, v3) and
             // (v2, v3, v1); the kernel restores the quad parameterization.
@@ -541,6 +556,15 @@ void ApplyMdlShaderCode(GpuSceneData& data, MdlShaderCode const& code)
             opaque = blocks(data.materials[data.primitiveMaterials[instance.info.z + p]]);
         if (opaque) instance.info.y |= kInstanceOpaque;
         else data.hasCutouts = true;
+    }
+
+    // Named primvars answer the scene data lookups of their name.
+    std::unordered_map<std::string, uint32_t> stringIds;
+    for (size_t i = 1; i < code.stringConstants.size(); ++i)
+        if (!code.stringConstants[i].empty()) stringIds.emplace(code.stringConstants[i], uint32_t(i));
+    for (size_t i = 0; i < data.primvars.size(); ++i) {
+        auto found = stringIds.find(data.primvarNames[i]);
+        data.primvars[i].info.x = found != stringIds.end() ? found->second : 0u;
     }
 
     data.mdlTextures.assign(1, GpuMdlTexture{});

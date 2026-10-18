@@ -20,6 +20,7 @@ namespace prism::device {
 struct CpuHit {
     SurfaceHit surface;
     ::Material* material = nullptr;
+    const void* primvarMesh = nullptr;
 };
 
 struct CpuShading {
@@ -82,6 +83,7 @@ struct CpuBackend {
         const RayHit rh = scene->cast_ray(query);
         CpuHit hit;
         hit.surface = FromRayHit(rh);
+        hit.primvarMesh = rh.primvarMesh;
         if (hit.surface.valid) hit.material = scene->getMaterial(rh);
         return hit;
     }
@@ -90,6 +92,7 @@ struct CpuBackend {
     {
         CpuShading shading;
         shading.hit = ToRayHit(hit.surface);
+        shading.hit->primvarMesh = hit.primvarMesh;
         shading.material = hit.material;
         hit.material->perturbNormal(*shading.hit);
         hit.material->prepare(*shading.hit, shading.prepared);
@@ -130,7 +133,12 @@ struct CpuBackend {
 
     bool supportsNee(CpuShading const& shading) { return shading.material->supportsNee(*shading.hit); }
     bool provenOpaque(CpuHit const& hit) { return hit.material->provenOpaque(); }
-    float cutoutOpacity(CpuHit const& hit) { return hit.material->cutoutOpacity(ToRayHit(hit.surface)); }
+    float cutoutOpacity(CpuHit const& hit)
+    {
+        RayHit rh = ToRayHit(hit.surface);
+        rh.primvarMesh = hit.primvarMesh;
+        return hit.material->cutoutOpacity(rh);
+    }
 
     float3 environmentRadiance(float3 direction, float angular)
     {
@@ -219,6 +227,10 @@ struct CpuBackend {
                                  rh.texture_footprint.filtering == prism::TextureFiltering::Filtered};
         hit.dpdx = FromFloat3(rh.dpdx);
         hit.dpdy = FromFloat3(rh.dpdy);
+        hit.bary_u = rh.bary_u;
+        hit.bary_v = rh.bary_v;
+        hit.vertex0 = hit.vertex1 = hit.vertex2 = 0u;
+        hit.prototype = 0u;
         return hit;
     }
 
@@ -254,6 +266,8 @@ struct CpuBackend {
             ? prism::TextureFiltering::Filtered : prism::TextureFiltering::Bilinear;
         rh.dpdx = ToFloat3(hit.dpdx);
         rh.dpdy = ToFloat3(hit.dpdy);
+        rh.bary_u = hit.bary_u;
+        rh.bary_v = hit.bary_v;
         return rh;
     }
 };

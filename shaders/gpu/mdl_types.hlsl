@@ -29,6 +29,10 @@ struct Shading_state_material {
     float meters_per_scene_unit;
     uint arg_block_offset;
     float3 view_origin;   // origin of the ray that hit: scene data CAMERA_POSITION
+    // The hit triangle, for named primvar lookups (prototype ~0u: none).
+    uint primvar_prototype;
+    uint primvar_vertex[3];
+    float2 primvar_bary;
 };
 
 

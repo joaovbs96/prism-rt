@@ -21,6 +21,8 @@ StructuredBuffer<float> envAliasProbabilityBuffer() { return ResourceDescriptorH
 StructuredBuffer<uint> envAliasBuffer() { return ResourceDescriptorHeap[kSlotEnvAlias]; }
 StructuredBuffer<LightRecord> lightsBuffer() { return ResourceDescriptorHeap[kSlotLights]; }
 StructuredBuffer<float4> lightAliasBuffer() { return ResourceDescriptorHeap[kSlotLightAlias]; }
+StructuredBuffer<float> primvarValuesBuffer() { return ResourceDescriptorHeap[kSlotPrimvarValues]; }
+StructuredBuffer<GpuPrimvar> primvarDirectoryBuffer() { return ResourceDescriptorHeap[kSlotPrimvarDirectory]; }
 StructuredBuffer<uint> argumentBlocksBuffer() { return ResourceDescriptorHeap[kSlotArgumentBlocks]; }
 StructuredBuffer<uint> roDataBuffer() { return ResourceDescriptorHeap[kSlotRoData]; }
 StructuredBuffer<GpuMdlTexture> mdlTexturesBuffer() { return ResourceDescriptorHeap[kSlotMdlTextures]; }

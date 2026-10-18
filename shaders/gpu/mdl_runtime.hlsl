@@ -496,30 +496,75 @@ float4 df_bsdf_measurement_albedos(int bm_idx, float2 theta_phi) { return float4
 bool prism_scene_data_is_texcoord(int id);
 bool prism_scene_data_is_camera_position(int id);
 
+// A named primvar of the hit triangle (Mesh::interpolatePrimvar).
+bool prism_primvar(Shading_state_material state, int id, out float4 value)
+{
+    value = (float4)0.0f;
+    if (state.primvar_prototype == 0xffffffffu || id <= 0) return false;
+    const GpuPrototype prototype = gpu_prototype(state.primvar_prototype);
+    for (uint i = 0u; i < prototype.info2.z; ++i) {
+        const GpuPrimvar primvar = gpu_primvar(prototype.info2.y + i);
+        if (primvar.info.x != uint(id)) continue;
+        const float w[3] = {1.0f - state.primvar_bary.x - state.primvar_bary.y, state.primvar_bary.x,
+                            state.primvar_bary.y};
+        float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (uint k = 0u; k < 3u; ++k) {
+            const uint base = prototype.info2.w + (state.primvar_vertex[k] - prototype.info.y) * primvar.info.w +
+                primvar.info.z;
+            for (uint c = 0u; c < 4u; ++c)
+                if (c < primvar.info.y) result[c] += w[k] * gpu_primvar_value(base + c);
+        }
+        value = float4(result[0], result[1], result[2], result[3]);
+        return true;
+    }
+    return false;
+}
+
 // Scene data: the texture coordinates under their usual primvar names
 // (prism_scene_data_is_texcoord, generated per link unit); other lookups
 // return their defaults, as in the native runtime.
 bool scene_data_isvalid(inout Shading_state_material state, int scene_data_id)
 {
-    return prism_scene_data_is_texcoord(scene_data_id) || prism_scene_data_is_camera_position(scene_data_id);
+    float4 probe;
+    return prism_scene_data_is_texcoord(scene_data_id) || prism_scene_data_is_camera_position(scene_data_id) ||
+        prism_primvar(state, scene_data_id, probe);
 }
-float4 scene_data_lookup_float4(inout Shading_state_material state, int id, float4 value, bool uniform_lookup) { return value; }
+float4 scene_data_lookup_float4(inout Shading_state_material state, int id, float4 value, bool uniform_lookup)
+{
+    float4 primvar;
+    return prism_primvar(state, id, primvar) ? primvar : value;
+}
 // MaterialX viewdirection: the view point of a path tracer is the origin of the ray that hit.
 float3 scene_data_lookup_float3(inout Shading_state_material state, int id, float3 value, bool uniform_lookup)
 {
-    return prism_scene_data_is_camera_position(id) ? state.view_origin : value;
+    if (prism_scene_data_is_camera_position(id)) return state.view_origin;
+    float4 primvar;
+    return prism_primvar(state, id, primvar) ? primvar.xyz : value;
 }
-float3 scene_data_lookup_color(inout Shading_state_material state, int id, float3 value, bool uniform_lookup) { return value; }
+float3 scene_data_lookup_color(inout Shading_state_material state, int id, float3 value, bool uniform_lookup)
+{
+    float4 primvar;
+    return prism_primvar(state, id, primvar) ? primvar.xyz : value;
+}
 float2 scene_data_lookup_float2(inout Shading_state_material state, int id, float2 value, bool uniform_lookup)
 {
     if (prism_scene_data_is_texcoord(id))
         return float2(state.text_coords[0].val.x, state.text_coords[0].val.y);
-    return value;
+    float4 primvar;
+    return prism_primvar(state, id, primvar) ? primvar.xy : value;
 }
 Derived_float2 scene_data_lookup_deriv_float2(inout Shading_state_material state, int id, Derived_float2 value,
                                               bool uniform_lookup)
 {
-    if (!prism_scene_data_is_texcoord(id)) return value;
+    float4 primvar;
+    if (!prism_scene_data_is_texcoord(id)) {
+        if (!prism_primvar(state, id, primvar)) return value;
+        Derived_float2 named;
+        named.val = primvar.xy;
+        named.dx = (float2)0.0f;
+        named.dy = (float2)0.0f;
+        return named;
+    }
     Derived_float2 result;
     result.val = float2(state.text_coords[0].val.x, state.text_coords[0].val.y);
     result.dx = float2(state.text_coords[0].dx.x, state.text_coords[0].dx.y);
@@ -527,22 +572,55 @@ Derived_float2 scene_data_lookup_deriv_float2(inout Shading_state_material state
     return result;
 }
 Derived_float scene_data_lookup_deriv_float(inout Shading_state_material state, int id, Derived_float value,
-                                            bool uniform_lookup) { return value; }
+                                            bool uniform_lookup)
+{
+    float4 primvar;
+    if (!prism_primvar(state, id, primvar)) return value;
+    Derived_float result;
+    result.val = primvar.x;
+    result.dx = 0.0f;
+    result.dy = 0.0f;
+    return result;
+}
 Derived_float3 scene_data_lookup_deriv_float3(inout Shading_state_material state, int id, Derived_float3 value,
                                               bool uniform_lookup)
 {
-    if (!prism_scene_data_is_camera_position(id)) return value;
+    float4 primvar;
+    const bool camera = prism_scene_data_is_camera_position(id);
+    if (!camera && !prism_primvar(state, id, primvar)) return value;
     Derived_float3 result;
-    result.val = state.view_origin;
+    result.val = camera ? state.view_origin : primvar.xyz;
     result.dx = (float3)0.0f;
     result.dy = (float3)0.0f;
     return result;
 }
 Derived_float4 scene_data_lookup_deriv_float4(inout Shading_state_material state, int id, Derived_float4 value,
-                                              bool uniform_lookup) { return value; }
+                                              bool uniform_lookup)
+{
+    float4 primvar;
+    if (!prism_primvar(state, id, primvar)) return value;
+    Derived_float4 result;
+    result.val = primvar;
+    result.dx = (float4)0.0f;
+    result.dy = (float4)0.0f;
+    return result;
+}
 Derived_float3 scene_data_lookup_deriv_color(inout Shading_state_material state, int id, Derived_float3 value,
-                                             bool uniform_lookup) { return value; }
-float scene_data_lookup_float(inout Shading_state_material state, int id, float value, bool uniform_lookup) { return value; }
+                                             bool uniform_lookup)
+{
+    float4 primvar;
+    if (!prism_primvar(state, id, primvar)) return value;
+    Derived_float3 result;
+    result.val = primvar.xyz;
+    result.dx = (float3)0.0f;
+    result.dy = (float3)0.0f;
+    return result;
+}
+float scene_data_lookup_float(inout Shading_state_material state, int id, float value, bool uniform_lookup)
+{
+    float4 primvar;
+    return prism_primvar(state, id, primvar) ? primvar.x : value;
+}
 int4 scene_data_lookup_int4(inout Shading_state_material state, int id, int4 value, bool uniform_lookup) { return value; }
 int3 scene_data_lookup_int3(inout Shading_state_material state, int id, int3 value, bool uniform_lookup) { return value; }
 int2 scene_data_lookup_int2(inout Shading_state_material state, int id, int2 value, bool uniform_lookup) { return value; }

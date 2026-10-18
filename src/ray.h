@@ -95,6 +95,8 @@ class RayHit {
 
                     n = m_normal.normalize();
                     n = front_face ? n : -n;
+                    bary_u = u;
+                    bary_v = v;
                     u = m_uv.u();
                     v = m_uv.v();
                     tangent = Float3(m_tangent[0], m_tangent[1], m_tangent[2]);
@@ -133,6 +135,9 @@ class RayHit {
         float u, v;
         bool front_face;
         float t;
+        // Triangle barycentrics and the mesh, for named primvar lookups.
+        float bary_u = 0.0f, bary_v = 0.0f;
+        const void* primvarMesh = nullptr;
         int geomid, primid, instid;
         int prototypeid = RTC_INVALID_GEOMETRY_ID;
         prism::RayFootprint ray_footprint;

@@ -205,6 +205,7 @@ public:
                 e_rayhit.hit.Ng_z = ng.z();
             }
             RayHit hit(e_rayhit, &interpolation, geom->type, analyticNormal);
+            if (geom->type == RTC_GEOMETRY_TYPE_TRIANGLE) hit.primvarMesh = dynamic_cast<Mesh const*>(geom);
             hit.ray_footprint = pathRay.footprint;
             hit.geomid = static_cast<int>(placementId);
             if (placement != placement_transforms.end()) {

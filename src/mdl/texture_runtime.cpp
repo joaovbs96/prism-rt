@@ -288,6 +288,7 @@ std::shared_ptr<NativeTextureRuntime> NativeTextureRuntime::clone() const
     copy->m_textures=m_textures;
     copy->m_texcoordSceneData=m_texcoordSceneData;
     copy->m_cameraPositionSceneData=m_cameraPositionSceneData;
+    copy->m_sceneDataNames=m_sceneDataNames;
     return copy;
 }
 
@@ -439,9 +440,11 @@ std::shared_ptr<NativeTextureRuntime> NativeTextureRuntime::Create(
     auto result = std::shared_ptr<NativeTextureRuntime>(new NativeTextureRuntime);
     result->m_texcoordSceneData.assign(code->get_string_constant_count(), false);
     result->m_cameraPositionSceneData.assign(code->get_string_constant_count(), false);
+    result->m_sceneDataNames.assign(code->get_string_constant_count(), std::string());
     for (mi::Size i=1; i<code->get_string_constant_count(); ++i) {
         result->m_texcoordSceneData[i]=IsTexcoordPrimvarName(code->get_string_constant(i));
         result->m_cameraPositionSceneData[i]=IsCameraPositionName(code->get_string_constant(i));
+        if (const char* name=code->get_string_constant(i)) result->m_sceneDataNames[i]=name;
     }
     result->m_textures.resize(code->get_texture_count());
     for (mi::Size i=1; i<code->get_texture_count(); ++i) {
@@ -646,9 +649,12 @@ mi::neuraylib::Texture_handler_deriv_vtable const &NativeTextureRuntime::Vtable(
         // names; other primvars return the defaults. States carry derivatives.
         v.m_scene_data_isvalid=[](Base const* base,
             mi::neuraylib::Shading_state_material*,unsigned id){
-            return Self(base)->isTexcoordSceneData(id) || Self(base)->isCameraPositionSceneData(id);};
-        v.m_scene_data_lookup_float=[](Base const*,
-            mi::neuraylib::Shading_state_material*,unsigned,float d,bool){return d;};
+            float probe[4];
+            return Self(base)->isTexcoordSceneData(id) || Self(base)->isCameraPositionSceneData(id) ||
+                Self(base)->lookupPrimvar(id,probe,4);};
+        v.m_scene_data_lookup_float=[](Base const* base,
+            mi::neuraylib::Shading_state_material*,unsigned id,float d,bool){
+            float out=d;Self(base)->lookupPrimvar(id,&out,1);return out;};
         v.m_scene_data_lookup_float2=[](float out[2],Base const* base,
             mi::neuraylib::Shading_state_material* state,unsigned id,float const d[2],bool){
             if(state && Self(base)->isTexcoordSceneData(id)) {
@@ -656,13 +662,16 @@ mi::neuraylib::Texture_handler_deriv_vtable const &NativeTextureRuntime::Vtable(
                     state)->text_coords;
                 out[0]=uv[0].val.x;out[1]=uv[0].val.y;return;
             }
+            if(Self(base)->lookupPrimvar(id,out,2))return;
             out[0]=d[0];out[1]=d[1];};
         v.m_scene_data_lookup_float3=[](float out[3],Base const* base,
             mi::neuraylib::Shading_state_material*,unsigned id,float const d[3],bool){
             const bool view=Self(base)->isCameraPositionSceneData(id);
+            if(!view&&Self(base)->lookupPrimvar(id,out,3))return;
             for(int i=0;i<3;++i)out[i]=view?viewOrigin[i]:d[i];};
-        v.m_scene_data_lookup_float4=[](float out[4],Base const*,
-            mi::neuraylib::Shading_state_material*,unsigned,float const d[4],bool){
+        v.m_scene_data_lookup_float4=[](float out[4],Base const* base,
+            mi::neuraylib::Shading_state_material*,unsigned id,float const d[4],bool){
+            if(Self(base)->lookupPrimvar(id,out,4))return;
             for(int i=0;i<4;++i)out[i]=d[i];};
         v.m_scene_data_lookup_int=[](Base const*,
             mi::neuraylib::Shading_state_material*,unsigned,int d,bool){return d;};
@@ -675,16 +684,20 @@ mi::neuraylib::Texture_handler_deriv_vtable const &NativeTextureRuntime::Vtable(
         v.m_scene_data_lookup_int4=[](int out[4],Base const*,
             mi::neuraylib::Shading_state_material*,unsigned,int const d[4],bool){
             for(int i=0;i<4;++i)out[i]=d[i];};
-        v.m_scene_data_lookup_color=[](float out[3],Base const*,
-            mi::neuraylib::Shading_state_material*,unsigned,float const d[3],bool){
+        v.m_scene_data_lookup_color=[](float out[3],Base const* base,
+            mi::neuraylib::Shading_state_material*,unsigned id,float const d[3],bool){
+            if(Self(base)->lookupPrimvar(id,out,3))return;
             for(int i=0;i<3;++i)out[i]=d[i];};
         v.m_scene_data_lookup_float4x4=[](float out[16],Base const*,
             mi::neuraylib::Shading_state_material*,unsigned,float const d[16],bool){
             for(int i=0;i<16;++i)out[i]=d[i];};
         v.m_scene_data_lookup_deriv_float=[](
-            mi::neuraylib::tct_deriv_float *out,Base const*,
-            mi::neuraylib::Shading_state_material_with_derivs*,unsigned,
-            mi::neuraylib::tct_deriv_float const *d,bool){*out=*d;};
+            mi::neuraylib::tct_deriv_float *out,Base const* base,
+            mi::neuraylib::Shading_state_material_with_derivs*,unsigned id,
+            mi::neuraylib::tct_deriv_float const *d,bool){
+            *out=*d;
+            float value;
+            if(Self(base)->lookupPrimvar(id,&value,1)){out->val=value;out->dx=out->dy=0.0f;}};
         v.m_scene_data_lookup_deriv_float2=[](
             mi::neuraylib::tct_deriv_arr_float_2 *out,Base const* base,
             mi::neuraylib::Shading_state_material_with_derivs* state,unsigned id,
@@ -696,22 +709,38 @@ mi::neuraylib::Texture_handler_deriv_vtable const &NativeTextureRuntime::Vtable(
                 out->dy[0]=uv.dy.x;out->dy[1]=uv.dy.y;
                 return;
             }
+            float value[2];
+            if(Self(base)->lookupPrimvar(id,value,2)) {
+                for(int i=0;i<2;++i){out->val[i]=value[i];out->dx[i]=out->dy[i]=0.0f;}
+                return;
+            }
             *out=*d;};
         v.m_scene_data_lookup_deriv_float3=[](
             mi::neuraylib::tct_deriv_arr_float_3 *out,Base const* base,
             mi::neuraylib::Shading_state_material_with_derivs*,unsigned id,
             mi::neuraylib::tct_deriv_arr_float_3 const *d,bool){
             *out=*d;
+            float value[3];
             if(Self(base)->isCameraPositionSceneData(id))
-                for(int i=0;i<3;++i){out->val[i]=viewOrigin[i];out->dx[i]=0.0f;out->dy[i]=0.0f;}};
+                for(int i=0;i<3;++i){out->val[i]=viewOrigin[i];out->dx[i]=0.0f;out->dy[i]=0.0f;}
+            else if(Self(base)->lookupPrimvar(id,value,3))
+                for(int i=0;i<3;++i){out->val[i]=value[i];out->dx[i]=out->dy[i]=0.0f;}};
         v.m_scene_data_lookup_deriv_float4=[](
-            mi::neuraylib::tct_deriv_arr_float_4 *out,Base const*,
-            mi::neuraylib::Shading_state_material_with_derivs*,unsigned,
-            mi::neuraylib::tct_deriv_arr_float_4 const *d,bool){*out=*d;};
+            mi::neuraylib::tct_deriv_arr_float_4 *out,Base const* base,
+            mi::neuraylib::Shading_state_material_with_derivs*,unsigned id,
+            mi::neuraylib::tct_deriv_arr_float_4 const *d,bool){
+            *out=*d;
+            float value[4];
+            if(Self(base)->lookupPrimvar(id,value,4))
+                for(int i=0;i<4;++i){out->val[i]=value[i];out->dx[i]=out->dy[i]=0.0f;}};
         v.m_scene_data_lookup_deriv_color=[](
-            mi::neuraylib::tct_deriv_arr_float_3 *out,Base const*,
-            mi::neuraylib::Shading_state_material_with_derivs*,unsigned,
-            mi::neuraylib::tct_deriv_arr_float_3 const *d,bool){*out=*d;};
+            mi::neuraylib::tct_deriv_arr_float_3 *out,Base const* base,
+            mi::neuraylib::Shading_state_material_with_derivs*,unsigned id,
+            mi::neuraylib::tct_deriv_arr_float_3 const *d,bool){
+            *out=*d;
+            float value[3];
+            if(Self(base)->lookupPrimvar(id,value,3))
+                for(int i=0;i<3;++i){out->val[i]=value[i];out->dx[i]=out->dy[i]=0.0f;}};
         return v;
     }();
     return table;

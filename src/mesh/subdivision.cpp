@@ -26,6 +26,23 @@ struct Value {
     }
 };
 
+// A run of `stride` floats per element in one buffer, for OpenSubdiv's
+// primvar refinement of data whose size is known only at run time.
+struct StridedBuffer {
+    float* data = nullptr;
+    int stride = 0;
+    struct Element {
+        float* v;
+        int n;
+        void Clear(void* = nullptr) { std::fill(v, v + n, 0.0f); }
+        void AddWithWeight(Element const& source, float weight)
+        {
+            for (int i = 0; i < n; ++i) v[i] += weight * source.v[i];
+        }
+    };
+    Element operator[](int i) const { return {data + size_t(i) * stride, stride}; }
+};
+
 Sdc::SchemeType SchemeType(Scheme scheme)
 {
     switch (scheme) {
@@ -195,6 +212,28 @@ Output Refine(Input const& input)
             primvars.InterpolateFaceVarying(l, fvarSource, fvarDestination, 0);
             fvarSource = fvarDestination;
         }
+    }
+
+    // Named per-point data follows the vertex refinement.
+    std::vector<float> pointData;
+    const int stride = input.pointDataStride;
+    const bool hasPointData = stride > 0 && input.pointData.size() == size_t(pointCount) * size_t(stride);
+    if (hasPointData) {
+        pointData.assign(size_t(refiner->GetNumVerticesTotal()) * stride, 0.0f);
+        std::copy(input.pointData.begin(), input.pointData.end(), pointData.begin());
+        size_t offset = 0;
+        for (int l = 1; l <= level; ++l) {
+            const size_t next = offset + size_t(refiner->GetLevel(l - 1).GetNumVertices());
+            StridedBuffer source{pointData.data() + offset * stride, stride};
+            StridedBuffer destination{pointData.data() + next * stride, stride};
+            primvars.Interpolate(l, source, destination);
+            offset = next;
+        }
+        std::vector<float> limitData(size_t(refiner->GetLevel(level).GetNumVertices()) * stride, 0.0f);
+        StridedBuffer source{pointData.data() + offset * stride, stride};
+        StridedBuffer destination{limitData.data(), stride};
+        primvars.Limit(source, destination);
+        output.pointData = std::move(limitData);
     }
 
     Far::TopologyLevel const& last = refiner->GetLevel(level);

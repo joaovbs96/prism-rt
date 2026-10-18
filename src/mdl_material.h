@@ -1,6 +1,7 @@
 #pragma once
 
 #include "material.h"
+#include "geometry.h"
 #include "mdl/context.h"
 #include "mdl/material_compiler.h"
 #include "mdl/backend_compiler.h"
@@ -551,6 +552,10 @@ private:
         mdl::NativeTextureRuntime::viewOrigin[0] = hit.o.x();
         mdl::NativeTextureRuntime::viewOrigin[1] = hit.o.y();
         mdl::NativeTextureRuntime::viewOrigin[2] = hit.o.z();
+        mdl::NativeTextureRuntime::primvarContext = {hit.primvarMesh, unsigned(hit.primid), hit.bary_u, hit.bary_v,
+            [](const void* mesh, const char* name, unsigned primitive, float u, float v, float* out, int count) {
+                return static_cast<Mesh const*>(mesh)->interpolatePrimvar(name, primitive, u, v, out, count);
+            }};
 
         // UV
         ss.tex_coord.val = mi::Float32_3(hit.u, hit.v, 0.0f);

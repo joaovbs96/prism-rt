@@ -32,6 +32,11 @@ struct GpuSceneData {
     // Row-major 3x4 object-to-world matrix per instance.
     std::vector<std::array<float, 12>> instanceTransforms;
     std::vector<uint32_t> primitiveMaterials;
+    // Named primvars of triangle prototypes (GpuPrototype.info2); the
+    // directory's scene data ids are set by ApplyMdlShaderCode from the names.
+    std::vector<float> primvarValues;
+    std::vector<GpuPrimvar> primvars;
+    std::vector<std::string> primvarNames;
 
     // Shading.
     std::vector<GpuMaterial> materials;

@@ -202,6 +202,8 @@ void MetalDevice::Impl::uploadBuffers(bool keepGeometry)
     setBuffer(kSlotEnvironment, buffer(d.environments.data(), Bytes(d.environments)));
     setBuffer(kSlotLights, buffer(d.lights.data(), Bytes(d.lights)));
     setBuffer(kSlotLightAlias, buffer(d.lightAlias.data(), Bytes(d.lightAlias)));
+    setBuffer(kSlotPrimvarValues, buffer(d.primvarValues.data(), Bytes(d.primvarValues)));
+    setBuffer(kSlotPrimvarDirectory, buffer(d.primvars.data(), Bytes(d.primvars)));
     if (!d.environmentTables || d.environmentTables != uploadedEnvironmentTables) {
         static const GpuSceneData::EnvironmentTables none;
         auto const& tables = d.environmentTables ? *d.environmentTables : none;

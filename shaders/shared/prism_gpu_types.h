@@ -105,7 +105,9 @@ static const uint kSlotOutput = 25;
 static const uint kSlotAccumulation = 26;
 static const uint kSlotLights = 27;        // LightRecord (shaders/integrator/lights.h)
 static const uint kSlotLightAlias = 28;    // float4 alias table over the lights and the dome
-static const uint kSlotCount = 29;
+static const uint kSlotPrimvarValues = 29;     // float, named primvars per vertex
+static const uint kSlotPrimvarDirectory = 30;  // uint4 per named primvar of a prototype
+static const uint kSlotCount = 31;
 // Images follow the fixed slots (HLSL) or form one array binding (GLSL).
 static const uint kSlotImageBase = 32;
 
@@ -118,7 +120,15 @@ static const uint kTileMissing = 0xffffffffu;
 
 struct GpuPrototype {
     uint4 info;   // x: type, y: first vertex, z: first triangle (or sphere), w: primitive count
-    uint4 info2;  // x: has per-vertex texture coordinates
+    uint4 info2;  // x: has per-vertex texture coordinates, y: first primvar directory entry,
+                  // z: primvar count, w: first primvar value
+};
+
+// One named primvar of a prototype: x: scene data id (string constant of the
+// MDL link unit, 0: unused), y: components, z: offset in a vertex's values,
+// w: values per vertex.
+struct GpuPrimvar {
+    uint4 info;
 };
 
 struct GpuInstance {

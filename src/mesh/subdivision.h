@@ -34,6 +34,9 @@ struct Input {
     // shared in the refinement.
     std::span<const float> uvs;
     bool uvPerPoint = false;
+    // Other per-point data (named primvars), pointDataStride floats per point.
+    std::span<const float> pointData;
+    int pointDataStride = 0;
     int level = 2;
 };
 
@@ -43,6 +46,7 @@ struct Output {
     std::vector<float> points;   // xyz, limit positions
     std::vector<float> normals;  // xyz per point, limit normals (right-handed winding)
     std::vector<float> uvs;      // xy per corner of faceVertexIndices
+    std::vector<float> pointData; // pointDataStride floats per refined point (limit values)
     std::vector<int> coarseFaces; // per refined face
     bool valid = false;
 };
