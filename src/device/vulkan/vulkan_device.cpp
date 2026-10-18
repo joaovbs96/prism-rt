@@ -36,6 +36,33 @@ namespace {
 using Clock = std::chrono::steady_clock;
 constexpr uint32_t kMaxImages = 4096;
 
+// IEEE binary16 conversion, round to nearest even (MSVC has no _Float16).
+uint16_t FloatToHalf(float value)
+{
+    uint32_t bits;
+    std::memcpy(&bits, &value, 4);
+    const uint32_t sign = (bits >> 16) & 0x8000u;
+    const uint32_t exponent = (bits >> 23) & 0xFFu;
+    uint32_t mantissa = bits & 0x7FFFFFu;
+    if (exponent == 0xFFu) return uint16_t(sign | 0x7C00u | (mantissa ? 0x200u : 0u));
+    const int halfExponent = int(exponent) - 127 + 15;
+    if (halfExponent >= 31) return uint16_t(sign | 0x7C00u);
+    if (halfExponent <= 0) {
+        if (halfExponent < -10) return uint16_t(sign);
+        mantissa |= 0x800000u;
+        const int shift = 14 - halfExponent;
+        uint32_t half = mantissa >> shift;
+        const uint32_t remainder = mantissa & ((1u << shift) - 1u);
+        const uint32_t halfway = 1u << (shift - 1);
+        if (remainder > halfway || (remainder == halfway && (half & 1u))) ++half;
+        return uint16_t(sign | half);
+    }
+    uint32_t half = (uint32_t(halfExponent) << 10) | (mantissa >> 13);
+    const uint32_t remainder = mantissa & 0x1FFFu;
+    if (remainder > 0x1000u || (remainder == 0x1000u && (half & 1u))) ++half;
+    return uint16_t(sign | half);
+}
+
 double SecondsSince(Clock::time_point start)
 {
     return std::chrono::duration<double>(Clock::now() - start).count();
@@ -634,7 +661,7 @@ bool VulkanDevice::Impl::uploadImages(std::string* error)
                 const float v = c < channels ? pixels[p * channels + c] : 0.0f;
                 uint8_t* out = staging.data() + (p * stored + c) * componentBytes;
                 if (componentBytes == 1) *out = uint8_t(std::lround(std::clamp(v, 0.0f, 1.0f) * 255.0f));
-                else if (componentBytes == 2) { _Float16 h = _Float16(v); std::memcpy(out, &h, 2); }
+                else if (componentBytes == 2) { const uint16_t h = FloatToHalf(v); std::memcpy(out, &h, 2); }
                 else std::memcpy(out, &v, 4);
             }
         });
