@@ -31,6 +31,9 @@ void render(UsdImagingGLEngine& engine, const UsdStageRefPtr& stage,
     params.frame = frame;
     params.enableSceneMaterials = true;
     params.enableSceneLights = true;
+    // Final frames: render-purpose geometry instead of the viewport's proxies.
+    params.showRender = true;
+    params.showProxy = false;
     engine.SetRendererSetting(TfToken("domeLightCameraVisibility"),
                               VtValue(domeLightCameraVisibility));
     const auto start = std::chrono::steady_clock::now();

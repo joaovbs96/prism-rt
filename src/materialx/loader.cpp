@@ -69,8 +69,10 @@ MaterialX::NodePtr AddAdapter(MaterialX::GraphElementPtr const& graph, std::stri
     static const std::vector<std::string> vectors = {"color3", "color4", "vector2", "vector3", "vector4"};
     const bool fromVector = std::find(vectors.begin(), vectors.end(), from) != vectors.end();
     const bool extract = to == "float" && fromVector;
-    const bool convert = std::find(vectors.begin(), vectors.end(), to) != vectors.end() &&
-        (from == "float" || fromVector);
+    const bool scalar = from == "float" || from == "integer" || from == "boolean";
+    const bool convert = (std::find(vectors.begin(), vectors.end(), to) != vectors.end() &&
+                          (scalar || fromVector)) ||
+        (to == "float" && (from == "integer" || from == "boolean"));
     if (!extract && !convert) return nullptr;
     auto adapter = graph->addNode(extract ? "extract" : "convert",
                                   graph->createValidChildName(baseName + "_as_" + to), to);
@@ -79,24 +81,83 @@ MaterialX::NodePtr AddAdapter(MaterialX::GraphElementPtr const& graph, std::stri
     return adapter;
 }
 
+int ComponentCount(std::string const& type)
+{
+    if (type == "float" || type == "integer" || type == "boolean") return 1;
+    if (type == "vector2") return 2;
+    if (type == "color3" || type == "vector3") return 3;
+    if (type == "color4" || type == "vector4") return 4;
+    return 0;
+}
+
+// A value written for another type, read as `type` (empty: not convertible).
+std::string ConvertValueString(std::string const& value, std::string const& type)
+{
+    std::vector<std::string> parts;
+    size_t begin = 0;
+    for (;;) {
+        const size_t comma = value.find(',', begin);
+        std::string part = value.substr(begin, comma == std::string::npos ? std::string::npos : comma - begin);
+        part.erase(0, part.find_first_not_of(" \t"));
+        part.erase(part.find_last_not_of(" \t") + 1);
+        parts.push_back(part);
+        if (comma == std::string::npos) break;
+        begin = comma + 1;
+    }
+    if (type == "boolean") {
+        if (parts.size() != 1) return {};
+        if (parts[0] == "true" || parts[0] == "false") return parts[0];
+        try { return std::stod(parts[0]) != 0.0 ? "true" : "false"; } catch (...) { return {}; }
+    }
+    if (type == "integer") {
+        if (parts.size() != 1) return {};
+        try { return std::to_string(int(std::stod(parts[0]))); } catch (...) { return {}; }
+    }
+    const int count = ComponentCount(type);
+    if (!count) return {};
+    for (auto const& part : parts) {
+        try { (void)std::stod(part); } catch (...) { return {}; }
+    }
+    if (int(parts.size()) == count) return value;
+    if (parts.size() == 1) {
+        std::string result = parts[0];
+        for (int i = 1; i < count; ++i) result += ", " + parts[0];
+        return result;
+    }
+    if (count == 1) return parts[0];
+    return {};
+}
+
 // Inputs whose type contradicts their node definition (hdMtlx types a
-// shader input after the graph output feeding it) are retyped, and the graph
-// output feeding them gets the extract/convert node the connection implies.
+// shader input after the graph output feeding it, and some exporters write
+// vector parameters as strings or flags as integers) get their declared
+// type; values are converted, and a graph output feeding them gets the
+// extract/convert node the connection implies.
 void FixDeclaredInputTypes(const MaterialX::DocumentPtr& doc, const MaterialX::DocumentPtr& library)
 {
     if (!library) return;
-    for (auto node : doc->getNodes()) {
-        std::vector<MaterialX::NodeDefPtr> candidates = library->getMatchingNodeDefs(node->getCategory());
-        auto local = doc->getMatchingNodeDefs(node->getCategory());
-        candidates.insert(candidates.end(), local.begin(), local.end());
+    std::vector<MaterialX::NodePtr> nodes;
+    for (auto element : doc->traverseTree())
+        if (auto node = element->asA<MaterialX::Node>()) nodes.push_back(node);
+    for (auto const& node : nodes) {
         MaterialX::NodeDefPtr nodedef;
-        for (auto const& candidate : candidates)
-            if (candidate->getType() == node->getType()) { nodedef = candidate; break; }
+        if (node->hasNodeDefString()) {
+            nodedef = library->getNodeDef(node->getNodeDefString());
+            if (!nodedef) nodedef = doc->getNodeDef(node->getNodeDefString());
+        }
+        if (!nodedef) {
+            std::vector<MaterialX::NodeDefPtr> candidates = library->getMatchingNodeDefs(node->getCategory());
+            auto local = doc->getMatchingNodeDefs(node->getCategory());
+            candidates.insert(candidates.end(), local.begin(), local.end());
+            for (auto const& candidate : candidates)
+                if (candidate->getType() == node->getType()) { nodedef = candidate; break; }
+        }
         if (!nodedef) continue;
         for (auto input : node->getInputs()) {
             auto declared = nodedef->getActiveInput(input->getName());
             if (!declared || declared->getType() == input->getType()) continue;
             const std::string from = input->getType(), to = declared->getType();
+            auto graphElement = node->getParent() ? node->getParent()->asA<MaterialX::GraphElement>() : nullptr;
             auto graph = input->hasNodeGraphString() ? doc->getNodeGraph(input->getNodeGraphString()) : nullptr;
             auto output = graph && input->hasOutputString() ? graph->getOutput(input->getOutputString()) : nullptr;
             if (output && output->getType() == from && output->hasNodeName()) {
@@ -104,16 +165,22 @@ void FixDeclaredInputTypes(const MaterialX::DocumentPtr& doc, const MaterialX::D
                 if (!adapter) continue;
                 output->setNodeName(adapter->getName());
                 output->setType(to);
-            } else if (input->hasValueString() && to == "float") {
-                // A vector value on a float input: keep its first component.
-                const std::string value = input->getValueString();
-                input->setValueString(value.substr(0, value.find(',')));
-            } else {
+            } else if (input->hasNodeName()) {
+                // Connected within the graph: FixConnectionTypes then adapts
+                // an upstream of another type.
+                auto upstream = graphElement ? graphElement->getNode(input->getNodeName()) : nullptr;
+                if (!upstream) continue;
+            } else if (input->hasValueString()) {
+                const std::string value = ConvertValueString(input->getValueString(), to);
+                if (value.empty()) continue;
+                input->setValueString(value);
+            } else if (input->hasInterfaceName()) {
                 continue;
             }
             input->setType(to);
-            std::cerr << "[MaterialX] " << from << " input " << input->getNamePath()
-                      << " retyped to its declared " << to << "\n";
+            if (VerboseMdl())
+                std::cout << "[MaterialX] " << from << " input " << input->getNamePath()
+                          << " retyped to its declared " << to << "\n";
         }
     }
 }
@@ -192,8 +259,8 @@ MaterialX::DocumentPtr DocumentLoader::load(const std::string& filepath)
         // below. Run before importing stdlib so library implementations are not
         // rewritten. Only this in-memory document changes, never the asset file.
         NormalizeColorSpaces(doc);
-        FixConnectionTypes(doc);
         FixDeclaredInputTypes(doc, m_stdlib);
+        FixConnectionTypes(doc);
         if (m_fallback_sss_to_diffuse) {
             // Collect first: adding an absent weight input mutates the tree.
             std::vector<MaterialX::NodePtr> surface_nodes;
