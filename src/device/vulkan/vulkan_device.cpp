@@ -537,6 +537,7 @@ bool VulkanDevice::Impl::buildPipeline(std::string* error)
     auto const start = Clock::now();
     const auto shared = gpu::CachedMdlShaderCode(data->mdlMaterials);
     gpu::MdlShaderCode const& code = *shared;
+    auto const generated = Clock::now();
     if (!code.success)
         std::cerr << "PrismRT Vulkan: MDL materials unavailable on the GPU (" << code.error << ")\n";
     gpu::ApplyMdlShaderCode(*data, code);
@@ -548,6 +549,7 @@ bool VulkanDevice::Impl::buildPipeline(std::string* error)
     pipelineCode = nullptr;
     std::vector<uint32_t> spirv;
     if (!CompileVulkanKernel(code.code, &spirv, error)) return false;
+    auto const compiled = Clock::now();
     const std::string key = gpu::SourceDigest(std::string(reinterpret_cast<const char*>(spirv.data()), spirv.size() * 4));
     if (auto found = pipelines.find(key); found != pipelines.end()) {
         pipeline = found->second;
@@ -578,7 +580,10 @@ bool VulkanDevice::Impl::buildPipeline(std::string* error)
     pipelines[key] = pipeline;
     pipelineCode = shared;
     if (gpu::GpuVerbose())
-        std::cerr << std::format("PrismRT Vulkan: shader setup {:.1f} s\n", SecondsSince(start));
+        std::cerr << std::format("PrismRT Vulkan: shader setup {:.1f} s (MDL code {:.1f} s, SPIR-V {:.1f} s, pipeline {:.1f} s)\n",
+                                 SecondsSince(start), std::chrono::duration<double>(generated - start).count(),
+                                 std::chrono::duration<double>(compiled - generated).count(),
+                                 SecondsSince(compiled));
     return true;
 }
 
@@ -988,6 +993,7 @@ bool VulkanDevice::Impl::ensureScene(SceneManager& scene, std::string* error)
 {
     if (boundScene == &scene && !dirty.load() && pipeline) return true;
     vkDeviceWaitIdle(device);
+    auto const sceneStart = Clock::now();
     dirty = false;
     boundScene = &scene;
     data = std::make_unique<GpuSceneData>(gpu::BuildGpuScene(scene));
@@ -1023,7 +1029,16 @@ bool VulkanDevice::Impl::ensureScene(SceneManager& scene, std::string* error)
     if (!buffers[kSlotFrame].buffer) upload(kSlotFrame, nullptr, sizeof(GpuFrame));
     for (int slot : {kSlotPixels, kSlotRng, kSlotOutput, kSlotAccumulation})
         if (!buffers[slot].buffer) upload(slot, nullptr, 16);
-    if (!uploadImages(error) || !buildAccelerationStructures(error) || !writeDescriptors(error)) return fail();
+    auto const uploaded = Clock::now();
+    if (!uploadImages(error)) return fail();
+    auto const imaged = Clock::now();
+    if (!buildAccelerationStructures(error) || !writeDescriptors(error)) return fail();
+    if (gpu::GpuVerbose())
+        std::cerr << std::format("PrismRT Vulkan: scene {:.3f} s (buffers {:.3f}, images {:.3f}, "
+                                 "acceleration structures {:.3f}; {} prototypes, {} instances)\n",
+                                 SecondsSince(sceneStart), std::chrono::duration<double>(uploaded - sceneStart).count(),
+                                 std::chrono::duration<double>(imaged - uploaded).count(), SecondsSince(imaged),
+                                 d.prototypes.size(), d.instances.size());
     return true;
 }
 
