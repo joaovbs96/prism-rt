@@ -402,8 +402,10 @@ bool Check(bool condition, char const *message)
 template<class Predicate>
 bool WaitFor(Predicate predicate)
 {
+    // GPU devices compile a kernel for each new material set first; a cold
+    // shader cache takes several seconds per kernel.
     auto const deadline = std::chrono::steady_clock::now() +
-        std::chrono::seconds(5);
+        std::chrono::seconds(60);
     while (!predicate() && std::chrono::steady_clock::now() < deadline)
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     return predicate();
