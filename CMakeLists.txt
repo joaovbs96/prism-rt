@@ -64,6 +64,12 @@ find_package(TBB REQUIRED CONFIG)
 find_package(OpenGL REQUIRED)
 find_package(pxr REQUIRED)
 find_package(OpenSubdiv CONFIG REQUIRED)
+# Shared OpenSubdiv builds export osdCPU, static builds osdCPU_static.
+if(TARGET OpenSubdiv::osdCPU)
+    set(PRISM_OSD_CPU_TARGET OpenSubdiv::osdCPU)
+else()
+    set(PRISM_OSD_CPU_TARGET OpenSubdiv::osdCPU_static)
+endif()
 find_package(MaterialX REQUIRED)
 find_package(Python3 COMPONENTS Development Interpreter REQUIRED)
 
@@ -246,7 +252,7 @@ target_link_libraries(prism_core PUBLIC
     embree
     TBB::tbb
     ${PXR_LIBRARIES}
-    OpenSubdiv::osdCPU
+    ${PRISM_OSD_CPU_TARGET}
     MaterialXCore
     MaterialXFormat
     MaterialXGenShader
