@@ -204,13 +204,17 @@ std::vector<float> CpuDevice::RenderImage(SceneManager& scene, ImageRequest cons
             }
         });
         done = next;
-        if (done < request.samples && adaptive.CheckAfter(done) &&
-            active.Update(adaptive.threshold, [&](size_t pixel) {
-                const float sum[3] = {sums[pixel].x(), sums[pixel].y(), sums[pixel].z()};
-                const float even[3] = {evenSums[pixel].x(), evenSums[pixel].y(), evenSums[pixel].z()};
-                return AdaptiveError(sum, even, done);
-            }) == 0)
-            break;
+        if (done < request.samples && adaptive.CheckAfter(done)) {
+            const float scale = ImageScale(count, [&](size_t pixel) {
+                return (sums[pixel].x() + sums[pixel].y() + sums[pixel].z()) / float(samples[pixel]);
+            });
+            if (active.Update(adaptive.threshold, [&](size_t pixel) {
+                    const float sum[3] = {sums[pixel].x(), sums[pixel].y(), sums[pixel].z()};
+                    const float even[3] = {evenSums[pixel].x(), evenSums[pixel].y(), evenSums[pixel].z()};
+                    return AdaptiveError(sum, even, done, scale);
+                }) == 0)
+                break;
+        }
     }
     double total = 0.0;
     for (size_t pixel = 0; pixel < count; ++pixel) {

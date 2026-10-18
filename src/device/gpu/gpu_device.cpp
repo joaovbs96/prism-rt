@@ -69,21 +69,47 @@ std::vector<float> GpuRenderDevice::RenderImage(SceneManager& scene, ImageReques
     frame.settings.w = request.seed;
     frame.counts.w = request.contributions & 7u;
     double gpuSeconds = 0.0;
-    for (int sample = 0; sample < request.samples && !list.empty(); ++sample) {
+    // Pixels left active by adaptive sampling get several samples in
+    // parallel, so the dispatch still fills the GPU.
+    constexpr int maxReplicas = 16;
+    for (int sample = 0; sample < request.samples && !list.empty();) {
+        int replicas = 1;
+        if (adaptive.Enabled() && list.size() < count) {
+            int stop = sample + 1;
+            while (stop < request.samples && !adaptive.CheckAfter(stop)) ++stop;
+            replicas = std::clamp(int(count / list.size()), 1, std::min(maxReplicas, stop - sample));
+        }
+        const uint32_t threads = uint32_t(list.size()) * uint32_t(replicas);
         std::memcpy(RenderBuffer(kSlotPixels, list.size() * 4), list.data(), list.size() * 4);
+        if (replicas > 1) RenderBuffer(kSlotOutput, size_t(threads) * 32);
         GpuFrame f = frame;
-        f.work = {uint32_t(list.size()), 0, kModeImage, 0};
+        f.work = {threads, replicas > 1 ? uint32_t(list.size()) : 0u, kModeImage, 0};
         f.counts.z = uint32_t(sample);
         if (sample == 0) f.settings.z |= kFrameSeedRng;
-        if (!Dispatch(f, uint32_t(list.size()), &gpuSeconds, &error)) {
+        if (!Dispatch(f, threads, &gpuSeconds, &error)) {
             std::cerr << LogPrefix() << error << '\n';
             break;
         }
-        for (uint32_t p : list) samples[p] = sample + 1;
-        if (sample + 1 < request.samples && adaptive.CheckAfter(sample + 1)) {
+        if (replicas > 1) {
+            auto const* out = static_cast<const float*>(RenderBuffer(kSlotOutput, size_t(threads) * 32));
+            auto* sums = static_cast<float*>(RenderBuffer(kSlotAccumulation, size_t(count) * 32));
+            for (uint32_t t = 0; t < threads; ++t) {
+                const uint32_t p = list[t % list.size()];
+                for (int c = 0; c < 3; ++c) {
+                    sums[8 * p + c] += out[8 * t + c];
+                    sums[8 * p + 4 + c] += out[8 * t + 4 + c];
+                }
+            }
+        }
+        sample += replicas;
+        for (uint32_t p : list) samples[p] = sample;
+        if (sample < request.samples && adaptive.CheckAfter(sample)) {
             auto const* sums = static_cast<const float*>(RenderBuffer(kSlotAccumulation, size_t(count) * 32));
+            const float scale = ImageScale(count, [&](size_t p) {
+                return (sums[8 * p] + sums[8 * p + 1] + sums[8 * p + 2]) / float(samples[p]);
+            });
             active.Update(adaptive.threshold, [&](size_t p) {
-                return AdaptiveError(sums + 8 * p, sums + 8 * p + 4, sample + 1);
+                return AdaptiveError(sums + 8 * p, sums + 8 * p + 4, sample, scale);
             });
             list.clear();
             for (uint32_t p = 0; p < count; ++p)

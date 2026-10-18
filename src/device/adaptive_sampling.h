@@ -30,17 +30,30 @@ struct AdaptiveSettings {
 };
 
 // Error of a pixel from the RGB sums of all its samples and of its
-// even-numbered samples (0, 2, 4, ...), after `samples` samples.
-inline float AdaptiveError(const float sum[3], const float evenSum[3], int samples)
+// even-numbered samples (0, 2, 4, ...), after `samples` samples. Values are
+// measured relative to `scale`, the image's brightness (ImageScale), so a
+// threshold means the same at any exposure.
+inline float AdaptiveError(const float sum[3], const float evenSum[3], int samples, float scale = 1.0f)
 {
-    const float inverse = 1.0f / float(samples);
-    const float halfInverse = 1.0f / float((samples + 1) / 2);
+    const float inverse = 1.0f / (float(samples) * scale);
+    const float halfInverse = 1.0f / (float((samples + 1) / 2) * scale);
     float difference = 0.0f, mean = 0.0f;
     for (int c = 0; c < 3; ++c) {
         difference += std::abs(sum[c] * inverse - evenSum[c] * halfInverse);
         mean += sum[c] * inverse;
     }
     return difference / (0.0001f + std::sqrt(std::max(0.0f, mean)));
+}
+
+// The image's brightness for AdaptiveError: the mean over all pixels of
+// meanRgbSum(pixel), the sum of a pixel's mean RGB components.
+template <typename MeanRgbSum>
+float ImageScale(size_t pixels, MeanRgbSum&& meanRgbSum)
+{
+    double total = 0.0;
+    for (size_t p = 0; p < pixels; ++p) total += meanRgbSum(p);
+    const double scale = pixels ? total / double(pixels) / 3.0 : 0.0;
+    return scale > 0.0 && std::isfinite(scale) ? float(scale) : 1.0f;
 }
 
 // Per-pixel active flags of a width x height image, top row first.

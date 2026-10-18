@@ -163,7 +163,8 @@ struct GpuFrame {
                                  // w: depth from which NEE is probabilistic
     uint4 size;                  // x: width, y: height, z: preview width, w: preview height
     uint4 settings;              // x: max depth, y: roulette depth, z: flags, w: seed
-    uint4 work;                  // x: thread count, z: mode
+    uint4 work;                  // x: thread count, y: image mode: pixels traced in parallel
+                                 // (0: one sample per listed pixel), z: mode
     uint4 counts;                // x: MDL texture count, y: debug view, z: sample number,
                                  // w: light contribution mask (0: all)
 };

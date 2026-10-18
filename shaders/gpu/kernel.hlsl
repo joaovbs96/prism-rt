@@ -77,11 +77,17 @@ void main(uint3 id : SV_DispatchThreadID)
         return;
     }
 
-    const uint pixel = gpu_pixel(thread);
+    // Image mode with work.y listed pixels traces several samples of each in
+    // parallel: thread t takes sample counts.z + t / work.y of pixel t % work.y
+    // and writes its own output slots, which the host adds up.
+    const bool replicated = mode == kModeImage && frame.work.y != 0u;
+    const uint replica = replicated ? thread / frame.work.y : 0u;
+    const uint pixel = gpu_pixel(replicated ? thread % frame.work.y : thread);
     const uint x = pixel % width;
     const uint y = pixel / width;
+    const uint sampleIndex = frame.counts.z + replica;
     // The sampler's sequence is indexed by the sample number, scrambled per pixel.
-    const Sampler sampler = {frame.counts.z,
+    const Sampler sampler = {sampleIndex,
                              mode == kModeImage ? seedImage(x, y, width, frame.settings.w)
                                                 : seedPass(x, y, width, frame.settings.w),
                              0u};
@@ -89,6 +95,8 @@ void main(uint3 id : SV_DispatchThreadID)
     if ((flags & kFrameSeedRng) != 0u)
         tracer.backend.rng.state = mode == kModeImage ? seedImage(x, y, width, frame.settings.w)
                                                       : seedPass(x, y, width, frame.settings.w);
+    else if (replicated)
+        tracer.backend.rng.state = hashCombine(sampler.seed, hashUint(sampleIndex));
     else
         tracer.backend.rng.state = gpu_load_rng(pixel);
     SampleResult result;
@@ -97,6 +105,11 @@ void main(uint3 id : SV_DispatchThreadID)
         result.coverage = 1.0f;
     } else {
         result = tracer.renderSample(camera, x, y, width, height, settings);
+    }
+    if (replicated) {
+        gpu_store_output(2u * thread, float4(result.color, 0.0f));
+        gpu_store_output(2u * thread + 1u, (sampleIndex & 1u) == 0u ? float4(result.color, 0.0f) : (float4)0.0f);
+        return;
     }
     gpu_store_rng(pixel, tracer.backend.rng.state);
     if (mode == kModeImage) gpu_accumulate(pixel, result.color, (frame.counts.z & 1u) == 0u);

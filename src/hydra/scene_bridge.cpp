@@ -4390,7 +4390,8 @@ public:
     std::vector<uint64_t> bindingAllocationRevisions;
     std::vector<unsigned int> committedRngStates;
     // Adaptive sampling: per-pixel RGB sums of all and of even-numbered
-    // samples (6 floats per pixel) and the pixels still sampled.
+    // samples and the sample count (7 floats per pixel), and the pixels
+    // still sampled.
     std::vector<float> adaptiveSums;
     prism::device::ActivePixels adaptiveActive;
     unsigned tileWidth = 0, tileHeight = 0;
@@ -5827,7 +5828,7 @@ void SceneBridge::Render()
         else
             std::vector<unsigned int>().swap(_impl->committedRngStates);
         if (hasColor && settings.adaptiveThreshold > 0.0f) {
-            _impl->adaptiveSums.assign(static_cast<size_t>(width) * height * 6, 0.0f);
+            _impl->adaptiveSums.assign(static_cast<size_t>(width) * height * 7, 0.0f);
             _impl->adaptiveActive.Reset(width, height);
         } else {
             std::vector<float>().swap(_impl->adaptiveSums);
@@ -6177,14 +6178,20 @@ void SceneBridge::Render()
                 if (!traced(pixel)) return;
                 Color3 const &c = passColors[pixel];
                 for (int channel = 0; channel < 3; ++channel) {
-                    sums[6 * pixel + channel] += c[channel];
-                    if (sample % 2 == 0) sums[6 * pixel + 3 + channel] += c[channel];
+                    sums[7 * pixel + channel] += c[channel];
+                    if (sample % 2 == 0) sums[7 * pixel + 3 + channel] += c[channel];
                 }
+                sums[7 * pixel + 6] += 1.0f;
             });
-            if (sample + 1 < sampleCount && adaptive.CheckAfter(sample + 1))
-                _impl->adaptiveActive.Update(adaptive.threshold, [&](size_t pixel) {
-                    return prism::device::AdaptiveError(sums + 6 * pixel, sums + 6 * pixel + 3, sample + 1);
+            if (sample + 1 < sampleCount && adaptive.CheckAfter(sample + 1)) {
+                const float scale = prism::device::ImageScale(passColors.size(), [&](size_t pixel) {
+                    const float* p = sums + 7 * pixel;
+                    return p[6] > 0.0f ? (p[0] + p[1] + p[2]) / p[6] : 0.0f;
                 });
+                _impl->adaptiveActive.Update(adaptive.threshold, [&](size_t pixel) {
+                    return prism::device::AdaptiveError(sums + 7 * pixel, sums + 7 * pixel + 3, sample + 1, scale);
+                });
+            }
         }
         _impl->committedRngStates.swap(rngStates);
         _impl->samples.store(static_cast<uint64_t>(sample + 1));
