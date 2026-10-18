@@ -67,10 +67,12 @@ static const uint kFrameFiltered = 8u;
 static const uint kFrameSeedRng = 16u;
 static const uint kFrameLens = 32u;
 static const uint kFrameCutouts = 64u;       // some instances are not opaque
+static const uint kFramePrimaryHits = 128u;  // preview, pass: also store each pixel's center-ray hit
 
 // Work modes.
 static const uint kModePass = 0u;      // one sample per listed pixel
 static const uint kModePreview = 1u;   // one sample per preview pixel
+static const uint kModePrimary = 3u;   // only the pixel-center hits of the listed pixels
 static const uint kModeImage = 2u;     // one sample per listed pixel, accumulated (standalone)
 
 // Resource slots: descriptor-heap indices (HLSL) and set-0 bindings (GLSL).

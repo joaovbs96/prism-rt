@@ -43,7 +43,8 @@ struct RenderSettings {
     bool adaptivePreview = true;
     bool domeLightCameraVisibility = true;
     int previewTargetMs = 33;
-    int previewMaxDimension = 512;
+    // 0: automatic (512 on GPU devices, 96 on the CPU).
+    int previewMaxDimension = 0;
     int refinementDelayMs = 100;
     int resourceRevision = 0;
     bool sphereBatching = false;

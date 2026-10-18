@@ -401,8 +401,9 @@ void PrismRenderBuffer::PublishPreviewFloat(
         _hasPublished = true;
         return;
     }
-    std::vector<uint8_t> expandedRow(static_cast<size_t>(_width) * stride);
-    for (unsigned int py = 0; py < previewHeight; ++py) {
+    // Each preview row fills its own block of buffer rows.
+    tbb::parallel_for(0u, previewHeight, [&](unsigned int py) {
+        std::vector<uint8_t> expandedRow(static_cast<size_t>(_width) * stride);
         const unsigned int y0 = py * _height / previewHeight;
         const unsigned int y1 = (py + 1) * _height / previewHeight;
         for (unsigned int px = 0; px < previewWidth; ++px) {
@@ -417,7 +418,7 @@ void PrismRenderBuffer::PublishPreviewFloat(
         for (unsigned int y = y0; y < y1; ++y)
             std::memcpy(published->data() + static_cast<size_t>(y) * _width * stride,
                         expandedRow.data(), expandedRow.size());
-    }
+    });
     std::lock_guard lock(_mutex);
     _pixels = std::move(published);
     _frame = std::move(frame);
@@ -448,8 +449,9 @@ void PrismRenderBuffer::PublishPreviewInt(
             _StoreIntComponent(_format, dst, c, v);
         }
     }
-    std::vector<uint8_t> expandedRow(static_cast<size_t>(_width) * stride);
-    for (unsigned int py = 0; py < previewHeight; ++py) {
+    // Each preview row fills its own block of buffer rows.
+    tbb::parallel_for(0u, previewHeight, [&](unsigned int py) {
+        std::vector<uint8_t> expandedRow(static_cast<size_t>(_width) * stride);
         const unsigned int y0 = py * _height / previewHeight;
         const unsigned int y1 = (py + 1) * _height / previewHeight;
         for (unsigned int px = 0; px < previewWidth; ++px) {
@@ -464,7 +466,7 @@ void PrismRenderBuffer::PublishPreviewInt(
         for (unsigned int y = y0; y < y1; ++y)
             std::memcpy(published->data() + static_cast<size_t>(y) * _width * stride,
                         expandedRow.data(), expandedRow.size());
-    }
+    });
     std::lock_guard lock(_mutex);
     _pixels = std::move(published);
     _frame = std::move(frame);

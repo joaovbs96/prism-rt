@@ -4,6 +4,7 @@
 
 #include <tbb/parallel_for.h>
 
+#include <bit>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -13,6 +14,24 @@
 
 namespace prism::device::gpu {
 
+
+// A pixel-center hit stored by the kernel (gpu_store_primary_hit), in the
+// RayHit fields that geometric outputs read.
+static RayHit PrimaryHit(float const* h)
+{
+    RTCRayHit miss{};
+    miss.hit.geomID = RTC_INVALID_GEOMETRY_ID;
+    RayHit hit(miss);
+    if (h[3] != 0.0f) {
+        hit.geomid = int(std::bit_cast<uint32_t>(h[10]));
+        hit.primid = int(std::bit_cast<uint32_t>(h[11]));
+        hit.p = Float3(h[0], h[1], h[2]);
+        hit.n = Float3(h[4], h[5], h[6]);
+        hit.u = h[8];
+        hit.v = h[9];
+    }
+    return hit;
+}
 
 bool GpuVerbose()
 {
@@ -138,17 +157,23 @@ void GpuRenderDevice::RenderPass(SceneManager& scene, PassRequest const& request
     const bool tracePrimary = request.tracePrimary && request.resolvePrimary;
     auto abandoned = [&] { return request.abandoned && request.abandoned(); };
     auto paused = [&] { return request.paused && request.paused(); };
-    const bool traceColor = request.traceColor && PrepareScene(scene, &error);
-    if (request.traceColor && !traceColor) std::cerr << LogPrefix() << error << '\n';
+    const bool prepared = (request.traceColor || tracePrimary) && PrepareScene(scene, &error);
+    if ((request.traceColor || tracePrimary) && !prepared) std::cerr << LogPrefix() << error << '\n';
+    const bool traceColor = request.traceColor && prepared;
+    // Geometric outputs come from the kernel's pixel-center hits, with or
+    // without color work, so they do not depend on the bound outputs.
+    const bool gpuPrimary = tracePrimary && prepared;
 
     const size_t pixels = size_t(width) * height;
     uint32_t* rng = nullptr;
     float* output = nullptr;
     GpuFrame frame{};
-    if (traceColor) {
-        rng = static_cast<uint32_t*>(RenderBuffer(kSlotRng, pixels * 4));
-        output = static_cast<float*>(RenderBuffer(kSlotOutput, pixels * 16));
-        std::memcpy(rng, request.rngStates, pixels * 4);
+    if (prepared) {
+        if (traceColor) {
+            rng = static_cast<uint32_t*>(RenderBuffer(kSlotRng, pixels * 4));
+            output = static_cast<float*>(RenderBuffer(kSlotOutput, pixels * 16));
+            std::memcpy(rng, request.rngStates, pixels * 4);
+        }
         frame = BaseFrame(request.camera, width, height);
         frame.shading = {request.shading.sampleClamp, request.shading.exposureScale,
                          request.shading.nee.probabilityMin, float(request.shading.nee.fromDepth)};
@@ -156,6 +181,10 @@ void GpuRenderDevice::RenderPass(SceneManager& scene, PassRequest const& request
         if (request.sample == 0) frame.settings.z |= kFrameSeedRng;
         frame.settings.w = request.seed;
         frame.counts.z = uint32_t(std::max(0, request.sample));
+        if (gpuPrimary) {
+            frame.settings.z |= kFramePrimaryHits;
+            RenderBuffer(kSlotAccumulation, pixels * 48);
+        }
     }
 
     // Tiles are dispatched in chunks so callers see progress and can stop.
@@ -180,17 +209,19 @@ void GpuRenderDevice::RenderPass(SceneManager& scene, PassRequest const& request
             ++last;
         }
         auto const rayStart = Clock::now();
-        if (traceColor && !list.empty()) {
+        if ((traceColor || gpuPrimary) && !list.empty()) {
             std::memcpy(RenderBuffer(kSlotPixels, list.size() * 4), list.data(), list.size() * 4);
-            // Buffers may move when resized; fetch them again after the pixels.
-            rng = static_cast<uint32_t*>(RenderBuffer(kSlotRng, pixels * 4));
-            output = static_cast<float*>(RenderBuffer(kSlotOutput, pixels * 16));
             GpuFrame f = frame;
-            f.work = {uint32_t(list.size()), 0, kModePass, 0};
+            f.work = {uint32_t(list.size()), 0, traceColor ? kModePass : kModePrimary, 0};
             if (!Dispatch(f, uint32_t(list.size()), nullptr, &error)) {
                 std::cerr << LogPrefix() << error << '\n';
                 return;
             }
+        }
+        if (traceColor && !list.empty()) {
+            // Buffers may move when resized; fetch them again after the dispatch.
+            rng = static_cast<uint32_t*>(RenderBuffer(kSlotRng, pixels * 4));
+            output = static_cast<float*>(RenderBuffer(kSlotOutput, pixels * 16));
             for (uint32_t pixel : list) {
                 request.rngStates[pixel] = rng[pixel];
                 request.colors[pixel] = Color3(output[4 * pixel], output[4 * pixel + 1], output[4 * pixel + 2]);
@@ -203,12 +234,16 @@ void GpuRenderDevice::RenderPass(SceneManager& scene, PassRequest const& request
             request.rayNanoseconds->fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
                 primaryStart - rayStart).count()), std::memory_order_relaxed);
         if (tracePrimary) {
+            auto const* hits = gpuPrimary
+                ? static_cast<const float*>(RenderBuffer(kSlotAccumulation, pixels * 48)) : nullptr;
             for (size_t t = first; t < last; ++t) {
                 PixelTile const& tile = request.tiles[t];
                 tbb::parallel_for(tile.y, tile.y + tile.height, [&](unsigned y) {
                     for (unsigned x = tile.x; x < tile.x + tile.width; ++x) {
-                        const RayHit hit = scene.cast_ray(prism::MakeCameraRayWithLens(request.camera,
-                            float(x) + 0.5f, float(y) + 0.5f, width, height, nullptr));
+                        // Without a usable GPU scene, trace on the CPU scene.
+                        const RayHit hit = hits ? PrimaryHit(hits + 12 * (size_t(y) * width + x))
+                            : scene.cast_ray(prism::MakeCameraRayWithLens(request.camera,
+                                  float(x) + 0.5f, float(y) + 0.5f, width, height, nullptr));
                         request.resolvePrimary(x, y, hit);
                     }
                 });
@@ -238,12 +273,14 @@ bool GpuRenderDevice::RenderPreview(SceneManager& scene, PreviewRequest const& r
     auto const traceStart = std::chrono::steady_clock::now();
     const uint32_t count = request.previewWidth * request.previewHeight;
     RenderBuffer(kSlotOutput, size_t(count) * 16);
+    if (request.tracePrimary) RenderBuffer(kSlotAccumulation, size_t(count) * 48);
     GpuFrame frame = BaseFrame(request.camera, request.width, request.height);
     frame.size.z = request.previewWidth;
     frame.size.w = request.previewHeight;
     frame.shading = {request.shading.sampleClamp, request.shading.exposureScale,
                          request.shading.nee.probabilityMin, float(request.shading.nee.fromDepth)};
     if (request.shading.transparentEscapes) frame.settings.z |= kFrameTransparentEscapes;
+    if (request.tracePrimary) frame.settings.z |= kFramePrimaryHits;
     frame.settings.w = request.seed;
     frame.work = {count, 0, kModePreview, 0};
     if (!Dispatch(frame, count, nullptr, &error)) {
@@ -252,21 +289,19 @@ bool GpuRenderDevice::RenderPreview(SceneManager& scene, PreviewRequest const& r
     }
     if (request.colorPixels) request.colorPixels->fetch_add(count, std::memory_order_relaxed);
     auto const* values = static_cast<const float*>(RenderBuffer(kSlotOutput, size_t(count) * 16));
-    const unsigned width = request.width, height = request.height;
+    auto const* hits = request.tracePrimary
+        ? static_cast<const float*>(RenderBuffer(kSlotAccumulation, size_t(count) * 48)) : nullptr;
     const unsigned previewWidth = request.previewWidth, previewHeight = request.previewHeight;
     tbb::parallel_for(0u, previewHeight, [&](unsigned py) {
-        const unsigned y = std::min(height - 1, unsigned((uint64_t(2 * py + 1) * height) / (2 * previewHeight)));
         for (unsigned px = 0; px < previewWidth; ++px) {
             const size_t i = size_t(py) * previewWidth + px;
             const Color3 color(values[4 * i], values[4 * i + 1], values[4 * i + 2]);
-            if (request.tracePrimary) {
-                const unsigned x = std::min(width - 1, unsigned((uint64_t(2 * px + 1) * width) / (2 * previewWidth)));
-                const RayHit primary = scene.cast_ray(prism::MakeCameraRayWithLens(request.camera,
-                    float(x) + 0.5f, float(y) + 0.5f, width, height, nullptr));
-                request.writePixel(px, py, color, values[4 * i + 3], &primary);
-            } else {
+            if (!hits) {
                 request.writePixel(px, py, color, values[4 * i + 3], nullptr);
+                continue;
             }
+            const RayHit primary = PrimaryHit(hits + 12 * i);
+            request.writePixel(px, py, color, values[4 * i + 3], &primary);
         }
     });
     if (request.traceMilliseconds)

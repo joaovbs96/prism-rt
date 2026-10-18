@@ -3991,7 +3991,9 @@ AovKind _AovKind(TfToken const &name)
     if (name == HdAovTokens->normal) return AovKind::Normal;
     if (name == HdAovTokens->Neye) return AovKind::Neye;
     if (name == HdAovTokens->Peye) return AovKind::Peye;
-    if (name == TfToken("primvars:st")) return AovKind::St;
+    // Constructing a token looks it up in USD's locked global registry.
+    static const TfToken st("primvars:st");
+    if (name == st) return AovKind::St;
     if (name == HdAovTokens->primId) return AovKind::PrimId;
     if (name == HdAovTokens->elementId) return AovKind::ElementId;
     if (name == HdAovTokens->instanceId) return AovKind::InstanceId;
@@ -4085,6 +4087,7 @@ PreviewResult _RenderPreview(std::shared_ptr<Snapshot> const &snapshot,
     struct Target {
         PrismRenderBuffer *buffer = nullptr;
         TfToken name;
+        AovKind kind = AovKind::Unknown;
         size_t components = 0;
         std::vector<float> floats;
         std::vector<int> ints;
@@ -4098,6 +4101,7 @@ PreviewResult _RenderPreview(std::shared_ptr<Snapshot> const &snapshot,
         Target target;
         target.buffer = buffer;
         target.name = binding.aovName;
+        target.kind = _AovKind(binding.aovName);
         if (binding.aovName == HdAovTokens->color) {
             target.components = 4; target.floats.resize(pixels * 4);
         } else if (binding.aovName == HdAovTokens->normal ||
@@ -4152,15 +4156,14 @@ PreviewResult _RenderPreview(std::shared_ptr<Snapshot> const &snapshot,
         const size_t pixel =
             (static_cast<size_t>(result.height - 1 - py) * result.width + px);
         for (Target &target : targets) {
-            if (target.name == HdAovTokens->color) {
+            if (target.kind == AovKind::Color) {
                 float *dst = target.floats.data() + pixel * 4;
                 dst[0] = color.x(); dst[1] = color.y();
                 dst[2] = color.z(); dst[3] = coverage;
                 continue;
             }
             if (!primary) continue;
-            const AovKind kind = _AovKind(target.name);
-            _ResolvePrimaryAov(kind, *primary, camera, snapshot.get(),
+            _ResolvePrimaryAov(target.kind, *primary, camera, snapshot.get(),
                 target.floats.empty() ? nullptr : target.floats.data() + pixel * target.components,
                 target.ints.empty() ? nullptr : target.ints.data() + pixel);
         }
@@ -4174,7 +4177,7 @@ PreviewResult _RenderPreview(std::shared_ptr<Snapshot> const &snapshot,
         else
             target.buffer->PublishPreviewFloat(result.width, result.height,
                                                 target.floats, target.components, frame,
-                                                target.name == HdAovTokens->color);
+                                                target.kind == AovKind::Color);
     }
     result.publicationMilliseconds = 1000.0 * std::chrono::duration<double>(
         std::chrono::steady_clock::now() - publicationStart).count();
@@ -5771,16 +5774,19 @@ void SceneBridge::Render()
         // buffer destruction and resize also stop this worker before changing
         // storage, so no preparation worker ever dereferences a render buffer.
         RenderSettings previewSettings = settings;
+        const auto deviceKind = renderDevice->Info().kind;
+        const bool gpuPreview = deviceKind == prism::device::DeviceKind::Metal ||
+            deviceKind == prism::device::DeviceKind::Vulkan;
+        // The automatic maximum keeps CPU previews coarse; GPU devices afford
+        // far more pixels within the target.
+        const int maxDimension = settings.previewMaxDimension > 0
+            ? std::clamp(settings.previewMaxDimension, 16, 1024) : (gpuPreview ? 512 : 96);
+        previewSettings.previewMaxDimension = maxDimension;
         if (settings.adaptivePreview) {
             std::lock_guard lock(_impl->mutex);
             if (_impl->previewCostMilliseconds <= 0.0) {
-                // Without a measurement, start small on the CPU; GPU devices
-                // trace a larger preview within the target.
-                const auto kind = renderDevice->Info().kind;
-                const bool gpu = kind == prism::device::DeviceKind::Metal ||
-                    kind == prism::device::DeviceKind::Vulkan;
-                previewSettings.previewMaxDimension = std::min(
-                    std::clamp(settings.previewMaxDimension, 16, 1024), gpu ? 256 : 96);
+                // Without a measurement, start below the maximum.
+                previewSettings.previewMaxDimension = std::min(maxDimension, gpuPreview ? 256 : 96);
             } else {
                 const double ratio = std::sqrt(
                     static_cast<double>(std::clamp(settings.previewTargetMs, 1, 1000)) /
@@ -5789,7 +5795,7 @@ void SceneBridge::Render()
                     static_cast<int>(std::lround(std::max(
                         _impl->previewWidth, _impl->previewHeight) *
                         std::clamp(ratio, 0.5, 2.0))),
-                    16, std::clamp(settings.previewMaxDimension, 16, 1024));
+                    16, maxDimension);
             }
         }
         auto const previewStart = std::chrono::steady_clock::now();

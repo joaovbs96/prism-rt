@@ -16,6 +16,15 @@
 
 typedef PathTracer<GpuBackend, GpuHit, GpuShading> GpuPathTracer;
 
+// The pinhole ray through a pixel's center, for geometric outputs.
+PathRay pixelCenterRay(CameraParams camera, uint x, uint y, uint width, uint height)
+{
+    PathRay center;
+    center.ray = cameraRay(camera, float(x) + 0.5f, float(y) + 0.5f, width, height, false, (float2)0.0f);
+    center.footprint = emptyFootprint();
+    return center;
+}
+
 CameraParams frameCamera(GpuFrame frame)
 {
     CameraParams camera;
@@ -74,6 +83,8 @@ void main(uint3 id : SV_DispatchThreadID)
         tracer.sampler = previewSampler;
         const SampleResult preview = tracer.renderSample(camera, x, y, width, height, settings);
         gpu_store_output(thread, float4(preview.color, preview.coverage));
+        if ((flags & kFramePrimaryHits) != 0u)
+            gpu_store_primary_hit(thread, tracer.backend.intersect(pixelCenterRay(camera, x, y, width, height)).surface);
         return;
     }
 
@@ -85,6 +96,10 @@ void main(uint3 id : SV_DispatchThreadID)
     const uint pixel = gpu_pixel(replicated ? thread % frame.work.y : thread);
     const uint x = pixel % width;
     const uint y = pixel / width;
+    if (mode == kModePrimary) {
+        gpu_store_primary_hit(pixel, tracer.backend.intersect(pixelCenterRay(camera, x, y, width, height)).surface);
+        return;
+    }
     const uint sampleIndex = frame.counts.z + replica;
     // The sampler's sequence is indexed by the sample number, scrambled per pixel.
     const Sampler sampler = {sampleIndex,
@@ -111,6 +126,8 @@ void main(uint3 id : SV_DispatchThreadID)
         gpu_store_output(2u * thread + 1u, (sampleIndex & 1u) == 0u ? float4(result.color, 0.0f) : (float4)0.0f);
         return;
     }
+    if (mode == kModePass && (flags & kFramePrimaryHits) != 0u)
+        gpu_store_primary_hit(pixel, tracer.backend.intersect(pixelCenterRay(camera, x, y, width, height)).surface);
     gpu_store_rng(pixel, tracer.backend.rng.state);
     if (mode == kModeImage) gpu_accumulate(pixel, result.color, (frame.counts.z & 1u) == 0u);
     else gpu_store_output(pixel, float4(result.color, result.coverage));

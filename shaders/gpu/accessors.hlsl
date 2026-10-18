@@ -50,6 +50,16 @@ void gpu_store_rng(uint pixel, uint value)
     RWStructuredBuffer<uint> b = rngBuffer();
     b[pixel] = value;
 }
+// Preview pixel-center hits for geometric outputs, three entries per pixel
+// in the accumulation buffer (unused by previews otherwise).
+void gpu_store_primary_hit(uint pixel, SurfaceHit hit)
+{
+    RWStructuredBuffer<float4> b = accumulationBuffer();
+    b[3u * pixel] = float4(hit.p, hit.valid ? 1.0f : 0.0f);
+    b[3u * pixel + 1u] = float4(hit.n, 0.0f);
+    b[3u * pixel + 2u] = float4(hit.u, hit.v, asfloat(hit.instance), asfloat(hit.primitive));
+}
+
 void gpu_store_output(uint index, float4 value)
 {
     RWStructuredBuffer<float4> b = outputBuffer();

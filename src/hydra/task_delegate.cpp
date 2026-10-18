@@ -196,7 +196,7 @@ HdRenderSettingDescriptorList PrismTaskDelegate::GetRenderSettingDescriptors() c
             {"Sphere batching (experimental)", _sphereBatching, VtValue(false)},
             {"Hidden geometry budget (MiB, 0 unlimited)", _hiddenGeometryBudget, VtValue(0)},
             {"Preview target (ms)", _previewTargetMs, VtValue(33)},
-            {"Preview maximum dimension", _previewMaxDimension, VtValue(512)},
+            {"Preview maximum dimension (0 automatic)", _previewMaxDimension, VtValue(0)},
             {"Refinement delay (ms)", _refinementDelayMs, VtValue(100)},
             {"Environment sampling", _environmentSampling, VtValue(std::string("mis"))},
             {"Texture filtering", _textureFiltering, VtValue(std::string("filtered"))},
@@ -334,7 +334,8 @@ void PrismTaskDelegate::SetRenderSetting(TfToken const &key, VtValue const &valu
     else if (key == _previewTargetMs)
         s.previewTargetMs = std::clamp(_Get(value, s.previewTargetMs), 1, 1000);
     else if (key == _previewMaxDimension)
-        s.previewMaxDimension = std::clamp(_Get(value, s.previewMaxDimension), 16, 1024);
+        s.previewMaxDimension = _Get(value, s.previewMaxDimension) <= 0
+            ? 0 : std::clamp(_Get(value, s.previewMaxDimension), 16, 1024);
     else if (key == _refinementDelayMs)
         s.refinementDelayMs = std::clamp(_Get(value, s.refinementDelayMs), 0, 2000);
     else if (key == _environmentSampling &&
