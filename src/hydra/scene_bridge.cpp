@@ -58,6 +58,7 @@
 #include <tbb/task_arena.h>
 
 #include <algorithm>
+#include <tuple>
 #include <array>
 #include <bit>
 #include <chrono>
@@ -4371,6 +4372,9 @@ public:
     prism::device::DevicePreference renderDevicePreference = prism::device::DevicePreference::Auto;
     SceneManager const *renderDeviceScene = nullptr;
     uint64_t renderDeviceGeneration = 0;
+    // Integrator settings the render device last saw: GPU devices copy them
+    // into their scene data, so a change must reach them like an edit.
+    std::tuple<int, int, bool, int> renderDeviceSettings{};
     std::atomic<int64_t> embreeLiveBytes{0};
     std::atomic<int64_t> embreePeakBytes{0};
     mutable std::mutex mutex;
@@ -5667,12 +5671,18 @@ void SceneBridge::Render()
         renderDevice = _impl->RenderDeviceLocked(settings.device);
         // Published edits replace the snapshot or advance its generation;
         // camera changes do neither.
+        const auto deviceSettings = snapshot && snapshot->scene
+            ? std::make_tuple(snapshot->scene->max_depth, snapshot->scene->rr_min_depth,
+                  snapshot->scene->environmentSampling, int(snapshot->scene->textureFiltering))
+            : std::tuple<int, int, bool, int>{};
         if (snapshot && snapshot->scene &&
             (_impl->renderDeviceScene != snapshot->scene.get() ||
-             _impl->renderDeviceGeneration != _impl->activeGeneration)) {
+             _impl->renderDeviceGeneration != _impl->activeGeneration ||
+             _impl->renderDeviceSettings != deviceSettings)) {
             renderDevice->SceneChanged(*snapshot->scene);
             _impl->renderDeviceScene = snapshot->scene.get();
             _impl->renderDeviceGeneration = _impl->activeGeneration;
+            _impl->renderDeviceSettings = deviceSettings;
         }
         width = _impl->width; height = _impl->height;
         generation = _impl->activeGeneration;

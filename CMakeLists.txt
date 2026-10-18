@@ -315,6 +315,26 @@ if(PRISM_BUILD_HYDRA)
                     128 128 16 --hide-dome-background)
             set_tests_properties(prism_hydra_transparent_background_export PROPERTIES
                 ENVIRONMENT "${_prism_test_environment}")
+            # A changed integrator setting must reach the render device: a
+            # render switched to depth 1 matches one made at depth 1.
+            add_test(NAME prism_hydra_depth1_render
+                COMMAND prism_hydra_render
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/parity.usda"
+                    "/World/Camera" "${CMAKE_BINARY_DIR}/hydra/parity_depth1.exr"
+                    64 64 8 --max-depth 1)
+            add_test(NAME prism_hydra_depth_change_render
+                COMMAND prism_hydra_render
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/parity.usda"
+                    "/World/Camera" "${CMAKE_BINARY_DIR}/hydra/parity_depth_changed.exr"
+                    64 64 8 --change-depth 1)
+            add_test(NAME prism_hydra_setting_change_test
+                COMMAND prism_compare_images
+                    "${CMAKE_BINARY_DIR}/hydra/parity_depth1.exr"
+                    "${CMAKE_BINARY_DIR}/hydra/parity_depth_changed.exr" --exact)
+            set_tests_properties(prism_hydra_depth1_render prism_hydra_depth_change_render PROPERTIES
+                ENVIRONMENT "${_prism_test_environment}" FIXTURES_SETUP prism_depth_change)
+            set_tests_properties(prism_hydra_setting_change_test PROPERTIES
+                ENVIRONMENT "${_prism_test_environment}" FIXTURES_REQUIRED prism_depth_change)
         endif()
         if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/animated.usda")
             add_test(NAME prism_hydra_animation_exercise

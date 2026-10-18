@@ -250,6 +250,8 @@ int main(int argc, char** argv) {
         std::string filtering = "filtered";
         float sampleClamp = 10.0f;
         float adaptiveThreshold = 0.0f;
+        int maxDepth = 32;
+        int changeDepth = 0;
         int seed = 0;
         for (int i = 7; i < argc; ++i) {
             const std::string option(argv[i]);
@@ -263,6 +265,10 @@ int main(int argc, char** argv) {
             else if (option == "--sample-clamp") sampleClamp = std::stof(argv[i]);
             else if (option == "--seed") seed = std::stoi(argv[i]);
             else if (option == "--adaptive-threshold") adaptiveThreshold = std::stof(argv[i]);
+            else if (option == "--max-depth") maxDepth = std::stoi(argv[i]);
+            // Render, then change the maximum depth and render again: the saved
+            // image must match a render made at the new depth from the start.
+            else if (option == "--change-depth") changeDepth = std::stoi(argv[i]);
             else throw std::runtime_error("Unknown option: " + option);
         }
         if ((sampling != "mis" && sampling != "bsdf") ||
@@ -284,7 +290,7 @@ int main(int argc, char** argv) {
         engine.SetCameraPath(SdfPath(argv[2]));
         engine.SetRenderViewport(GfVec4d(0, 0, width, height));
         engine.SetRendererSetting(TfToken("prism:samplesPerPixel"), VtValue(spp));
-        engine.SetRendererSetting(TfToken("prism:maxDepth"), VtValue(32));
+        engine.SetRendererSetting(TfToken("prism:maxDepth"), VtValue(maxDepth));
         engine.SetRendererSetting(TfToken("prism:rrMinDepth"), VtValue(4));
         engine.SetRendererSetting(TfToken("prism:maxSampleRadiance"), VtValue(sampleClamp));
         engine.SetRendererSetting(TfToken("prism:environmentSampling"), VtValue(TfToken(sampling)));
@@ -302,6 +308,10 @@ int main(int argc, char** argv) {
             return 0;
         }
         render(engine, stage, UsdTimeCode::Default(), !hideDomeBackground);
+        if (changeDepth > 0) {
+            engine.SetRendererSetting(TfToken("prism:maxDepth"), VtValue(changeDepth));
+            render(engine, stage, UsdTimeCode::Default(), !hideDomeBackground);
+        }
         for (const auto& [name,value] : engine.GetRenderStats())
             std::cout << "Render stat " << name << ": " << value << '\n';
         // Some SDK/plugin shutdown paths terminate the process without
