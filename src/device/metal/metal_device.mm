@@ -122,6 +122,8 @@ struct MetalDevice::Impl {
     uint32_t mdlTextureCount = 1;
     id<MTLComputePipelineState> pipeline = nil;
     std::unordered_map<std::string, id<MTLComputePipelineState>> pipelines;
+    // The generated MDL code `pipeline` was built from.
+    std::shared_ptr<const gpu::MdlShaderCode> pipelineCode;
     id<MTLBuffer> buffers[kSlotCount] = {};
     std::vector<id<MTLTexture>> images;
     // Uploaded images by prepared resource, reused across scene rebuilds.
@@ -132,6 +134,8 @@ struct MetalDevice::Impl {
     };
     std::unordered_map<const prism::TextureResource*, CachedImage> imageCache;
     std::vector<id<MTLAccelerationStructure>> primitiveStructures;
+    std::vector<uint32_t> structureOfPrototype; // prototype -> primitiveStructures index
+    std::shared_ptr<const GpuSceneData::EnvironmentTables> uploadedEnvironmentTables;
     id<MTLAccelerationStructure> instanceStructure = nil;
     id<MTLBuffer> accelerationHeader = nil;
     id<MTLBuffer> resourceHeap = nil;
@@ -142,9 +146,9 @@ struct MetalDevice::Impl {
 
     bool ensureScene(SceneManager& scene, std::string* error);
     bool buildPipeline(std::string* error);
-    void uploadBuffers();
+    void uploadBuffers(bool keepGeometry);
     void uploadImages();
-    bool buildAccelerationStructures(std::string* error);
+    bool buildAccelerationStructures(bool keepPrimitives, std::string* error);
     void writeHeap();
     id<MTLBuffer> buffer(const void* bytes, size_t size);
     void setBuffer(int slot, id<MTLBuffer> buffer);
@@ -175,25 +179,31 @@ id<MTLBuffer> MetalDevice::Impl::renderBuffer(int slot, size_t size)
 template <class T>
 static size_t Bytes(std::vector<T> const& v) { return v.size() * sizeof(T); }
 
-void MetalDevice::Impl::uploadBuffers()
+void MetalDevice::Impl::uploadBuffers(bool keepGeometry)
 {
     GpuSceneData const& d = *data;
-    setBuffer(kSlotPositions, buffer(d.positions.data(), Bytes(d.positions)));
-    setBuffer(kSlotNormals, buffer(d.normals.data(), Bytes(d.normals)));
-    setBuffer(kSlotTexcoords, buffer(d.texcoords.data(), Bytes(d.texcoords)));
-    setBuffer(kSlotTangents, buffer(d.tangents.data(), Bytes(d.tangents)));
-    setBuffer(kSlotIndices, buffer(d.indices.data(), Bytes(d.indices)));
-    setBuffer(kSlotPrototypes, buffer(d.prototypes.data(), Bytes(d.prototypes)));
+    if (!keepGeometry) {
+        setBuffer(kSlotPositions, buffer(d.positions.data(), Bytes(d.positions)));
+        setBuffer(kSlotNormals, buffer(d.normals.data(), Bytes(d.normals)));
+        setBuffer(kSlotTexcoords, buffer(d.texcoords.data(), Bytes(d.texcoords)));
+        setBuffer(kSlotTangents, buffer(d.tangents.data(), Bytes(d.tangents)));
+        setBuffer(kSlotIndices, buffer(d.indices.data(), Bytes(d.indices)));
+        setBuffer(kSlotPrototypes, buffer(d.prototypes.data(), Bytes(d.prototypes)));
+        setBuffer(kSlotSpheres, buffer(d.spheres.data(), Bytes(d.spheres)));
+    }
     setBuffer(kSlotInstances, buffer(d.instances.data(), Bytes(d.instances)));
     setBuffer(kSlotPrimitiveMaterials, buffer(d.primitiveMaterials.data(), Bytes(d.primitiveMaterials)));
     setBuffer(kSlotMaterials, buffer(d.materials.data(), Bytes(d.materials)));
     setBuffer(kSlotLegacyTextures, buffer(d.legacyTextures.data(), Bytes(d.legacyTextures)));
-    setBuffer(kSlotSpheres, buffer(d.spheres.data(), Bytes(d.spheres)));
     setBuffer(kSlotEnvironment, buffer(&d.environment, sizeof(d.environment)));
-    setBuffer(kSlotEnvTexelPdf, buffer(d.environmentTexelPdf.data(), Bytes(d.environmentTexelPdf)));
-    setBuffer(kSlotEnvAliasProbability,
-              buffer(d.environmentAliasProbability.data(), Bytes(d.environmentAliasProbability)));
-    setBuffer(kSlotEnvAlias, buffer(d.environmentAlias.data(), Bytes(d.environmentAlias)));
+    if (!d.environmentTables || d.environmentTables != uploadedEnvironmentTables) {
+        static const GpuSceneData::EnvironmentTables none;
+        auto const& tables = d.environmentTables ? *d.environmentTables : none;
+        setBuffer(kSlotEnvTexelPdf, buffer(tables.texelPdf.data(), Bytes(tables.texelPdf)));
+        setBuffer(kSlotEnvAliasProbability, buffer(tables.aliasProbability.data(), Bytes(tables.aliasProbability)));
+        setBuffer(kSlotEnvAlias, buffer(tables.alias.data(), Bytes(tables.alias)));
+        uploadedEnvironmentTables = d.environmentTables;
+    }
     setBuffer(kSlotMdlTextures, buffer(d.mdlTextures.data(), Bytes(d.mdlTextures)));
     setBuffer(kSlotMdlTiles, buffer(d.mdlTiles.data(), Bytes(d.mdlTiles)));
     setBuffer(kSlotBsdfData, buffer(d.bsdfData.data(), Bytes(d.bsdfData)));
@@ -324,14 +334,16 @@ static id<MTLAccelerationStructure> BuildStructure(id<MTLDevice> device, id<MTLC
     return commands.status == MTLCommandBufferStatusCompleted ? structure : nil;
 }
 
-bool MetalDevice::Impl::buildAccelerationStructures(std::string* error)
+bool MetalDevice::Impl::buildAccelerationStructures(bool keepPrimitives, std::string* error)
 {
     GpuSceneData const& d = *data;
-    primitiveStructures.clear();
-    std::vector<uint32_t> structureOfPrototype(d.prototypes.size(), ~0u);
     std::vector<id<MTLBuffer>> boxes;
     std::vector<MTLPrimitiveAccelerationStructureDescriptor*> descriptors;
-    for (size_t p = 0; p < d.prototypes.size(); ++p) {
+    if (!keepPrimitives) {
+        primitiveStructures.clear();
+        structureOfPrototype.assign(d.prototypes.size(), ~0u);
+    }
+    for (size_t p = 0; p < d.prototypes.size() && !keepPrimitives; ++p) {
         GpuPrototype const& proto = d.prototypes[p];
         if (proto.info.w == 0) continue;
         MTLAccelerationStructureGeometryDescriptor* geometry = nil;
@@ -457,7 +469,8 @@ void MetalDevice::Impl::writeHeap()
 bool MetalDevice::Impl::buildPipeline(std::string* error)
 {
     auto const start = Clock::now();
-    gpu::MdlShaderCode code = gpu::GenerateMdlShaderCode(data->mdlMaterials);
+    const auto shared = gpu::CachedMdlShaderCode(data->mdlMaterials);
+    gpu::MdlShaderCode const& code = *shared;
     if (!code.success)
         std::cerr << "PrismRT Metal: MDL materials unavailable on the GPU (" << code.error << ")\n";
     for (size_t i = 0; i < code.materials.size(); ++i)
@@ -467,6 +480,9 @@ bool MetalDevice::Impl::buildPipeline(std::string* error)
     mdlTextureCount = uint32_t(data->mdlTextures.size());
     setBuffer(kSlotArgumentBlocks, buffer(code.argumentBlocks.data(), code.argumentBlocks.size()));
     setBuffer(kSlotRoData, buffer(code.roData.data(), code.roData.size()));
+    // The same generated code (an edit that kept the materials) keeps its pipeline.
+    if (shared == pipelineCode && pipeline) return true;
+    pipelineCode = nullptr;
 
     std::string mdlCode;
     if (!gpu::RewriteHlslToFp32(code.code, &mdlCode, error)) return false;
@@ -475,6 +491,7 @@ bool MetalDevice::Impl::buildPipeline(std::string* error)
     const std::string key = gpu::SourceDigest(source);
     if (auto found = pipelines.find(key); found != pipelines.end()) {
         pipeline = found->second;
+        pipelineCode = shared;
         return true;
     }
     const auto cacheDirectory = gpu::ShaderCacheDirectory("metal");
@@ -509,6 +526,7 @@ bool MetalDevice::Impl::buildPipeline(std::string* error)
         return false;
     }
     pipelines[key] = pipeline;
+    pipelineCode = shared;
     if (Verbose() || SecondsSince(pipelineStart) > 1.0)
         std::cerr << std::format("PrismRT Metal: pipeline {:.1f} s, total shader setup {:.1f} s\n",
                                  SecondsSince(pipelineStart), SecondsSince(start));
@@ -521,15 +539,29 @@ bool MetalDevice::Impl::ensureScene(SceneManager& scene, std::string* error)
     auto const start = Clock::now();
     dirty = false;
     boundScene = &scene;
+    auto previous = std::move(data);
     data = std::make_unique<GpuSceneData>(gpu::BuildGpuScene(scene));
+    // Edits that keep the geometry (placements, materials) keep the geometry
+    // buffers and the per-prototype acceleration structures.
+    const bool sameGeometry = previous && !primitiveStructures.empty() && gpu::SameGeometry(*previous, *data);
+    previous.reset();
+    auto const t1 = Clock::now();
     for (auto const& warning : data->warnings) std::cerr << "PrismRT Metal: " << warning << '\n';
     // The MDL link step patches materials and adds MDL textures and images,
     // so it runs before the upload.
     if (!buildPipeline(error)) { pipeline = nil; boundScene = nullptr; return false; }
-    uploadBuffers();
+    auto const t2 = Clock::now();
+    uploadBuffers(sameGeometry);
+    auto const t3 = Clock::now();
     uploadImages();
-    if (!buildAccelerationStructures(error)) { pipeline = nil; boundScene = nullptr; return false; }
+    auto const t4 = Clock::now();
+    if (!buildAccelerationStructures(sameGeometry, error)) { pipeline = nil; boundScene = nullptr; return false; }
+    auto const t5 = Clock::now();
     writeHeap();
+    if (Verbose()) std::cerr << std::format("PrismRT Metal: scene data {:.3f} s, shaders {:.3f} s, buffers {:.3f} s, images {:.3f} s, acceleration structures {:.3f} s, heap {:.3f} s\n",
+        std::chrono::duration<double>(t1 - start).count(), std::chrono::duration<double>(t2 - t1).count(),
+        std::chrono::duration<double>(t3 - t2).count(), std::chrono::duration<double>(t4 - t3).count(),
+        std::chrono::duration<double>(t5 - t4).count(), std::chrono::duration<double>(Clock::now() - t5).count());
     lastBuildSeconds = SecondsSince(start);
     if (Verbose())
         std::cerr << std::format("PrismRT Metal: scene ready in {:.2f} s ({} instances, {} triangles, {} spheres)\n",

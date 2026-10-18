@@ -45,8 +45,13 @@ struct GpuSceneData {
 
     // Environment.
     GpuEnvironment environment{};
-    std::vector<float> environmentTexelPdf, environmentAliasProbability;
-    std::vector<uint32_t> environmentAlias;
+    // Importance tables of a lat-long environment, shared between scene
+    // builds of the same environment (devices upload them once).
+    struct EnvironmentTables {
+        std::vector<float> texelPdf, aliasProbability;
+        std::vector<uint32_t> alias;
+    };
+    std::shared_ptr<const EnvironmentTables> environmentTables;
 
     // Integrator settings of the SceneManager.
     // Some instance has a material that may transmit shadow rays.
@@ -61,6 +66,11 @@ struct GpuSceneData {
 };
 
 GpuSceneData BuildGpuScene(SceneManager& scene);
+
+// Whether two scenes have the same prototype geometry (vertex data, indices,
+// prototypes, spheres), so their per-prototype acceleration structures and
+// geometry buffers can be kept. Placements and materials may differ.
+bool SameGeometry(GpuSceneData const& a, GpuSceneData const& b);
 
 // Records the MDL link unit in the scene data: dispatch indices and argument
 // block offsets of MDL materials (invalid ones become magenta), and the MDL

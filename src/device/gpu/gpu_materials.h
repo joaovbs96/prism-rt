@@ -64,4 +64,9 @@ constexpr int kGpuTextureResults = 16;
 
 MdlShaderCode GenerateMdlShaderCode(std::vector<MDLMaterial const*> const& materials);
 
+// GenerateMdlShaderCode, reusing the result for the same material bindings
+// (bindings are immutable, so equal bindings give equal code and data). Scene
+// edits that keep the materials then skip the MDL translation.
+std::shared_ptr<const MdlShaderCode> CachedMdlShaderCode(std::vector<MDLMaterial const*> const& materials);
+
 } // namespace prism::device::gpu

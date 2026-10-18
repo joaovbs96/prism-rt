@@ -135,6 +135,8 @@ struct VulkanDevice::Impl {
     VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
     std::unordered_map<std::string, VkPipeline> pipelines;
+    // The generated MDL code `pipeline` was built from.
+    std::shared_ptr<const gpu::MdlShaderCode> pipelineCode;
     VkQueryPool timestamps = VK_NULL_HANDLE;
 
     ~Impl();
@@ -486,18 +488,23 @@ bool VulkanDevice::Impl::submit(VkCommandBuffer commands, std::string* error)
 bool VulkanDevice::Impl::buildPipeline(std::string* error)
 {
     auto const start = Clock::now();
-    gpu::MdlShaderCode code = gpu::GenerateMdlShaderCode(data->mdlMaterials);
+    const auto shared = gpu::CachedMdlShaderCode(data->mdlMaterials);
+    gpu::MdlShaderCode const& code = *shared;
     if (!code.success)
         std::cerr << "PrismRT Vulkan: MDL materials unavailable on the GPU (" << code.error << ")\n";
     gpu::ApplyMdlShaderCode(*data, code);
     mdlTextureCount = uint32_t(data->mdlTextures.size());
     upload(kSlotArgumentBlocks, code.argumentBlocks.data(), code.argumentBlocks.size());
     upload(kSlotRoData, code.roData.data(), code.roData.size());
+    // The same generated code (an edit that kept the materials) keeps its pipeline.
+    if (shared == pipelineCode && pipeline != VK_NULL_HANDLE) return true;
+    pipelineCode = nullptr;
     std::vector<uint32_t> spirv;
     if (!CompileVulkanKernel(code.code, &spirv, error)) return false;
     const std::string key = gpu::SourceDigest(std::string(reinterpret_cast<const char*>(spirv.data()), spirv.size() * 4));
     if (auto found = pipelines.find(key); found != pipelines.end()) {
         pipeline = found->second;
+        pipelineCode = shared;
         return true;
     }
     VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
@@ -522,6 +529,7 @@ bool VulkanDevice::Impl::buildPipeline(std::string* error)
         return false;
     }
     pipelines[key] = pipeline;
+    pipelineCode = shared;
     if (gpu::GpuVerbose())
         std::cerr << std::format("PrismRT Vulkan: shader setup {:.1f} s\n", SecondsSince(start));
     return true;
@@ -934,9 +942,11 @@ bool VulkanDevice::Impl::ensureScene(SceneManager& scene, std::string* error)
     upload(kSlotLegacyTextures, d.legacyTextures.data(), bytes(d.legacyTextures));
     upload(kSlotSpheres, d.spheres.data(), bytes(d.spheres));
     upload(kSlotEnvironment, &d.environment, sizeof(d.environment));
-    upload(kSlotEnvTexelPdf, d.environmentTexelPdf.data(), bytes(d.environmentTexelPdf));
-    upload(kSlotEnvAliasProbability, d.environmentAliasProbability.data(), bytes(d.environmentAliasProbability));
-    upload(kSlotEnvAlias, d.environmentAlias.data(), bytes(d.environmentAlias));
+    static const GpuSceneData::EnvironmentTables noTables;
+    auto const& tables = d.environmentTables ? *d.environmentTables : noTables;
+    upload(kSlotEnvTexelPdf, tables.texelPdf.data(), bytes(tables.texelPdf));
+    upload(kSlotEnvAliasProbability, tables.aliasProbability.data(), bytes(tables.aliasProbability));
+    upload(kSlotEnvAlias, tables.alias.data(), bytes(tables.alias));
     upload(kSlotMdlTextures, d.mdlTextures.data(), bytes(d.mdlTextures));
     upload(kSlotMdlTiles, d.mdlTiles.data(), bytes(d.mdlTiles));
     upload(kSlotBsdfData, d.bsdfData.data(), bytes(d.bsdfData));

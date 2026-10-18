@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <mutex>
 #include <map>
 #include <unordered_map>
 
@@ -154,18 +155,36 @@ public:
             // The Embree vertex buffer holds any baked transform.
             float const* embree = geometry->geom ? static_cast<float const*>(
                 rtcGetGeometryBufferData(geometry->geom, RTC_BUFFER_TYPE_VERTEX, 0)) : nullptr;
-            for (size_t v = 0; v < vertexCount; ++v) {
-                float p[3] = {mesh->vertices[v].x(), mesh->vertices[v].y(), mesh->vertices[v].z()};
-                if (embree) std::memcpy(p, embree + 3 * v, sizeof(p));
-                pushVertex(p);
-                Float3 n = v < mesh->normals.size() ? mesh->normals[v] : Float3(0.0f);
-                m_data.normals.insert(m_data.normals.end(), {n.x(), n.y(), n.z()});
-                Float2 uv = v < mesh->texcoords.size() ? mesh->texcoords[v] : Float2(0.0f, 0.0f);
-                m_data.texcoords.insert(m_data.texcoords.end(), {uv.u(), uv.v()});
-                for (int c = 0; c < 4; ++c)
-                    m_data.tangents.push_back(4 * v + c < mesh->tangents.size()
-                        ? mesh->tangents[4 * v + c] : 0.0f);
+            // Sized once and filled in place: scenes rebuild this on every edit.
+            const size_t base = m_data.positions.size() / 3;
+            m_data.positions.resize(3 * (base + vertexCount));
+            m_data.normals.resize(3 * (base + vertexCount), 0.0f);
+            m_data.texcoords.resize(2 * (base + vertexCount), 0.0f);
+            m_data.tangents.resize(4 * (base + vertexCount), 0.0f);
+            float* positions = m_data.positions.data() + 3 * base;
+            float* normals = m_data.normals.data() + 3 * base;
+            float* texcoords = m_data.texcoords.data() + 2 * base;
+            if (embree) {
+                std::memcpy(positions, embree, vertexCount * 3 * sizeof(float));
+            } else {
+                for (size_t v = 0; v < vertexCount; ++v) {
+                    positions[3 * v] = mesh->vertices[v].x();
+                    positions[3 * v + 1] = mesh->vertices[v].y();
+                    positions[3 * v + 2] = mesh->vertices[v].z();
+                }
             }
+            for (size_t v = 0; v < std::min(vertexCount, mesh ? mesh->normals.size() : 0); ++v) {
+                normals[3 * v] = mesh->normals[v].x();
+                normals[3 * v + 1] = mesh->normals[v].y();
+                normals[3 * v + 2] = mesh->normals[v].z();
+            }
+            for (size_t v = 0; v < std::min(vertexCount, mesh ? mesh->texcoords.size() : 0); ++v) {
+                texcoords[2 * v] = mesh->texcoords[v].u();
+                texcoords[2 * v + 1] = mesh->texcoords[v].v();
+            }
+            if (mesh)
+                std::memcpy(m_data.tangents.data() + 4 * base, mesh->tangents.data(),
+                            std::min(4 * vertexCount, mesh->tangents.size()) * sizeof(float));
             const size_t triangles = mesh ? mesh->indices.size() / 3 : 0;
             m_data.indices.insert(m_data.indices.end(), mesh->indices.begin(),
                                   mesh->indices.begin() + triangles * 3);
@@ -240,6 +259,36 @@ void SetMatrixRows(float4 rows[3], std::array<float, 9> const& m)
     for (int r = 0; r < 3; ++r) rows[r] = {m[r * 3], m[r * 3 + 1], m[r * 3 + 2], 0.0f};
 }
 
+// The GPU form of a map's importance tables, built once per map. The cache
+// is keyed by the tables' storage, checked against a sample of the content
+// so storage reused by another map is not mistaken for it.
+std::shared_ptr<const GpuSceneData::EnvironmentTables> SharedEnvironmentTables(EnvironmentMap const& map)
+{
+    struct Entry {
+        const float* storage = nullptr;
+        size_t size = 0;
+        std::vector<float> sample;
+        std::shared_ptr<const GpuSceneData::EnvironmentTables> tables;
+    };
+    const size_t size = map.texelProbability.size();
+    std::vector<float> sample;
+    for (size_t i = 0; i < size; i += std::max<size_t>(1, size / 1024)) sample.push_back(map.texelProbability[i]);
+    static std::mutex mutex;
+    static std::vector<Entry> cache;
+    std::lock_guard lock(mutex);
+    for (auto const& entry : cache)
+        if (entry.storage == map.texelProbability.data() && entry.size == size && entry.sample == sample)
+            return entry.tables;
+    auto tables = std::make_shared<GpuSceneData::EnvironmentTables>();
+    tables->texelPdf = map.texelProbability;
+    tables->aliasProbability = map.probability;
+    tables->alias.assign(map.alias.begin(), map.alias.end());
+    constexpr size_t maxEntries = 2;
+    if (cache.size() >= maxEntries) cache.erase(cache.begin());
+    cache.push_back({map.texelProbability.data(), size, std::move(sample), tables});
+    return tables;
+}
+
 void BuildEnvironment(Environment const* environment, Builder& builder, GpuSceneData& data)
 {
     GpuEnvironment& record = data.environment;
@@ -262,9 +311,7 @@ void BuildEnvironment(Environment const* environment, Builder& builder, GpuScene
         if (!map.probability.empty()) {
             record.info.z = uint32_t(map.width);
             record.info2.x = uint32_t(map.height);
-            data.environmentTexelPdf = map.texelProbability;
-            data.environmentAliasProbability = map.probability;
-            data.environmentAlias.assign(map.alias.begin(), map.alias.end());
+            data.environmentTables = SharedEnvironmentTables(map);
         }
     };
     auto setTransform = [&](std::array<float, 9> const& toLocal,
@@ -305,6 +352,17 @@ void BuildEnvironment(Environment const* environment, Builder& builder, GpuScene
 }
 
 } // namespace
+
+bool SameGeometry(GpuSceneData const& a, GpuSceneData const& b)
+{
+    auto same = [](auto const& x, auto const& y) {
+        return x.size() == y.size() &&
+            (x.empty() || std::memcmp(x.data(), y.data(), x.size() * sizeof(x[0])) == 0);
+    };
+    return same(a.positions, b.positions) && same(a.normals, b.normals) && same(a.texcoords, b.texcoords) &&
+        same(a.tangents, b.tangents) && same(a.indices, b.indices) && same(a.prototypes, b.prototypes) &&
+        same(a.spheres, b.spheres);
+}
 
 GpuSceneData BuildGpuScene(SceneManager& scene)
 {

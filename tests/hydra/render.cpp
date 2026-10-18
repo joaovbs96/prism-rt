@@ -255,6 +255,8 @@ int main(int argc, char** argv) {
         int changeDepth = 0;
         float neeProbabilityMin = 0.05f;
         int previewSequence = 0;
+        int editSequence = 0;
+        std::string editPrim;
         int seed = 0;
         for (int i = 7; i < argc; ++i) {
             const std::string option(argv[i]);
@@ -272,6 +274,13 @@ int main(int argc, char** argv) {
             // Moves the camera this many times after the first render and
             // reports each preview's size and cost (adaptive preview).
             else if (option == "--preview-sequence") previewSequence = std::stoi(argv[i]);
+            // Moves the given prim this many times after the first render and
+            // reports how long each edit takes to show (scene updates).
+            else if (option == "--edit-sequence") {
+                editSequence = std::stoi(argv[i]);
+                if (++i >= argc) throw std::runtime_error("--edit-sequence needs a prim path");
+                editPrim = argv[i];
+            }
             else if (option == "--nee-probability-min") neeProbabilityMin = std::stof(argv[i]);
             // Render, then change the maximum depth and render again: the saved
             // image must match a render made at the new depth from the start.
@@ -332,6 +341,26 @@ int main(int argc, char** argv) {
             };
             std::cout << "Preview " << step << ": " << stat("previewWidth") << "x" << stat("previewHeight")
                       << ", cost " << stat("previewCostMilliseconds") << " ms\n";
+        }
+        for (int step = 1; step <= editSequence; ++step) {
+            UsdGeomXformable prim(stage->GetPrimAtPath(SdfPath(editPrim)));
+            if (!prim) throw std::runtime_error("--edit-sequence prim is not transformable");
+            bool resets = false;
+            GfMatrix4d transform;
+            prim.GetLocalTransformation(&transform, &resets);
+            transform.SetTranslateOnly(transform.ExtractTranslation() + GfVec3d(0.02, 0.0, 0.0));
+            const auto start = std::chrono::steady_clock::now();
+            prim.ClearXformOpOrder();
+            prim.AddTransformOp().Set(transform);
+            render(engine, stage, UsdTimeCode::Default(), !hideDomeBackground);
+            const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+            const auto stats = engine.GetRenderStats();
+            const auto stat = [&](const char* name) {
+                auto found = stats.find(name);
+                return found == stats.end() ? std::string("?") : TfStringify(found->second);
+            };
+            std::cout << "Edit " << step << ": converged after " << seconds << " s, snapshot "
+                      << stat("snapshotBuildSeconds") << " s, preview " << stat("previewMilliseconds") << " ms\n";
         }
         if (changeDepth > 0) {
             engine.SetRendererSetting(TfToken("prism:maxDepth"), VtValue(changeDepth));

@@ -554,4 +554,27 @@ MdlShaderCode GenerateMdlShaderCode(std::vector<MDLMaterial const*> const& mater
     return result;
 }
 
+std::shared_ptr<const MdlShaderCode> CachedMdlShaderCode(std::vector<MDLMaterial const*> const& materials)
+{
+    // The key holds the bindings, so their addresses cannot be reused while cached.
+    using Key = std::vector<std::shared_ptr<const mdl::MaterialBinding>>;
+    Key key;
+    key.reserve(materials.size());
+    for (MDLMaterial const* material : materials)
+        key.push_back(material && material->is_valid() ? material->get_target_code().binding : nullptr);
+    static std::mutex mutex;
+    static std::vector<std::pair<Key, std::shared_ptr<const MdlShaderCode>>> cache;
+    {
+        std::lock_guard lock(mutex);
+        for (auto const& [cachedKey, code] : cache)
+            if (cachedKey == key) return code;
+    }
+    auto code = std::make_shared<const MdlShaderCode>(GenerateMdlShaderCode(materials));
+    std::lock_guard lock(mutex);
+    constexpr size_t maxEntries = 4;
+    if (cache.size() >= maxEntries) cache.erase(cache.begin());
+    cache.emplace_back(std::move(key), code);
+    return code;
+}
+
 } // namespace prism::device::gpu
