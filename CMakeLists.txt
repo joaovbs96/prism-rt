@@ -230,6 +230,13 @@ endif()
 option(PRISM_ENABLE_VULKAN "Build the Vulkan render device" ${_prism_vulkan_default})
 if(PRISM_ENABLE_VULKAN)
     find_package(Vulkan REQUIRED)
+    if(MSVC)
+        # FindVulkan only sets a configuration-less IMPORTED_LOCATION, which the
+        # MSVC config mapping above does not fall back to.
+        foreach(_config MINSIZEREL RELEASE DEBUG RELWITHDEBINFO)
+            set_property(TARGET Vulkan::Vulkan PROPERTY IMPORTED_LOCATION_${_config} "${Vulkan_LIBRARY}")
+        endforeach()
+    endif()
     if(NOT PRISM_DXC_EXECUTABLE)
         message(FATAL_ERROR "The Vulkan device needs DXC (PRISM_DXC_EXECUTABLE); or set PRISM_ENABLE_VULKAN=OFF.")
     endif()
