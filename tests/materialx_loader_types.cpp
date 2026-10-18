@@ -39,6 +39,10 @@ int main() {
         <input name="top" type="BSDF" nodename="coats" />
         <input name="base" type="BSDF" nodename="base" />
       </layer>
+      <constant name="rgb" type="color3"><input name="value" type="color3" value="0.5, 0.5, 1" /></constant>
+      <convert name="to_vector" type="vector3">
+        <input name="in" type="color3" nodename="rgb" />
+      </convert>
       <nodegraph name="graph">
         <constant name="c" type="color3"><input name="value" type="color3" value="0.5, 0.5, 0.5" /></constant>
         <output name="out" type="color3" nodename="c" />
@@ -49,6 +53,8 @@ int main() {
     auto nodedef = library->addNodeDef("ND_surface_like", "surfaceshader", "surface_like");
     nodedef->addInput("opacity", "float");
     nodedef->addInput("tint", "color3");
+    library->addNodeDef("ND_convert_float_vector3", "vector3", "convert")->addInput("in", "float");
+    library->addNodeDef("ND_convert_color3_vector3", "vector3", "convert")->addInput("in", "color3");
     DocumentLoader loader(library, false, false);
     auto doc = loader.load(path.string());
     require(bool(doc), "load failed");
@@ -70,6 +76,9 @@ int main() {
     auto graphAdapter = doc->getNodeGraph("graph")->getNode(output->getNodeName());
     require(graphAdapter && graphAdapter->getCategory() == "extract", "no extract in the graph");
     require(doc->getNode("retyped")->getInput("tint")->getType() == "color3", "matching input changed");
+
+    // Ambiguous definitions (convert per input type) are left alone.
+    require(doc->getNode("to_vector")->getInput("in")->getType() == "color3", "convert input retyped");
 
     // A layer over a mix becomes a mix of layers.
     auto glaze = doc->getNode("glaze");

@@ -6,15 +6,14 @@ validation, and MDL generation. It does not rewrite source `.mtlx` files.
 The SSS fallback and the conductor clamp live side by side with independent
 switches.
 
-## SSS-to-diffuse fallback
+## SSS-to-diffuse fallback (opt-in)
 
-PrismRT currently samples MDL surface BSDFs without integrating volume scattering
-or absorption. MaterialX's MDL implementation of subsurface scattering uses both
-a transmitting surface and interior volume coefficients. Ignoring the volume
-while retaining that surface makes SSS objects appear transparent; it does not
-provide a diffuse approximation automatically.
-
-The loader therefore defaults to the following compatibility substitutions:
+Subsurface scattering is traced as a random walk through the MDL volume
+coefficients (`volume.absorption_coefficient`, `volume.scattering_coefficient`;
+see `shaders/integrator/path_tracer.h`), so the loader no longer removes it by
+default. Setting `PRISM_SSS_FALLBACK=1` (or passing
+`fallback_sss_to_diffuse=true`) restores the old substitution, for comparison
+or for scenes where the walk is too expensive:
 
 | MaterialX node category | Input replaced with constant zero |
 | --- | --- |
@@ -22,35 +21,45 @@ The loader therefore defaults to the following compatibility substitutions:
 | `open_pbr_surface` | `subsurface_weight` |
 
 This selects the surface model's ordinary diffuse branch instead of its SSS
-branch. Specular, metalness, base color, roughness, normal mapping, and explicitly
-authored transmission are preserved. Glass pawn tops therefore remain glass.
-The approximation uses the model's existing diffuse color, not a reconstruction
-of its subsurface color or scattering radius. It provides opaque diffuse shading
-where appropriate, not physically correct subsurface transport.
+branch; everything else is preserved. It handles top-level nodes and nodes in
+authored nodegraphs, removes `nodename`, `nodegraph`, `output` and
+`interfacename` bindings before setting the value (a value does not override a
+connection), and sets an absent weight explicitly. Imported standard-library
+nodes are added afterwards, so the shared library is not changed.
 
-The operation handles top-level nodes and nodes inside authored nodegraphs.
-It removes `nodename`, `nodegraph`, `output`, and `interfacename` bindings before
-setting the value: merely adding `value="0"` does not override a connected input.
-An absent weight is also explicitly set to zero. Imported standard-library nodes
-are added afterwards so their implementation graphs and the shared library are
-not changed. Other node categories, custom SSS implementations, and direct MDL
-materials are not covered by this fallback.
+## Color space names
 
-Every affected surface node is reported as `[MaterialX] SSS-to-diffuse fallback`.
-`MDLMaterial` uses the loader's default, so both direct `.mtlx` loading and the
-USD-to-MaterialX loading path receive the fallback. Calling `create_empty()` and
-then building a document manually does not run preprocessing.
+Assets name color spaces after their OCIO configs (`srgb_tx`, `Raw`, `ACEScg`,
+`Utility - sRGB - Texture`, `lin_srgb`, ...), which MaterialX does not know:
+their textures would stay unconverted. The loader maps these aliases to
+MaterialX's names (`srgb_texture`, `lin_rec709`, `acescg`, ...) on the document
+and on every element (`CanonicalColorSpace` in `src/materialx/loader.cpp`).
 
-When volume transport is implemented, opt out explicitly:
+## Input types
 
-```cpp
-DocumentLoader loader(stdlib, /*clamp=*/false,
-                      /*fallback_sss_to_diffuse=*/false);
-```
+Documents written by exporters, and those hdMtlx regenerates from USD shading
+networks, do not always type inputs as their node definitions declare:
 
-Do not remove the fallback merely because the MDL backend compiles volume fields:
-the path integrator must actually consume those fields. Keep it enabled until
-SSS surface/volume transport has been validated end to end.
+- An input connected to a node output of another type (a `color3` image driving
+  a `float` opacity) gets an `extract` (vector to float) or `convert` node.
+- An input typed differently from its node definition is retyped to the
+  declaration: vector values written as strings, flags written as integers,
+  and shader inputs hdMtlx typed after the graph output feeding them (the graph
+  output then gets the `extract`/`convert` node).
+
+Without these repairs validation fails ("doesn't match declaration") and the
+material renders as the magenta error material.
+
+## Layers over mixes
+
+MaterialX's MDL generator implements `layer` by passing the base BSDF into the
+top BSDF's `base` parameter (`ClosureLayerNodeMdl.cpp`). A `mix` as the top
+only works when one of its sides is empty; otherwise the base is dropped
+(`// TODO handle mix, add, and multiply`, still the case in MaterialX 1.39.5),
+which renders glazed or coated materials black. The loader distributes such
+layers over the mix, which is equivalent:
+
+    layer(mix(fg, bg, m), base) = mix(layer(fg, base), layer(bg, base), m)
 
 ## standard_surface conductor clamp
 
@@ -80,8 +89,9 @@ clamped; authoring them above one can still reach the same failure.
 
 ## Regression checks
 
-`materialx_loader_sss` covers the SSS fallback and `materialx_loader_clamp` the
-conductor clamp. The small standalone test project avoids loading the renderer
+`materialx_loader_sss` covers the SSS fallback, `materialx_loader_clamp` the
+conductor clamp, and `materialx_loader_types` the color space names, input type
+repairs and layer distribution. The small standalone test project avoids loading the renderer
 and its USD/MDL runtime dependencies:
 
 ```text

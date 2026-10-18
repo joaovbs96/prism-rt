@@ -39,8 +39,12 @@ void render(UsdImagingGLEngine& engine, const UsdStageRefPtr& stage,
     const auto start = std::chrono::steady_clock::now();
     do {
         engine.Render(stage->GetPseudoRoot(), params);
-        if (std::chrono::steady_clock::now()-start > std::chrono::minutes(5))
-            throw std::runtime_error("Hydra failed to converge within five minutes");
+        static const int minutes = [] {
+            const char* value = std::getenv("PRISM_RENDER_TIMEOUT_MINUTES");
+            return value && *value ? std::max(1, std::atoi(value)) : 5;
+        }();
+        if (std::chrono::steady_clock::now()-start > std::chrono::minutes(minutes))
+            throw std::runtime_error("Hydra failed to converge within the time limit (PRISM_RENDER_TIMEOUT_MINUTES)");
         if (!engine.IsConverged()) std::this_thread::sleep_for(std::chrono::milliseconds(10));
     } while (!engine.IsConverged());
 }
@@ -259,6 +263,7 @@ int main(int argc, char** argv) {
         float neeProbabilityMin = 0.05f;
         int previewSequence = 0;
         int editSequence = 0;
+        UsdTimeCode renderTime = UsdTimeCode::Default();
         std::string editPrim;
         int seed = 0;
         for (int i = 7; i < argc; ++i) {
@@ -274,6 +279,7 @@ int main(int argc, char** argv) {
             else if (option == "--seed") seed = std::stoi(argv[i]);
             else if (option == "--adaptive-threshold") adaptiveThreshold = std::stof(argv[i]);
             else if (option == "--max-depth") maxDepth = std::stoi(argv[i]);
+            else if (option == "--time") renderTime = UsdTimeCode(std::stod(argv[i]));
             // Moves the camera this many times after the first render and
             // reports each preview's size and cost (adaptive preview).
             else if (option == "--preview-sequence") previewSequence = std::stoi(argv[i]);
@@ -327,7 +333,7 @@ int main(int argc, char** argv) {
             std::cout << "Hydra animation exercise passed\n";
             return 0;
         }
-        render(engine, stage, UsdTimeCode::Default(), !hideDomeBackground);
+        render(engine, stage, renderTime, !hideDomeBackground);
         for (int step = 1; step <= previewSequence; ++step) {
             UsdGeomXformable camera(stage->GetPrimAtPath(SdfPath(argv[2])));
             bool resets = false;
@@ -336,7 +342,7 @@ int main(int argc, char** argv) {
             transform.SetTranslateOnly(transform.ExtractTranslation() + GfVec3d(0.002, 0.0, 0.0));
             camera.ClearXformOpOrder();
             camera.AddTransformOp().Set(transform);
-            render(engine, stage, UsdTimeCode::Default(), !hideDomeBackground);
+            render(engine, stage, renderTime, !hideDomeBackground);
             const auto stats = engine.GetRenderStats();
             const auto stat = [&](const char* name) {
                 auto found = stats.find(name);
@@ -355,7 +361,7 @@ int main(int argc, char** argv) {
             const auto start = std::chrono::steady_clock::now();
             prim.ClearXformOpOrder();
             prim.AddTransformOp().Set(transform);
-            render(engine, stage, UsdTimeCode::Default(), !hideDomeBackground);
+            render(engine, stage, renderTime, !hideDomeBackground);
             const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
             const auto stats = engine.GetRenderStats();
             const auto stat = [&](const char* name) {
@@ -367,7 +373,7 @@ int main(int argc, char** argv) {
         }
         if (changeDepth > 0) {
             engine.SetRendererSetting(TfToken("prism:maxDepth"), VtValue(changeDepth));
-            render(engine, stage, UsdTimeCode::Default(), !hideDomeBackground);
+            render(engine, stage, renderTime, !hideDomeBackground);
         }
         for (const auto& [name,value] : engine.GetRenderStats())
             std::cout << "Render stat " << name << ": " << value << '\n';

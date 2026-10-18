@@ -149,8 +149,15 @@ void FixDeclaredInputTypes(const MaterialX::DocumentPtr& doc, const MaterialX::D
             std::vector<MaterialX::NodeDefPtr> candidates = library->getMatchingNodeDefs(node->getCategory());
             auto local = doc->getMatchingNodeDefs(node->getCategory());
             candidates.insert(candidates.end(), local.begin(), local.end());
+            // Only an unambiguous definition: nodes such as convert have one
+            // per input type for the same output type.
+            int matches = 0;
             for (auto const& candidate : candidates)
-                if (candidate->getType() == node->getType()) { nodedef = candidate; break; }
+                if (candidate->getType() == node->getType()) {
+                    nodedef = candidate;
+                    ++matches;
+                }
+            if (matches != 1) nodedef = nullptr;
         }
         if (!nodedef) continue;
         for (auto input : node->getInputs()) {

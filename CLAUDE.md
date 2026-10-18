@@ -66,7 +66,7 @@ Most of the renderer is header-only (`src/*.h`); only the MDL/MaterialX pipeline
 4. Nested `tbb::parallel_for` over rows/columns; per pixel, `cam.get_ray()` + `SceneManager::trace()` per sample, with a TEA-hash RNG seed per pixel
 5. `FrameBuffer::applyGammaCorrection()` then save `output.png` via OpenImageIO
 
-`SceneManager::trace()` is a simple recursive path tracer with no next-event estimation: `emission + color * trace(next)`. Lights are only found by BSDF sampling, and a material's `BRDFSample` (`color`, `emission`, `wi`, `scattered`) is the whole integrator contract. There is no volume transport.
+`SceneManager::trace()` is the original recursive integrator, kept as the `cpu-reference` device. Every other device runs the shared integrator in `shaders/integrator/path_tracer.h`, compiled as C++ (CPU backend, `src/device/cpu_backend.h`) and as HLSL (`shaders/gpu/gpu_backend.hlsl`): NEE with power-heuristic MIS over a light table (`shaders/integrator/lights.h`, built by `src/device/light_table.h`) holding UsdLux sphere/rect/disk/cylinder/distant lights, constant-emission triangles and the domes (several domes combine as one `CompositeEnvironment` entry), light and shadow linking, and random-walk media (SSS and absorbing transmission) from MDL volume coefficients.
 
 ### Key Subsystems
 
@@ -82,7 +82,9 @@ Most of the renderer is header-only (`src/*.h`); only the MDL/MaterialX pipeline
 
 `USDMesh` runs the same pipeline for materials bound in USD (referenced `.mtlx` files or UsdShade networks), caching compiled materials per load by `(canonical file path, material name)`.
 
-**Compatibility preprocessing** — see `docs/materialx_compatibility.md`. `DocumentLoader` has two independent switches: a **conductor clamp** (`standard_surface` `base_color`/`specular_color` limited to `[0, 0.9999]` to work around an upstream MaterialX `artistic_ior` bug — value clamp for working-space constants, inserted `clamp` node otherwise, because color management converts after preprocessing) and an **SSS-to-diffuse fallback** (zeroes `standard_surface.subsurface` / `open_pbr_surface.subsurface_weight`, removing any connections) because the integrator ignores MDL volume coefficients and SSS surfaces would otherwise render transparent. Keep the fallback until volume transport is implemented and validated end to end. `mdl_report.md` holds further notes on MDL pipeline issues.
+**Compatibility preprocessing** — see `docs/materialx_compatibility.md`. `DocumentLoader` repairs documents in memory before generation: a **conductor clamp** (`standard_surface` `base_color`/`specular_color` limited to `[0, 0.9999]` for an upstream `artistic_ior` bug), OCIO **color space aliases** mapped to MaterialX names, **input type repairs** (extract/convert nodes for mismatched connections, inputs retyped to their node definition), and **layers distributed over mixed tops** (MaterialX's MDL generator drops the base otherwise). The **SSS-to-diffuse fallback** is opt-in (`PRISM_SSS_FALLBACK=1`) now that the integrator traces SSS. `mdl_report.md` holds further notes on MDL pipeline issues.
+
+**Lights, media and geometry (Hydra).** `scene_bridge.cpp` converts UsdLux lights into `SceneManager::lights` (`src/lights.h`), resolves light/shadow-link categories from `HdsiLightLinkingSceneIndex` (added in `plugin.cpp`), refines subdivision surfaces with OpenSubdiv (`src/mesh/subdivision.cpp`; `PRISM_SUBDIVISION_LEVEL`, default 2, and `PRISM_SUBDIVISION_MAX_FACES` per mesh), displaces meshes by their material's `geometry.displacement` at load time (`PRISM_DISPLACEMENT_LEVEL`/`_MAX_FACES`), and carries named mesh primvars to MDL scene data lookups (`geompropvalue`) on both devices. GPU textures beyond `PRISM_GPU_TEXTURE_BUDGET_MIB` (default 45% of device memory) upload at reduced resolution. Deferred features are listed in `docs/feature_roadmap.md`.
 
 ### Asset Resolution
 
