@@ -6,6 +6,7 @@
 
 #include "hlsl_math.h"
 #include "../../shaders/integrator/path_tracer.h"
+#include "light_table.h"
 #include "../camera_rays.h"
 #include "../scene.h"
 
@@ -33,6 +34,7 @@ inline float3 FromFloat3(Float3 const& v) { return float3(v.x(), v.y(), v.z()); 
 
 struct CpuBackend {
     SceneManager* scene = nullptr;
+    LightTable const* lights = nullptr;
     Rng rng = {0u};
     // Every material of the scene always blocks shadow rays (no cutouts).
     bool opaqueScene = false;
@@ -134,6 +136,29 @@ struct CpuBackend {
     }
 
     float environmentPdf(float3 direction) { return scene->environment->directionPdf(ToFloat3(direction)); }
+
+    uint lightCount() { return lights ? uint(lights->records.size()) : 0u; }
+    uint analyticLightCount() { return lights ? lights->analyticCount : 0u; }
+    LightRecord light(uint i) { return lights->records[i]; }
+    float4 lightAlias(uint i) { return lights->alias[i]; }
+    float3 lightTexture(uint texture, float2 st)
+    {
+        if (!lights || texture >= lights->textures.size()) return float3(1.0f);
+        return FromFloat3(lights->textures[texture]->sampleInterp(st.x, st.y, Float3(0.0f)));
+    }
+    float emitterPdfArea(CpuHit const& hit)
+    {
+        if (!lights || lights->emitters.empty() || !hit.material) return 0.0f;
+        auto found = lights->emitters.find(hit.material);
+        if (found == lights->emitters.end()) return 0.0f;
+        if (!found->second.twoSided && !hit.surface.front_face) return 0.0f;
+        auto geometry = scene->geometry.find(int(hit.surface.instance));
+        if (geometry == scene->geometry.end() || !geometry->second ||
+            (geometry->second->type != RTC_GEOMETRY_TYPE_TRIANGLE &&
+             geometry->second->type != RTC_GEOMETRY_TYPE_QUAD))
+            return 0.0f;
+        return found->second.pdfArea;
+    }
     int maxDepth() { return scene->max_depth; }
     int rouletteDepth() { return scene->rr_min_depth; }
     bool environmentMis() { return scene->environmentSampling; }

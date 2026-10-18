@@ -95,13 +95,14 @@ bool AllMaterialsBlock(SceneManager& scene)
 
 // One sample of the shared path tracer; seed carries the pixel's random state.
 // The sampler's sequence is indexed by `sample`, scrambled per pixel.
-SampleResult TraceSample(SceneManager& scene, bool opaqueScene, CameraParams const& camera,
+SampleResult TraceSample(SceneManager& scene, CpuSceneState const& state, CameraParams const& camera,
                          SampleSettings const& settings, unsigned x, unsigned y, unsigned width,
                          unsigned height, unsigned& seed, unsigned sample, unsigned pixelSeed)
 {
     CpuPathTracer tracer;
     tracer.backend.scene = &scene;
-    tracer.backend.opaqueScene = opaqueScene;
+    tracer.backend.opaqueScene = state.opaque;
+    tracer.backend.lights = state.lights.get();
     tracer.backend.rng.state = seed;
     tracer.sampler = {sample, pixelSeed, 0u};
     const SampleResult result = tracer.renderSample(camera, x, y, width, height, settings);
@@ -113,18 +114,22 @@ SampleResult TraceSample(SceneManager& scene, bool opaqueScene, CameraParams con
 
 void CpuDevice::SceneChanged(SceneManager&)
 {
-    std::lock_guard lock(m_opaqueMutex);
-    m_opaqueSceneOf = nullptr;
+    std::lock_guard lock(m_stateMutex);
+    m_stateOf = nullptr;
+    m_state.reset();
 }
 
-bool CpuDevice::OpaqueScene(SceneManager& scene)
+std::shared_ptr<const CpuSceneState> CpuDevice::PreparedScene(SceneManager& scene)
 {
-    std::lock_guard lock(m_opaqueMutex);
-    if (m_opaqueSceneOf != &scene) {
-        m_opaqueScene = AllMaterialsBlock(scene);
-        m_opaqueSceneOf = &scene;
+    std::lock_guard lock(m_stateMutex);
+    if (m_stateOf != &scene || !m_state) {
+        auto state = std::make_shared<CpuSceneState>();
+        state->opaque = AllMaterialsBlock(scene);
+        state->lights = std::make_shared<LightTable>(BuildLightTable(scene));
+        m_state = std::move(state);
+        m_stateOf = &scene;
     }
-    return m_opaqueScene;
+    return m_state;
 }
 
 DeviceInfo CpuDevice::Info() const
@@ -170,7 +175,7 @@ std::vector<float> CpuDevice::RenderImage(SceneManager& scene, ImageRequest cons
     }
 
     const CameraParams camera = ToCameraParams(request.camera);
-    const bool opaqueScene = OpaqueScene(scene);
+    const auto state = PreparedScene(scene);
     const SampleSettings settings = {request.sampleClamp, 1.0f, false, request.contributions,
         request.nee.probabilityMin, request.nee.fromDepth};
     const AdaptiveSettings& adaptive = request.adaptive;
@@ -194,7 +199,7 @@ std::vector<float> CpuDevice::RenderImage(SceneManager& scene, ImageRequest cons
                 unsigned& seed = seeds[pixel];
                 if (done == 0) seed = tea<64>(unsigned(y*width) ^ request.seed, unsigned(x));
                 for (int sample = done; sample < next; ++sample) {
-                    const auto result = TraceSample(scene, opaqueScene, camera, settings, unsigned(x),
+                    const auto result = TraceSample(scene, *state, camera, settings, unsigned(x),
                         unsigned(y), unsigned(width), unsigned(height), seed, unsigned(sample),
                         seedImage(unsigned(x), unsigned(y), unsigned(width), request.seed));
                     sums[pixel] += ToFloat3(result.color);
@@ -239,7 +244,7 @@ void CpuDevice::RenderPass(SceneManager& scene, PassRequest const& request)
     auto abandoned = [&] { return request.abandoned && request.abandoned(); };
     auto paused = [&] { return request.paused && request.paused(); };
     const CameraParams camera = ToCameraParams(request.camera);
-    const bool opaqueScene = !m_reference && OpaqueScene(scene);
+    const auto state = m_reference ? std::make_shared<const CpuSceneState>() : PreparedScene(scene);
     const SampleSettings settings = {request.shading.sampleClamp,
         request.shading.exposureScale, request.shading.transparentEscapes, kContributionAll,
         request.shading.nee.probabilityMin, request.shading.nee.fromDepth};
@@ -291,7 +296,7 @@ void CpuDevice::RenderPass(SceneManager& scene, PassRequest const& request)
                                             static_cast<float>(x) + 0.5f,
                                             static_cast<float>(y) + 0.5f,
                                             width, height, nullptr);
-                                const auto result = TraceSample(scene, opaqueScene, camera, settings, x, y, width,
+                                const auto result = TraceSample(scene, *state, camera, settings, x, y, width,
                                     height, seed, unsigned(request.sample), seedPass(x, y, width, request.seed));
                                 ++colorWork.value;
                                 request.colors[pixel] = ToFloat3(result.color);
@@ -351,7 +356,7 @@ bool CpuDevice::RenderPreview(SceneManager& scene, PreviewRequest const& request
     std::atomic<bool> cancelled{false};
     auto stopRequested = [&] { return request.stopRequested && request.stopRequested(); };
     const CameraParams camera = ToCameraParams(request.camera);
-    const bool opaqueScene = !m_reference && OpaqueScene(scene);
+    const auto state = m_reference ? std::make_shared<const CpuSceneState>() : PreparedScene(scene);
     const SampleSettings settings = {request.shading.sampleClamp,
         request.shading.exposureScale, request.shading.transparentEscapes, kContributionAll,
         request.shading.nee.probabilityMin, request.shading.nee.fromDepth};
@@ -391,7 +396,7 @@ bool CpuDevice::RenderPreview(SceneManager& scene, PreviewRequest const& request
                 color = ShadeSample(color, outcome, request.shading, &coverage);
                 center = rays.center;
             } else {
-                const auto result = TraceSample(scene, opaqueScene, camera, settings, x, y, width, height,
+                const auto result = TraceSample(scene, *state, camera, settings, x, y, width, height,
                                                 seed, 0u, seed);
                 color = ToFloat3(result.color);
                 coverage = result.coverage;

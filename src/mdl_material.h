@@ -58,7 +58,11 @@ public:
     // and a freshly bound argument/resource block. The binding retains its
     // program and runtime, so no generator or SDK transaction is needed here.
     explicit MDLMaterial(mdl::TargetCode boundTarget)
-        : m_target(std::move(boundTarget)), m_valid(m_target.success) { evaluateUniformCutout(); }
+        : m_target(std::move(boundTarget)), m_valid(m_target.success)
+    {
+        evaluateUniformCutout();
+        evaluateUniformEmission();
+    }
     // Compiles a .mtlx file into a callable MDL material.
     //   mtlx_path:         path to the .mtlx file
     //   mdl_context:       initialized MDL SDK context (from main)
@@ -173,6 +177,7 @@ public:
         m_compiled.release();
         m_valid = true;
         evaluateUniformCutout();
+        evaluateUniformEmission();
         // NOTE: prints the *resolved* name (material_name may be empty)
         if (PrismMdlVerbose())
             std::cout << "[MDLMaterial] OK: " << m_target.program->target_code->get_callable_function_count()
@@ -408,6 +413,8 @@ public:
 
     // The cutout opacity when it is the same everywhere on the material:
     // constant in the class, or depending only on the material's arguments.
+    std::optional<ConstantEmission> constantEmission() const override { return m_uniformEmission; }
+
     std::optional<float> constant_cutout() const {
         if (m_target.binding && m_target.binding->constant_cutout_opacity)
             return m_target.binding->constant_cutout_opacity;
@@ -653,7 +660,32 @@ private:
             m_uniformCutout = std::clamp(opacity, 0.0f, 1.0f);
     }
 
+    // Uniform emission is evaluated once, toward the normal of the front face.
+    void evaluateUniformEmission() {
+        m_uniformEmission.reset();
+        if (!m_valid || !m_target.program || !m_target.program->uniform_emission) return;
+        // A varying cutout scales the emission per point; leave those to BSDF sampling.
+        const auto cutout = constant_cutout();
+        if (!cutout) return;
+        RTCRayHit miss{};
+        miss.hit.geomID = RTC_INVALID_GEOMETRY_ID;
+        RayHit hit(miss);
+        hit.n = hit.n_g = Float3(0.0f, 0.0f, 1.0f);
+        hit.tangent = Float3(1.0f, 0.0f, 0.0f);
+        hit.u = hit.v = 0.0f;
+        hit.front_face = true;
+        ShadingStateData ss;
+        build_shading_state(hit, ss);
+        if (m_target.program->target_code->execute_init(m_target.program->functions.init_function_index,
+                ss.base(), m_target.texture_handler(), m_target.argument_data()) != 0) return;
+        const Color3 radiance = get_emission(ss.base(), mi::Float32_3(0.0f, 0.0f, 1.0f), false) * *cutout;
+        if (!(radiance.x() > 0.0f || radiance.y() > 0.0f || radiance.z() > 0.0f)) return;
+        if (!std::isfinite(radiance.x()) || !std::isfinite(radiance.y()) || !std::isfinite(radiance.z())) return;
+        m_uniformEmission = ConstantEmission{radiance, false};
+    }
+
     std::optional<float> m_uniformCutout;
+    std::optional<ConstantEmission> m_uniformEmission;
 
     // MDL pipeline objects — kept alive for the material's lifetime
     std::unique_ptr<mdl::MaterialCompiler> m_compiler;

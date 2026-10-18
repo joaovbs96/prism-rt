@@ -4,7 +4,17 @@
 #include "camera_ray_diagnostics.h"
 #include "device/device.h"
 #include <pxr/usd/usdGeom/camera.h>
+#include <pxr/usd/usdLux/blackbody.h>
+#include <pxr/usd/usdLux/cylinderLight.h>
+#include <pxr/usd/usdLux/diskLight.h>
+#include <pxr/usd/usdLux/distantLight.h>
 #include <pxr/usd/usdLux/domeLight.h>
+#include <pxr/usd/usdLux/domeLight_1.h>
+#include <pxr/usd/usdLux/lightAPI.h>
+#include <pxr/usd/usdLux/rectLight.h>
+#include <pxr/usd/usdLux/sphereLight.h>
+#include <pxr/usd/usdLux/tokens.h>
+#include <pxr/usd/usdGeom/xformCache.h>
 #include <pxr/usd/usdRender/settings.h>
 #include <pxr/base/gf/camera.h>
 #include <pxr/base/gf/frustum.h>
@@ -322,28 +332,86 @@ int runStandaloneCli(int argc, char** argv) {
             envImage->adjustExposure(o.exposure);
             env = std::make_unique<EnvironmentMap>(envImage.get());
             scene.environment = env.get();
-        } else if (stage) {
-            size_t domeCount = 0;
+        }
+        std::vector<std::unique_ptr<Texture<Color3>>> domeTextures;
+        std::vector<std::unique_ptr<Environment>> domes;
+        if (stage) {
             UsdGeomXformCache transforms;
+            const bool useDomes = !o.environmentColor && o.environment.empty();
             for (const auto& prim : stage->Traverse()) {
-                UsdLuxDomeLight dome(prim);
-                if (!dome) continue;
+                if (!prim.HasAPI<UsdLuxLightAPI>()) continue;
                 if (UsdGeomImageable(prim).ComputeVisibility() == UsdGeomTokens->invisible) continue;
-                if (domeCount++) { std::cerr << "PrismRT: only the first dome light is supported\n"; continue; }
+                UsdLuxLightAPI light(prim);
                 GfVec3f color(1); float intensity = 1, exposure = 0;
-                dome.GetColorAttr().Get(&color); dome.GetIntensityAttr().Get(&intensity); dome.GetExposureAttr().Get(&exposure);
-                const Color3 multiplier = Float3(color[0], color[1], color[2]) * (intensity*std::exp2(exposure));
-                SdfAssetPath asset; dome.GetTextureFileAttr().Get(&asset);
-                const std::string texturePath = asset.GetResolvedPath();
-                if (!asset.GetAssetPath().empty() && texturePath.empty())
-                    throw std::runtime_error("Cannot resolve dome texture: " + asset.GetAssetPath());
-                Texture<Color3>* texture;
-                if (!texturePath.empty()) { envImage = std::make_unique<ImageTexture<Color3>>(texturePath); texture = envImage.get(); }
-                else { domeColor = std::make_unique<ColorTexture>(Color3(1)); texture = domeColor.get(); }
-                const auto inverse = transforms.GetLocalToWorldTransform(prim).GetInverse();
-                std::array<float,9> linear;
-                for (int row=0; row<3; ++row) for (int col=0; col<3; ++col) linear[row*3+col] = float(inverse[col][row]);
-                env = std::make_unique<TransformedEnvironmentMap>(texture, multiplier, linear);
+                light.GetColorAttr().Get(&color); light.GetIntensityAttr().Get(&intensity);
+                light.GetExposureAttr().Get(&exposure);
+                bool enableTemperature = false; float temperature = 6500.0f;
+                light.GetEnableColorTemperatureAttr().Get(&enableTemperature);
+                light.GetColorTemperatureAttr().Get(&temperature);
+                if (enableTemperature) color = GfCompMult(color, UsdLuxBlackbodyTemperatureAsRgb(temperature));
+                const GfMatrix4d world = transforms.GetLocalToWorldTransform(prim);
+                const bool isDome = prim.IsA<UsdLuxDomeLight>() || prim.IsA<UsdLuxDomeLight_1>();
+                if (isDome) {
+                    if (!useDomes) continue;
+                    const Color3 multiplier = Float3(color[0], color[1], color[2]) * (intensity*std::exp2(exposure));
+                    SdfAssetPath asset;
+                    prim.GetAttribute(UsdLuxTokens->inputsTextureFile).Get(&asset);
+                    const std::string texturePath = asset.GetResolvedPath();
+                    if (!asset.GetAssetPath().empty() && texturePath.empty())
+                        throw std::runtime_error("Cannot resolve dome texture: " + asset.GetAssetPath());
+                    if (!texturePath.empty()) domeTextures.push_back(std::make_unique<ImageTexture<Color3>>(texturePath));
+                    else domeTextures.push_back(std::make_unique<ColorTexture>(Color3(1)));
+                    const auto inverse = world.GetInverse();
+                    std::array<float,9> linear;
+                    for (int row=0; row<3; ++row) for (int col=0; col<3; ++col) linear[row*3+col] = float(inverse[col][row]);
+                    domes.push_back(std::make_unique<TransformedEnvironmentMap>(domeTextures.back().get(), multiplier, linear));
+                    continue;
+                }
+                prism::LightParameters params;
+                if (prim.IsA<UsdLuxSphereLight>()) {
+                    params.shape = prism::LightShape::Sphere;
+                    UsdLuxSphereLight(prim).GetRadiusAttr().Get(&params.radius);
+                    UsdLuxSphereLight(prim).GetTreatAsPointAttr().Get(&params.treatAsPoint);
+                } else if (prim.IsA<UsdLuxRectLight>()) {
+                    params.shape = prism::LightShape::Rect;
+                    UsdLuxRectLight(prim).GetWidthAttr().Get(&params.width);
+                    UsdLuxRectLight(prim).GetHeightAttr().Get(&params.height);
+                } else if (prim.IsA<UsdLuxDiskLight>()) {
+                    params.shape = prism::LightShape::Disk;
+                    UsdLuxDiskLight(prim).GetRadiusAttr().Get(&params.radius);
+                } else if (prim.IsA<UsdLuxCylinderLight>()) {
+                    params.shape = prism::LightShape::Cylinder;
+                    UsdLuxCylinderLight(prim).GetRadiusAttr().Get(&params.radius);
+                    UsdLuxCylinderLight(prim).GetLengthAttr().Get(&params.length);
+                } else if (prim.IsA<UsdLuxDistantLight>()) {
+                    params.shape = prism::LightShape::Distant;
+                    UsdLuxDistantLight(prim).GetAngleAttr().Get(&params.angle);
+                } else {
+                    std::cerr << "PrismRT: light type '" << prim.GetTypeName() << "' is not supported; skipped\n";
+                    continue;
+                }
+                params.color = Color3(color[0], color[1], color[2]);
+                params.intensity = intensity;
+                params.exposure = exposure;
+                light.GetNormalizeAttr().Get(&params.normalize);
+                std::array<double, 16> matrix{};
+                for (int row = 0; row < 4; ++row)
+                    for (int column = 0; column < 4; ++column) matrix[row * 4 + column] = world[row][column];
+                prism::SceneLight sceneLight = prism::MakeSceneLight(params, matrix);
+                if (params.shape == prism::LightShape::Rect) {
+                    SdfAssetPath asset;
+                    UsdLuxRectLight(prim).GetTextureFileAttr().Get(&asset);
+                    if (!asset.GetResolvedPath().empty())
+                        sceneLight.texture = std::make_shared<ImageTexture<Color3>>(asset.GetResolvedPath());
+                }
+                scene.lights.push_back(std::move(sceneLight));
+            }
+            if (domes.size() == 1) {
+                scene.environment = domes.front().get();
+            } else if (domes.size() > 1) {
+                std::vector<const Environment*> parts;
+                for (auto const& dome : domes) parts.push_back(dome.get());
+                env = std::make_unique<CompositeEnvironment>(std::move(parts));
                 scene.environment = env.get();
             }
         }

@@ -195,6 +195,43 @@ bool IsUniformExpression(const mi::neuraylib::IExpression* expression,
     }
 }
 
+// A diffuse EDF with uniform arguments (or none at all): its radiance does
+// not depend on the shading point or the direction.
+bool IsUniformDiffuseEdf(const mi::neuraylib::IExpression* expression,
+                         const mi::neuraylib::ICompiled_material* material,
+                         mi::neuraylib::ITransaction* transaction, int depth = 0)
+{
+    if (!expression || depth > 256) return false;
+    using E = mi::neuraylib::IExpression;
+    switch (expression->get_kind()) {
+    case E::EK_CONSTANT:
+        return true; // no EDF
+    case E::EK_TEMPORARY: {
+        mi::base::Handle<const mi::neuraylib::IExpression_temporary> temporary(
+            expression->get_interface<mi::neuraylib::IExpression_temporary>());
+        mi::base::Handle<const E> value(material->get_temporary(temporary->get_index()));
+        return IsUniformDiffuseEdf(value.get(), material, transaction, depth + 1);
+    }
+    case E::EK_DIRECT_CALL: {
+        mi::base::Handle<const mi::neuraylib::IExpression_direct_call> call(
+            expression->get_interface<mi::neuraylib::IExpression_direct_call>());
+        mi::base::Handle<const mi::neuraylib::IFunction_definition> definition(
+            transaction->access<mi::neuraylib::IFunction_definition>(call->get_definition()));
+        if (!definition ||
+            definition->get_semantic() != mi::neuraylib::IFunction_definition::DS_INTRINSIC_DF_DIFFUSE_EDF)
+            return false;
+        mi::base::Handle<const mi::neuraylib::IExpression_list> arguments(call->get_arguments());
+        for (mi::Size i = 0; arguments && i < arguments->get_size(); ++i) {
+            mi::base::Handle<const E> argument(arguments->get_expression(i));
+            if (!IsUniformExpression(argument.get(), material, transaction, depth + 1)) return false;
+        }
+        return true;
+    }
+    default:
+        return false;
+    }
+}
+
 class KnownResourceCallback final : public mi::base::Interface_implement<
     mi::neuraylib::ITarget_resource_callback> {
 public:
@@ -399,6 +436,19 @@ TargetCode BackendCompiler::generate_target_code(const CompiledMaterial& compile
     if (VerboseMdl()) std::cout << std::format("  thin_walled: {}\n", binding->is_thin_walled ? "true" : "false");
     const bool uniformCutout = cutoutExpr && !binding->constant_cutout_opacity &&
         IsUniformExpression(cutoutExpr.get(), compiled.compiled_material.get(), compiled.transaction.get());
+
+    // Emission that is the same everywhere: emissive triangles become lights.
+    mi::base::Handle<const mi::neuraylib::IExpression> emissionIntensity(
+        compiled.compiled_material->lookup_sub_expression("surface.emission.intensity"));
+    mi::base::Handle<const mi::neuraylib::IExpression> emissionEdf(
+        compiled.compiled_material->lookup_sub_expression("surface.emission.emission"));
+    mi::base::Handle<const mi::neuraylib::IExpression> emissionMode(
+        compiled.compiled_material->lookup_sub_expression("surface.emission.mode"));
+    const bool uniformEmission = emissionIntensity && emissionEdf &&
+        IsUniformExpression(emissionIntensity.get(), compiled.compiled_material.get(), compiled.transaction.get()) &&
+        IsUniformDiffuseEdf(emissionEdf.get(), compiled.compiled_material.get(), compiled.transaction.get()) &&
+        (!emissionMode || IsUniformExpression(emissionMode.get(), compiled.compiled_material.get(),
+                                              compiled.transaction.get()));
 
     const std::string materialHash = std::format("{}:{}",
         static_cast<const void*>(&m_ctx),
@@ -780,6 +830,7 @@ TargetCode BackendCompiler::generate_target_code(const CompiledMaterial& compile
             program->compiled_material_name = std::move(name);
     }
     program->uniform_cutout = uniformCutout;
+    program->uniform_emission = uniformEmission;
     program->builtin_resources = !binding->texture_runtime;
     program->identity = cacheKey;
     result.success = true;

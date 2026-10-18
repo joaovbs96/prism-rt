@@ -8,6 +8,7 @@
 #include "triangulation.h"
 
 #include "../environment.h"
+#include "../lights.h"
 #include "../batched_spheres.h"
 #include "../camera_rays.h"
 #include "../camera_ray_diagnostics.h"
@@ -31,6 +32,7 @@
 #include "pxr/base/gf/vec2f.h"
 #include "pxr/base/gf/vec3f.h"
 #include "pxr/usd/ar/resolver.h"
+#include "pxr/usd/usdLux/blackbody.h"
 #include "pxr/usd/ar/resolverContextBinder.h"
 #include "pxr/usd/sdf/assetPath.h"
 #include "pxr/imaging/hd/light.h"
@@ -184,10 +186,19 @@ HdDataSourceBaseHandle _MakeStaticCopy(HdDataSourceBaseHandle const &source)
     return source;
 }
 
+struct _LightTokenSet {
+    TfToken treatAsPoint{"treatAsPoint"};
+};
+_LightTokenSet const &_LightTokens()
+{
+    static const _LightTokenSet tokens;
+    return tokens;
+}
+
 HdContainerDataSourceHandle _MakeStaticPrimCopy(
     TfToken const &primType, HdContainerDataSourceHandle const &source)
 {
-    if (!source || primType != HdPrimTypeTokens->domeLight)
+    if (!source || !HdPrimTypeIsLight(primType))
         return HdContainerDataSource::Cast(_MakeStaticCopy(source));
 
     // The legacy light data source resolves authored shader inputs from
@@ -213,7 +224,11 @@ HdContainerDataSourceHandle _MakeStaticPrimCopy(
         TfTokenVector lightNames = light->GetNames();
         TfToken const consumed[] = {
             HdLightTokens->color, HdLightTokens->intensity,
-            HdLightTokens->exposure, HdLightTokens->textureFile};
+            HdLightTokens->exposure, HdLightTokens->textureFile,
+            HdLightTokens->textureFormat, HdLightTokens->normalize,
+            HdLightTokens->enableColorTemperature, HdLightTokens->colorTemperature,
+            HdLightTokens->radius, HdLightTokens->width, HdLightTokens->height,
+            HdLightTokens->length, HdLightTokens->angle, _LightTokens().treatAsPoint};
         for (TfToken const &token : consumed) {
             if (light->Get(token) &&
                 std::find(lightNames.begin(), lightNames.end(), token) ==
@@ -562,6 +577,8 @@ struct Snapshot {
     std::unordered_map<SdfPath, Material *, SdfPath::Hash> displayMaterialsByPath;
     std::unique_ptr<Texture<Color3>> environmentTexture;
     std::unique_ptr<Environment> environment;
+    // With several domes: each of them; `environment` is then their composite.
+    std::vector<std::unique_ptr<Environment>> domeEnvironments;
     std::unordered_map<unsigned int, int> geomToPrimId;
     std::unordered_map<unsigned int, SharedFaceTable> geomToCoarseFaces;
     std::unordered_map<unsigned int, int> geomToInstanceId;
@@ -2620,13 +2637,14 @@ void _SetDomeEnvironment(HdSceneIndexBaseRefPtr const &scene,
                          Snapshot *snapshot)
 {
     if (!_WorldVisible(scene, path)) return;
-    if (snapshot->domeCount++ > 0 &&
-        snapshot->warnedFeatures.insert("multipleDomes").second) {
-        TF_WARN("PrismRT: multiple dome lights are not yet combined; using the last dome");
-    }
     HdLightSchema schema = HdLightSchema::GetFromParent(prim.dataSource);
     HdContainerDataSourceHandle light = schema.GetContainer();
     if (!light) return;
+    const TfToken format = _ContainerValue(light, HdLightTokens->textureFormat, TfToken());
+    if (!format.IsEmpty() && format != TfToken("automatic") && format != TfToken("latlong") &&
+        snapshot->warnedFeatures.insert("domeTextureFormat").second)
+        TF_WARN("PrismRT: dome texture format '%s' is not supported; reading it as lat-long",
+                format.GetText());
     const GfVec3f color = _ContainerValue(
         light, HdLightTokens->color, GfVec3f(1.0f));
     const float intensity = _ContainerValue(light, HdLightTokens->intensity, 1.0f);
@@ -2658,11 +2676,84 @@ void _SetDomeEnvironment(HdSceneIndexBaseRefPtr const &scene,
         if (auto* image = dynamic_cast<ImageTexture<Color3>*>(snapshot->environmentTexture.get()))
             texture = std::make_shared<ImageTexture<Color3>>(*image);
         auto local = snapshot->prototypePool->environmentCache.Get(std::move(texture), multiplier);
-        snapshot->environment = std::make_unique<CachedTransformedEnvironment>(std::move(local), linear);
+        auto dome = std::make_unique<CachedTransformedEnvironment>(std::move(local), linear);
+        // Several domes light the scene together (CompositeEnvironment).
+        if (++snapshot->domeCount == 1) {
+            snapshot->environment = std::move(dome);
+        } else {
+            if (snapshot->domeCount == 2)
+                snapshot->domeEnvironments.push_back(std::move(snapshot->environment));
+            snapshot->domeEnvironments.push_back(std::move(dome));
+            std::vector<const Environment *> parts;
+            for (auto const &part : snapshot->domeEnvironments) parts.push_back(part.get());
+            snapshot->environment = std::make_unique<CompositeEnvironment>(std::move(parts));
+        }
         snapshot->scene->environment = snapshot->environment.get();
     } catch (std::exception const &e) {
         TF_WARN("PrismRT: failed to load dome environment: %s", e.what());
     }
+}
+
+// UsdLux sphere, rect, disk, cylinder and distant lights.
+void _AddAnalyticLight(HdSceneIndexBaseRefPtr const &scene,
+                       SdfPath const &path, HdSceneIndexPrim const &prim,
+                       Snapshot *snapshot)
+{
+    prism::LightParameters params;
+    TfToken const &type = prim.primType;
+    if (type == HdPrimTypeTokens->sphereLight) params.shape = prism::LightShape::Sphere;
+    else if (type == HdPrimTypeTokens->rectLight) params.shape = prism::LightShape::Rect;
+    else if (type == HdPrimTypeTokens->diskLight) params.shape = prism::LightShape::Disk;
+    else if (type == HdPrimTypeTokens->cylinderLight) params.shape = prism::LightShape::Cylinder;
+    else if (type == HdPrimTypeTokens->distantLight) params.shape = prism::LightShape::Distant;
+    else {
+        if (snapshot->warnedFeatures.insert("lightType:" + type.GetString()).second)
+            TF_WARN("PrismRT: light type '%s' is not supported and will be skipped", type.GetText());
+        return;
+    }
+    if (!_WorldVisible(scene, path)) return;
+    HdContainerDataSourceHandle light =
+        HdLightSchema::GetFromParent(prim.dataSource).GetContainer();
+    if (!light) return;
+    GfVec3f color = _ContainerValue(light, HdLightTokens->color, GfVec3f(1.0f));
+    if (_ContainerValue(light, HdLightTokens->enableColorTemperature, false)) {
+        const GfVec3f temperature = UsdLuxBlackbodyTemperatureAsRgb(
+            _ContainerValue(light, HdLightTokens->colorTemperature, 6500.0f));
+        color = GfCompMult(color, temperature);
+    }
+    params.color = Color3(color[0], color[1], color[2]);
+    params.intensity = _ContainerValue(light, HdLightTokens->intensity,
+        params.shape == prism::LightShape::Distant ? 50000.0f : 1.0f);
+    params.exposure = _ContainerValue(light, HdLightTokens->exposure, 0.0f);
+    params.normalize = _ContainerValue(light, HdLightTokens->normalize, false);
+    params.radius = _ContainerValue(light, HdLightTokens->radius, 0.5f);
+    params.width = _ContainerValue(light, HdLightTokens->width, 1.0f);
+    params.height = _ContainerValue(light, HdLightTokens->height, 1.0f);
+    params.length = _ContainerValue(light, HdLightTokens->length, 1.0f);
+    params.angle = _ContainerValue(light, HdLightTokens->angle, 0.53f);
+    params.treatAsPoint = _ContainerValue(light, _LightTokens().treatAsPoint, false);
+    params.cameraVisible = false;
+    const GfMatrix4d world = _WorldTransform(scene, path);
+    std::array<double, 16> matrix{};
+    for (int row = 0; row < 4; ++row)
+        for (int column = 0; column < 4; ++column) matrix[row * 4 + column] = world[row][column];
+    prism::SceneLight result = prism::MakeSceneLight(params, matrix);
+    if (params.shape == prism::LightShape::Rect) {
+        const SdfAssetPath asset = _ContainerValue(light, HdLightTokens->textureFile, SdfAssetPath());
+        std::string resolved = asset.GetResolvedPath();
+        if (resolved.empty() && !asset.GetAssetPath().empty())
+            resolved = ArGetResolver().Resolve(asset.GetAssetPath()).GetPathString();
+        if (!resolved.empty() && std::filesystem::exists(resolved)) {
+            try {
+                result.texture = std::make_shared<ImageTexture<Color3>>(resolved);
+            } catch (std::exception const &e) {
+                TF_WARN("PrismRT: failed to load light texture '%s': %s", resolved.c_str(), e.what());
+            }
+        } else if (!asset.GetAssetPath().empty()) {
+            TF_WARN("PrismRT: could not resolve light texture '%s'", asset.GetAssetPath().c_str());
+        }
+    }
+    snapshot->scene->lights.push_back(std::move(result));
 }
 
 // Mesh prototypes converted ahead of the serial walk, which consumes them in
@@ -2928,10 +3019,8 @@ void _Walk(HdSceneIndexBaseRefPtr const &scene, SdfPath const &path,
     }
     if (prim.primType == HdPrimTypeTokens->domeLight)
         _SetDomeEnvironment(scene, path, prim, snapshot);
-    else if (HdLightSchema::GetFromParent(prim.dataSource) &&
-             snapshot->warnedFeatures.insert("analyticLights").second) {
-        TF_WARN("PrismRT: analytic USD lights are not supported; only dome lights are rendered");
-    }
+    else if (HdPrimTypeIsLight(prim.primType) && HdLightSchema::GetFromParent(prim.dataSource))
+        _AddAnalyticLight(scene, path, prim, snapshot);
     static const std::unordered_set<std::string> unsupportedPrimTypes{
         "basisCurves", "nurbsCurves", "points", "volume", "tetMesh"};
     std::string const type = prim.primType.GetString();
@@ -3728,6 +3817,8 @@ void _RefreshEnvironment(HdSceneIndexBaseRefPtr const &index,
     HdSceneIndexPrim const prim = index->GetPrim(path);
     if (prim.primType == HdPrimTypeTokens->domeLight)
         _SetDomeEnvironment(index, path, prim, snapshot);
+    else if (HdPrimTypeIsLight(prim.primType) && HdLightSchema::GetFromParent(prim.dataSource))
+        _AddAnalyticLight(index, path, prim, snapshot);
     for (SdfPath const &child : index->GetChildPrimPaths(path))
         _RefreshEnvironment(index, child, snapshot);
 }
@@ -5500,6 +5591,8 @@ bool SceneBridge::Prepare(CameraState const &camera,
                                         black.get());
                                 bank->environmentTexture = std::move(black);
                                 bank->scene->environment = bank->environment.get();
+                                bank->domeEnvironments.clear();
+                                bank->scene->lights.clear();
                                 _RefreshEnvironment(
                                     retained, SdfPath::AbsoluteRootPath(), bank.get());
                             }

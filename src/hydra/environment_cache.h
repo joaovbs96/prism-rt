@@ -140,6 +140,8 @@ public:
         if (transformed.is_zero()) return 0.0f;
         return this->local->map.directionPdf(transformed.normalize()) * localPerWorldJacobian(world.normalize());
     }
+    // A linear transform of the directions keeps the integral over the sphere.
+    float integratedLuminance() const override { return this->local->map.integratedLuminance(); }
 private:
     static Float3 apply(const std::array<float,9>& a, const Float3& v) {
         return {a[0]*v.x()+a[1]*v.y()+a[2]*v.z(), a[3]*v.x()+a[4]*v.y()+a[5]*v.z(), a[6]*v.x()+a[7]*v.y()+a[8]*v.z()};

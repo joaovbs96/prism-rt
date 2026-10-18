@@ -63,6 +63,23 @@ class Environment {
         s.pdf = 1.0f / (4.0f * PI);
         return s;
     }
+
+    // The integral of the radiance's luminance over the sphere (light
+    // selection). Estimated from a fixed set of directions by default.
+    virtual float integratedLuminance() const {
+        constexpr int count = 256;
+        double sum = 0.0;
+        for (int i = 0; i < count; ++i) {
+            // Fibonacci sphere.
+            const float y = 1.0f - 2.0f * (float(i) + 0.5f) / float(count);
+            const float r = std::sqrt(std::max(0.0f, 1.0f - y * y));
+            const float phi = float(i) * 2.39996322972865332f;
+            const Color3 c = radiance(Float3(r * std::cos(phi), y, r * std::sin(phi)));
+            const float lum = 0.2126f * c.x() + 0.7152f * c.y() + 0.0722f * c.z();
+            if (std::isfinite(lum) && lum > 0.0f) sum += lum;
+        }
+        return float(sum / count * 4.0 * 3.14159265358979323846);
+    }
 };
 
 class ConstantColorBackground : public Environment {
@@ -231,6 +248,7 @@ class EnvironmentMap : public Environment {
             }
         }
         if (!(total > 0.0) || !std::isfinite(total)) return;
+        luminanceIntegral = float(total);
         texelProbability.resize(count); probability.resize(count); alias.resize(count);
         std::vector<float> scaled(count); std::vector<size_t> under, over;
         // Bilinear filtering can emit radiance outside nonzero source texels.
@@ -246,9 +264,14 @@ class EnvironmentMap : public Environment {
         for(size_t i:over){probability[i]=1;alias[i]=i;} for(size_t i:under){probability[i]=1;alias[i]=i;}
     }
 
+    float integratedLuminance() const override {
+        return luminanceIntegral > 0.0f ? luminanceIntegral : Environment::integratedLuminance();
+    }
+
     Texture<Color3>* texture;
     Color3 multiplier;
     float exposure;
+    float luminanceIntegral = 0.0f;
     int width = 0, height = 0;
     std::vector<float> texelProbability, probability;
     std::vector<size_t> alias;
@@ -362,4 +385,74 @@ class CylindricalEnvironmentMap : public Environment {
     }
 
     Texture<Color3>* texture;
+};
+
+// Several environments lit at once (multiple dome lights): radiance is their
+// sum, and sampling picks one of them by integrated luminance, so the
+// density is the mixture of theirs.
+class CompositeEnvironment : public Environment {
+public:
+    explicit CompositeEnvironment(std::vector<const Environment*> environments)
+        : parts(std::move(environments)) {
+        double total = 0.0;
+        std::vector<double> power(parts.size());
+        for (size_t i = 0; i < parts.size(); ++i) {
+            const float p = parts[i]->integratedLuminance();
+            power[i] = std::isfinite(p) && p > 0.0f ? p : 0.0;
+            total += power[i];
+        }
+        weights.resize(parts.size());
+        for (size_t i = 0; i < parts.size(); ++i)
+            weights[i] = total > 0.0 ? float(power[i] / total) : 1.0f / float(parts.size());
+    }
+
+    Color3 sample(const RayHit& hit) override { return radiance(hit.d); }
+    Color3 radiance(const Float3& direction) const override {
+        Color3 sum(0.0f);
+        for (auto const* part : parts) sum += part->radiance(direction);
+        return sum;
+    }
+    Color3 radiance(const Float3& direction, const prism::DirectionFootprint& footprint) const override {
+        Color3 sum(0.0f);
+        for (auto const* part : parts) sum += part->radiance(direction, footprint);
+        return sum;
+    }
+    EnvironmentSample sampleDirection(unsigned int& seed, const prism::DirectionFootprint& footprint) const override {
+        const float u[4] = {rnd(seed), rnd(seed), rnd(seed), rnd(seed)};
+        return sampleDirectionUniform(u, footprint);
+    }
+    EnvironmentSample sampleDirection(unsigned int& seed) const override {
+        return sampleDirection(seed, prism::DirectionFootprint{});
+    }
+    // u[0] picks the environment and is rescaled for its own sampling.
+    EnvironmentSample sampleDirectionUniform(const float u[4],
+                                             const prism::DirectionFootprint& footprint) const override {
+        size_t chosen = parts.size() - 1;
+        float start = 0.0f;
+        for (size_t i = 0; i < parts.size(); ++i) {
+            if (u[0] < start + weights[i] || i + 1 == parts.size()) { chosen = i; break; }
+            start += weights[i];
+        }
+        float rescaled[4] = {u[0], u[1], u[2], u[3]};
+        if (weights[chosen] > 0.0f)
+            rescaled[0] = std::clamp((u[0] - start) / weights[chosen], 0.0f, std::nextafter(1.0f, 0.0f));
+        EnvironmentSample s = parts[chosen]->sampleDirectionUniform(rescaled, footprint);
+        s.radiance = radiance(s.wi, footprint);
+        s.pdf = directionPdf(s.wi);
+        return s;
+    }
+    float directionPdf(const Float3& direction) const override {
+        float pdf = 0.0f;
+        for (size_t i = 0; i < parts.size(); ++i)
+            if (weights[i] > 0.0f) pdf += weights[i] * parts[i]->directionPdf(direction);
+        return pdf;
+    }
+    float integratedLuminance() const override {
+        float sum = 0.0f;
+        for (auto const* part : parts) sum += part->integratedLuminance();
+        return sum;
+    }
+
+    std::vector<const Environment*> parts;
+    std::vector<float> weights; // selection probabilities
 };

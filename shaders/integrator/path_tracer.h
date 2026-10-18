@@ -22,6 +22,14 @@
 //   float3   backend.environmentRadiance(float3 direction, float angularRadius)
 //   EnvironmentLightSample backend.sampleEnvironment(float4 u, float angularRadius)
 //   float    backend.environmentPdf(float3 direction)
+//   uint     backend.lightCount()                 records of the light table (lights.h)
+//   uint     backend.analyticLightCount()         the first records: analytic shapes
+//   LightRecord backend.light(uint i)
+//   float4   backend.lightAlias(uint i)           alias table over lightCount() + 1 entries
+//                                                 (the last one: the dome)
+//   float3   backend.lightTexture(uint texture, float2 st)
+//   float    backend.emitterPdfArea(Hit)          selection density per unit area of a hit
+//                                                 emissive triangle (0: not a light)
 //   int      backend.maxDepth(), backend.rouletteDepth()
 //   bool     backend.environmentMis()
 //   Rng      backend.rng                          white noise for materials and cutouts
@@ -36,6 +44,7 @@
 // material function (prepare, sample, evaluate, cutoutOpacity).
 
 #include "types.h"
+#include "lights.h"
 
 inline float powerHeuristic(float a, float b)
 {
@@ -181,20 +190,72 @@ struct PathTracer {
     // SceneManager::environmentVisible: stochastic transmission through cutouts.
     // Opaque geometry anywhere on the ray blocks it whatever cutouts lie in
     // front, so a cheap any-hit query on opaque geometry comes first.
-    bool environmentVisible(PathRay shadow)
+    // Shadow rays end at shadow.ray.tfar (lights at a finite distance).
+    bool visible(PathRay shadow)
     {
         if (backend.occludedByOpaque(shadow)) return false;
         if (!backend.mayHaveCutouts()) return true;
         const float3 direction = shadow.ray.direction;
+        float remaining = shadow.ray.tfar;
         for (int crossings = 0; crossings < 64; ++crossings) {
             const Hit hit = backend.intersectNonOpaque(shadow);
             if (!hit.surface.valid) return true;
             if (backend.provenOpaque(hit)) return false;
             const float opacity = saturate(backend.cutoutOpacity(hit));
             if (opacity >= 1.0f || (opacity > 0.0f && backend.rng.next() < opacity)) return false;
+            remaining -= hit.surface.t;
             shadow = spawnRay(hit.surface, direction, true);
+            shadow.ray.tfar = remaining;
+            if (!(remaining > shadow.ray.tnear)) return true;
         }
         return false;
+    }
+
+    // The light table entry for the selection number u (lightCount() > 0).
+    LightPick pickLight(float u)
+    {
+        const uint entries = backend.lightCount() + 1u;
+        const float scaled = u * float(entries);
+        const uint column = min(uint(scaled), entries - 1u);
+        const float4 entry = backend.lightAlias(column);
+        LightPick pick;
+        pick.index = scaled - float(column) < entry.x ? column : asuint(entry.y);
+        pick.pmf = backend.lightAlias(pick.index).z;
+        return pick;
+    }
+
+    float domeSelectionProbability()
+    {
+        const uint count = backend.lightCount();
+        return count == 0u ? 1.0f : backend.lightAlias(count).z;
+    }
+
+    // Emission of the analytic lights a ray segment passes through, and of
+    // distant lights for escaped rays (tmax infinite), weighted against NEE.
+    float3 crossedLights(PathRay ray, float tmax, bool escaped, bool cameraRay, bool weighted,
+                         float bsdfPdf, float neeProbability)
+    {
+        float3 sum = (float3)0.0f;
+        const uint count = backend.analyticLightCount();
+        for (uint i = 0u; i < count; ++i) {
+            const LightRecord light = backend.light(i);
+            if (cameraRay && (light.info.y & kLightCameraVisible) == 0u) continue;
+            LightHit crossing;
+            if (light.info.x == kLightDistant) {
+                if (!escaped) continue;
+                crossing = escapedDistantLight(light, ray.ray.direction);
+            } else {
+                const LightHitTextured textured = intersectLight(light, ray.ray, tmax);
+                crossing = textured.hit;
+                if (crossing.hit && (light.info.y & kLightTextured) != 0u)
+                    crossing.radiance *= backend.lightTexture(light.info.z, textured.texcoord);
+            }
+            if (!crossing.hit) continue;
+            float misWeight = 1.0f;
+            if (weighted) misWeight = powerHeuristic(bsdfPdf, neeProbability * light.n.w * crossing.pdf);
+            sum += crossing.radiance * misWeight;
+        }
+        return sum;
     }
 
     // With environment MIS: BSDF sampling and environment NEE with the power
@@ -219,20 +280,37 @@ struct PathTracer {
         for (;;) {
             if (depth >= maxDepth) break;
             const Hit hit = backend.intersect(ray);
+            const bool weighted = mis && previousNee;
+            if (backend.analyticLightCount() > 0u) {
+                const float3 crossed = crossedLights(ray, hit.surface.valid ? hit.surface.t : ray.ray.tfar,
+                                                     !hit.surface.valid, depth == 0, weighted, previousPdf,
+                                                     previousNeeProbability);
+                result.radiance += weight * crossed * contributionWeight(contributions, depth);
+            }
             if (!hit.surface.valid) {
                 if (tracking) result.outcome = kPrimaryEscaped;
                 const float3 direction = normalize(ray.ray.direction);
                 const float3 li = backend.environmentRadiance(direction, angularRadius(ray.footprint));
                 float misWeight = 1.0f;
-                if (mis && previousNee)
-                    misWeight = powerHeuristic(previousPdf,
-                                               previousNeeProbability * backend.environmentPdf(direction));
+                if (weighted)
+                    misWeight = powerHeuristic(previousPdf, previousNeeProbability * domeSelectionProbability() *
+                                                                backend.environmentPdf(direction));
                 result.radiance += weight * li * (misWeight * contributionWeight(contributions, depth));
                 break;
             }
             const Shading shading = backend.prepare(hit);
             const BsdfSample bs = backend.sample(shading, sampler.next4());
-            result.radiance += weight * bs.emission * contributionWeight(contributions, depth);
+            float emissionWeight = 1.0f;
+            if (weighted && !isZero(bs.emission)) {
+                // Emissive triangles are also sampled by NEE: area to solid angle.
+                const float pdfArea = backend.emitterPdfArea(hit);
+                const float cosLight = abs(dot(hit.surface.n_g, normalize(ray.ray.direction)));
+                const float distance = hit.surface.t * length(ray.ray.direction);
+                if (pdfArea > 0.0f && cosLight > 0.0f)
+                    emissionWeight = powerHeuristic(previousPdf, previousNeeProbability * pdfArea *
+                                                                     distance * distance / cosLight);
+            }
+            result.radiance += weight * bs.emission * (emissionWeight * contributionWeight(contributions, depth));
             if (mis && bs.null_event) {
                 if (!bs.scattered) tracking = false;
                 if (nullCrossings >= 64) break;
@@ -254,17 +332,40 @@ struct PathTracer {
                 neeProbability = clamp(maxComponent(weight), settings.neeProbabilityMin, 1.0f);
             const bool doNee = canNee && (neeProbability >= 1.0f || sampler.next1() < neeProbability);
             if (doNee) {
-                const EnvironmentLightSample light =
-                    backend.sampleEnvironment(sampler.next4(), angularRadius(hit.surface.ray_footprint));
-                if (light.pdf > 0.0f && isfinite(light.pdf)) {
+                // Without other lights the dome is the only entry (no selection number).
+                LightPick pick;
+                pick.index = 0u;
+                pick.pmf = 1.0f;
+                const uint lightCount = backend.lightCount();
+                if (lightCount > 0u) pick = pickLight(sampler.next1());
+                LightSample light = invalidLightSample();
+                if (pick.index >= lightCount) {
+                    const EnvironmentLightSample dome =
+                        backend.sampleEnvironment(sampler.next4(), angularRadius(hit.surface.ray_footprint));
+                    light.wi = dome.wi;
+                    light.radiance = dome.radiance;
+                    light.pdf = dome.pdf;
+                    light.distance = infinity();
+                    light.delta = false;
+                    light.valid = dome.pdf > 0.0f && isfinite(dome.pdf);
+                } else {
+                    const LightRecord record = backend.light(pick.index);
+                    const float4 u = sampler.next4();
+                    const LightSampleTextured sampled = sampleLight(record, hit.surface.p, float2(u.x, u.y));
+                    light = sampled.sample;
+                    if (light.valid && (record.info.y & kLightTextured) != 0u)
+                        light.radiance *= backend.lightTexture(record.info.z, sampled.texcoord);
+                }
+                if (light.valid && pick.pmf > 0.0f) {
                     // The shadow ray is traced only for a nonzero contribution.
                     const BsdfEvaluation f = backend.evaluate(shading, light.wi);
                     if (f.valid && f.pdf >= 0.0f && isfinite(f.pdf)) {
-                        const float lightPdf = neeProbability * light.pdf;
-                        const float3 contribution = weight * f.value * light.radiance *
-                            (powerHeuristic(lightPdf, f.pdf) / lightPdf);
-                        if (maxComponent(contribution) > 0.0f &&
-                            environmentVisible(spawnRay(hit.surface, light.wi, false)))
+                        const float lightPdf = neeProbability * pick.pmf * light.pdf;
+                        const float misWeight = light.delta ? 1.0f : powerHeuristic(lightPdf, f.pdf);
+                        const float3 contribution = weight * f.value * light.radiance * (misWeight / lightPdf);
+                        PathRay shadow = spawnRay(hit.surface, light.wi, false);
+                        if (isfinite(light.distance)) shadow.ray.tfar = light.distance * (1.0f - 1e-4f);
+                        if (maxComponent(contribution) > 0.0f && visible(shadow))
                             result.radiance += contribution * contributionWeight(contributions, depth + 1);
                     }
                 }

@@ -8,6 +8,7 @@
 
 #include "../hlsl_math.h"
 #include "../../../shaders/shared/prism_gpu_types.h"
+#include "../../../shaders/integrator/lights.h"
 #include "gpu_materials.h"
 
 #include <array>
@@ -43,15 +44,22 @@ struct GpuSceneData {
     std::vector<uint32_t> mdlTiles;
     std::vector<float> bsdfData;
 
-    // Environment.
-    GpuEnvironment environment{};
-    // Importance tables of a lat-long environment, shared between scene
-    // builds of the same environment (devices upload them once).
+    // Environment: one record per dome (at least one).
+    std::vector<GpuEnvironment> environments;
+    // Importance tables of the lat-long environments (GpuEnvironment.info3.x
+    // offsets); those of a single map are shared between scene builds of
+    // the same environment (devices upload them once).
     struct EnvironmentTables {
         std::vector<float> texelPdf, aliasProbability;
         std::vector<uint32_t> alias;
     };
     std::shared_ptr<const EnvironmentTables> environmentTables;
+
+    // Lights (device/light_table.h): analytic lights first, then emissive
+    // triangles; the alias table has one more entry for the domes.
+    std::vector<LightRecord> lights;
+    std::vector<float4> lightAlias;
+    uint32_t analyticLights = 0;
 
     // Integrator settings of the SceneManager.
     // Some instance has a material that may transmit shadow rays.

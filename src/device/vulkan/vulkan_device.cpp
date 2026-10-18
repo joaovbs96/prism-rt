@@ -547,7 +547,8 @@ bool VulkanDevice::Impl::uploadImages(std::string* error)
     auto service = prism::TextureService::Acquire();
     for (size_t i = 0; i < d.images.size(); ++i) {
         auto const& resource = d.images[i];
-        const bool floatPrecision = d.environment.info.y == i;
+        bool floatPrecision = false;
+        for (auto const& environment : d.environments) floatPrecision |= environment.info.y == i;
         info[i].info = {uint32_t(resource->width()), uint32_t(resource->height()),
                         uint32_t(resource->channels()), uint32_t(i)};
         auto found = imageCache.find(resource.get());
@@ -941,7 +942,9 @@ bool VulkanDevice::Impl::ensureScene(SceneManager& scene, std::string* error)
     upload(kSlotMaterials, d.materials.data(), bytes(d.materials));
     upload(kSlotLegacyTextures, d.legacyTextures.data(), bytes(d.legacyTextures));
     upload(kSlotSpheres, d.spheres.data(), bytes(d.spheres));
-    upload(kSlotEnvironment, &d.environment, sizeof(d.environment));
+    upload(kSlotEnvironment, d.environments.data(), bytes(d.environments));
+    upload(kSlotLights, d.lights.data(), bytes(d.lights));
+    upload(kSlotLightAlias, d.lightAlias.data(), bytes(d.lightAlias));
     static const GpuSceneData::EnvironmentTables noTables;
     auto const& tables = d.environmentTables ? *d.environmentTables : noTables;
     upload(kSlotEnvTexelPdf, tables.texelPdf.data(), bytes(tables.texelPdf));

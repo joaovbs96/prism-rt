@@ -195,7 +195,9 @@ void MetalDevice::Impl::uploadBuffers(bool keepGeometry)
     setBuffer(kSlotPrimitiveMaterials, buffer(d.primitiveMaterials.data(), Bytes(d.primitiveMaterials)));
     setBuffer(kSlotMaterials, buffer(d.materials.data(), Bytes(d.materials)));
     setBuffer(kSlotLegacyTextures, buffer(d.legacyTextures.data(), Bytes(d.legacyTextures)));
-    setBuffer(kSlotEnvironment, buffer(&d.environment, sizeof(d.environment)));
+    setBuffer(kSlotEnvironment, buffer(d.environments.data(), Bytes(d.environments)));
+    setBuffer(kSlotLights, buffer(d.lights.data(), Bytes(d.lights)));
+    setBuffer(kSlotLightAlias, buffer(d.lightAlias.data(), Bytes(d.lightAlias)));
     if (!d.environmentTables || d.environmentTables != uploadedEnvironmentTables) {
         static const GpuSceneData::EnvironmentTables none;
         auto const& tables = d.environmentTables ? *d.environmentTables : none;
@@ -274,8 +276,9 @@ void MetalDevice::Impl::uploadImages()
     images.assign(d.images.size(), nil);
     std::vector<GpuImage> info(d.images.size());
     std::vector<bool> floatPrecision(d.images.size(), false);
-    if (d.environment.info.y != kImageNone && d.environment.info.y < d.images.size())
-        floatPrecision[d.environment.info.y] = true;
+    for (auto const& environment : d.environments)
+        if (environment.info.y != kImageNone && environment.info.y < d.images.size())
+            floatPrecision[environment.info.y] = true;
     std::vector<size_t> missing;
     for (size_t i = 0; i < d.images.size(); ++i) {
         auto const& resource = d.images[i];

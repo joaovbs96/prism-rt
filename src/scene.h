@@ -23,6 +23,7 @@
 #include "mesh/gltf_mesh.h"
 #include "mesh/usd_mesh.h"
 #include "environment.h"
+#include "lights.h"
 #include "system_utils.h"
 #include "render_profile.h"
 
@@ -624,6 +625,8 @@ public:
     // cannot be queried for this; GPU devices mirror the scene from here.
     std::unordered_set<int> disabled_placements;
     Environment *environment;
+    // Analytic lights (UsdLux shapes); domes are the environment.
+    std::vector<prism::SceneLight> lights;
     Camera cam;
     int image_width = 1280;
     int image_height = 720;

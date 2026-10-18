@@ -2,9 +2,19 @@
 
 #include "device.h"
 
+#include <memory>
 #include <mutex>
 
 namespace prism::device {
+
+struct LightTable;
+
+// Per-scene state of the CPU device, rebuilt when the scene changes.
+struct CpuSceneState {
+    // Every material of the scene always blocks shadow rays.
+    bool opaque = false;
+    std::shared_ptr<const LightTable> lights;
+};
 
 // CPU rendering (Embree intersection, TBB parallelism, MDL native code).
 // By default it runs the shared integrator (shaders/integrator) on a CPU
@@ -22,14 +32,13 @@ public:
     void SceneChanged(SceneManager& scene) override;
 
 private:
-    // Whether every material of the scene always blocks shadow rays, cached
-    // per scene until it changes.
-    bool OpaqueScene(SceneManager& scene);
+    // The scene's CpuSceneState, cached until it changes.
+    std::shared_ptr<const CpuSceneState> PreparedScene(SceneManager& scene);
 
     bool m_reference;
-    std::mutex m_opaqueMutex;
-    SceneManager const* m_opaqueSceneOf = nullptr;
-    bool m_opaqueScene = false;
+    std::mutex m_stateMutex;
+    SceneManager const* m_stateOf = nullptr;
+    std::shared_ptr<const CpuSceneState> m_state;
 };
 
 } // namespace prism::device

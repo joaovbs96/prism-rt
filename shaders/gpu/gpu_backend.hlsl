@@ -172,6 +172,7 @@ void gpu_prepare_footprint(inout SurfaceHit hit, GpuPrototype proto, GpuInstance
 struct GpuHit {
     SurfaceHit surface;
     uint material;
+    bool sphere;     // analytic sphere primitive
 };
 
 // SceneManager::cast_ray: intersection plus RayHit construction and the
@@ -180,6 +181,7 @@ GpuHit gpu_intersect(PathRay ray, uint mask)
 {
     GpuHit result;
     result.material = 0u;
+    result.sphere = false;
     SurfaceHit hit = gpu_empty_hit(ray);
     GpuRawHit raw = gpu_trace(ray.ray, mask);
     if (!raw.hit) {
@@ -199,6 +201,7 @@ GpuHit gpu_intersect(PathRay ray, uint mask)
     hit.instance = inst.info.w;
     hit.primitive = localPrimitive;
     result.material = gpu_primitive_material(inst.info.z + localPrimitive);
+    result.sphere = type == kProtoSpheres;
 
     // Geometric normal in the prototype's space (Embree conventions).
     float3 ng = (float3)0.0f;
@@ -809,7 +812,8 @@ EnvironmentLightSample gpu_latlong_sample_local(GpuEnvironment env, float4 u)
     float carry = floor(fraction);
     uint column = min(integerPart + uint(carry), n - 1u);
     fraction -= carry;
-    uint index = fraction < gpu_env_alias_probability(column) ? column : gpu_env_alias(column);
+    uint index = fraction < gpu_env_alias_probability(env.info3.x + column) ? column
+                                                                           : gpu_env_alias(env.info3.x + column);
     uint px = index % width;
     uint py = index / width;
     float phi = 2.0f * kPi * (float(px) + u.z) / float(width);
@@ -826,7 +830,7 @@ EnvironmentLightSample gpu_latlong_sample_local(GpuEnvironment env, float4 u)
     float cosTheta = 0.5f * (onePlusCos - oneMinusCos);
     float sinTheta = sqrt(max(0.0f, oneMinusCos * onePlusCos));
     s.wi = float3(sinTheta * cos(phi), cosTheta, sinTheta * sin(phi));
-    s.pdf = gpu_env_texel_pdf(index) / gpu_texel_solid_angle(py, width, height);
+    s.pdf = gpu_env_texel_pdf(env.info3.x + index) / gpu_texel_solid_angle(py, width, height);
     return s;
 }
 
@@ -840,7 +844,7 @@ float gpu_latlong_pdf_local(GpuEnvironment env, float3 direction)
     if (phi < 0.0f) phi += 2.0f * kPi;
     uint x = min(uint(int(phi * float(width) / (2.0f * kPi))), width - 1u);
     uint y = min(uint(int(atan2(hypot(d.x, d.z), d.y) * float(height) / kPi)), height - 1u);
-    return gpu_env_texel_pdf(y * width + x) / gpu_texel_solid_angle(y, width, height);
+    return gpu_env_texel_pdf(env.info3.x + y * width + x) / gpu_texel_solid_angle(y, width, height);
 }
 
 float gpu_env_jacobian(GpuEnvironment env, float3 world)
@@ -970,17 +974,68 @@ struct GpuBackend {
         return isfinite(opacity) ? saturate(opacity) : 1.0f;
     }
 
+    // All domes together (CompositeEnvironment): radiance sums, sampling
+    // picks one by its selection probability and returns the mixture density.
     float3 environmentRadiance(float3 direction, float angularRadius)
     {
-        return gpu_environment_radiance(gpu_environment(), direction, angularRadius);
+        const uint count = gpu_environment_count();
+        float3 sum = gpu_environment_radiance(gpu_environment(0u), direction, angularRadius);
+        for (uint i = 1u; i < count; ++i)
+            sum += gpu_environment_radiance(gpu_environment(i), direction, angularRadius);
+        return sum;
     }
 
     EnvironmentLightSample sampleEnvironment(float4 u, float angularRadius)
     {
-        return gpu_environment_sample(gpu_environment(), u, angularRadius);
+        const uint count = gpu_environment_count();
+        if (count == 1u) return gpu_environment_sample(gpu_environment(0u), u, angularRadius);
+        uint chosen = count - 1u;
+        float start = 0.0f;
+        for (uint i = 0u; i < count; ++i) {
+            const float w = gpu_environment(i).selection.x;
+            if (u.x < start + w || i + 1u == count) {
+                chosen = i;
+                break;
+            }
+            start += w;
+        }
+        const float w = gpu_environment(chosen).selection.x;
+        float4 rescaled = u;
+        if (w > 0.0f) rescaled.x = clamp((u.x - start) / w, 0.0f, 0.99999994f);
+        EnvironmentLightSample s = gpu_environment_sample(gpu_environment(chosen), rescaled, angularRadius);
+        s.radiance = environmentRadiance(s.wi, angularRadius);
+        s.pdf = environmentPdf(s.wi);
+        return s;
     }
 
-    float environmentPdf(float3 direction) { return gpu_environment_pdf(gpu_environment(), direction); }
+    float environmentPdf(float3 direction)
+    {
+        const uint count = gpu_environment_count();
+        if (count == 1u) return gpu_environment_pdf(gpu_environment(0u), direction);
+        float pdf = 0.0f;
+        for (uint i = 0u; i < count; ++i) {
+            const GpuEnvironment env = gpu_environment(i);
+            if (env.selection.x > 0.0f) pdf += env.selection.x * gpu_environment_pdf(env, direction);
+        }
+        return pdf;
+    }
+
+    uint lightCount() { return gpu_frame().lights.x; }
+    uint analyticLightCount() { return gpu_frame().lights.y; }
+    LightRecord light(uint i) { return gpu_light(i); }
+    float4 lightAlias(uint i) { return gpu_light_alias(i); }
+    float3 lightTexture(uint image, float2 st)
+    {
+        if (image == kImageNone) return (float3)1.0f;
+        return gpu_xyz(gpu_image_sample(image, st, float2(0.0f, 0.0f), float2(0.0f, 0.0f), 0u, 0u));
+    }
+    float emitterPdfArea(GpuHit hit)
+    {
+        const GpuMaterial material = gpu_material(hit.material);
+        if (!(material.emitter.x > 0.0f)) return 0.0f;
+        if (material.emitter.y == 0.0f && !hit.surface.front_face) return 0.0f;
+        return hit.sphere ? 0.0f : material.emitter.x;
+    }
     int maxDepth() { return int(gpu_frame().settings.x); }
     int rouletteDepth() { return int(gpu_frame().settings.y); }
     bool environmentMis() { return (gpu_frame().settings.z & kFrameEnvironmentMis) != 0u; }

@@ -31,10 +31,13 @@ uint gpu_primitive_material(uint i) { return primitiveMaterialsBuffer()[i]; }
 GpuMaterial gpu_material(uint i) { return materialsBuffer()[i]; }
 GpuLegacyTexture gpu_legacy_texture(uint i) { return legacyTexturesBuffer()[i]; }
 float4 gpu_sphere(uint i) { return spheresBuffer()[i]; }
-GpuEnvironment gpu_environment() { return environmentBuffer()[0]; }
+GpuEnvironment gpu_environment(uint i) { return environmentBuffer()[i]; }
+uint gpu_environment_count() { return max(1u, gpu_frame().lights.z); }
 float gpu_env_texel_pdf(uint i) { return envTexelPdfBuffer()[i]; }
 float gpu_env_alias_probability(uint i) { return envAliasProbabilityBuffer()[i]; }
 uint gpu_env_alias(uint i) { return envAliasBuffer()[i]; }
+LightRecord gpu_light(uint i) { return lightsBuffer()[i]; }
+float4 gpu_light_alias(uint i) { return lightAliasBuffer()[i]; }
 uint gpu_argblock_word(uint i) { return argumentBlocksBuffer()[i]; }
 uint gpu_rodata_word(uint i) { return roDataBuffer()[i]; }
 GpuMdlTexture gpu_mdl_texture(uint i) { return mdlTexturesBuffer()[i]; }

@@ -103,7 +103,9 @@ static const uint kSlotPixels = 23;   // pixel indices of the pass or image thre
 static const uint kSlotRng = 24;
 static const uint kSlotOutput = 25;
 static const uint kSlotAccumulation = 26;
-static const uint kSlotCount = 27;
+static const uint kSlotLights = 27;        // LightRecord (shaders/integrator/lights.h)
+static const uint kSlotLightAlias = 28;    // float4 alias table over the lights and the dome
+static const uint kSlotCount = 29;
 // Images follow the fixed slots (HLSL) or form one array binding (GLSL).
 static const uint kSlotImageBase = 32;
 
@@ -131,6 +133,8 @@ struct GpuMaterial {
     uint4 textures;  // legacy texture records (kind dependent)
     uint4 textures2; // x: normal texture, y: gltfPBR emission
     float4 params;   // kind dependent scalars; params.w: constant cutout opacity
+    float4 emitter;  // x: selection density per unit area of its emissive triangles (0: none),
+                     // y: 1 if both faces emit
 };
 
 struct GpuLegacyTexture {
@@ -155,6 +159,8 @@ struct GpuEnvironment {
     float4 multiplier; // xyz: lat-long multiplier, w: transform determinant
     float4 toLocal[3]; // rows of the world-to-environment matrix
     float4 toWorld[3]; // rows of its inverse
+    float4 selection;  // x: probability of sampling this dome among the domes
+    uint4 info3;       // x: offset of its importance tables
 };
 
 struct GpuFrame {
@@ -169,6 +175,7 @@ struct GpuFrame {
                                  // (0: one sample per listed pixel), z: mode
     uint4 counts;                // x: MDL texture count, y: debug view, z: sample number,
                                  // w: light contribution mask (0: all)
+    uint4 lights;                // x: light records, y: analytic lights, z: domes
 };
 
 

@@ -60,6 +60,7 @@ GpuFrame GpuRenderDevice::BaseFrame(prism::CameraRayParameters const& camera, un
     if (data.hasCutouts) flags |= kFrameCutouts;
     frame.settings = {uint32_t(std::max(0, data.maxDepth)), uint32_t(std::max(0, data.rouletteDepth)), flags, 0};
     frame.counts = {MdlTextureCount(), 0, 0, 0};
+    frame.lights = {uint32_t(data.lights.size()), data.analyticLights, uint32_t(data.environments.size()), 0};
     // Debug views of the primary hit (see gpu_kernel.inc).
     if (const char* debug = std::getenv("PRISM_GPU_DEBUG")) frame.counts.y = uint32_t(std::atoi(debug));
     return frame;

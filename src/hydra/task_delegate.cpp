@@ -507,7 +507,8 @@ static bool _NeedsSceneRebuild(HdSceneIndexPrim const &prim)
         prim.primType == HdPrimTypeTokens->renderSettings ||
         prim.primType == HdPrimTypeTokens->renderBuffer ||
         HdLegacyTaskSchema::GetFromParent(prim.dataSource)) return false;
-    if (prim.primType != HdPrimTypeTokens->domeLight &&
+    // Light filters and other light-like prims Prism does not render.
+    if (!HdPrimTypeIsLight(prim.primType) &&
         HdLightSchema::GetFromParent(prim.dataSource)) return false;
     return true;
 }
@@ -531,7 +532,12 @@ void PrismTaskDelegate::PrimsAdded(HdSceneIndexBase const &sender,
         renderSettingsChanged = renderSettingsChanged ||
             entry.primType == HdPrimTypeTokens->renderSettings || previousWasRenderSettings;
         const bool previousWasGeometry = previousType == HdPrimTypeTokens->mesh || previousType == HdPrimTypeTokens->sphere;
-        if (_NeedsSceneRebuild(sender.GetPrim(entry.primPath)) || previousWasGeometry || hadChildren) {
+        if (HdPrimTypeIsLight(entry.primType) && !previousWasGeometry && !hadChildren &&
+            (previousType.IsEmpty() || HdPrimTypeIsLight(previousType))) {
+            // Lights are rebuilt on their own, without the geometry.
+            notices.push_back({prism::hydra::SceneDirtyKind::Environment, {entry.primPath},
+                               entry.primPath.GetString() + ": light added"});
+        } else if (_NeedsSceneRebuild(sender.GetPrim(entry.primPath)) || previousWasGeometry || hadChildren) {
             StructuralChange change{previous == _knownPrimTypes.end() ? StructuralChange::Operation::Add :
                 StructuralChange::Operation::Replace, entry.primPath,previousType,entry.primType,hadChildren};
             notices.push_back({prism::hydra::SceneDirtyKind::Structure,{entry.primPath},{},{change}});
@@ -561,7 +567,11 @@ void PrismTaskDelegate::PrimsRemoved(HdSceneIndexBase const &,
         const bool hadChildren = next != _knownPrimTypes.end() && next->first.HasPrefix(entry.primPath);
         StructuralChange change{previous == _knownPrimTypes.end() ? StructuralChange::Operation::Unknown :
             StructuralChange::Operation::Remove,entry.primPath,previousType,{},hadChildren};
-        notices.push_back({prism::hydra::SceneDirtyKind::Structure,{entry.primPath},{},{change}});
+        if (previous != _knownPrimTypes.end() && !hadChildren && HdPrimTypeIsLight(previousType))
+            notices.push_back({prism::hydra::SceneDirtyKind::Environment, {entry.primPath},
+                               entry.primPath.GetString() + ": light removed"});
+        else
+            notices.push_back({prism::hydra::SceneDirtyKind::Structure,{entry.primPath},{},{change}});
         if (previous != _knownPrimTypes.end() && !hadChildren) {
             if (previousType == HdPrimTypeTokens->renderSettings) {
                 _authoredSettingsDirty = true; renderSettingsChanged = true;
@@ -641,7 +651,7 @@ void PrismTaskDelegate::PrimsDirtied(HdSceneIndexBase const &sender,
                         continue;
                     }
                     SdfPathVector dirtyPaths{entry.primPath};
-                    if (prim.primType == HdPrimTypeTokens->domeLight)
+                    if (HdPrimTypeIsLight(prim.primType))
                         kind = prism::hydra::SceneDirtyKind::Environment;
                     else if (prim.primType == HdPrimTypeTokens->material)
                         kind = prism::hydra::SceneDirtyKind::Material;

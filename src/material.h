@@ -7,6 +7,7 @@
 #include "texture.h"
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 
 struct BRDFSample {
     Float3 wi;
@@ -23,6 +24,13 @@ struct BRDFEvaluation {
     Color3 value = Color3(0.0f); // BSDF times abs(n.wi), in solid-angle measure
     float pdf = 0.0f;
     bool valid = false;
+};
+
+// Emission that is the same at every point and in every direction of a
+// material (emissive triangles are then sampled as lights).
+struct ConstantEmission {
+    Color3 radiance = Color3(0.0f);
+    bool twoSided = false;   // false: the front face only
 };
 
 class Material {
@@ -65,6 +73,7 @@ class Material {
         virtual bool supportsNee(const RayHit&) const { return false; }
         virtual float cutoutOpacity(const RayHit&) { return 1.0f; }
         virtual bool provenOpaque() const { return false; }
+        virtual std::optional<ConstantEmission> constantEmission() const { return std::nullopt; }
 
         virtual Float3 sample_direction(const RayHit ray_hit, unsigned int &seed) = 0;
 
@@ -227,6 +236,12 @@ class Emissive : public Material {
         Color3 evaluate_emission(const RayHit ray_hit) override {
             return emissive_color->sample(ray_hit.u, ray_hit.v, ray_hit.p,
                 ray_hit.texture_footprint) * emissive_multiplier;
+        }
+
+        std::optional<ConstantEmission> constantEmission() const override {
+            auto const* value = dynamic_cast<ValueTexture<Color3> const*>(emissive_color);
+            if (!value) return std::nullopt;
+            return ConstantEmission{value->value * emissive_multiplier, true};
         }
 
         Texture<Color3>* emissive_color;
@@ -469,6 +484,12 @@ class gltfPBR : public Material {
         Color3 evaluate_emission(const RayHit ray_hit) override {
             return emissive_color->sample(ray_hit.u, ray_hit.v, ray_hit.p,
                 ray_hit.texture_footprint) * emissive_multiplier;
+        }
+
+        std::optional<ConstantEmission> constantEmission() const override {
+            auto const* value = dynamic_cast<ValueTexture<Color3> const*>(emissive_color);
+            if (!value) return std::nullopt;
+            return ConstantEmission{value->value * emissive_multiplier, true};
         }
 
         // we won't need these: we will sample directly fomr the brdfs

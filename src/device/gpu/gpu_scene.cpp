@@ -1,5 +1,7 @@
 #include "gpu_scene.h"
 
+#include "../light_table.h"
+
 #include "../../batched_spheres.h"
 #include "../../hydra/environment_cache.h"
 #include "../../hydra/fallback_material.h"
@@ -9,6 +11,7 @@
 #include <algorithm>
 #include <cstring>
 #include <mutex>
+#include <optional>
 #include <map>
 #include <unordered_map>
 
@@ -134,6 +137,13 @@ public:
         m_data.materials.push_back(record);
         m_materials.emplace(material, index);
         return index;
+    }
+
+    std::optional<uint32_t> materialIndex(Material const* material) const
+    {
+        auto found = m_materials.find(const_cast<Material*>(material));
+        if (found == m_materials.end()) return std::nullopt;
+        return found->second;
     }
 
     // One prototype per distinct geometry.
@@ -289,29 +299,32 @@ std::shared_ptr<const GpuSceneData::EnvironmentTables> SharedEnvironmentTables(E
     return tables;
 }
 
-void BuildEnvironment(Environment const* environment, Builder& builder, GpuSceneData& data)
+// One dome's record; its lat-long map (if any) is returned through *map.
+GpuEnvironment BuildEnvironmentRecord(Environment const* environment, Builder& builder, GpuSceneData& data,
+                                      EnvironmentMap const** map)
 {
-    GpuEnvironment& record = data.environment;
-    record = {};
+    GpuEnvironment record{};
     record.info.x = kEnvConstant;
     record.info.y = kImageNone;
     SetMatrixRows(record.toLocal, {1, 0, 0, 0, 1, 0, 0, 0, 1});
     SetMatrixRows(record.toWorld, {1, 0, 0, 0, 1, 0, 0, 0, 1});
     record.multiplier.w = 1.0f;
-    if (!environment) return;
+    record.selection.x = 1.0f;
+    *map = nullptr;
+    if (!environment) return record;
 
-    auto setLatLong = [&](EnvironmentMap const& map) {
+    auto setLatLong = [&](EnvironmentMap const& latlong) {
         record.info.x = kEnvLatlong;
-        record.multiplier = F4(map.multiplier, record.multiplier.w);
-        if (auto const* image = dynamic_cast<ImageTexture<Color3> const*>(map.texture);
+        record.multiplier = F4(latlong.multiplier, record.multiplier.w);
+        if (auto const* image = dynamic_cast<ImageTexture<Color3> const*>(latlong.texture);
             image && image->width > 0 && image->height > 0)
             record.info.y = builder.image(image->resource);
-        else if (map.texture)
-            record.color0 = F4(map.texture->sampleInterp(0.0f, 0.0f, Float3(0.0f)));
-        if (!map.probability.empty()) {
-            record.info.z = uint32_t(map.width);
-            record.info2.x = uint32_t(map.height);
-            data.environmentTables = SharedEnvironmentTables(map);
+        else if (latlong.texture)
+            record.color0 = F4(latlong.texture->sampleInterp(0.0f, 0.0f, Float3(0.0f)));
+        if (!latlong.probability.empty()) {
+            record.info.z = uint32_t(latlong.width);
+            record.info2.x = uint32_t(latlong.height);
+            *map = &latlong;
         }
     };
     auto setTransform = [&](std::array<float, 9> const& toLocal,
@@ -330,8 +343,8 @@ void BuildEnvironment(Environment const* environment, Builder& builder, GpuScene
         setTransform(transformed->worldToEnvironment(), transformed->environmentToWorld(),
                      transformed->transformDeterminant());
         setLatLong(*transformed);
-    } else if (auto const* map = dynamic_cast<EnvironmentMap const*>(environment)) {
-        setLatLong(*map);
+    } else if (auto const* latlong = dynamic_cast<EnvironmentMap const*>(environment)) {
+        setLatLong(*latlong);
     } else if (auto const* cylindrical = dynamic_cast<CylindricalEnvironmentMap const*>(environment)) {
         record.info.x = kEnvCylindrical;
         if (auto const* image = dynamic_cast<ImageTexture<Color3> const*>(cylindrical->texture))
@@ -348,6 +361,46 @@ void BuildEnvironment(Environment const* environment, Builder& builder, GpuScene
         // Unknown environments are directional constants at best; sample one.
         record.color0 = F4(environment->radiance(Float3(0.0f, 1.0f, 0.0f)));
         data.warnings.push_back("unsupported environment type rendered as a constant");
+    }
+    return record;
+}
+
+void BuildEnvironment(Environment const* environment, Builder& builder, GpuSceneData& data)
+{
+    data.environments.clear();
+    data.environmentTables.reset();
+    std::vector<Environment const*> parts{environment};
+    std::vector<float> weights{1.0f};
+    if (auto const* composite = dynamic_cast<CompositeEnvironment const*>(environment);
+        composite && !composite->parts.empty()) {
+        parts = composite->parts;
+        weights = composite->weights;
+    }
+    std::vector<EnvironmentMap const*> maps;
+    for (size_t i = 0; i < parts.size(); ++i) {
+        EnvironmentMap const* map = nullptr;
+        GpuEnvironment record = BuildEnvironmentRecord(parts[i], builder, data, &map);
+        record.selection.x = weights[i];
+        data.environments.push_back(record);
+        maps.push_back(map);
+    }
+    size_t mapCount = 0;
+    for (auto const* map : maps) mapCount += map ? 1 : 0;
+    if (mapCount == 1) {
+        for (auto const* map : maps)
+            if (map) data.environmentTables = SharedEnvironmentTables(*map);
+    } else if (mapCount > 1) {
+        auto tables = std::make_shared<GpuSceneData::EnvironmentTables>();
+        for (size_t i = 0; i < maps.size(); ++i) {
+            if (!maps[i]) continue;
+            data.environments[i].info3.x = uint32_t(tables->texelPdf.size());
+            tables->texelPdf.insert(tables->texelPdf.end(), maps[i]->texelProbability.begin(),
+                                    maps[i]->texelProbability.end());
+            tables->aliasProbability.insert(tables->aliasProbability.end(), maps[i]->probability.begin(),
+                                            maps[i]->probability.end());
+            tables->alias.insert(tables->alias.end(), maps[i]->alias.begin(), maps[i]->alias.end());
+        }
+        data.environmentTables = std::move(tables);
     }
 }
 
@@ -441,6 +494,19 @@ GpuSceneData BuildGpuScene(SceneManager& scene)
     }
 
     BuildEnvironment(scene.environment, builder, data);
+
+    const LightTable lights = BuildLightTable(scene);
+    data.lights = lights.records;
+    data.lightAlias = lights.alias;
+    data.analyticLights = lights.analyticCount;
+    for (auto& record : data.lights) {
+        if ((record.info.y & kLightTextured) == 0u) continue;
+        auto const* image = dynamic_cast<ImageTexture<Color3> const*>(lights.textures[record.info.z].get());
+        record.info.z = image ? builder.image(image->resource) : kImageNone;
+    }
+    for (auto const& [material, emitter] : lights.emitters)
+        if (auto index = builder.materialIndex(material))
+            data.materials[*index].emitter = {emitter.pdfArea, emitter.twoSided ? 1.0f : 0.0f, 0.0f, 0.0f};
     data.mdlTextures.resize(1);
     return data;
 }
