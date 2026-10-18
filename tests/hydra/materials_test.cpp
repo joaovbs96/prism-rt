@@ -14,6 +14,11 @@
 #include <pxr/usd/sdf/assetPath.h>
 
 #include <filesystem>
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
@@ -121,8 +126,24 @@ int main()
         return 2;
     }
 
+    // Concurrent runs (parallel ctest, other checkouts) must not share the
+    // fixed temp texture or the persistent cache they mutate and invalidate.
+    const std::string runTag = std::to_string(static_cast<unsigned long>(
+#ifdef _WIN32
+        _getpid()
+#else
+        getpid()
+#endif
+        ));
+    const std::string testCache = (std::filesystem::temp_directory_path() /
+        ("prism_hydra_materials_test_cache_" + runTag)).string();
+#ifdef _WIN32
+    _putenv_s("PRISM_CACHE_DIR", testCache.c_str());
+#else
+    setenv("PRISM_CACHE_DIR", testCache.c_str(), 1);
+#endif
     const std::filesystem::path texture = std::filesystem::temp_directory_path() /
-        "prism_hydra_material_test.ppm";
+        ("prism_hydra_material_test_" + runTag + ".ppm");
     {
         std::ofstream image(texture, std::ios::binary | std::ios::trunc);
         image << "P3\n1 1\n255\n160 90 40\n";
@@ -254,7 +275,7 @@ int main()
         std::cerr << "Cross-service invalidation did not recapture and validate exact content\n";
         return 17;
     }
-    const auto otherTexture = texture.parent_path() / "prism_hydra_unrelated_texture.ppm";
+    const auto otherTexture = texture.parent_path() / ("prism_hydra_unrelated_texture_" + runTag + ".ppm");
     std::filesystem::copy_file(texture, otherTexture,
         std::filesystem::copy_options::overwrite_existing);
     const SdfPath otherPath("/Looks/Unrelated");
@@ -323,6 +344,7 @@ int main()
     std::error_code ec;
     std::filesystem::remove(otherTexture, ec);
     std::filesystem::remove(texture, ec);
+    std::filesystem::remove_all(testCache, ec);
     std::cout << "Hydra material conversion and cache tests passed\n";
     return 0;
 }
