@@ -760,7 +760,7 @@ bool VulkanDevice::Impl::buildPipeline(std::string* error)
     const vulkan::CallableMode callableMode = rayTracing.pipeline ? vulkan::CallableModeSetting()
                                                                   : vulkan::CallableMode::Never;
     if (callableMode == vulkan::CallableMode::Always)
-        return buildCallablePipeline(shared, "PRISM_VULKAN_CALLABLES=1", error);
+        return buildCallablePipeline(shared, "the default; PRISM_VULKAN_CALLABLES=0 uses the compute kernel", error);
     if (callableMode == vulkan::CallableMode::Auto) {
         std::string source;
         if (AssembleVulkanKernel(code.code, &source, nullptr)) {

@@ -94,7 +94,7 @@ Scenes: **Eggs** (MaterialEggs), **OpenPBR** (OpenPBRShaderPlayground),
        sequence of shared step functions; the material runs once per vertex
        (`backend.shade`: BSDF sample, light evaluation, medium). Images are
        bit-identical to the single loop on the CPU and Vulkan devices.
-    2. Done on Vulkan (see [GPU devices](gpu_devices.md#large-material-sets-callable-shaders-vulkan)):
+    2. Done on Vulkan (see [GPU devices](gpu_devices.md#material-programs-as-callable-shaders-vulkan)):
        above the kernel-size threshold each MDL program is a callable shader
        of a ray tracing pipeline, with optional shader execution reordering
        by program. OpenPBR, Stirling and the countertop now render on the
@@ -117,9 +117,10 @@ Scenes: **Eggs** (MaterialEggs), **OpenPBR** (OpenPBRShaderPlayground),
        functions into separate kernels, not rewrite the integrator, and needs
        a design decision because it changes how the CPU and GPU devices share
        code.
-    5. Open: make callables the default for every Vulkan scene (faster on the
-       scenes measured, and the compute kernel's 20–40 s cold compile goes
-       away), and port the same split to Metal with visible function tables.
+    5. Done on Vulkan: callables are the default for every scene (the compute
+       kernel's 20–40 s cold compile goes away; see
+       [GPU devices](gpu_devices.md#material-programs-as-callable-shaders-vulkan)).
+       Open: port the same split to Metal with visible function tables.
   - Large scenes like ALab also need texture streaming on the GPU: feedback
     of the needed texture, mip and tile from shading, loaded from the already
     tiled `.tx.exr` files into a resident tile pool. Whole mip levels first,

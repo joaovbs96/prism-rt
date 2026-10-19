@@ -94,13 +94,15 @@ again. Both files are written to a temporary name and renamed, so processes
 sharing the cache directory never read a partial file. Uploaded textures
 are reused across Hydra scene rebuilds.
 
-## Large material sets: callable shaders (Vulkan)
+## Material programs as callable shaders (Vulkan)
 
 One inlined kernel stops compiling at about 1 MB of HLSL: DXC's SPIR-V
 legalization of the single function needs more than 8 GB, and the NVIDIA
-driver's compile of unlegalized SPIR-V more than 12 GB and 400 s. Above that
-size the Vulkan device does not inline the materials; it builds a ray tracing
-pipeline (`VK_KHR_ray_tracing_pipeline`, `src/device/vulkan/vulkan_material_calls.*`):
+driver's compile of unlegalized SPIR-V more than 12 GB and 400 s. Below that
+size it compiles, but slowly (OpenChessSet: 41 s cold) and runs slower than
+separate programs. The Vulkan device therefore does not inline the
+materials; it builds a ray tracing pipeline
+(`VK_KHR_ray_tracing_pipeline`, `src/device/vulkan/vulkan_material_calls.*`):
 
 - **Raygen shader.** `kernel.hlsl` compiled with `PRISM_CALL_MATERIALS`:
   the same integrator and step functions, legacy materials, lights and
@@ -137,12 +139,15 @@ pipeline (`VK_KHR_ray_tracing_pipeline`, `src/device/vulkan/vulkan_material_call
 - **Fallback.** If the pipeline cannot be built, the scene renders on the
   CPU device as before.
 
-When it is used (`PRISM_VULKAN_CALLABLES`): unset, the assembled compute
-kernel above `PRISM_VULKAN_CALLABLE_THRESHOLD_KIB` (default 1024), a kernel
-DXC already failed to compile within its memory limit (the remembered
-`.too-large` marker), or one that fails that way now; `1` always (for
-comparisons); `0` never. Devices without ray tracing pipelines keep the CPU
-fallback. Small kernels keep the compute megakernel unchanged.
+When it is used (`PRISM_VULKAN_CALLABLES`): unset or `1`, for every scene on
+devices with ray tracing pipelines; `0` never (the compute megakernel, for
+comparisons and devices without ray tracing pipelines); `auto` the earlier
+rule: the assembled compute kernel above
+`PRISM_VULKAN_CALLABLE_THRESHOLD_KIB` (default 1024), a kernel DXC already
+failed to compile within its memory limit (the remembered `.too-large`
+marker), or one that fails that way now. Devices without ray tracing
+pipelines use the compute megakernel, and the CPU fallback for kernels too
+large for it.
 
 Measured on an RTX 4070 Ti (driver 610.88, DXC 1.8), 960x540, 64 spp,
 Hydra (`prism_hydra_render`). Chess and the eggs are forced through callables
@@ -308,7 +313,7 @@ they change the image, not just its noise.
   kernels with very many materials (OpenPBR playground, MaterialEggs
   countertop, Stirling) exceeds it; the Vulkan device then uses callable
   shaders (above), or renders on the CPU without ray tracing pipelines.
-- `PRISM_VULKAN_CALLABLES=0|1`, `PRISM_VULKAN_CALLABLE_THRESHOLD_KIB=<n>`,
+- `PRISM_VULKAN_CALLABLES=0|1|auto`, `PRISM_VULKAN_CALLABLE_THRESHOLD_KIB=<n>`,
   `PRISM_VULKAN_REORDER=1`, `PRISM_DXC_JOBS=<n>`: the callable path (above).
 - `PRISM_VULKAN_PIPELINE_STATS=1`: the driver's statistics of each compiled
   shader (registers, spills, stack) through

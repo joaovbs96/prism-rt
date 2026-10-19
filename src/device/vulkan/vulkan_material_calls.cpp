@@ -193,10 +193,10 @@ std::string ShaderSaltDefine()
 CallableMode CallableModeSetting()
 {
     const char* value = Setting("PRISM_VULKAN_CALLABLES");
-    if (!value) return CallableMode::Auto;
+    if (!value) return CallableMode::Always;
     if (std::strcmp(value, "0") == 0) return CallableMode::Never;
-    if (std::strcmp(value, "1") == 0) return CallableMode::Always;
-    return CallableMode::Auto;
+    if (std::strcmp(value, "auto") == 0) return CallableMode::Auto;
+    return CallableMode::Always;
 }
 
 size_t CallableThresholdBytes()

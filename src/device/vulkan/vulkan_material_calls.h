@@ -31,9 +31,10 @@ struct RayTracingSupport {
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_PROPERTIES_KHR};
 };
 
-// When scenes use the callable path (PRISM_VULKAN_CALLABLES: 0 never, 1
-// always, otherwise above the kernel size threshold or after the compute
-// kernel was found too large).
+// When scenes use the callable path (PRISM_VULKAN_CALLABLES): by default
+// always (where ray tracing pipelines exist); 0 never (the compute
+// megakernel); `auto` above the kernel size threshold or after the compute
+// kernel was found too large.
 enum class CallableMode { Never, Always, Auto };
 CallableMode CallableModeSetting();
 // Assembled compute kernels above this size use callables in Auto mode
