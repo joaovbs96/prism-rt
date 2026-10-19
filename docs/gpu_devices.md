@@ -99,21 +99,28 @@ are reused across Hydra scene rebuilds.
 One inlined kernel stops compiling at about 1 MB of HLSL: DXC's SPIR-V
 legalization of the single function needs more than 8 GB, and the NVIDIA
 driver's compile of unlegalized SPIR-V more than 12 GB and 400 s. Below that
-size it compiles, but slowly (OpenChessSet: 41 s cold) and runs slower than
-separate programs. The Vulkan device therefore does not inline the
-materials; it builds a ray tracing pipeline
-(`VK_KHR_ray_tracing_pipeline`, `src/device/vulkan/vulkan_material_calls.*`):
+size it compiles, but slowly (OpenChessSet: 41 s cold) and, for all but the
+smallest material sets, runs slower than separate programs. The Vulkan
+device therefore does not inline the materials of most scenes; it builds a
+ray tracing pipeline (`VK_KHR_ray_tracing_pipeline`,
+`src/device/vulkan/vulkan_material_calls.*`):
 
 - **Raygen shader.** `kernel.hlsl` compiled with `PRISM_CALL_MATERIALS`:
   the same integrator and step functions, legacy materials, lights and
   environment, but no MDL code. `GpuBackend::shade` packs a `MaterialCall`
   (`shaders/gpu/material_call.hlsl`) and calls the hit's MDL program with
   `CallShader(program, call)`; `cutoutOpacity` of a varying cutout does the
-  same in its own mode.
+  same in its own mode. It depends on no scene (with reordering, on the
+  hint bit count only), so the device compiles it in the background from
+  its creation, while the first scene loads.
 - **One callable per MDL program.** `shaders/gpu/vulkan/material_callable.hlsl`
-  with the scene's link unit and a dispatch that reaches only that program
-  (`MdlShaderCode::programDispatch`); DXC emits only reachable functions, so
-  each callable holds one program. It runs the megakernel's own code: the
+  with that program's dispatch (`MdlShaderCode::programDispatch`) and only
+  the functions of the scene's link unit it reaches (a top-level split of the
+  generated HLSL, `LinkUnitTrimmer`; DXC would drop the others anyway, the
+  SPIR-V is identical). The program's index is left out of its source (fixed
+  function names and dispatch case: only that program reaches the callable),
+  so a program compiles to the same callable in any material set whose
+  link unit gives it the same code. It runs the megakernel's own code: the
   program's init on the prepared shading point, then `GpuBackend::shade`
   (BSDF sample, BSDF towards the light sample, medium). With the integrator's
   step functions that is one call per surface bounce.
@@ -128,10 +135,23 @@ materials; it builds a ray tracing pipeline
   by program (`OpReorderThreadWithHintNV`, hint bits for the program count)
   just before the call.
 - **Compilation.** Each callable and the raygen shader is its own DXC run
-  (`lib_6_6`), several at a time (`PRISM_DXC_JOBS`, default 4, each capped
-  by `PRISM_DXC_MEMORY_MIB`), cached by source in the SPIR-V cache. The driver
-  compiles the pipeline as a deferred operation joined by worker threads,
-  and its result is kept in a `VkPipelineCache` file next to the SPIR-V
+  (`lib_6_6`, cached by source in the SPIR-V cache) and, with
+  `VK_KHR_pipeline_library`, its own pipeline library, compiled by the
+  driver right after its DXC run on the same thread: DXC of one shader
+  overlaps the driver compile of others. Up to `PRISM_VULKAN_COMPILE_THREADS`
+  shaders (default min(16, hardware threads)) compile at once, with up to
+  `PRISM_DXC_JOBS` DXC processes (default half the hardware threads, at most
+  12 and one per 2 GiB of memory; each capped by `PRISM_DXC_MEMORY_MIB`).
+  The background raygen compile and its DXC run above normal priority.
+  Libraries stay in memory for the device's life, each with its own
+  `VkPipelineCache` file (`<SPIR-V digest>-lib-<pipeline cache UUID, device,
+  driver>.vkpc`); a scene's pipeline links the raygen library and its
+  programs' libraries (10–60 ms), so a new scene or an edited material set
+  compiles only the callables the device has not seen. The pipeline compiles
+  while the scene's buffers, images and acceleration structures upload.
+  Without pipeline libraries (or `PRISM_VULKAN_PIPELINE_LIBRARIES=0`) the
+  pipeline is created whole, as a deferred operation joined by worker
+  threads, with one cache file per material set
   (`<digest>-<pipeline cache UUID, device, driver>.vkpc`).
 - **Payload.** 47 words in (the shading point fields the MDL state and BSDF
   read, the BSDF sample point, the light direction, the RNG state) and 21
@@ -139,17 +159,21 @@ materials; it builds a ray tracing pipeline
 - **Fallback.** If the pipeline cannot be built, the scene renders on the
   CPU device as before.
 
-When it is used (`PRISM_VULKAN_CALLABLES`): unset or `1`, for every scene on
-devices with ray tracing pipelines; `0` never (the compute megakernel, for
-comparisons and devices without ray tracing pipelines); `auto` the earlier
-rule: the assembled compute kernel above
-`PRISM_VULKAN_CALLABLE_THRESHOLD_KIB` (default 1024), a kernel DXC already
-failed to compile within its memory limit (the remembered `.too-large`
-marker), or one that fails that way now. Devices without ray tracing
-pipelines use the compute megakernel, and the CPU fallback for kernels too
-large for it.
+When it is used (`PRISM_VULKAN_CALLABLES`): unset (`auto`), when the
+assembled compute kernel is above `PRISM_VULKAN_CALLABLE_THRESHOLD_KIB`
+(default 320), when DXC already failed to compile it within its memory limit
+(the remembered `.too-large` marker), or when it fails that way now; `1`
+always; `0` never. Kernels up to 320 KB carry little material code next to
+the integrator (about 180 KB): the compute kernel then compiles about as fast
+as the raygen shader alone and runs faster (CornellBox, 256 KB: 1.7x;
+the test fixtures, 183–230 KB: up to 10%), while from the lion (392 KB, one
+program) up every scene measured is faster with callables or within noise.
+Devices without ray tracing pipelines use the compute megakernel, and the
+CPU fallback for kernels too large for it.
 
-Measured on an RTX 4070 Ti (driver 610.88, DXC 1.8), 960x540, 64 spp,
+Measured before pipeline libraries, trimmed callables and the size rule
+(one monolithic pipeline per material set, callables forced), on an RTX
+4070 Ti (driver 610.88, DXC 1.8), 960x540, 64 spp,
 Hydra (`prism_hydra_render`). Chess and the eggs are forced through callables
 (`PRISM_VULKAN_CALLABLES=1`) for comparison with the megakernel. Cold: every
 shader compiled anew (`PRISM_VULKAN_SHADER_SALT`); warm: SPIR-V and pipeline
@@ -314,13 +338,16 @@ they change the image, not just its noise.
   countertop, Stirling) exceeds it; the Vulkan device then uses callable
   shaders (above), or renders on the CPU without ray tracing pipelines.
 - `PRISM_VULKAN_CALLABLES=0|1|auto`, `PRISM_VULKAN_CALLABLE_THRESHOLD_KIB=<n>`,
-  `PRISM_VULKAN_REORDER=1`, `PRISM_DXC_JOBS=<n>`: the callable path (above).
+  `PRISM_VULKAN_REORDER=1`, `PRISM_DXC_JOBS=<n>`,
+  `PRISM_VULKAN_COMPILE_THREADS=<n>`, `PRISM_VULKAN_PIPELINE_LIBRARIES=0`
+  (one monolithic pipeline), `PRISM_VULKAN_TRIM_CALLABLES=0` (callables with
+  the whole link unit): the callable path (above).
 - `PRISM_VULKAN_PIPELINE_STATS=1`: the driver's statistics of each compiled
   shader (registers, spills, stack) through
   `VK_KHR_pipeline_executable_properties`.
 - `PRISM_VULKAN_PARALLEL_PIPELINE=0` (driver compile on one thread),
   `PRISM_VULKAN_PIPELINE_CACHE=0` (ignore stored pipeline caches) and
-  `PRISM_VULKAN_SHADER_SALT=<n>` (unique callable-path shaders, so DXC and
+  `PRISM_VULKAN_SHADER_SALT=<n>` (unique shaders on both paths, so DXC and
   the driver's own shader cache compile anew): cold-compile measurements.
 - `PRISM_GPU_TEXTURE_BUDGET_MIB=<n>`: GPU memory for textures (default 45%
   of the device's). Images beyond it are uploaded at reduced resolution,

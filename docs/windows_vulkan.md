@@ -81,10 +81,14 @@ ctest --test-dir build -C RelWithDebInfo --output-on-failure
   and upload times (buffers, images, acceleration structures).
 - The SPIR-V cache in `%LOCALAPPDATA%\PrismRT\vulkan` is keyed on the kernel
   source, not on the DXC flags. Clear it after changing those flags.
-- The first render of a new material set compiles its kernel with DXC. That
-  takes seconds for small scenes, longer for large material sets, and is cached
-  afterwards. OpenChessSet takes about 20 s in DXC and 15 s in the driver's
-  pipeline compile.
+- The first render of a new material set compiles its shaders with DXC and
+  the driver, cached afterwards. Most scenes compile one callable shader per
+  MDL program, in parallel, plus a raygen shader that depends on no scene and
+  compiles in the background from device creation (about 10 s the first time
+  on a machine, then from its pipeline cache file): OpenChessSet's first GPU
+  sample comes 10–11 s after start cold, against 52 s with the compute
+  kernel (26 s DXC, 19 s driver). See
+  [GPU devices](gpu_devices.md#material-programs-as-callable-shaders-vulkan).
 - The SDK's DXC 1.8 (1.8.0.4973) is enough. Large kernels (over about 4M
   SPIR-V ids during legalization) need `-fspv-max-id`, which the device
   passes. Without it, DXC 1.8 fails with "Internal compiler error: stack
@@ -97,8 +101,9 @@ ctest --test-dir build -C RelWithDebInfo --output-on-failure
   3.0 MB, MaterialEggs countertop 3.1 MB) are too large for DXC's SPIR-V
   legalization. It inlines everything into one function and its SSA rewrite
   grows superlinearly (more than 28 GB for OpenPBR). DXC is stopped at
-  `PRISM_DXC_MEMORY_MIB` (default min(8 GiB, RAM/4)) and these scenes render on
-  the CPU. A `.too-large` marker in the shader cache, keyed on the kernel
+  `PRISM_DXC_MEMORY_MIB` (default min(8 GiB, RAM/4)); these scenes use callable
+  shaders, or render on the CPU on devices without ray tracing pipelines
+  (and with `PRISM_VULKAN_CALLABLES=0`). A `.too-large` marker in the shader cache, keyed on the kernel
   source and the DXC command, skips the attempt on later runs; set
   `PRISM_VULKAN_RETRY_LARGE=1` to try again. Marking the material functions
   `[noinline]` makes DXC fast (OpenPBR

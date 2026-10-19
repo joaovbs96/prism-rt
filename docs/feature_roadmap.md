@@ -117,10 +117,18 @@ Scenes: **Eggs** (MaterialEggs), **OpenPBR** (OpenPBRShaderPlayground),
        functions into separate kernels, not rewrite the integrator, and needs
        a design decision because it changes how the CPU and GPU devices share
        code.
-    5. Done on Vulkan: callables are the default for every scene (the compute
-       kernel's 20–40 s cold compile goes away; see
+    5. Done on Vulkan: callables are the default for every scene but the
+       smallest material sets (kernels up to 320 KB keep the compute kernel,
+       which is faster there and compiles as fast), so the compute kernel's
+       20–40 s cold compile goes away. The raygen shader depends on no scene
+       and compiles once per machine in the background; each shader is a
+       pipeline library, linked per scene (see
        [GPU devices](gpu_devices.md#material-programs-as-callable-shaders-vulkan)).
-       Open: port the same split to Metal with visible function tables.
+       Open: port the same split to Metal with visible function tables;
+       per-program link units (own read-only data and texture table) so a
+       program's callable no longer depends on the other programs of its link
+       unit; the generated MDL code differs between runs for some scenes
+       (commutative operand order), so they compile again on every start.
   - Large scenes like ALab also need texture streaming on the GPU: feedback
     of the needed texture, mip and tile from shading, loaded from the already
     tiled `.tx.exr` files into a resident tile pool. Whole mip levels first,
