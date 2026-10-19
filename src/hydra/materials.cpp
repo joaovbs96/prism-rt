@@ -175,7 +175,7 @@ bool TemplateStructure(NetworkSnapshot graph, NetworkSnapshot* structure)
 }
 
 // Prefetch compile policy. "auto" (default) folds every class parameter that
-// no material of the batch needs to rebind; "class" keeps all of them runtime
+// no material of the batch needs to rebind; "class" keeps all but strings runtime
 // arguments, which is how Resolve and the standalone loader always compile.
 bool FoldingCompileMode()
 {

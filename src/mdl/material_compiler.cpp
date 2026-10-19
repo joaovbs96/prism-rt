@@ -135,6 +135,18 @@ bool contains_resource(const mi::neuraylib::IValue* value) {
     return false;
 }
 
+bool contains_string(const mi::neuraylib::IValue* value) {
+    if (!value) return false;
+    if (value->get_kind() == mi::neuraylib::IValue::VK_STRING) return true;
+    mi::base::Handle<const mi::neuraylib::IValue_compound> compound(
+        value->get_interface<mi::neuraylib::IValue_compound>());
+    for (mi::Size i = 0; compound && i < compound->get_size(); ++i) {
+        mi::base::Handle<const mi::neuraylib::IValue> child(compound->get_value(i));
+        if (contains_string(child.get())) return true;
+    }
+    return false;
+}
+
 } // namespace
 
 MaterialCompiler::MaterialCompiler(Context& ctx, const std::string& mx_mdl_path)
@@ -472,6 +484,49 @@ void MaterialCompiler::fold_class_parameters(
     result.folded_parameters = std::move(folded);
 }
 
+void MaterialCompiler::fold_string_parameters(
+    mi::neuraylib::ITransaction* transaction,
+    const std::string& instance_name,
+    mi::neuraylib::IMdl_execution_context* context,
+    CompiledMaterial& result)
+{
+    const auto& unfolded = result.compiled_material;
+    mi::base::Handle<mi::IDynamic_array> names(
+        transaction->create<mi::IDynamic_array>("String[]"));
+    if (!unfolded || !names) return;
+    mi::Size count = 0;
+    for (mi::Size i = 0; i < unfolded->get_parameter_count(); ++i) {
+        const char* name = unfolded->get_parameter_name(i);
+        mi::base::Handle<const mi::neuraylib::IValue> value(unfolded->get_argument(i));
+        if (!name || contains_resource(value.get()) || !contains_string(value.get()))
+            continue;
+        mi::base::Handle<mi::IString> entry(transaction->create<mi::IString>("String"));
+        if (!entry) return;
+        entry->set_c_str(name);
+        names->push_back(entry.get());
+        ++count;
+    }
+    if (count == 0) return;
+
+    context->clear_messages();
+    if (context->set_option("fold_parameters", names.get()) != 0) {
+        std::cerr << "[WARN] Cannot fold MDL string parameters; scene data lookups by "
+                     "argument name will return their defaults\n";
+        print_context_messages(context);
+        return;
+    }
+    mi::base::Handle<const mi::neuraylib::ICompiled_material> compiled(
+        compile_instance(transaction, instance_name, context, true));
+    if (!compiled) {
+        std::cerr << "[WARN] Folding MDL string parameters failed; scene data lookups by "
+                     "argument name will return their defaults\n";
+        return;
+    }
+    if (verbose_mdl())
+        std::cout << std::format("  Folded {} string class parameters\n", count);
+    result.compiled_material = compiled;
+}
+
 // ========================================================================
 // Full pipeline: GeneratedMDL -> CompiledMaterial
 // ========================================================================
@@ -751,6 +806,13 @@ CompiledMaterial MaterialCompiler::compile(const GeneratedMDL& generated_mdl,
         // parameter names and types it may fold.
         fold_class_parameters(transaction.get(), result.instance_db_name,
                               specification, context.get(), result);
+        // Nothing folded (the folded compile failed): still fold the strings.
+        if (result.folded_parameters.empty())
+            fold_string_parameters(transaction.get(), result.instance_db_name,
+                                   context.get(), result);
+    } else {
+        fold_string_parameters(transaction.get(), result.instance_db_name,
+                               context.get(), result);
     }
 
     if (!result.compiled_material) {

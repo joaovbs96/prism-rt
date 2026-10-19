@@ -100,6 +100,9 @@ struct CompiledProgram {
     // surface.emission is a diffuse EDF and intensity depending only on the
     // arguments: the front-face radiance is one constant per binding.
     bool uniform_emission = false;
+    // With uniform_emission: the EDF has a df::directional_factor, so it is
+    // diffuse only for bindings whose tints agree (checked per binding).
+    bool directional_emission = false;
     // geometry.displacement is not the constant zero.
     bool has_displacement = false;
 };

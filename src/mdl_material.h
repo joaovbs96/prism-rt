@@ -55,7 +55,7 @@ public:
         bool foldedParameters = false;
     };
     // Chooses the compile specification once generation has published the
-    // material's uniforms. Empty: every class parameter is a runtime argument.
+    // material's uniforms. Empty: every class parameter but strings is a runtime argument.
     using CompileSelector =
         std::function<mdl::CompileSpecification(const GeneratedMDL&)>;
     // Construct a material from an already validated immutable native program
@@ -753,6 +753,19 @@ private:
         const Color3 radiance = get_emission(ss.base(), mi::Float32_3(0.0f, 0.0f, 1.0f), false) * *cutout;
         if (!(radiance.x() > 0.0f || radiance.y() > 0.0f || radiance.z() > 0.0f)) return;
         if (!std::isfinite(radiance.x()) || !std::isfinite(radiance.y()) || !std::isfinite(radiance.z())) return;
+        // A df::directional_factor (OpenPBR and standard_surface layer their
+        // emission under the coat this way) is isotropic when its tints agree,
+        // as when these arguments disable the coat: class compilation keeps
+        // the factor that folding the arguments would remove.
+        if (m_target.program->directional_emission) {
+            for (const float angle : {0.5f, 1.0f, 1.3f, 1.5f}) {
+                const mi::Float32_3 wo(std::sin(angle), 0.0f, std::cos(angle));
+                const Color3 other = get_emission(ss.base(), wo, false) * *cutout;
+                for (int c = 0; c < 3; ++c)
+                    if (!(std::abs(other[c] - radiance[c]) <= 1.0e-4f * std::max(radiance[c], 1.0e-6f)))
+                        return;
+            }
+        }
         m_uniformEmission = ConstantEmission{radiance, false};
     }
 

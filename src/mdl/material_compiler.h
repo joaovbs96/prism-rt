@@ -18,7 +18,8 @@ namespace mdl {
 // always remain arguments so resource preflight and the custom texture runtime
 // keep binding them per argument block.
 struct CompileSpecification {
-    // false: every class parameter is an argument (full class compilation).
+    // false: every class parameter except strings is an argument (full class
+    // compilation; strings are always folded, see fold_string_parameters).
     bool foldParameters = false;
     // With foldParameters, the generated-uniform names that stay arguments.
     std::set<std::string> keptUniforms;
@@ -118,6 +119,18 @@ private:
         mi::neuraylib::ITransaction* transaction,
         const std::string& instance_name,
         const CompileSpecification& specification,
+        mi::neuraylib::IMdl_execution_context* context,
+        CompiledMaterial& result);
+
+    // Recompiles a full class compilation with its string-valued parameters
+    // folded. Native argument blocks carry strings as ids into the target
+    // code's string table, which holds only the strings of the code itself:
+    // a string argument reaches the program as id 0 (unknown), so scene data
+    // lookups such as MaterialX geompropvalue would always return their
+    // defaults. Folded, the names become code constants with valid ids.
+    void fold_string_parameters(
+        mi::neuraylib::ITransaction* transaction,
+        const std::string& instance_name,
         mi::neuraylib::IMdl_execution_context* context,
         CompiledMaterial& result);
 
