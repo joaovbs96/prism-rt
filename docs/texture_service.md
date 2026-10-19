@@ -1,14 +1,23 @@
 # Texture service cache configuration
 
-The texture service writes immutable float `.tx` files to a content-addressed
-disk cache. By default, the cache is `%LOCALAPPDATA%/PrismRT/cache` on Windows,
+The texture service writes immutable float, tiled and mipmapped OpenEXR files
+(`<content key>.tx.exr`) to a content-addressed disk cache. They used to be
+named `.tx`, which OIIO opens by trying its TIFF reader and then every other
+format; older `.tx` entries are still trimmed. By default, the cache is `%LOCALAPPDATA%/PrismRT/cache` on Windows,
 with the system temporary directory as the fallback when `LOCALAPPDATA` is
 unavailable. Set `PRISM_CACHE_DIR` to choose another directory.
 
 `PRISM_TEXTURE_CACHE_MB` sets OIIO's shared texture tile-cache budget in MiB
-(default 512). `PRISM_DISK_CACHE_GB` sets the disk cache's LRU budget in GiB
+(default a sixteenth of physical memory, between 512 and 4096; 512 MiB made
+ALab render about 21 times slower than 4 GiB). `PRISM_DISK_CACHE_GB` sets the disk cache's LRU budget in GiB
 (default 10). Disk trimming skips prepared textures pinned by live resource
 handles in any process. Source files are not modified.
+
+`PRISM_TEXTURE_OPEN_FILES` sets how many prepared files the TextureSystem keeps
+open. The default is the process's file limit less 512, at most 7680 (on
+Windows the C runtime's stdio limit is raised to 8192 first). OIIO's own default
+of 100 makes a scene with thousands of textures, such as ALab, close and reopen
+files on almost every lookup.
 
 The persistent disk allowance is partitioned between prepared textures and
 generated MaterialX source templates. Generated templates receive the smaller

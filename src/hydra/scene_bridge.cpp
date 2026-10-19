@@ -84,6 +84,7 @@
 #include <type_traits>
 #include <unordered_set>
 #include <optional>
+#include <queue>
 
 PXR_NAMESPACE_USING_DIRECTIVE
 
@@ -1317,6 +1318,11 @@ struct _SubdivisionSettings {
     // PRISM_DISPLACEMENT_MAX_FACES).
     int displacementLevel = 4;
     size_t displacementMaxFaces = size_t(1) << 18;
+    // Faces all refined prototypes of one scene build may add up to
+    // (PRISM_SUBDIVISION_BUDGET_FACES). Beyond it the meshes that refine to
+    // the most faces drop levels first. Each face costs a few hundred bytes
+    // once triangulated, with normals, UVs, tangents and its Embree BVH.
+    size_t budgetFaces = size_t(24) << 20;
 };
 
 _SubdivisionSettings const &_Subdivision()
@@ -1331,6 +1337,8 @@ _SubdivisionSettings const &_Subdivision()
             result.displacementLevel = std::clamp(std::atoi(value), 0, 6);
         if (const char *value = std::getenv("PRISM_DISPLACEMENT_MAX_FACES"); value && *value)
             result.displacementMaxFaces = size_t(std::max(1ll, std::atoll(value)));
+        if (const char *value = std::getenv("PRISM_SUBDIVISION_BUDGET_FACES"); value && *value)
+            result.budgetFaces = size_t(std::max(1ll, std::atoll(value)));
         return result;
     }();
     return settings;
@@ -1415,11 +1423,78 @@ void _Displace(Mesh &mesh, Material const &material, bool flip)
     mesh.ensureTangents();
 }
 
+// The faces a mesh refines to at each subdivision level up to the one its
+// conversion would use (index = level); a single entry, its own face count,
+// for meshes that do not refine. Reads only the topology.
+std::vector<size_t> _RefinementFaces(HdContainerDataSourceHandle const &dataSource,
+                                     Material const *displacer)
+{
+    HdMeshSchema meshSchema = HdMeshSchema::GetFromParent(dataSource);
+    HdMeshTopologySchema topology = meshSchema.GetTopology();
+    VtIntArray counts;
+    if (!meshSchema || !topology || !_ReadArray(topology.GetFaceVertexCounts(), &counts))
+        return {};
+    std::vector<size_t> faces{counts.size()};
+    TfToken scheme("none");
+    if (auto authored = meshSchema.GetSubdivisionScheme()) {
+        TfToken const value = authored->GetTypedValue(0.0f);
+        if (!value.IsEmpty()) scheme = value;
+    }
+    const bool displaced = displacer && displacer->hasDisplacement();
+    if (displaced && scheme == TfToken("none")) scheme = TfToken("bilinear");
+    if (scheme == TfToken("none")) return faces;
+    _SubdivisionSettings const &subdivision = _Subdivision();
+    const auto kind = scheme == TfToken("loop") ? prism::subdivision::Scheme::Loop
+        : scheme == TfToken("bilinear") ? prism::subdivision::Scheme::Bilinear
+                                        : prism::subdivision::Scheme::CatmullClark;
+    const int top = displaced ? subdivision.displacementLevel : subdivision.level;
+    const size_t maxFaces = displaced ? subdivision.displacementMaxFaces : subdivision.maxFaces;
+    std::span<const int> countSpan(counts.cdata(), counts.size());
+    for (int level = 1; level <= top; ++level) {
+        const size_t refined = prism::subdivision::RefinedFaceCount(countSpan, kind, level);
+        if (refined > maxFaces) break;
+        faces.push_back(refined);
+    }
+    return faces;
+}
+
+// Highest subdivision level for each mesh such that all of them together
+// stay within the scene's refinement budget. Meshes are lowered one level
+// at a time, always the one currently refining to the most faces, so dense
+// meshes (whose control hulls are already fine) give up refinement first.
+// Fixed entries (already converted prototypes) count but are not lowered.
+std::vector<int> _BudgetSubdivisionLevels(
+    std::vector<std::vector<size_t>> const &faces, std::vector<bool> const &fixed,
+    size_t budget, size_t *plannedFaces, size_t *requestedFaces)
+{
+    std::vector<int> levels(faces.size(), 0);
+    size_t total = 0;
+    std::priority_queue<std::pair<size_t, size_t>> largest;
+    for (size_t i = 0; i < faces.size(); ++i) {
+        if (faces[i].empty()) continue;
+        levels[i] = int(faces[i].size()) - 1;
+        total += faces[i].back();
+        if (!fixed[i] && levels[i] > 0) largest.emplace(faces[i].back(), i);
+    }
+    if (requestedFaces) *requestedFaces = total;
+    while (total > budget && !largest.empty()) {
+        const size_t i = largest.top().second;
+        largest.pop();
+        total -= faces[i][levels[i]];
+        --levels[i];
+        total += faces[i][levels[i]];
+        if (levels[i] > 0) largest.emplace(faces[i][levels[i]], i);
+    }
+    if (plannedFaces) *plannedFaces = total;
+    return levels;
+}
+
 // Pure: reads only the prim's data source and touches no Snapshot, pool,
 // Embree or material state, so snapshot builds run it on TBB workers. The
-// caller emits the warnings recorded in MeshConversionInfo.
+// caller emits the warnings recorded in MeshConversionInfo. levelCap, when
+// not negative, limits the subdivision level (see _BudgetSubdivisionLevels).
 MeshConversion _ConvertMesh(HdContainerDataSourceHandle const &dataSource,
-                            Material const *displacer = nullptr)
+                            Material const *displacer = nullptr, int levelCap = -1)
 {
     MeshConversion result;
     MeshConversionInfo &info = result.info;
@@ -1513,6 +1588,7 @@ MeshConversion _ConvertMesh(HdContainerDataSourceHandle const &dataSource,
         while (input.level > 0 &&
                prism::subdivision::RefinedFaceCount(countSpan, input.scheme, input.level) > maxFaces)
             --input.level;
+        if (levelCap >= 0) input.level = std::min(input.level, levelCap);
         info.subdivisionLevel = input.level;
         if (input.level > 0) {
             std::vector<float> points(pointCount * 3);
@@ -3295,11 +3371,40 @@ MeshPreparation _PrepareMeshes(HdSceneIndexBaseRefPtr const &scene,
     snapshot->prototypeConversions = misses.size();
     snapshot->prototypeConversionCacheHits = candidates.size() - misses.size();
 
+    // Refinement budget over every prototype of the build. Cache hits keep
+    // the level they were converted at.
+    std::vector<std::vector<size_t>> refinementFaces(candidates.size());
+    std::vector<bool> fixedLevel(candidates.size(), true);
+    for (size_t const i : misses) fixedLevel[i] = false;
+    tbb::parallel_for(size_t(0), candidates.size(), [&](size_t i) {
+        if (cancelled && cancelled()) return;
+        refinementFaces[i] = _RefinementFaces(candidates[i].second, displacers[i]);
+        if (fixedLevel[i]) {
+            auto const found = preparation.meshes.find(candidates[i].first);
+            const size_t level = found != preparation.meshes.end()
+                ? size_t(std::max(0, found->second.info.subdivisionLevel)) : 0;
+            if (refinementFaces[i].size() > level + 1) refinementFaces[i].resize(level + 1);
+        }
+    });
+    if (cancelled && cancelled()) return preparation;
+    size_t requestedFaces = 0, plannedFaces = 0;
+    const std::vector<int> levelCaps = _BudgetSubdivisionLevels(refinementFaces, fixedLevel,
+        _Subdivision().budgetFaces, &plannedFaces, &requestedFaces);
+    if (plannedFaces < requestedFaces) {
+        static std::once_flag warned;
+        std::call_once(warned, [&] {
+            TF_WARN("PrismRT: subdivision refines to %zu faces, over the %zu-face budget "
+                    "(PRISM_SUBDIVISION_BUDGET_FACES); the densest meshes use lower levels (%zu faces)",
+                    requestedFaces, _Subdivision().budgetFaces, plannedFaces);
+        });
+    }
+
     std::vector<MeshConversion> conversions(misses.size());
     const auto conversionStart = std::chrono::steady_clock::now();
     tbb::parallel_for(size_t(0), misses.size(), [&](size_t i) {
         if (cancelled && cancelled()) return;
-        conversions[i] = _ConvertMesh(candidates[misses[i]].second, displacers[misses[i]]);
+        conversions[i] = _ConvertMesh(candidates[misses[i]].second, displacers[misses[i]],
+                                      levelCaps[misses[i]]);
     });
     // Wall time of the parallel phase, covering the whole pure conversion
     // including tangents, vertex de-duplication and hashing.
@@ -4793,6 +4898,8 @@ public:
         std::unique_ptr<MaterialService> materialService;
         double seconds = 0.0;
         std::string error;
+        // The build ran out of memory; rebuilding the same scene would too.
+        bool outOfMemory = false;
         bool reusedBank = false;
         bool residencyUnchanged = false;
         bool pinnedBankFallback = false;
@@ -5150,6 +5257,12 @@ public:
     std::shared_ptr<std::atomic<bool>> buildCancel;
     uint64_t buildingGeneration = 0;
     uint64_t discardedBuilds = 0;
+    // Failed builds of requestedGeneration. After an out-of-memory failure, or
+    // a second failure, the scene is not rebuilt until it changes again;
+    // generationFailure (the snapshotError statistic) then says why.
+    uint64_t failedGeneration = 0;
+    unsigned failedBuildAttempts = 0;
+    std::string generationFailure;
     uint64_t reusedSnapshotBuilds = 0;
     uint64_t prototypeBuilds = 0;
     uint64_t capturedPrims = 0;
@@ -5638,10 +5751,29 @@ bool SceneBridge::Prepare(CameraState const &camera,
                 completed.generation == _impl->requestedGeneration &&
                 !_impl->sceneDirty;
             if (!publish) ++_impl->discardedBuilds;
-            if (!publish && completed.generation == _impl->requestedGeneration &&
+            if (publish) {
+                _impl->failedBuildAttempts = 0;
+                _impl->generationFailure.clear();
+            } else if (completed.generation == _impl->requestedGeneration &&
                 !_impl->sceneDirty) {
-                _impl->sceneDirty = true;
-                _impl->lastRebuildReason = "background generation failed";
+                if (_impl->failedGeneration != completed.generation) {
+                    _impl->failedGeneration = completed.generation;
+                    _impl->failedBuildAttempts = 0;
+                }
+                ++_impl->failedBuildAttempts;
+                if (!completed.error.empty() &&
+                    (completed.outOfMemory || _impl->failedBuildAttempts >= 2)) {
+                    // Rebuilding would fail the same way and, when out of
+                    // memory, keep the process at its peak indefinitely.
+                    // Report the failure and wait for the scene to change.
+                    _impl->generationFailure = completed.error;
+                    _impl->lastRebuildReason = "background generation failed";
+                    TF_RUNTIME_ERROR("PrismRT: scene preparation failed (%s); "
+                        "the scene is not rebuilt until it changes", completed.error.c_str());
+                } else {
+                    _impl->sceneDirty = true;
+                    _impl->lastRebuildReason = "background generation failed";
+                }
             }
         }
         if (publish) {
@@ -6322,6 +6454,11 @@ bool SceneBridge::Prepare(CameraState const &camera,
                             result.snapshot->scene->textureFiltering =
                                 jobSettings.textureFiltering;
                         }
+                    } catch (std::bad_alloc const &) {
+                        // Release the partial scene before reporting.
+                        result.snapshot.reset();
+                        result.error = "out of memory while preparing the scene";
+                        result.outOfMemory = true;
                     } catch (std::exception const &e) {
                         result.error = e.what();
                     } catch (...) {
@@ -7289,6 +7426,10 @@ VtDictionary SceneBridge::GetStats() const
     result["visibilityRecoveryRebuilds"] = VtValue(static_cast<int64_t>(
         _impl->visibilityRecoveryRebuilds));
     result["lastRebuildReason"] = VtValue(_impl->lastRebuildReason);
+    // Why the current scene could not be prepared; empty while it can be.
+    result["snapshotError"] = VtValue(
+        _impl->failedGeneration == _impl->requestedGeneration
+            ? _impl->generationFailure : std::string());
     uint64_t writeNs = 0, publishNs = 0, mapNs = 0, presentationCopyBytes = 0;
     std::unordered_set<PrismRenderBuffer *> measuredBuffers;
     for (auto const &binding : _impl->bindings) {

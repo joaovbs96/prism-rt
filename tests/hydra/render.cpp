@@ -36,9 +36,26 @@ void render(UsdImagingGLEngine& engine, const UsdStageRefPtr& stage,
     params.showProxy = false;
     engine.SetRendererSetting(TfToken("domeLightCameraVisibility"),
                               VtValue(domeLightCameraVisibility));
+    // A scene that cannot be prepared (for example out of memory) is not
+    // retried by the delegate, which then reports itself converged; report
+    // the failure instead of saving an empty image.
+    auto checkPreparation = [&engine] {
+        const VtDictionary stats = engine.GetRenderStats();
+        if (const auto found = stats.find("snapshotError");
+            found != stats.end() && found->second.IsHolding<std::string>() &&
+            !found->second.UncheckedGet<std::string>().empty())
+            throw std::runtime_error("Scene preparation failed: " +
+                found->second.UncheckedGet<std::string>());
+    };
     const auto start = std::chrono::steady_clock::now();
+    auto lastErrorCheck = start;
     do {
         engine.Render(stage->GetPseudoRoot(), params);
+        // Statistics scan the scene, so poll them about once a second.
+        if (std::chrono::steady_clock::now() - lastErrorCheck > std::chrono::seconds(1)) {
+            lastErrorCheck = std::chrono::steady_clock::now();
+            checkPreparation();
+        }
         static const int minutes = [] {
             const char* value = std::getenv("PRISM_RENDER_TIMEOUT_MINUTES");
             return value && *value ? std::max(1, std::atoi(value)) : 5;
@@ -47,6 +64,7 @@ void render(UsdImagingGLEngine& engine, const UsdStageRefPtr& stage,
             throw std::runtime_error("Hydra failed to converge within the time limit (PRISM_RENDER_TIMEOUT_MINUTES)");
         if (!engine.IsConverged()) std::this_thread::sleep_for(std::chrono::milliseconds(10));
     } while (!engine.IsConverged());
+    checkPreparation();
 }
 
 std::vector<float> pixels(UsdImagingGLEngine& engine, int width, int height);

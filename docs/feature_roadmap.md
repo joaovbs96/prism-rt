@@ -59,7 +59,10 @@ Scenes: **Eggs** (MaterialEggs), **OpenPBR** (OpenPBRShaderPlayground),
 - **Motion blur**: camera shutters and time-sampled transforms (Eggs, ALab).
 - **Adaptive subdivision and dicing.** Subdivision is uniform per mesh under a
   face budget; dense subdivision meshes render as their control hulls, and
-  displacement dicing is limited the same way.
+  displacement dicing is limited the same way. A scene-wide budget
+  (`PRISM_SUBDIVISION_BUDGET_FACES`, default 24 Mi faces) lowers the levels of
+  the meshes refining to the most faces first: ALab asks for 48 M faces at
+  level 2 and renders with 25 M (40 M triangles, 25 GB peak).
 - **Multiple UV sets.** Texture coordinates come from `st` (or `uv`);
   `geompropvalue` reads of other float2 primvars work, but MDL
   `texture_coordinate(i)` beyond the first set does not.

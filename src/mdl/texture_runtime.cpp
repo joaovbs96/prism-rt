@@ -531,7 +531,9 @@ mi::neuraylib::Texture_handler_deriv_vtable const &NativeTextureRuntime::Vtable(
             if (!self->m_service->lookup(*resource,q,4,out)) {
                 out[0]=out[2]=out[3]=1.0f; out[1]=0.0f;
                 if (!self->m_reportedLookupFailure.exchange(true))
-                    std::cerr << "MDL TextureSystem lookup failed; affected texels are magenta\n";
+                    std::cerr << "MDL TextureSystem lookup failed; affected texels are magenta ("
+                              << resource->preparedPath().string() << ": "
+                              << prism::TextureService::lastError() << ")\n";
             } else ExpandChannels(resource->channels(),out);
         };
         v.m_tex_lookup_float3_2d=[](float out[3],Base const *base,unsigned index,

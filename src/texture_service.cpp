@@ -12,6 +12,7 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
@@ -21,6 +22,7 @@
 #include <cctype>
 #include <memory>
 #include <sstream>
+#include <string_view>
 #include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
@@ -36,6 +38,7 @@
 #include <csignal>
 #include <fcntl.h>
 #include <sys/file.h>
+#include <sys/resource.h>
 #include <unistd.h>
 #endif
 
@@ -45,6 +48,8 @@ namespace {
 std::mutex singletonMutex;
 std::weak_ptr<TextureService> singleton;
 std::atomic<uint64_t> texturePinSerial{0};
+// Prepared resources released so far; a trim can only evict what was released.
+std::atomic<uint64_t> releasedResources{0};
 
 uint64_t elapsedNanoseconds(std::chrono::steady_clock::time_point start)
 {
@@ -92,9 +97,49 @@ std::filesystem::path cacheRoot()
     return prism::PersistentCacheRoot();
 }
 
+uint64_t physicalMemoryMB()
+{
+#ifdef _WIN32
+    MEMORYSTATUSEX status{};
+    status.dwLength = sizeof(status);
+    if (GlobalMemoryStatusEx(&status)) return status.ullTotalPhys >> 20;
+#else
+    const long pages = sysconf(_SC_PHYS_PAGES), pageSize = sysconf(_SC_PAGESIZE);
+    if (pages > 0 && pageSize > 0)
+        return (static_cast<uint64_t>(pages) * static_cast<uint64_t>(pageSize)) >> 20;
+#endif
+    return 0;
+}
+
+// OIIO's tile cache. Too small a cache for the scene's texture working set
+// makes render threads wait on tile eviction and rereads: ALab rendered 21x
+// slower with 512 MiB than with 4 GiB. The default is a sixteenth of physical
+// memory, between 512 MiB and 4 GiB.
 size_t memoryBudgetMB()
 {
-    return static_cast<size_t>(prism::ResourceLimit("PRISM_TEXTURE_CACHE_MB", 512, 65536));
+    const uint64_t fallback = std::clamp<uint64_t>(physicalMemoryMB() / 16, 512, 4096);
+    return static_cast<size_t>(prism::ResourceLimit("PRISM_TEXTURE_CACHE_MB", fallback, 65536));
+}
+
+// Files the TextureSystem keeps open. OIIO's default of 100 makes a scene
+// with thousands of textures close and reopen files on nearly every lookup,
+// and each reopen is serialized inside OIIO. The limit stays well inside the
+// process's file limit: OIIO reads through C stdio, which on Windows allows
+// 512 streams unless raised.
+int openFileLimit()
+{
+    int available = 0;
+#ifdef _WIN32
+    available = std::max(_getmaxstdio(), _setmaxstdio(8192));
+#else
+    rlimit limit{};
+    if (getrlimit(RLIMIT_NOFILE, &limit) == 0)
+        available = limit.rlim_cur == RLIM_INFINITY ? 8192
+            : static_cast<int>(std::min<rlim_t>(limit.rlim_cur, 8192));
+#endif
+    const int fallback = std::clamp(available - 512, 100, 7680);
+    return static_cast<int>(prism::ResourceLimit("PRISM_TEXTURE_OPEN_FILES",
+        static_cast<uint64_t>(fallback), 8192));
 }
 
 uint64_t processId()
@@ -209,6 +254,12 @@ std::string rawSourceStamp(std::filesystem::path const &path,
         options.sourceVersion + "\n" + std::to_string(generation);
 }
 
+std::string &lookupError() noexcept
+{
+    thread_local std::string error;
+    return error;
+}
+
 OIIO::TextureOpt::Wrap wrap(TextureWrap value)
 {
     using W = OIIO::TextureOpt::Wrap;
@@ -223,6 +274,20 @@ OIIO::TextureOpt::Wrap wrap(TextureWrap value)
     }
 }
 
+// Prepared textures are tiled, mipmapped OpenEXR files. They used to be named
+// .tx, which OIIO reads with its TIFF plugin first and then by trying every
+// other format: an expensive, serialized probe on each reopen. The .exr suffix
+// selects the OpenEXR reader directly; legacy .tx entries are still trimmed.
+constexpr char kPreparedSuffix[] = ".tx.exr";
+
+bool isPreparedFile(std::filesystem::path const &path)
+{
+    const std::string name = path.filename().string();
+    const std::string_view suffix(kPreparedSuffix);
+    return path.extension() == ".tx" ||
+        (name.size() > suffix.size() && name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0);
+}
+
 // Returns the bytes of prepared textures left in the cache.
 uintmax_t trimDiskCache(std::filesystem::path const &root, double maxGB,
                         std::unordered_map<std::string, bool> const &pinned,
@@ -235,7 +300,7 @@ uintmax_t trimDiskCache(std::filesystem::path const &root, double maxGB,
     std::error_code ec;
     for (auto const &item : std::filesystem::directory_iterator(root, ec)) {
         if (ec) break;
-        if (!item.is_regular_file(ec) || item.path().extension() != ".tx") continue;
+        if (!item.is_regular_file(ec) || !isPreparedFile(item.path())) continue;
         const auto size = item.file_size(ec);
         if (ec) { ec.clear(); continue; }
         total += size;
@@ -263,7 +328,10 @@ uintmax_t trimDiskCache(std::filesystem::path const &root, double maxGB,
             else if (errno == ESRCH) active = false;
 #endif
         } catch (...) { active = false; }
-        if (active) processPinned.emplace(filename.substr(0, marker) + ".tx", true);
+        if (active) {
+            processPinned.emplace(filename.substr(0, marker) + kPreparedSuffix, true);
+            processPinned.emplace(filename.substr(0, marker) + ".tx", true);
+        }
         else std::filesystem::remove(item.path(), ec);
         ec.clear();
     }
@@ -341,9 +409,16 @@ struct TextureResource::Impl {
     std::shared_ptr<OIIO::TextureSystem> system;
     std::shared_ptr<TextureService> serviceOwner;
     OIIO::TextureSystem::TextureHandle *handle = nullptr;
+    // An alias samples its base resource's OIIO handle, so it keeps the base
+    // alive: otherwise the base could expire and a later preparation of the
+    // same content would invalidate the file while the alias samples it.
+    std::shared_ptr<const TextureResource> base;
     std::filesystem::path pinPath;
     ResourceVersion version;
-    ~Impl() { if (!pinPath.empty()) { std::error_code ec; std::filesystem::remove(pinPath, ec); } }
+    ~Impl() {
+        if (!pinPath.empty()) { std::error_code ec; std::filesystem::remove(pinPath, ec); }
+        releasedResources.fetch_add(1, std::memory_order_relaxed);
+    }
 };
 
 struct TextureService::Impl {
@@ -359,7 +434,7 @@ struct TextureService::Impl {
     std::unordered_map<std::string, std::vector<std::string>> sourcePreparedKeys;
     std::unordered_map<std::string, std::unordered_map<std::string, std::string>> sourceKeyStamps;
     struct DiskUsage {
-        uint64_t bytes = 0, added = 0;
+        uint64_t bytes = 0, added = 0, addedAtTrim = 0, releasedAtTrim = 0;
         std::chrono::steady_clock::time_point lastTrim;
         bool known = false;
     };
@@ -399,6 +474,7 @@ TextureService::TextureService() : m_impl(std::make_unique<Impl>())
     if (!m_impl->system) throw std::runtime_error("cannot create OIIO TextureSystem");
     if (!m_impl->system->attribute("max_memory_MB", static_cast<int>(memoryBudgetMB())))
         throw std::runtime_error("cannot configure OIIO texture cache budget");
+    m_impl->system->attribute("max_open_files", openFileLimit());
 }
 TextureService::~TextureService() = default;
 
@@ -558,7 +634,7 @@ bool TextureService::invalidate(std::filesystem::path const &source,
     std::error_code ec;
     bool allRemoved = true;
     for (const std::string &key : keys) {
-        const auto tx = root / (key + ".tx");
+        const auto tx = root / (key + kPreparedSuffix);
         bool pinned = false;
         for (auto const &item : std::filesystem::directory_iterator(root, ec)) {
             if (ec) break;
@@ -708,6 +784,7 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
         aliasImpl->system = cached->m_impl->system;
         aliasImpl->serviceOwner = shared_from_this();
         aliasImpl->handle = cached->m_impl->handle;
+        aliasImpl->base = cached;
         aliasImpl->version = {absolute.generic_string(), stamp, rawFingerprint, generation};
         const auto preparedRoot = aliasImpl->prepared.parent_path();
         const auto pinWaitStart = std::chrono::steady_clock::now();
@@ -785,7 +862,7 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
     std::filesystem::create_directories(root);
     auto lockWaitStart = std::chrono::steady_clock::now();
     CrossProcessCacheLock processLock(root, key);
-    const auto tx = root / (key + ".tx");
+    const auto tx = root / (key + kPreparedSuffix);
     auto publicationLock = std::make_unique<CrossProcessCacheLock>(root);
     m_impl->lockWaitNanoseconds.fetch_add(elapsedNanoseconds(lockWaitStart),
                                           std::memory_order_relaxed);
@@ -966,7 +1043,7 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
         stageStart = std::chrono::steady_clock::now();
         static std::atomic<uint64_t> serial{0};
         const auto temp = root / (key + "." + std::to_string(processId()) + "." +
-                                  std::to_string(++serial) + ".tmp.tx");
+                                  std::to_string(++serial) + ".tmp.exr");
         OIIO::ImageSpec config;
         config.format = OIIO::TypeDesc::FLOAT;
         config.tile_width = config.tile_height = 64;
@@ -1031,9 +1108,20 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
     impl->system = m_impl->system;
     impl->serviceOwner = shared_from_this();
     // A previous cache entry at this content path may have been evicted and
-    // recreated while this process kept its TextureSystem alive.
-    m_impl->system->invalidate(OIIO::ustring(tx.string()), true);
+    // recreated while this process kept its TextureSystem alive. Only a file
+    // written just now can be such a recreation; an existing one may be
+    // sampled by render threads right now, and invalidating it under them
+    // clears its level table mid-lookup.
+    if (!cacheFilePresent)
+        m_impl->system->invalidate(OIIO::ustring(tx.string()), true);
     impl->handle = m_impl->system->get_texture_handle(OIIO::ustring(tx.string()));
+    if (impl->handle && !m_impl->system->good(impl->handle)) {
+        // A file OIIO once failed to open stays broken until invalidated.
+        // Nothing samples a broken file, so retrying it is safe.
+        (void)m_impl->system->geterror();
+        m_impl->system->invalidate(OIIO::ustring(tx.string()), true);
+        impl->handle = m_impl->system->get_texture_handle(OIIO::ustring(tx.string()));
+    }
     if (!impl->handle || !m_impl->system->good(impl->handle))
         throw std::runtime_error("cannot open prepared texture: " + m_impl->system->geterror());
     std::error_code accessError;
@@ -1078,10 +1166,21 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
         auto &usage = m_impl->diskUsage[usageKey];
         usage.bytes += addedBytes;
         usage.added += addedBytes;
-        trim = !usage.known || usage.bytes > limit || now - usage.lastTrim >= kDiskTrimInterval;
+        // When live textures alone exceed the budget a trim cannot get under
+        // it, and trimming again on every publication serializes preparation
+        // on a full directory scan. Over budget, trim again only after this
+        // process added a further slice of the budget, or once a resource was
+        // released (it may now be evictable).
+        const uint64_t released = releasedResources.load(std::memory_order_relaxed);
+        const uint64_t trimStep = std::max<uint64_t>(limit / 32, 64ull * 1024 * 1024);
+        trim = !usage.known || now - usage.lastTrim >= kDiskTrimInterval ||
+            (usage.bytes > limit && (released != usage.releasedAtTrim ||
+                                     usage.added - usage.addedAtTrim >= trimStep));
         if (trim) {
             usage.known = true;
             usage.lastTrim = now;
+            usage.addedAtTrim = usage.added;
+            usage.releasedAtTrim = released;
             addedBeforeTrim = usage.added;
             for (auto const &[resourceKey, weak] : m_impl->resources) {
                 (void)resourceKey;
@@ -1188,10 +1287,15 @@ bool TextureService::lookup(TextureResource const &resource, TextureLookup const
         ? OIIO::TextureOpt::MipModeNoMIP : OIIO::TextureOpt::MipModeAniso;
     options.interpmode = query.nearest ? OIIO::TextureOpt::InterpClosest
                                        : OIIO::TextureOpt::InterpBilinear;
-    return resource.m_impl->system->texture(resource.m_impl->handle,
-        resource.m_impl->system->get_perthread_info(), options, query.s, query.t,
-        query.dsdx, query.dtdx, query.dsdy, query.dtdy, channelCount, result);
+    if (resource.m_impl->system->texture(resource.m_impl->handle,
+            resource.m_impl->system->get_perthread_info(), options, query.s, query.t,
+            query.dsdx, query.dtdx, query.dsdy, query.dtdy, channelCount, result))
+        return true;
+    lookupError() = resource.m_impl->system->geterror();
+    return false;
 }
+
+std::string const &TextureService::lastError() noexcept { return lookupError(); }
 
 bool TextureService::readPixels(TextureResource const &resource, int xb, int yb,
                                 int xe, int ye, int firstChannel, int channelCount,
@@ -1201,10 +1305,13 @@ bool TextureService::readPixels(TextureResource const &resource, int xb, int yb,
         xe <= xb || ye <= yb || firstChannel < 0 || channelCount <= 0 ||
         firstChannel + channelCount > resource.channels()) return false;
     OIIO::TextureOpt options;
-    return resource.m_impl->system->get_texels(resource.m_impl->handle,
-        resource.m_impl->system->get_perthread_info(), options, 0,
-        xb, xe, yb, ye, 0, 1, firstChannel, firstChannel + channelCount,
-        OIIO::TypeDesc::FLOAT, result);
+    if (resource.m_impl->system->get_texels(resource.m_impl->handle,
+            resource.m_impl->system->get_perthread_info(), options, 0,
+            xb, xe, yb, ye, 0, 1, firstChannel, firstChannel + channelCount,
+            OIIO::TypeDesc::FLOAT, result))
+        return true;
+    lookupError() = resource.m_impl->system->geterror();
+    return false;
 }
 
 OIIO::TextureSystem *TextureService::textureSystem() const noexcept { return m_impl->system.get(); }

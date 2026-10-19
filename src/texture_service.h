@@ -143,11 +143,15 @@ public:
     bool invalidate(std::filesystem::path const &source,
                     TexturePrepareOptions const &options = {});
 
+    // On failure these take OIIO's error message, which would otherwise
+    // accumulate per thread without bound, and keep it for lastError().
     bool lookup(TextureResource const &resource, TextureLookup const &query,
                 int channelCount, float *result) const;
     bool readPixels(TextureResource const &resource, int xbegin, int ybegin,
                     int xend, int yend, int firstChannel, int channelCount,
                     float *result) const;
+    // The calling thread's last lookup or readPixels failure.
+    static std::string const &lastError() noexcept;
     OIIO::TextureSystem *textureSystem() const noexcept;
     TextureServiceStats stats() const noexcept;
     std::string textureStatistics() const;
