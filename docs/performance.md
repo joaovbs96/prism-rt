@@ -27,6 +27,61 @@ These are single historical renders, not repeated benchmark samples. Cache state
 
 The loading table will be filled from the completed three-scene benchmark. Until then, comparative performance acceptance remains open. Fresh relocated-install coverage and motion tests on larger scenes are also pending.
 
+## Loading profile (October 2026)
+
+Measured with `PRISM_LOAD_PROFILE=1` (see [Hydra loading measurements](hydra.md#loading-measurements))
+through `prism_hydra_render` at 480x270, 4 spp, on the i7-14700K / RTX 4070 Ti,
+each process under a 24 GB job-memory cap. Warm means a second run on the same
+private `PRISM_CACHE_DIR`. The baseline and the changed plugin ran in
+alternating rounds; the table gives the time from process start to the first
+published image, each a two-round mean (Vulkan: one round).
+
+| Scene, warm | CPU before | CPU after | Ratio | Vulkan before | Vulkan after | Ratio |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| MaterialEggs countertop (35 materials) | 25.2 s | 13.5 s | 0.54 | 30.4 s | 18.9 s | 0.62 |
+| OpenPBR shader playground | 13.4 s | 7.6 s | 0.57 | | | |
+| Stirling | 7.5 s | 5.0 s | 0.67 | 9.5 s | 6.8 s | 0.72 |
+| Egg jade | 3.8 s | 1.9 s | 0.51 | 4.8 s | 3.0 s | 0.62 |
+| Teapot (UDIM textures) | 4.7 s | 2.5 s | 0.53 | 15.8 s | 9.6 s | 0.61 |
+| Chess | 3.5 s | 2.6 s | 0.75 | 5.0 s | 4.1 s | 0.82 |
+
+In usdview (the real launcher, warm caches, Vulkan) the countertop's first
+image went from 26.9 s to 14.9 s. The countertop, playground and Stirling
+kernels exceed DXC's memory limit, so their Vulkan runs render on the CPU.
+
+What the timeline showed before the change, and what changed:
+
+- Material conversion through hdMtlx ran serially on the build thread: about
+  0.6 s per material (the countertop's 34 conversions took 19-21 s of its 25 s
+  material phase; hdMtlx imports and validates the whole standard library for
+  every document, which PrismRT cannot avoid without patching USD). It now runs
+  on the material workers, interleaved with compilation, largest graphs first.
+  Conversions slow down about 1.8x each when eight run at once, so the gain is
+  about 2.5x on the material phase.
+- UDIM tiles were read, hashed and published one at a time (2.2-2.9 s on the
+  teapot and the playground, warm); they are now handled in parallel (0.45 s
+  on the teapot).
+- Mesh conversion and subdivision started only after every material had
+  compiled; now meshes whose materials cannot displace convert meanwhile
+  (0.2-1 s; the countertop's displaced meshes still wait).
+- Native MDL code generation (LLVM) remains the largest material cost (12-15 s
+  of worker time on the countertop and the playground). The MDL SDK 2026.0.2
+  native back end does not support `ITarget_code::serialize`
+  (`supports_serialization()` is false), so it cannot be cached on disk; more
+  than eight workers did not help (14 workers: same wall time, twice the
+  per-material JIT time).
+- Cold runs are dominated by texture preparation (teapot: 30 s, mostly the
+  UDIM `.tx.exr` creation inside one material's compile) and, on Vulkan, by
+  DXC (9-23 s, cached afterwards) and driver pipeline compilation (up to 17 s
+  for ALab's kernel, now cached in `.vkpc` files).
+- Teapot on Vulkan spends 6.5-8.9 s per warm run decoding its 94 prepared
+  float textures (5.6 GB) into GPU formats; a GPU-format texture cache would
+  remove most of it.
+- The usdview "discarded first build": usdview edits its default light about
+  1.2 s after population, which cancels the first generation. The second
+  generation reuses the conversions and programs the first finished, so this
+  costs about 1 s now.
+
 ## Interpretation limits
 
 MDL variants remain cached for the renderer process lifetime, affecting warm-recreation results. Historical InOneWeekend measurements used coarse tessellated spheres; the current implementation uses analytic spheres. Report this representation change when comparing geometry memory and rendering results. See [Hydra scope and costs](hydra.md) for rendering limitations and supported geometry behavior.

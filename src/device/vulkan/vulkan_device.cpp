@@ -17,6 +17,7 @@
 #include "../../progress.h"
 #include "../../scene.h"
 #include "../../texture_service.h"
+#include "../../load_profile.h"
 
 #include <OpenImageIO/imageio.h>
 #include <tbb/parallel_for.h>
@@ -33,6 +34,7 @@
 #include <fstream>
 #include <mutex>
 #include <iostream>
+#include <thread>
 #include <unordered_map>
 
 namespace prism::device {
@@ -133,6 +135,39 @@ struct AccelerationStructure {
     VkDeviceAddress address = 0;
 };
 
+// Pipeline-cache data is only valid for the driver that produced it: name the
+// files after the cache UUID and the device and driver identifiers, so a
+// driver update or another GPU reads its own file. The driver checks the
+// data's header again when it is loaded.
+std::string PipelineCacheTag(VkPhysicalDeviceProperties const& properties)
+{
+    std::string tag;
+    for (uint8_t byte : properties.pipelineCacheUUID) tag += std::format("{:02x}", byte);
+    return tag + std::format("-{:x}-{:x}-{:x}", properties.vendorID, properties.deviceID,
+                             properties.driverVersion);
+}
+
+// Publishes a cache file whole: other processes sharing the cache directory
+// read either the previous complete file or this one.
+void WriteCacheFileAtomically(std::filesystem::path const& path, void const* data, size_t size)
+{
+    static std::atomic<uint64_t> serial{0};
+    std::error_code error;
+    std::filesystem::create_directories(path.parent_path(), error);
+    const auto temporary = std::filesystem::path(path.string() + std::format(".{}.{}.tmp",
+        std::hash<std::thread::id>{}(std::this_thread::get_id()), ++serial));
+    {
+        std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
+        if (!out || !out.write(static_cast<const char*>(data), std::streamsize(size))) {
+            out.close();
+            std::filesystem::remove(temporary, error);
+            return;
+        }
+    }
+    std::filesystem::rename(temporary, path, error);
+    if (error) std::filesystem::remove(temporary, error);
+}
+
 } // namespace
 
 // A short reason for a scene the GPU cannot render, for the host's status line.
@@ -206,7 +241,7 @@ bool CompileVulkanKernel(std::string const& mdlCode, std::vector<uint32_t>* spir
         }
         std::error_code ignored;
         std::filesystem::remove(tooLarge, ignored);
-        std::ofstream(cached, std::ios::binary).write(bytes.data(), std::streamsize(bytes.size()));
+        WriteCacheFileAtomically(cached, bytes.data(), bytes.size());
     }
     spirv->resize(bytes.size() / 4);
     std::memcpy(spirv->data(), bytes.data(), bytes.size());
@@ -259,11 +294,12 @@ struct VulkanDevice::Impl {
     VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
     std::unordered_map<std::string, VkPipeline> pipelines;
+    // Identifies this driver's pipeline-cache data (see PipelineCacheTag).
+    std::string pipelineCacheTag;
     // Ray tracing pipelines with material callables, by generated MDL code
     // and reordering; `callables` is the one in use (null: `pipeline` is the
     // compute kernel).
     vulkan::RayTracingSupport rayTracing;
-    std::string pipelineCacheTag;
     std::unordered_map<std::string, std::unique_ptr<vulkan::MaterialCallPipeline>> callablePipelines;
     vulkan::MaterialCallPipeline const* callables = nullptr;
     // The generated MDL code `pipeline` was built from.
@@ -488,9 +524,7 @@ bool VulkanDevice::Impl::initialize(std::string* reason)
     vkGetPhysicalDeviceProperties2(physical, &properties2);
     accelerationProperties.pNext = nullptr;
     rayTracing.properties.pNext = nullptr;
-    for (uint8_t byte : properties2.properties.pipelineCacheUUID) pipelineCacheTag += std::format("{:02x}", byte);
-    pipelineCacheTag += std::format("-{:x}-{:x}-{:x}", properties2.properties.vendorID,
-                                    properties2.properties.deviceID, properties2.properties.driverVersion);
+    pipelineCacheTag = PipelineCacheTag(properties2.properties);
 
     createAccelerationStructure = reinterpret_cast<PFN_vkCreateAccelerationStructureKHR>(
         vkGetDeviceProcAddr(device, "vkCreateAccelerationStructureKHR"));
@@ -768,8 +802,35 @@ bool VulkanDevice::Impl::buildPipeline(std::string* error)
     info.stage.module = module;
     info.stage.pName = "main";
     info.layout = pipelineLayout;
-    const VkResult result = vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &info, nullptr, &pipeline);
+    // The driver compiles the SPIR-V to GPU code here, which takes seconds
+    // for a large kernel: keep its result next to the SPIR-V for later runs.
+    const auto pipelineCacheFile = gpu::ShaderCacheDirectory("vulkan") / (key + "-" + pipelineCacheTag + ".vkpc");
+    std::vector<char> cacheData;
+    if (std::ifstream file{pipelineCacheFile, std::ios::binary})
+        cacheData.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+    VkPipelineCacheCreateInfo cacheInfo{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+    cacheInfo.initialDataSize = cacheData.size();
+    cacheInfo.pInitialData = cacheData.empty() ? nullptr : cacheData.data();
+    VkPipelineCache pipelineCache = VK_NULL_HANDLE;
+    if (vkCreatePipelineCache(device, &cacheInfo, nullptr, &pipelineCache) != VK_SUCCESS) {
+        // Data the driver rejects outright: start empty.
+        cacheInfo.initialDataSize = 0;
+        cacheInfo.pInitialData = nullptr;
+        if (vkCreatePipelineCache(device, &cacheInfo, nullptr, &pipelineCache) != VK_SUCCESS)
+            pipelineCache = VK_NULL_HANDLE;
+    }
+    const VkResult result = vkCreateComputePipelines(device, pipelineCache, 1, &info, nullptr, &pipeline);
     vkDestroyShaderModule(device, module, nullptr);
+    if (pipelineCache) {
+        size_t size = 0;
+        if (result == VK_SUCCESS && vkGetPipelineCacheData(device, pipelineCache, &size, nullptr) == VK_SUCCESS &&
+            size > 0 && size != cacheData.size()) {
+            std::vector<char> data(size);
+            if (vkGetPipelineCacheData(device, pipelineCache, &size, data.data()) == VK_SUCCESS)
+                WriteCacheFileAtomically(pipelineCacheFile, data.data(), size);
+        }
+        vkDestroyPipelineCache(device, pipelineCache, nullptr);
+    }
     if (result != VK_SUCCESS) {
         if (error) *error = std::string("cannot create the compute pipeline: ") + ResultText(result);
         pipeline = VK_NULL_HANDLE;
@@ -778,6 +839,11 @@ bool VulkanDevice::Impl::buildPipeline(std::string* error)
     pipelines[key] = pipeline;
     pipelineCode = shared;
     if (statistics) vulkan::PrintPipelineStatistics(device, pipeline, "compute kernel");
+    prism::load_profile::Mark("vulkan.pipeline",
+        std::format("mdl_code_s={:.3f} translate_s={:.3f} spirv_s={:.3f} pipeline_s={:.3f} programs={}",
+                    std::chrono::duration<double>(generated - start).count(), code.translateSeconds,
+                    std::chrono::duration<double>(compiled - generated).count(), SecondsSince(compiled),
+                    code.programCount));
     if (gpu::GpuVerbose())
         std::cerr << std::format("PrismRT Vulkan: shader setup {:.1f} s (MDL code {:.1f} s, SPIR-V {:.1f} s, pipeline {:.1f} s)\n",
                                  SecondsSince(start), std::chrono::duration<double>(generated - start).count(),
@@ -1322,6 +1388,7 @@ bool VulkanDevice::Impl::ensureScene(SceneManager& scene, std::string* error)
     progress::Scope uploadPhase(Phase::Upload);
     progress::Detail(Phase::Upload, "converting the scene");
     data = std::make_unique<GpuSceneData>(gpu::BuildGpuScene(scene));
+    auto const sceneBuilt = Clock::now();
     for (auto const& warning : data->warnings) std::cerr << "PrismRT Vulkan: " << warning << '\n';
     auto fail = [&] {
         pipeline = VK_NULL_HANDLE;
@@ -1331,6 +1398,7 @@ bool VulkanDevice::Impl::ensureScene(SceneManager& scene, std::string* error)
         return false;
     };
     if (!buildPipeline(error)) return fail();
+    auto const piped = Clock::now();
     GpuSceneData const& d = *data;
     progress::Detail(Phase::Upload, "buffers");
     auto bytes = [](auto const& v) { return v.size() * sizeof(v[0]); };
@@ -1367,6 +1435,14 @@ bool VulkanDevice::Impl::ensureScene(SceneManager& scene, std::string* error)
     progress::SetTotal(Phase::Upload, 0);
     progress::Detail(Phase::Upload, "acceleration structures");
     if (!buildAccelerationStructures(error) || !writeDescriptors(error)) return fail();
+    prism::load_profile::Mark("vulkan.scene",
+        std::format("total_s={:.3f} gpu_scene_s={:.3f} pipeline_s={:.3f} buffers_s={:.3f} images_s={:.3f} "
+                    "acceleration_s={:.3f} images={}",
+                    SecondsSince(sceneStart), std::chrono::duration<double>(sceneBuilt - sceneStart).count(),
+                    std::chrono::duration<double>(piped - sceneBuilt).count(),
+                    std::chrono::duration<double>(uploaded - piped).count(),
+                    std::chrono::duration<double>(imaged - uploaded).count(), SecondsSince(imaged),
+                    d.images.size()));
     if (gpu::GpuVerbose())
         std::cerr << std::format("PrismRT Vulkan: scene {:.3f} s (buffers {:.3f}, images {:.3f}, "
                                  "acceleration structures {:.3f}; {} prototypes, {} instances)\n",

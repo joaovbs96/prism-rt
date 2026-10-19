@@ -49,3 +49,78 @@ spaces.
 After correcting a failed check, `-Resume` keeps that build directory and
 rebuilds changed targets before rerunning validation. Its result is explicitly
 reported as a resumed build, rather than a new clean-build measurement.
+
+## Windows demo package
+
+`tools/package_windows.ps1` turns an existing build into a self-contained zip,
+`PrismRT-windows-x64-<git short sha>.zip`, for demos. A user extracts it
+anywhere (spaces are fine) and double-clicks `usdview.bat`, which opens the
+bundled Cornell box in usdview with the PrismRT renderer. No installation or
+environment variables are needed.
+
+```powershell
+.\tools\package_windows.ps1 -OutputDir local\package
+```
+
+The dependency roots default from the same `PRISM_*` variables as
+`prism_env.ps1`, then from `prism_local_env.ps1`, then from
+`build\prism-runtime.json`. Each can be overridden with a parameter
+(`-UsdRoot`, `-MaterialXRoot`, `-TbbRuntime`, `-EmbreeRuntime`, `-MdlSdkRoot`,
+`-VcpkgBin`, `-PythonRoot`, `-DxcDir`, `-VulkanLoader`, `-UsdviewScript`).
+`-SkipPip` and `-SkipZip` shorten local iterations.
+
+The package contains `cmake --install` output (`PrismRT.exe`, the Hydra
+delegate, the usdview extension, the sample scenes), the runtime DLLs of
+OpenUSD, oneTBB, Embree, the MDL SDK (`mdl\bin`), vcpkg, the MSVC runtime and
+the Vulkan loader, the MaterialX libraries, DXC (compiles the GPU kernel at run
+time), and a private Python 3.11 with PySide6 (Essentials, 6.7.2), PyOpenGL and
+numpy installed with pip into `python\Lib\site-packages`. `.pdb`, `.lib` and
+headers are left out. The extracted size is about 730 MiB (zip about 280 MiB):
+the MDL SDK DLLs (about 230 MiB), Python with PySide6 (about 270 MiB) and the
+OpenUSD DLLs (about 160 MiB) dominate.
+
+The launchers (`usdview.bat`, `prism_render.bat`, `list_devices.bat`; shared
+setup in `env_setup.bat`, templates in `tools/package/`) use only paths relative
+to themselves. They first clear inherited `PRISM_*`, `PXR_*`, `PYTHON*`, `QT_*`
+and `MDL_SDK_ROOT`, replace `PATH` with the package directories plus
+`System32`, and then set what usdview needs. Shader and material caches live in
+`%LOCALAPPDATA%\PrismRT\cache` (set `PRISMRT_CACHE_DIR` to move them). The device
+is automatic; `PRISMRT_DEVICE=cpu` forces the CPU. `usdview.bat` without a scene
+opens the Cornell box through its camera; with only options it adds the same
+scene; otherwise it passes its arguments to usdview. `README.txt` in the package
+lists requirements and third-party notices.
+
+To check a package, extract it to a path with a space and run the launchers with
+a minimal `PATH`:
+`list_devices.bat` (must list `vulkan` and `cpu`), `prism_render.bat` (writes
+`cornell_box.png`) and `usdview.bat --quitAfterStartup` (logs "rendering on
+vulkan device").
+
+### CI
+
+`.github/workflows/windows.yml` runs on pushes to `device-abstraction` and
+`main`, pull requests and manual dispatch, on `windows-2022`. All dependencies
+live on `D:`.
+
+- `usd` job: builds OpenSubdiv 3.6.1, MaterialX 1.39.4 and OpenUSD 26.05 with
+  `tools/ci/build_usd_stack.ps1`, mirroring the development machine (separate
+  prefixes, `RelWithDebInfo`, oneTBB through `PXR_FIND_TBB_IN_CONFIG`, Python 3.11,
+  imaging and usdview). The install, minus `.pdb` files, is cached under a key
+  made of the versions and the hash of the two CI scripts. On a hit the job only
+  does the cache lookup. It does not use `build_usd.py`, which would fetch its
+  own TBB.
+- `build` job: restores that cache, downloads oneTBB 2022.2.0, Embree 4.4.0 and
+  the MDL SDK 2026.0.2 (`tools/ci/fetch_prebuilt.ps1`), installs the Vulkan SDK
+  1.4.321.0 and the LunarG Vulkan runtime (the SDK has no `vulkan-1.dll`),
+  installs OpenImageIO from the `vcpkg.json` manifest with a vcpkg binary cache,
+  configures `prism-hydra` with `PRISM_ENABLE_VULKAN=ON` (using
+  `cmake/PrismLocalDependencies.cmake` created from the `.example`), builds
+  `RelWithDebInfo`, runs CTest serially with `PRISM_DISABLE_VULKAN=1` (hosted
+  runners have no GPU), runs the package script, smoke-tests the extracted
+  package from a clean environment on the CPU device, and uploads the zip as an
+  artifact kept for 14 days. On tags `v*` the zip is also attached to a GitHub
+  release.
+- The first run builds everything (several hours, mostly OpenUSD); later runs
+  reuse the caches and take roughly the PrismRT build time plus packaging.
+  Change the versions in `windows.yml` and the scripts together; the cache key
+  follows the script hashes.

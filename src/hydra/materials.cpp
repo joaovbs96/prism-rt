@@ -7,6 +7,7 @@
 #include "../materialx/prepared_template.h"
 #include "../mdl_material.h"
 #include "../resource_limits.h"
+#include "../load_profile.h"
 #include "../progress.h"
 
 #include <pxr/base/tf/stringUtils.h>
@@ -22,6 +23,7 @@
 #include <pxr/imaging/hd/materialSchema.h>
 #include <pxr/imaging/hd/materialNetworkInterface.h>
 #include <pxr/imaging/hd/materialNetworkSchema.h>
+#include <pxr/imaging/hd/materialConnectionSchema.h>
 #include <pxr/imaging/hd/materialNodeSchema.h>
 #include <pxr/imaging/hd/materialNodeParameterSchema.h>
 #include <pxr/imaging/hdMtlx/hdMtlx.h>
@@ -46,6 +48,9 @@
 #include <iterator>
 #include <map>
 #include <mutex>
+#include <shared_mutex>
+#include <numeric>
+#include <functional>
 #include <sstream>
 #include <string_view>
 #include <thread>
@@ -326,7 +331,8 @@ TfToken SurfaceTerminalName(HdMaterialNetworkInterface& net)
 // hdMtlx converts one terminal; a displacement terminal is converted on its
 // own and merged into the surface document, its shader bound to the
 // material's displacementshader input.
-void AddDisplacementShader(HdMaterialNetworkInterface& net, const mx::DocumentPtr& doc)
+void AddDisplacementShader(HdMaterialNetworkInterface& net, const mx::DocumentPtr& doc,
+                           const mx::DocumentPtr& library)
 {
     TfToken terminal;
     for (const TfToken& name : net.GetTerminalNames())
@@ -337,7 +343,7 @@ void AddDisplacementShader(HdMaterialNetworkInterface& net, const mx::DocumentPt
     HdMtlxTexturePrimvarData data;
     mx::DocumentPtr displacement = HdMtlxCreateMtlxDocumentFromHdMaterialNetworkInterface(
         &net, connection.second.upstreamNodeName,
-        net.GetNodeInputConnectionNames(connection.second.upstreamNodeName), HdMtlxStdLibraries(), &data);
+        net.GetNodeInputConnectionNames(connection.second.upstreamNodeName), library, &data);
     if (!displacement) return;
     auto sourceMaterials = displacement->getMaterialNodes();
     auto materials = doc->getMaterialNodes();
@@ -471,6 +477,33 @@ std::string ReadableImageSubstitute(const std::string& path)
             if (std::filesystem::is_regular_file(candidate, error)) return candidate.string();
         }
     return {};
+}
+
+// Material conversions run on several workers. They read hdMtlx's shared
+// standard library (HdMtlxStdLibraries), which hdMtlx extends itself when a
+// network uses a node definition the library lacks (an Sdr-registered
+// asset implementation, or a v1.38 swizzle). Readers share this lock; a
+// network that may extend the library converts alone.
+std::shared_mutex& HdMtlxLibraryMutex()
+{
+    static std::shared_mutex mutex;
+    return mutex;
+}
+
+// Call with HdMtlxLibraryMutex held at least shared.
+bool MayExtendHdMtlxLibrary(HdMaterialNetworkInterface& net, std::string* why = nullptr)
+{
+    const mx::DocumentPtr& library = HdMtlxStdLibraries();
+    for (const TfToken& node : net.GetNodeNames()) {
+        const std::string type = net.GetNodeType(node).GetString();
+        // hdMtlx looks definitions up under their current names.
+        if (type.starts_with("ND_swizzle_") ||
+            !library->getNodeDef(HdMtlxGetNodeDefName(type))) {
+            if (why) *why = type;
+            return true;
+        }
+    }
+    return false;
 }
 
 std::string ResolveTextureAssets(HdMaterialNetworkInterface& net,
@@ -703,11 +736,19 @@ public:
           m_arena(static_cast<int>(std::min<size_t>(
               prism::TexturePreparationThreadCount(), m_work.size())), 0)
     {
+        if (prism::load_profile::Enabled()) {
+            m_profile = std::make_unique<prism::load_profile::Scope>("texture.prefetch");
+            m_profile->detail("items=" + std::to_string(m_work.size()));
+        }
+        m_running = m_arena.max_concurrency();
         prism::progress::Begin(prism::Phase::Textures);
         prism::progress::SetTotal(prism::Phase::Textures, m_work.size());
         m_arena.execute([this] {
             for (int i = 0; i < m_arena.max_concurrency(); ++i)
-                m_group.run([this] { Run(); });
+                m_group.run([this] {
+                    Run();
+                    if (m_running.fetch_sub(1) == 1) m_profile.reset();
+                });
         });
     }
     // Preparation jobs must finish before Prefetch returns; the MDL SDK and
@@ -769,6 +810,8 @@ private:
     std::atomic<uint64_t>* m_bytesRead;
     std::vector<Result> m_results;
     std::atomic<size_t> m_next{0};
+    std::atomic<int> m_running{0};
+    std::unique_ptr<prism::load_profile::Scope> m_profile;
     tbb::task_arena m_arena;
     tbb::task_group m_group;
 };
@@ -854,6 +897,7 @@ PrewarmResult RunPrewarm(mdl::Context* context, const std::string& libraries,
                          const std::string& mdlPath, const std::filesystem::path& cacheDir)
 {
     const auto start = std::chrono::steady_clock::now();
+    prism::load_profile::Scope profile("materials.prewarm");
     PrewarmResult result;
     try {
         // Loaded by the first hdMtlx conversion.
@@ -1175,6 +1219,15 @@ public:
         if (previewSurface && !RewritePreviewSurfaceNetwork(netInterface))
             return result;
         uint64_t resolvedTextureBytes = 0;
+        prism::load_profile::Scope conversionProfile("material.convert");
+        auto profileClock = std::chrono::steady_clock::now();
+        auto profileLap = [&profileClock] {
+            const auto now = std::chrono::steady_clock::now();
+            const double ms = std::chrono::duration<double, std::milli>(now - profileClock).count();
+            profileClock = now;
+            return std::to_string(int(ms));
+        };
+        std::string profileDetail = materialPath.GetString();
         const auto resourceStart = std::chrono::steady_clock::now();
         const std::string resourceFingerprint =
             ResolveTextureAssets(netInterface, cacheDir, result.resolverContext,
@@ -1182,10 +1235,21 @@ public:
                 &resolvedTextureBytes);
         resourceNanoseconds += std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - resourceStart).count();
+        profileDetail += " resources_ms=" + profileLap();
         textureBytes += resolvedTextureBytes;
         HdMtlxTexturePrimvarData mtlxData;
         ++conversionCalls;
-        mx::DocumentPtr doc = prism::materialx::SimpleOpenPbrDocument(netInterface, terminal.second.upstreamNodeName, HdMtlxStdLibraries());
+        // Conversions run concurrently; see HdMtlxLibraryMutex.
+        std::shared_lock sharedLibrary(HdMtlxLibraryMutex());
+        std::unique_lock exclusiveLibrary(HdMtlxLibraryMutex(), std::defer_lock);
+        std::string extendingType;
+        if (MayExtendHdMtlxLibrary(netInterface, &extendingType)) {
+            sharedLibrary.unlock();
+            exclusiveLibrary.lock();
+            profileDetail += " exclusive=" + extendingType;
+        }
+        const mx::DocumentPtr& library = HdMtlxStdLibraries();
+        mx::DocumentPtr doc = prism::materialx::SimpleOpenPbrDocument(netInterface, terminal.second.upstreamNodeName, library);
         const bool simpleDocument = bool(doc);
         if (!doc) {
             prism::materialx::CapturedMaterialRegistry::Shared().recordStockConversion();
@@ -1193,7 +1257,7 @@ public:
                 &netInterface,
                 terminal.second.upstreamNodeName,
                 netInterface.GetNodeInputConnectionNames(terminal.second.upstreamNodeName),
-                HdMtlxStdLibraries(), &mtlxData);
+                library, &mtlxData);
         }
         if (!doc) {
             TF_WARN("[Hydra Material] MaterialX conversion failed at %s",
@@ -1201,7 +1265,8 @@ public:
             return result;
         }
         if (previewSurface) FixPreviewSurfaceNormalOutput(doc);
-        else AddDisplacementShader(netInterface, doc);
+        else AddDisplacementShader(netInterface, doc, library);
+        profileDetail += (simpleDocument ? " simple_ms=" : " hdmtlx_ms=") + profileLap();
 
         // hdMtlx derives the terminal material name from the USD prim path.
         // That makes otherwise identical M0/M1 graphs generate different MDL
@@ -1214,8 +1279,14 @@ public:
         // Import MaterialX USD definitions from the same installation used by
         // the native generator. hdMtlx's definitions are also imported for
         // Hydra's texture/primvar node aliases.
-        if (!simpleDocument) doc->importLibrary(HdMtlxStdLibraries());
+        if (!simpleDocument) doc->importLibrary(library);
+        sharedLibrary = {};
+        exclusiveLibrary = {};
+        profileDetail += " import_ms=" + profileLap();
         result.xml = prism::materialx::SerializeDocument(doc, libraries);
+        profileDetail += " serialize_ms=" + profileLap() +
+            " xml_kb=" + std::to_string(result.xml.size() / 1024);
+        conversionProfile.detail(profileDetail);
         conversionNanoseconds += std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - conversionStart).count();
         // Native target-code handles are owned by one MDL runtime. Keep the
@@ -1403,6 +1474,7 @@ public:
             return specification;
         };
         std::shared_ptr<MDLMaterial> candidate;
+        prism::load_profile::Scope compileProfile("material.compile");
         try {
             candidate = std::make_shared<MDLMaterial>(
                 prepared.mtlxPath.string(), *context, libraries, mdlPath,
@@ -1442,6 +1514,17 @@ public:
         const auto& target = candidate->get_target_code();
         if (!target.cacheHit) ++nativeJits;
         else ++programCacheHits;
+        if (prism::load_profile::Enabled()) {
+            auto ms = [](double seconds) { return std::to_string(int(seconds * 1000.0)); };
+            compileProfile.detail(prepared.path.GetString() +
+                " load_ms=" + ms(timings.loadSeconds) +
+                " generate_ms=" + ms(timings.generationSeconds - timings.loadSeconds) +
+                " class_ms=" + ms(timings.classCompilationSeconds) +
+                " jit_ms=" + ms(timings.nativeJitSeconds) +
+                " program_wait_ms=" + ms(target.programWaitSeconds) +
+                (target.cacheHit ? " program=reused" : " program=jit") +
+                (timings.templateCacheHit ? " generation=cached" : ""));
+        }
         sdkTranslationCalls += target.translationCalls;
         fallbackTranslations += target.fallbackTranslations;
         programWaitNanoseconds += static_cast<int64_t>(target.programWaitSeconds * 1.0e9);
@@ -1658,6 +1741,19 @@ void MaterialService::Prewarm()
     impl.prewarm = entry;
 }
 
+bool MaterialService::MayDisplace(const HdContainerDataSourceHandle& materialPrimDataSource)
+{
+    HdMaterialSchema material = HdMaterialSchema::GetFromParent(materialPrimDataSource);
+    if (!material) return false;
+    for (const TfToken& context : material.GetRenderContexts()) {
+        HdMaterialNetworkSchema network = material.GetMaterialNetwork(context);
+        if (!network) continue;
+        HdMaterialConnectionSchema terminal = network.GetTerminals().Get(TfToken("displacement"));
+        if (terminal) return true;
+    }
+    return false;
+}
+
 void MaterialService::WaitForPrewarm()
 {
     const auto running = m_impl->FindPrewarm();
@@ -1687,6 +1783,8 @@ void MaterialService::Prefetch(const std::vector<Request>& requests,
         if (!request.path.IsEmpty() && seen.insert(request.path).second)
             unique.push_back(request);
     if (unique.empty()) return;
+    prism::load_profile::Scope profile("materials.prefetch");
+    profile.detail("requests=" + std::to_string(unique.size()));
     m_impl->jobs += unique.size();
     prism::progress::Scope progressScope(prism::Phase::Materials);
     prism::progress::AddTotal(prism::Phase::Materials, unique.size());
@@ -1696,10 +1794,13 @@ void MaterialService::Prefetch(const std::vector<Request>& requests,
     // be published.
     std::vector<Impl::Prepared> captured;
     captured.reserve(unique.size());
-    for (const Request& request : unique) {
-        if (cancelled && cancelled()) return;
-        captured.push_back(m_impl->Prepare(
-            request.dataSource, request.path, true, true));
+    {
+        prism::load_profile::Scope captureProfile("materials.capture");
+        for (const Request& request : unique) {
+            if (cancelled && cancelled()) return;
+            captured.push_back(m_impl->Prepare(
+                request.dataSource, request.path, true, true));
+        }
     }
     // Every texture of the batch is known now, long before the compile of
     // the material that needs it. Declared after captured so that an early
@@ -1746,16 +1847,33 @@ void MaterialService::Prefetch(const std::vector<Request>& requests,
         value.keptValues.clear();
         return value;
     };
-    // Compiles on a bounded worker pool. Only immutable Prepared inputs reach
-    // the workers; Hydra data sources stay on the calling thread.
+    // Compiles on a bounded worker pool. An item with a preparer is converted
+    // by its worker first, so conversions run in parallel and overlap other
+    // items' compilation. Converting reads the retained scene captured for
+    // this build, never the live scene, under the resolver context bound on
+    // this calling thread.
+    using Preparers = std::vector<std::function<Impl::Prepared()>>;
+    const ArResolverContext resolverContext = ArGetResolver().GetCurrentContext();
     auto compileInPool = [&](std::vector<Impl::Prepared>& items,
                              std::vector<std::shared_ptr<Material>>* results,
                              std::vector<uint8_t>* needsFallback,
-                             std::vector<std::vector<TemplateValueKey>>* grownKeepSets) {
+                             std::vector<std::vector<TemplateValueKey>>* grownKeepSets,
+                             const Preparers* preparers = nullptr) {
         // The main pass is counted up front; seeds and fallbacks add to it.
         if (!grownKeepSets) prism::progress::AddTotal(prism::Phase::Materials, items.size());
         const unsigned workers = std::min<unsigned>(
             prism::MaterialWorkerCount(), static_cast<unsigned>(items.size()));
+        prism::load_profile::Scope poolProfile("materials.compile_pool");
+        poolProfile.detail("items=" + std::to_string(items.size()) +
+                           " workers=" + std::to_string(workers));
+        // Largest graphs first: one large conversion started last would end
+        // the pool alone.
+        std::vector<size_t> order(items.size());
+        std::iota(order.begin(), order.end(), size_t(0));
+        if (preparers)
+            std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+                return items[a].network.nodes.size() > items[b].network.nodes.size();
+            });
         std::atomic<size_t> next{0};
         std::vector<std::thread> pool;
         pool.reserve(workers);
@@ -1764,14 +1882,19 @@ void MaterialService::Prefetch(const std::vector<Request>& requests,
                 const double cpuStart = CurrentThreadCpuSeconds();
                 for (;;) {
                     if (cancelled && cancelled()) break;
-                    const size_t index = next.fetch_add(1);
-                    if (index >= items.size()) break;
+                    const size_t position = next.fetch_add(1);
+                    if (position >= items.size()) break;
+                    const size_t index = order[position];
                     bool fallback = false;
                     std::shared_ptr<Material> material;
                     // An exception leaving a std::thread terminates the
                     // process; a failed material (for example out of memory)
                     // renders with the fallback material instead.
                     try {
+                        if (preparers && (*preparers)[index]) {
+                            ArResolverContextBinder binder(resolverContext);
+                            items[index] = (*preparers)[index]();
+                        }
                         material = m_impl->Compile(
                             items[index], needsFallback ? &fallback : nullptr,
                             grownKeepSets ? &(*grownKeepSets)[index] : nullptr);
@@ -1797,22 +1920,36 @@ void MaterialService::Prefetch(const std::vector<Request>& requests,
     std::vector<Impl::Prepared> prepared;
     prepared.reserve(unique.size());
     std::vector<Impl::Prepared> seeds;
+    Preparers seedPreparers;
     std::vector<size_t> seedGroupIndices;
     std::vector<std::shared_ptr<Material>> groupSeedMaterials(groups.size());
+    // A placeholder for an item its worker prepares; failures keep the path.
+    auto pending = [](const Request& request, const NetworkSnapshot& network) {
+        Impl::Prepared value;
+        value.source = request.dataSource;
+        value.path = request.path;
+        // Only orders the pool (see compileInPool); preparation replaces it.
+        value.network = network;
+        return value;
+    };
     for (size_t groupIndex = 0; groupIndex < groups.size(); ++groupIndex) {
         const Group& group = groups[groupIndex];
         if (group.indices.size() < 2) continue;
         if (cancelled && cancelled()) return;
         const size_t seedIndex = group.indices.front();
-        seeds.push_back(m_impl->Prepare(unique[seedIndex].dataSource,
-                                       unique[seedIndex].path));
         // The seed keeps as arguments exactly the template values on which
         // group members disagree; its variants bind only those.
         std::vector<const NetworkSnapshot*> members;
         for (const size_t index : group.indices) members.push_back(&captured[index].network);
-        seeds.back().foldParameters = fold;
-        seeds.back().shareFoldedProgram = true;
-        seeds.back().keptValues = VaryingTemplateValues(members);
+        seeds.push_back(pending(unique[seedIndex], captured[seedIndex].network));
+        seedPreparers.push_back([this, &unique, seedIndex, fold,
+                                 keptValues = VaryingTemplateValues(members)] {
+            auto seed = m_impl->Prepare(unique[seedIndex].dataSource, unique[seedIndex].path);
+            seed.foldParameters = fold;
+            seed.shareFoldedProgram = true;
+            seed.keptValues = keptValues;
+            return seed;
+        });
         seedGroupIndices.push_back(groupIndex);
         grouped[seedIndex] = true;
         for (size_t j = 1; j < group.indices.size(); ++j)
@@ -1820,7 +1957,7 @@ void MaterialService::Prefetch(const std::vector<Request>& requests,
     }
     std::vector<std::shared_ptr<Material>> seedMaterials(seeds.size());
     if (!seeds.empty()) {
-        compileInPool(seeds, &seedMaterials, nullptr, nullptr);
+        compileInPool(seeds, &seedMaterials, nullptr, nullptr, &seedPreparers);
         for (size_t i = 0; i < seeds.size(); ++i) {
             if (cancelled && cancelled()) return;
             if (seedMaterials[i] || !seeds[i].templatePrototype) continue;
@@ -1873,15 +2010,22 @@ void MaterialService::Prefetch(const std::vector<Request>& requests,
             }
         }
     }
+    Preparers preparers(prepared.size());
     for (size_t i = 0; i < unique.size(); ++i) {
         if (grouped[i]) continue;
-        if (captured[i].cached) prepared.push_back(std::move(captured[i]));
-        else prepared.push_back(foldAlone(
-            m_impl->Prepare(unique[i].dataSource, unique[i].path)));
+        if (captured[i].cached) {
+            prepared.push_back(std::move(captured[i]));
+            preparers.emplace_back();
+        } else {
+            prepared.push_back(pending(unique[i], captured[i].network));
+            preparers.push_back([this, &unique, &foldAlone, i] {
+                return foldAlone(m_impl->Prepare(unique[i].dataSource, unique[i].path));
+            });
+        }
     }
     std::vector<uint8_t> needsFallback(prepared.size(), 0);
     std::vector<std::vector<TemplateValueKey>> grownKeepSets(prepared.size());
-    compileInPool(prepared, nullptr, &needsFallback, &grownKeepSets);
+    compileInPool(prepared, nullptr, &needsFallback, &grownKeepSets, &preparers);
     // Rejected template bindings (mapping/resource incompatibilities, or a
     // value the template folded) return to the Prefetch caller, which owns the
     // captured data-source lifetime and re-prepares them. Workers never
