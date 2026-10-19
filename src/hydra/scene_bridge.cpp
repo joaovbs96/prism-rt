@@ -5075,6 +5075,8 @@ public:
             settings.gpuPreparationPreviewMaxMiB = std::max(0, std::atoi(value));
         if (const char *value = std::getenv("PRISM_GPU_PREPARATION_PREVIEW_DELAY_MS"); value && *value)
             gpuPreviewDelayMs = std::max(0, std::atoi(value));
+        if (const char *value = std::getenv("PRISM_GPU_PREPARATION_PREVIEW_THREADS"); value && *value)
+            gpuPreviewThreads = std::max(0, std::atoi(value));
         if (const char *value = std::getenv("PRISM_PROFILE_BUFFERS"))
             profileBufferWrites = value[0] != '\0' && std::strcmp(value, "0") != 0;
         try {
@@ -5440,6 +5442,7 @@ public:
     // atomics, which statistics read).
     std::shared_ptr<prism::device::RenderDevice> previewDevice;
     int gpuPreviewDelayMs = 1000;
+    int gpuPreviewThreads = 0; // 0: a fraction of the cores
     std::atomic<bool> gpuPreviewActive{false};
     std::atomic<uint64_t> gpuPreviewSamples{0};
     std::atomic<uint64_t> gpuPreviewHandovers{0};
@@ -7201,10 +7204,13 @@ void SceneBridge::Render()
         // Reserve execution capacity for the host and coordinator.
         passRequest.concurrency = std::max(1, tbb::this_task_arena::max_concurrency() - 2);
         // The CPU preview shares the machine with the GPU preparation (DXC and
-        // driver compiles): leave it half the cores.
+        // driver compiles). Measured on 28 threads, 7 or more preview threads
+        // slowed a 35 s preparation by 20-60%, 4 or fewer did not: keep an
+        // eighth of the threads.
         if (previewingGpu)
             passRequest.concurrency = std::max(1, std::min(passRequest.concurrency,
-                tbb::this_task_arena::max_concurrency() / 2));
+                _impl->gpuPreviewThreads > 0 ? _impl->gpuPreviewThreads
+                    : std::max(2, tbb::this_task_arena::max_concurrency() / 8)));
         passRequest.colorPixels = &_impl->colorTracedPixels;
         passRequest.geometricOnlyPixels = &_impl->geometricOnlyPixels;
         passRequest.rayNanoseconds = &rayNanoseconds;
