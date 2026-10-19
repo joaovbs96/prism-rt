@@ -86,6 +86,104 @@ on the CPU device until the scene changes.
 The Vulkan device caches its SPIR-V the same way (`.../PrismRT/vulkan`). Uploaded textures
 are reused across Hydra scene rebuilds.
 
+## Large material sets: callable shaders (Vulkan)
+
+One inlined kernel stops compiling at about 1 MB of HLSL: DXC's SPIR-V
+legalization of the single function needs more than 8 GB, and the NVIDIA
+driver's compile of unlegalized SPIR-V more than 12 GB and 400 s. Above that
+size the Vulkan device does not inline the materials; it builds a ray tracing
+pipeline (`VK_KHR_ray_tracing_pipeline`, `src/device/vulkan/vulkan_material_calls.*`):
+
+- **Raygen shader.** `kernel.hlsl` compiled with `PRISM_CALL_MATERIALS`:
+  the same integrator and step functions, legacy materials, lights and
+  environment, but no MDL code. `GpuBackend::shade` packs a `MaterialCall`
+  (`shaders/gpu/material_call.hlsl`) and calls the hit's MDL program with
+  `CallShader(program, call)`; `cutoutOpacity` of a varying cutout does the
+  same in its own mode.
+- **One callable per MDL program.** `shaders/gpu/vulkan/material_callable.hlsl`
+  with the scene's link unit and a dispatch that reaches only that program
+  (`MdlShaderCode::programDispatch`); DXC emits only reachable functions, so
+  each callable holds one program. It runs the megakernel's own code: the
+  program's init on the prepared shading point, then `GpuBackend::shade`
+  (BSDF sample, BSDF towards the light sample, medium). With the integrator's
+  step functions that is one call per surface bounce.
+- **Intersection stays in inline ray queries** inside the raygen shader, not
+  `TraceRay`: the hit shading is the material, which is already a callable;
+  the query loop (including the analytic sphere test) is the megakernel's,
+  so both paths trace identical rays; and no hit groups, intersection
+  shaders or payload for hits are needed. Shader execution reordering works
+  without hit objects (a hint is enough).
+- **Shader execution reordering** (opt-in, `PRISM_VULKAN_REORDER=1`). With
+  `VK_NV_ray_tracing_invocation_reorder`, the raygen shader reorders threads
+  by program (`OpReorderThreadWithHintNV`, hint bits for the program count)
+  just before the call.
+- **Compilation.** Each callable and the raygen shader is its own DXC run
+  (`lib_6_6`), several at a time (`PRISM_DXC_JOBS`, default 4, each capped
+  by `PRISM_DXC_MEMORY_MIB`), cached by source in the SPIR-V cache. The driver
+  compiles the pipeline as a deferred operation joined by worker threads,
+  and its result is kept in a `VkPipelineCache` file next to the SPIR-V
+  (`<digest>-<pipeline cache UUID, device, driver>.vkpc`).
+- **Payload.** 47 words in (the shading point fields the MDL state and BSDF
+  read, the BSDF sample point, the light direction, the RNG state) and 21
+  out: 272 bytes through the callable's stack per call.
+- **Fallback.** If the pipeline cannot be built, the scene renders on the
+  CPU device as before.
+
+When it is used (`PRISM_VULKAN_CALLABLES`): unset, the assembled compute
+kernel above `PRISM_VULKAN_CALLABLE_THRESHOLD_KIB` (default 1024), a kernel
+DXC already failed to compile within its memory limit (the remembered
+`.too-large` marker), or one that fails that way now; `1` always (for
+comparisons); `0` never. Devices without ray tracing pipelines keep the CPU
+fallback. Small kernels keep the compute megakernel unchanged.
+
+Measured on an RTX 4070 Ti (driver 610.88, DXC 1.8), 960x540, 64 spp,
+Hydra (`prism_hydra_render`). Chess and the eggs are forced through callables
+(`PRISM_VULKAN_CALLABLES=1`) for comparison with the megakernel. Cold: every
+shader compiled anew (`PRISM_VULKAN_SHADER_SALT`); warm: SPIR-V and pipeline
+caches present. GPU times are the median pass time per run, averaged over 4
+alternating runs (another process used the GPU meanwhile; runs it slowed by
+over 1.5x are left out). Parity is against the CPU device with the same seed;
+the noise floor is the CPU with seed 1 against seed 0.
+
+| Scene (programs) | Cold setup: total (DXC wall, slowest, largest DXC; driver) | Warm setup | Callables ms/sample | Megakernel ms/sample (cold compile) | CPU ms/sample (approx.) | Mean ratio, NRMSE vs CPU (noise floor) | Callables vs megakernel |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| OpenPBR playground (35) | 26.4 s (15.2 s, 5.2 s, 440 MiB; 10.2 s, +820 MiB) | 1.0 s | 85.8 | does not compile | 660 | 0.9989, 0.075 (0.228) | — |
+| Stirling (24) | 13.6 s (6.5 s, 2.7 s, 245 MiB; 6.9 s) | 0.4 s | 13.2 | does not compile | 56 | 0.9986, 0.034 (0.126) | — |
+| MaterialEggs countertop (34) | 24.4 s (14.4 s, 4.5 s, 350 MiB; 9.1 s) | 1.1 s | 107.7 | does not compile | 560 | 1.0000, 0.027 (0.159) | — |
+| OpenChessSet (5) | 8.7 s (2.2 s, 1.5 s, 136 MiB; 6.5 s) | 0.1 s | 23.4 | 45.5 (41 s) | 180 | 0.9982, 0.056 (0.157) | 1.00000, 0.0022 |
+| Jade egg (7) | 8.4 s (1.9 s, 0.9 s, 79 MiB; 6.4 s) | 0.1 s | 22.3 | 26.7 (34 s) | 185 | 0.9998, 0.0015 (0.072) | 1.00000, 0.0007 |
+| Brown egg (6) | 8.1 s (1.7 s, 1.1 s, 93 MiB; 6.4 s) | 0.1 s | 18.0 | 19.7 (26 s) | 180 | 0.9997, 0.0036 (0.066) | 1.00000, 0.0011 |
+| Gold egg (6) | 7.7 s (1.3 s, 0.6 s, 55 MiB; 6.4 s) | 0.1 s | 18.0 | 18.1 (24 s) | 155 | 0.9998, 0.0024 (0.070) | 1.00000, 0.0006 |
+
+- **Parity.** Callables reproduce the megakernel image (mean ratio
+  1.00000, NRMSE 0.0006–0.002, float-level differences in the inlined
+  code); against the CPU they stand exactly where the megakernel does. The
+  0.1–0.2% darker mean on textured scenes (chess, Stirling, OpenPBR) is the
+  GPU's mipmapped texture filtering, also seen with the megakernel. OpenPBR
+  ran with the default texture budget (38 of 152 images at reduced
+  resolution); its 8.7 GB of full-resolution textures do not fit next to the
+  desktop on a 12 GB card and paging made it 2.7x slower. The fixtures
+  (lights, emissive, linking, SSS furnace, parity, CornellBox, cutouts) match
+  the megakernel the same way and are clean under `VK_LAYER_KHRONOS_validation`.
+- **Speed.** The callable path is not slower than the megakernel on any
+  scene that has both, and up to 2x faster (chess): the compute megakernel
+  uses 168–255 registers per thread and spills 1.5–3.4 KB (driver
+  statistics), while the raygen shader keeps only the integrator's state and
+  each material runs with its own register allocation.
+- **Compile cost.** DXC per callable takes 0.2–5 s and at most 440 MiB
+  (the megakernel needed more than 8 GB); the driver compiles the pipeline on
+  worker threads (Stirling: 16.5 s on one thread, 7 s on 25) and about 6 s of
+  it is the raygen shader alone. Warm starts take 0.1–1.1 s.
+- **Shader execution reordering** (hint by program, `PRISM_VULKAN_REORDER=1`)
+  is off by default: 2–8% slower on OpenPBR, chess and the eggs, neutral on
+  Stirling, 16% faster on the countertop. Reordering by program alone does
+  not pay for itself; the countertop gains because its many programs
+  interleave within warps.
+- **Not measured:** occupancy and spills of the raygen and callables. The
+  NVIDIA driver lists no executables for ray tracing pipelines
+  (`VK_KHR_pipeline_executable_properties`), and Nsight Compute was not
+  available.
+
 ## Mac GPU vs CPU
 
 Apple M5 (10 CPU threads, 8 GPU cores), macOS 26. Times are the renderer's
@@ -200,7 +298,17 @@ they change the image, not just its noise.
 - `PRISM_DXC_MEMORY_MIB=<n>` (Windows): memory DXC may use, by default a
   quarter of physical memory and at most 8 GiB. SPIR-V legalization of
   kernels with very many materials (OpenPBR playground, MaterialEggs
-  countertop, Stirling) exceeds it; the Vulkan device then renders on the CPU.
+  countertop, Stirling) exceeds it; the Vulkan device then uses callable
+  shaders (above), or renders on the CPU without ray tracing pipelines.
+- `PRISM_VULKAN_CALLABLES=0|1`, `PRISM_VULKAN_CALLABLE_THRESHOLD_KIB=<n>`,
+  `PRISM_VULKAN_REORDER=1`, `PRISM_DXC_JOBS=<n>`: the callable path (above).
+- `PRISM_VULKAN_PIPELINE_STATS=1`: the driver's statistics of each compiled
+  shader (registers, spills, stack) through
+  `VK_KHR_pipeline_executable_properties`.
+- `PRISM_VULKAN_PARALLEL_PIPELINE=0` (driver compile on one thread),
+  `PRISM_VULKAN_PIPELINE_CACHE=0` (ignore stored pipeline caches) and
+  `PRISM_VULKAN_SHADER_SALT=<n>` (unique callable-path shaders, so DXC and
+  the driver's own shader cache compile anew): cold-compile measurements.
 - `PRISM_GPU_TEXTURE_BUDGET_MIB=<n>`: GPU memory for textures (default 45%
   of the device's). Images beyond it are uploaded at reduced resolution,
   reported as `PrismRT Vulkan: N of M images uploaded at reduced resolution

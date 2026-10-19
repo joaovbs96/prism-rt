@@ -89,22 +89,37 @@ Scenes: **Eggs** (MaterialEggs), **OpenPBR** (OpenPBRShaderPlayground),
   - The long-term fix is to stop compiling all materials into one function:
     per-material-program pipelines with wavefront (queued) shading, or
     callable shaders.
-  - Planned order:
-    1. Make the path state explicit: one struct for what a path carries
-       between bounces. Split each bounce into shared step functions
-       (intersect, shade, sample lights, continue). The megakernel and the
-       CPU device keep calling them in a loop, so devices still agree sample
-       for sample.
-    2. On Vulkan, call each material program as a callable shader in a ray
-       tracing pipeline, with shader execution reordering by material where
-       available. Use this only above the kernel-size threshold; the inlined
-       megakernel stays for scenes that fit.
-    3. Profile the large scenes (occupancy, registers, SIMT efficiency).
-    4. Move to wavefront only if callables leave occupancy or divergence
-       limits. That would rearrange the step functions into separate kernels,
-       not rewrite the integrator. It is an architectural change that affects
-       how the CPU and GPU devices share code, so it needs a design decision,
-       not just a feature branch.
+  - Planned order and status:
+    1. Done: the path state is explicit (`PathState`) and each bounce is a
+       sequence of shared step functions; the material runs once per vertex
+       (`backend.shade`: BSDF sample, light evaluation, medium). Images are
+       bit-identical to the single loop on the CPU and Vulkan devices.
+    2. Done on Vulkan (see [GPU devices](gpu_devices.md#large-material-sets-callable-shaders-vulkan)):
+       above the kernel-size threshold each MDL program is a callable shader
+       of a ray tracing pipeline, with optional shader execution reordering
+       by program. OpenPBR, Stirling and the countertop now render on the
+       GPU; cold compiles take 14–26 s (DXC per program in parallel, the
+       driver's compile on worker threads), warm starts about 1 s. On chess and the
+       eggs, forced through callables, the callable path is as fast as the
+       megakernel or faster (chess 2x): the megakernel's register pressure
+       and spills cost more than the call overhead.
+    3. Partly done: the driver lists no executables for ray tracing
+       pipelines, so registers and spills are known only for the compute
+       megakernel (255 registers and 1.5–3.4 KB of local memory per thread
+       on the eggs and chess). Nsight Compute would give the raygen and
+       callable occupancy.
+    4. Wavefront is not needed for the scenes measured: callables compile in
+       seconds and run at least as fast as the megakernel, and reordering by
+       program helps only the countertop (16%) and costs 2–8% elsewhere, so
+       material divergence is not the main limit. Reconsider it if profiling the callable path shows low
+       occupancy in the raygen shader (its live state across the call) or
+       for scenes with many more programs. It would rearrange the step
+       functions into separate kernels, not rewrite the integrator, and needs
+       a design decision because it changes how the CPU and GPU devices share
+       code.
+    5. Open: make callables the default for every Vulkan scene (faster on the
+       scenes measured, and the compute kernel's 20–40 s cold compile goes
+       away), and port the same split to Metal with visible function tables.
   - Large scenes like ALab also need texture streaming on the GPU: feedback
     of the needed texture, mip and tile from shading, loaded from the already
     tiled `.tx.exr` files into a resident tile pool. Whole mip levels first,

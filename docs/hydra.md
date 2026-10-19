@@ -207,7 +207,7 @@ While a scene cannot render yet (and while an edit is converted), the renderer r
 | `prismMaterialsDone` / `prismMaterialsTotal` (int) | Materials compiled; the total grows when template seeds or fallback compiles are added |
 | `prismTexturesDone` / `prismTexturesTotal` (int) | Textures prepared ahead of material compilation |
 | `prismUploadDone` / `prismUploadTotal` (int) | Images prepared for the GPU (zero total outside the image stage; the stage is in `prismPhaseDetail`) |
-| `prismDevice` (string) | `vulkan: <GPU name>`, `cpu`, `cpu-reference`, or `cpu (Vulkan fallback: <reason>)` when the GPU device was unavailable at creation or later could not prepare the scene (`kernel too large`, `kernel compile failed`, ...); empty until the device exists |
+| `prismDevice` (string) | `vulkan: <GPU name>`, `cpu`, `cpu-reference`, or `cpu (Vulkan fallback: <reason>)` when the GPU device was unavailable at creation or later could not prepare the scene (`kernel too large` only without ray tracing pipelines: otherwise large material sets compile as callable shaders, see [gpu_devices.md](gpu_devices.md#large-material-sets-callable-shaders-vulkan); `kernel compile failed`, ...); empty until the device exists |
 | `prismError` (string) | Last scene-conversion failure; cleared by the next published snapshot |
 
 Counters stay readable after their phase ends and restart when it begins again. Metal reports the device, loading, material and texture phases but not yet the kernel and upload stages.
