@@ -53,7 +53,7 @@ public:
         bool foldedParameters = false;
     };
     // Chooses the compile specification once generation has published the
-    // material's uniforms. Empty: every class parameter is a runtime argument.
+    // material's uniforms. Empty: every class parameter but strings is a runtime argument.
     using CompileSelector =
         std::function<mdl::CompileSpecification(const GeneratedMDL&)>;
     // Construct a material from an already validated immutable native program
