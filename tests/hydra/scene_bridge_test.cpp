@@ -53,6 +53,7 @@ int RunDependencyUpdateTests();
 int RunStructuralUpdateTests();
 int RunProgressiveIntegrationTests();
 int RunProgressStatusTests();
+int RunGpuPreparationPreviewTests();
 int RunAccumulationIntegrationTests();
 int RunB2DoublePrimvarIntegrationTests();
 int RunB3FallbackOpacityIntegrationTests();
@@ -647,6 +648,14 @@ int main()
     _putenv_s("PRISM_CACHE_DIR", testCache.c_str());
 #else
     setenv("PRISM_CACHE_DIR", testCache.c_str(), 1);
+#endif
+    // Tests that compare device output exactly must not switch between the CPU
+    // preview and the GPU depending on how long the GPU takes to prepare; the
+    // preview test enables it through its settings.
+#ifdef _WIN32
+    _putenv_s("PRISM_GPU_PREPARATION_PREVIEW", "0");
+#else
+    setenv("PRISM_GPU_PREPARATION_PREVIEW", "0", 1);
 #endif
     if (RunAuthoredSettingsTests() != 0) return 1;
     if (RunB2DoublePrimvarIntegrationTests() != 0) return 1;
@@ -2339,6 +2348,7 @@ int main()
     ok &= RunStructuralUpdateTests() == 0;
     ok &= RunProgressiveIntegrationTests() == 0;
     ok &= RunProgressStatusTests() == 0;
+    ok &= RunGpuPreparationPreviewTests() == 0;
     ok &= RunAccumulationIntegrationTests() == 0;
     return ok ? 0 : 1;
 }
