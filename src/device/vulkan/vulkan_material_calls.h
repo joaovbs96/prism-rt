@@ -104,6 +104,10 @@ struct ShaderBuild {
     double driverSeconds = 0.0;     // the library's vkCreateRayTracingPipelinesKHR
     bool driverCacheHit = false;    // its pipeline cache file existed
     double readySeconds = 0.0;      // seconds after the request that it was ready
+    // The library's stack size (vkGetRayTracingShaderGroupStackSizeKHR), the
+    // largest the driver reported for this SPIR-V, also when it was compiled
+    // for an earlier run (kept with its pipeline cache file).
+    uint64_t stackSize = 0;
 };
 
 // The shaders of the callable path compiled on one device, by source, shared
@@ -197,10 +201,14 @@ private:
     VkDeviceMemory m_tableMemory = VK_NULL_HANDLE;
     VkStridedDeviceAddressRegionKHR m_raygen{};
     VkStridedDeviceAddressRegionKHR m_callables{};
+    uint32_t m_stackSize = 0;       // set at each launch of a linked pipeline (dynamic state)
+    bool m_dynamicStack = false;
     CallableBuildReport m_report;
     PFN_vkCreateRayTracingPipelinesKHR m_createPipelines = nullptr;
     PFN_vkGetRayTracingShaderGroupHandlesKHR m_groupHandles = nullptr;
     PFN_vkCmdTraceRaysKHR m_traceRays = nullptr;
+    PFN_vkCmdSetRayTracingPipelineStackSizeKHR m_setStackSize = nullptr;
+    PFN_vkGetRayTracingShaderGroupStackSizeKHR m_groupStackSize = nullptr;
     PFN_vkCreateDeferredOperationKHR m_createDeferred = nullptr;
     PFN_vkDestroyDeferredOperationKHR m_destroyDeferred = nullptr;
     PFN_vkGetDeferredOperationMaxConcurrencyKHR m_deferredConcurrency = nullptr;

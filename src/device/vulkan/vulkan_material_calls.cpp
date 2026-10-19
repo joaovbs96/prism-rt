@@ -260,10 +260,14 @@ void StorePipelineCache(VkDevice device, VkPipelineCache cache, std::filesystem:
     vkDestroyPipelineCache(device, cache, nullptr);
 }
 
-// Libraries hold no ray payloads or hit attributes: the raygen shader traces
-// with ray queries and calls the materials with callable data.
+// The interface every library and the linked pipeline share. No shader uses
+// ray payloads or hit attributes (the raygen shader traces with ray queries
+// and calls the materials with callable data, which the interface does not
+// size); the payload size is set to the callable data's (MaterialCall, 272
+// bytes) anyway, as a conservative bound.
+constexpr uint32_t kMaterialCallBytes = 272;
 const VkRayTracingPipelineInterfaceCreateInfoKHR kLibraryInterface{
-    VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_INTERFACE_CREATE_INFO_KHR, nullptr, 0, 0};
+    VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_INTERFACE_CREATE_INFO_KHR, nullptr, kMaterialCallBytes, 0};
 
 std::string SpirvDigest(std::vector<uint32_t> const& spirv)
 {
@@ -716,6 +720,7 @@ std::shared_ptr<const ShaderBuild> MaterialCallShaders::shader(std::string const
         auto const& built = earlier.get();
         auto reused = std::make_shared<ShaderBuild>();
         reused->library = built->library;
+        reused->stackSize = built->stackSize;
         reused->error = built->error;
         reused->readySeconds = SecondsSince(start);
         if (!built->error.empty()) {
@@ -792,16 +797,30 @@ std::shared_ptr<ShaderBuild> MaterialCallShaders::compile(std::string const& sou
     info.layout = m_layout;
     const auto cacheFile = directory / (SpirvDigest(built->spirv) + "-lib-" + m_cacheTag + ".vkpc");
     size_t loaded = 0;
-    VkPipelineCache cache = LoadPipelineCache(m_device, m_properties, cacheFile, &loaded);
+    uint64_t recordedStack = 0;
+    VkPipelineCache cache = LoadPipelineCache(m_device, m_properties, cacheFile, &loaded, &recordedStack);
     built->driverCacheHit = loaded > 0;
     const auto start = Clock::now();
     const VkResult result = m_createPipelines(m_device, VK_NULL_HANDLE, cache, 1, &info, nullptr, &built->library);
     built->driverSeconds = SecondsSince(start);
     vkDestroyShaderModule(m_device, module, nullptr);
-    StorePipelineCache(m_device, cache, cacheFile, loaded, result == VK_SUCCESS);
+    if (result == VK_SUCCESS) {
+        static auto groupStackSize = reinterpret_cast<PFN_vkGetRayTracingShaderGroupStackSizeKHR>(
+            vkGetDeviceProcAddr(m_device, "vkGetRayTracingShaderGroupStackSizeKHR"));
+        const uint64_t reported = groupStackSize
+            ? groupStackSize(m_device, built->library, 0, VK_SHADER_GROUP_SHADER_GENERAL_KHR) : 0;
+        built->stackSize = std::max(reported, recordedStack);
+        if (gpu::GpuVerbose() && reported < recordedStack)
+            std::cerr << std::format("PrismRT Vulkan: {} library reports a {} B stack, {} B when it was compiled\n",
+                                     raygen ? "raygen" : "callable", reported, recordedStack);
+    }
+    // The stack size is stored with the cache data, also when only it changed.
+    StorePipelineCache(m_device, cache, cacheFile, built->stackSize != recordedStack ? 0 : loaded,
+                       result == VK_SUCCESS, built->stackSize);
     if (gpu::GpuVerbose())
-        std::cerr << std::format("PrismRT Vulkan: library {} {:.2f} s{}\n", raygen ? "raygen" : "callable",
-                                 built->driverSeconds, built->driverCacheHit ? " (pipeline cache)" : "");
+        std::cerr << std::format("PrismRT Vulkan: library {} {:.2f} s{}, stack {} B\n", raygen ? "raygen" : "callable",
+                                 built->driverSeconds, built->driverCacheHit ? " (pipeline cache)" : "",
+                                 built->stackSize);
     if (result != VK_SUCCESS) {
         built->library = VK_NULL_HANDLE;
         built->error = std::format("cannot create a {} pipeline library (VkResult {})",
@@ -819,6 +838,10 @@ MaterialCallPipeline::MaterialCallPipeline(VkDevice device, VkPhysicalDevice phy
     m_groupHandles = reinterpret_cast<PFN_vkGetRayTracingShaderGroupHandlesKHR>(
         vkGetDeviceProcAddr(device, "vkGetRayTracingShaderGroupHandlesKHR"));
     m_traceRays = reinterpret_cast<PFN_vkCmdTraceRaysKHR>(vkGetDeviceProcAddr(device, "vkCmdTraceRaysKHR"));
+    m_setStackSize = reinterpret_cast<PFN_vkCmdSetRayTracingPipelineStackSizeKHR>(
+        vkGetDeviceProcAddr(device, "vkCmdSetRayTracingPipelineStackSizeKHR"));
+    m_groupStackSize = reinterpret_cast<PFN_vkGetRayTracingShaderGroupStackSizeKHR>(
+        vkGetDeviceProcAddr(device, "vkGetRayTracingShaderGroupStackSizeKHR"));
     m_createDeferred = reinterpret_cast<PFN_vkCreateDeferredOperationKHR>(
         vkGetDeviceProcAddr(device, "vkCreateDeferredOperationKHR"));
     m_destroyDeferred = reinterpret_cast<PFN_vkDestroyDeferredOperationKHR>(
@@ -956,10 +979,20 @@ bool MaterialCallPipeline::link(std::vector<std::shared_ptr<const ShaderBuild>> 
     VkPipelineLibraryCreateInfoKHR libraryInfo{VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR};
     libraryInfo.libraryCount = uint32_t(libraries.size());
     libraryInfo.pLibraries = libraries.data();
+    // The stack size is set at each launch from the libraries' sizes (the
+    // default formula of the spec for a raygen shader calling callables, with
+    // no hit shaders: raygen + 2 x the largest callable), the largest each
+    // library ever reported, rather than left to the linked pipeline's default.
+    const bool dynamicStack = m_setStackSize && m_groupStackSize;
+    const VkDynamicState stackState = VK_DYNAMIC_STATE_RAY_TRACING_PIPELINE_STACK_SIZE_KHR;
+    VkPipelineDynamicStateCreateInfo dynamicState{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    dynamicState.dynamicStateCount = 1;
+    dynamicState.pDynamicStates = &stackState;
     VkRayTracingPipelineCreateInfoKHR info{VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CREATE_INFO_KHR};
     info.maxPipelineRayRecursionDepth = 1;
     info.pLibraryInfo = &libraryInfo;
     info.pLibraryInterface = &kLibraryInterface;
+    info.pDynamicState = dynamicStack ? &dynamicState : nullptr;
     info.layout = layout;
     const auto start = Clock::now();
     const VkResult result = m_createPipelines(m_device, VK_NULL_HANDLE, VK_NULL_HANDLE, 1, &info, nullptr,
@@ -969,6 +1002,16 @@ bool MaterialCallPipeline::link(std::vector<std::shared_ptr<const ShaderBuild>> 
         m_pipeline = VK_NULL_HANDLE;
         if (error) *error = std::format("cannot link the ray tracing pipeline (VkResult {})", int(result));
         return false;
+    }
+    if (dynamicStack) {
+        uint64_t raygen = std::max(shaders[0]->stackSize,
+                                   m_groupStackSize(m_device, m_pipeline, 0, VK_SHADER_GROUP_SHADER_GENERAL_KHR));
+        uint64_t callable = 0;
+        for (uint32_t g = 1; g < shaders.size(); ++g)
+            callable = std::max({callable, shaders[g]->stackSize,
+                                 m_groupStackSize(m_device, m_pipeline, g, VK_SHADER_GROUP_SHADER_GENERAL_KHR)});
+        m_stackSize = uint32_t(std::min<uint64_t>(raygen + 2 * callable, UINT32_MAX));
+        m_dynamicStack = true;
     }
     return true;
 }
@@ -1107,6 +1150,7 @@ void MaterialCallPipeline::trace(VkCommandBuffer commands, uint32_t threads) con
 {
     const VkStridedDeviceAddressRegionKHR none{};
     vkCmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_pipeline);
+    if (m_dynamicStack) m_setStackSize(commands, m_stackSize);
     m_traceRays(commands, &m_raygen, &none, &none, &m_callables, threads, 1, 1);
 }
 
