@@ -244,7 +244,7 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (argc < 4) {
-            std::cerr << "usage: prism_hydra_render scene.usda /Camera output.exr [width height spp [--exercise] [--animation-exercise] [--hide-dome-background] [--environment-sampling mis|bsdf] [--sample-clamp N] [--seed N] [--sphere-batching]]\n";
+            std::cerr << "usage: prism_hydra_render scene.usda /Camera output.exr [width height spp [--exercise] [--animation-exercise] [--hide-dome-background] [--environment-sampling mis|bsdf] [--light-selection spatial|power] [--sample-clamp N] [--seed N] [--sphere-batching]]\n";
             return 2;
         }
         const int width = argc > 4 ? std::stoi(argv[4]) : 128;
@@ -261,6 +261,7 @@ int main(int argc, char** argv) {
         int maxDepth = 32;
         int changeDepth = 0;
         float neeProbabilityMin = 0.05f;
+        std::string lightSelection = "spatial";
         int previewSequence = 0;
         int editSequence = 0;
         UsdTimeCode renderTime = UsdTimeCode::Default();
@@ -291,6 +292,7 @@ int main(int argc, char** argv) {
                 editPrim = argv[i];
             }
             else if (option == "--nee-probability-min") neeProbabilityMin = std::stof(argv[i]);
+            else if (option == "--light-selection") lightSelection = argv[i];
             // Render, then change the maximum depth and render again: the saved
             // image must match a render made at the new depth from the start.
             else if (option == "--change-depth") changeDepth = std::stoi(argv[i]);
@@ -323,6 +325,7 @@ int main(int argc, char** argv) {
         engine.SetRendererSetting(TfToken("prism:seed"), VtValue(seed));
         engine.SetRendererSetting(TfToken("prism:adaptiveThreshold"), VtValue(adaptiveThreshold));
         engine.SetRendererSetting(TfToken("prism:neeProbabilityMin"), VtValue(neeProbabilityMin));
+        engine.SetRendererSetting(TfToken("prism:lightSelection"), VtValue(TfToken(lightSelection)));
         engine.SetRendererSetting(TfToken("prism:sphereBatching"), VtValue(sphereBatching));
         engine.SetRendererAovs({HdAovTokens->color, HdAovTokens->depth,
             HdAovTokens->cameraDepth, HdAovTokens->normal, HdAovTokens->Neye,

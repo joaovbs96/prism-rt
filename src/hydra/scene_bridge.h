@@ -40,6 +40,8 @@ struct RenderSettings {
     // Probabilistic NEE (see prism::device::NeeSettings; 0 always samples).
     float neeProbabilityMin = 0.05f;
     int neeFromDepth = 2;
+    // Spatial light selection among analytic lights (prism:lightSelection).
+    bool spatialLights = true;
     bool adaptivePreview = true;
     bool domeLightCameraVisibility = true;
     int previewTargetMs = 33;

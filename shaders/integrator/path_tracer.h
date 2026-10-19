@@ -167,6 +167,17 @@ struct SampleSettings {
     // clamp(path weight, neeProbabilityMin, 1). 0 disables.
     float neeProbabilityMin;
     int neeFromDepth;
+    // Spatial light selection (see PathTracer::pickLight); false: by power only.
+    bool spatialLights;
+};
+
+// Spatial light selection loops over the analytic lights: at most this many.
+static const uint kMaxSpatialLights = 64u;
+
+// Sums over the analytic lights at one shading point.
+struct AnalyticLightSums {
+    float importance;  // of lightImportance, for lights linked to the receiver
+    float probability; // of the lights' table (power) selection probabilities
 };
 
 struct SampleResult {
@@ -259,6 +270,60 @@ struct PathTracer {
         return pick;
     }
 
+    // Spatial light selection, when enabled and the scene has 2 to
+    // kMaxSpatialLights analytic lights: an analytic light picked by the
+    // alias table is picked again among the analytic lights in proportion to
+    // lightImportance at the shading point (lights it cannot reach are never
+    // picked). The analytic lights keep their total probability; emissive
+    // triangles and the dome keep theirs. A mixture with power selection was
+    // measured worse: the importance is zero only where a light cannot reach.
+    bool spatialSelection(bool enabled)
+    {
+        const uint count = backend.analyticLightCount();
+        return enabled && count > 1u && count <= kMaxSpatialLights;
+    }
+
+    float linkedImportance(LightRecord light, float3 p, uint receiver)
+    {
+        if (light.info.w != 0u && (receiver & light.info.w) == 0u) return 0.0f;
+        return lightImportance(light, p);
+    }
+
+    AnalyticLightSums analyticSums(float3 p, uint receiver)
+    {
+        AnalyticLightSums sums = {0.0f, 0.0f};
+        const uint count = backend.analyticLightCount();
+        for (uint i = 0u; i < count; ++i) {
+            const LightRecord light = backend.light(i);
+            sums.importance += linkedImportance(light, p, receiver);
+            sums.probability += light.n.w;
+        }
+        return sums;
+    }
+
+    // Selection probability of an analytic light at p (spatial selection).
+    float analyticPmf(LightRecord light, float3 p, uint receiver, AnalyticLightSums sums)
+    {
+        if (!(sums.importance > 0.0f)) return light.n.w;
+        return sums.probability * linkedImportance(light, p, receiver) / sums.importance;
+    }
+
+    uint pickAnalytic(float3 p, uint receiver, AnalyticLightSums sums, float u)
+    {
+        const uint count = backend.analyticLightCount();
+        float remaining = u * sums.importance;
+        uint chosen = 0u;
+        for (uint i = 0u; i < count; ++i) {
+            const float w = linkedImportance(backend.light(i), p, receiver);
+            if (w > 0.0f) {
+                chosen = i;
+                if (remaining < w) break;
+                remaining -= w;
+            }
+        }
+        return chosen;
+    }
+
     float domeSelectionProbability()
     {
         const uint count = backend.lightCount();
@@ -268,10 +333,12 @@ struct PathTracer {
     // Emission of the analytic lights a ray segment passes through, and of
     // distant lights for escaped rays (tmax infinite), weighted against NEE.
     float3 crossedLights(PathRay ray, float tmax, bool escaped, bool cameraRay, bool weighted,
-                         float bsdfPdf, float neeProbability, uint receiver, float3 from)
+                         float bsdfPdf, float neeProbability, uint receiver, float3 from, bool spatial)
     {
         float3 sum = (float3)0.0f;
         const uint count = backend.analyticLightCount();
+        AnalyticLightSums sums = {0.0f, 0.0f};
+        if (weighted && spatial) sums = analyticSums(from, receiver);
         for (uint i = 0u; i < count; ++i) {
             const LightRecord light = backend.light(i);
             if (cameraRay && (light.info.y & kLightCameraVisible) == 0u) continue;
@@ -289,7 +356,10 @@ struct PathTracer {
             }
             if (!crossing.hit) continue;
             float misWeight = 1.0f;
-            if (weighted) misWeight = powerHeuristic(bsdfPdf, neeProbability * light.n.w * crossing.pdf);
+            if (weighted) {
+                const float pmf = spatial ? analyticPmf(light, from, receiver, sums) : light.n.w;
+                misWeight = powerHeuristic(bsdfPdf, neeProbability * pmf * crossing.pdf);
+            }
             sum += crossing.radiance * misWeight;
         }
         return sum;
@@ -305,6 +375,7 @@ struct PathTracer {
         const bool mis = backend.environmentMis();
         const int maxDepth = backend.maxDepth();
         const int rouletteDepth = backend.rouletteDepth();
+        const bool spatial = spatialSelection(settings.spatialLights);
         TraceResult result = {(float3)0.0f, kPrimaryUnresolved};
         float3 weight = 1.0f;      // product of the scattering weights so far
         float3 throughput = 1.0f;  // roulette state, as in the recursive form
@@ -379,7 +450,7 @@ struct PathTracer {
             if (!inMedium && backend.analyticLightCount() > 0u) {
                 const float3 crossed = crossedLights(ray, hit.surface.valid ? hit.surface.t : ray.ray.tfar,
                                                      !hit.surface.valid, depth == 0, weighted, previousPdf,
-                                                     previousNeeProbability, receiver, previousPosition);
+                                                     previousNeeProbability, receiver, previousPosition, spatial);
                 result.radiance += weight * crossed * contributionWeight(contributions, depth);
             }
             if (!hit.surface.valid) {
@@ -433,7 +504,15 @@ struct PathTracer {
                 pick.index = 0u;
                 pick.pmf = 1.0f;
                 const uint lightCount = backend.lightCount();
-                if (lightCount > 0u) pick = pickLight(sampler.next1());
+                if (lightCount > 0u) {
+                    const float4 u = sampler.next4();
+                    pick = pickLight(u.x);
+                    if (spatial && pick.index < backend.analyticLightCount()) {
+                        const AnalyticLightSums sums = analyticSums(hit.surface.p, hitReceiver);
+                        if (sums.importance > 0.0f) pick.index = pickAnalytic(hit.surface.p, hitReceiver, sums, u.y);
+                        pick.pmf = analyticPmf(backend.light(pick.index), hit.surface.p, hitReceiver, sums);
+                    }
+                }
                 LightSample light = invalidLightSample();
                 uint shadowBit = 0u;
                 if (pick.index >= lightCount) {

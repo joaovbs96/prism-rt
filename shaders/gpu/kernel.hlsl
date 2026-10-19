@@ -65,7 +65,8 @@ void main(uint3 id : SV_DispatchThreadID)
     const SampleSettings settings = {frame.shading.x, frame.shading.y,
                                      (flags & kFrameTransparentEscapes) != 0u,
                                      frame.counts.w != 0u ? frame.counts.w : kContributionAll,
-                                     frame.shading.z, int(frame.shading.w)};
+                                     frame.shading.z, int(frame.shading.w),
+                                     (flags & kFrameSpatialLights) != 0u};
     const uint width = frame.size.x;
     const uint height = frame.size.y;
     const uint mode = frame.work.z;

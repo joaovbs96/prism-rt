@@ -64,6 +64,8 @@ void help() {
         "  --environment-sampling mis|bsdf (default mis)\n"
         "  --nee-probability-min 0.05 --nee-from-depth 2 (from that depth on, environment light is\n"
         "                 sampled with probability clamp(path weight, min, 1); min 0 always samples)\n"
+        "  --light-selection spatial|power (default spatial: analytic lights by their estimated\n"
+        "                 irradiance at the shading point, mixed with power; power: by power only)\n"
         "  --texture-filtering filtered|bilinear (default filtered)\n"
         "  --device auto|cpu|cpu-reference|vulkan|metal (default auto: GPU if available, else CPU;\n"
         "                 cpu-reference runs the original CPU integrator)\n"
@@ -137,6 +139,11 @@ Options parse(int argc, char** argv) {
         else if (key == "--adaptive-min-samples") o.adaptiveMinSamples = integer(value);
         else if (key == "--nee-probability-min") o.nee.probabilityMin = number(value);
         else if (key == "--nee-from-depth") o.nee.fromDepth = integer(value);
+        else if (key == "--light-selection") {
+            if (value != "spatial" && value != "power")
+                throw std::runtime_error("--light-selection takes spatial or power");
+            o.nee.spatialLights = value == "spatial";
+        }
         else if (key == "--debug-contributions") {
             o.contributions = 0;
             std::stringstream list(value);

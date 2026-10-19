@@ -290,6 +290,46 @@ inline float cylinderPdfArea(CylinderFrame c, float t)
     return pdfT / (2.0f * c.alpha * c.radius);
 }
 
+inline float luminanceOf(float3 c) { return max(0.0f, 0.2126f * c.x + 0.7152f * c.y + 0.0722f * c.z); }
+
+// Spatial light selection: about the unoccluded irradiance an analytic light
+// brings to p, without the receiver's cosine (its radiance times the solid
+// angle it subtends, at most a hemisphere). Zero only where the light cannot
+// reach p: behind a one-sided planar light, inside a sphere or cylinder.
+inline float lightImportance(LightRecord light, float3 p)
+{
+    const float l = luminanceOf(xyz(light.radiance));
+    const uint type = light.info.x;
+    if (type == kLightDistant) return light.u.w >= 1.0f ? l : l * 2.0f * kPi * (1.0f - light.u.w);
+    const float3 d = p - xyz(light.p0);
+    const float d2 = dot(d, d);
+    if (type == kLightPoint) return l / max(d2, 1e-20f);
+    float solidAngle = 0.0f;
+    if (type == kLightSphere) {
+        const float r = light.p0.w;
+        if (!(d2 > r * r)) return 0.0f;
+        solidAngle = 2.0f * kPi * sphereOneMinusCos(r, d2);
+    } else if (type == kLightRect || type == kLightDisk) {
+        float cosLight = dot(xyz(light.n), d) / sqrt(max(d2, 1e-30f));
+        if ((light.info.y & kLightTwoSided) != 0u) cosLight = abs(cosLight);
+        if (!(cosLight > 0.0f)) return 0.0f;
+        solidAngle = light.v.w * max(cosLight, 0.1f) / max(d2, 1e-20f);
+    } else if (type == kLightCylinder) {
+        // A thin segment: 2 r (sin(thetaB) - sin(thetaA)) / distance.
+        const float3 axisVector = xyz(light.u);
+        const float halfLength = length(axisVector);
+        const float r = length(xyz(light.v));
+        const float along = dot(d, axisVector) / max(halfLength, 1e-30f);
+        const float distance2 = max(0.0f, d2 - along * along);
+        if (!(distance2 > r * r)) return 0.0f;
+        const float b = halfLength - along;
+        const float a = -halfLength - along;
+        const float sines = b / sqrt(distance2 + b * b) - a / sqrt(distance2 + a * a);
+        solidAngle = 2.0f * r * sines / sqrt(distance2);
+    }
+    return l * min(solidAngle, 2.0f * kPi);
+}
+
 // Texture coordinates of a point on a rect light, in image space (top row
 // first): UsdLuxRectLight puts the texture's (0, 0) at local (+X, +Y).
 inline float2 rectTexcoord(float a, float b) { return float2(0.5f * (1.0f - a), 0.5f * (1.0f + b)); }

@@ -44,6 +44,7 @@ python tests/hydra/validate.py
 | `prism:refinementDelayMs` | 100 | Quiet interval before refinement, clamped to 0-2000 ms |
 | `domeLightCameraVisibility` | true | Show dome light in primary camera rays; secondary lighting remains enabled |
 | `prism:environmentSampling` | `mis` | Environment next-event sampling with MIS, or `bsdf` |
+| `prism:lightSelection` | `spatial` | NEE picks among the analytic (UsdLux) lights by their estimated irradiance at the shading point (`spatial`, for 2 to 64 analytic lights), or by power only (`power`); see [Sampling](gpu_devices.md#sampling) |
 | `prism:textureFiltering` | `filtered` | Footprint-based anisotropic mip filtering, or highest-resolution `bilinear` reference mode |
 | `prism:sphereBatching` | false | Experimental batches of at most 1,024 eligible analytic spheres; ordinary instancing remains the default |
 | `prism:hiddenGeometryBudgetMiB` | 0 | Soft budget for retained hidden converted geometry; zero keeps unlimited retention |

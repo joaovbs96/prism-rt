@@ -69,6 +69,7 @@ static const uint kFrameLens = 32u;
 static const uint kFrameCutouts = 64u;       // some instances are not opaque
 static const uint kFramePrimaryHits = 128u;  // preview, pass: also store each pixel's center-ray hit
 static const uint kFrameLightLinking = 256u; // instances carry light/shadow-link categories
+static const uint kFrameSpatialLights = 512u; // spatial light selection (SampleSettings::spatialLights)
 
 // Work modes.
 static const uint kModePass = 0u;      // one sample per listed pixel

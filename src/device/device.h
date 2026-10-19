@@ -55,6 +55,8 @@ struct PixelTile {
 struct NeeSettings {
     float probabilityMin = 0.05f;
     int fromDepth = 2;
+    // Spatial light selection among analytic lights (PathTracer::pickLight).
+    bool spatialLights = true;
 };
 
 // Per-sample post-processing shared by every render loop.

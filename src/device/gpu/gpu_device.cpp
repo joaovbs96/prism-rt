@@ -88,6 +88,7 @@ std::vector<float> GpuRenderDevice::RenderImage(SceneManager& scene, ImageReques
     active.Reset(request.width, request.height);
     GpuFrame frame = BaseFrame(request.camera, request.width, request.height);
     frame.shading = {request.sampleClamp, 1.0f, request.nee.probabilityMin, float(request.nee.fromDepth)};
+    if (request.nee.spatialLights) frame.settings.z |= kFrameSpatialLights;
     frame.settings.w = request.seed;
     frame.counts.w = request.contributions & 7u;
     double gpuSeconds = 0.0;
@@ -180,6 +181,7 @@ void GpuRenderDevice::RenderPass(SceneManager& scene, PassRequest const& request
         frame = BaseFrame(request.camera, width, height);
         frame.shading = {request.shading.sampleClamp, request.shading.exposureScale,
                          request.shading.nee.probabilityMin, float(request.shading.nee.fromDepth)};
+        if (request.shading.nee.spatialLights) frame.settings.z |= kFrameSpatialLights;
         if (request.shading.transparentEscapes) frame.settings.z |= kFrameTransparentEscapes;
         if (request.sample == 0) frame.settings.z |= kFrameSeedRng;
         frame.settings.w = request.seed;
@@ -287,6 +289,7 @@ bool GpuRenderDevice::RenderPreview(SceneManager& scene, PreviewRequest const& r
     frame.size.w = request.previewHeight;
     frame.shading = {request.shading.sampleClamp, request.shading.exposureScale,
                          request.shading.nee.probabilityMin, float(request.shading.nee.fromDepth)};
+    if (request.shading.nee.spatialLights) frame.settings.z |= kFrameSpatialLights;
     if (request.shading.transparentEscapes) frame.settings.z |= kFrameTransparentEscapes;
     if (request.tracePrimary) frame.settings.z |= kFramePrimaryHits;
     frame.settings.w = request.seed;

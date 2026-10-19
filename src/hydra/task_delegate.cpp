@@ -37,6 +37,7 @@ TfToken const _adaptiveMinSamples("prism:adaptiveMinSamples");
 TfToken const _adaptivePreview("prism:adaptivePreview");
 TfToken const _neeProbabilityMin("prism:neeProbabilityMin");
 TfToken const _neeFromDepth("prism:neeFromDepth");
+TfToken const _lightSelection("prism:lightSelection");
 TfToken const _domeCameraVisibility("domeLightCameraVisibility");
 TfToken const _sphereBatching("prism:sphereBatching");
 TfToken const _hiddenGeometryBudget("prism:hiddenGeometryBudgetMiB");
@@ -191,6 +192,7 @@ HdRenderSettingDescriptorList PrismTaskDelegate::GetRenderSettingDescriptors() c
             {"Adaptive sampling minimum samples", _adaptiveMinSamples, VtValue(16)},
             {"Minimum NEE probability (0 always samples)", _neeProbabilityMin, VtValue(0.05f)},
             {"Probabilistic NEE from depth", _neeFromDepth, VtValue(2)},
+            {"Light selection (spatial, power)", _lightSelection, VtValue(std::string("spatial"))},
             {"Adaptive preview", _adaptivePreview, VtValue(true)},
             {"Dome light camera visibility", _domeCameraVisibility, VtValue(true)},
             {"Sphere batching (experimental)", _sphereBatching, VtValue(false)},
@@ -221,6 +223,7 @@ VtValue PrismTaskDelegate::GetRenderSetting(TfToken const &key) const
     if (key == _adaptivePreview) return VtValue(s.adaptivePreview);
     if (key == _neeProbabilityMin) return VtValue(s.neeProbabilityMin);
     if (key == _neeFromDepth) return VtValue(s.neeFromDepth);
+    if (key == _lightSelection) return VtValue(std::string(s.spatialLights ? "spatial" : "power"));
     if (key == _domeCameraVisibility) return VtValue(s.domeLightCameraVisibility);
     if (key == _sphereBatching) return VtValue(s.sphereBatching);
     if (key == _hiddenGeometryBudget) return VtValue(s.hiddenGeometryBudgetMiB);
@@ -338,6 +341,15 @@ void PrismTaskDelegate::SetRenderSetting(TfToken const &key, VtValue const &valu
             ? 0 : std::clamp(_Get(value, s.previewMaxDimension), 16, 1024);
     else if (key == _refinementDelayMs)
         s.refinementDelayMs = std::clamp(_Get(value, s.refinementDelayMs), 0, 2000);
+    else if (key == _lightSelection &&
+             (value.IsHolding<std::string>() || value.IsHolding<TfToken>())) {
+        const std::string mode = value.IsHolding<std::string>()
+            ? value.UncheckedGet<std::string>()
+            : value.UncheckedGet<TfToken>().GetString();
+        if (mode == "spatial") s.spatialLights = true;
+        else if (mode == "power") s.spatialLights = false;
+        else return;
+    }
     else if (key == _environmentSampling &&
              (value.IsHolding<std::string>() || value.IsHolding<TfToken>())) {
         const std::string mode = value.IsHolding<std::string>()
