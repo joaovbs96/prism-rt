@@ -1,6 +1,8 @@
 #include "../src/mdl/backend_compiler.h"
 #include "../src/mdl/context.h"
 #include "../src/mdl/material_compiler.h"
+#include "../src/mdl/texture_runtime.h"
+#include "../src/mdl_material.h"
 #include "../src/materialx/mdl_generator.h"
 
 #include <mi/mdl_sdk.h>
@@ -24,12 +26,7 @@
 
 namespace {
 
-// Element types of the MDL state's matrix and texture-result pointers
-// (tct_float4_a16 in MDL SDK 2026, tct_float4 before).
-using MdlStateFloat4 = std::remove_const_t<std::remove_pointer_t<
-    decltype(mi::neuraylib::Shading_state_material_with_derivs::text_results)>>;
-using MdlStateMatrixRow = std::remove_const_t<std::remove_pointer_t<
-    decltype(mi::neuraylib::Shading_state_material_with_derivs::world_to_object)>>;
+// MdlStateFloat4 and MdlStateMatrixRow come from mdl_material.h.
 
 void require(bool condition, std::string const &message)
 {
@@ -101,6 +98,45 @@ GeneratedMDL stringMaterial(std::string module, std::string value)
         "export material main(uniform string choice = \"" + value + "\") = material(\n"
         "  surface: material_surface(scattering: df::diffuse_reflection_bsdf(\n"
         "    tint: choice == \"red\" ? color(1,0,0) : color(0,1,0))));\n";
+    return generated;
+}
+
+// Like MaterialX geompropvalue: the primvar name is a uniform string
+// parameter, so class compilation sees it only as an argument.
+GeneratedMDL sceneDataMaterial(std::string module, std::string primvar)
+{
+    GeneratedMDL generated;
+    generated.module_name = "::" + std::move(module);
+    generated.success = true;
+    generated.mdl_source =
+        "mdl 1.8;\n"
+        "import ::df::*;\n"
+        "import ::scene::*;\n"
+        "color lookup(uniform string name, color fallback) {\n"
+        "  return scene::data_lookup_color(name, fallback);\n"
+        "}\n"
+        "export material main(uniform string primvar = \"" + primvar + "\") = material(\n"
+        "  surface: material_surface(scattering: df::diffuse_reflection_bsdf(\n"
+        "    tint: lookup(primvar, color(0,0,1)))));\n";
+    return generated;
+}
+
+// Emission behind a df::directional_factor, as OpenPBR and standard_surface
+// layer it under their coat. Equal tints make it diffuse; class compilation
+// keeps the factor that folding these arguments would remove.
+GeneratedMDL directionalEmissionMaterial(std::string module, float grazing)
+{
+    GeneratedMDL generated;
+    generated.module_name = "::" + std::move(module);
+    generated.success = true;
+    generated.mdl_source =
+        "mdl 1.8;\n"
+        "import ::df::*;\n"
+        "export material main(color normal_tint = color(1.0),\n"
+        "                     color grazing_tint = color(" + std::to_string(grazing) + ")) = material(\n"
+        "  surface: material_surface(emission: material_emission(\n"
+        "    emission: df::directional_factor(normal_tint, grazing_tint, 5.0, df::diffuse_edf()),\n"
+        "    intensity: color(2.0))));\n";
     return generated;
 }
 
@@ -547,6 +583,47 @@ int main()
                 "changed string constant incorrectly reused a cached program");
         require(dominant(evaluate(stringGreen.target,.25f,.25f),1),
                 "fresh target did not preserve changed string argument");
+
+        // Scene data named by a class argument (MaterialX geompropvalue): the
+        // name appears nowhere in the code, so as an argument it reached the
+        // program as string id 0 and every lookup returned its default (blue).
+        // Two materials of one class that differ only in the primvar name.
+        int dummyMesh=0;
+        mdl::NativeTextureRuntime::primvarContext={&dummyMesh,0,0,0,
+            [](const void*,const char* name,unsigned,float,float,float* out,int count) {
+                const std::string_view primvar(name?name:"");
+                if(count!=3||(primvar!="displayColor"&&primvar!="otherColor"))return false;
+                const bool red=primvar=="displayColor";
+                out[0]=red?1.f:0.f; out[1]=red?0.f:1.f; out[2]=0.f;
+                return true;
+            }};
+        auto sceneDataRed=compile(context,scratch.path,
+            sceneDataMaterial("target_scene_data_red","displayColor"));
+        require(dominant(evaluate(sceneDataRed.target,.25f,.25f),0),
+                "class-compiled scene data lookup by argument name returned its default");
+        auto sceneDataGreen=compile(context,scratch.path,
+            sceneDataMaterial("target_scene_data_green","otherColor"));
+        require(dominant(evaluate(sceneDataGreen.target,.25f,.25f),1),
+                "class-compiled scene data lookup used another material's primvar name");
+        require(dominant(evaluate(sceneDataRed.target,.25f,.25f),0),
+                "scene data variant changed an earlier material's lookup");
+        mdl::NativeTextureRuntime::primvarContext={};
+
+        // Constant emission (emissive triangles join the light table) must
+        // not depend on the compile mode: under class compilation a
+        // directional_factor whose tints agree is still diffuse.
+        auto isotropic=compile(context,scratch.path,
+            directionalEmissionMaterial("target_directional_isotropic",1.0f));
+        require(isotropic.target.program->uniform_emission &&
+                    isotropic.target.program->directional_emission,
+                "class-compiled directional_factor emission was not recognised");
+        const auto isotropicEmission=MDLMaterial(isotropic.target).constantEmission();
+        require(isotropicEmission&&isotropicEmission->radiance.x()>0.0f,
+                "directional_factor with equal tints lost its constant emission");
+        auto directional=compile(context,scratch.path,
+            directionalEmissionMaterial("target_directional_grazing",0.0f));
+        require(!MDLMaterial(directional.target).constantEmission(),
+                "direction-dependent emission was treated as constant");
 
         // Exercise a real MaterialX standard_surface target. Its glossy/sheen
         // implementation causes the SDK to inject internal BSDF data textures;

@@ -195,14 +195,50 @@ bool IsUniformExpression(const mi::neuraylib::IExpression* expression,
     }
 }
 
+// True if a type is or holds an EDF (edf, edf_component, arrays of them).
+bool ContainsEdf(const mi::neuraylib::IType* type, int depth = 0)
+{
+    if (!type || depth > 16) return false;
+    using T = mi::neuraylib::IType;
+    mi::base::Handle<const T> skipped(type->skip_all_type_aliases());
+    switch (skipped->get_kind()) {
+    case T::TK_EDF:
+        return true;
+    case T::TK_ARRAY: {
+        mi::base::Handle<const mi::neuraylib::IType_array> array(
+            skipped->get_interface<mi::neuraylib::IType_array>());
+        mi::base::Handle<const T> element(array->get_element_type());
+        return ContainsEdf(element.get(), depth + 1);
+    }
+    case T::TK_STRUCT: {
+        mi::base::Handle<const mi::neuraylib::IType_struct> structure(
+            skipped->get_interface<mi::neuraylib::IType_struct>());
+        for (mi::Size i = 0; i < structure->get_size(); ++i) {
+            mi::base::Handle<const T> field(structure->get_field_type(i));
+            if (ContainsEdf(field.get(), depth + 1)) return true;
+        }
+        return false;
+    }
+    default:
+        return false;
+    }
+}
+
 // A diffuse EDF with uniform arguments (or none at all): its radiance does
-// not depend on the shading point or the direction.
+// not depend on the shading point or the direction. Mixes, tints and uniform
+// selections of such EDFs qualify too: class compilation keeps them where
+// folding the arguments reduces them to a single diffuse_edf. A
+// directional_factor with uniform arguments sets *directional: the EDF is
+// then isotropic only for arguments whose tints agree, which each binding
+// checks by evaluating it.
 bool IsUniformDiffuseEdf(const mi::neuraylib::IExpression* expression,
                          const mi::neuraylib::ICompiled_material* material,
-                         mi::neuraylib::ITransaction* transaction, int depth = 0)
+                         mi::neuraylib::ITransaction* transaction, bool* directional,
+                         int depth = 0)
 {
     if (!expression || depth > 256) return false;
     using E = mi::neuraylib::IExpression;
+    using F = mi::neuraylib::IFunction_definition;
     switch (expression->get_kind()) {
     case E::EK_CONSTANT:
         return true; // no EDF
@@ -210,20 +246,46 @@ bool IsUniformDiffuseEdf(const mi::neuraylib::IExpression* expression,
         mi::base::Handle<const mi::neuraylib::IExpression_temporary> temporary(
             expression->get_interface<mi::neuraylib::IExpression_temporary>());
         mi::base::Handle<const E> value(material->get_temporary(temporary->get_index()));
-        return IsUniformDiffuseEdf(value.get(), material, transaction, depth + 1);
+        return IsUniformDiffuseEdf(value.get(), material, transaction, directional, depth + 1);
     }
     case E::EK_DIRECT_CALL: {
         mi::base::Handle<const mi::neuraylib::IExpression_direct_call> call(
             expression->get_interface<mi::neuraylib::IExpression_direct_call>());
-        mi::base::Handle<const mi::neuraylib::IFunction_definition> definition(
-            transaction->access<mi::neuraylib::IFunction_definition>(call->get_definition()));
-        if (!definition ||
-            definition->get_semantic() != mi::neuraylib::IFunction_definition::DS_INTRINSIC_DF_DIFFUSE_EDF)
+        mi::base::Handle<const F> definition(
+            transaction->access<F>(call->get_definition()));
+        if (!definition) return false;
+        switch (definition->get_semantic()) {
+        case F::DS_INTRINSIC_DF_DIRECTIONAL_FACTOR:
+            if (!directional) return false;
+            *directional = true;
+            break;
+        case F::DS_INTRINSIC_DF_DIFFUSE_EDF:
+        case F::DS_INTRINSIC_DF_NORMALIZED_MIX:
+        case F::DS_INTRINSIC_DF_CLAMPED_MIX:
+        case F::DS_INTRINSIC_DF_UNBOUNDED_MIX:
+        case F::DS_INTRINSIC_DF_COLOR_NORMALIZED_MIX:
+        case F::DS_INTRINSIC_DF_COLOR_CLAMPED_MIX:
+        case F::DS_INTRINSIC_DF_COLOR_UNBOUNDED_MIX:
+        case F::DS_INTRINSIC_DF_TINT:
+        case F::DS_INTRINSIC_DAG_ARRAY_CONSTRUCTOR:
+        case F::DS_ELEM_CONSTRUCTOR:
+        case F::DS_TERNARY:
+            break;
+        default:
             return false;
+        }
+        // EDF-valued arguments must themselves qualify; the others (weights,
+        // tints, exponents, the selector) must be uniform values.
         mi::base::Handle<const mi::neuraylib::IExpression_list> arguments(call->get_arguments());
         for (mi::Size i = 0; arguments && i < arguments->get_size(); ++i) {
             mi::base::Handle<const E> argument(arguments->get_expression(i));
-            if (!IsUniformExpression(argument.get(), material, transaction, depth + 1)) return false;
+            mi::base::Handle<const mi::neuraylib::IType> type(
+                argument ? argument->get_type() : nullptr);
+            if (!type) return false;
+            if (ContainsEdf(type.get())
+                    ? !IsUniformDiffuseEdf(argument.get(), material, transaction, directional, depth + 1)
+                    : !IsUniformExpression(argument.get(), material, transaction, depth + 1))
+                return false;
         }
         return true;
     }
@@ -465,9 +527,11 @@ TargetCode BackendCompiler::generate_target_code(const CompiledMaterial& compile
         compiled.compiled_material->lookup_sub_expression("surface.emission.emission"));
     mi::base::Handle<const mi::neuraylib::IExpression> emissionMode(
         compiled.compiled_material->lookup_sub_expression("surface.emission.mode"));
+    bool directionalEmission = false;
     const bool uniformEmission = emissionIntensity && emissionEdf &&
         IsUniformExpression(emissionIntensity.get(), compiled.compiled_material.get(), compiled.transaction.get()) &&
-        IsUniformDiffuseEdf(emissionEdf.get(), compiled.compiled_material.get(), compiled.transaction.get()) &&
+        IsUniformDiffuseEdf(emissionEdf.get(), compiled.compiled_material.get(), compiled.transaction.get(),
+                            &directionalEmission) &&
         (!emissionMode || IsUniformExpression(emissionMode.get(), compiled.compiled_material.get(),
                                               compiled.transaction.get()));
 
@@ -875,6 +939,7 @@ TargetCode BackendCompiler::generate_target_code(const CompiledMaterial& compile
     }
     program->uniform_cutout = uniformCutout;
     program->uniform_emission = uniformEmission;
+    program->directional_emission = uniformEmission && directionalEmission;
     program->has_displacement = hasDisplacement;
     program->builtin_resources = !binding->texture_runtime;
     program->identity = cacheKey;
