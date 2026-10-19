@@ -150,6 +150,12 @@ public:
     // Inform the device that a scene was (re)built or edited before rendering it.
     // The scene must stay alive and unmodified while the device renders it.
     virtual void SceneChanged(SceneManager& scene) { (void)scene; }
+    // Performs the per-scene setup that rendering would otherwise do on first
+    // use (GPU kernel compilation, scene upload, light tables). Rendering
+    // calls it implicitly; calling it first lets a host run that work on a
+    // thread it can stop waiting for. Not concurrent with rendering calls;
+    // SceneChanged may be called while it runs.
+    virtual void Prepare(SceneManager& scene) { (void)scene; }
 
     virtual std::vector<float> RenderImage(SceneManager& scene, ImageRequest const& request) = 0;
     virtual void RenderPass(SceneManager& scene, PassRequest const& request) = 0;

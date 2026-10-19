@@ -71,6 +71,21 @@ Scenes: **Eggs** (MaterialEggs), **OpenPBR** (OpenPBRShaderPlayground),
   streaming or virtual texturing.
 - **GPU kernel compile time** grows with the material set (OpenPBR and Eggs
   take three to six minutes on first use).
+- **Per-material shading for large material sets.** The GPU kernel is one
+  megakernel that inlines every MDL program. On Vulkan, kernels over about
+  1 MB of HLSL (Stirling 1.4 MB with 24 programs, OpenPBR playground 3.0 MB
+  with 35, MaterialEggs countertop 3.1 MB with 34) do not compile.
+  - DXC's SPIR-V legalization rewrites the single inlined function into SSA
+    form, which needs more than 8 GB, so these scenes render on the CPU.
+  - Neither alternative works. Skipping that pass, the NVIDIA driver's pipeline
+    compile still needs more than 8 GB and 400 s. Keeping the material
+    functions out of line (`[noinline]`) makes the driver's compile larger
+    and loses the device.
+  - Class compilation (`PRISM_MDL_COMPILE_MODE=class`) does not help: fewer
+    programs, but 4–7x the HLSL.
+  - The long-term fix is to stop compiling all materials into one function:
+    per-material-program pipelines with wavefront (queued) shading, or
+    callable shaders.
 - **Denoising** (e.g. Intel Open Image Denoise).
 
 ## Standalone CLI

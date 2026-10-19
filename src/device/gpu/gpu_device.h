@@ -20,6 +20,7 @@ public:
     bool RenderPreview(SceneManager& scene, PreviewRequest const& request) override;
     // Picking uses the CPU scene, which is exact and needs no GPU round trip.
     RTCRayHit Intersect(SceneManager& scene, prism::PathRay const& ray) override;
+    void Prepare(SceneManager& scene) override;
 
 protected:
     // Makes the device's copy of the scene current; data() is valid after.

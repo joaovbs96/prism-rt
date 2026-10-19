@@ -130,7 +130,8 @@ struct AccelerationStructure {
 
 } // namespace
 
-bool CompileVulkanKernel(std::string const& mdlCode, std::vector<uint32_t>* spirv, std::string* error)
+bool CompileVulkanKernel(std::string const& mdlCode, std::vector<uint32_t>* spirv, std::string* error,
+                         uint32_t programCount)
 {
     std::string source;
     if (!gpu::AssembleShader("gpu/kernel.hlsl", {"gpu/vulkan"}, mdlCode, &source, error)) return false;
@@ -165,6 +166,8 @@ bool CompileVulkanKernel(std::string const& mdlCode, std::vector<uint32_t>* spir
             failed[key] = error ? *error : reason;
             return false;
         }
+        std::cerr << std::format("PrismRT Vulkan: compiling the GPU kernel ({} MDL programs, {} KB of HLSL); this "
+                                 "happens once per material set\n", programCount, source.size() >> 10);
         std::string reason;
         if (!gpu::CompileHlsl(source, gpu::HlslTarget::Spirv, cacheDirectory, &bytes, &reason)) {
             if (gpu::HlslTooLarge(reason)) std::ofstream(tooLarge) << reason << '\n';
@@ -235,7 +238,8 @@ struct VulkanDevice::Impl {
     ~Impl();
     bool initialize(std::string* reason);
     uint32_t memoryType(uint32_t bits, VkMemoryPropertyFlags flags) const;
-    bool createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, Buffer* buffer, bool hostVisible = true);
+    bool createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, Buffer* buffer, bool hostVisible = true,
+                      bool hostCached = false);
     void destroyBuffer(Buffer& buffer);
     bool upload(int slot, const void* bytes, size_t size);
     void destroyStructure(AccelerationStructure& structure);
@@ -493,7 +497,8 @@ uint32_t VulkanDevice::Impl::memoryType(uint32_t bits, VkMemoryPropertyFlags fla
     return ~0u;
 }
 
-bool VulkanDevice::Impl::createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, Buffer* buffer, bool hostVisible)
+bool VulkanDevice::Impl::createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, Buffer* buffer, bool hostVisible,
+                                      bool hostCached)
 {
     *buffer = {};
     buffer->size = std::max<VkDeviceSize>(16, (size + 15) & ~VkDeviceSize(15));
@@ -508,9 +513,18 @@ bool VulkanDevice::Impl::createBuffer(VkDeviceSize size, VkBufferUsageFlags usag
     VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     allocation.pNext = &flags;
     allocation.allocationSize = requirements.size;
-    allocation.memoryTypeIndex = memoryType(requirements.memoryTypeBits, hostVisible
-        ? VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
-        : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    const VkMemoryPropertyFlags hostFlags =
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    allocation.memoryTypeIndex = ~0u;
+    // The host reads results back from these buffers every pass. Uncached
+    // (write-combined) memory makes those reads several times slower than
+    // the dispatch itself, so prefer a cached type when one exists.
+    if (hostVisible && hostCached)
+        allocation.memoryTypeIndex = memoryType(requirements.memoryTypeBits,
+            hostFlags | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+    if (allocation.memoryTypeIndex == ~0u)
+        allocation.memoryTypeIndex = memoryType(requirements.memoryTypeBits,
+            hostVisible ? hostFlags : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     if (allocation.memoryTypeIndex == ~0u ||
         vkAllocateMemory(device, &allocation, nullptr, &buffer->memory) != VK_SUCCESS) {
         vkDestroyBuffer(device, buffer->buffer, nullptr);
@@ -537,7 +551,8 @@ bool VulkanDevice::Impl::upload(int slot, const void* bytes, size_t size)
     destroyBuffer(buffers[slot]);
     const VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
         VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
-    if (!createBuffer(size, usage, &buffers[slot])) return false;
+    const bool readBack = slot == kSlotRng || slot == kSlotOutput || slot == kSlotAccumulation;
+    if (!createBuffer(size, usage, &buffers[slot], true, readBack)) return false;
     if (bytes && size) std::memcpy(buffers[slot].mapped, bytes, size);
     return true;
 }
@@ -596,7 +611,7 @@ bool VulkanDevice::Impl::buildPipeline(std::string* error)
     if (shared == pipelineCode && pipeline != VK_NULL_HANDLE) return true;
     pipelineCode = nullptr;
     std::vector<uint32_t> spirv;
-    if (!CompileVulkanKernel(code.code, &spirv, error)) return false;
+    if (!CompileVulkanKernel(code.code, &spirv, error, code.programCount)) return false;
     auto const compiled = Clock::now();
     const std::string key = gpu::SourceDigest(std::string(reinterpret_cast<const char*>(spirv.data()), spirv.size() * 4));
     if (auto found = pipelines.find(key); found != pipelines.end()) {
@@ -1291,6 +1306,11 @@ bool VulkanDevice::RenderPreview(SceneManager& scene, PreviewRequest const& requ
 {
     if (RendersOnCpu(scene)) return m_cpu.RenderPreview(scene, request);
     return GpuRenderDevice::RenderPreview(scene, request);
+}
+
+void VulkanDevice::Prepare(SceneManager& scene)
+{
+    if (RendersOnCpu(scene)) m_cpu.Prepare(scene);
 }
 
 bool VulkanDevice::PrepareScene(SceneManager& scene, std::string* error) { return m_impl->ensureScene(scene, error); }

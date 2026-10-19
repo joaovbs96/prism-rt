@@ -196,6 +196,19 @@ void GpuRenderDevice::RenderPass(SceneManager& scene, PassRequest const& request
     constexpr size_t chunkPixels = 1u << 18;
     std::vector<uint32_t> list;
     size_t first = 0;
+    auto const passStart = Clock::now();
+    double passGpuSeconds = 0.0, dispatchSeconds = 0.0, readbackSeconds = 0.0;
+    struct PassLog {
+        double& gpu; double& dispatch; double& readback; Clock::time_point start;
+        ~PassLog() {
+            static const bool verbose = GpuVerbose();
+            if (verbose)
+                std::cerr << std::format("PrismRT GPU pass: wall {:.2f} ms, dispatch {:.2f} ms (GPU {:.2f} ms), "
+                                         "readback {:.2f} ms\n",
+                                         std::chrono::duration<double, std::milli>(Clock::now() - start).count(),
+                                         dispatch * 1e3, gpu * 1e3, readback * 1e3);
+        }
+    } passLog{passGpuSeconds, dispatchSeconds, readbackSeconds, passStart};
     while (first < request.tiles.size()) {
         while (paused()) {
             if (abandoned()) return;
@@ -218,11 +231,13 @@ void GpuRenderDevice::RenderPass(SceneManager& scene, PassRequest const& request
             std::memcpy(RenderBuffer(kSlotPixels, list.size() * 4), list.data(), list.size() * 4);
             GpuFrame f = frame;
             f.work = {uint32_t(list.size()), 0, traceColor ? kModePass : kModePrimary, 0};
-            if (!Dispatch(f, uint32_t(list.size()), nullptr, &error)) {
+            if (!Dispatch(f, uint32_t(list.size()), &passGpuSeconds, &error)) {
                 std::cerr << LogPrefix() << error << '\n';
                 return;
             }
         }
+        auto const dispatched = Clock::now();
+        dispatchSeconds += std::chrono::duration<double>(dispatched - rayStart).count();
         if (traceColor && !list.empty()) {
             // Buffers may move when resized; fetch them again after the dispatch.
             rng = static_cast<uint32_t*>(RenderBuffer(kSlotRng, pixels * 4));
@@ -239,6 +254,7 @@ void GpuRenderDevice::RenderPass(SceneManager& scene, PassRequest const& request
                 });
             if (request.colorPixels) request.colorPixels->fetch_add(list.size(), std::memory_order_relaxed);
         }
+        readbackSeconds += std::chrono::duration<double>(Clock::now() - dispatched).count();
         auto const primaryStart = Clock::now();
         if (request.rayNanoseconds)
             request.rayNanoseconds->fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -319,6 +335,14 @@ bool GpuRenderDevice::RenderPreview(SceneManager& scene, PreviewRequest const& r
         *request.traceMilliseconds = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - traceStart).count();
     return !(request.stopRequested && request.stopRequested());
+}
+
+void GpuRenderDevice::Prepare(SceneManager& scene)
+{
+    std::lock_guard lock(m_renderMutex);
+    std::string error;
+    // Failures are reported again, once, by the render call that needs the scene.
+    (void)PrepareScene(scene, &error);
 }
 
 RTCRayHit GpuRenderDevice::Intersect(SceneManager& scene, prism::PathRay const& ray)

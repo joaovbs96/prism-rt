@@ -30,6 +30,7 @@ public:
     bool RenderPreview(SceneManager& scene, PreviewRequest const& request) override;
     RTCRayHit Intersect(SceneManager& scene, prism::PathRay const& ray) override;
     void SceneChanged(SceneManager& scene) override;
+    void Prepare(SceneManager& scene) override { (void)PreparedScene(scene); }
 
 private:
     // The scene's CpuSceneState, cached until it changes.
