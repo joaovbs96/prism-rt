@@ -5,8 +5,14 @@
 //
 // Requires the resource accessors (resources.hlsl), gpu_trace (geometry.hlsl)
 // and the MDL dispatch functions (prism_mdl_*) of the generated code.
+//
+// With PRISM_CALL_MATERIALS (the Vulkan ray tracing pipeline's raygen
+// shader) there is no generated code: MDL programs are separate shaders,
+// called through prism_call_material with a MaterialCall payload.
 
 #pragma once
+
+#include "material_call.hlsl"
 
 float3 gpu_xyz(float4 v) { return float3(v.x, v.y, v.z); }
 
@@ -538,12 +544,17 @@ BsdfSample gpu_legacy_sample(SurfaceHit hit, GpuMaterial material, inout Rng rng
 // ---------------------------------------------------------------------------
 
 // A prepared shading point: the hit after normal mapping and, for MDL
-// materials, the state after the material's init function.
+// materials, the state after the material's init function (which runs in
+// the called program with PRISM_CALL_MATERIALS).
 struct GpuShading {
     SurfaceHit surface;
     uint material;
+#ifndef PRISM_CALL_MATERIALS
     Shading_state_material state;
+#endif
 };
+
+#ifndef PRISM_CALL_MATERIALS
 
 // MDLMaterial::build_shading_state
 void gpu_build_mdl_state(SurfaceHit hit, GpuMaterial material, out Shading_state_material state)
@@ -684,6 +695,39 @@ BsdfEvaluation gpu_mdl_evaluate(SurfaceHit hit, GpuMaterial material, inout Shad
     result.valid = result.pdf >= 0.0f && isfinite(result.pdf);
     return result;
 }
+
+// The medium behind the front face (MDLMaterial::medium).
+MediumCoefficients gpu_mdl_medium(GpuMaterial material, Shading_state_material state)
+{
+    MediumCoefficients m = noMedium();
+    if (prism_mdl_thin_walled(material.info.y, state)) return m;
+    m.sigmaA = max(prism_mdl_volume_absorption(material.info.y, state), (float3)0.0f);
+    m.sigmaS = max(prism_mdl_volume_scattering(material.info.y, state), (float3)0.0f);
+    const float g = prism_mdl_volume_anisotropy(material.info.y, state);
+    m.g = isfinite(g) ? clamp(g, -0.99f, 0.99f) : 0.0f;
+    m.valid = isfinite(m.sigmaA.x + m.sigmaA.y + m.sigmaA.z + m.sigmaS.x + m.sigmaS.y + m.sigmaS.z);
+    return m;
+}
+
+// The cutout opacity of a program with a varying cutout. Its init has its own
+// dispatch so the full material set is not inlined a second time.
+float gpu_mdl_cutout_opacity(SurfaceHit hit, GpuMaterial material)
+{
+    Shading_state_material state;
+    gpu_build_mdl_state(hit, material, state);
+    prism_mdl_init_cutout(material.info.y, state);
+    const float opacity = prism_mdl_cutout(material.info.y, state);
+    return isfinite(opacity) ? saturate(opacity) : 1.0f;
+}
+
+// MDLMaterial::prepare after normal mapping: the state after init.
+void gpu_mdl_init_shading(inout GpuShading shading, GpuMaterial material)
+{
+    gpu_build_mdl_state(shading.surface, material, shading.state);
+    prism_mdl_init(material.info.y, shading.state);
+}
+
+#endif // PRISM_CALL_MATERIALS
 
 // ---------------------------------------------------------------------------
 // Environment (environment.h, hydra/environment_cache.h)
@@ -938,24 +982,27 @@ struct GpuBackend {
                 shading.surface.n = normalize(t * tangentNormal.x + b * tangentNormal.y + ng * tangentNormal.z);
             }
         }
-        if (material.info.x == kMaterialMdl) {
-            gpu_build_mdl_state(shading.surface, material, shading.state);
-            prism_mdl_init(material.info.y, shading.state);
-        }
+#ifndef PRISM_CALL_MATERIALS
+        if (material.info.x == kMaterialMdl) gpu_mdl_init_shading(shading, material);
+#endif
         return shading;
     }
 
     BsdfSample sample(GpuShading shading, float4 xi)
     {
         const GpuMaterial material = gpu_material(shading.material);
+#ifndef PRISM_CALL_MATERIALS
         if (material.info.x == kMaterialMdl) return gpu_mdl_sample(shading.surface, material, shading.state, rng, xi);
+#endif
         return gpu_legacy_sample(shading.surface, material, rng);
     }
 
     BsdfEvaluation evaluate(GpuShading shading, float3 wi)
     {
         const GpuMaterial material = gpu_material(shading.material);
+#ifndef PRISM_CALL_MATERIALS
         if (material.info.x == kMaterialMdl) return gpu_mdl_evaluate(shading.surface, material, shading.state, wi);
+#endif
         BsdfEvaluation e = {(float3)0.0f, 0.0f, false};
         if (material.info.x == kMaterialDiffuse || material.info.x == kMaterialFallback) {
             // Diffuse::evaluate
@@ -969,27 +1016,35 @@ struct GpuBackend {
 
     MediumCoefficients medium(GpuShading shading)
     {
-        MediumCoefficients m;
-        m.sigmaA = (float3)0.0f;
-        m.sigmaS = (float3)0.0f;
-        m.g = 0.0f;
-        m.valid = false;
+#ifndef PRISM_CALL_MATERIALS
         const GpuMaterial material = gpu_material(shading.material);
-        if (material.info.x != kMaterialMdl) return m;
-        Shading_state_material state = shading.state;
-        if (prism_mdl_thin_walled(material.info.y, state)) return m;
-        m.sigmaA = max(prism_mdl_volume_absorption(material.info.y, state), (float3)0.0f);
-        m.sigmaS = max(prism_mdl_volume_scattering(material.info.y, state), (float3)0.0f);
-        const float g = prism_mdl_volume_anisotropy(material.info.y, state);
-        m.g = isfinite(g) ? clamp(g, -0.99f, 0.99f) : 0.0f;
-        m.valid = isfinite(m.sigmaA.x + m.sigmaA.y + m.sigmaA.z + m.sigmaS.x + m.sigmaS.y + m.sigmaS.z);
-        return m;
+        if (material.info.x == kMaterialMdl) return gpu_mdl_medium(material, shading.state);
+#endif
+        return noMedium();
     }
 
     // The one call site of sample, evaluate and medium: each material's code
-    // is inlined once.
+    // is inlined once. With PRISM_CALL_MATERIALS an MDL program runs this
+    // same function in its own shader (material_callable.hlsl).
     MaterialResult shade(GpuShading shading, MaterialQuery query)
     {
+#ifdef PRISM_CALL_MATERIALS
+        const GpuMaterial callee = gpu_material(shading.material);
+        if (callee.info.x == kMaterialMdl) {
+            MaterialCall call = materialCall(shading.surface, shading.material, kMaterialCallShade);
+            call.xi = query.xi;
+            call.lightWi = query.lightWi;
+            if (query.evaluateLight) call.flags |= kMaterialCallEvaluateLight;
+            call.rng = rng.state;
+#ifdef PRISM_REORDER_MATERIALS
+            // Threads that run the same program continue together.
+            prism_reorder_thread(callee.info.y, PRISM_REORDER_HINT_BITS);
+#endif
+            prism_call_material(callee.info.y, call);
+            rng.state = call.rng;
+            return loadMaterialResult(call);
+        }
+#endif
         MaterialResult result;
         result.sample = sample(shading, query.xi);
         result.light = invalidBsdfEvaluation();
@@ -1020,13 +1075,14 @@ struct GpuBackend {
         if (material.info.x == kMaterialFallback) return material.params.x;
         if (material.info.x != kMaterialMdl) return 1.0f;
         if ((material.info.w & kMaterialConstantCutout) != 0u) return material.params.w;
-        // Only programs with a varying cutout get here; their init has its own
-        // dispatch so the full material set is not inlined a second time.
-        Shading_state_material state;
-        gpu_build_mdl_state(hit.surface, material, state);
-        prism_mdl_init_cutout(material.info.y, state);
-        const float opacity = prism_mdl_cutout(material.info.y, state);
-        return isfinite(opacity) ? saturate(opacity) : 1.0f;
+        // Only programs with a varying cutout get here.
+#ifdef PRISM_CALL_MATERIALS
+        MaterialCall call = materialCall(hit.surface, hit.material, kMaterialCallCutout);
+        prism_call_material(material.info.y, call);
+        return call.pdf;
+#else
+        return gpu_mdl_cutout_opacity(hit.surface, material);
+#endif
     }
 
     // All domes together (CompositeEnvironment): radiance sums, sampling

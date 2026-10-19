@@ -3,6 +3,10 @@
 // loops. Compiled by DXC for Metal (DXIL, then Metal shader converter) and
 // for Vulkan (SPIR-V); resources.hlsl comes from shaders/gpu/metal or
 // shaders/gpu/vulkan. The host inserts the generated MDL code at the marker.
+//
+// With PRISM_CALL_MATERIALS this is the raygen shader of the Vulkan ray
+// tracing pipeline instead: no MDL code, the programs are callable shaders
+// (gpu/vulkan/material_callable.hlsl).
 
 #include "../shared/prism_gpu_types.h"
 #include "../integrator/path_tracer.h"
@@ -10,7 +14,9 @@
 #include "accessors.hlsl"
 #include "geometry.hlsl"
 #include "mdl_types.hlsl"
+#ifndef PRISM_CALL_MATERIALS
 #include "mdl_runtime.hlsl"
+#endif
 //@PRISM_MDL_CODE@
 #include "gpu_backend.hlsl"
 
@@ -54,12 +60,10 @@ float3 debugView(inout GpuPathTracer tracer, CameraParams camera, uint x, uint y
     return (float3)hit.surface.t;
 }
 
-[numthreads(64, 1, 1)]
-void main(uint3 id : SV_DispatchThreadID)
+void renderThread(uint thread)
 {
     const GpuFrame frame = gpu_frame();
-    if (id.x >= frame.work.x) return;
-    const uint thread = id.x;
+    if (thread >= frame.work.x) return;
     const uint flags = frame.settings.z;
     const CameraParams camera = frameCamera(frame);
     const SampleSettings settings = {frame.shading.x, frame.shading.y,
@@ -138,3 +142,17 @@ void main(uint3 id : SV_DispatchThreadID)
     if (mode == kModeImage) gpu_accumulate(pixel, result.color, (frame.counts.z & 1u) == 0u);
     else gpu_store_output(pixel, float4(result.color, result.coverage));
 }
+
+#ifdef PRISM_CALL_MATERIALS
+[shader("raygeneration")]
+void raygen()
+{
+    renderThread(DispatchRaysIndex().x);
+}
+#else
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID)
+{
+    renderThread(id.x);
+}
+#endif

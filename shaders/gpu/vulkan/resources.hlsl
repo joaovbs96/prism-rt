@@ -86,3 +86,19 @@ RWStructuredBuffer<float4> accumulationBuffer() { return g_accumulation; }
 RaytracingAccelerationStructure sceneStructure() { return g_scene; }
 Texture2D<float4> imageTexture(uint image) { return g_textures[NonUniformResourceIndex(image)]; }
 SamplerState imageSampler(uint index) { return g_samplers[NonUniformResourceIndex(index)]; }
+
+#ifdef PRISM_CALL_MATERIALS
+// Material programs are the callable shaders of the ray tracing pipeline,
+// indexed by program (vulkan_material_calls.cpp).
+#define prism_call_material(program, call) CallShader(program, call)
+#endif
+
+#ifdef PRISM_REORDER_MATERIALS
+// Shader execution reordering (SPV_NV_shader_invocation_reorder,
+// OpReorderThreadWithHintNV): regroups the raygen shader's threads by the
+// low `bits` bits of `hint`.
+[[vk::ext_extension("SPV_NV_shader_invocation_reorder")]]
+[[vk::ext_capability(5383)]] // ShaderInvocationReorderNV
+[[vk::ext_instruction(5280)]] // OpReorderThreadWithHintNV
+void prism_reorder_thread(uint hint, uint bits);
+#endif
