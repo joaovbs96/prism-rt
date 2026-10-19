@@ -2,6 +2,8 @@
 
 #include "resolved_resource.h"
 #include <pxr/usd/usdShade/udimUtils.h>
+#include <tbb/parallel_for.h>
+#include <atomic>
 #include <charconv>
 
 namespace prism::materialx {
@@ -113,20 +115,42 @@ inline MaterialUdimResult PrepareMaterialUdimResource(
     if (sources.empty()) return result;
     if (extension.empty()) extension = ".bin";
     std::string family = "PrismMaterialUdim-v1\n";
+    // Tiles are independent files: read, hash and publish them in parallel.
+    // Results stay in tile order, so the family digest and the tile list are
+    // those of a serial walk; PrepareMaterialResource is single-flight per
+    // source and the publication below locks each destination.
+    std::vector<MaterialResourceResult> materialized(sources.size());
+    std::atomic<bool> failed{false};
+    tbb::parallel_for(size_t(0), sources.size(), [&](size_t i) {
+        if (failed.load(std::memory_order_relaxed)) return;
+        try {
+            materialized[i] = PrepareMaterialResource(sources[i].resolved, resolverContext,
+                sourceVersion, cacheDir, extension);
+        } catch (...) {
+            // Rethrown below for the first failing tile in order.
+        }
+        if (!materialized[i].resource) failed = true;
+    });
     std::vector<std::pair<int, std::shared_ptr<const ResolvedMaterialResource>>> prepared;
-    for (const auto& source : sources) {
-        auto tile = PrepareMaterialResource(source.resolved, resolverContext,
-            sourceVersion, cacheDir, extension);
-        if (!tile.resource) return {};
-        result.bytesRead += tile.bytesRead;
-        family += std::to_string(source.tile) + ":" + tile.resource->fingerprint + "\n";
-        prepared.emplace_back(source.tile, std::move(tile.resource));
+    for (size_t i = 0; i < sources.size(); ++i) {
+        if (!materialized[i].resource) {
+            // Same outcome as the serial walk: rethrow that tile's failure.
+            auto tile = PrepareMaterialResource(sources[i].resolved, resolverContext,
+                sourceVersion, cacheDir, extension);
+            if (!tile.resource) return {};
+            materialized[i] = std::move(tile);
+        }
+        result.bytesRead += materialized[i].bytesRead;
+        family += std::to_string(sources[i].tile) + ":" + materialized[i].resource->fingerprint + "\n";
+        prepared.emplace_back(sources[i].tile, std::move(materialized[i].resource));
     }
     const std::string digest = OIIO::SHA1::digest(family.data(), family.size());
     // The tiles' content decides the extension (see ImageExtensionFor).
     if (!prepared.empty()) extension = prepared.front().second->path.extension().string();
     const auto textures = prism::TextureService::Acquire();
-    for (const auto& [tile, resource] : prepared) {
+    std::vector<uint8_t> published(prepared.size(), 0);
+    tbb::parallel_for(size_t(0), prepared.size(), [&](size_t i) {
+        const auto& [tile, resource] = prepared[i];
         const auto destination = cacheDir /
             (digest + "." + std::to_string(tile) + extension);
         resource_detail::PublicationLock lock(destination);
@@ -143,16 +167,16 @@ inline MaterialUdimResult PrepareMaterialUdimResource(
         if (verified) {
             // Same process/version already verified this immutable family tile.
         } else if (std::filesystem::exists(destination, error)) {
-            if (error || !SameMaterialResourceFile(resource->path, destination)) return {};
+            if (error || !SameMaterialResourceFile(resource->path, destination)) return;
         } else {
             // The source is already an immutable, verified publication. Copy
             // through a sibling temporary and validate by size/content.
             const auto temporary = std::filesystem::path(destination.string() + ".tmp");
             std::filesystem::copy_file(resource->path, temporary,
                 std::filesystem::copy_options::overwrite_existing, error);
-            if (error) return {};
+            if (error) return;
             std::filesystem::rename(temporary, destination, error);
-            if (error && !std::filesystem::exists(destination)) return {};
+            if (error && !std::filesystem::exists(destination)) return;
             std::filesystem::remove(temporary, error);
         }
         textures->registerTrustedSource(destination,
@@ -166,7 +190,11 @@ inline MaterialUdimResult PrepareMaterialUdimResource(
                 registry.verifiedPublications.erase(
                     registry.verifiedPublications.begin());
         }
-        result.tiles.push_back(resource);
+        published[i] = 1;
+    });
+    for (size_t i = 0; i < prepared.size(); ++i) {
+        if (!published[i]) return {};
+        result.tiles.push_back(prepared[i].second);
     }
     result.mdlPath = "/" + digest + ".<UDIM>" + extension;
     return result;
