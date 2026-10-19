@@ -32,6 +32,7 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <future>
 #include <mutex>
 #include <iostream>
 #include <thread>
@@ -303,6 +304,8 @@ struct VulkanDevice::Impl {
     // compute kernel).
     vulkan::RayTracingSupport rayTracing;
     std::unordered_map<std::string, std::unique_ptr<vulkan::MaterialCallPipeline>> callablePipelines;
+    // The compiled shaders (pipeline libraries) of every callable pipeline.
+    std::unique_ptr<vulkan::MaterialCallShaders> callableShaders;
     vulkan::MaterialCallPipeline const* callables = nullptr;
     // The generated MDL code `pipeline` was built from.
     std::shared_ptr<const gpu::MdlShaderCode> pipelineCode;
@@ -319,7 +322,11 @@ struct VulkanDevice::Impl {
     VkCommandBuffer beginCommands();
     bool submit(VkCommandBuffer commands, std::string* error);
     bool ensureScene(SceneManager& scene, std::string* error);
-    bool buildPipeline(std::string* error);
+    // Generates the scene's MDL shader code and uploads its data; `compile`
+    // tells whether its pipeline still has to be built (compilePipeline).
+    bool prepareMaterials(std::shared_ptr<const gpu::MdlShaderCode>* code, bool* compile, std::string* error);
+    // Builds the pipeline of `code`; runs while the scene uploads.
+    bool compilePipeline(std::shared_ptr<const gpu::MdlShaderCode> const& shared, std::string* error);
     bool buildCallablePipeline(std::shared_ptr<const gpu::MdlShaderCode> const& code, std::string const& reason,
                                std::string* error);
     bool uploadImages(std::string* error);
@@ -338,6 +345,7 @@ VulkanDevice::Impl::~Impl()
     vkDeviceWaitIdle(device);
     callables = nullptr;
     callablePipelines.clear();
+    callableShaders.reset();
     for (auto& [key, p] : pipelines) vkDestroyPipeline(device, p, nullptr);
     if (descriptorPool) vkDestroyDescriptorPool(device, descriptorPool, nullptr);
     if (pipelineLayout) vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
@@ -455,11 +463,13 @@ bool VulkanDevice::Impl::initialize(std::string* reason)
         query.pNext = &pipelineFeatures;
         vkGetPhysicalDeviceFeatures2(physical, &query);
         rayTracing.pipeline = has(VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME) && pipelineFeatures.rayTracingPipeline;
+        rayTracing.library = rayTracing.pipeline && has(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
         rayTracing.reorder = rayTracing.pipeline && has(VK_NV_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME) &&
             reorderFeatures.rayTracingInvocationReorder;
         rayTracing.executableStatistics = has(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME) &&
             statisticsFeatures.pipelineExecutableInfo;
         if (rayTracing.pipeline) enabled.push_back(VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME);
+        if (rayTracing.library) enabled.push_back(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
         if (rayTracing.reorder) enabled.push_back(VK_NV_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME);
         if (rayTracing.executableStatistics) enabled.push_back(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
     }
@@ -628,6 +638,12 @@ bool VulkanDevice::Impl::initialize(std::string* reason)
     poolCreate.poolSizeCount = uint32_t(std::size(sizes));
     poolCreate.pPoolSizes = sizes;
     vkCreateDescriptorPool(device, &poolCreate, nullptr, &descriptorPool);
+    if (rayTracing.pipeline) {
+        callableShaders = std::make_unique<vulkan::MaterialCallShaders>(device, rayTracing, pipelineLayout,
+                                                                         pipelineCacheTag);
+        // The raygen shader depends on no scene: compile it while the scene loads.
+        if (vulkan::CallableModeSetting() != vulkan::CallableMode::Never) callableShaders->prewarmRaygen();
+    }
     return true;
 }
 
@@ -736,24 +752,41 @@ bool VulkanDevice::Impl::submit(VkCommandBuffer commands, std::string* error)
     return true;
 }
 
-bool VulkanDevice::Impl::buildPipeline(std::string* error)
+bool VulkanDevice::Impl::prepareMaterials(std::shared_ptr<const gpu::MdlShaderCode>* result, bool* compile,
+                                          std::string* error)
 {
     auto const start = Clock::now();
     progress::Scope kernelPhase(Phase::Kernel);
     progress::Detail(Phase::Kernel, "generating MDL shader code");
     const auto shared = gpu::CachedMdlShaderCode(data->mdlMaterials);
     gpu::MdlShaderCode const& code = *shared;
-    auto const generated = Clock::now();
     if (!code.success)
         std::cerr << "PrismRT Vulkan: MDL materials unavailable on the GPU (" << code.error << ")\n";
     gpu::ApplyMdlShaderCode(*data, code);
     mdlTextureCount = uint32_t(data->mdlTextures.size());
     upload(kSlotArgumentBlocks, code.argumentBlocks.data(), code.argumentBlocks.size());
     upload(kSlotRoData, code.roData.data(), code.roData.size());
+    prism::load_profile::Mark("vulkan.mdl_code", std::format("mdl_code_s={:.3f} translate_s={:.3f} programs={}",
+                                                            SecondsSince(start), code.translateSeconds,
+                                                            code.programCount));
+    *result = shared;
     // The same generated code (an edit that kept the materials) keeps its pipeline.
-    if (shared == pipelineCode && pipeline != VK_NULL_HANDLE) return true;
-    pipelineCode = nullptr;
-    callables = nullptr;
+    *compile = !(shared == pipelineCode && pipeline != VK_NULL_HANDLE);
+    if (*compile) {
+        pipeline = VK_NULL_HANDLE;
+        pipelineCode = nullptr;
+        callables = nullptr;
+    }
+    return true;
+}
+
+bool VulkanDevice::Impl::compilePipeline(std::shared_ptr<const gpu::MdlShaderCode> const& shared,
+                                         std::string* error)
+{
+    auto const start = Clock::now();
+    progress::Scope kernelPhase(Phase::Kernel);
+    gpu::MdlShaderCode const& code = *shared;
+    auto const generated = start;
     // Material sets too large for one kernel use the callable pipeline: above
     // the size threshold, when DXC was found unable to compile the kernel, or
     // when it fails now for lack of memory.
@@ -842,14 +875,12 @@ bool VulkanDevice::Impl::buildPipeline(std::string* error)
     pipelineCode = shared;
     if (statistics) vulkan::PrintPipelineStatistics(device, pipeline, "compute kernel");
     prism::load_profile::Mark("vulkan.pipeline",
-        std::format("mdl_code_s={:.3f} translate_s={:.3f} spirv_s={:.3f} pipeline_s={:.3f} programs={}",
-                    std::chrono::duration<double>(generated - start).count(), code.translateSeconds,
+        std::format("callables=0 spirv_s={:.3f} pipeline_s={:.3f} programs={}",
                     std::chrono::duration<double>(compiled - generated).count(), SecondsSince(compiled),
                     code.programCount));
     if (gpu::GpuVerbose())
-        std::cerr << std::format("PrismRT Vulkan: shader setup {:.1f} s (MDL code {:.1f} s, SPIR-V {:.1f} s, pipeline {:.1f} s)\n",
-                                 SecondsSince(start), std::chrono::duration<double>(generated - start).count(),
-                                 std::chrono::duration<double>(compiled - generated).count(),
+        std::cerr << std::format("PrismRT Vulkan: shader setup {:.1f} s (SPIR-V {:.1f} s, pipeline {:.1f} s)\n",
+                                 SecondsSince(start), std::chrono::duration<double>(compiled - generated).count(),
                                  SecondsSince(compiled));
     return true;
 }
@@ -866,20 +897,37 @@ bool VulkanDevice::Impl::buildCallablePipeline(std::shared_ptr<const gpu::MdlSha
     auto found = callablePipelines.find(key);
     if (found == callablePipelines.end()) {
         auto built = std::make_unique<vulkan::MaterialCallPipeline>(device, physical, rayTracing, pipelineCacheTag);
-        if (!built->build(code, pipelineLayout, reorder, error)) {
+        if (!built->build(code, pipelineLayout, reorder, *callableShaders, error)) {
             if (error) *error = "callable material pipeline: " + *error;
             return false;
         }
         found = callablePipelines.emplace(key, std::move(built)).first;
         auto const& r = found->second->report();
+        prism::load_profile::Mark("vulkan.pipeline",
+            std::format("callables=1 libraries={} programs={} dxc_compiled={} shaders_s={:.3f} dxc_max_s={:.3f} "
+                        "driver_max_s={:.3f} driver_sum_s={:.3f} libraries_compiled={} libraries_cached={} "
+                        "raygen_dxc={} raygen_dxc_s={:.3f} raygen_driver_s={:.3f} raygen_wait_s={:.3f} "
+                        "pipeline_s={:.3f} total_s={:.3f}",
+                        r.libraries ? 1 : 0, r.programs, r.compiled, r.shadersSeconds, r.dxcMaxSeconds,
+                        r.driverMaxSeconds, r.driverSumSeconds, r.librariesCompiled, r.librariesCached,
+                        r.raygenCompiled ? 1 : 0, r.raygenSeconds, r.raygenDriverSeconds, r.raygenWaitSeconds,
+                        r.pipelineSeconds, SecondsSince(start)));
         if (gpu::GpuVerbose())
             std::cerr << std::format(
-                "PrismRT Vulkan: callable pipeline {:.1f} s: {} of {} callables compiled (DXC wall {:.1f} s, "
-                "slowest {:.1f} s, peak {} MiB; raygen {:.1f} s, {} MiB), driver pipeline {:.1f} s ({}, "
-                "{} threads, +{} MiB commit)\n", SecondsSince(start), r.compiled, r.programs, r.dxcWallSeconds,
-                r.dxcMaxSeconds, r.dxcPeakBytes >> 20, r.raygenSeconds, r.raygenPeakBytes >> 20, r.pipelineSeconds,
-                r.pipelineCacheHit ? "pipeline cache hit" : "no pipeline cache", r.pipelineThreads,
-                r.pipelineCommitBytes >> 20);
+                "PrismRT Vulkan: callable pipeline {:.2f} s: {} programs, {} DXC compiles (slowest {:.1f} s, peak {} "
+                "MiB), shaders {:.2f} s; raygen {}, waited {:.2f} s; {} {:.3f} s{}\n",
+                SecondsSince(start), r.programs, r.compiled, r.dxcMaxSeconds, r.dxcPeakBytes >> 20, r.shadersSeconds,
+                r.raygenCompiled ? std::format("DXC {:.1f} s", r.raygenSeconds) : std::string("ready"),
+                r.raygenWaitSeconds,
+                r.libraries ? std::format("{} libraries compiled ({} from pipeline caches, slowest {:.2f} s, sum "
+                                          "{:.2f} s), link", r.librariesCompiled, r.librariesCached,
+                                          r.driverMaxSeconds, r.driverSumSeconds)
+                            : std::string("driver pipeline"),
+                r.pipelineSeconds,
+                r.libraries ? std::string()
+                            : std::format(" ({}, {} threads, +{} MiB commit)",
+                                          r.pipelineCacheHit ? "pipeline cache hit" : "no pipeline cache",
+                                          r.pipelineThreads, r.pipelineCommitBytes >> 20));
     }
     callables = found->second.get();
     pipeline = callables->pipeline();
@@ -1392,15 +1440,30 @@ bool VulkanDevice::Impl::ensureScene(SceneManager& scene, std::string* error)
     data = std::make_unique<GpuSceneData>(gpu::BuildGpuScene(scene));
     auto const sceneBuilt = Clock::now();
     for (auto const& warning : data->warnings) std::cerr << "PrismRT Vulkan: " << warning << '\n';
+    // The pipeline compiles while the scene uploads: it needs only the
+    // generated code, and the uploads do not touch the pipeline.
+    std::string compileError;
+    std::future<bool> compiled;
     auto fail = [&] {
+        if (compiled.valid()) compiled.wait();
         pipeline = VK_NULL_HANDLE;
         boundScene = nullptr;
         failedScene = &scene;
         failedError = error && !error->empty() ? *error : std::string("the scene could not be prepared");
         return false;
     };
-    if (!buildPipeline(error)) return fail();
+    std::shared_ptr<const gpu::MdlShaderCode> code;
+    bool compile = false;
+    if (!prepareMaterials(&code, &compile, error)) return fail();
     auto const piped = Clock::now();
+    if (compile)
+        compiled = std::async(std::launch::async, [this, code, &compileError] {
+            return compilePipeline(code, &compileError);
+        });
+    struct Join {
+        std::future<bool>& f;
+        ~Join() { if (f.valid()) f.wait(); }
+    } join{compiled};
     GpuSceneData const& d = *data;
     progress::Detail(Phase::Upload, "buffers");
     auto bytes = [](auto const& v) { return v.size() * sizeof(v[0]); };
@@ -1436,15 +1499,28 @@ bool VulkanDevice::Impl::ensureScene(SceneManager& scene, std::string* error)
     auto const imaged = Clock::now();
     progress::SetTotal(Phase::Upload, 0);
     progress::Detail(Phase::Upload, "acceleration structures");
-    if (!buildAccelerationStructures(error) || !writeDescriptors(error)) return fail();
+    if (!buildAccelerationStructures(error)) return fail();
+    auto const structured = Clock::now();
+    progress::Detail(Phase::Upload, "waiting for the shaders");
+    if (compiled.valid() && !compiled.get()) {
+        if (error) *error = compileError;
+        return fail();
+    }
+    if (!pipeline) {
+        if (error && error->empty()) *error = "no pipeline";
+        return fail();
+    }
+    auto const shadersReady = Clock::now();
+    if (!writeDescriptors(error)) return fail();
     prism::load_profile::Mark("vulkan.scene",
-        std::format("total_s={:.3f} gpu_scene_s={:.3f} pipeline_s={:.3f} buffers_s={:.3f} images_s={:.3f} "
-                    "acceleration_s={:.3f} images={}",
+        std::format("total_s={:.3f} gpu_scene_s={:.3f} mdl_code_s={:.3f} buffers_s={:.3f} images_s={:.3f} "
+                    "acceleration_s={:.3f} shader_wait_s={:.3f} images={}",
                     SecondsSince(sceneStart), std::chrono::duration<double>(sceneBuilt - sceneStart).count(),
                     std::chrono::duration<double>(piped - sceneBuilt).count(),
                     std::chrono::duration<double>(uploaded - piped).count(),
-                    std::chrono::duration<double>(imaged - uploaded).count(), SecondsSince(imaged),
-                    d.images.size()));
+                    std::chrono::duration<double>(imaged - uploaded).count(),
+                    std::chrono::duration<double>(structured - imaged).count(),
+                    std::chrono::duration<double>(shadersReady - structured).count(), d.images.size()));
     if (gpu::GpuVerbose())
         std::cerr << std::format("PrismRT Vulkan: scene {:.3f} s (buffers {:.3f}, images {:.3f}, "
                                  "acceleration structures {:.3f}; {} prototypes, {} instances)\n",

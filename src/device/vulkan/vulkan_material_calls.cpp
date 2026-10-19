@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -130,12 +131,51 @@ private:
 
 uint32_t AlignUp(uint32_t value, uint32_t alignment) { return (value + alignment - 1) / alignment * alignment; }
 
-// DXC processes run at once for the callables (PRISM_DXC_JOBS; each is
-// memory capped by PRISM_DXC_MEMORY_MIB).
+// DXC processes run at once (PRISM_DXC_JOBS; each is memory capped by
+// PRISM_DXC_MEMORY_MIB).
 unsigned DxcJobs()
 {
     if (const char* value = Setting("PRISM_DXC_JOBS")) return unsigned(std::max(1, std::atoi(value)));
     return std::clamp(std::thread::hardware_concurrency() / 4u, 1u, 4u);
+}
+
+// Shaders compiled at once, DXC and driver (PRISM_VULKAN_COMPILE_THREADS).
+// The driver compiles each library on the calling thread.
+unsigned CompileThreads()
+{
+    if (const char* value = Setting("PRISM_VULKAN_COMPILE_THREADS")) return unsigned(std::max(1, std::atoi(value)));
+    return std::clamp(std::thread::hardware_concurrency(), 1u, 16u);
+}
+
+// Limits the DXC processes running at once.
+class DxcSlots {
+public:
+    explicit DxcSlots(unsigned count) : m_free(count) {}
+    void acquire()
+    {
+        std::unique_lock lock(m_mutex);
+        m_ready.wait(lock, [&] { return m_free > 0; });
+        --m_free;
+    }
+    void release()
+    {
+        {
+            std::lock_guard lock(m_mutex);
+            ++m_free;
+        }
+        m_ready.notify_one();
+    }
+
+private:
+    std::mutex m_mutex;
+    std::condition_variable m_ready;
+    unsigned m_free;
+};
+
+DxcSlots& Dxc()
+{
+    static DxcSlots slots(DxcJobs());
+    return slots;
 }
 
 const gpu::HlslStage kLibraryStage{kMaterialCallProfile, ""};
@@ -155,22 +195,69 @@ bool PipelineCacheSetting()
     return !value || std::strcmp(value, "0") != 0;
 }
 
+// A VkPipelineCache with the data of `file` (empty if missing or rejected).
+VkPipelineCache LoadPipelineCache(VkDevice device, std::filesystem::path const& file, size_t* loadedBytes)
+{
+    const std::vector<char> data = PipelineCacheSetting() ? ReadFile(file) : std::vector<char>();
+    *loadedBytes = data.size();
+    VkPipelineCacheCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+    info.initialDataSize = data.size();
+    info.pInitialData = data.empty() ? nullptr : data.data();
+    VkPipelineCache cache = VK_NULL_HANDLE;
+    if (vkCreatePipelineCache(device, &info, nullptr, &cache) == VK_SUCCESS) return cache;
+    *loadedBytes = 0;
+    info.initialDataSize = 0;
+    info.pInitialData = nullptr;
+    return vkCreatePipelineCache(device, &info, nullptr, &cache) == VK_SUCCESS ? cache : VK_NULL_HANDLE;
+}
+
+// Stores `cache` in `file` if it grew, and destroys it.
+void StorePipelineCache(VkDevice device, VkPipelineCache cache, std::filesystem::path const& file,
+                        size_t loadedBytes, bool succeeded)
+{
+    if (!cache) return;
+    size_t size = 0;
+    if (succeeded && vkGetPipelineCacheData(device, cache, &size, nullptr) == VK_SUCCESS && size > 0 &&
+        size != loadedBytes) {
+        std::vector<char> data(size);
+        if (vkGetPipelineCacheData(device, cache, &size, data.data()) == VK_SUCCESS)
+            WriteFileAtomically(file, data.data(), size);
+    }
+    vkDestroyPipelineCache(device, cache, nullptr);
+}
+
+// Libraries hold no ray payloads or hit attributes: the raygen shader traces
+// with ray queries and calls the materials with callable data.
+const VkRayTracingPipelineInterfaceCreateInfoKHR kLibraryInterface{
+    VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_INTERFACE_CREATE_INFO_KHR, nullptr, 0, 0};
+
+std::string SpirvDigest(std::vector<uint32_t> const& spirv)
+{
+    return gpu::SourceDigest(std::string(reinterpret_cast<const char*>(spirv.data()), spirv.size() * 4));
+}
+
 } // namespace
+
+bool RaygenSource(bool reorder, uint32_t programs, std::string* source, std::string* error)
+{
+    std::string defines = "#define PRISM_CALL_MATERIALS 1\n" + ShaderSaltDefine();
+    if (reorder) {
+        uint32_t bits = 1;
+        while ((1u << bits) < programs && bits < 16) ++bits;
+        defines += std::format("#define PRISM_REORDER_MATERIALS 1\n#define PRISM_REORDER_HINT_BITS {}u\n", bits);
+    }
+    if (!gpu::AssembleShader("gpu/kernel.hlsl", {"gpu/vulkan"}, std::string(), source, error)) return false;
+    *source = defines + *source;
+    return true;
+}
 
 bool MaterialCallSources(gpu::MdlShaderCode const& code, bool reorder, std::vector<std::string>* sources,
                          std::string* error)
 {
     const uint32_t programs = uint32_t(code.programDispatch.size());
     sources->assign(programs + 1, std::string());
+    if (!RaygenSource(reorder, programs, &(*sources)[0], error)) return false;
     const std::string salt = ShaderSaltDefine();
-    std::string defines = "#define PRISM_CALL_MATERIALS 1\n" + salt;
-    if (reorder) {
-        uint32_t bits = 1;
-        while ((1u << bits) < programs && bits < 16) ++bits;
-        defines += std::format("#define PRISM_REORDER_MATERIALS 1\n#define PRISM_REORDER_HINT_BITS {}u\n", bits);
-    }
-    if (!gpu::AssembleShader("gpu/kernel.hlsl", {"gpu/vulkan"}, std::string(), &(*sources)[0], error)) return false;
-    (*sources)[0] = defines + (*sources)[0];
     for (uint32_t p = 0; p < programs; ++p) {
         const std::string mdl = code.targetCode + code.programDispatch[p] + code.sceneData;
         if (!gpu::AssembleShader("gpu/vulkan/material_callable.hlsl", {"gpu/vulkan"}, mdl, &(*sources)[p + 1],
@@ -210,6 +297,12 @@ bool ReorderSetting()
 {
     const char* value = Setting("PRISM_VULKAN_REORDER");
     return value && std::strcmp(value, "0") != 0;
+}
+
+bool PipelineLibrariesSetting()
+{
+    const char* value = Setting("PRISM_VULKAN_PIPELINE_LIBRARIES");
+    return !value || std::strcmp(value, "0") != 0;
 }
 
 bool PipelineStatisticsSetting()
@@ -260,6 +353,149 @@ void PrintPipelineStatistics(VkDevice device, VkPipeline pipeline, std::string c
         }
         std::cerr << line << '\n';
     }
+}
+
+MaterialCallShaders::MaterialCallShaders(VkDevice device, RayTracingSupport const& support, VkPipelineLayout layout,
+                                         std::string pipelineCacheTag)
+    : m_device(device), m_support(support), m_layout(layout), m_cacheTag(std::move(pipelineCacheTag))
+{
+    m_createPipelines = reinterpret_cast<PFN_vkCreateRayTracingPipelinesKHR>(
+        vkGetDeviceProcAddr(device, "vkCreateRayTracingPipelinesKHR"));
+    // Statistics are captured on whole pipelines only.
+    m_libraries = support.pipeline && support.library && m_createPipelines && PipelineLibrariesSetting() &&
+        !(support.executableStatistics && PipelineStatisticsSetting());
+}
+
+MaterialCallShaders::~MaterialCallShaders()
+{
+    if (m_prewarm.valid()) m_prewarm.wait();
+    std::lock_guard lock(m_mutex);
+    for (auto& [key, future] : m_shaders) {
+        auto const& built = future.get();
+        if (built && built->library) vkDestroyPipeline(m_device, built->library, nullptr);
+    }
+}
+
+void MaterialCallShaders::prewarmRaygen()
+{
+    if (m_prewarm.valid() || !m_libraries) return;
+    m_prewarm = std::async(std::launch::async, [this] {
+        std::string source, error;
+        if (RaygenSource(false, 0, &source, &error)) (void)shader(source, true);
+    });
+}
+
+std::shared_ptr<const ShaderBuild> MaterialCallShaders::shader(std::string const& source, bool raygen)
+{
+    const std::string key = gpu::SourceDigest(source + gpu::HlslCompilerSignature(gpu::HlslTarget::Spirv,
+                                                                                  kLibraryStage));
+    const auto start = Clock::now();
+    // Without libraries the SPIR-V cache is enough: nothing is kept.
+    if (!m_libraries) return compile(source, raygen);
+    std::promise<std::shared_ptr<const ShaderBuild>> promise;
+    std::shared_future<std::shared_ptr<const ShaderBuild>> earlier;
+    {
+        std::lock_guard lock(m_mutex);
+        if (auto found = m_shaders.find(key); found != m_shaders.end()) earlier = found->second;
+        else m_shaders.emplace(key, promise.get_future().share());
+    }
+    if (earlier.valid()) {
+        // Compiled (or compiling) for an earlier request: no work for this one.
+        auto const& built = earlier.get();
+        auto reused = std::make_shared<ShaderBuild>();
+        reused->library = built->library;
+        reused->error = built->error;
+        reused->readySeconds = SecondsSince(start);
+        if (!built->error.empty()) {
+            // A failed compile is tried again by the next request.
+            std::lock_guard lock(m_mutex);
+            m_shaders.erase(key);
+        }
+        return reused;
+    }
+    auto built = compile(source, raygen);
+    built->readySeconds = SecondsSince(start);
+    promise.set_value(built);
+    return built;
+}
+
+std::shared_ptr<ShaderBuild> MaterialCallShaders::compile(std::string const& source, bool raygen)
+{
+    auto built = std::make_shared<ShaderBuild>();
+    const auto directory = gpu::ShaderCacheDirectory("vulkan");
+    const auto cached = directory /
+        (gpu::SourceDigest(source + gpu::HlslCompilerSignature(gpu::HlslTarget::Spirv, kLibraryStage)) + ".spv");
+    std::vector<char> bytes = ReadFile(cached);
+    if (bytes.empty() || bytes.size() % 4 != 0) {
+        gpu::HlslCompileStats stats;
+        std::string reason;
+        Dxc().acquire();
+        const bool ok = gpu::CompileHlsl(source, gpu::HlslTarget::Spirv, directory, &bytes, &reason, kLibraryStage,
+                                         &stats);
+        Dxc().release();
+        built->dxcCompiled = true;
+        built->dxcSeconds = stats.seconds;
+        built->dxcPeakBytes = stats.peakBytes;
+        if (gpu::GpuVerbose())
+            std::cerr << std::format("PrismRT Vulkan: DXC {} {:.1f} s, peak {} MiB, {} KB SPIR-V\n",
+                                     raygen ? "raygen" : "callable", stats.seconds, stats.peakBytes >> 20,
+                                     bytes.size() >> 10);
+        if (!ok || bytes.empty() || bytes.size() % 4 != 0) {
+            built->error = (raygen ? std::string("raygen shader: ") : std::string("material callable: ")) + reason;
+            return built;
+        }
+        WriteFileAtomically(cached, bytes.data(), bytes.size());
+    }
+    built->spirv.resize(bytes.size() / 4);
+    std::memcpy(built->spirv.data(), bytes.data(), bytes.size());
+    if (!m_libraries) return built;
+
+    // The library: one stage, one general group.
+    VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    moduleInfo.codeSize = bytes.size();
+    moduleInfo.pCode = built->spirv.data();
+    VkShaderModule module = VK_NULL_HANDLE;
+    if (vkCreateShaderModule(m_device, &moduleInfo, nullptr, &module) != VK_SUCCESS) {
+        built->error = "cannot create a ray tracing shader module";
+        return built;
+    }
+    VkPipelineShaderStageCreateInfo stage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    stage.stage = raygen ? VK_SHADER_STAGE_RAYGEN_BIT_KHR : VK_SHADER_STAGE_CALLABLE_BIT_KHR;
+    stage.module = module;
+    stage.pName = raygen ? "raygen" : "material";
+    VkRayTracingShaderGroupCreateInfoKHR group{VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR};
+    group.type = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
+    group.generalShader = 0;
+    group.closestHitShader = VK_SHADER_UNUSED_KHR;
+    group.anyHitShader = VK_SHADER_UNUSED_KHR;
+    group.intersectionShader = VK_SHADER_UNUSED_KHR;
+    VkRayTracingPipelineCreateInfoKHR info{VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CREATE_INFO_KHR};
+    info.flags = VK_PIPELINE_CREATE_LIBRARY_BIT_KHR;
+    info.stageCount = 1;
+    info.pStages = &stage;
+    info.groupCount = 1;
+    info.pGroups = &group;
+    info.maxPipelineRayRecursionDepth = 1;
+    info.pLibraryInterface = &kLibraryInterface;
+    info.layout = m_layout;
+    const auto cacheFile = directory / (SpirvDigest(built->spirv) + "-lib-" + m_cacheTag + ".vkpc");
+    size_t loaded = 0;
+    VkPipelineCache cache = LoadPipelineCache(m_device, cacheFile, &loaded);
+    built->driverCacheHit = loaded > 0;
+    const auto start = Clock::now();
+    const VkResult result = m_createPipelines(m_device, VK_NULL_HANDLE, cache, 1, &info, nullptr, &built->library);
+    built->driverSeconds = SecondsSince(start);
+    vkDestroyShaderModule(m_device, module, nullptr);
+    StorePipelineCache(m_device, cache, cacheFile, loaded, result == VK_SUCCESS);
+    if (gpu::GpuVerbose())
+        std::cerr << std::format("PrismRT Vulkan: library {} {:.2f} s{}\n", raygen ? "raygen" : "callable",
+                                 built->driverSeconds, built->driverCacheHit ? " (pipeline cache)" : "");
+    if (result != VK_SUCCESS) {
+        built->library = VK_NULL_HANDLE;
+        built->error = std::format("cannot create a {} pipeline library (VkResult {})",
+                                   raygen ? "raygen" : "callable", int(result));
+    }
+    return built;
 }
 
 MaterialCallPipeline::MaterialCallPipeline(VkDevice device, VkPhysicalDevice physical,
@@ -315,101 +551,120 @@ MaterialCallPipeline::~MaterialCallPipeline()
     if (m_tableMemory) vkFreeMemory(m_device, m_tableMemory, nullptr);
 }
 
-bool MaterialCallPipeline::compileShaders(gpu::MdlShaderCode const& code, bool reorder,
-                                          std::vector<std::vector<uint32_t>>* modules, std::string* error)
-{
-    const uint32_t programs = uint32_t(code.programDispatch.size());
-    std::vector<std::string> sources;
-    if (!MaterialCallSources(code, reorder, &sources, error)) return false;
-    const auto directory = gpu::ShaderCacheDirectory("vulkan");
-    const std::string signature = gpu::HlslCompilerSignature(gpu::HlslTarget::Spirv, kLibraryStage);
-    std::vector<std::filesystem::path> cached(sources.size());
-    std::vector<size_t> missing;
-    modules->assign(sources.size(), {});
-    for (size_t i = 0; i < sources.size(); ++i) {
-        cached[i] = directory / (gpu::SourceDigest(sources[i] + signature) + ".spv");
-        const std::vector<char> bytes = ReadFile(cached[i]);
-        if (bytes.empty() || bytes.size() % 4 != 0) {
-            missing.push_back(i);
-            continue;
-        }
-        (*modules)[i].resize(bytes.size() / 4);
-        std::memcpy((*modules)[i].data(), bytes.data(), bytes.size());
-    }
-    m_report.programs = programs;
-    m_report.compiled = uint32_t(std::count_if(missing.begin(), missing.end(), [](size_t i) { return i > 0; }));
-    if (missing.empty()) return true;
-    std::cerr << std::format("PrismRT Vulkan: compiling {} of {} material callables and {} raygen shader "
-                             "({} DXC jobs); this happens once per material set\n",
-                             m_report.compiled, programs, missing.front() == 0 ? "the" : "no", DxcJobs());
-    progress::Detail(Phase::Kernel, std::format("DXC to SPIR-V, {} callables", missing.size()));
-    std::mutex mutex;
-    std::string firstError;
-    std::atomic<size_t> done{0};
-    const auto start = Clock::now();
-    tbb::task_arena arena{int(DxcJobs())};
-    arena.execute([&] {
-        tbb::parallel_for(size_t(0), missing.size(), size_t(1), [&](size_t m) {
-            const size_t i = missing[m];
-            std::vector<char> bytes;
-            std::string reason;
-            gpu::HlslCompileStats stats;
-            const bool ok = gpu::CompileHlsl(sources[i], gpu::HlslTarget::Spirv, directory, &bytes, &reason,
-                                             kLibraryStage, &stats);
-            std::lock_guard lock(mutex);
-            if (i == 0) {
-                m_report.raygenSeconds = stats.seconds;
-                m_report.raygenPeakBytes = stats.peakBytes;
-            } else {
-                m_report.dxcMaxSeconds = std::max(m_report.dxcMaxSeconds, stats.seconds);
-                m_report.dxcPeakBytes = std::max(m_report.dxcPeakBytes, stats.peakBytes);
-            }
-            if (gpu::GpuVerbose())
-                std::cerr << std::format("PrismRT Vulkan: DXC {} {:.1f} s, peak {} MiB, {} KB SPIR-V\n",
-                                         i == 0 ? std::string("raygen") : std::format("callable {}", i - 1),
-                                         stats.seconds, stats.peakBytes >> 20, bytes.size() >> 10);
-            progress::Detail(Phase::Kernel, std::format("DXC to SPIR-V, callable {} of {}", ++done, missing.size()));
-            if (!ok) {
-                if (firstError.empty())
-                    firstError = (i == 0 ? std::string("raygen shader: ") : std::format("material callable {}: ", i - 1))
-                        + reason;
-                return;
-            }
-            WriteFileAtomically(cached[i], bytes.data(), bytes.size());
-            (*modules)[i].resize(bytes.size() / 4);
-            std::memcpy((*modules)[i].data(), bytes.data(), bytes.size());
-        });
-    });
-    m_report.dxcWallSeconds = SecondsSince(start);
-    if (!firstError.empty()) {
-        if (error) *error = firstError;
-        return false;
-    }
-    return true;
-}
-
 bool MaterialCallPipeline::build(gpu::MdlShaderCode const& code, VkPipelineLayout layout, bool reorder,
-                                 std::string* error)
+                                 MaterialCallShaders& shaderSet, std::string* error)
 {
     if (!m_createPipelines || !m_groupHandles || !m_traceRays) {
         if (error) *error = "ray tracing pipeline functions unavailable";
         return false;
     }
-    std::vector<std::vector<uint32_t>> modules;
-    if (!compileShaders(code, reorder, &modules, error)) return false;
-
+    std::vector<std::string> sources;
+    if (!MaterialCallSources(code, reorder, &sources, error)) return false;
+    const uint32_t programs = uint32_t(sources.size() - 1);
+    m_report.programs = programs;
+    m_report.libraries = shaderSet.libraries();
+    progress::Detail(Phase::Kernel, std::format("compiling {} material callables", programs));
+    if (gpu::GpuVerbose())
+        std::cerr << std::format("PrismRT Vulkan: preparing {} material callables ({} DXC jobs, {} compile threads, "
+                                 "{})\n", programs, DxcJobs(), CompileThreads(),
+                                 shaderSet.libraries() ? "pipeline libraries" : "one pipeline");
+    // Callables first, the raygen shader (usually compiling since device creation) last.
+    std::vector<std::shared_ptr<const ShaderBuild>> shaders(sources.size());
+    std::atomic<size_t> done{0};
+    const auto start = Clock::now();
+    tbb::task_arena arena{int(CompileThreads())};
+    arena.execute([&] {
+        tbb::parallel_for(size_t(1), sources.size(), size_t(1), [&](size_t i) {
+            shaders[i] = shaderSet.shader(sources[i], false);
+            progress::Detail(Phase::Kernel, std::format("material callable {} of {}", ++done, programs));
+        });
+    });
+    const auto callablesReady = Clock::now();
+    shaders[0] = shaderSet.shader(sources[0], true);
+    m_report.raygenWaitSeconds = SecondsSince(callablesReady);
+    m_report.shadersSeconds = SecondsSince(start);
+    for (size_t i = 0; i < shaders.size(); ++i) {
+        ShaderBuild const& s = *shaders[i];
+        if (!s.error.empty()) {
+            if (error) *error = s.error;
+            return false;
+        }
+        if (i == 0) {
+            m_report.raygenCompiled = s.dxcCompiled;
+            m_report.raygenSeconds = s.dxcSeconds;
+            m_report.raygenPeakBytes = s.dxcPeakBytes;
+            m_report.raygenDriverSeconds = s.driverSeconds;
+            continue;
+        }
+        if (s.dxcCompiled) ++m_report.compiled;
+        m_report.dxcMaxSeconds = std::max(m_report.dxcMaxSeconds, s.dxcSeconds);
+        m_report.dxcPeakBytes = std::max(m_report.dxcPeakBytes, s.dxcPeakBytes);
+        if (s.driverSeconds > 0.0) {
+            ++m_report.librariesCompiled;
+            if (s.driverCacheHit) ++m_report.librariesCached;
+        }
+        m_report.driverMaxSeconds = std::max(m_report.driverMaxSeconds, s.driverSeconds);
+        m_report.driverSumSeconds += s.driverSeconds;
+    }
     progress::Detail(Phase::Kernel, "creating the Vulkan ray tracing pipeline");
-    std::vector<VkShaderModule> shaderModules(modules.size(), VK_NULL_HANDLE);
-    std::vector<VkPipelineShaderStageCreateInfo> stages(modules.size());
-    std::vector<VkRayTracingShaderGroupCreateInfoKHR> groups(modules.size());
+    const bool created = shaderSet.libraries() ? link(shaders, layout, error) : createMonolithic(shaders, layout, error);
+    if (created && gpu::GpuVerbose()) {
+        auto stackSize = reinterpret_cast<PFN_vkGetRayTracingShaderGroupStackSizeKHR>(
+            vkGetDeviceProcAddr(m_device, "vkGetRayTracingShaderGroupStackSizeKHR"));
+        if (stackSize) {
+            VkDeviceSize callableMax = 0;
+            for (uint32_t g = 1; g < shaders.size(); ++g)
+                callableMax = std::max(callableMax,
+                                       stackSize(m_device, m_pipeline, g, VK_SHADER_GROUP_SHADER_GENERAL_KHR));
+            std::cerr << std::format("PrismRT Vulkan: stack raygen {} B, largest callable {} B\n",
+                                     stackSize(m_device, m_pipeline, 0, VK_SHADER_GROUP_SHADER_GENERAL_KHR),
+                                     callableMax);
+        }
+    }
+    return created && createBindingTable(uint32_t(shaders.size()), error);
+}
+
+bool MaterialCallPipeline::link(std::vector<std::shared_ptr<const ShaderBuild>> const& shaders,
+                                VkPipelineLayout layout, std::string* error)
+{
+    // Groups of the linked pipeline follow the libraries: raygen, then the programs in order.
+    std::vector<VkPipeline> libraries;
+    for (auto const& s : shaders) libraries.push_back(s->library);
+    VkPipelineLibraryCreateInfoKHR libraryInfo{VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR};
+    libraryInfo.libraryCount = uint32_t(libraries.size());
+    libraryInfo.pLibraries = libraries.data();
+    VkRayTracingPipelineCreateInfoKHR info{VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CREATE_INFO_KHR};
+    info.maxPipelineRayRecursionDepth = 1;
+    info.pLibraryInfo = &libraryInfo;
+    info.pLibraryInterface = &kLibraryInterface;
+    info.layout = layout;
+    const auto start = Clock::now();
+    const VkResult result = m_createPipelines(m_device, VK_NULL_HANDLE, VK_NULL_HANDLE, 1, &info, nullptr,
+                                              &m_pipeline);
+    m_report.pipelineSeconds = SecondsSince(start);
+    if (result != VK_SUCCESS) {
+        m_pipeline = VK_NULL_HANDLE;
+        if (error) *error = std::format("cannot link the ray tracing pipeline (VkResult {})", int(result));
+        return false;
+    }
+    return true;
+}
+
+bool MaterialCallPipeline::createMonolithic(std::vector<std::shared_ptr<const ShaderBuild>> const& shaders,
+                                            VkPipelineLayout layout, std::string* error)
+{
+    std::vector<VkShaderModule> shaderModules(shaders.size(), VK_NULL_HANDLE);
+    std::vector<VkPipelineShaderStageCreateInfo> stages(shaders.size());
+    std::vector<VkRayTracingShaderGroupCreateInfoKHR> groups(shaders.size());
     std::string digests;
     bool created = true;
-    for (size_t i = 0; i < modules.size(); ++i) {
+    for (size_t i = 0; i < shaders.size(); ++i) {
+        auto const& spirv = shaders[i]->spirv;
         VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-        moduleInfo.codeSize = modules[i].size() * 4;
-        moduleInfo.pCode = modules[i].data();
+        moduleInfo.codeSize = spirv.size() * 4;
+        moduleInfo.pCode = spirv.data();
         created = created && vkCreateShaderModule(m_device, &moduleInfo, nullptr, &shaderModules[i]) == VK_SUCCESS;
-        digests += gpu::SourceDigest(std::string(reinterpret_cast<const char*>(modules[i].data()), moduleInfo.codeSize));
+        digests += SpirvDigest(spirv);
         stages[i] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
         stages[i].stage = i == 0 ? VK_SHADER_STAGE_RAYGEN_BIT_KHR : VK_SHADER_STAGE_CALLABLE_BIT_KHR;
         stages[i].module = shaderModules[i];
@@ -441,43 +696,26 @@ bool MaterialCallPipeline::build(gpu::MdlShaderCode const& code, VkPipelineLayou
     info.maxPipelineRayRecursionDepth = 1;
     info.layout = layout;
 
-    // The driver translates every callable here; keep its result for later runs.
+    // The driver translates every shader here; keep its result for later runs.
     const auto cacheFile = gpu::ShaderCacheDirectory("vulkan") /
         (gpu::SourceDigest(digests + (statistics ? "|stats" : "")) + "-" + m_cacheTag + ".vkpc");
-    const std::vector<char> cacheData = PipelineCacheSetting() ? ReadFile(cacheFile) : std::vector<char>();
-    m_report.pipelineCacheHit = !cacheData.empty();
-    VkPipelineCacheCreateInfo cacheInfo{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
-    cacheInfo.initialDataSize = cacheData.size();
-    cacheInfo.pInitialData = cacheData.empty() ? nullptr : cacheData.data();
-    VkPipelineCache cache = VK_NULL_HANDLE;
-    if (vkCreatePipelineCache(m_device, &cacheInfo, nullptr, &cache) != VK_SUCCESS) {
-        cacheInfo.initialDataSize = 0;
-        cacheInfo.pInitialData = nullptr;
-        if (vkCreatePipelineCache(m_device, &cacheInfo, nullptr, &cache) != VK_SUCCESS) cache = VK_NULL_HANDLE;
-    }
+    size_t loaded = 0;
+    VkPipelineCache cache = LoadPipelineCache(m_device, cacheFile, &loaded);
+    m_report.pipelineCacheHit = loaded > 0;
     const auto start = Clock::now();
     CommitSampler commit;
     const VkResult result = createPipeline(info, cache);
     m_report.pipelineCommitBytes = commit.stop();
     m_report.pipelineSeconds = SecondsSince(start);
     destroyModules();
-    if (cache) {
-        size_t size = 0;
-        if (result == VK_SUCCESS && vkGetPipelineCacheData(m_device, cache, &size, nullptr) == VK_SUCCESS &&
-            size > 0 && size != cacheData.size()) {
-            std::vector<char> data(size);
-            if (vkGetPipelineCacheData(m_device, cache, &size, data.data()) == VK_SUCCESS)
-                WriteFileAtomically(cacheFile, data.data(), size);
-        }
-        vkDestroyPipelineCache(m_device, cache, nullptr);
-    }
+    StorePipelineCache(m_device, cache, cacheFile, loaded, result == VK_SUCCESS);
     if (result != VK_SUCCESS) {
         m_pipeline = VK_NULL_HANDLE;
         if (error) *error = std::format("cannot create the ray tracing pipeline (VkResult {})", int(result));
         return false;
     }
     if (statistics) PrintPipelineStatistics(m_device, m_pipeline, "callable pipeline");
-    return createBindingTable(uint32_t(groups.size()), error);
+    return true;
 }
 
 bool MaterialCallPipeline::createBindingTable(uint32_t groups, std::string* error)
