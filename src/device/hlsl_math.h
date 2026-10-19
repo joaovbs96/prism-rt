@@ -75,6 +75,7 @@ using std::pow;
 using std::round;
 using std::sin;
 using std::sqrt;
+using std::tan;
 using std::trunc;
 
 inline float min(float a, float b) { return std::fmin(a, b); }

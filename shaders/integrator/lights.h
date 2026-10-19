@@ -242,6 +242,54 @@ inline float3 sampleSphericalRect(SphericalRect r, float2 u)
     return r.x * xu + r.y * yv + r.z * r.z0;
 }
 
+// Cylinder lights are sampled on the arc a shading point sees (outside the
+// cylinder, the points within acos(r / d) of the direction to it, d its
+// distance from the axis) and, along the axis, in proportion to the solid
+// angle of the axis segment (equiangular). Both depend on the shading point
+// only through d and its position along the axis.
+struct CylinderFrame {
+    float3 axis;      // unit
+    float3 e1;        // unit, from the axis toward the shading point
+    float3 e2;
+    float halfLength;
+    float radius;
+    float along;      // shading point's coordinate along the axis
+    float distance;   // shading point's distance from the axis
+    float alpha;      // half angle of the visible arc
+    float thetaA;     // angles of the segment's ends seen from the axis point nearest p
+    float thetaB;
+    bool valid;       // outside the cylinder, non-degenerate
+};
+
+inline CylinderFrame cylinderFrame(LightRecord light, float3 p)
+{
+    CylinderFrame c;
+    const float3 axisVector = xyz(light.u);
+    c.halfLength = length(axisVector);
+    c.radius = length(xyz(light.v));
+    c.axis = axisVector / max(c.halfLength, 1e-30f);
+    const float3 rel = p - xyz(light.p0);
+    c.along = dot(rel, c.axis);
+    const float3 perpendicular = rel - c.axis * c.along;
+    c.distance = length(perpendicular);
+    c.valid = c.halfLength > 0.0f && c.radius > 0.0f && c.distance > c.radius;
+    c.e1 = perpendicular / max(c.distance, 1e-30f);
+    c.e2 = cross(c.axis, c.e1);
+    c.alpha = acos(clamp(c.radius / max(c.distance, 1e-30f), 0.0f, 1.0f));
+    c.thetaA = atan2(-c.halfLength - c.along, c.distance);
+    c.thetaB = atan2(c.halfLength - c.along, c.distance);
+    c.valid = c.valid && c.alpha > 0.0f && c.thetaB > c.thetaA;
+    return c;
+}
+
+// Density per unit area of the point at axial coordinate t on the visible arc.
+inline float cylinderPdfArea(CylinderFrame c, float t)
+{
+    const float h = t - c.along;
+    const float pdfT = c.distance / ((c.thetaB - c.thetaA) * (c.distance * c.distance + h * h));
+    return pdfT / (2.0f * c.alpha * c.radius);
+}
+
 // Texture coordinates of a point on a rect light, in image space (top row
 // first): UsdLuxRectLight puts the texture's (0, 0) at local (+X, +Y).
 inline float2 rectTexcoord(float a, float b) { return float2(0.5f * (1.0f - a), 0.5f * (1.0f + b)); }
@@ -318,13 +366,27 @@ inline LightSampleTextured sampleLight(LightRecord light, float3 p, float2 u)
         return result;
     }
     if (type == kLightCylinder) {
-        const float3 axis = xyz(light.u);
-        const float3 r1 = xyz(light.v);
-        const float3 r2 = normalize(cross(axis, r1)) * length(r1);
-        const float phi = 2.0f * kPi * u.y;
-        const float3 radial = r1 * cos(phi) + r2 * sin(phi);
-        const float3 q = xyz(light.p0) + axis * (2.0f * u.x - 1.0f) + radial;
-        result.sample = areaSample(light, p, q, normalize(radial), radiance);
+        const CylinderFrame c = cylinderFrame(light, p);
+        if (!c.valid) return result; // inside: the surface emits outward only
+        const float phi = (2.0f * u.y - 1.0f) * c.alpha;
+        const float3 normal = c.e1 * cos(phi) + c.e2 * sin(phi);
+        const float theta = c.thetaA + u.x * (c.thetaB - c.thetaA);
+        const float t = clamp(c.along + c.distance * tan(theta), -c.halfLength, c.halfLength);
+        const float3 q = xyz(light.p0) + c.axis * t + normal * c.radius;
+        LightSample s = invalidLightSample();
+        const float3 d = q - p;
+        const float dist2 = dot(d, d);
+        if (!(dist2 > 0.0f)) return result;
+        const float dist = sqrt(dist2);
+        s.wi = d / dist;
+        const float cosLight = -dot(normal, s.wi);
+        if (!(cosLight > 0.0f)) return result;
+        s.pdf = cylinderPdfArea(c, t) * dist2 / cosLight;
+        s.radiance = radiance;
+        s.distance = dist;
+        s.delta = false;
+        s.valid = s.pdf > 0.0f && isfinite(s.pdf);
+        result.sample = s;
         return result;
     }
     if (type == kLightTriangle) {
@@ -463,11 +525,13 @@ inline LightHitTextured intersectLight(LightRecord light, Ray ray, float tmax)
         if (abs(dot(q, axis)) > halfLength) return result;
         const float3 nq = normalize(q - axis * dot(q, axis));
         const float cosLight = -dot(nq, d);
-        if (!(cosLight > 0.0f) || !(light.v.w > 0.0f)) return result;
+        if (!(cosLight > 0.0f)) return result;
+        const CylinderFrame frame = cylinderFrame(light, o);
+        if (!frame.valid) return result;
         result.hit.hit = true;
         result.hit.t = t;
         result.hit.radiance = radiance;
-        result.hit.pdf = t * t / (cosLight * light.v.w);
+        result.hit.pdf = cylinderPdfArea(frame, dot(q, axis)) * t * t / cosLight;
         return result;
     }
     return result;
