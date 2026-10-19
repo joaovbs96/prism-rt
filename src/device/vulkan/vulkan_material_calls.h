@@ -17,6 +17,7 @@
 #include <vulkan/vulkan.h>
 
 #include <cstdint>
+#include <filesystem>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -62,6 +63,19 @@ std::string ShaderSaltDefine();
 // Whether to print the driver's per-shader statistics (PRISM_VULKAN_PIPELINE_STATS=1).
 bool PipelineStatisticsSetting();
 
+// Shader cache files (SPIR-V, pipeline cache data). They are written whole
+// (a flushed temporary file renamed over the old one) with a trailer of their
+// size and digest; a file whose trailer does not match (torn by a crash, or
+// of an older format) reads as empty and is compiled again. `extra` is a
+// value stored with the data.
+void WriteCacheFile(std::filesystem::path const& path, void const* data, size_t size, uint64_t extra = 0);
+std::vector<char> ReadCacheFile(std::filesystem::path const& path, uint64_t* extra = nullptr);
+// Word-aligned bytes that start with the SPIR-V magic number.
+bool PlausibleSpirv(std::vector<char> const& bytes);
+// Pipeline cache data whose header (VkPipelineCacheHeaderVersionOne) names
+// this device and its pipeline cache UUID.
+bool PipelineCacheDataMatches(std::vector<char> const& data, VkPhysicalDeviceProperties const& properties);
+
 // The HLSL of the raygen shader: the kernel without MDL code
 // (PRISM_CALL_MATERIALS). It depends on no scene, except with reordering
 // (the hint bits cover `programs`).
@@ -97,8 +111,8 @@ struct ShaderBuild {
 // source wait for a single compile.
 class MaterialCallShaders {
 public:
-    MaterialCallShaders(VkDevice device, RayTracingSupport const& support, VkPipelineLayout layout,
-                        std::string pipelineCacheTag);
+    MaterialCallShaders(VkDevice device, VkPhysicalDeviceProperties const& properties,
+                        RayTracingSupport const& support, VkPipelineLayout layout, std::string pipelineCacheTag);
     ~MaterialCallShaders(); // waits for background compiles
     MaterialCallShaders(MaterialCallShaders const&) = delete;
     MaterialCallShaders& operator=(MaterialCallShaders const&) = delete;
@@ -114,6 +128,7 @@ private:
     std::shared_ptr<ShaderBuild> compile(std::string const& source, bool raygen);
 
     VkDevice m_device = VK_NULL_HANDLE;
+    VkPhysicalDeviceProperties m_properties{};
     RayTracingSupport m_support;
     VkPipelineLayout m_layout = VK_NULL_HANDLE;
     std::string m_cacheTag;

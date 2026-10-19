@@ -148,26 +148,6 @@ std::string PipelineCacheTag(VkPhysicalDeviceProperties const& properties)
                              properties.driverVersion);
 }
 
-// Publishes a cache file whole: other processes sharing the cache directory
-// read either the previous complete file or this one.
-void WriteCacheFileAtomically(std::filesystem::path const& path, void const* data, size_t size)
-{
-    static std::atomic<uint64_t> serial{0};
-    std::error_code error;
-    std::filesystem::create_directories(path.parent_path(), error);
-    const auto temporary = std::filesystem::path(path.string() + std::format(".{}.{}.tmp",
-        std::hash<std::thread::id>{}(std::this_thread::get_id()), ++serial));
-    {
-        std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
-        if (!out || !out.write(static_cast<const char*>(data), std::streamsize(size))) {
-            out.close();
-            std::filesystem::remove(temporary, error);
-            return;
-        }
-    }
-    std::filesystem::rename(temporary, path, error);
-    if (error) std::filesystem::remove(temporary, error);
-}
 
 } // namespace
 
@@ -202,10 +182,8 @@ bool CompileVulkanKernel(std::string const& mdlCode, std::vector<uint32_t>* spir
     if (!AssembleVulkanKernel(mdlCode, &source, error)) return false;
     const auto cacheDirectory = gpu::ShaderCacheDirectory("vulkan");
     const auto cached = cacheDirectory / (gpu::SourceDigest(source) + ".spv");
-    std::vector<char> bytes;
-    if (std::ifstream file{cached, std::ios::binary})
-        bytes.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
-    if (bytes.empty() || bytes.size() % 4 != 0) {
+    std::vector<char> bytes = vulkan::ReadCacheFile(cached);
+    if (!vulkan::PlausibleSpirv(bytes)) {
         // A kernel that failed to compile fails again: do not retry it every frame.
         static std::mutex failedMutex;
         static std::unordered_map<std::string, std::string> failed;
@@ -244,7 +222,11 @@ bool CompileVulkanKernel(std::string const& mdlCode, std::vector<uint32_t>* spir
         }
         std::error_code ignored;
         std::filesystem::remove(tooLarge, ignored);
-        WriteCacheFileAtomically(cached, bytes.data(), bytes.size());
+        if (!vulkan::PlausibleSpirv(bytes)) {
+            if (error) *error = "DXC produced no valid SPIR-V";
+            return false;
+        }
+        vulkan::WriteCacheFile(cached, bytes.data(), bytes.size());
     }
     spirv->resize(bytes.size() / 4);
     std::memcpy(spirv->data(), bytes.data(), bytes.size());
@@ -299,6 +281,7 @@ struct VulkanDevice::Impl {
     std::unordered_map<std::string, VkPipeline> pipelines;
     // Identifies this driver's pipeline-cache data (see PipelineCacheTag).
     std::string pipelineCacheTag;
+    VkPhysicalDeviceProperties deviceProperties{};
     // Ray tracing pipelines with material callables, by generated MDL code
     // and reordering; `callables` is the one in use (null: `pipeline` is the
     // compute kernel).
@@ -537,6 +520,7 @@ bool VulkanDevice::Impl::initialize(std::string* reason)
     accelerationProperties.pNext = nullptr;
     rayTracing.properties.pNext = nullptr;
     pipelineCacheTag = PipelineCacheTag(properties2.properties);
+    deviceProperties = properties2.properties;
 
     createAccelerationStructure = reinterpret_cast<PFN_vkCreateAccelerationStructureKHR>(
         vkGetDeviceProcAddr(device, "vkCreateAccelerationStructureKHR"));
@@ -639,8 +623,8 @@ bool VulkanDevice::Impl::initialize(std::string* reason)
     poolCreate.pPoolSizes = sizes;
     vkCreateDescriptorPool(device, &poolCreate, nullptr, &descriptorPool);
     if (rayTracing.pipeline) {
-        callableShaders = std::make_unique<vulkan::MaterialCallShaders>(device, rayTracing, pipelineLayout,
-                                                                         pipelineCacheTag);
+        callableShaders = std::make_unique<vulkan::MaterialCallShaders>(device, deviceProperties, rayTracing,
+                                                                         pipelineLayout, pipelineCacheTag);
         // The raygen shader depends on no scene: compile it while the scene loads.
         if (vulkan::CallableModeSetting() != vulkan::CallableMode::Never) callableShaders->prewarmRaygen();
     }
@@ -840,9 +824,8 @@ bool VulkanDevice::Impl::compilePipeline(std::shared_ptr<const gpu::MdlShaderCod
     // The driver compiles the SPIR-V to GPU code here, which takes seconds
     // for a large kernel: keep its result next to the SPIR-V for later runs.
     const auto pipelineCacheFile = gpu::ShaderCacheDirectory("vulkan") / (key + "-" + pipelineCacheTag + ".vkpc");
-    std::vector<char> cacheData;
-    if (std::ifstream file{pipelineCacheFile, std::ios::binary})
-        cacheData.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+    std::vector<char> cacheData = vulkan::ReadCacheFile(pipelineCacheFile);
+    if (!vulkan::PipelineCacheDataMatches(cacheData, deviceProperties)) cacheData.clear();
     VkPipelineCacheCreateInfo cacheInfo{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
     cacheInfo.initialDataSize = cacheData.size();
     cacheInfo.pInitialData = cacheData.empty() ? nullptr : cacheData.data();
@@ -862,7 +845,7 @@ bool VulkanDevice::Impl::compilePipeline(std::shared_ptr<const gpu::MdlShaderCod
             size > 0 && size != cacheData.size()) {
             std::vector<char> data(size);
             if (vkGetPipelineCacheData(device, pipelineCache, &size, data.data()) == VK_SUCCESS)
-                WriteCacheFileAtomically(pipelineCacheFile, data.data(), size);
+                vulkan::WriteCacheFile(pipelineCacheFile, data.data(), size);
         }
         vkDestroyPipelineCache(device, pipelineCache, nullptr);
     }

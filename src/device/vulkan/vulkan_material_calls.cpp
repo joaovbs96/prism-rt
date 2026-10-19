@@ -14,6 +14,7 @@
 #include <cctype>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -34,6 +35,8 @@
 #endif
 #include <windows.h>
 #include <psapi.h>
+#else
+#include <unistd.h>
 #endif
 
 namespace prism::device::vulkan {
@@ -55,32 +58,48 @@ const char* Setting(const char* name)
     return value && *value ? value : nullptr;
 }
 
-// Writes a cache file whole: concurrent readers see the previous complete
-// file or this one.
-void WriteFileAtomically(std::filesystem::path const& path, void const* data, size_t size)
-{
-    static std::atomic<uint64_t> serial{0};
-    std::error_code error;
-    const auto temporary = std::filesystem::path(path.string() + std::format(".{}.{}.tmp",
-        std::hash<std::thread::id>{}(std::this_thread::get_id()), ++serial));
-    {
-        std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
-        if (!out || !out.write(static_cast<const char*>(data), std::streamsize(size))) {
-            out.close();
-            std::filesystem::remove(temporary, error);
-            return;
-        }
-    }
-    std::filesystem::rename(temporary, path, error);
-    if (error) std::filesystem::remove(temporary, error);
-}
-
 std::vector<char> ReadFile(std::filesystem::path const& path)
 {
     std::vector<char> bytes;
     if (std::ifstream file{path, std::ios::binary})
         bytes.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
     return bytes;
+}
+
+// The trailer of a cache file.
+struct CacheTrailer {
+    char magic[8];
+    uint64_t size;
+    uint64_t digest;
+    uint64_t extra;
+};
+constexpr char kCacheMagic[8] = {'P', 'R', 'I', 'S', 'M', 'C', 'F', '1'};
+
+uint64_t CacheDigest(const char* data, size_t size)
+{
+    uint64_t a = 1469598103934665603ull;
+    for (size_t i = 0; i < size; ++i) a = (a ^ uint8_t(data[i])) * 1099511628211ull;
+    return a ^ (uint64_t(size) * 0x9e3779b97f4a7c15ull);
+}
+
+// Writes `bytes` to `path` and makes them durable before returning.
+bool WriteDurably(std::filesystem::path const& path, std::vector<char> const& bytes)
+{
+#ifdef _WIN32
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return false;
+    DWORD written = 0;
+    const bool ok = WriteFile(file, bytes.data(), DWORD(bytes.size()), &written, nullptr) &&
+        written == bytes.size() && FlushFileBuffers(file);
+    CloseHandle(file);
+    return ok;
+#else
+    FILE* file = std::fopen(path.c_str(), "wb");
+    if (!file) return false;
+    bool ok = std::fwrite(bytes.data(), 1, bytes.size(), file) == bytes.size() && std::fflush(file) == 0;
+    ok = fsync(fileno(file)) == 0 && ok;
+    return std::fclose(file) == 0 && ok;
+#endif
 }
 
 // The largest growth of the process's committed memory while it lives, for
@@ -206,10 +225,14 @@ bool PipelineCacheSetting()
     return !value || std::strcmp(value, "0") != 0;
 }
 
-// A VkPipelineCache with the data of `file` (empty if missing or rejected).
-VkPipelineCache LoadPipelineCache(VkDevice device, std::filesystem::path const& file, size_t* loadedBytes)
+// A VkPipelineCache with the data of `file` (empty if missing, torn, for
+// another device, or rejected by the driver); `extra` is the value stored with it.
+VkPipelineCache LoadPipelineCache(VkDevice device, VkPhysicalDeviceProperties const& properties,
+                                  std::filesystem::path const& file, size_t* loadedBytes, uint64_t* extra = nullptr)
 {
-    const std::vector<char> data = PipelineCacheSetting() ? ReadFile(file) : std::vector<char>();
+    std::vector<char> data = PipelineCacheSetting() ? ReadCacheFile(file, extra) : std::vector<char>();
+    if (!PipelineCacheDataMatches(data, properties)) data.clear();
+    if (data.empty() && extra) *extra = 0;
     *loadedBytes = data.size();
     VkPipelineCacheCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
     info.initialDataSize = data.size();
@@ -224,7 +247,7 @@ VkPipelineCache LoadPipelineCache(VkDevice device, std::filesystem::path const& 
 
 // Stores `cache` in `file` if it grew, and destroys it.
 void StorePipelineCache(VkDevice device, VkPipelineCache cache, std::filesystem::path const& file,
-                        size_t loadedBytes, bool succeeded)
+                        size_t loadedBytes, bool succeeded, uint64_t extra = 0)
 {
     if (!cache) return;
     size_t size = 0;
@@ -232,7 +255,7 @@ void StorePipelineCache(VkDevice device, VkPipelineCache cache, std::filesystem:
         size != loadedBytes) {
         std::vector<char> data(size);
         if (vkGetPipelineCacheData(device, cache, &size, data.data()) == VK_SUCCESS)
-            WriteFileAtomically(file, data.data(), size);
+            WriteCacheFile(file, data.data(), size, extra);
     }
     vkDestroyPipelineCache(device, cache, nullptr);
 }
@@ -447,6 +470,64 @@ void ReplaceAll(std::string& text, std::string const& from, std::string const& t
 
 } // namespace
 
+void WriteCacheFile(std::filesystem::path const& path, void const* data, size_t size, uint64_t extra)
+{
+    static std::atomic<uint64_t> serial{0};
+    std::vector<char> bytes(static_cast<const char*>(data), static_cast<const char*>(data) + size);
+    CacheTrailer trailer{};
+    std::memcpy(trailer.magic, kCacheMagic, sizeof(kCacheMagic));
+    trailer.size = size;
+    trailer.digest = CacheDigest(bytes.data(), size);
+    trailer.extra = extra;
+    bytes.insert(bytes.end(), reinterpret_cast<const char*>(&trailer),
+                 reinterpret_cast<const char*>(&trailer) + sizeof(trailer));
+    std::error_code error;
+    std::filesystem::create_directories(path.parent_path(), error);
+    const auto temporary = std::filesystem::path(path.string() + std::format(".{}.{}.tmp",
+        std::hash<std::thread::id>{}(std::this_thread::get_id()), ++serial));
+    if (!WriteDurably(temporary, bytes)) {
+        std::filesystem::remove(temporary, error);
+        return;
+    }
+    // Concurrent readers see the previous complete file or this one.
+    std::filesystem::rename(temporary, path, error);
+    if (error) std::filesystem::remove(temporary, error);
+}
+
+std::vector<char> ReadCacheFile(std::filesystem::path const& path, uint64_t* extra)
+{
+    std::vector<char> bytes = ReadFile(path);
+    CacheTrailer trailer{};
+    if (bytes.size() < sizeof(trailer)) return {};
+    std::memcpy(&trailer, bytes.data() + bytes.size() - sizeof(trailer), sizeof(trailer));
+    const size_t size = bytes.size() - sizeof(trailer);
+    if (std::memcmp(trailer.magic, kCacheMagic, sizeof(kCacheMagic)) != 0 || trailer.size != size ||
+        trailer.digest != CacheDigest(bytes.data(), size))
+        return {};
+    bytes.resize(size);
+    if (extra) *extra = trailer.extra;
+    return bytes;
+}
+
+bool PlausibleSpirv(std::vector<char> const& bytes)
+{
+    uint32_t magic = 0;
+    if (bytes.size() < 20 || bytes.size() % 4 != 0) return false;
+    std::memcpy(&magic, bytes.data(), 4);
+    return magic == 0x07230203u;
+}
+
+bool PipelineCacheDataMatches(std::vector<char> const& data, VkPhysicalDeviceProperties const& properties)
+{
+    VkPipelineCacheHeaderVersionOne header{};
+    if (data.size() < sizeof(header)) return false;
+    std::memcpy(&header, data.data(), sizeof(header));
+    return header.headerSize >= sizeof(header) && header.headerSize <= data.size() &&
+        header.headerVersion == VK_PIPELINE_CACHE_HEADER_VERSION_ONE &&
+        header.vendorID == properties.vendorID && header.deviceID == properties.deviceID &&
+        std::memcmp(header.pipelineCacheUUID, properties.pipelineCacheUUID, VK_UUID_SIZE) == 0;
+}
+
 bool RaygenSource(bool reorder, uint32_t programs, std::string* source, std::string* error)
 {
     std::string defines = "#define PRISM_CALL_MATERIALS 1\n" + ShaderSaltDefine();
@@ -579,9 +660,11 @@ void PrintPipelineStatistics(VkDevice device, VkPipeline pipeline, std::string c
     }
 }
 
-MaterialCallShaders::MaterialCallShaders(VkDevice device, RayTracingSupport const& support, VkPipelineLayout layout,
+MaterialCallShaders::MaterialCallShaders(VkDevice device, VkPhysicalDeviceProperties const& properties,
+                                         RayTracingSupport const& support, VkPipelineLayout layout,
                                          std::string pipelineCacheTag)
-    : m_device(device), m_support(support), m_layout(layout), m_cacheTag(std::move(pipelineCacheTag))
+    : m_device(device), m_properties(properties), m_support(support), m_layout(layout),
+      m_cacheTag(std::move(pipelineCacheTag))
 {
     m_createPipelines = reinterpret_cast<PFN_vkCreateRayTracingPipelinesKHR>(
         vkGetDeviceProcAddr(device, "vkCreateRayTracingPipelinesKHR"));
@@ -654,8 +737,8 @@ std::shared_ptr<ShaderBuild> MaterialCallShaders::compile(std::string const& sou
     const auto directory = gpu::ShaderCacheDirectory("vulkan");
     const auto cached = directory /
         (gpu::SourceDigest(source + gpu::HlslCompilerSignature(gpu::HlslTarget::Spirv, kLibraryStage)) + ".spv");
-    std::vector<char> bytes = ReadFile(cached);
-    if (bytes.empty() || bytes.size() % 4 != 0) {
+    std::vector<char> bytes = ReadCacheFile(cached);
+    if (!PlausibleSpirv(bytes)) {
         gpu::HlslCompileStats stats;
         std::string reason;
         Dxc().acquire();
@@ -669,11 +752,11 @@ std::shared_ptr<ShaderBuild> MaterialCallShaders::compile(std::string const& sou
             std::cerr << std::format("PrismRT Vulkan: DXC {} {:.1f} s, peak {} MiB, {} KB SPIR-V\n",
                                      raygen ? "raygen" : "callable", stats.seconds, stats.peakBytes >> 20,
                                      bytes.size() >> 10);
-        if (!ok || bytes.empty() || bytes.size() % 4 != 0) {
+        if (!ok || !PlausibleSpirv(bytes)) {
             built->error = (raygen ? std::string("raygen shader: ") : std::string("material callable: ")) + reason;
             return built;
         }
-        WriteFileAtomically(cached, bytes.data(), bytes.size());
+        WriteCacheFile(cached, bytes.data(), bytes.size());
     }
     built->spirv.resize(bytes.size() / 4);
     std::memcpy(built->spirv.data(), bytes.data(), bytes.size());
@@ -709,7 +792,7 @@ std::shared_ptr<ShaderBuild> MaterialCallShaders::compile(std::string const& sou
     info.layout = m_layout;
     const auto cacheFile = directory / (SpirvDigest(built->spirv) + "-lib-" + m_cacheTag + ".vkpc");
     size_t loaded = 0;
-    VkPipelineCache cache = LoadPipelineCache(m_device, cacheFile, &loaded);
+    VkPipelineCache cache = LoadPipelineCache(m_device, m_properties, cacheFile, &loaded);
     built->driverCacheHit = loaded > 0;
     const auto start = Clock::now();
     const VkResult result = m_createPipelines(m_device, VK_NULL_HANDLE, cache, 1, &info, nullptr, &built->library);
@@ -940,7 +1023,9 @@ bool MaterialCallPipeline::createMonolithic(std::vector<std::shared_ptr<const Sh
     const auto cacheFile = gpu::ShaderCacheDirectory("vulkan") /
         (gpu::SourceDigest(digests + (statistics ? "|stats" : "")) + "-" + m_cacheTag + ".vkpc");
     size_t loaded = 0;
-    VkPipelineCache cache = LoadPipelineCache(m_device, cacheFile, &loaded);
+    VkPhysicalDeviceProperties properties;
+    vkGetPhysicalDeviceProperties(m_physical, &properties);
+    VkPipelineCache cache = LoadPipelineCache(m_device, properties, cacheFile, &loaded);
     m_report.pipelineCacheHit = loaded > 0;
     const auto start = Clock::now();
     CommitSampler commit;
