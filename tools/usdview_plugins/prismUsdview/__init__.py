@@ -104,7 +104,7 @@ _HUD_LINE = 15
 _HUD_COLOR = (.733, .604, .333)
 _CONVERGED_COLOR = (.45, .78, .42)
 _BUSY_COLOR = (.45, .72, .95)     # work in progress before the first sample
-_WARNING_COLOR = (.95, .5, .25)   # GPU fallback, errors
+_WARNING_COLOR = (1.0, .42, .2)    # GPU fallback, errors
 _STATS_INTERVAL = 0.1  # seconds; GetRenderStats is called at most 10x/s
 
 _KIND_COLORS = {"normal": _HUD_COLOR, "converged": _CONVERGED_COLOR,
