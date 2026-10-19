@@ -219,6 +219,11 @@ def hud_lines(stats, completed, target, converged):
         lines.append(device)
     busy = phase_lines(stats)
     if busy:
+        # The CPU renders a preview while the GPU prepares ("prismGpuPreview"):
+        # keep the GPU phase and count the preview's samples beside it.
+        if stats.get("prismGpuPreview") and completed:
+            samples, _ = hud_text(completed, target, converged)
+            busy = busy + [("Samples".rjust(7) + ": " + samples, "normal")]
         return lines + busy
     samples, state = hud_text(completed, target, converged)
     if samples is not None:

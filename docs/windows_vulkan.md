@@ -32,12 +32,42 @@ modules, so the interpreter's major and minor version must match the USD build
 | MaterialX | 1.39.4 | Built by `build_usd.py`; PrismRT needs `libraries\` and `libraries\mdl\`. |
 | oneTBB | 2022.2 | Shared by USD and PrismRT (`tbb12.dll`). |
 | Embree | 4.4.0 | Intel binary release. |
-| NVIDIA MDL SDK | 2026.0.2 | GitHub release `MDL-SDK-2026.0.2-391700.2276-nt-x86-64.zip`. |
+| NVIDIA MDL SDK | 2026.0.2 | Built from source without CUDA, see below. Do not use the binary release zip. |
 | OpenImageIO | 3.1.12 | vcpkg, installed into `build\vcpkg_installed\x64-windows`. |
 
-The MDL SDK zip puts `libmdl_sdk.dll` and `nv_openimageio.dll` in `bin\`.
-`prism_env.ps1` searches both `bin` and `nt-x86-64\lib`, so copying the DLLs into
-`nt-x86-64\lib` is optional.
+### MDL SDK: build from source, without CUDA
+
+The binary release `MDL-SDK-2026.0.2-...-nt-x86-64.zip` links its GPU baker
+statically: `libmdl_sdk.dll` imports 23 `cu*` functions from `nvcuda.dll`
+(`dumpbin /dependents libmdl_sdk.dll`). On a machine without an NVIDIA driver
+(GitHub runners, AMD or Intel PCs) Windows cannot load it and `LoadLibrary`
+fails with error 126. PrismRT only uses the native (LLVM) and HLSL backends,
+never PTX, so it builds the SDK itself with the GPU baker off:
+
+```powershell
+.	ools\ciuild_mdl_sdk.ps1 -Prefix C:\deps\mdl-sdk-2026.0.2-nocuda -WorkDir D:\mdl-work
+```
+
+The script (also used by CI) needs Visual Studio 2022, CMake, git, Python 3 and
+7-Zip, and downloads the rest: the SDK at the tag, clang 12.0.1 (mandatory, it
+compiles the LLVM 12 bitcode libraries; the LLVM inside the SDK is vendored),
+vcpkg at the SDK's tested baseline with Boost headers and a static OpenImageIO
+(`tools/ci/mdl_vcpkg/vcpkg.json`, triplet `x64-windows-static`). Roughly 10
+minutes of vcpkg and 10 minutes of SDK build with 8 jobs, 10 GB of work files
+(delete `-WorkDir` afterwards). CMake options that matter:
+
+- `-DMDL_ENABLE_GPU_BAKER=OFF`: removes the only `nvcuda.dll` import.
+- `-DMDL_ENABLE_CUDA_EXAMPLES=OFF`, `MDL_BUILD_SDK_EXAMPLES=OFF`,
+  `MDL_BUILD_CORE_EXAMPLES=OFF`, `MDL_BUILD_DOCUMENTATION=OFF`,
+  `MDL_ENABLE_UNIT_TESTS=OFF`, `MDL_ENABLE_PYTHON_BINDINGS=OFF`, the other
+  `MDL_ENABLE_*_EXAMPLES` and `MDL_BUILD_ARNOLD_PLUGIN=OFF`: not needed.
+- `-DMDL_BUILD_OPENIMAGEIO_PLUGIN=ON`: `nv_openimageio.dll`, which PrismRT loads.
+- Release configuration; install with `cmake --install`.
+
+The result has `bin\` with `libmdl_sdk.dll`, `libmdl_core.dll`,
+`nv_openimageio.dll`, `dds.dll`, `mdl_distiller.dll` and the command line tools,
+plus `include\`. The script fails if any file in `bin\` imports `nvcuda.dll`.
+`prism_env.ps1` searches both `bin` and `nt-x86-64\lib`.
 
 **The MDL SDK found at run time must be the one PrismRT was compiled against.**
 Headers from one SDK version combined with `libmdl_sdk.dll` from another load
@@ -54,7 +84,7 @@ loads first.
 ## Configure, build and test
 
 ```powershell
-cmake --preset prism-hydra -DPRISM_ENABLE_VULKAN=ON "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" -DMDL_SDK_DIR=C:/deps/mdl-sdk-2026.0.2
+cmake --preset prism-hydra -DPRISM_ENABLE_VULKAN=ON "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" -DMDL_SDK_DIR=C:/deps/mdl-sdk-2026.0.2-nocuda
 cmake --build --preset prism-hydra
 . .\prism_env.ps1
 .\build\RelWithDebInfo\PrismRT.exe --list-devices

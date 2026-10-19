@@ -76,7 +76,8 @@ the Vulkan loader, the MaterialX libraries, DXC (compiles the GPU kernel at run
 time), and a private Python 3.11 with PySide6 (Essentials, 6.7.2), PyOpenGL and
 numpy installed with pip into `python\Lib\site-packages`. `.pdb`, `.lib` and
 headers are left out. The extracted size is about 730 MiB (zip about 280 MiB):
-the MDL SDK DLLs (about 230 MiB), Python with PySide6 (about 270 MiB) and the
+the MDL SDK DLLs (about 230 MiB; built from source without CUDA, so none of
+them imports `nvcuda.dll`), Python with PySide6 (about 270 MiB) and the
 OpenUSD DLLs (about 160 MiB) dominate.
 
 The launchers (`usdview.bat`, `prism_render.bat`, `list_devices.bat`; shared
@@ -109,8 +110,14 @@ live on `D:`.
   made of the versions and the hash of the two CI scripts. On a hit the job only
   does the cache lookup. It does not use `build_usd.py`, which would fetch its
   own TBB.
-- `build` job: restores that cache, downloads oneTBB 2022.2.0, Embree 4.4.0 and
-  the MDL SDK 2026.0.2 (`tools/ci/fetch_prebuilt.ps1`), installs the Vulkan SDK
+- `mdl` job (parallel to `usd`): builds the NVIDIA MDL SDK 2026.0.2 from source
+  without CUDA with `tools/ci/build_mdl_sdk.ps1` (the binary release imports
+  `nvcuda.dll` and cannot load on a runner without an NVIDIA driver; see
+  `docs/windows_vulkan.md`). It caches `D:\deps\mdl` under a key made of the SDK
+  version and the hash of that script and `tools/ci/mdl_vcpkg/vcpkg.json`, so it
+  never invalidates the OpenUSD cache and vice versa.
+- `build` job: restores both caches, downloads oneTBB 2022.2.0 and Embree 4.4.0
+  (`tools/ci/fetch_prebuilt.ps1 -Components tbb,embree`), installs the Vulkan SDK
   1.4.321.0 and the LunarG Vulkan runtime (the SDK has no `vulkan-1.dll`),
   installs OpenImageIO from the `vcpkg.json` manifest with a vcpkg binary cache,
   configures `prism-hydra` with `PRISM_ENABLE_VULKAN=ON` (using
@@ -120,7 +127,8 @@ live on `D:`.
   package from a clean environment on the CPU device, and uploads the zip as an
   artifact kept for 14 days. On tags `v*` the zip is also attached to a GitHub
   release.
-- The first run builds everything (several hours, mostly OpenUSD); later runs
+- The first run builds everything (several hours, mostly OpenUSD; the MDL SDK
+  adds about an hour on a 4-core runner, in parallel with the USD job); later runs
   reuse the caches and take roughly the PrismRT build time plus packaging.
   Change the versions in `windows.yml` and the scripts together; the cache key
   follows the script hashes.
