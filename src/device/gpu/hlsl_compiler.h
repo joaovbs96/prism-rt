@@ -23,4 +23,11 @@ std::string SourceDigest(std::string const& text);
 bool CompileHlsl(std::string const& source, HlslTarget target, std::filesystem::path const& workDirectory,
                  std::vector<char>* binary, std::string* error);
 
+// The DXC executable, options and memory limit CompileHlsl uses for `target`,
+// for keys of results cached by callers.
+std::string HlslCompilerSignature(HlslTarget target);
+
+// Whether a CompileHlsl error means DXC exceeded its memory limit (Windows).
+bool HlslTooLarge(std::string const& error);
+
 } // namespace prism::device::gpu

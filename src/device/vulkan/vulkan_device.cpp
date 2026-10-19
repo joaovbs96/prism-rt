@@ -151,11 +151,30 @@ bool CompileVulkanKernel(std::string const& mdlCode, std::vector<uint32_t>* spir
                 return false;
             }
         }
-        if (!gpu::CompileHlsl(source, gpu::HlslTarget::Spirv, cacheDirectory, &bytes, error)) {
+        // A kernel too large for DXC stays too large for the same compiler:
+        // a marker in the cache skips the minutes-long attempt next time.
+        const auto tooLarge = cacheDirectory /
+            (gpu::SourceDigest(source + gpu::HlslCompilerSignature(gpu::HlslTarget::Spirv)) + ".too-large");
+        const char* retry = std::getenv("PRISM_VULKAN_RETRY_LARGE");
+        if (std::ifstream marker{tooLarge}; marker && !(retry && *retry && *retry != '0')) {
+            std::string reason;
+            std::getline(marker, reason);
+            if (error)
+                *error = reason + " (remembered from an earlier run; PRISM_VULKAN_RETRY_LARGE=1 tries again)";
             std::lock_guard lock(failedMutex);
-            failed[key] = error ? *error : std::string("GPU kernel compilation failed");
+            failed[key] = error ? *error : reason;
             return false;
         }
+        std::string reason;
+        if (!gpu::CompileHlsl(source, gpu::HlslTarget::Spirv, cacheDirectory, &bytes, &reason)) {
+            if (gpu::HlslTooLarge(reason)) std::ofstream(tooLarge) << reason << '\n';
+            if (error) *error = reason;
+            std::lock_guard lock(failedMutex);
+            failed[key] = reason;
+            return false;
+        }
+        std::error_code ignored;
+        std::filesystem::remove(tooLarge, ignored);
         std::ofstream(cached, std::ios::binary).write(bytes.data(), std::streamsize(bytes.size()));
     }
     spirv->resize(bytes.size() / 4);

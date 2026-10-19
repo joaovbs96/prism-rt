@@ -140,6 +140,36 @@ std::string SourceDigest(std::string const& text)
     return std::format("{:016x}{:016x}-{}", a, b, text.size());
 }
 
+namespace {
+
+constexpr const char* kTooLarge = "exceeded its memory limit";
+
+// No DXC optimization: Metal's and the Vulkan drivers' compilers optimize,
+// and DXC's optimizer on these very large kernels is slow (its DXIL output
+// can also exceed what Metal compiles).
+// SPIR-V legalization inlines every function and runs out of the default
+// id bound (0x3FFFFF) on kernels with many materials; DXC then crashes
+// ("Internal compiler error: stack overflow"). Compacting the ids at the
+// end brings the final module's bound back down to a fraction of that.
+const char* TargetOptions(HlslTarget target)
+{
+    return target == HlslTarget::Dxil ? "-Od -Qstrip_debug -Qstrip_reflect"
+                                      : "-spirv -fspv-target-env=vulkan1.3 -O0 -fspv-max-id 268435455";
+}
+
+} // namespace
+
+std::string HlslCompilerSignature(HlslTarget target)
+{
+    std::string signature = DxcExecutable() + " -T cs_6_6 -E main -HV 2021 " + TargetOptions(target);
+#ifdef _WIN32
+    signature += std::format(" memory {}", DxcMemoryLimit());
+#endif
+    return signature;
+}
+
+bool HlslTooLarge(std::string const& error) { return error.find(kTooLarge) != std::string::npos; }
+
 bool CompileHlsl(std::string const& source, HlslTarget target, std::filesystem::path const& workDirectory,
                  std::vector<char>* binary, std::string* error)
 {
@@ -148,16 +178,7 @@ bool CompileHlsl(std::string const& source, HlslTarget target, std::filesystem::
     const auto input = workDirectory / (stem + ".hlsl");
     const auto output = workDirectory / (stem + (target == HlslTarget::Dxil ? ".dxil" : ".spv"));
     std::ofstream(input, std::ios::binary).write(source.data(), std::streamsize(source.size()));
-    // No DXC optimization: Metal's and the Vulkan drivers' compilers optimize,
-    // and DXC's optimizer on these very large kernels is slow (its DXIL output
-    // can also exceed what Metal compiles).
-    // SPIR-V legalization inlines every function and runs out of the default
-    // id bound (0x3FFFFF) on kernels with many materials; DXC then crashes
-    // ("Internal compiler error: stack overflow"). Compacting the ids at the
-    // end brings the final module's bound back down to a fraction of that.
-    const std::string targetOptions = target == HlslTarget::Dxil
-        ? "-Od -Qstrip_debug -Qstrip_reflect"
-        : "-spirv -fspv-target-env=vulkan1.3 -O0 -fspv-max-id 268435455";
+    const std::string targetOptions = TargetOptions(target);
     const std::string command = std::format("\"{}\" -T cs_6_6 -E main -HV 2021 {} -Fo \"{}\" \"{}\"",
                                             DxcExecutable(), targetOptions, output.string(), input.string());
     std::string log;
@@ -166,8 +187,8 @@ bool CompileHlsl(std::string const& source, HlslTarget target, std::filesystem::
     bool overMemory = false;
     const int status = RunLimited(command, memoryLimit, &log, &overMemory);
     if (overMemory)
-        log = std::format("DXC exceeded its memory limit of {} MiB (PRISM_DXC_MEMORY_MIB): the kernel of this "
-                          "scene's materials is too large to compile", memoryLimit >> 20);
+        log = std::format("DXC {} of {} MiB (PRISM_DXC_MEMORY_MIB): the kernel of this scene's materials is "
+                          "too large to compile", kTooLarge, memoryLimit >> 20);
 #else
     FILE* pipe = popen((command + " 2>&1").c_str(), "r");
     char buffer[4096];
