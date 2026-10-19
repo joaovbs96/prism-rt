@@ -1262,7 +1262,9 @@ public:
             shared.sourceVersion = std::to_string(result.resourceRevision);
             shared.graph = result.network;
             shared.dependencies = result.dependencies;
-            shared.document = doc;
+            // Publish the serialized XML only. This document has the whole
+            // standard library imported into it (about 20 MB in memory), and
+            // the registry keeps up to 2048 entries; readers parse the XML.
             shared.xml = result.xml;
             shared.materialName = result.materialName;
             if (result.conversionTicket) {
