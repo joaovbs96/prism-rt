@@ -6860,9 +6860,20 @@ void SceneBridge::RemoveRenderBuffer(HdRenderBuffer *buffer)
 VtDictionary SceneBridge::GetStats() const
 {
     VtDictionary result;
-    result["completedSamples"] = VtValue(static_cast<int64_t>(_impl->samples.load()));
-    result["converged"] = VtValue(_converged.load());
+    const int64_t completed = static_cast<int64_t>(_impl->samples.load());
+    const bool converged = _converged.load();
+    result["completedSamples"] = VtValue(completed);
+    result["converged"] = VtValue(converged);
     std::lock_guard lock(_impl->mutex);
+    // Standard Hydra progress keys that hosts such as usdview read:
+    // numCompletedSamples (int) and percentDone (double, 0-100). A converged
+    // pass reports 100 even below the target (adaptive early-out).
+    const int targetSamples = std::max(1, _impl->settings.samples);
+    result["numCompletedSamples"] = VtValue(static_cast<int>(
+        std::min<int64_t>(completed, std::numeric_limits<int>::max())));
+    result["targetSamples"] = VtValue(targetSamples);
+    result["percentDone"] = VtValue(converged ? 100.0 :
+        std::clamp(100.0 * static_cast<double>(completed) / targetSamples, 0.0, 100.0));
     result["refinementPublishes"] = VtValue(static_cast<int64_t>(_impl->refinementPublishes));
     result["firstPassPrimaryScratchBytes"] = VtValue(static_cast<int64_t>(_impl->firstPassPrimaryScratchBytes));
     result["colorTracedPixels"] = VtValue(static_cast<int64_t>(_impl->colorTracedPixels.load()));
