@@ -41,13 +41,15 @@ struct RayTracingSupport {
 };
 
 // When scenes use the callable path (PRISM_VULKAN_CALLABLES): by default
-// always (where ray tracing pipelines exist); 0 never (the compute
-// megakernel); `auto` above the kernel size threshold or after the compute
-// kernel was found too large.
+// (`auto`) above the kernel size threshold or after the compute kernel was
+// found too large; 1 always (where ray tracing pipelines exist); 0 never.
 enum class CallableMode { Never, Always, Auto };
 CallableMode CallableModeSetting();
 // Assembled compute kernels above this size use callables in Auto mode
-// (PRISM_VULKAN_CALLABLE_THRESHOLD_KIB, default 1024).
+// (PRISM_VULKAN_CALLABLE_THRESHOLD_KIB, default 320). Smaller kernels have
+// little material code: the compute kernel compiles about as fast as the
+// raygen shader and runs faster (CornellBox, 256 KB: 1.7x); from the lion
+// (392 KB, 1 program, 3.3x slower) up, callables are faster or equal.
 size_t CallableThresholdBytes();
 // Whether to reorder threads by material program (PRISM_VULKAN_REORDER=1, where supported). Off by
 // default: measured 2-8% slower on most scenes, 16% faster on the MaterialEggs countertop.

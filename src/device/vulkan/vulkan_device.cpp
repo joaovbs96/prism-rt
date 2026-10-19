@@ -787,13 +787,13 @@ bool VulkanDevice::Impl::compilePipeline(std::shared_ptr<const gpu::MdlShaderCod
     progress::Scope kernelPhase(Phase::Kernel);
     gpu::MdlShaderCode const& code = *shared;
     auto const generated = start;
-    // Material sets too large for one kernel use the callable pipeline: above
-    // the size threshold, when DXC was found unable to compile the kernel, or
-    // when it fails now for lack of memory.
+    // All but the smallest material sets use the callable pipeline: above the
+    // size threshold (vulkan_material_calls.h), when DXC was found unable to
+    // compile the kernel, or when it fails now for lack of memory.
     const vulkan::CallableMode callableMode = rayTracing.pipeline ? vulkan::CallableModeSetting()
                                                                   : vulkan::CallableMode::Never;
     if (callableMode == vulkan::CallableMode::Always)
-        return buildCallablePipeline(shared, "the default; PRISM_VULKAN_CALLABLES=0 uses the compute kernel", error);
+        return buildCallablePipeline(shared, "PRISM_VULKAN_CALLABLES=1", error);
     if (callableMode == vulkan::CallableMode::Auto) {
         std::string source;
         if (AssembleVulkanKernel(code.code, &source, nullptr)) {
