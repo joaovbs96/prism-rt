@@ -14,6 +14,7 @@
 #endif
 
 #include <cstdlib>
+#include <format>
 #include <iostream>
 
 namespace {
@@ -85,6 +86,17 @@ int main(int argc, char** argv)
         check(prism::device::vulkan::MaterialCallSources(code, true, &sources, &error) &&
                   sources.size() == code.programCount + 1u,
               "callable sources: " + error);
+        // Each callable keeps only its program's code, named without the program index.
+        std::vector<std::string> whole;
+        check(prism::device::vulkan::MaterialCallSources(code, true, &whole, &error, false) &&
+                  whole.size() == sources.size(),
+              "untrimmed callable sources: " + error);
+        for (size_t i = 1; i < sources.size() && i < whole.size(); ++i) {
+            check(sources[i].size() <= whole[i].size(), "callable " + std::to_string(i - 1) + " is trimmed");
+            check(sources[i].find(std::format("prism_p{}_", i - 1)) == std::string::npos &&
+                      sources[i].find("prism_p_") != std::string::npos,
+                  "callable " + std::to_string(i - 1) + " does not name its program index");
+        }
         for (size_t i = 0; i < sources.size(); ++i) {
             std::vector<char> library;
             check(CompileHlsl(sources[i], HlslTarget::Spirv, ShaderCacheDirectory("test"), &library, &error,
