@@ -130,7 +130,8 @@ struct AccelerationStructure {
 
 } // namespace
 
-bool CompileVulkanKernel(std::string const& mdlCode, std::vector<uint32_t>* spirv, std::string* error)
+bool CompileVulkanKernel(std::string const& mdlCode, std::vector<uint32_t>* spirv, std::string* error,
+                         uint32_t programCount)
 {
     std::string source;
     if (!gpu::AssembleShader("gpu/kernel.hlsl", {"gpu/vulkan"}, mdlCode, &source, error)) return false;
@@ -165,6 +166,8 @@ bool CompileVulkanKernel(std::string const& mdlCode, std::vector<uint32_t>* spir
             failed[key] = error ? *error : reason;
             return false;
         }
+        std::cerr << std::format("PrismRT Vulkan: compiling the GPU kernel ({} MDL programs, {} KB of HLSL); this "
+                                 "happens once per material set\n", programCount, source.size() >> 10);
         std::string reason;
         if (!gpu::CompileHlsl(source, gpu::HlslTarget::Spirv, cacheDirectory, &bytes, &reason)) {
             if (gpu::HlslTooLarge(reason)) std::ofstream(tooLarge) << reason << '\n';
@@ -596,7 +599,7 @@ bool VulkanDevice::Impl::buildPipeline(std::string* error)
     if (shared == pipelineCode && pipeline != VK_NULL_HANDLE) return true;
     pipelineCode = nullptr;
     std::vector<uint32_t> spirv;
-    if (!CompileVulkanKernel(code.code, &spirv, error)) return false;
+    if (!CompileVulkanKernel(code.code, &spirv, error, code.programCount)) return false;
     auto const compiled = Clock::now();
     const std::string key = gpu::SourceDigest(std::string(reinterpret_cast<const char*>(spirv.data()), spirv.size() * 4));
     if (auto found = pipelines.find(key); found != pipelines.end()) {

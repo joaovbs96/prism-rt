@@ -49,6 +49,7 @@ private:
 };
 
 // The Vulkan kernel for the given MDL code, as SPIR-V (exposed for the shader compile test).
-bool CompileVulkanKernel(std::string const& mdlCode, std::vector<uint32_t>* spirv, std::string* error);
+bool CompileVulkanKernel(std::string const& mdlCode, std::vector<uint32_t>* spirv, std::string* error,
+                         uint32_t programCount = 0);
 
 } // namespace prism::device
