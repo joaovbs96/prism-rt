@@ -56,7 +56,14 @@ back to the CPU device with a message when no GPU device is usable.
 
 GPU shading languages inline every call, so the kernel contains each
 material's code once per call site; the integrator therefore calls every
-material entry point from exactly one place.
+material entry point from exactly one place, and the kernel entry calls
+`renderSample` once. Even so, SPIR-V legalization of a kernel with many
+materials needs more than the default 4M ids, so the Vulkan device passes
+`-fspv-max-id` to DXC (the final module's ids are compacted).
+
+If the Vulkan device cannot prepare a scene (its kernel fails to compile,
+its resources do not fit), it prints the reason once and renders that scene
+on the CPU device until the scene changes.
 
 | OpenChessSet (4 MDL programs) | Time |
 | --- | --- |
@@ -115,4 +122,9 @@ setup; see `prism_env.sh`).
 - `PRISM_SHADER_DIR=<repo>/shaders`: load shader sources from disk instead
   of the embedded copies.
 - `PRISM_DXC=<path>`: the DXC executable to use.
+- `PRISM_GPU_TEXTURE_BUDGET_MIB=<n>`: GPU memory for textures (default 45%
+  of the device's). Images beyond it are uploaded at reduced resolution,
+  reported as `PrismRT Vulkan: N of M images uploaded at reduced resolution
+  to fit GPU memory (PRISM_GPU_TEXTURE_BUDGET_MIB)` (`PrismRT Metal:` on
+  Metal).
 - `PRISM_DISABLE_METAL=1`, `PRISM_DISABLE_VULKAN=1`: hide a device.
