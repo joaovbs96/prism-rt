@@ -439,6 +439,12 @@ bool TrimCallablesSetting()
     return !value || std::strcmp(value, "0") != 0;
 }
 
+void ReplaceAll(std::string& text, std::string const& from, std::string const& to)
+{
+    for (size_t at = text.find(from); at != std::string::npos; at = text.find(from, at + to.size()))
+        text.replace(at, from.size(), to);
+}
+
 } // namespace
 
 bool RaygenSource(bool reorder, uint32_t programs, std::string* source, std::string* error)
@@ -464,9 +470,21 @@ bool MaterialCallSources(gpu::MdlShaderCode const& code, bool reorder, std::vect
     std::optional<LinkUnitTrimmer> trimmer;
     if (trim && TrimCallablesSetting()) trimmer.emplace(code.targetCode);
     for (uint32_t p = 0; p < programs; ++p) {
-        std::string target = trimmer && trimmer->valid()
-            ? trimmer->trim(code.programDispatch[p] + code.sceneData) : code.targetCode;
-        const std::string mdl = target + code.programDispatch[p] + code.sceneData;
+        std::string mdl;
+        if (trimmer && trimmer->valid()) {
+            // Only this program's functions remain, and only it reaches this
+            // callable: without its index in the source (function names and
+            // dispatch cases), the program compiles to the same callable in
+            // any material set.
+            std::string dispatch = code.programDispatch[p];
+            ReplaceAll(dispatch, "switch (program)", "switch (0u)");
+            ReplaceAll(dispatch, std::format("case {}u:", p), "case 0u:");
+            mdl = trimmer->trim(code.programDispatch[p] + code.sceneData) + dispatch + code.sceneData;
+            ReplaceAll(mdl, std::format("prism_p{}_", p), "prism_p_");
+            ReplaceAll(mdl, std::format("Prism material dispatch: program {} ", p), "Prism material dispatch ");
+        } else {
+            mdl = code.targetCode + code.programDispatch[p] + code.sceneData;
+        }
         if (!gpu::AssembleShader("gpu/vulkan/material_callable.hlsl", {"gpu/vulkan"}, mdl, &(*sources)[p + 1],
                                  error))
             return false;
