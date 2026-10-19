@@ -164,6 +164,84 @@ inline LightSample areaSample(LightRecord light, float3 p, float3 q, float3 nq, 
     return s;
 }
 
+// Uniform sampling of the solid angle a rect light subtends (Urena et al.
+// 2013, "An Area-Preserving Parametrization for Spherical Rectangles"). In
+// the frame (x, y, z) at the shading point the rectangle spans
+// [x0, x1] x [y0, y1] at height z0 < 0.
+struct SphericalRect {
+    float3 x;
+    float3 y;
+    float3 z;
+    float x0;
+    float y0;
+    float x1;
+    float y1;
+    float z0;
+    float b0;
+    float b1;
+    float k;
+    float solidAngle;
+};
+
+// Below this solid angle the rect is area-sampled: the solid angle loses
+// precision (it is a difference of angles near 2 pi) and the two densities
+// differ little anyway.
+static const float kMinSphericalRectSolidAngle = 1e-3f;
+
+inline SphericalRect sphericalRect(LightRecord light, float3 p)
+{
+    SphericalRect r;
+    const float3 halfU = xyz(light.u);
+    const float3 halfV = xyz(light.v);
+    const float exl = 2.0f * length(halfU);
+    const float eyl = 2.0f * length(halfV);
+    r.x = normalize(halfU);
+    r.y = normalize(halfV);
+    r.z = cross(r.x, r.y);
+    const float3 d = xyz(light.p0) - halfU - halfV - p;
+    r.z0 = dot(d, r.z);
+    if (r.z0 > 0.0f) {
+        r.z = -r.z;
+        r.z0 = -r.z0;
+    }
+    r.x0 = dot(d, r.x);
+    r.y0 = dot(d, r.y);
+    r.x1 = r.x0 + exl;
+    r.y1 = r.y0 + eyl;
+    const float3 n0 = normalize(float3(0.0f, r.z0, -r.y0));
+    const float3 n1 = normalize(float3(-r.z0, 0.0f, r.x1));
+    const float3 n2 = normalize(float3(0.0f, -r.z0, r.y1));
+    const float3 n3 = normalize(float3(r.z0, 0.0f, -r.x0));
+    const float g0 = acos(clamp(-dot(n0, n1), -1.0f, 1.0f));
+    const float g1 = acos(clamp(-dot(n1, n2), -1.0f, 1.0f));
+    const float g2 = acos(clamp(-dot(n2, n3), -1.0f, 1.0f));
+    const float g3 = acos(clamp(-dot(n3, n0), -1.0f, 1.0f));
+    r.b0 = n0.z;
+    r.b1 = n2.z;
+    r.k = 2.0f * kPi - g2 - g3;
+    r.solidAngle = g0 + g1 - r.k;
+    if (!(r.z0 < 0.0f) || !isfinite(r.solidAngle)) r.solidAngle = 0.0f;
+    return r;
+}
+
+inline bool useSphericalRect(SphericalRect r) { return r.solidAngle > kMinSphericalRectSolidAngle; }
+
+// The point of the rect for the sample u, relative to the shading point.
+inline float3 sampleSphericalRect(SphericalRect r, float2 u)
+{
+    const float au = u.x * r.solidAngle + r.k;
+    const float fu = (cos(au) * r.b0 - r.b1) / sin(au);
+    const float cu = clamp((fu > 0.0f ? 1.0f : -1.0f) / sqrt(fu * fu + r.b0 * r.b0), -1.0f, 1.0f);
+    const float xu = clamp(-(cu * r.z0) / max(sqrt(1.0f - cu * cu), 1e-7f), r.x0, r.x1);
+    const float d2 = xu * xu + r.z0 * r.z0;
+    const float h0 = r.y0 / sqrt(d2 + r.y0 * r.y0);
+    const float h1 = r.y1 / sqrt(d2 + r.y1 * r.y1);
+    const float hv = h0 + u.y * (h1 - h0);
+    const float hv2 = hv * hv;
+    const float yv = hv2 < 1.0f - 1e-6f ? clamp(hv * sqrt(d2) / sqrt(1.0f - hv2), r.y0, r.y1) : r.y1;
+    return r.x * xu + r.y * yv + r.z * r.z0;
+}
+
 // Texture coordinates of a point on a rect light, in image space (top row
 // first): UsdLuxRectLight puts the texture's (0, 0) at local (+X, +Y).
 inline float2 rectTexcoord(float a, float b) { return float2(0.5f * (1.0f - a), 0.5f * (1.0f + b)); }
@@ -205,6 +283,27 @@ inline LightSampleTextured sampleLight(LightRecord light, float3 p, float2 u)
         return result;
     }
     if (type == kLightRect) {
+        const SphericalRect sr = sphericalRect(light, p);
+        if (useSphericalRect(sr)) {
+            const float3 offset = sampleSphericalRect(sr, u);
+            const float dist = length(offset);
+            const float3 rel = p + offset - xyz(light.p0);
+            const float3 axisU = xyz(light.u);
+            const float3 axisV = xyz(light.v);
+            LightSample s = invalidLightSample();
+            s.wi = offset / dist;
+            // The emitting side faces the shading point (sr.z points to the rect).
+            float facing = -dot(xyz(light.n), s.wi);
+            if ((light.info.y & kLightTwoSided) != 0u) facing = abs(facing);
+            s.radiance = radiance;
+            s.pdf = 1.0f / sr.solidAngle;
+            s.distance = dist;
+            s.delta = false;
+            s.valid = facing > 0.0f && dist > 0.0f && isfinite(dist);
+            result.sample = s;
+            result.texcoord = rectTexcoord(dot(rel, axisU) / dot(axisU, axisU), dot(rel, axisV) / dot(axisV, axisV));
+            return result;
+        }
         const float a = 2.0f * u.x - 1.0f;
         const float b = 2.0f * u.y - 1.0f;
         const float3 q = xyz(light.p0) + xyz(light.u) * a + xyz(light.v) * b;
@@ -337,6 +436,10 @@ inline LightHitTextured intersectLight(LightRecord light, Ray ray, float tmax)
         if (type == kLightRect ? (abs(a) > 1.0f || abs(b) > 1.0f) : (a * a + b * b > 1.0f)) return result;
         result.hit = planarHit(light, t, d, radiance);
         result.texcoord = rectTexcoord(a, b);
+        if (result.hit.hit && type == kLightRect) {
+            const SphericalRect sr = sphericalRect(light, o);
+            if (useSphericalRect(sr)) result.hit.pdf = 1.0f / sr.solidAngle;
+        }
         return result;
     }
     if (type == kLightCylinder) {
