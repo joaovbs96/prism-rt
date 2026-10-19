@@ -296,7 +296,10 @@ if(PRISM_BUILD_HYDRA)
     # Keep the original MaterialX compatibility regressions in clean builds.
     add_subdirectory(tests "${CMAKE_BINARY_DIR}/materialx-tests")
 
-    set(_prism_test_environment "PXR_PLUGINPATH_NAME=${PRISM_HYDRA_RESOURCES_DIR}")
+    # Tests that compare renders exactly must not depend on whether the CPU
+    # preview covered a slow GPU preparation.
+    set(_prism_test_environment "PXR_PLUGINPATH_NAME=${PRISM_HYDRA_RESOURCES_DIR}"
+        "PRISM_GPU_PREPARATION_PREVIEW=0")
     if(PRISM_MATERIALX_LIBRARY_PATH)
         list(APPEND _prism_test_environment
             "PRISM_MATERIALX_LIBRARY_PATH=${PRISM_MATERIALX_LIBRARY_PATH}")
