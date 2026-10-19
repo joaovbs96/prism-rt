@@ -13,9 +13,12 @@
 #include "../../scene.h"
 #include "../../texture_service.h"
 
+#include <OpenImageIO/imageio.h>
 #include <tbb/parallel_for.h>
+#include <tbb/parallel_reduce.h>
 #include <vulkan/vulkan.h>
 
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -83,6 +86,27 @@ const char* ResultText(VkResult result)
     }
 }
 
+// The top level of a texture as readPixels returns it, read straight from
+// its prepared file. Reading whole images through the texture system's
+// shared tile cache is several times slower, and much slower again for
+// concurrent reads that do not fit in the cache.
+bool ReadPreparedImage(prism::TextureResource const& resource, int channels, float* pixels)
+{
+    auto const& path = resource.preparedPath();
+    if (path.empty()) return false;
+    auto input = OIIO::ImageInput::open(path.string());
+    if (!input) {
+        OIIO::geterror(); // clear it
+        return false;
+    }
+    OIIO::ImageSpec const& spec = input->spec();
+    if (spec.width != resource.width() || spec.height != resource.height() || spec.nchannels < channels ||
+        spec.x != 0 || spec.y != 0 || spec.depth > 1) return false;
+    const bool read = input->read_image(0, 0, 0, channels, OIIO::TypeDesc::FLOAT, pixels);
+    if (!read) input->geterror();
+    return read;
+}
+
 struct Buffer {
     VkBuffer buffer = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
@@ -95,6 +119,7 @@ struct Image {
     VkImage image = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkImageView view = VK_NULL_HANDLE;
+    VkDeviceSize bytes = 0;
 };
 
 struct AccelerationStructure {
@@ -174,6 +199,7 @@ struct VulkanDevice::Impl {
         int shift = 0;   // resolution halvings (texture budget)
     };
     std::unordered_map<const prism::TextureResource*, CachedImage> imageCache;
+    size_t reportedReducedImages = 0;
     std::vector<AccelerationStructure> bottomLevel;
     AccelerationStructure topLevel;
     VkSampler samplers[kSamplerCount] = {};
@@ -617,15 +643,23 @@ bool VulkanDevice::Impl::uploadImages(std::string* error)
                          isEnvironment[i] ? 4 : 1, bool(isEnvironment[i])};
     }
     const std::vector<int> shift = gpu::FitImages(footprints, gpu::TextureBudget(deviceLocal));
+    size_t reduced = 0;
+    for (int s : shift) reduced += s > 0 ? 1 : 0;
+    if (reduced && reduced != reportedReducedImages) {
+        std::cerr << "PrismRT Vulkan: " << reduced << " of " << d.images.size()
+                  << " images uploaded at reduced resolution to fit GPU memory "
+                     "(PRISM_GPU_TEXTURE_BUDGET_MIB)\n";
+    }
+    reportedReducedImages = reduced;
+    std::vector<size_t> missing;
     for (size_t i = 0; i < d.images.size(); ++i) {
         auto const& resource = d.images[i];
-        const bool floatPrecision = isEnvironment[i];
         info[i].info = {uint32_t(std::max(1, resource->width() >> shift[i])),
                         uint32_t(std::max(1, resource->height() >> shift[i])),
                         uint32_t(resource->channels()), uint32_t(i)};
         auto found = imageCache.find(resource.get());
         if (found != imageCache.end() && !found->second.resource.expired() &&
-            found->second.floatPrecision == floatPrecision && found->second.shift == shift[i]) {
+            found->second.floatPrecision == isEnvironment[i] && found->second.shift == shift[i]) {
             imageViews[i] = found->second.image.view;
             continue;
         }
@@ -635,77 +669,98 @@ bool VulkanDevice::Impl::uploadImages(std::string* error)
             vkFreeMemory(device, found->second.image.memory, nullptr);
             imageCache.erase(found);
         }
-        // Same storage policy as the Metal device (see UploadImage there).
+        missing.push_back(i);
+    }
+
+    // Texel data of one image, converted for upload. Same storage policy as
+    // the Metal device (see UploadImage there).
+    struct Prepared {
+        std::vector<uint8_t> staging;
+        int width = 0, height = 0;
+        VkFormat format = VK_FORMAT_UNDEFINED;
+        uint32_t levels = 1;
+    };
+    auto prepare = [&](size_t i, Prepared& out) {
+        auto const& resource = d.images[i];
+        const bool floatPrecision = isEnvironment[i];
         int width = resource->width(), height = resource->height();
         const int channels = std::clamp(resource->channels(), 1, 4);
         std::vector<float> pixels(size_t(width) * height * channels);
-        if (!service->readPixels(*resource, 0, 0, width, height, 0, channels, pixels.data()))
+        if (!ReadPreparedImage(*resource, channels, pixels.data()) &&
+            !service->readPixels(*resource, 0, 0, width, height, 0, channels, pixels.data()))
             std::fill(pixels.begin(), pixels.end(), 0.0f);
         gpu::Downsample(pixels, width, height, channels, shift[i]);
-        bool quantized = !floatPrecision;
-        float peak = 0.0f;
-        for (float v : pixels) {
-            if (quantized) {
-                const float k = v * 255.0f;
-                if (!(v >= 0.0f && v <= 1.0f) || std::abs(k - std::round(k)) > 1e-3f) quantized = false;
-            }
-            if (std::isfinite(v)) peak = std::max(peak, std::abs(v));
-        }
+        struct Scan {
+            bool quantized;
+            float peak;
+        };
+        const Scan scan = tbb::parallel_reduce(
+            tbb::blocked_range<size_t>(0, pixels.size(), size_t(1) << 16), Scan{!floatPrecision, 0.0f},
+            [&](tbb::blocked_range<size_t> const& range, Scan scan) {
+                for (size_t p = range.begin(); p != range.end(); ++p) {
+                    const float v = pixels[p];
+                    if (scan.quantized) {
+                        const float k = v * 255.0f;
+                        if (!(v >= 0.0f && v <= 1.0f) || std::abs(k - std::round(k)) > 1e-3f) scan.quantized = false;
+                    }
+                    if (std::isfinite(v)) scan.peak = std::max(scan.peak, std::abs(v));
+                }
+                return scan;
+            },
+            [](Scan a, Scan b) { return Scan{a.quantized && b.quantized, std::max(a.peak, b.peak)}; });
+        const bool quantized = scan.quantized;
+        const float peak = scan.peak;
         const int stored = channels == 3 ? 4 : channels;
         const int componentBytes = quantized ? 1 : (!floatPrecision && peak < 60000.0f) ? 2 : 4;
         static const VkFormat formats[3][4] = {
             {VK_FORMAT_R8_UNORM, VK_FORMAT_R8G8_UNORM, VK_FORMAT_UNDEFINED, VK_FORMAT_R8G8B8A8_UNORM},
             {VK_FORMAT_R16_SFLOAT, VK_FORMAT_R16G16_SFLOAT, VK_FORMAT_UNDEFINED, VK_FORMAT_R16G16B16A16_SFLOAT},
             {VK_FORMAT_R32_SFLOAT, VK_FORMAT_R32G32_SFLOAT, VK_FORMAT_UNDEFINED, VK_FORMAT_R32G32B32A32_SFLOAT}};
-        const VkFormat format = formats[componentBytes == 1 ? 0 : componentBytes == 2 ? 1 : 2][stored - 1];
+        out.format = formats[componentBytes == 1 ? 0 : componentBytes == 2 ? 1 : 2][stored - 1];
         VkFormatProperties formatProperties;
-        vkGetPhysicalDeviceFormatProperties(physical, format, &formatProperties);
+        vkGetPhysicalDeviceFormatProperties(physical, out.format, &formatProperties);
         const VkFormatFeatureFlags blit = VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT |
             VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
         const bool mipmapped = (formatProperties.optimalTilingFeatures & blit) == blit;
-        const uint32_t levels = mipmapped ? 1u + uint32_t(std::floor(std::log2(double(std::max(width, height))))) : 1u;
+        out.levels = mipmapped ? 1u + uint32_t(std::floor(std::log2(double(std::max(width, height))))) : 1u;
+        out.width = width;
+        out.height = height;
+        out.staging.resize(size_t(width) * height * stored * componentBytes);
+        tbb::parallel_for(tbb::blocked_range<size_t>(0, size_t(width) * height, size_t(1) << 14),
+            [&](tbb::blocked_range<size_t> const& range) {
+                for (size_t p = range.begin(); p != range.end(); ++p) {
+                    for (int c = 0; c < stored; ++c) {
+                        const float v = c < channels ? pixels[p * channels + c] : 0.0f;
+                        uint8_t* texel = out.staging.data() + (p * stored + c) * componentBytes;
+                        if (componentBytes == 1) *texel = uint8_t(std::lround(std::clamp(v, 0.0f, 1.0f) * 255.0f));
+                        else if (componentBytes == 2) { const uint16_t h = FloatToHalf(v); std::memcpy(texel, &h, 2); }
+                        else std::memcpy(texel, &v, 4);
+                    }
+                }
+            });
+    };
 
-        std::vector<uint8_t> staging(size_t(width) * height * stored * componentBytes);
-        tbb::parallel_for(size_t(0), size_t(width) * height, [&](size_t p) {
-            for (int c = 0; c < stored; ++c) {
-                const float v = c < channels ? pixels[p * channels + c] : 0.0f;
-                uint8_t* out = staging.data() + (p * stored + c) * componentBytes;
-                if (componentBytes == 1) *out = uint8_t(std::lround(std::clamp(v, 0.0f, 1.0f) * 255.0f));
-                else if (componentBytes == 2) { const uint16_t h = FloatToHalf(v); std::memcpy(out, &h, 2); }
-                else std::memcpy(out, &v, 4);
-            }
-        });
-        Buffer stagingBuffer;
-        if (!createBuffer(staging.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &stagingBuffer)) {
-            if (error) *error = "cannot allocate an image staging buffer";
-            return false;
-        }
-        std::memcpy(stagingBuffer.mapped, staging.data(), staging.size());
-
-        Image image;
+    // Creates the image of `prepared`, recording its upload and mipmaps.
+    auto record = [&](VkCommandBuffer commands, Prepared const& prepared, Buffer const& staging, Image* image) {
         VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         imageInfo.imageType = VK_IMAGE_TYPE_2D;
-        imageInfo.format = format;
-        imageInfo.extent = {uint32_t(width), uint32_t(height), 1};
-        imageInfo.mipLevels = levels;
+        imageInfo.format = prepared.format;
+        imageInfo.extent = {uint32_t(prepared.width), uint32_t(prepared.height), 1};
+        imageInfo.mipLevels = prepared.levels;
         imageInfo.arrayLayers = 1;
         imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
         imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
         imageInfo.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-        vkCreateImage(device, &imageInfo, nullptr, &image.image);
+        if (vkCreateImage(device, &imageInfo, nullptr, &image->image) != VK_SUCCESS) return false;
         VkMemoryRequirements requirements;
-        vkGetImageMemoryRequirements(device, image.image, &requirements);
+        vkGetImageMemoryRequirements(device, image->image, &requirements);
         VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         allocation.allocationSize = requirements.size;
         allocation.memoryTypeIndex = memoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        if (vkAllocateMemory(device, &allocation, nullptr, &image.memory) != VK_SUCCESS) {
-            destroyBuffer(stagingBuffer);
-            if (error) *error = "out of memory for images";
-            return false;
-        }
-        vkBindImageMemory(device, image.image, image.memory, 0);
-
-        VkCommandBuffer commands = beginCommands();
+        if (vkAllocateMemory(device, &allocation, nullptr, &image->memory) != VK_SUCCESS) return false;
+        vkBindImageMemory(device, image->image, image->memory, 0);
+        image->bytes = requirements.size;
+        const uint32_t levels = prepared.levels;
         auto barrier = [&](uint32_t level, uint32_t count, VkImageLayout from, VkImageLayout to,
                            VkAccessFlags src, VkAccessFlags dst, VkPipelineStageFlags srcStage,
                            VkPipelineStageFlags dstStage) {
@@ -715,7 +770,7 @@ bool VulkanDevice::Impl::uploadImages(std::string* error)
             b.srcAccessMask = src;
             b.dstAccessMask = dst;
             b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            b.image = image.image;
+            b.image = image->image;
             b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, level, count, 0, 1};
             vkCmdPipelineBarrier(commands, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &b);
         };
@@ -723,9 +778,9 @@ bool VulkanDevice::Impl::uploadImages(std::string* error)
                 VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
         VkBufferImageCopy copy{};
         copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        copy.imageExtent = {uint32_t(width), uint32_t(height), 1};
-        vkCmdCopyBufferToImage(commands, stagingBuffer.buffer, image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
-        int w = width, h = height;
+        copy.imageExtent = {uint32_t(prepared.width), uint32_t(prepared.height), 1};
+        vkCmdCopyBufferToImage(commands, staging.buffer, image->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+        int w = prepared.width, h = prepared.height;
         for (uint32_t level = 1; level < levels; ++level) {
             barrier(level - 1, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                     VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -737,7 +792,7 @@ bool VulkanDevice::Impl::uploadImages(std::string* error)
             h = std::max(1, h / 2);
             region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0, 1};
             region.dstOffsets[1] = {w, h, 1};
-            vkCmdBlitImage(commands, image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, image.image,
+            vkCmdBlitImage(commands, image->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, image->image,
                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region, VK_FILTER_LINEAR);
             barrier(level - 1, 1, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                     VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -746,21 +801,69 @@ bool VulkanDevice::Impl::uploadImages(std::string* error)
         barrier(levels - 1, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                 VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-        const bool submitted = submit(commands, error);
-        destroyBuffer(stagingBuffer);
-        if (!submitted) return false;
-
         VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-        viewInfo.image = image.image;
+        viewInfo.image = image->image;
         viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        viewInfo.format = format;
+        viewInfo.format = prepared.format;
         // Absent channels read as zero (Metal semantics for R/RG formats).
         viewInfo.components = {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
                                VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
         viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, levels, 0, 1};
-        vkCreateImageView(device, &viewInfo, nullptr, &image.view);
-        imageCache[resource.get()] = {resource, image, floatPrecision, shift[i]};
-        imageViews[i] = image.view;
+        return vkCreateImageView(device, &viewInfo, nullptr, &image->view) == VK_SUCCESS;
+    };
+    auto destroyImage = [&](Image& image) {
+        if (image.view) vkDestroyImageView(device, image.view, nullptr);
+        if (image.image) vkDestroyImage(device, image.image, nullptr);
+        if (image.memory) vkFreeMemory(device, image.memory, nullptr);
+        image = {};
+    };
+
+    // Images are prepared in parallel, in batches that bound the host
+    // memory, and each batch is uploaded with one submission.
+    constexpr uint64_t batchBytes = uint64_t(2) << 30;
+    for (size_t first = 0; first < missing.size();) {
+        size_t last = first;
+        uint64_t bytes = 0;
+        while (last < missing.size()) {
+            auto const& resource = d.images[missing[last]];
+            // The float texels and the converted copy (at most as large).
+            const uint64_t imageBytes = uint64_t(resource->width()) * uint64_t(resource->height()) *
+                uint64_t(std::clamp(resource->channels(), 1, 4)) * 8;
+            if (last > first && bytes + imageBytes > batchBytes) break;
+            bytes += imageBytes;
+            ++last;
+        }
+        std::vector<Prepared> prepared(last - first);
+        tbb::parallel_for(first, last, [&](size_t m) { prepare(missing[m], prepared[m - first]); });
+        std::vector<Buffer> staging(prepared.size());
+        std::vector<Image> images(prepared.size());
+        VkCommandBuffer commands = beginCommands();
+        bool recorded = true;
+        for (size_t k = 0; k < prepared.size() && recorded; ++k) {
+            if (!createBuffer(prepared[k].staging.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &staging[k])) {
+                if (error) *error = "cannot allocate an image staging buffer";
+                recorded = false;
+                break;
+            }
+            std::memcpy(staging[k].mapped, prepared[k].staging.data(), prepared[k].staging.size());
+            std::vector<uint8_t>().swap(prepared[k].staging);
+            if (!record(commands, prepared[k], staging[k], &images[k])) {
+                if (error) *error = "out of memory for images";
+                recorded = false;
+            }
+        }
+        const bool submitted = submit(commands, recorded ? error : nullptr) && recorded;
+        for (auto& buffer : staging) destroyBuffer(buffer);
+        if (!submitted) {
+            for (auto& image : images) destroyImage(image);
+            return false;
+        }
+        for (size_t k = 0; k < prepared.size(); ++k) {
+            const size_t i = missing[first + k];
+            imageCache[d.images[i].get()] = {d.images[i], images[k], bool(isEnvironment[i]), shift[i]};
+            imageViews[i] = images[k].view;
+        }
+        first = last;
     }
     for (auto it = imageCache.begin(); it != imageCache.end();) {
         if (!it->second.resource.expired()) { ++it; continue; }
@@ -768,6 +871,12 @@ bool VulkanDevice::Impl::uploadImages(std::string* error)
         vkDestroyImage(device, it->second.image.image, nullptr);
         vkFreeMemory(device, it->second.image.memory, nullptr);
         it = imageCache.erase(it);
+    }
+    if (gpu::GpuVerbose()) {
+        VkDeviceSize bytes = 0;
+        for (auto const& [key, cached] : imageCache) bytes += cached.image.bytes;
+        std::cerr << std::format("PrismRT Vulkan: {} images ({} uploaded), {:.0f} MiB\n", d.images.size(), missing.size(),
+                                 double(bytes) / 1048576.0);
     }
     return upload(kSlotImages, info.data(), info.size() * sizeof(GpuImage));
 }
