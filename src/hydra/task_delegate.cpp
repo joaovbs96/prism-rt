@@ -190,7 +190,7 @@ HdRenderSettingDescriptorList PrismTaskDelegate::GetRenderSettingDescriptors() c
             {"Sample clamp", _sampleClamp, VtValue(10.0f)},
             {"Adaptive sampling threshold (0 off)", _adaptiveThreshold, VtValue(0.0f)},
             {"Adaptive sampling minimum samples", _adaptiveMinSamples, VtValue(16)},
-            {"Minimum NEE probability (0 always samples)", _neeProbabilityMin, VtValue(0.05f)},
+            {"Minimum NEE probability (0 always samples)", _neeProbabilityMin, VtValue(0.0f)},
             {"Probabilistic NEE from depth", _neeFromDepth, VtValue(2)},
             {"Light selection (spatial, power)", _lightSelection, VtValue(std::string("spatial"))},
             {"Adaptive preview", _adaptivePreview, VtValue(true)},

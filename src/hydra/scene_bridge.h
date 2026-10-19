@@ -38,7 +38,7 @@ struct RenderSettings {
     float adaptiveThreshold = 0.0f;
     int adaptiveMinSamples = 16;
     // Probabilistic NEE (see prism::device::NeeSettings; 0 always samples).
-    float neeProbabilityMin = 0.05f;
+    float neeProbabilityMin = 0.0f;
     int neeFromDepth = 2;
     // Spatial light selection among analytic lights (prism:lightSelection).
     bool spatialLights = true;

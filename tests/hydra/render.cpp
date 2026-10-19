@@ -260,7 +260,7 @@ int main(int argc, char** argv) {
         float adaptiveThreshold = 0.0f;
         int maxDepth = 32;
         int changeDepth = 0;
-        float neeProbabilityMin = 0.05f;
+        float neeProbabilityMin = 0.0f;
         std::string lightSelection = "spatial";
         int previewSequence = 0;
         int editSequence = 0;

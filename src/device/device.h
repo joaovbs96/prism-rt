@@ -48,12 +48,13 @@ struct PixelTile {
     size_t index = 0;
 };
 
-// Probabilistic next-event estimation: from fromDepth on, environment light
-// is sampled with probability clamp(path weight, probabilityMin, 1), which
-// saves most NEE work on dim deep paths at a small noise cost. A
-// probabilityMin of 0 always samples it.
+// Probabilistic next-event estimation: from fromDepth on, lights are sampled
+// with probability clamp(path weight, probabilityMin, 1), which saves NEE
+// work on dim deep paths at a noise cost. A probabilityMin of 0 (the default)
+// always samples them: skipping NEE raised the MSE of CornellBox by 40% for 1%
+// of time, and was about neutral on dome-lit and subsurface scenes.
 struct NeeSettings {
-    float probabilityMin = 0.05f;
+    float probabilityMin = 0.0f;
     int fromDepth = 2;
     // Spatial light selection among analytic lights (PathTracer::pickLight).
     bool spatialLights = true;

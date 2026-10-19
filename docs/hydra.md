@@ -37,6 +37,8 @@ python tests/hydra/validate.py
 | `prism:maxDepth` | 32 | Maximum path depth |
 | `prism:rrMinDepth` | 4 | Start of Russian roulette |
 | `prism:maxSampleRadiance` | 10 | Existing hue-preserving per-sample clamp; zero disables it |
+| `prism:neeProbabilityMin` | 0 | Probabilistic NEE: from `prism:neeFromDepth` on, lights are sampled with probability clamp(path weight, this, 1); 0 samples them at every vertex (lower noise, slightly more work per sample) |
+| `prism:neeFromDepth` | 2 | First depth of probabilistic NEE |
 | `prism:seed` | 0 | Per-pixel RNG seed |
 | `prism:previewMaxDimension` | 96 | Preview longest edge, clamped to 16-1024 pixels |
 | `prism:adaptivePreview` | true | Adapt preview resolution using measured render time |

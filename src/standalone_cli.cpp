@@ -62,7 +62,7 @@ void help() {
         "  --debug-contributions all|visible|direct|indirect (noise analysis: keep only light seen\n"
         "                 directly, reaching the first hit, or bounced more often; comma-separated)\n"
         "  --environment-sampling mis|bsdf (default mis)\n"
-        "  --nee-probability-min 0.05 --nee-from-depth 2 (from that depth on, environment light is\n"
+        "  --nee-probability-min 0 --nee-from-depth 2 (from that depth on, lights are\n"
         "                 sampled with probability clamp(path weight, min, 1); min 0 always samples)\n"
         "  --light-selection spatial|power (default spatial: analytic lights by their estimated\n"
         "                 irradiance at the shading point, mixed with power; power: by power only)\n"
