@@ -52,6 +52,7 @@ int RunVisibilityRetentionTests();
 int RunDependencyUpdateTests();
 int RunStructuralUpdateTests();
 int RunProgressiveIntegrationTests();
+int RunProgressStatusTests();
 int RunAccumulationIntegrationTests();
 int RunB2DoublePrimvarIntegrationTests();
 int RunB3FallbackOpacityIntegrationTests();
@@ -2337,6 +2338,7 @@ int main()
     ok &= RunDependencyUpdateTests() == 0;
     ok &= RunStructuralUpdateTests() == 0;
     ok &= RunProgressiveIntegrationTests() == 0;
+    ok &= RunProgressStatusTests() == 0;
     ok &= RunAccumulationIntegrationTests() == 0;
     return ok ? 0 : 1;
 }
