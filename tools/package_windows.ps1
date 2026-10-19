@@ -26,6 +26,7 @@ param(
     [string] $VcpkgBin = "",
     [string] $PythonRoot = "",
     [string] $DxcDir = "",
+    [string] $VulkanLoader = "",
     [string] $PySideVersion = "6.7.2",
     [string[]] $PipPackages = @("numpy==2.2.6", "PyOpenGL==3.1.7"),
     [switch] $SkipPip,
@@ -190,6 +191,14 @@ Copy-Dlls $mdlBin $mdlOut @("libmdl_sdk.dll", "libmdl_core.dll", "nv_openimageio
 # DXC compiles the GPU kernel at run time.
 $dxcOut = Join-Path $pkg "dxc"
 foreach ($f in @("dxc.exe", "dxcompiler.dll", "dxil.dll")) { Copy-IfExists (Join-Path $DxcDir $f) $dxcOut }
+# PrismRT.exe imports the Vulkan loader, which machines without a GPU driver
+# lack. The SDK does not ship it; use the LunarG runtime, else the system copy.
+$loader = @($VulkanLoader, $env:PRISM_VULKAN_LOADER, (Join-Path $env:SystemRoot "System32\vulkan-1.dll")) |
+    Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 1
+if (-not $loader) { throw "vulkan-1.dll not found. Pass -VulkanLoader." }
+Copy-IfExists $loader $binDir
+Write-Host "Vulkan loader from $loader"
+Copy-IfExists (Join-Path (Split-Path -Parent (Split-Path -Parent $loader)) "VulkanRT-License.txt") (Join-Path $pkg "licenses") "VulkanRT-License.txt"
 
 # 3. Private Python.
 $pyOut = Join-Path $pkg "python"
@@ -239,13 +248,13 @@ foreach ($c in @((Join-Path $usdSource "LICENSE.txt"), (Join-Path $UsdRoot "LICE
 Copy-IfExists (Join-Path $UsdRoot "NOTICE.txt") $lic "OpenUSD-NOTICE.txt"
 Copy-IfExists (Join-Path $MaterialXRoot "LICENSE") $lic "MaterialX-LICENSE.txt"
 Copy-IfExists (Join-Path $MaterialXRoot "THIRD-PARTY.md") $lic "MaterialX-THIRD-PARTY.md"
-foreach ($n in @("LICENSE.md", "LICENSE.txt", "LICENSE")) { Copy-IfExists (Join-Path $MdlSdkRoot $n) $lic "MDL-SDK-$n" }
+foreach ($n in @("LICENSE.md", "LICENSE_THIRDPARTY.md", "LICENSE.txt", "LICENSE")) { Copy-IfExists (Join-Path $MdlSdkRoot $n) $lic "MDL-SDK-$n" }
 $embreeRoot = Split-Path -Parent $EmbreeRuntime
 foreach ($n in @("LICENSE.txt", "doc\LICENSE.txt", "third-party-programs.txt", "doc\third-party-programs.txt")) {
     Copy-IfExists (Join-Path $embreeRoot $n) $lic ("Embree-" + (Split-Path -Leaf $n))
 }
 $tbbRoot = $TbbRuntime
-for ($i = 0; $i -lt 4; $i++) { $tbbRoot = Split-Path -Parent $tbbRoot }
+for ($i = 0; $i -lt 3; $i++) { $tbbRoot = Split-Path -Parent $tbbRoot }
 foreach ($n in @("LICENSE.txt", "licensing\LICENSE.txt", "share\doc\TBB\LICENSE.txt", "share\doc\tbb\LICENSE.txt")) {
     Copy-IfExists (Join-Path $tbbRoot $n) $lic ("oneTBB-" + (Split-Path -Leaf $n))
 }
