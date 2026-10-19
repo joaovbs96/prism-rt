@@ -34,6 +34,8 @@
 
 namespace prism::device::vulkan {
 
+const char* const kMaterialCallProfile = "lib_6_6";
+
 namespace {
 
 using Clock = std::chrono::steady_clock;
@@ -136,9 +138,52 @@ unsigned DxcJobs()
     return std::clamp(std::thread::hardware_concurrency() / 4u, 1u, 4u);
 }
 
-const gpu::HlslStage kLibraryStage{"lib_6_6", ""};
+const gpu::HlslStage kLibraryStage{kMaterialCallProfile, ""};
+
+// The driver compiles the pipeline's shaders on several threads through a
+// deferred operation (PRISM_VULKAN_PARALLEL_PIPELINE=0: on one thread).
+bool ParallelPipelineSetting()
+{
+    const char* value = Setting("PRISM_VULKAN_PARALLEL_PIPELINE");
+    return !value || std::strcmp(value, "0") != 0;
+}
+
+// Ignore stored pipeline caches (PRISM_VULKAN_PIPELINE_CACHE=0), to measure the driver's compile.
+bool PipelineCacheSetting()
+{
+    const char* value = Setting("PRISM_VULKAN_PIPELINE_CACHE");
+    return !value || std::strcmp(value, "0") != 0;
+}
 
 } // namespace
+
+bool MaterialCallSources(gpu::MdlShaderCode const& code, bool reorder, std::vector<std::string>* sources,
+                         std::string* error)
+{
+    const uint32_t programs = uint32_t(code.programDispatch.size());
+    sources->assign(programs + 1, std::string());
+    // PRISM_VULKAN_SHADER_SALT=<n> changes every module's code, so DXC and
+    // the driver (which keeps its own cache) compile anew: cold measurements.
+    std::string salt;
+    if (const char* value = Setting("PRISM_VULKAN_SHADER_SALT"))
+        salt = std::format("#define PRISM_SHADER_SALT {}u\n", std::strtoul(value, nullptr, 10) | 0x80000000u);
+    std::string defines = "#define PRISM_CALL_MATERIALS 1\n" + salt;
+    if (reorder) {
+        uint32_t bits = 1;
+        while ((1u << bits) < programs && bits < 16) ++bits;
+        defines += std::format("#define PRISM_REORDER_MATERIALS 1\n#define PRISM_REORDER_HINT_BITS {}u\n", bits);
+    }
+    if (!gpu::AssembleShader("gpu/kernel.hlsl", {"gpu/vulkan"}, std::string(), &(*sources)[0], error)) return false;
+    (*sources)[0] = defines + (*sources)[0];
+    for (uint32_t p = 0; p < programs; ++p) {
+        const std::string mdl = code.targetCode + code.programDispatch[p] + code.sceneData;
+        if (!gpu::AssembleShader("gpu/vulkan/material_callable.hlsl", {"gpu/vulkan"}, mdl, &(*sources)[p + 1],
+                                 error))
+            return false;
+        (*sources)[p + 1] = salt + (*sources)[p + 1];
+    }
+    return true;
+}
 
 CallableMode CallableModeSetting()
 {
@@ -216,6 +261,41 @@ MaterialCallPipeline::MaterialCallPipeline(VkDevice device, VkPhysicalDevice phy
     m_groupHandles = reinterpret_cast<PFN_vkGetRayTracingShaderGroupHandlesKHR>(
         vkGetDeviceProcAddr(device, "vkGetRayTracingShaderGroupHandlesKHR"));
     m_traceRays = reinterpret_cast<PFN_vkCmdTraceRaysKHR>(vkGetDeviceProcAddr(device, "vkCmdTraceRaysKHR"));
+    m_createDeferred = reinterpret_cast<PFN_vkCreateDeferredOperationKHR>(
+        vkGetDeviceProcAddr(device, "vkCreateDeferredOperationKHR"));
+    m_destroyDeferred = reinterpret_cast<PFN_vkDestroyDeferredOperationKHR>(
+        vkGetDeviceProcAddr(device, "vkDestroyDeferredOperationKHR"));
+    m_deferredConcurrency = reinterpret_cast<PFN_vkGetDeferredOperationMaxConcurrencyKHR>(
+        vkGetDeviceProcAddr(device, "vkGetDeferredOperationMaxConcurrencyKHR"));
+    m_deferredResult = reinterpret_cast<PFN_vkGetDeferredOperationResultKHR>(
+        vkGetDeviceProcAddr(device, "vkGetDeferredOperationResultKHR"));
+    m_joinDeferred = reinterpret_cast<PFN_vkDeferredOperationJoinKHR>(
+        vkGetDeviceProcAddr(device, "vkDeferredOperationJoinKHR"));
+}
+
+VkResult MaterialCallPipeline::createPipeline(VkRayTracingPipelineCreateInfoKHR const& info, VkPipelineCache cache)
+{
+    VkDeferredOperationKHR deferred = VK_NULL_HANDLE;
+    const bool parallel = ParallelPipelineSetting() && m_createDeferred && m_destroyDeferred &&
+        m_deferredConcurrency && m_deferredResult && m_joinDeferred &&
+        m_createDeferred(m_device, nullptr, &deferred) == VK_SUCCESS;
+    VkResult result = m_createPipelines(m_device, parallel ? deferred : VK_NULL_HANDLE, cache, 1, &info, nullptr,
+                                        &m_pipeline);
+    if (!parallel) return result;
+    if (result == VK_OPERATION_DEFERRED_KHR) {
+        // Every joining thread compiles shaders until the driver has none left.
+        const uint32_t workers = std::clamp(m_deferredConcurrency(m_device, deferred), 1u,
+                                            std::max(1u, std::thread::hardware_concurrency()));
+        m_report.pipelineThreads = workers;
+        tbb::parallel_for(0u, workers, [&](uint32_t) {
+            while (m_joinDeferred(m_device, deferred) == VK_THREAD_IDLE_KHR) std::this_thread::yield();
+        });
+        result = m_deferredResult(m_device, deferred);
+    } else if (result == VK_OPERATION_NOT_DEFERRED_KHR) {
+        result = VK_SUCCESS;
+    }
+    m_destroyDeferred(m_device, deferred, nullptr);
+    return result;
 }
 
 MaterialCallPipeline::~MaterialCallPipeline()
@@ -229,22 +309,8 @@ bool MaterialCallPipeline::compileShaders(gpu::MdlShaderCode const& code, bool r
                                           std::vector<std::vector<uint32_t>>* modules, std::string* error)
 {
     const uint32_t programs = uint32_t(code.programDispatch.size());
-    // Module 0: the raygen shader (the kernel without MDL code); then one
-    // callable per program: the link unit with only that program's dispatch.
-    std::vector<std::string> sources(programs + 1);
-    std::string defines = "#define PRISM_CALL_MATERIALS 1\n";
-    if (reorder) {
-        uint32_t bits = 1;
-        while ((1u << bits) < programs && bits < 16) ++bits;
-        defines += std::format("#define PRISM_REORDER_MATERIALS 1\n#define PRISM_REORDER_HINT_BITS {}u\n", bits);
-    }
-    if (!gpu::AssembleShader("gpu/kernel.hlsl", {"gpu/vulkan"}, std::string(), &sources[0], error)) return false;
-    sources[0] = defines + sources[0];
-    for (uint32_t p = 0; p < programs; ++p) {
-        const std::string mdl = code.targetCode + code.programDispatch[p] + code.sceneData;
-        if (!gpu::AssembleShader("gpu/vulkan/material_callable.hlsl", {"gpu/vulkan"}, mdl, &sources[p + 1], error))
-            return false;
-    }
+    std::vector<std::string> sources;
+    if (!MaterialCallSources(code, reorder, &sources, error)) return false;
     const auto directory = gpu::ShaderCacheDirectory("vulkan");
     const std::string signature = gpu::HlslCompilerSignature(gpu::HlslTarget::Spirv, kLibraryStage);
     std::vector<std::filesystem::path> cached(sources.size());
@@ -368,7 +434,7 @@ bool MaterialCallPipeline::build(gpu::MdlShaderCode const& code, VkPipelineLayou
     // The driver translates every callable here; keep its result for later runs.
     const auto cacheFile = gpu::ShaderCacheDirectory("vulkan") /
         (gpu::SourceDigest(digests + (statistics ? "|stats" : "")) + "-" + m_cacheTag + ".vkpc");
-    const std::vector<char> cacheData = ReadFile(cacheFile);
+    const std::vector<char> cacheData = PipelineCacheSetting() ? ReadFile(cacheFile) : std::vector<char>();
     m_report.pipelineCacheHit = !cacheData.empty();
     VkPipelineCacheCreateInfo cacheInfo{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
     cacheInfo.initialDataSize = cacheData.size();
@@ -381,7 +447,7 @@ bool MaterialCallPipeline::build(gpu::MdlShaderCode const& code, VkPipelineLayou
     }
     const auto start = Clock::now();
     CommitSampler commit;
-    const VkResult result = m_createPipelines(m_device, VK_NULL_HANDLE, cache, 1, &info, nullptr, &m_pipeline);
+    const VkResult result = createPipeline(info, cache);
     m_report.pipelineCommitBytes = commit.stop();
     m_report.pipelineSeconds = SecondsSince(start);
     destroyModules();

@@ -64,6 +64,9 @@ void renderThread(uint thread)
 {
     const GpuFrame frame = gpu_frame();
     if (thread >= frame.work.x) return;
+#ifdef PRISM_SHADER_SALT
+    if (thread == PRISM_SHADER_SALT) return; // never: makes the code unique (cold-compile measurements)
+#endif
     const uint flags = frame.settings.z;
     const CameraParams camera = frameCamera(frame);
     const SampleSettings settings = {frame.shading.x, frame.shading.y,

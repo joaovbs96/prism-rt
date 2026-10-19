@@ -10,6 +10,7 @@
 #include "../src/scene.h"
 #ifdef PRISM_HAS_VULKAN
 #include "../src/device/vulkan/vulkan_device.h"
+#include "../src/device/vulkan/vulkan_material_calls.h"
 #endif
 
 #include <cstdlib>
@@ -79,6 +80,19 @@ int main(int argc, char** argv)
         check(prism::device::CompileVulkanKernel(code.code, &spirv, &error) && spirv.size() > 1000 &&
                   spirv[0] == 0x07230203u,
               "Vulkan kernel compiles to SPIR-V: " + error);
+        // The callable path: the raygen shader (with reordering) and each program's callable.
+        std::vector<std::string> sources;
+        check(prism::device::vulkan::MaterialCallSources(code, true, &sources, &error) &&
+                  sources.size() == code.programCount + 1u,
+              "callable sources: " + error);
+        for (size_t i = 0; i < sources.size(); ++i) {
+            std::vector<char> library;
+            check(CompileHlsl(sources[i], HlslTarget::Spirv, ShaderCacheDirectory("test"), &library, &error,
+                              HlslStage{prism::device::vulkan::kMaterialCallProfile, ""}) &&
+                      library.size() > 1000,
+                  (i == 0 ? std::string("raygen shader") : "callable " + std::to_string(i - 1)) +
+                      " compiles to SPIR-V: " + error);
+        }
 #endif
         std::string source;
         std::vector<char> dxil;

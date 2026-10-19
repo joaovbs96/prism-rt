@@ -808,9 +808,10 @@ bool VulkanDevice::Impl::buildCallablePipeline(std::shared_ptr<const gpu::MdlSha
             std::cerr << std::format(
                 "PrismRT Vulkan: callable pipeline {:.1f} s: {} of {} callables compiled (DXC wall {:.1f} s, "
                 "slowest {:.1f} s, peak {} MiB; raygen {:.1f} s, {} MiB), driver pipeline {:.1f} s ({}, "
-                "+{} MiB commit)\n", SecondsSince(start), r.compiled, r.programs, r.dxcWallSeconds, r.dxcMaxSeconds,
-                r.dxcPeakBytes >> 20, r.raygenSeconds, r.raygenPeakBytes >> 20, r.pipelineSeconds,
-                r.pipelineCacheHit ? "pipeline cache hit" : "no pipeline cache", r.pipelineCommitBytes >> 20);
+                "{} threads, +{} MiB commit)\n", SecondsSince(start), r.compiled, r.programs, r.dxcWallSeconds,
+                r.dxcMaxSeconds, r.dxcPeakBytes >> 20, r.raygenSeconds, r.raygenPeakBytes >> 20, r.pipelineSeconds,
+                r.pipelineCacheHit ? "pipeline cache hit" : "no pipeline cache", r.pipelineThreads,
+                r.pipelineCommitBytes >> 20);
     }
     callables = found->second.get();
     pipeline = callables->pipeline();

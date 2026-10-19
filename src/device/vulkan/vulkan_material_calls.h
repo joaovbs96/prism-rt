@@ -44,6 +44,14 @@ bool ReorderSetting();
 // Whether to print the driver's per-shader statistics (PRISM_VULKAN_PIPELINE_STATS=1).
 bool PipelineStatisticsSetting();
 
+// The HLSL of the callable pipeline: the raygen shader (the kernel without
+// MDL code, PRISM_CALL_MATERIALS), then one callable per program of `code`
+// (the link unit with only that program's dispatch), each compiled alone with
+// the kMaterialCallProfile library profile.
+bool MaterialCallSources(gpu::MdlShaderCode const& code, bool reorder, std::vector<std::string>* sources,
+                         std::string* error);
+extern const char* const kMaterialCallProfile; // lib_6_6
+
 // Prints the statistics of every executable of `pipeline` (created with
 // VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR).
 void PrintPipelineStatistics(VkDevice device, VkPipeline pipeline, std::string const& label);
@@ -58,6 +66,7 @@ struct CallableBuildReport {
     double raygenSeconds = 0.0;
     uint64_t raygenPeakBytes = 0;
     double pipelineSeconds = 0.0;   // vkCreateRayTracingPipelinesKHR
+    uint32_t pipelineThreads = 1;   // threads that joined its deferred compile
     int64_t pipelineCommitBytes = 0; // process commit growth at its peak during pipeline creation (Windows)
     bool pipelineCacheHit = false;  // the pipeline cache file existed
 };
@@ -82,6 +91,7 @@ private:
     bool compileShaders(gpu::MdlShaderCode const& code, bool reorder,
                         std::vector<std::vector<uint32_t>>* modules, std::string* error);
     bool createBindingTable(uint32_t groups, std::string* error);
+    VkResult createPipeline(VkRayTracingPipelineCreateInfoKHR const& info, VkPipelineCache cache);
 
     VkDevice m_device = VK_NULL_HANDLE;
     VkPhysicalDevice m_physical = VK_NULL_HANDLE;
@@ -96,6 +106,11 @@ private:
     PFN_vkCreateRayTracingPipelinesKHR m_createPipelines = nullptr;
     PFN_vkGetRayTracingShaderGroupHandlesKHR m_groupHandles = nullptr;
     PFN_vkCmdTraceRaysKHR m_traceRays = nullptr;
+    PFN_vkCreateDeferredOperationKHR m_createDeferred = nullptr;
+    PFN_vkDestroyDeferredOperationKHR m_destroyDeferred = nullptr;
+    PFN_vkGetDeferredOperationMaxConcurrencyKHR m_deferredConcurrency = nullptr;
+    PFN_vkGetDeferredOperationResultKHR m_deferredResult = nullptr;
+    PFN_vkDeferredOperationJoinKHR m_joinDeferred = nullptr;
 };
 
 } // namespace prism::device::vulkan
