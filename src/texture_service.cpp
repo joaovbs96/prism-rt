@@ -97,9 +97,28 @@ std::filesystem::path cacheRoot()
     return prism::PersistentCacheRoot();
 }
 
+uint64_t physicalMemoryMB()
+{
+#ifdef _WIN32
+    MEMORYSTATUSEX status{};
+    status.dwLength = sizeof(status);
+    if (GlobalMemoryStatusEx(&status)) return status.ullTotalPhys >> 20;
+#else
+    const long pages = sysconf(_SC_PHYS_PAGES), pageSize = sysconf(_SC_PAGESIZE);
+    if (pages > 0 && pageSize > 0)
+        return (static_cast<uint64_t>(pages) * static_cast<uint64_t>(pageSize)) >> 20;
+#endif
+    return 0;
+}
+
+// OIIO's tile cache. Too small a cache for the scene's texture working set
+// makes render threads wait on tile eviction and rereads: ALab rendered 21x
+// slower with 512 MiB than with 4 GiB. The default is a sixteenth of physical
+// memory, between 512 MiB and 4 GiB.
 size_t memoryBudgetMB()
 {
-    return static_cast<size_t>(prism::ResourceLimit("PRISM_TEXTURE_CACHE_MB", 512, 65536));
+    const uint64_t fallback = std::clamp<uint64_t>(physicalMemoryMB() / 16, 512, 4096);
+    return static_cast<size_t>(prism::ResourceLimit("PRISM_TEXTURE_CACHE_MB", fallback, 65536));
 }
 
 // Files the TextureSystem keeps open. OIIO's default of 100 makes a scene

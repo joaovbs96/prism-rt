@@ -8,7 +8,8 @@ with the system temporary directory as the fallback when `LOCALAPPDATA` is
 unavailable. Set `PRISM_CACHE_DIR` to choose another directory.
 
 `PRISM_TEXTURE_CACHE_MB` sets OIIO's shared texture tile-cache budget in MiB
-(default 512). `PRISM_DISK_CACHE_GB` sets the disk cache's LRU budget in GiB
+(default a sixteenth of physical memory, between 512 and 4096; 512 MiB made
+ALab render about 21 times slower than 4 GiB). `PRISM_DISK_CACHE_GB` sets the disk cache's LRU budget in GiB
 (default 10). Disk trimming skips prepared textures pinned by live resource
 handles in any process. Source files are not modified.
 
