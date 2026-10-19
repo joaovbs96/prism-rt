@@ -204,7 +204,7 @@ size_t CallableThresholdBytes()
 bool ReorderSetting()
 {
     const char* value = Setting("PRISM_VULKAN_REORDER");
-    return !value || std::strcmp(value, "0") != 0;
+    return value && std::strcmp(value, "0") != 0;
 }
 
 bool PipelineStatisticsSetting()

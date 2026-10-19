@@ -39,7 +39,8 @@ CallableMode CallableModeSetting();
 // Assembled compute kernels above this size use callables in Auto mode
 // (PRISM_VULKAN_CALLABLE_THRESHOLD_KIB, default 1024).
 size_t CallableThresholdBytes();
-// Whether to reorder threads by material program (PRISM_VULKAN_REORDER, default on where supported).
+// Whether to reorder threads by material program (PRISM_VULKAN_REORDER=1, where supported). Off by
+// default: measured 2-8% slower on most scenes, 16% faster on the MaterialEggs countertop.
 bool ReorderSetting();
 // Whether to print the driver's per-shader statistics (PRISM_VULKAN_PIPELINE_STATS=1).
 bool PipelineStatisticsSetting();
