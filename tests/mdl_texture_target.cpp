@@ -2,6 +2,7 @@
 #include "../src/mdl/context.h"
 #include "../src/mdl/material_compiler.h"
 #include "../src/mdl/texture_runtime.h"
+#include "../src/mdl_material.h"
 #include "../src/materialx/mdl_generator.h"
 
 #include <mi/mdl_sdk.h>
@@ -25,12 +26,7 @@
 
 namespace {
 
-// Element types of the MDL state's matrix and texture-result pointers
-// (tct_float4_a16 in MDL SDK 2026, tct_float4 before).
-using MdlStateFloat4 = std::remove_const_t<std::remove_pointer_t<
-    decltype(mi::neuraylib::Shading_state_material_with_derivs::text_results)>>;
-using MdlStateMatrixRow = std::remove_const_t<std::remove_pointer_t<
-    decltype(mi::neuraylib::Shading_state_material_with_derivs::world_to_object)>>;
+// MdlStateFloat4 and MdlStateMatrixRow come from mdl_material.h.
 
 void require(bool condition, std::string const &message)
 {
@@ -122,6 +118,25 @@ GeneratedMDL sceneDataMaterial(std::string module, std::string primvar)
         "export material main(uniform string primvar = \"" + primvar + "\") = material(\n"
         "  surface: material_surface(scattering: df::diffuse_reflection_bsdf(\n"
         "    tint: lookup(primvar, color(0,0,1)))));\n";
+    return generated;
+}
+
+// Emission behind a df::directional_factor, as OpenPBR and standard_surface
+// layer it under their coat. Equal tints make it diffuse; class compilation
+// keeps the factor that folding these arguments would remove.
+GeneratedMDL directionalEmissionMaterial(std::string module, float grazing)
+{
+    GeneratedMDL generated;
+    generated.module_name = "::" + std::move(module);
+    generated.success = true;
+    generated.mdl_source =
+        "mdl 1.8;\n"
+        "import ::df::*;\n"
+        "export material main(color normal_tint = color(1.0),\n"
+        "                     color grazing_tint = color(" + std::to_string(grazing) + ")) = material(\n"
+        "  surface: material_surface(emission: material_emission(\n"
+        "    emission: df::directional_factor(normal_tint, grazing_tint, 5.0, df::diffuse_edf()),\n"
+        "    intensity: color(2.0))));\n";
     return generated;
 }
 
@@ -593,6 +608,22 @@ int main()
         require(dominant(evaluate(sceneDataRed.target,.25f,.25f),0),
                 "scene data variant changed an earlier material's lookup");
         mdl::NativeTextureRuntime::primvarContext={};
+
+        // Constant emission (emissive triangles join the light table) must
+        // not depend on the compile mode: under class compilation a
+        // directional_factor whose tints agree is still diffuse.
+        auto isotropic=compile(context,scratch.path,
+            directionalEmissionMaterial("target_directional_isotropic",1.0f));
+        require(isotropic.target.program->uniform_emission &&
+                    isotropic.target.program->directional_emission,
+                "class-compiled directional_factor emission was not recognised");
+        const auto isotropicEmission=MDLMaterial(isotropic.target).constantEmission();
+        require(isotropicEmission&&isotropicEmission->radiance.x()>0.0f,
+                "directional_factor with equal tints lost its constant emission");
+        auto directional=compile(context,scratch.path,
+            directionalEmissionMaterial("target_directional_grazing",0.0f));
+        require(!MDLMaterial(directional.target).constantEmission(),
+                "direction-dependent emission was treated as constant");
 
         // Exercise a real MaterialX standard_surface target. Its glossy/sheen
         // implementation causes the SDK to inject internal BSDF data textures;
