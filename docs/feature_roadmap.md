@@ -41,9 +41,14 @@ Scenes: **Eggs** (MaterialEggs), **OpenPBR** (OpenPBRShaderPlayground),
 - **Light filters** and portal lights.
 - **Dome texture formats** other than lat-long (angular, mirrored ball,
   cube maps) are read as lat-long with a warning.
-- **Many-light sampling.** NEE picks lights by power from an alias table and
-  BSDF rays test every analytic light; scenes with hundreds of lights want a
-  light BVH.
+- **Many-light sampling.** NEE picks lights by power from an alias table,
+  then re-picks analytic lights by their estimated irradiance at the shading
+  point (up to 64 of them; see [Sampling](gpu_devices.md#sampling)). Emissive
+  triangles are still picked by power alone, and BSDF rays test every
+  analytic light; scenes with hundreds of lights want a light BVH.
+- **Solid-angle sampling of emissive triangles and disk lights** (spherical
+  triangles, Arvo 1995); both are area-sampled. On CornellBox direct light is
+  under 1% of the noise, so it was not pursued.
 
 ## Geometry
 

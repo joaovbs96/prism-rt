@@ -114,6 +114,68 @@ Notes:
 Reproduce with `local/baseline/compare_gpu.sh <output dir>` (local, untracked
 setup; see `prism_env.sh`).
 
+## Sampling
+
+Everything below lives in the shared integrator (`shaders/integrator/`), in
+the C++/HLSL subset, so the CPU, Vulkan and Metal devices draw the same
+numbers in the same order and agree sample for sample.
+
+- **Sample points.** `Sampler` (`types.h`) hands out 4-D points:
+  Owen-scrambled Sobol (Burley 2020) indexed by the sample number, with a
+  per-pixel seed and a separate index shuffle and scramble for each 4-D
+  group, so any sample index works in progressive rendering. The first four
+  groups are Sobol (camera pixel and lens, the first BSDF sample, the light
+  selection, the light sample); later ones are hashed random points.
+  Materials and cutouts keep the pixel's LCG. Numbers stay on a 24-bit grid
+  in (0, 1): zero becomes 2^-25, because MDL's layered BSDFs pick a
+  zero-weight lobe for xi exactly 0 and divide by its probability.
+- **Next-event estimation** at every scattering vertex, with power-heuristic
+  MIS against BSDF sampling for every light type. Probabilistic NEE
+  (`prism:neeProbabilityMin`) is off by default.
+- **Light selection.** An alias table over the light table picks by power
+  (analytic lights, constant-emission triangles, the dome as one entry).
+  With `prism:lightSelection spatial` (default) and 2 to 64 analytic lights,
+  an analytic pick is redone among the analytic lights in proportion to
+  `lightImportance` at the shading point: radiance times the solid angle
+  the light subtends, zero behind one-sided planar lights, inside spheres
+  and cylinders, and for lights not linked to the receiver. Triangles and
+  the dome keep their probabilities. BSDF hits on a light recompute its
+  selection probability from the vertex that scattered the ray (not the ray
+  origin, which moves at cutout crossings).
+- **Shapes.** Spheres: uniform cone. Rects: uniform solid angle (spherical
+  rectangles, Urena et al. 2013) above 1e-3 sr, area below. Cylinders: the
+  arc visible from the shading point, equiangular along the axis. Disks and
+  triangles: area. Distant lights: cone. Dome: texel alias table.
+- **Russian roulette** from `prism:rrMinDepth` (4) with survival
+  clamp(path weight, 0.05, 0.95).
+
+Measured on Vulkan at 256x256 against 32768-spp references, sample clamp off,
+RMS over 4 seeds (before: the integrator before these changes, with
+probabilistic NEE and power selection):
+
+| Scene | NRMSE 64 spp before → after | NRMSE 256 spp before → after | Time per sample |
+| --- | --- | --- | --- |
+| CornellBox (small area light) | 0.0101 → 0.0088 | 0.0045 → 0.0038 | +2% |
+| `tests/hydra/fixtures/lights.usda` (5 UsdLux lights) | 0.224 → 0.053 | 0.113 → 0.027 | +2% |
+| Large rect light near a ball and floor | 0.106 → 0.080 | 0.053 → 0.040 | +3% |
+| MaterialEggs jade egg (dome, subsurface) | 0.118 → 0.116 | 0.062 → 0.061 | +9% |
+| OpenChessSet (dome) | 0.147 → 0.151 | 0.080 → 0.081 | +1% |
+
+Relative mean luminance stays within 0.05% of the references. Where the
+noise came from (64 spp): on CornellBox, 77% from light that bounced at least
+twice, 23% from directly visible edges and the light, under 1% from direct
+light; on the lights fixture, 89% from direct light, nearly all of it on the
+wall next to the tube light; on the egg and the chess set, roughly 45% direct
+and 55% indirect. Always sampling lights costs the egg and the chess set a few
+percent of efficiency (the egg's random walks leave through many vertices);
+`prism:neeProbabilityMin 0.05` restores the previous behavior.
+
+Tried without a measurable gain: Sobol points for all dimensions or for 8 or
+16 groups (within 2%), packing the light selection into the light sample's
+group, and Russian roulette from depth 2 (worse) or 8 (CornellBox -14% MSE,
+OpenChessSet +18% time). Pixel filters other than the box were not tried:
+they change the image, not just its noise.
+
 ## Diagnostics
 
 - `PRISM_GPU_VERBOSE=1`: compile and upload timings.
