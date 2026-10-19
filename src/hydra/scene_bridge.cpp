@@ -5403,6 +5403,15 @@ public:
         std::make_shared<PrototypePool>();
     uint64_t requestedGeneration = 1;
     uint64_t cameraRevision = 0;
+    // When Prepare last saw the camera change; lighting-only edits wait for
+    // the camera to rest (see Prepare).
+    std::chrono::steady_clock::time_point lastCameraChange{};
+    uint64_t deferredEnvironmentCaptures = 0;
+    // The running build converts edits of lights alone.
+    bool buildLightingOnly = false;
+    // The displayed snapshot brought lighting held back during camera motion:
+    // its quiet interval before refinement counts from that motion.
+    bool refineFromCameraChange = false;
     std::deque<DirtyRecord> dirtyJournal;
     std::vector<StructuralChange> dirtyStructuralChanges;
     CanonicalPrimIds canonicalPrimIds;
@@ -5857,7 +5866,11 @@ bool SceneBridge::Prepare(CameraState const &camera,
             _impl->lastRebuildReason = "render tags changed";
         }
         _impl->camera = camera;
-        if (cameraChanged) ++_impl->cameraRevision;
+        if (cameraChanged) {
+            ++_impl->cameraRevision;
+            _impl->lastCameraChange = std::chrono::steady_clock::now();
+            _impl->refineFromCameraChange = false;
+        }
         _impl->bindings = bindings;
         _impl->bindingAllocationRevisions = std::move(allocationRevisions);
         _impl->renderTags = renderTags;
@@ -6044,6 +6057,11 @@ bool SceneBridge::Prepare(CameraState const &camera,
             if (completed.needsSpare)
                 _impl->LaunchSpareLocked(completed.generation);
             published = true;
+            // Lighting that waited for the camera to rest: the camera has
+            // already been quiet, so refinement need not wait a full
+            // interval again after this snapshot's preview.
+            _impl->refineFromCameraChange = _impl->buildLightingOnly &&
+                std::chrono::steady_clock::now() - _impl->lastCameraChange < std::chrono::seconds(1);
             _impl->progress.SetError({});
         } else if (!completed.error.empty()) {
             TF_WARN("PrismRT: background snapshot generation failed: %s",
@@ -6062,8 +6080,22 @@ bool SceneBridge::Prepare(CameraState const &camera,
         std::lock_guard lock(_impl->mutex);
         if (!_impl->snapshot)
             captureBudget = kInitialCaptureBudgetMilliseconds;
+        // Edits of lights alone wait while the camera moves. A host light
+        // that follows the camera (usdview's default camera light) changes
+        // with every camera move; converting and uploading each of those
+        // scenes restarted the render worker before any preview of the moving
+        // camera could finish. Previews keep the displayed lighting until the
+        // camera rests, then the latest lighting is captured once.
+        const auto holdLighting = std::chrono::milliseconds(
+            std::clamp(_impl->settings.refinementDelayMs / 2, 0, 50));
+        const bool deferLighting = _impl->snapshot &&
+            _impl->dirtyKinds == static_cast<unsigned int>(SceneDirtyKind::Environment) &&
+            std::chrono::steady_clock::now() - _impl->lastCameraChange < holdLighting;
+        if (deferLighting && _impl->sceneDirty && !_impl->captureActive &&
+            !_impl->buildFuture.valid())
+            ++_impl->deferredEnvironmentCaptures;
         if (_impl->sceneDirty && !_impl->captureActive &&
-            !_impl->buildFuture.valid()) {
+            !_impl->buildFuture.valid() && !deferLighting) {
             _impl->captureActive = true;
             _impl->captureGeneration = _impl->requestedGeneration;
             _impl->captureQueue.clear();
@@ -6301,6 +6333,8 @@ bool SceneBridge::Prepare(CameraState const &camera,
             _impl->jobSettings = jobSettings;
             _impl->jobResolverContext = resolverContext;
             _impl->buildIsSpare = false;
+            _impl->buildLightingOnly =
+                jobDirtyKinds == static_cast<unsigned int>(SceneDirtyKind::Environment);
             auto cancel = std::make_shared<std::atomic<bool>>(false);
             _impl->buildCancel = cancel;
             _impl->buildFuture = std::async(std::launch::async,
@@ -6896,11 +6930,16 @@ void SceneBridge::Render()
         for (;;) {
             if (_impl->renderThread->IsStopRequested()) return;
             int delay;
+            auto start = quietStart;
             {
                 std::lock_guard lock(_impl->mutex);
                 delay = _impl->settings.refinementDelayMs;
+                // Lighting held back during camera motion was published after
+                // the camera came to rest: the quiet interval started then.
+                if (_impl->refineFromCameraChange)
+                    start = std::min(quietStart, _impl->lastCameraChange);
             }
-            if (std::chrono::steady_clock::now() >= quietStart +
+            if (std::chrono::steady_clock::now() >= start +
                 std::chrono::milliseconds(std::clamp(delay, 0, 2000))) break;
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
@@ -7409,6 +7448,8 @@ VtDictionary SceneBridge::GetStats() const
     result["devicePreparationsInterrupted"] = VtValue(
         static_cast<int64_t>(_impl->devicePreparationsInterrupted.load()));
     result["devicePreparationSeconds"] = VtValue(_impl->devicePreparationSeconds);
+    result["deferredEnvironmentCaptures"] = VtValue(
+        static_cast<int64_t>(_impl->deferredEnvironmentCaptures));
     result["firstPassPrimaryScratchBytes"] = VtValue(static_cast<int64_t>(_impl->firstPassPrimaryScratchBytes));
     result["colorTracedPixels"] = VtValue(static_cast<int64_t>(_impl->colorTracedPixels.load()));
     result["geometricOnlyPixels"] = VtValue(static_cast<int64_t>(_impl->geometricOnlyPixels.load()));
