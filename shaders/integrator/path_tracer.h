@@ -8,11 +8,14 @@
 //
 //   Hit      backend.intersect(PathRay)        prepared closest hit; hit.surface.valid
 //   Shading  backend.prepare(Hit)              Material::perturbNormal + prepare
-//   BsdfSample     backend.sample(Shading, float4 xi)   xi: the BSDF's sample point; materials
-//                                               without one draw from backend.rng
-//   BsdfEvaluation backend.evaluate(Shading, float3 wi)
-//   MediumCoefficients backend.medium(Shading)    the medium behind the front face
-//                                                 (valid false: none, or thin-walled)
+//   MaterialResult backend.shade(Shading, MaterialQuery)   the material, once per vertex:
+//                                               sample: the BSDF sampled at query.xi (materials
+//                                                 without a sample point draw from backend.rng)
+//                                               light: the BSDF towards query.lightWi, when
+//                                                 evaluatesLight(query, sample)
+//                                               medium: the medium behind the front face, when
+//                                                 entersMedium(sample, front face) (valid
+//                                                 false: none, or thin-walled)
 //   bool     backend.supportsNee(Shading)
 //   bool     backend.provenOpaque(Hit)
 //   float    backend.cutoutOpacity(Hit)
@@ -40,13 +43,16 @@
 //   Rng      backend.rng                          white noise for materials and cutouts
 //
 // The integrator's own dimensions (pixel, lens, BSDF, light and roulette
-// samples) come from the low-discrepancy `sampler`, set up per pixel and
+// samples) come from the low-discrepancy `path.sampler`, set up per pixel and
 // sample by the device; the decisions are those of SceneManager::trace and
 // SceneManager::traceEnvironmentMis, which this replaces with one loop.
 //
+// The path is explicit state (PathState) advanced by step functions in the
+// order of the original single loop; see "The steps of a path" below.
+//
 // GPU compilers inline every call, and each material call expands to the code
 // of every material in the scene: keep exactly one call site per backend
-// material function (prepare, sample, evaluate, cutoutOpacity).
+// material function (prepare, shade, cutoutOpacity).
 
 #include "types.h"
 #include "lights.h"
@@ -223,10 +229,69 @@ struct TraceResult {
     uint outcome;      // kPrimary*
 };
 
+// Everything a path carries from one bounce to the next. The step functions
+// of PathTracer read and update it; a wavefront integrator would keep it in
+// memory between its kernels. (The white-noise state the materials draw from
+// is backend.rng; it would travel with this state.)
+struct PathState {
+    PathRay ray;               // the next segment to trace
+    Sampler sampler;           // the path's low-discrepancy dimensions
+    float3 radiance;           // gathered so far
+    float3 weight;             // product of the scattering weights so far
+    float3 throughput;         // roulette state, as in the recursive form
+    // The last scattering vertex, for MIS against next-event estimation of
+    // the light the next segment may hit.
+    float3 previousPosition;
+    float previousPdf;         // BSDF density of the segment's direction
+    float previousNeeProbability;
+    bool previousNee;          // that vertex sampled lights: weight hits with MIS
+    uint receiver;             // light-link categories of the last surface
+    int depth;                 // scattering vertices so far
+    int nullCrossings;         // cutout crossings in a row (environment MIS)
+    int volumeEvents;          // scattering events inside media
+    // The medium the path travels in (entered through a front face), traced
+    // as a random walk with spectral (hero channel) MIS.
+    bool inMedium;
+    MediumCoefficients medium;
+    uint outcome;              // kPrimary*
+    bool tracking;             // primary outcome still unresolved
+    bool active;               // false: the path has ended
+};
+
+// Next-event estimation at one surface vertex: the light sample, drawn
+// before the material runs so that one material invocation (backend.shade)
+// both samples the BSDF and evaluates it towards the light.
+struct LightConnection {
+    float3 wi;
+    float3 radiance;
+    float distance;            // infinity: the dome or a distant light
+    float pdf;                 // neeProbability * selection * light density
+    uint shadowBit;            // shadow-link category of the light (0: all)
+    bool delta;
+    bool valid;                // the BSDF is evaluated and a shadow ray traced
+};
+
+// What the steps of one surface bounce share.
+struct SurfaceVertex {
+    uint receiver;             // light-link categories of the surface
+    bool canNee;
+    float neeProbability;      // next-event estimation is a strategy with this weight
+    // The sampler position after the BSDF's sample point: a cutout crossing
+    // uses no light sample, so it rewinds to here.
+    uint samplerDimension;
+    LightConnection light;
+};
+
 template <typename Backend, typename Hit, typename Shading>
 struct PathTracer {
     Backend backend;
-    Sampler sampler;
+    PathState path;
+    // Constant over a path (set by beginPath).
+    SampleSettings settings;
+    bool mis;                  // environment MIS and next-event estimation
+    int maxDepth;
+    int rouletteDepth;
+    bool spatial;              // spatial light selection
 
     // SceneManager::environmentVisible: stochastic transmission through cutouts.
     // Opaque geometry anywhere on the ray blocks it whatever cutouts lie in
@@ -365,223 +430,339 @@ struct PathTracer {
         return sum;
     }
 
-    // With environment MIS: BSDF sampling and environment NEE with the power
-    // heuristic; cutout null events do not count as bounces (at most 64 in a
-    // row). Without: BSDF sampling only, and null events are bounces. Both use
-    // Russian roulette from the roulette depth on.
-    TraceResult trace(PathRay ray, SampleSettings settings)
+    // -----------------------------------------------------------------------
+    // The steps of a path. A bounce is extend (trace the segment, media,
+    // lights it crosses or the environment it escapes to), then at a surface
+    // chooseLight (the NEE light sample), backend.shade (the material,
+    // once), arrive (emission and cutout crossings), connectLight (the shadow
+    // ray) and continuePath (roulette and the next segment). Random numbers
+    // are drawn in the order of the original single loop.
+    //
+    // With environment MIS: BSDF sampling and next-event estimation with the
+    // power heuristic; cutout null events do not count as bounces (at most 64
+    // in a row). Without: BSDF sampling only, and null events are bounces.
+    // Both use Russian roulette from the roulette depth on.
+    // -----------------------------------------------------------------------
+
+    void beginPath(PathRay ray, SampleSettings sampleSettings)
     {
-        const uint contributions = settings.contributions;
-        const bool mis = backend.environmentMis();
-        const int maxDepth = backend.maxDepth();
-        const int rouletteDepth = backend.rouletteDepth();
-        const bool spatial = spatialSelection(settings.spatialLights);
-        TraceResult result = {(float3)0.0f, kPrimaryUnresolved};
-        float3 weight = 1.0f;      // product of the scattering weights so far
-        float3 throughput = 1.0f;  // roulette state, as in the recursive form
-        int depth = 0;
-        int nullCrossings = 0;
-        float previousPdf = 0.0f;
-        float previousNeeProbability = 1.0f;
-        float3 previousPosition = ray.ray.origin; // the last scattering vertex
-        bool previousNee = false;
-        bool tracking = true;      // primary outcome still unresolved
-        // The medium the path travels in (entered through a front face),
-        // traced as a random walk with spectral (hero channel) MIS.
-        bool inMedium = false;
-        MediumCoefficients medium = {(float3)0.0f, (float3)0.0f, 0.0f, false};
-        int volumeEvents = 0;
-        uint receiver = ~0u;       // light-link categories of the last surface
-        for (;;) {
-            if (depth >= maxDepth) break;
-            float scatterDistance = infinity();
-            if (inMedium) {
-                ray.ray.direction = normalize(ray.ray.direction);
-                if (maxComponent(medium.sigmaS) > 0.0f) {
-                    const float4 u = sampler.next4();
-                    const float sigmaT = component(medium.sigmaA + medium.sigmaS, min(uint(u.x * 3.0f), 2u));
-                    if (sigmaT > 0.0f) scatterDistance = -log(1.0f - u.y) / sigmaT;
-                    ray.ray.tfar = min(ray.ray.tfar, scatterDistance);
-                }
+        settings = sampleSettings;
+        mis = backend.environmentMis();
+        maxDepth = backend.maxDepth();
+        rouletteDepth = backend.rouletteDepth();
+        spatial = spatialSelection(settings.spatialLights);
+        path.ray = ray;
+        path.radiance = (float3)0.0f;
+        path.weight = (float3)1.0f;
+        path.throughput = (float3)1.0f;
+        path.previousPosition = ray.ray.origin;
+        path.previousPdf = 0.0f;
+        path.previousNeeProbability = 1.0f;
+        path.previousNee = false;
+        path.receiver = ~0u;
+        path.depth = 0;
+        path.nullCrossings = 0;
+        path.volumeEvents = 0;
+        path.inMedium = false;
+        path.medium = noMedium();
+        path.outcome = kPrimaryUnresolved;
+        path.tracking = true;
+        path.active = true;
+    }
+
+    // A scattering event inside the medium, scatterDistance along the ray.
+    void scatterInMedium(float scatterDistance, float3 sigmaT)
+    {
+        const float3 transmittance = exp(-sigmaT * scatterDistance);
+        const float pdf = average(sigmaT * transmittance);
+        if (!(pdf > 0.0f)) {
+            path.active = false;
+            return;
+        }
+        const float3 factor = path.medium.sigmaS * transmittance / pdf;
+        path.weight *= factor;
+        path.throughput *= factor;
+        if (++path.volumeEvents > kMaxVolumeEvents) {
+            path.active = false;
+            return;
+        }
+        if (path.volumeEvents > 8) {
+            const float q = clamp(maxComponent(path.throughput), 0.05f, 0.95f);
+            if (path.sampler.next1() >= q) {
+                path.active = false;
+                return;
             }
-            const Hit hit = backend.intersect(ray);
-            if (inMedium) {
-                const float3 sigmaT = medium.sigmaA + medium.sigmaS;
-                if (!hit.surface.valid && !isfinite(scatterDistance)) break; // open surface: lost inside
-                if (!hit.surface.valid) {
-                    // A scattering event inside the medium.
-                    const float3 transmittance = exp(-sigmaT * scatterDistance);
-                    const float pdf = average(sigmaT * transmittance);
-                    if (!(pdf > 0.0f)) break;
-                    const float3 factor = medium.sigmaS * transmittance / pdf;
-                    weight *= factor;
-                    throughput *= factor;
-                    if (++volumeEvents > kMaxVolumeEvents) break;
-                    if (volumeEvents > 8) {
-                        const float q = clamp(maxComponent(throughput), 0.05f, 0.95f);
-                        if (sampler.next1() >= q) break;
-                        weight *= 1.0f / q;
-                        throughput *= 1.0f / q;
-                    }
-                    const float3 position = ray.ray.origin + ray.ray.direction * scatterDistance;
-                    const float4 u = sampler.next4();
-                    const float3 direction = sampleHenyeyGreenstein(ray.ray.direction, medium.g, float2(u.x, u.y));
-                    const RayFootprint footprint = ray.footprint;
-                    ray.ray = makeRay(position, direction);
-                    ray.ray.tnear = 0.0f;
-                    ray.footprint = footprint;
-                    ray.footprint.exact = false;
-                    previousNee = false;
-                    continue;
-                }
-                // Reached the boundary (or another surface) without scattering.
-                const float3 transmittance = exp(-sigmaT * hit.surface.t);
-                if (maxComponent(medium.sigmaS) > 0.0f) {
-                    const float pdf = average(transmittance);
-                    if (!(pdf > 0.0f)) break;
-                    weight *= transmittance / pdf;
-                    throughput *= transmittance / pdf;
-                } else {
-                    weight *= transmittance;
-                    throughput *= transmittance;
-                }
+            path.weight *= 1.0f / q;
+            path.throughput *= 1.0f / q;
+        }
+        const float3 position = path.ray.ray.origin + path.ray.ray.direction * scatterDistance;
+        const float4 u = path.sampler.next4();
+        const float3 direction = sampleHenyeyGreenstein(path.ray.ray.direction, path.medium.g, float2(u.x, u.y));
+        const RayFootprint footprint = path.ray.footprint;
+        path.ray.ray = makeRay(position, direction);
+        path.ray.ray.tnear = 0.0f;
+        path.ray.footprint = footprint;
+        path.ray.footprint.exact = false;
+        path.previousNee = false;
+    }
+
+    // Traces the path's next segment. Returns the surface the path goes on
+    // at (surface.valid), or an invalid hit when the path scattered inside a
+    // medium (still active) or ended (escaped, absorbed or lost).
+    Hit extend()
+    {
+        float scatterDistance = infinity();
+        const bool inMedium = path.inMedium;
+        if (inMedium) {
+            path.ray.ray.direction = normalize(path.ray.ray.direction);
+            if (maxComponent(path.medium.sigmaS) > 0.0f) {
+                const float4 u = path.sampler.next4();
+                const float sigmaT =
+                    component(path.medium.sigmaA + path.medium.sigmaS, min(uint(u.x * 3.0f), 2u));
+                if (sigmaT > 0.0f) scatterDistance = -log(1.0f - u.y) / sigmaT;
+                path.ray.ray.tfar = min(path.ray.ray.tfar, scatterDistance);
             }
-            const bool weighted = mis && previousNee;
-            if (!inMedium && backend.analyticLightCount() > 0u) {
-                const float3 crossed = crossedLights(ray, hit.surface.valid ? hit.surface.t : ray.ray.tfar,
-                                                     !hit.surface.valid, depth == 0, weighted, previousPdf,
-                                                     previousNeeProbability, receiver, previousPosition, spatial);
-                result.radiance += weight * crossed * contributionWeight(contributions, depth);
+        }
+        Hit hit = backend.intersect(path.ray);
+        if (inMedium) {
+            const float3 sigmaT = path.medium.sigmaA + path.medium.sigmaS;
+            if (!hit.surface.valid && !isfinite(scatterDistance)) { // open surface: lost inside
+                path.active = false;
+                return hit;
             }
             if (!hit.surface.valid) {
-                if (tracking) result.outcome = kPrimaryEscaped;
-                const float3 direction = normalize(ray.ray.direction);
-                const float3 li = backend.environmentRadiance(direction, angularRadius(ray.footprint));
-                float misWeight = 1.0f;
-                if (weighted)
-                    misWeight = powerHeuristic(previousPdf, previousNeeProbability * domeSelectionProbability() *
-                                                                backend.environmentPdf(direction));
-                result.radiance += weight * li * (misWeight * contributionWeight(contributions, depth));
-                break;
+                scatterInMedium(scatterDistance, sigmaT);
+                return hit;
             }
-            const Shading shading = backend.prepare(hit);
-            const BsdfSample bs = backend.sample(shading, sampler.next4());
-            const uint hitReceiver = backend.lightLinkMask(hit);
-            float emissionWeight = 1.0f;
-            if (weighted && !isZero(bs.emission)) {
-                // Emissive triangles are also sampled by NEE: area to solid angle.
-                const float pdfArea = backend.emitterPdfArea(hit);
-                const float cosLight = abs(dot(hit.surface.n_g, normalize(ray.ray.direction)));
-                const float distance = length(hit.surface.p - previousPosition);
-                if (pdfArea > 0.0f && cosLight > 0.0f)
-                    emissionWeight = powerHeuristic(previousPdf, previousNeeProbability * pdfArea *
-                                                                     distance * distance / cosLight);
-            }
-            result.radiance += weight * bs.emission * (emissionWeight * contributionWeight(contributions, depth));
-            if (mis && bs.null_event) {
-                if (!bs.scattered) tracking = false;
-                if (nullCrossings >= 64) break;
-                weight *= bs.color;
-                throughput *= bs.color;
-                ray = spawnRay(hit.surface, bs.wi, true);
-                ++nullCrossings;
-                continue;
-            }
-            if (!bs.null_event && tracking) {
-                result.outcome = kPrimaryAccepted;
-                tracking = false;
-            }
-            // At the depth boundary the competing continuation is truncated too.
-            const bool canNee = mis && depth + 1 < maxDepth && backend.supportsNee(shading);
-            // Light sampling is a strategy with density neeProbability * light pdf.
-            float neeProbability = 1.0f;
-            if (canNee && settings.neeProbabilityMin > 0.0f && depth >= settings.neeFromDepth)
-                neeProbability = clamp(maxComponent(weight), settings.neeProbabilityMin, 1.0f);
-            const bool doNee = canNee && (neeProbability >= 1.0f || sampler.next1() < neeProbability);
-            if (doNee) {
-                // Without other lights the dome is the only entry (no selection number).
-                LightPick pick;
-                pick.index = 0u;
-                pick.pmf = 1.0f;
-                const uint lightCount = backend.lightCount();
-                if (lightCount > 0u) {
-                    const float4 u = sampler.next4();
-                    pick = pickLight(u.x);
-                    if (spatial && pick.index < backend.analyticLightCount()) {
-                        const AnalyticLightSums sums = analyticSums(hit.surface.p, hitReceiver);
-                        if (sums.importance > 0.0f) pick.index = pickAnalytic(hit.surface.p, hitReceiver, sums, u.y);
-                        pick.pmf = analyticPmf(backend.light(pick.index), hit.surface.p, hitReceiver, sums);
-                    }
+            // Reached the boundary (or another surface) without scattering.
+            const float3 transmittance = exp(-sigmaT * hit.surface.t);
+            if (maxComponent(path.medium.sigmaS) > 0.0f) {
+                const float pdf = average(transmittance);
+                if (!(pdf > 0.0f)) {
+                    path.active = false;
+                    hit.surface.valid = false;
+                    return hit;
                 }
-                LightSample light = invalidLightSample();
-                uint shadowBit = 0u;
-                if (pick.index >= lightCount) {
-                    const EnvironmentLightSample dome =
-                        backend.sampleEnvironment(sampler.next4(), angularRadius(hit.surface.ray_footprint));
-                    light.wi = dome.wi;
-                    light.radiance = dome.radiance;
-                    light.pdf = dome.pdf;
-                    light.distance = infinity();
-                    light.delta = false;
-                    light.valid = dome.pdf > 0.0f && isfinite(dome.pdf);
-                } else {
-                    const LightRecord record = backend.light(pick.index);
-                    const float4 u = sampler.next4();
-                    const LightSampleTextured sampled = sampleLight(record, hit.surface.p, float2(u.x, u.y));
-                    light = sampled.sample;
-                    shadowBit = shadowLinkBit(record);
-                    if (record.info.w != 0u && (hitReceiver & record.info.w) == 0u) light.valid = false;
-                    if (light.valid && (record.info.y & kLightTextured) != 0u)
-                        light.radiance *= backend.lightTexture(record.info.z, sampled.texcoord);
-                }
-                if (light.valid && pick.pmf > 0.0f) {
-                    // The shadow ray is traced only for a nonzero contribution.
-                    const BsdfEvaluation f = backend.evaluate(shading, light.wi);
-                    if (f.valid && f.pdf >= 0.0f && isfinite(f.pdf)) {
-                        const float lightPdf = neeProbability * pick.pmf * light.pdf;
-                        const float misWeight = light.delta ? 1.0f : powerHeuristic(lightPdf, f.pdf);
-                        const float3 contribution = weight * f.value * light.radiance * (misWeight / lightPdf);
-                        PathRay shadow = spawnRay(hit.surface, light.wi, false);
-                        if (isfinite(light.distance)) shadow.ray.tfar = light.distance * (1.0f - 1e-4f);
-                        if (maxComponent(contribution) > 0.0f && visible(shadow, shadowBit))
-                            result.radiance += contribution * contributionWeight(contributions, depth + 1);
-                    }
-                }
+                path.weight *= transmittance / pdf;
+                path.throughput *= transmittance / pdf;
+            } else {
+                path.weight *= transmittance;
+                path.throughput *= transmittance;
             }
-            if (!bs.scattered) break;
-            if (bs.transmitted && !bs.null_event) {
-                if (hit.surface.front_face) {
-                    medium = backend.medium(shading);
-                    inMedium = medium.valid && (maxComponent(medium.sigmaA) > 0.0f ||
-                                                maxComponent(medium.sigmaS) > 0.0f);
-                } else {
-                    inMedium = false;
-                }
-            }
-            throughput *= bs.color;
-            float rouletteWeight = 1.0f;
-            if (depth >= rouletteDepth) {
-                const float q = clamp(maxComponent(throughput), 0.05f, 0.95f);
-                if (sampler.next1() >= q) break;
-                rouletteWeight = 1.0f / q;
-                throughput *= rouletteWeight;
-            }
-            previousNee = canNee && !bs.delta && !bs.null_event && bs.pdf > 0.0f;
-            receiver = hitReceiver;
-            previousPdf = bs.pdf;
-            previousNeeProbability = neeProbability;
-            previousPosition = hit.surface.p;
-            weight *= bs.color * rouletteWeight;
-            ray = spawnRay(hit.surface, bs.wi, bs.null_event);
-            ++depth;
-            nullCrossings = 0;
         }
+        const bool weighted = mis && path.previousNee;
+        if (!inMedium && backend.analyticLightCount() > 0u) {
+            const float3 crossed = crossedLights(path.ray, hit.surface.valid ? hit.surface.t : path.ray.ray.tfar,
+                                                 !hit.surface.valid, path.depth == 0, weighted, path.previousPdf,
+                                                 path.previousNeeProbability, path.receiver, path.previousPosition,
+                                                 spatial);
+            path.radiance += path.weight * crossed * contributionWeight(settings.contributions, path.depth);
+        }
+        if (!hit.surface.valid) {
+            if (path.tracking) path.outcome = kPrimaryEscaped;
+            const float3 direction = normalize(path.ray.ray.direction);
+            const float3 li = backend.environmentRadiance(direction, angularRadius(path.ray.footprint));
+            float misWeight = 1.0f;
+            if (weighted)
+                misWeight = powerHeuristic(path.previousPdf, path.previousNeeProbability * domeSelectionProbability() *
+                                                                 backend.environmentPdf(direction));
+            path.radiance += path.weight * li * (misWeight * contributionWeight(settings.contributions, path.depth));
+            path.active = false;
+        }
+        return hit;
+    }
+
+    // Chooses the light sample of next-event estimation at a surface. Needs
+    // nothing from the material but whether it supports NEE (canNee).
+    SurfaceVertex chooseLight(Hit hit, bool canNee)
+    {
+        SurfaceVertex vertex;
+        vertex.receiver = backend.lightLinkMask(hit);
+        vertex.samplerDimension = path.sampler.dimension;
+        vertex.light.wi = (float3)0.0f;
+        vertex.light.radiance = (float3)0.0f;
+        vertex.light.distance = infinity();
+        vertex.light.pdf = 0.0f;
+        vertex.light.shadowBit = 0u;
+        vertex.light.delta = false;
+        vertex.light.valid = false;
+        vertex.canNee = canNee;
+        // Light sampling is a strategy with density neeProbability * light pdf.
+        vertex.neeProbability = 1.0f;
+        if (vertex.canNee && settings.neeProbabilityMin > 0.0f && path.depth >= settings.neeFromDepth)
+            vertex.neeProbability = clamp(maxComponent(path.weight), settings.neeProbabilityMin, 1.0f);
+        const bool doNee =
+            vertex.canNee && (vertex.neeProbability >= 1.0f || path.sampler.next1() < vertex.neeProbability);
+        if (!doNee) return vertex;
+        // Without other lights the dome is the only entry (no selection number).
+        LightPick pick;
+        pick.index = 0u;
+        pick.pmf = 1.0f;
+        const uint lightCount = backend.lightCount();
+        if (lightCount > 0u) {
+            const float4 u = path.sampler.next4();
+            pick = pickLight(u.x);
+            if (spatial && pick.index < backend.analyticLightCount()) {
+                const AnalyticLightSums sums = analyticSums(hit.surface.p, vertex.receiver);
+                if (sums.importance > 0.0f) pick.index = pickAnalytic(hit.surface.p, vertex.receiver, sums, u.y);
+                pick.pmf = analyticPmf(backend.light(pick.index), hit.surface.p, vertex.receiver, sums);
+            }
+        }
+        LightSample light = invalidLightSample();
+        if (pick.index >= lightCount) {
+            const EnvironmentLightSample dome =
+                backend.sampleEnvironment(path.sampler.next4(), angularRadius(hit.surface.ray_footprint));
+            light.wi = dome.wi;
+            light.radiance = dome.radiance;
+            light.pdf = dome.pdf;
+            light.distance = infinity();
+            light.delta = false;
+            light.valid = dome.pdf > 0.0f && isfinite(dome.pdf);
+        } else {
+            const LightRecord record = backend.light(pick.index);
+            const float4 u = path.sampler.next4();
+            const LightSampleTextured sampled = sampleLight(record, hit.surface.p, float2(u.x, u.y));
+            light = sampled.sample;
+            vertex.light.shadowBit = shadowLinkBit(record);
+            if (record.info.w != 0u && (vertex.receiver & record.info.w) == 0u) light.valid = false;
+            if (light.valid && (record.info.y & kLightTextured) != 0u)
+                light.radiance *= backend.lightTexture(record.info.z, sampled.texcoord);
+        }
+        vertex.light.valid = light.valid && pick.pmf > 0.0f;
+        vertex.light.wi = light.wi;
+        vertex.light.radiance = light.radiance;
+        vertex.light.distance = light.distance;
+        vertex.light.delta = light.delta;
+        vertex.light.pdf = vertex.neeProbability * pick.pmf * light.pdf;
+        return vertex;
+    }
+
+    // Emission at the surface and cutout crossings. False: the bounce ends
+    // here (the path crossed a cutout or ended).
+    bool arrive(Hit hit, SurfaceVertex vertex, BsdfSample bs)
+    {
+        const bool weighted = mis && path.previousNee;
+        float emissionWeight = 1.0f;
+        if (weighted && !isZero(bs.emission)) {
+            // Emissive triangles are also sampled by NEE: area to solid angle.
+            const float pdfArea = backend.emitterPdfArea(hit);
+            const float cosLight = abs(dot(hit.surface.n_g, normalize(path.ray.ray.direction)));
+            const float distance = length(hit.surface.p - path.previousPosition);
+            if (pdfArea > 0.0f && cosLight > 0.0f)
+                emissionWeight = powerHeuristic(path.previousPdf, path.previousNeeProbability * pdfArea *
+                                                                      distance * distance / cosLight);
+        }
+        path.radiance += path.weight * bs.emission *
+                         (emissionWeight * contributionWeight(settings.contributions, path.depth));
+        if (mis && bs.null_event) {
+            path.sampler.dimension = vertex.samplerDimension; // the light sample goes unused
+            if (!bs.scattered) path.tracking = false;
+            if (path.nullCrossings >= 64) {
+                path.active = false;
+                return false;
+            }
+            path.weight *= bs.color;
+            path.throughput *= bs.color;
+            path.ray = spawnRay(hit.surface, bs.wi, true);
+            ++path.nullCrossings;
+            return false;
+        }
+        if (!bs.null_event && path.tracking) {
+            path.outcome = kPrimaryAccepted;
+            path.tracking = false;
+        }
+        return true;
+    }
+
+    // Next-event estimation: the light sample weighted against BSDF
+    // sampling, if the shadow ray reaches the light.
+    void connectLight(Hit hit, SurfaceVertex vertex, BsdfEvaluation f)
+    {
+        if (!vertex.light.valid) return;
+        // The shadow ray is traced only for a nonzero contribution.
+        if (!(f.valid && f.pdf >= 0.0f && isfinite(f.pdf))) return;
+        const float lightPdf = vertex.light.pdf;
+        const float misWeight = vertex.light.delta ? 1.0f : powerHeuristic(lightPdf, f.pdf);
+        const float3 contribution = path.weight * f.value * vertex.light.radiance * (misWeight / lightPdf);
+        PathRay shadow = spawnRay(hit.surface, vertex.light.wi, false);
+        if (isfinite(vertex.light.distance)) shadow.ray.tfar = vertex.light.distance * (1.0f - 1e-4f);
+        if (maxComponent(contribution) > 0.0f && visible(shadow, vertex.light.shadowBit))
+            path.radiance += contribution * contributionWeight(settings.contributions, path.depth + 1);
+    }
+
+    // Absorption, media, Russian roulette and the next segment.
+    void continuePath(Hit hit, SurfaceVertex vertex, MaterialResult material)
+    {
+        const BsdfSample bs = material.sample;
+        if (!bs.scattered) {
+            path.active = false;
+            return;
+        }
+        if (bs.transmitted && !bs.null_event) {
+            if (hit.surface.front_face) {
+                path.medium = material.medium;
+                path.inMedium = path.medium.valid && (maxComponent(path.medium.sigmaA) > 0.0f ||
+                                                      maxComponent(path.medium.sigmaS) > 0.0f);
+            } else {
+                path.inMedium = false;
+            }
+        }
+        path.throughput *= bs.color;
+        float rouletteWeight = 1.0f;
+        if (path.depth >= rouletteDepth) {
+            const float q = clamp(maxComponent(path.throughput), 0.05f, 0.95f);
+            if (path.sampler.next1() >= q) {
+                path.active = false;
+                return;
+            }
+            rouletteWeight = 1.0f / q;
+            path.throughput *= rouletteWeight;
+        }
+        path.previousNee = vertex.canNee && !bs.delta && !bs.null_event && bs.pdf > 0.0f;
+        path.receiver = vertex.receiver;
+        path.previousPdf = bs.pdf;
+        path.previousNeeProbability = vertex.neeProbability;
+        path.previousPosition = hit.surface.p;
+        path.weight *= bs.color * rouletteWeight;
+        path.ray = spawnRay(hit.surface, bs.wi, bs.null_event);
+        ++path.depth;
+        path.nullCrossings = 0;
+    }
+
+    // One bounce at a surface. The material runs once (backend.shade): it
+    // samples the BSDF and evaluates it towards the light sample.
+    void scatterAtSurface(Hit hit)
+    {
+        const Shading shading = backend.prepare(hit);
+        MaterialQuery query;
+        query.xi = path.sampler.next4();
+        // At the depth boundary the competing continuation is truncated too.
+        const bool canNee = mis && path.depth + 1 < maxDepth && backend.supportsNee(shading);
+        const SurfaceVertex vertex = chooseLight(hit, canNee);
+        query.lightWi = vertex.light.wi;
+        query.evaluateLight = vertex.light.valid;
+        const MaterialResult material = backend.shade(shading, query);
+        if (!arrive(hit, vertex, material.sample)) return;
+        connectLight(hit, vertex, material.light);
+        continuePath(hit, vertex, material);
+    }
+
+    TraceResult trace(PathRay ray, SampleSettings sampleSettings)
+    {
+        beginPath(ray, sampleSettings);
+        for (;;) {
+            if (!path.active || path.depth >= maxDepth) break;
+            const Hit hit = extend();
+            if (path.active && hit.surface.valid) scatterAtSurface(hit);
+        }
+        TraceResult result = {path.radiance, path.outcome};
         return result;
     }
+
     // GenerateCameraRays: jittered sample ray with exact pixel differentials.
     PathRay cameraSample(CameraParams camera, uint x, uint y, uint width, uint height)
     {
-        const float4 u = sampler.next4();
+        const float4 u = path.sampler.next4();
         const float sx = float(x) + u.x;
         const float sy = float(y) + u.y;
         float2 lens = 0.0f;
@@ -609,17 +790,17 @@ struct PathTracer {
 
     // One sample of one pixel, post-processed as in every render loop.
     SampleResult renderSample(CameraParams camera, uint x, uint y, uint width, uint height,
-                              SampleSettings settings)
+                              SampleSettings sampleSettings)
     {
-        const TraceResult traced = trace(cameraSample(camera, x, y, width, height), settings);
+        const TraceResult traced = trace(cameraSample(camera, x, y, width, height), sampleSettings);
         SampleResult result;
-        result.coverage = settings.transparentEscapes && traced.outcome == kPrimaryEscaped ? 0.0f : 1.0f;
+        result.coverage = sampleSettings.transparentEscapes && traced.outcome == kPrimaryEscaped ? 0.0f : 1.0f;
         float3 color = result.coverage == 0.0f ? (float3)0.0f : traced.radiance;
-        if (settings.sampleClamp > 0.0f) {
+        if (sampleSettings.sampleClamp > 0.0f) {
             const float peak = maxComponent(color);
-            if (peak > settings.sampleClamp) color *= settings.sampleClamp / peak;
+            if (peak > sampleSettings.sampleClamp) color *= sampleSettings.sampleClamp / peak;
         }
-        result.color = color * settings.exposureScale;
+        result.color = color * sampleSettings.exposureScale;
         return result;
     }
 };

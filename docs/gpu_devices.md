@@ -29,6 +29,19 @@ back to the CPU device with a message when no GPU device is usable.
   intersection differences. The CPU device matches `cpu-reference` far
   below the noise floor; the remaining difference comes from its
   single-precision camera rays.
+- **Explicit path state.** What a path carries between bounces is one
+  struct, `PathState` (ray, sampler, radiance, weights, the previous
+  vertex's MIS data, medium, depth and flags), advanced by step functions:
+  `extend` (trace the segment, media, crossed lights, escape), then at a
+  surface `chooseLight` (the next-event light sample), `backend.shade` (the
+  material runs once: BSDF sample, BSDF towards the light, medium),
+  `arrive` (emission, cutout crossings), `connectLight` (shadow ray) and
+  `continuePath` (roulette, next segment). The light sample needs nothing
+  from the material, so it is drawn first and one material invocation
+  answers both the BSDF sample and the light evaluation; a cutout crossing
+  rewinds the sampler to before the unused light sample. Random numbers are
+  drawn in the original order: images are bit-identical to the single-loop
+  integrator on the CPU and Vulkan devices.
 - **One GPU kernel.** Metal and Vulkan compile the same HLSL; only
   `shaders/gpu/metal/resources.hlsl` (descriptor heaps) and
   `shaders/gpu/vulkan/resources.hlsl` (descriptor set bindings) differ.

@@ -88,7 +88,7 @@ void main(uint3 id : SV_DispatchThreadID)
         x = min(width - 1u, ((2u * px + 1u) * width) / (2u * previewWidth));
         tracer.backend.rng.state = seedPreview(px, py, previewWidth, frame.settings.w);
         const Sampler previewSampler = {0u, tracer.backend.rng.state, 0u};
-        tracer.sampler = previewSampler;
+        tracer.path.sampler = previewSampler;
     } else {
         // Image mode with work.y listed pixels traces several samples of each in
         // parallel: thread t takes sample counts.z + t / work.y of pixel t % work.y
@@ -108,7 +108,7 @@ void main(uint3 id : SV_DispatchThreadID)
                                  mode == kModeImage ? seedImage(x, y, width, frame.settings.w)
                                                     : seedPass(x, y, width, frame.settings.w),
                                  0u};
-        tracer.sampler = sampler;
+        tracer.path.sampler = sampler;
         if ((flags & kFrameSeedRng) != 0u)
             tracer.backend.rng.state = mode == kModeImage ? seedImage(x, y, width, frame.settings.w)
                                                           : seedPass(x, y, width, frame.settings.w);

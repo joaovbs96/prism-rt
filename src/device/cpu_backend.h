@@ -131,6 +131,16 @@ struct CpuBackend {
         return result;
     }
 
+    MaterialResult shade(CpuShading const& shading, MaterialQuery const& query)
+    {
+        MaterialResult result;
+        result.sample = sample(shading, query.xi);
+        result.light = evaluatesLight(query, result.sample) ? evaluate(shading, query.lightWi)
+                                                             : invalidBsdfEvaluation();
+        result.medium = entersMedium(result.sample, shading.hit->front_face) ? medium(shading) : noMedium();
+        return result;
+    }
+
     bool supportsNee(CpuShading const& shading) { return shading.material->supportsNee(*shading.hit); }
     bool provenOpaque(CpuHit const& hit) { return hit.material->provenOpaque(); }
     float cutoutOpacity(CpuHit const& hit)

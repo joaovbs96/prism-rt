@@ -986,6 +986,19 @@ struct GpuBackend {
         return m;
     }
 
+    // The one call site of sample, evaluate and medium: each material's code
+    // is inlined once.
+    MaterialResult shade(GpuShading shading, MaterialQuery query)
+    {
+        MaterialResult result;
+        result.sample = sample(shading, query.xi);
+        result.light = invalidBsdfEvaluation();
+        if (evaluatesLight(query, result.sample)) result.light = evaluate(shading, query.lightWi);
+        result.medium = noMedium();
+        if (entersMedium(result.sample, shading.surface.front_face)) result.medium = medium(shading);
+        return result;
+    }
+
     bool supportsNee(GpuShading shading)
     {
         const uint kind = gpu_material(shading.material).info.x;

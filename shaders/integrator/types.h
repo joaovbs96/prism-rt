@@ -231,6 +231,46 @@ struct BsdfEvaluation {
     bool valid;
 };
 
+// One material invocation per surface vertex: the BSDF sample, the BSDF
+// towards the light chosen for next-event estimation, and the medium behind
+// the surface. Backends answer it with backend.shade (path_tracer.h), so a
+// material runs once per bounce wherever it is compiled (an inlined call, a
+// callable shader, or later a shading queue).
+struct MaterialQuery {
+    float4 xi;          // the BSDF's sample point
+    float3 lightWi;     // the light direction of next-event estimation
+    bool evaluateLight; // evaluate the BSDF towards lightWi
+};
+
+struct MaterialResult {
+    BsdfSample sample;
+    BsdfEvaluation light;      // valid false unless evaluated
+    MediumCoefficients medium; // valid false unless the path enters it
+};
+
+// Which parts of a MaterialQuery a backend computes after sampling: a cutout
+// crossing (null event) neither connects to the light nor enters a medium.
+inline bool evaluatesLight(MaterialQuery query, BsdfSample sample)
+{
+    return query.evaluateLight && !sample.null_event;
+}
+inline bool entersMedium(BsdfSample sample, bool frontFace)
+{
+    return sample.scattered && sample.transmitted && !sample.null_event && frontFace;
+}
+
+inline BsdfEvaluation invalidBsdfEvaluation()
+{
+    const BsdfEvaluation e = {(float3)0.0f, 0.0f, false};
+    return e;
+}
+
+inline MediumCoefficients noMedium()
+{
+    const MediumCoefficients m = {(float3)0.0f, (float3)0.0f, 0.0f, false};
+    return m;
+}
+
 struct EnvironmentLightSample {
     float3 wi;
     float3 radiance;
