@@ -1,0 +1,255 @@
+name: Windows
+
+# Builds PrismRT with the Vulkan device on Windows, runs the CPU-only tests and
+# publishes the relocatable demo package (see docs/deployment.md).
+
+on:
+  push:
+    branches: [device-abstraction, main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+permissions:
+  contents: read
+
+env:
+  # Everything heavy lives on D:, the large drive of the hosted runner.
+  DEPS: D:\deps
+  OUT: D:\out
+  USD_STACK_KEY: usd-26.05-osd-3.6.1-mtlx-1.39.4-tbb-2022.2.0-py3.11-win2022
+  VCPKG_BINARY_CACHE: D:\vcpkg-binary-cache
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  # OpenSubdiv + MaterialX + OpenUSD take well over an hour to build, so they
+  # get their own job and cache. A failing PrismRT build never loses them, and
+  # a cache hit costs only the lookup.
+  usd:
+    name: OpenUSD stack
+    runs-on: windows-2022
+    timeout-minutes: 300
+    outputs:
+      key: ${{ steps.key.outputs.key }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache key
+        id: key
+        run: |
+          $hash = "${{ hashFiles('tools/ci/build_usd_stack.ps1', 'tools/ci/fetch_prebuilt.ps1') }}"
+          "key=$env:USD_STACK_KEY-$hash" >> $env:GITHUB_OUTPUT
+      - name: Look up cache
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            D:\deps\osd
+            D:\deps\mtlx
+            D:\deps\usd
+          key: ${{ steps.key.outputs.key }}
+          lookup-only: true
+      - uses: actions/setup-python@v5
+        if: steps.cache.outputs.cache-hit != 'true'
+        with:
+          python-version: "3.11"
+      - name: Fetch oneTBB
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: ./tools/ci/fetch_prebuilt.ps1 -Prefix $env:DEPS -Components tbb
+      - name: Build OpenSubdiv, MaterialX and OpenUSD
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          ./tools/ci/build_usd_stack.ps1 -Prefix $env:DEPS `
+            -TbbRoot "$env:DEPS\tbb\oneapi-tbb-2022.2.0" -SourceDir D:\src
+      - name: Save cache
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            D:\deps\osd
+            D:\deps\mtlx
+            D:\deps\usd
+          key: ${{ steps.key.outputs.key }}
+
+  build:
+    name: Build, test and package
+    needs: usd
+    permissions:
+      contents: write # attaching the zip to a release
+    runs-on: windows-2022
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0 # the package name uses the git short sha
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Restore OpenUSD stack
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            D:\deps\osd
+            D:\deps\mtlx
+            D:\deps\usd
+          key: ${{ needs.usd.outputs.key }}
+          fail-on-cache-miss: true
+
+      - name: Fetch oneTBB, Embree and the MDL SDK
+        run: ./tools/ci/fetch_prebuilt.ps1 -Prefix $env:DEPS
+
+      - name: Install the Vulkan SDK
+        run: |
+          $version = "1.4.321.0"
+          $installer = "$env:RUNNER_TEMP\vulkan-sdk.exe"
+          $ProgressPreference = "SilentlyContinue"
+          Invoke-WebRequest -Uri "https://sdk.lunarg.com/sdk/download/$version/windows/vulkansdk-windows-X64-$version.exe" `
+            -OutFile $installer -MaximumRetryCount 3 -RetryIntervalSec 5
+          Start-Process -FilePath $installer -Wait -ArgumentList `
+            "--root", "C:\VulkanSDK\$version", "--accept-licenses", "--default-answer", "--confirm-command", "install"
+          if (-not (Test-Path "C:\VulkanSDK\$version\Bin\dxc.exe")) { throw "Vulkan SDK install failed" }
+          "VULKAN_SDK=C:\VulkanSDK\$version" >> $env:GITHUB_ENV
+          "C:\VulkanSDK\$version\Bin" >> $env:GITHUB_PATH
+          # The SDK has no vulkan-1.dll, which PrismRT.exe imports and a hosted
+          # runner (no GPU driver) lacks. The LunarG runtime provides the loader
+          # for the tests and for the package.
+          $rt = "$env:RUNNER_TEMP\VulkanRT.zip"
+          Invoke-WebRequest -Uri "https://sdk.lunarg.com/sdk/download/$version/windows/VulkanRT-X64-$version-Components.zip" `
+            -OutFile $rt -MaximumRetryCount 3 -RetryIntervalSec 5
+          Expand-Archive $rt -DestinationPath D:\vulkan-rt -Force
+          $loaderDir = "D:\vulkan-rt\VulkanRT-X64-$version-Components\x64"
+          if (-not (Test-Path "$loaderDir\vulkan-1.dll")) { throw "Vulkan loader missing" }
+          "PRISM_VULKAN_LOADER=$loaderDir\vulkan-1.dll" >> $env:GITHUB_ENV
+          $loaderDir >> $env:GITHUB_PATH
+
+      - name: Restore vcpkg binary cache
+        id: vcpkg-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.VCPKG_BINARY_CACHE }}
+          key: vcpkg-binaries-${{ hashFiles('vcpkg.json') }}-win2022
+          restore-keys: vcpkg-binaries-
+
+      - name: Install OpenImageIO with vcpkg
+        run: |
+          $baseline = (Get-Content vcpkg.json -Raw | ConvertFrom-Json).'builtin-baseline'
+          git clone --quiet --filter=blob:none https://github.com/microsoft/vcpkg D:\vcpkg
+          git -C D:\vcpkg checkout --quiet $baseline
+          D:\vcpkg\bootstrap-vcpkg.bat -disableMetrics
+          New-Item -ItemType Directory -Force $env:VCPKG_BINARY_CACHE | Out-Null
+          $env:VCPKG_BINARY_SOURCES = "clear;files,$env:VCPKG_BINARY_CACHE,readwrite"
+          D:\vcpkg\vcpkg.exe install --triplet x64-windows `
+            --x-manifest-root=$PWD --x-install-root=$PWD\build\vcpkg_installed
+          if ($LASTEXITCODE) { throw "vcpkg install failed" }
+
+      - name: Save vcpkg binary cache
+        if: always() && steps.vcpkg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.VCPKG_BINARY_CACHE }}
+          key: vcpkg-binaries-${{ hashFiles('vcpkg.json') }}-win2022
+
+      - name: Configure
+        run: |
+          Copy-Item cmake\PrismLocalDependencies.cmake.example cmake\PrismLocalDependencies.cmake
+          $deps = $env:DEPS.Replace('\', '/')
+          $vcpkgPrefix = "$($PWD.Path.Replace('\', '/'))/build/vcpkg_installed/x64-windows"
+          $env:PRISM_OPENUSD_ROOT = "$deps/usd"
+          $env:PRISM_OPENSUBDIV_ROOT = "$deps/osd"
+          $env:PRISM_MATERIALX_ROOT = "$deps/mtlx"
+          $env:PRISM_TBB_ROOT = "$deps/tbb/oneapi-tbb-2022.2.0"
+          $env:PRISM_TBB_REDIST = "$deps/tbb/oneapi-tbb-2022.2.0/redist/intel64/vc14"
+          $env:PRISM_EMBREE_ROOT = "$deps/embree"
+          $env:PRISM_EMBREE_RUNTIME_DIR = "$deps/embree/bin"
+          $env:PRISM_MDL_SDK_ROOT = "$deps/mdl"
+          $env:PRISM_VCPKG_PREFIX = $vcpkgPrefix
+          $env:PRISM_VCPKG_BIN = "$vcpkgPrefix/bin"
+          $env:PRISM_OPENIMAGEIO_DIR = "$vcpkgPrefix/share/openimageio"
+          cmake --preset prism-hydra -DPRISM_ENABLE_VULKAN=ON `
+            "-DCMAKE_TOOLCHAIN_FILE=D:/vcpkg/scripts/buildsystems/vcpkg.cmake" `
+            "-DMDL_SDK_DIR=$deps/mdl"
+          if ($LASTEXITCODE) { throw "configure failed" }
+
+      - name: Build
+        run: |
+          cmake --build --preset prism-hydra --parallel
+          if ($LASTEXITCODE) { throw "build failed" }
+
+      - name: Test (CPU only, no GPU on hosted runners)
+        run: |
+          . ./prism_env.ps1
+          $env:PRISM_DISABLE_VULKAN = "1"
+          # Several Hydra tests share fixed temporary file names: run serially.
+          ctest --test-dir build -C RelWithDebInfo --output-on-failure --timeout 900 `
+            -E "prism_cli_clean_exit_vulkan"
+          if ($LASTEXITCODE) { throw "ctest failed" }
+
+      - name: Package
+        run: |
+          # The package script reads the dependency roots from build\prism-runtime.json.
+          ./tools/package_windows.ps1 -OutputDir $env:OUT
+          if ($LASTEXITCODE) { throw "packaging failed" }
+          $zip = Get-ChildItem $env:OUT -Filter "PrismRT-windows-x64-*.zip" | Select-Object -First 1
+          "ZIP=$($zip.FullName)" >> $env:GITHUB_ENV
+          "ZIP_NAME=$($zip.Name)" >> $env:GITHUB_ENV
+
+      - name: Smoke-test the package from a clean environment
+        run: |
+          $dir = "D:\package test"
+          New-Item -ItemType Directory $dir | Out-Null
+          tar -xf $env:ZIP -C $dir
+          $pkg = "$dir\PrismRT"
+          # The launchers must not rely on this runner: a minimal PATH and no
+          # developer variables, run on the CPU device.
+          $env:PRISMRT_DEVICE = "cpu"
+          $smoke = "$env:RUNNER_TEMP\smoke.cmd"
+          @"
+          @echo off
+          set "PATH=%SystemRoot%\System32;%SystemRoot%"
+          cd /d "$dir"
+          call "$pkg\list_devices.bat" || exit /b 1
+          call "$pkg\prism_render.bat" --scene "$pkg\bin\assets\scenes\CornellBox.usda" --camera /World/Camera --spp 4 --width 128 --height 128 --output smoke.png || exit /b 1
+          "@ | Set-Content $smoke -Encoding ascii
+          cmd /c $smoke
+          if ($LASTEXITCODE) { throw "package smoke test failed" }
+          if (-not (Test-Path "$dir\smoke.png")) { throw "no image rendered" }
+
+      - name: Smoke-test usdview startup
+        # Qt needs an OpenGL implementation; hosted runners may not have one.
+        continue-on-error: true
+        run: |
+          $pkg = "D:\package test\PrismRT"
+          $env:PRISMRT_DEVICE = "cpu"
+          $smoke = "$env:RUNNER_TEMP\usdview.cmd"
+          @"
+          @echo off
+          set "PATH=%SystemRoot%\System32;%SystemRoot%"
+          call "$pkg\usdview.bat" --quitAfterStartup
+          "@ | Set-Content $smoke -Encoding ascii
+          cmd /c $smoke
+          if ($LASTEXITCODE) { throw "usdview startup failed: $LASTEXITCODE" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PrismRT-windows-x64
+          path: ${{ env.ZIP }}
+          retention-days: 14
+          compression-level: 0 # the zip is already compressed
+          if-no-files-found: error
+
+      - name: Attach to the GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ZIP }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
