@@ -159,6 +159,9 @@ struct VulkanDevice::Impl {
 
     std::atomic<bool> dirty{true};
     SceneManager const* boundScene = nullptr;
+    // A scene that failed to prepare fails again until it changes.
+    SceneManager const* failedScene = nullptr;
+    std::string failedError;
     std::unique_ptr<GpuSceneData> data;
     uint32_t mdlTextureCount = 1;
 
@@ -992,13 +995,24 @@ bool VulkanDevice::Impl::writeDescriptors(std::string* error)
 bool VulkanDevice::Impl::ensureScene(SceneManager& scene, std::string* error)
 {
     if (boundScene == &scene && !dirty.load() && pipeline) return true;
+    if (failedScene == &scene && !dirty.load()) {
+        if (error) *error = failedError;
+        return false;
+    }
+    failedScene = nullptr;
     vkDeviceWaitIdle(device);
     auto const sceneStart = Clock::now();
     dirty = false;
     boundScene = &scene;
     data = std::make_unique<GpuSceneData>(gpu::BuildGpuScene(scene));
     for (auto const& warning : data->warnings) std::cerr << "PrismRT Vulkan: " << warning << '\n';
-    auto fail = [&] { pipeline = VK_NULL_HANDLE; boundScene = nullptr; return false; };
+    auto fail = [&] {
+        pipeline = VK_NULL_HANDLE;
+        boundScene = nullptr;
+        failedScene = &scene;
+        failedError = error && !error->empty() ? *error : std::string("the scene could not be prepared");
+        return false;
+    };
     if (!buildPipeline(error)) return fail();
     GpuSceneData const& d = *data;
     auto bytes = [](auto const& v) { return v.size() * sizeof(v[0]); };
@@ -1110,7 +1124,47 @@ DeviceInfo VulkanDevice::Info() const
     return info;
 }
 
-void VulkanDevice::SceneChanged(SceneManager&) { m_impl->dirty = true; }
+void VulkanDevice::SceneChanged(SceneManager& scene)
+{
+    m_impl->dirty = true;
+    m_cpu.SceneChanged(scene);
+}
+
+bool VulkanDevice::RendersOnCpu(SceneManager& scene)
+{
+    std::lock_guard lock(m_renderMutex);
+    std::string error;
+    if (m_impl->ensureScene(scene, &error)) {
+        m_cpuReason.clear();
+        return false;
+    }
+    if (error != m_cpuReason) {
+        std::cerr << LogPrefix() << error << '\n'
+                  << LogPrefix() << "cannot render the scene on the GPU; rendering it with the CPU device\n";
+        m_cpuReason = error;
+    }
+    return true;
+}
+
+std::vector<float> VulkanDevice::RenderImage(SceneManager& scene, ImageRequest const& request)
+{
+    if (RendersOnCpu(scene)) return m_cpu.RenderImage(scene, request);
+    return GpuRenderDevice::RenderImage(scene, request);
+}
+
+void VulkanDevice::RenderPass(SceneManager& scene, PassRequest const& request)
+{
+    const bool traces = request.traceColor || (request.tracePrimary && request.resolvePrimary);
+    if (traces && RendersOnCpu(scene)) return m_cpu.RenderPass(scene, request);
+    GpuRenderDevice::RenderPass(scene, request);
+}
+
+bool VulkanDevice::RenderPreview(SceneManager& scene, PreviewRequest const& request)
+{
+    if (RendersOnCpu(scene)) return m_cpu.RenderPreview(scene, request);
+    return GpuRenderDevice::RenderPreview(scene, request);
+}
+
 bool VulkanDevice::PrepareScene(SceneManager& scene, std::string* error) { return m_impl->ensureScene(scene, error); }
 GpuSceneData const& VulkanDevice::Data() const { return *m_impl->data; }
 uint32_t VulkanDevice::MdlTextureCount() const { return m_impl->mdlTextureCount; }
