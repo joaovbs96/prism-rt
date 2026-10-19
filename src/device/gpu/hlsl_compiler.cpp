@@ -1,6 +1,7 @@
 #include "hlsl_compiler.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -39,9 +40,11 @@ uint64_t DxcMemoryLimit()
 
 // Runs a command line (no shell) in a job limited to `memoryLimit` bytes,
 // capturing its output. Returns the exit code, or -1 if it did not start.
-int RunLimited(std::string command, uint64_t memoryLimit, std::string* log, bool* overMemory)
+int RunLimited(std::string command, uint64_t memoryLimit, std::string* log, bool* overMemory,
+               uint64_t* peakBytes)
 {
     *overMemory = false;
+    *peakBytes = 0;
     SECURITY_ATTRIBUTES inherit{sizeof(inherit), nullptr, TRUE};
     HANDLE readEnd = nullptr, writeEnd = nullptr;
     if (!CreatePipe(&readEnd, &writeEnd, &inherit, 0)) return -1;
@@ -86,10 +89,12 @@ int RunLimited(std::string command, uint64_t memoryLimit, std::string* log, bool
     WaitForSingleObject(process.hProcess, INFINITE);
     DWORD code = DWORD(-1);
     GetExitCodeProcess(process.hProcess, &code);
-    if (limited && code != 0) {
+    if (limited) {
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION used{};
-        if (QueryInformationJobObject(job, JobObjectExtendedLimitInformation, &used, sizeof(used), nullptr))
-            *overMemory = uint64_t(used.PeakProcessMemoryUsed) + (uint64_t(64) << 20) >= memoryLimit;
+        if (QueryInformationJobObject(job, JobObjectExtendedLimitInformation, &used, sizeof(used), nullptr)) {
+            *peakBytes = uint64_t(used.PeakProcessMemoryUsed);
+            *overMemory = code != 0 && *peakBytes + (uint64_t(64) << 20) >= memoryLimit;
+        }
     }
     if (job) CloseHandle(job);
     CloseHandle(process.hThread);
@@ -159,9 +164,16 @@ const char* TargetOptions(HlslTarget target)
 
 } // namespace
 
-std::string HlslCompilerSignature(HlslTarget target)
+// The profile and entry options of a stage.
+std::string StageOptions(HlslStage const& stage)
 {
-    std::string signature = DxcExecutable() + " -T cs_6_6 -E main -HV 2021 " + TargetOptions(target);
+    return stage.entry.empty() ? std::format("-T {}", stage.profile)
+                               : std::format("-T {} -E {}", stage.profile, stage.entry);
+}
+
+std::string HlslCompilerSignature(HlslTarget target, HlslStage const& stage)
+{
+    std::string signature = DxcExecutable() + " " + StageOptions(stage) + " -HV 2021 " + TargetOptions(target);
 #ifdef _WIN32
     signature += std::format(" memory {}", DxcMemoryLimit());
 #endif
@@ -171,21 +183,24 @@ std::string HlslCompilerSignature(HlslTarget target)
 bool HlslTooLarge(std::string const& error) { return error.find(kTooLarge) != std::string::npos; }
 
 bool CompileHlsl(std::string const& source, HlslTarget target, std::filesystem::path const& workDirectory,
-                 std::vector<char>* binary, std::string* error)
+                 std::vector<char>* binary, std::string* error, HlslStage const& stage, HlslCompileStats* stats)
 {
+    const auto start = std::chrono::steady_clock::now();
     const std::string stem = SourceDigest(source) +
         std::format(".{}", std::hash<std::thread::id>{}(std::this_thread::get_id()));
     const auto input = workDirectory / (stem + ".hlsl");
     const auto output = workDirectory / (stem + (target == HlslTarget::Dxil ? ".dxil" : ".spv"));
     std::ofstream(input, std::ios::binary).write(source.data(), std::streamsize(source.size()));
     const std::string targetOptions = TargetOptions(target);
-    const std::string command = std::format("\"{}\" -T cs_6_6 -E main -HV 2021 {} -Fo \"{}\" \"{}\"",
-                                            DxcExecutable(), targetOptions, output.string(), input.string());
+    const std::string command = std::format("\"{}\" {} -HV 2021 {} -Fo \"{}\" \"{}\"", DxcExecutable(),
+                                            StageOptions(stage), targetOptions, output.string(), input.string());
     std::string log;
 #ifdef _WIN32
     const uint64_t memoryLimit = DxcMemoryLimit();
     bool overMemory = false;
-    const int status = RunLimited(command, memoryLimit, &log, &overMemory);
+    uint64_t peakBytes = 0;
+    const int status = RunLimited(command, memoryLimit, &log, &overMemory, &peakBytes);
+    if (stats) stats->peakBytes = peakBytes;
     if (overMemory)
         log = std::format("DXC {} of {} MiB (PRISM_DXC_MEMORY_MIB): the kernel of this scene's materials is "
                           "too large to compile", kTooLarge, memoryLimit >> 20);
@@ -195,14 +210,16 @@ bool CompileHlsl(std::string const& source, HlslTarget target, std::filesystem::
     while (pipe && fgets(buffer, sizeof(buffer), pipe)) log += buffer;
     const int status = pipe ? PCloseProcess(pipe) : -1;
 #endif
+    if (stats) stats->seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     std::ifstream file(output, std::ios::binary);
     binary->assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
     file.close();
     std::error_code ignored;
     std::filesystem::remove(output, ignored);
     if (status != 0 || binary->empty()) {
-        // Keep the source for inspection.
-        std::filesystem::rename(input, workDirectory / "failed_kernel.hlsl", ignored);
+        // Keep the source for inspection (named per source for concurrent library compiles).
+        const std::string kept = stage.entry == "main" ? std::string("failed_kernel.hlsl") : stem + ".failed.hlsl";
+        std::filesystem::rename(input, workDirectory / kept, ignored);
         if (error) *error = "DXC failed: " + log.substr(0, 4000);
         return false;
     }
