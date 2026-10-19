@@ -102,7 +102,12 @@ inline Sobol4 sobol4(uint index)
     return r;
 }
 
-inline float uintToUnit(uint x) { return float(x >> 8u) / 16777216.0f; }
+// The top 24 bits as a number in (0, 1): 0 becomes the midpoint of its
+// stratum, 2^-25. MDL's layered BSDFs select a lobe of zero weight for xi
+// exactly 0 and divide by its probability (one sample in about 2^24 then
+// weighs ~1e8). Every other value stays on the 24-bit grid, which the
+// environment's alias sampling relies on (it rebuilds 24-bit integers).
+inline float uintToUnit(uint x) { return max(float(x >> 8u), 0.5f) / 16777216.0f; }
 
 // Sobol points pay off in the first dimensions (pixel, lens, first bounce);
 // later groups use cheaper hashed random points.
