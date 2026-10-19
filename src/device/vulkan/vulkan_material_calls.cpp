@@ -223,7 +223,12 @@ void PrintPipelineStatistics(VkDevice device, VkPipeline pipeline, std::string c
     VkPipelineInfoKHR info{VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR};
     info.pipeline = pipeline;
     uint32_t count = 0;
-    if (properties(device, &info, &count, nullptr) != VK_SUCCESS) return;
+    const VkResult listed = properties(device, &info, &count, nullptr);
+    if (listed != VK_SUCCESS || count == 0) {
+        std::cerr << std::format("PrismRT Vulkan: {}: the driver reports no executables (VkResult {})\n", label,
+                                 int(listed));
+        return;
+    }
     std::vector<VkPipelineExecutablePropertiesKHR> executables(
         count, VkPipelineExecutablePropertiesKHR{VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR});
     properties(device, &info, &count, executables.data());
