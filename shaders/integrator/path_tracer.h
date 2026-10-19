@@ -268,7 +268,7 @@ struct PathTracer {
     // Emission of the analytic lights a ray segment passes through, and of
     // distant lights for escaped rays (tmax infinite), weighted against NEE.
     float3 crossedLights(PathRay ray, float tmax, bool escaped, bool cameraRay, bool weighted,
-                         float bsdfPdf, float neeProbability, uint receiver)
+                         float bsdfPdf, float neeProbability, uint receiver, float3 from)
     {
         float3 sum = (float3)0.0f;
         const uint count = backend.analyticLightCount();
@@ -282,7 +282,7 @@ struct PathTracer {
                 if (!escaped) continue;
                 crossing = escapedDistantLight(light, ray.ray.direction);
             } else {
-                const LightHitTextured textured = intersectLight(light, ray.ray, tmax);
+                const LightHitTextured textured = intersectLight(light, ray.ray, tmax, from);
                 crossing = textured.hit;
                 if (crossing.hit && (light.info.y & kLightTextured) != 0u)
                     crossing.radiance *= backend.lightTexture(light.info.z, textured.texcoord);
@@ -312,6 +312,7 @@ struct PathTracer {
         int nullCrossings = 0;
         float previousPdf = 0.0f;
         float previousNeeProbability = 1.0f;
+        float3 previousPosition = ray.ray.origin; // the last scattering vertex
         bool previousNee = false;
         bool tracking = true;      // primary outcome still unresolved
         // The medium the path travels in (entered through a front face),
@@ -378,7 +379,7 @@ struct PathTracer {
             if (!inMedium && backend.analyticLightCount() > 0u) {
                 const float3 crossed = crossedLights(ray, hit.surface.valid ? hit.surface.t : ray.ray.tfar,
                                                      !hit.surface.valid, depth == 0, weighted, previousPdf,
-                                                     previousNeeProbability, receiver);
+                                                     previousNeeProbability, receiver, previousPosition);
                 result.radiance += weight * crossed * contributionWeight(contributions, depth);
             }
             if (!hit.surface.valid) {
@@ -400,7 +401,7 @@ struct PathTracer {
                 // Emissive triangles are also sampled by NEE: area to solid angle.
                 const float pdfArea = backend.emitterPdfArea(hit);
                 const float cosLight = abs(dot(hit.surface.n_g, normalize(ray.ray.direction)));
-                const float distance = hit.surface.t * length(ray.ray.direction);
+                const float distance = length(hit.surface.p - previousPosition);
                 if (pdfArea > 0.0f && cosLight > 0.0f)
                     emissionWeight = powerHeuristic(previousPdf, previousNeeProbability * pdfArea *
                                                                      distance * distance / cosLight);
@@ -490,6 +491,7 @@ struct PathTracer {
             receiver = hitReceiver;
             previousPdf = bs.pdf;
             previousNeeProbability = neeProbability;
+            previousPosition = hit.surface.p;
             weight *= bs.color * rouletteWeight;
             ray = spawnRay(hit.surface, bs.wi, bs.null_event);
             ++depth;

@@ -80,7 +80,7 @@ void CheckShape(char const* name, LightRecord const& light, float3 p)
             lightEstimate += s.sample.radiance.x / s.sample.pdf;
             Ray ray = makeRay(p, s.sample.wi);
             ray.tnear = 0.0f;
-            const LightHitTextured h = intersectLight(light, ray, infinity());
+            const LightHitTextured h = intersectLight(light, ray, infinity(), p);
             ++checked;
             if (!h.hit.hit || std::abs(h.hit.pdf - s.sample.pdf) > 2e-2f * s.sample.pdf ||
                 std::abs(h.hit.t - s.sample.distance) > 1e-3f * s.sample.distance)
@@ -91,7 +91,7 @@ void CheckShape(char const* name, LightRecord const& light, float3 p)
         const float phi = 2.0f * kPi * uniform(rng);
         Ray ray = makeRay(p, float3(r * std::cos(phi), y, r * std::sin(phi)));
         ray.tnear = 0.0f;
-        const LightHitTextured h = intersectLight(light, ray, infinity());
+        const LightHitTextured h = intersectLight(light, ray, infinity(), p);
         if (h.hit.hit) directionEstimate += h.hit.radiance.x * 4.0 * kPi;
     }
     lightEstimate /= samples;
@@ -118,6 +118,8 @@ int main()
     params.width = 1.5f;
     params.height = 0.5f;
     CheckShape("rect", Record(prism::MakeSceneLight(params, Transform(0, 0, 1.0f))), float3(0.3f, 0.1f, 0));
+    // Close enough to be sampled by solid angle.
+    CheckShape("rect near", Record(prism::MakeSceneLight(params, Transform(0, 0, 0.2f))), float3(0.3f, 0.1f, 0));
 
     params.shape = prism::LightShape::Disk;
     params.radius = 0.4f;
@@ -130,6 +132,7 @@ int main()
     CheckShape("cylinder", Record(prism::MakeSceneLight(params, Transform(0, 1.0f, 0))), float3(0.3f, 0, 0.2f));
     CheckShape("cylinder", Record(prism::MakeSceneLight(params, Transform(0, 1.0f, 0, 1.0f, true))),
                float3(0.3f, 0, 0.2f));
+    CheckShape("cyl near", Record(prism::MakeSceneLight(params, Transform(0, 1.0f, 0))), float3(0.7f, 0.8f, 0.05f));
 
     // Normalized lights keep their power when their size changes.
     params.shape = prism::LightShape::Rect;

@@ -64,7 +64,7 @@ struct LightHit {
     bool hit;
     float t;
     float3 radiance;
-    float pdf;       // solid angle density of sampling this point from the ray origin
+    float pdf;       // solid angle density of sampling this point (see intersectLight)
 };
 
 inline float3 xyz(float4 v) { return float3(v.x, v.y, v.z); }
@@ -436,12 +436,14 @@ inline LightSampleTextured sampleLight(LightRecord light, float3 p, float2 u)
 // distances in units of the ray's direction (which need not be normalized).
 // Distant lights are found on escape (escapedDistantLight) and emissive
 // triangles by the acceleration structure. `texcoord` as in sampleLight.
+// The pdf is that of sampling the point from `from`, the vertex the ray
+// scattered at: its origin, unless it has since crossed cutouts.
 struct LightHitTextured {
     LightHit hit;
     float2 texcoord;
 };
 
-inline LightHit planarHit(LightRecord light, float t, float3 direction, float3 radiance)
+inline LightHit planarHit(LightRecord light, float t, float pdfDistance, float3 direction, float3 radiance)
 {
     LightHit h = noLightHit();
     float cosLight = -dot(xyz(light.n), direction);
@@ -450,11 +452,11 @@ inline LightHit planarHit(LightRecord light, float t, float3 direction, float3 r
     h.hit = true;
     h.t = t;
     h.radiance = radiance;
-    h.pdf = t * t / (cosLight * light.v.w);
+    h.pdf = pdfDistance * pdfDistance / (cosLight * light.v.w);
     return h;
 }
 
-inline LightHitTextured intersectLight(LightRecord light, Ray ray, float tmax)
+inline LightHitTextured intersectLight(LightRecord light, Ray ray, float tmax, float3 from)
 {
     LightHitTextured result;
     result.hit = noLightHit();
@@ -481,7 +483,8 @@ inline LightHitTextured intersectLight(LightRecord light, Ray ray, float tmax)
         result.hit.hit = true;
         result.hit.t = t;
         result.hit.radiance = radiance;
-        result.hit.pdf = conePdf(sphereOneMinusCos(r, d2));
+        const float3 fc = c - from;
+        result.hit.pdf = conePdf(sphereOneMinusCos(r, dot(fc, fc)));
         return result;
     }
     if (type == kLightRect || type == kLightDisk) {
@@ -496,10 +499,10 @@ inline LightHitTextured intersectLight(LightRecord light, Ray ray, float tmax)
         const float a = dot(rel, u) / dot(u, u);
         const float b = dot(rel, v) / dot(v, v);
         if (type == kLightRect ? (abs(a) > 1.0f || abs(b) > 1.0f) : (a * a + b * b > 1.0f)) return result;
-        result.hit = planarHit(light, t, d, radiance);
+        result.hit = planarHit(light, t, length(rel + xyz(light.p0) - from), d, radiance);
         result.texcoord = rectTexcoord(a, b);
         if (result.hit.hit && type == kLightRect) {
-            const SphericalRect sr = sphericalRect(light, o);
+            const SphericalRect sr = sphericalRect(light, from);
             if (useSphericalRect(sr)) result.hit.pdf = 1.0f / sr.solidAngle;
         }
         return result;
@@ -526,12 +529,13 @@ inline LightHitTextured intersectLight(LightRecord light, Ray ray, float tmax)
         const float3 nq = normalize(q - axis * dot(q, axis));
         const float cosLight = -dot(nq, d);
         if (!(cosLight > 0.0f)) return result;
-        const CylinderFrame frame = cylinderFrame(light, o);
+        const CylinderFrame frame = cylinderFrame(light, from);
         if (!frame.valid) return result;
         result.hit.hit = true;
         result.hit.t = t;
         result.hit.radiance = radiance;
-        result.hit.pdf = cylinderPdfArea(frame, dot(q, axis)) * t * t / cosLight;
+        const float3 fq = q + xyz(light.p0) - from;
+        result.hit.pdf = cylinderPdfArea(frame, dot(q, axis)) * dot(fq, fq) / cosLight;
         return result;
     }
     return result;
