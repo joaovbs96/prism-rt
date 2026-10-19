@@ -49,6 +49,13 @@ struct MdlShaderCode {
     std::string error;
     // Generated target code followed by the prism_mdl_* dispatch functions.
     std::string code;
+    // The same code for one program at a time (callable shaders): the target
+    // code without dispatch (targetCode), then programDispatch[p], whose
+    // prism_mdl_* functions only reach program p, then sceneData. A compiler
+    // that emits only reachable functions translates just that program.
+    std::string targetCode;
+    std::vector<std::string> programDispatch;
+    std::string sceneData;
     std::vector<char> roData;
     std::vector<char> argumentBlocks;
     std::vector<MdlTexture> textures;

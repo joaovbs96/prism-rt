@@ -584,13 +584,20 @@ MdlShaderCode GenerateMdlShaderCode(std::vector<MDLMaterial const*> const& mater
     }
     result.roData.resize(std::max<size_t>(16, (result.roData.size() + 15) & ~size_t(15)));
 
-    result.code = code->get_code();
+    result.targetCode = code->get_code();
     result.stringConstants.assign(code->get_string_constant_count(), std::string());
     for (mi::Size i = 1; i < code->get_string_constant_count(); ++i)
         if (const char* name = code->get_string_constant(i)) result.stringConstants[i] = name;
-    result.code += "\n// ---- Prism material dispatch ----\n";
-    result.code += GenerateDispatch(present, traits);
-    result.code += GenerateSceneData(code.get());
+    result.sceneData = GenerateSceneData(code.get());
+    result.code = result.targetCode + "\n// ---- Prism material dispatch ----\n" + GenerateDispatch(present, traits) +
+        result.sceneData;
+    for (size_t p = 0; p < programs.size(); ++p) {
+        std::vector<std::array<bool, kEntryPointCount>> only(programs.size());
+        for (auto& row : only) row.fill(false);
+        only[p] = present[p];
+        result.programDispatch.push_back(std::format("\n// ---- Prism material dispatch: program {} ----\n", p) +
+                                         GenerateDispatch(only, traits));
+    }
     transaction->commit();
     result.success = true;
     return result;
