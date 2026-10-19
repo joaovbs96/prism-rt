@@ -122,6 +122,10 @@ setup; see `prism_env.sh`).
 - `PRISM_SHADER_DIR=<repo>/shaders`: load shader sources from disk instead
   of the embedded copies.
 - `PRISM_DXC=<path>`: the DXC executable to use.
+- `PRISM_DXC_MEMORY_MIB=<n>` (Windows): memory DXC may use, by default a
+  quarter of physical memory and at most 8 GiB. SPIR-V legalization of
+  kernels with very many materials (OpenPBR playground, MaterialEggs
+  countertop, Stirling) exceeds it; the Vulkan device then renders on the CPU.
 - `PRISM_GPU_TEXTURE_BUDGET_MIB=<n>`: GPU memory for textures (default 45%
   of the device's). Images beyond it are uploaded at reduced resolution,
   reported as `PrismRT Vulkan: N of M images uploaded at reduced resolution
