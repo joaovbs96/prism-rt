@@ -2,6 +2,7 @@
 
 #include "loader.h"
 #include <mi/mdl_sdk.h>
+#include <functional>
 #include <string>
 #include <mutex>
 #include <unordered_set>
@@ -41,6 +42,12 @@ public:
     // Convenience: Configure search paths (can be called after construction)
     bool add_mdl_path(const std::string& path);
     bool add_resource_path(const std::string& path);
+
+    // Registers a callback that runs at the start of every Context destruction,
+    // before the MDL SDK shuts down and libmdl_sdk is unloaded. Process-wide caches
+    // that keep MDL interface handles (or objects whose destructors call into the
+    // SDK) must release them here: their static destructors run after the DLL is gone.
+    static void add_shutdown_hook(std::function<void()> hook);
 
     // Get configured paths
     std::vector<std::string> get_mdl_paths() const;

@@ -1,6 +1,7 @@
 #include "gpu_materials.h"
 
 #include "../../mdl_material.h"
+#include "../../mdl/context.h"
 #include "../../mdl/texture_runtime.h"
 #include "../../resource_limits.h"
 
@@ -595,16 +596,31 @@ MdlShaderCode GenerateMdlShaderCode(std::vector<MDLMaterial const*> const& mater
     return result;
 }
 
+namespace {
+// The key holds the bindings, so their addresses cannot be reused while cached.
+using ShaderCodeKey = std::vector<std::shared_ptr<const mdl::MaterialBinding>>;
+std::mutex gShaderCodeMutex;
+std::vector<std::pair<ShaderCodeKey, std::shared_ptr<const MdlShaderCode>>> gShaderCodeCache;
+}
+
 std::shared_ptr<const MdlShaderCode> CachedMdlShaderCode(std::vector<MDLMaterial const*> const& materials)
 {
-    // The key holds the bindings, so their addresses cannot be reused while cached.
-    using Key = std::vector<std::shared_ptr<const mdl::MaterialBinding>>;
+    // The bindings own MDL interface handles, so the cache must be emptied before the
+    // MDL SDK unloads; static destruction would run after libmdl_sdk is gone.
+    static std::once_flag hookRegistered;
+    std::call_once(hookRegistered, [] {
+        mdl::Context::add_shutdown_hook([] {
+            std::lock_guard lock(gShaderCodeMutex);
+            gShaderCodeCache.clear();
+        });
+    });
+    auto& mutex = gShaderCodeMutex;
+    auto& cache = gShaderCodeCache;
+    using Key = ShaderCodeKey;
     Key key;
     key.reserve(materials.size());
     for (MDLMaterial const* material : materials)
         key.push_back(material && material->is_valid() ? material->get_target_code().binding : nullptr);
-    static std::mutex mutex;
-    static std::vector<std::pair<Key, std::shared_ptr<const MdlShaderCode>>> cache;
     {
         std::lock_guard lock(mutex);
         for (auto const& [cachedKey, code] : cache)

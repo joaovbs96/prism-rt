@@ -593,6 +593,20 @@ if(PRISM_BUILD_HYDRA)
         target_link_libraries(prism_scene_export_test PRIVATE PrismRT::core ${PXR_LIBRARIES})
         add_test(NAME prism_scene_export_test COMMAND prism_scene_export_test)
     endif()
+    # The CLI must exit cleanly: process-wide caches holding MDL handles once outlived
+    # libmdl_sdk and crashed in static destruction after the image was written.
+    set(_prism_cli_exit_devices cpu)
+    if(PRISM_ENABLE_VULKAN)
+        list(APPEND _prism_cli_exit_devices vulkan)
+    endif()
+    foreach(_device IN LISTS _prism_cli_exit_devices)
+        add_test(NAME prism_cli_clean_exit_${_device}
+            COMMAND PrismRT --scene "${CMAKE_CURRENT_SOURCE_DIR}/assets/scenes/CornellBox.usda"
+                --camera /World/Camera --width 32 --height 32 --spp 2 --device ${_device}
+                --output "${CMAKE_BINARY_DIR}/cli_clean_exit_${_device}.png")
+        set_tests_properties(prism_cli_clean_exit_${_device} PROPERTIES
+            ENVIRONMENT "${_prism_test_environment}")
+    endforeach()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/material_loading_test.cpp")
         add_executable(prism_hydra_material_loading_test
             tests/hydra/material_loading_test.cpp src/hydra/materials.cpp)

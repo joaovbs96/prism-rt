@@ -50,6 +50,21 @@ private:
 };
 }
 
+namespace {
+std::mutex& ShutdownHookMutex() { static std::mutex m; return m; }
+std::vector<std::function<void()>>& ShutdownHooks()
+{
+    static std::vector<std::function<void()>> hooks;
+    return hooks;
+}
+}
+
+void Context::add_shutdown_hook(std::function<void()> hook)
+{
+    std::lock_guard lock(ShutdownHookMutex());
+    ShutdownHooks().push_back(std::move(hook));
+}
+
 Context::Context(const char* library_path, const std::vector<std::string>& plugins)
     : m_is_valid(false)
 {
@@ -90,6 +105,12 @@ Context::Context(const char* library_path, const std::vector<std::string>& plugi
 
 Context::~Context() {
     if (m_is_valid) {
+        std::vector<std::function<void()>> hooks;
+        {
+            std::lock_guard lock(ShutdownHookMutex());
+            hooks = ShutdownHooks();
+        }
+        for (auto const& hook : hooks) hook();
         ClearTargetCodeCache(this);
         // Release interface handles (automatic via mi::base::Handle)
         m_mdl_factory.reset();
