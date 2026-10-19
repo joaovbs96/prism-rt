@@ -21,6 +21,7 @@
 #include <fstream>
 #include <iostream>
 #include <mutex>
+#include <optional>
 #include <string_view>
 #include <thread>
 
@@ -280,129 +281,156 @@ template<class F> void ForEachIdentifier(std::string_view text, F&& f)
     }
 }
 
-// The link unit's code with only the functions reachable from `roots` (the
-// dispatch of one program): DXC parses and legalizes much less, and the
-// callable's source no longer changes with the other programs. Declarations
-// other than function definitions are all kept. Empty if the code cannot be
-// split into top-level declarations.
-std::string TrimToReachable(std::string const& code, std::string const& roots)
-{
-    struct Chunk {
-        size_t begin, end;
-        std::string name; // function definitions only
-    };
-    std::vector<Chunk> chunks;
-    size_t start = 0, depth = 0, parenDepth = 0;
-    bool sawBrace = false, sawAssign = false, sawParen = false;
-    std::string name, lastIdentifier;
-    auto finish = [&](size_t end, bool function) {
-        chunks.push_back({start, end, function ? name : std::string()});
-        start = end;
-        sawBrace = sawAssign = sawParen = false;
-        name.clear();
-        lastIdentifier.clear();
-    };
-    for (size_t i = 0; i < code.size();) {
-        const char c = code[i];
-        if (c == '/' && i + 1 < code.size() && code[i + 1] == '/') {
-            const size_t end = code.find('\n', i);
-            i = end == std::string::npos ? code.size() : end;
-            continue;
-        }
-        if (c == '/' && i + 1 < code.size() && code[i + 1] == '*') {
-            const size_t end = code.find("*/", i + 2);
-            if (end == std::string::npos) return {};
-            i = end + 2;
-            continue;
-        }
-        if (c == '"' || c == '\'') {
-            size_t j = i + 1;
-            while (j < code.size() && code[j] != c) j += code[j] == '\\' ? 2 : 1;
-            i = j + 1;
-            continue;
-        }
-        if (c == '#' && depth == 0 && parenDepth == 0) {
-            // Preprocessor lines stand alone, kept like declarations.
-            if (i > start) chunks.push_back({start, i, std::string()});
-            const size_t end = code.find('\n', i);
-            const size_t next = end == std::string::npos ? code.size() : end + 1;
-            chunks.push_back({i, next, std::string()});
-            i = start = next;
-            sawBrace = sawAssign = sawParen = false;
-            name.clear();
-            lastIdentifier.clear();
-            continue;
-        }
-        if (IdentifierStart(c)) {
-            size_t j = i + 1;
-            while (j < code.size() && IdentifierChar(code[j])) ++j;
-            if (depth == 0 && parenDepth == 0) lastIdentifier = code.substr(i, j - i);
-            i = j;
-            continue;
-        }
-        if (depth == 0) {
-            if (c == '(') {
-                if (parenDepth++ == 0 && !sawParen && !sawAssign) {
-                    sawParen = true;
-                    name = lastIdentifier;
-                }
-            } else if (c == ')') {
-                if (parenDepth == 0) return {};
-                --parenDepth;
-            } else if (c == '=' && parenDepth == 0) {
-                sawAssign = true;
-            } else if (c == ';' && parenDepth == 0) {
-                ++i;
-                finish(i, false);
-                continue;
-            }
-        }
-        if (c == '{') {
-            if (depth == 0) sawBrace = true;
-            ++depth;
-        } else if (c == '}') {
-            if (depth == 0) return {};
-            if (--depth == 0 && sawParen && !sawAssign) {
-                ++i;
-                finish(i, !name.empty());
-                continue;
-            }
-        }
-        ++i;
-    }
-    if (depth != 0 || parenDepth != 0) return {};
-    if (start < code.size()) chunks.push_back({start, code.size(), std::string()});
+// The link unit's code split into top-level declarations once, to keep for
+// each program only the functions its dispatch reaches: DXC parses and
+// legalizes much less, and a callable's source no longer changes with the
+// other programs. Declarations other than function definitions are all kept.
+class LinkUnitTrimmer {
+public:
+    explicit LinkUnitTrimmer(std::string const& code) : m_code(code) { m_valid = split(); if (m_valid) index(); }
+    bool valid() const { return m_valid; }
 
-    std::unordered_map<std::string, std::vector<size_t>> definitions;
-    for (size_t k = 0; k < chunks.size(); ++k)
-        if (!chunks[k].name.empty()) definitions[chunks[k].name].push_back(k);
-    std::vector<bool> keep(chunks.size(), false);
-    std::vector<size_t> pending;
-    auto reach = [&](std::string_view identifier) {
-        auto found = definitions.find(std::string(identifier));
-        if (found == definitions.end()) return;
-        for (size_t k : found->second)
+    // The code with the functions reachable from `roots`.
+    std::string trim(std::string const& roots) const
+    {
+        std::vector<bool> keep(m_chunks.size(), false);
+        std::vector<size_t> pending;
+        auto reachChunk = [&](size_t k) {
             if (!keep[k]) {
                 keep[k] = true;
                 pending.push_back(k);
             }
-    };
-    ForEachIdentifier(roots, reach);
-    // Declarations other than functions (types, constants) may name functions too.
-    for (size_t k = 0; k < chunks.size(); ++k)
-        if (chunks[k].name.empty())
-            ForEachIdentifier(std::string_view(code).substr(chunks[k].begin, chunks[k].end - chunks[k].begin), reach);
-    while (!pending.empty()) {
-        const size_t k = pending.back();
-        pending.pop_back();
-        ForEachIdentifier(std::string_view(code).substr(chunks[k].begin, chunks[k].end - chunks[k].begin), reach);
+        };
+        ForEachIdentifier(roots, [&](std::string_view identifier) {
+            if (auto found = m_definitions.find(identifier); found != m_definitions.end())
+                for (size_t k : found->second) reachChunk(k);
+        });
+        for (size_t k : m_alwaysReached) reachChunk(k);
+        while (!pending.empty()) {
+            const size_t k = pending.back();
+            pending.pop_back();
+            for (size_t r : m_references[k]) reachChunk(r);
+        }
+        std::string trimmed;
+        trimmed.reserve(m_code.size());
+        for (size_t k = 0; k < m_chunks.size(); ++k)
+            if (m_chunks[k].name.empty() || keep[k])
+                trimmed.append(m_code, m_chunks[k].begin, m_chunks[k].end - m_chunks[k].begin);
+        return trimmed;
     }
-    std::string trimmed;
-    trimmed.reserve(code.size());
-    for (size_t k = 0; k < chunks.size(); ++k)
-        if (chunks[k].name.empty() || keep[k]) trimmed.append(code, chunks[k].begin, chunks[k].end - chunks[k].begin);
-    return trimmed;
-}
+
+private:
+    struct Chunk {
+        size_t begin, end;
+        std::string_view name; // function definitions only
+    };
+
+    bool split()
+    {
+        std::string const& code = m_code;
+        size_t start = 0, depth = 0, parenDepth = 0;
+        bool sawAssign = false, sawParen = false;
+        std::string_view name, lastIdentifier;
+        auto reset = [&] {
+            sawAssign = sawParen = false;
+            name = lastIdentifier = {};
+        };
+        auto finish = [&](size_t end, bool function) {
+            m_chunks.push_back({start, end, function ? name : std::string_view()});
+            start = end;
+            reset();
+        };
+        for (size_t i = 0; i < code.size();) {
+            const char c = code[i];
+            if (c == '/' && i + 1 < code.size() && code[i + 1] == '/') {
+                const size_t end = code.find('\n', i);
+                i = end == std::string::npos ? code.size() : end;
+                continue;
+            }
+            if (c == '/' && i + 1 < code.size() && code[i + 1] == '*') {
+                const size_t end = code.find("*/", i + 2);
+                if (end == std::string::npos) return false;
+                i = end + 2;
+                continue;
+            }
+            if (c == '"' || c == '\'') {
+                size_t j = i + 1;
+                while (j < code.size() && code[j] != c) j += code[j] == '\\' ? 2 : 1;
+                i = j + 1;
+                continue;
+            }
+            if (c == '#' && depth == 0 && parenDepth == 0) {
+                // Preprocessor lines stand alone, kept like declarations.
+                if (i > start) m_chunks.push_back({start, i, {}});
+                const size_t end = code.find('\n', i);
+                const size_t next = end == std::string::npos ? code.size() : end + 1;
+                m_chunks.push_back({i, next, {}});
+                i = start = next;
+                reset();
+                continue;
+            }
+            if (IdentifierStart(c)) {
+                size_t j = i + 1;
+                while (j < code.size() && IdentifierChar(code[j])) ++j;
+                if (depth == 0 && parenDepth == 0) lastIdentifier = std::string_view(code).substr(i, j - i);
+                i = j;
+                continue;
+            }
+            if (depth == 0) {
+                if (c == '(') {
+                    if (parenDepth++ == 0 && !sawParen && !sawAssign) {
+                        sawParen = true;
+                        name = lastIdentifier;
+                    }
+                } else if (c == ')') {
+                    if (parenDepth == 0) return false;
+                    --parenDepth;
+                } else if (c == '=' && parenDepth == 0) {
+                    sawAssign = true;
+                } else if (c == ';' && parenDepth == 0) {
+                    finish(++i, false);
+                    continue;
+                }
+            }
+            if (c == '{') {
+                ++depth;
+            } else if (c == '}') {
+                if (depth == 0) return false;
+                if (--depth == 0 && sawParen && !sawAssign) {
+                    finish(++i, !name.empty());
+                    continue;
+                }
+            }
+            ++i;
+        }
+        if (depth != 0 || parenDepth != 0) return false;
+        if (start < code.size()) m_chunks.push_back({start, code.size(), {}});
+        return true;
+    }
+
+    // The functions each declaration names, and those other declarations (types, constants) name.
+    void index()
+    {
+        for (size_t k = 0; k < m_chunks.size(); ++k)
+            if (!m_chunks[k].name.empty()) m_definitions[m_chunks[k].name].push_back(k);
+        m_references.resize(m_chunks.size());
+        for (size_t k = 0; k < m_chunks.size(); ++k) {
+            auto& references = m_chunks[k].name.empty() ? m_alwaysReached : m_references[k];
+            ForEachIdentifier(std::string_view(m_code).substr(m_chunks[k].begin, m_chunks[k].end - m_chunks[k].begin),
+                              [&](std::string_view identifier) {
+                                  if (auto found = m_definitions.find(identifier); found != m_definitions.end())
+                                      references.insert(references.end(), found->second.begin(), found->second.end());
+                              });
+        }
+    }
+
+    std::string const& m_code;
+    bool m_valid = false;
+    std::vector<Chunk> m_chunks;
+    std::unordered_map<std::string_view, std::vector<size_t>> m_definitions;
+    std::vector<std::vector<size_t>> m_references;
+    std::vector<size_t> m_alwaysReached;
+};
 
 // Whether callables hold only their program's functions (PRISM_VULKAN_TRIM_CALLABLES=0: the whole link unit).
 bool TrimCallablesSetting()
@@ -433,11 +461,11 @@ bool MaterialCallSources(gpu::MdlShaderCode const& code, bool reorder, std::vect
     sources->assign(programs + 1, std::string());
     if (!RaygenSource(reorder, programs, &(*sources)[0], error)) return false;
     const std::string salt = ShaderSaltDefine();
-    trim = trim && TrimCallablesSetting();
+    std::optional<LinkUnitTrimmer> trimmer;
+    if (trim && TrimCallablesSetting()) trimmer.emplace(code.targetCode);
     for (uint32_t p = 0; p < programs; ++p) {
-        std::string target;
-        if (trim) target = TrimToReachable(code.targetCode, code.programDispatch[p] + code.sceneData);
-        if (target.empty()) target = code.targetCode;
+        std::string target = trimmer && trimmer->valid()
+            ? trimmer->trim(code.programDispatch[p] + code.sceneData) : code.targetCode;
         const std::string mdl = target + code.programDispatch[p] + code.sceneData;
         if (!gpu::AssembleShader("gpu/vulkan/material_callable.hlsl", {"gpu/vulkan"}, mdl, &(*sources)[p + 1],
                                  error))
