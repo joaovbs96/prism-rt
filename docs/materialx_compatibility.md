@@ -61,6 +61,14 @@ layers over the mix, which is equivalent:
 
     layer(mix(fg, bg, m), base) = mix(layer(fg, base), layer(bg, base), m)
 
+A layer whose top is itself a layer hands the base on to that layer's base,
+which loses it the same way when that base is a mix (the Lion's dust over
+sheen over glaze). Layering is associative, so the loader first rewrites
+
+    layer(layer(top, middle), base) = layer(top, layer(middle, base))
+
+and then distributes the exposed mix.
+
 ## standard_surface conductor clamp
 
 Upstream MaterialX bug: `standard_surface` feeds `base_color` and

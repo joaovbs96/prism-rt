@@ -242,6 +242,26 @@ void DistributeLayersOverMixes(const MaterialX::DocumentPtr& doc)
         auto baseInput = layer->getInput("base");
         if (!graph || !topInput || !topInput->hasNodeName()) continue;
         auto mix = graph->getNode(topInput->getNodeName());
+        // Layering is associative: layer(layer(T, M), B) = layer(T, layer(M, B)),
+        // which brings a mix that is the inner layer's base to the top of a layer.
+        if (mix && mix->getCategory() == "layer" && mix->getType() == "BSDF" && baseInput) {
+            auto innerTop = mix->getInput("top");
+            auto innerBase = mix->getInput("base");
+            if (innerTop && innerTop->hasNodeName() && innerBase && innerBase->hasNodeName()) {
+                auto lower = graph->addNode("layer", graph->createValidChildName(layer->getName() + "_lower"), "BSDF");
+                lower->addInput("top", "BSDF")->setNodeName(innerBase->getNodeName());
+                auto lowerBase = lower->addInput("base", "BSDF");
+                if (baseInput->hasNodeName()) lowerBase->setNodeName(baseInput->getNodeName());
+                topInput->setNodeName(innerTop->getNodeName());
+                baseInput->setNodeName(lower->getName());
+                work.push_back(layer);
+                work.push_back(lower);
+                if (VerboseMdl())
+                    std::cout << "[MaterialX] layer " << layer->getNamePath() << " reassociated over "
+                              << mix->getNamePath() << "\n";
+                continue;
+            }
+        }
         if (!mix || mix->getCategory() != "mix" || mix->getType() != "BSDF") continue;
         auto makeLayer = [&](const char* side) -> MaterialX::NodePtr {
             auto source = mix->getInput(side);

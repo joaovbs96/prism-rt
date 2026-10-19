@@ -43,6 +43,22 @@ int main() {
       <convert name="to_vector" type="vector3">
         <input name="in" type="color3" nodename="rgb" />
       </convert>
+      <sheen_bsdf name="sheen" type="BSDF" />
+      <oren_nayar_diffuse_bsdf name="dust" type="BSDF" />
+      <dielectric_bsdf name="clear" type="BSDF"><input name="weight" type="float" value="0" /></dielectric_bsdf>
+      <mix name="dust_or_clear" type="BSDF">
+        <input name="fg" type="BSDF" nodename="dust" />
+        <input name="bg" type="BSDF" nodename="clear" />
+        <input name="mix" type="float" value="0.5" />
+      </mix>
+      <layer name="sheen_dust" type="BSDF">
+        <input name="top" type="BSDF" nodename="sheen" />
+        <input name="base" type="BSDF" nodename="dust_or_clear" />
+      </layer>
+      <layer name="dusty" type="BSDF">
+        <input name="top" type="BSDF" nodename="sheen_dust" />
+        <input name="base" type="BSDF" nodename="base" />
+      </layer>
       <nodegraph name="graph">
         <constant name="c" type="color3"><input name="value" type="color3" value="0.5, 0.5, 0.5" /></constant>
         <output name="out" type="color3" nodename="c" />
@@ -90,6 +106,19 @@ int main() {
         require(layer->getInput("base")->getNodeName() == "base", "layer lost its base");
         require(layer->getInput("top")->getNodeName() == (std::string(side) == "fg" ? "coat_a" : "coat_b"),
                 "layer top is not the mix side");
+    }
+
+    // A layer over a layer is reassociated, and the mix it exposes distributed:
+    // dusty = layer(sheen, mix(layer(dust, base), layer(clear, base))).
+    auto dusty = doc->getNode("dusty");
+    require(dusty->getCategory() == "layer" && dusty->getInput("top")->getNodeName() == "sheen",
+            "layer over layer not reassociated");
+    auto lower = doc->getNode(dusty->getInput("base")->getNodeName());
+    require(lower && lower->getCategory() == "mix", "exposed mix not distributed");
+    for (const char* side : {"fg", "bg"}) {
+        auto sideLayer = doc->getNode(lower->getInput(side)->getNodeName());
+        require(sideLayer && sideLayer->getCategory() == "layer" &&
+                sideLayer->getInput("base")->getNodeName() == "base", "base lost under the dust layer");
     }
 
     std::filesystem::remove(path);
