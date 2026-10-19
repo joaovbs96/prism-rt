@@ -238,7 +238,8 @@ struct VulkanDevice::Impl {
     ~Impl();
     bool initialize(std::string* reason);
     uint32_t memoryType(uint32_t bits, VkMemoryPropertyFlags flags) const;
-    bool createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, Buffer* buffer, bool hostVisible = true);
+    bool createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, Buffer* buffer, bool hostVisible = true,
+                      bool hostCached = false);
     void destroyBuffer(Buffer& buffer);
     bool upload(int slot, const void* bytes, size_t size);
     void destroyStructure(AccelerationStructure& structure);
@@ -496,7 +497,8 @@ uint32_t VulkanDevice::Impl::memoryType(uint32_t bits, VkMemoryPropertyFlags fla
     return ~0u;
 }
 
-bool VulkanDevice::Impl::createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, Buffer* buffer, bool hostVisible)
+bool VulkanDevice::Impl::createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, Buffer* buffer, bool hostVisible,
+                                      bool hostCached)
 {
     *buffer = {};
     buffer->size = std::max<VkDeviceSize>(16, (size + 15) & ~VkDeviceSize(15));
@@ -511,9 +513,18 @@ bool VulkanDevice::Impl::createBuffer(VkDeviceSize size, VkBufferUsageFlags usag
     VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     allocation.pNext = &flags;
     allocation.allocationSize = requirements.size;
-    allocation.memoryTypeIndex = memoryType(requirements.memoryTypeBits, hostVisible
-        ? VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
-        : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    const VkMemoryPropertyFlags hostFlags =
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    allocation.memoryTypeIndex = ~0u;
+    // The host reads results back from these buffers every pass. Uncached
+    // (write-combined) memory makes those reads several times slower than
+    // the dispatch itself, so prefer a cached type when one exists.
+    if (hostVisible && hostCached)
+        allocation.memoryTypeIndex = memoryType(requirements.memoryTypeBits,
+            hostFlags | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+    if (allocation.memoryTypeIndex == ~0u)
+        allocation.memoryTypeIndex = memoryType(requirements.memoryTypeBits,
+            hostVisible ? hostFlags : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     if (allocation.memoryTypeIndex == ~0u ||
         vkAllocateMemory(device, &allocation, nullptr, &buffer->memory) != VK_SUCCESS) {
         vkDestroyBuffer(device, buffer->buffer, nullptr);
@@ -540,7 +551,8 @@ bool VulkanDevice::Impl::upload(int slot, const void* bytes, size_t size)
     destroyBuffer(buffers[slot]);
     const VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
         VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
-    if (!createBuffer(size, usage, &buffers[slot])) return false;
+    const bool readBack = slot == kSlotRng || slot == kSlotOutput || slot == kSlotAccumulation;
+    if (!createBuffer(size, usage, &buffers[slot], true, readBack)) return false;
     if (bytes && size) std::memcpy(buffers[slot].mapped, bytes, size);
     return true;
 }
