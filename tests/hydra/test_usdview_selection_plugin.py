@@ -181,6 +181,107 @@ class UsdviewSampleHudTest(unittest.TestCase):
                          ("7", "refining"))
         self.assertEqual(prismUsdview.hud_text(7, 0, False), ("7", "refining"))
 
+    def test_device_line_names_gpu_and_flags_fallback(self):
+        self.assertEqual(prismUsdview.device_line({}), None)
+        self.assertEqual(
+            prismUsdview.device_line({"prismDevice": "vulkan: NVIDIA GeForce RTX 4070 Ti"}),
+            (" Device: vulkan (RTX 4070 Ti)", "normal"))
+        self.assertEqual(prismUsdview.device_line({"prismDevice": "cpu"}),
+                         (" Device: cpu", "normal"))
+        self.assertEqual(
+            prismUsdview.device_line({
+                "prismDevice": "cpu (Vulkan fallback: kernel too large)"}),
+            (" Device: cpu (Vulkan fallback: kernel too large)", "warning"))
+
+    def test_phase_lines_for_each_phase(self):
+        def lines(**stats):
+            return prismUsdview.phase_lines(stats)
+
+        self.assertEqual(lines(), [])  # older renderer: no phase statistics
+        self.assertEqual(lines(prismPhase="rendering"), [])
+        self.assertEqual(lines(prismPhase="idle"),
+                         [(" Status: Preparing...", "busy")])
+        self.assertEqual(
+            lines(prismPhase="loading", prismMeshesDone=3, prismMeshesTotal=10),
+            [(" Status: Loading scene (meshes 3 / 10)", "busy")])
+        self.assertEqual(lines(prismPhase="loading"),
+                         [(" Status: Loading scene...", "busy")])
+        self.assertEqual(
+            lines(prismPhase="materials", prismMaterialsDone=12,
+                  prismMaterialsTotal=35),
+            [(" Status: Compiling materials 12 / 35", "busy")])
+        self.assertEqual(
+            lines(prismPhase="materials", prismMaterialsDone=12,
+                  prismMaterialsTotal=35, prismPhaseSeconds=7.9),
+            [(" Status: Compiling materials 12 / 35 7 s", "busy")])
+        self.assertEqual(
+            lines(prismPhase="textures", prismTexturesDone=1, prismTexturesTotal=4),
+            [(" Status: Preparing textures 1 / 4", "busy")])
+        # Cold kernel compiles are long: elapsed time from the first second.
+        self.assertEqual(
+            lines(prismPhase="kernel", prismPhaseSeconds=42.2,
+                  prismPhaseDetail="DXC to SPIR-V, 9 MDL programs, 310 KB HLSL"),
+            [(" Status: Compiling GPU kernel... 42 s", "busy"),
+             (" " * 9 + "DXC to SPIR-V, 9 MDL programs, 310 KB HLSL", "busy")])
+        self.assertEqual(
+            lines(prismPhase="upload", prismPhaseDetail="images",
+                  prismUploadDone=5, prismUploadTotal=20),
+            [(" Status: Uploading to GPU (images) 5 / 20", "busy")])
+        self.assertEqual(
+            lines(prismPhase="upload", prismPhaseDetail="acceleration structures",
+                  prismUploadDone=0, prismUploadTotal=0),
+            [(" Status: Uploading to GPU (acceleration structures)", "busy")])
+        self.assertEqual(
+            lines(prismPhase="error", prismError="scene conversion failed: x"),
+            [(" Status: Error: scene conversion failed: x", "warning")])
+
+    def test_overlapping_phases_show_secondary_counters(self):
+        stats = {"prismPhase": "materials", "prismMaterialsDone": 2,
+                 "prismMaterialsTotal": 35,
+                 "prismActivePhases": "loading,materials,textures",
+                 "prismTexturesDone": 4, "prismTexturesTotal": 20,
+                 "prismMeshesDone": 5, "prismMeshesTotal": 5}
+        self.assertEqual(prismUsdview.phase_lines(stats), [
+            (" Status: Compiling materials 2 / 35", "busy"),
+            (" " * 9 + "textures 4 / 20", "busy")])  # finished meshes omitted
+
+    def test_hud_lines_switch_from_phase_to_samples(self):
+        busy = {"prismPhase": "kernel", "prismDevice": "vulkan: AMD Radeon RX 7900",
+                "numCompletedSamples": 0, "targetSamples": 256}
+        self.assertEqual(
+            [t for t, _ in prismUsdview.hud_lines(busy, 0, 256, False)],
+            [" Device: vulkan (RX 7900)", " Status: Compiling GPU kernel..."])
+        done = dict(busy, prismPhase="rendering",
+                    prismDevice="cpu (Vulkan fallback: kernel too large)")
+        lines = prismUsdview.hud_lines(done, 300, 2048, True)
+        self.assertEqual(
+            lines,
+            [(" Device: cpu (Vulkan fallback: kernel too large)", "warning"),
+             ("Samples: 300 / 2048", "normal"), ("  State: converged", "converged")])
+        # Without phase statistics the original two lines remain.
+        self.assertEqual(prismUsdview.hud_lines({}, 7, 64, False),
+                         [("Samples: 7 / 64", "normal"), ("  State: refining", "normal")])
+
+    def test_overlay_shows_phase_and_device_colors(self):
+        window, hud, view = self._hud({
+            "prismPhase": "materials", "prismMaterialsDone": 12,
+            "prismMaterialsTotal": 35,
+            "prismDevice": "cpu (Vulkan fallback: kernel too large)",
+            "numCompletedSamples": 0, "targetSamples": 256})
+        label = hud._labels[view]
+        self.assertEqual(label.lines(), [
+            (" Device: cpu (Vulkan fallback: kernel too large)",
+             prismUsdview._WARNING_COLOR),
+            (" Status: Compiling materials 12 / 35", prismUsdview._BUSY_COLOR)])
+        view._renderer.stats = {
+            "prismPhase": "rendering", "prismDevice": "vulkan: NVIDIA GeForce RTX 4070 Ti",
+            "numCompletedSamples": 8, "targetSamples": 256}
+        hud._stats_cache.clear()
+        hud.refresh()
+        self.assertEqual([text for text, _ in label.lines()], [
+            " Device: vulkan (RTX 4070 Ti)", "Samples: 8 / 256", "  State: refining"])
+        window.close()
+
     def _hud(self, stats, converged=False, renderer=None, show=True):
         window = QtWidgets.QWidget()
         window.resize(400, 300)
