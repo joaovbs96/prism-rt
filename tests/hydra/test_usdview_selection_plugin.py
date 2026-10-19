@@ -193,6 +193,33 @@ class UsdviewSampleHudTest(unittest.TestCase):
                 "prismDevice": "cpu (Vulkan fallback: kernel too large)"}),
             (" Device: cpu (Vulkan fallback: kernel too large)", "warning"))
 
+    def test_cpu_preview_keeps_gpu_phase_and_counts_samples(self):
+        preview = {"prismPhase": "kernel", "prismPhaseSeconds": 12.4,
+                   "prismDevice": "cpu (preview while the GPU prepares)",
+                   "prismGpuPreview": True}
+        self.assertEqual(
+            prismUsdview.device_line(preview),
+            (" Device: cpu (preview while the GPU prepares)", "normal"))
+        self.assertEqual(
+            prismUsdview.hud_lines(preview, 17, 256, False),
+            [(" Device: cpu (preview while the GPU prepares)", "normal"),
+             (" Status: Compiling GPU kernel... 12 s", "busy"),
+             ("Samples: 17 / 256", "normal")])
+        # No samples yet, or an ordinary busy renderer: the phase lines alone.
+        self.assertEqual(
+            [t for t, _ in prismUsdview.hud_lines(preview, 0, 256, False)],
+            [" Device: cpu (preview while the GPU prepares)",
+             " Status: Compiling GPU kernel... 12 s"])
+        plain = dict(preview, prismGpuPreview=False)
+        self.assertEqual(len(prismUsdview.hud_lines(plain, 17, 256, False)), 2)
+        # After the handover the GPU is named and the status line is gone.
+        done = {"prismPhase": "rendering", "prismGpuPreview": False,
+                "prismDevice": "vulkan: NVIDIA GeForce RTX 4070 Ti"}
+        self.assertEqual(
+            prismUsdview.hud_lines(done, 40, 256, False),
+            [(" Device: vulkan (RTX 4070 Ti)", "normal"),
+             ("Samples: 40 / 256", "normal"), ("  State: refining", "normal")])
+
     def test_phase_lines_for_each_phase(self):
         def lines(**stats):
             return prismUsdview.phase_lines(stats)

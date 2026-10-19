@@ -44,6 +44,8 @@ python tests/hydra/validate.py
 | `prism:adaptivePreview` | true | Adapt preview resolution using measured render time |
 | `prism:previewTargetMs` | 33 | Preview render-time target, clamped to 1-1000 ms |
 | `prism:refinementDelayMs` | 100 | Quiet interval before refinement, clamped to 0-2000 ms |
+| `prism:gpuPreparationPreview` | true | While a GPU device (Vulkan, Metal) is still preparing the scene after one second, render progressively on the CPU and continue on the GPU from the same sample once it is ready; env `PRISM_GPU_PREPARATION_PREVIEW=0` sets the initial value, see [CPU preview while the GPU prepares](#cpu-preview-while-the-gpu-prepares) |
+| `prism:gpuPreparationPreviewMaxMiB` | 8192 | Skip that preview when the scene's Embree memory exceeds this many MiB (0 never skips); env `PRISM_GPU_PREPARATION_PREVIEW_MAX_MIB` |
 | `domeLightCameraVisibility` | true | Show dome light in primary camera rays; secondary lighting remains enabled |
 | `prism:environmentSampling` | `mis` | Environment next-event sampling with MIS, or `bsdf` |
 | `prism:lightSelection` | `spatial` | NEE picks among the analytic (UsdLux) lights by their estimated irradiance at the shading point (`spatial`, for 2 to 64 analytic lights), or by power only (`power`); see [Sampling](gpu_devices.md#sampling) |
@@ -208,6 +210,7 @@ While a scene cannot render yet (and while an edit is converted), the renderer r
 | `prismTexturesDone` / `prismTexturesTotal` (int) | Textures prepared ahead of material compilation |
 | `prismUploadDone` / `prismUploadTotal` (int) | Images prepared for the GPU (zero total outside the image stage; the stage is in `prismPhaseDetail`) |
 | `prismDevice` (string) | `vulkan: <GPU name>`, `cpu`, `cpu-reference`, or `cpu (Vulkan fallback: <reason>)` when the GPU device was unavailable at creation or later could not prepare the scene (`kernel too large` only without ray tracing pipelines: otherwise large material sets compile as callable shaders, see [gpu_devices.md](gpu_devices.md#large-material-sets-callable-shaders-vulkan); `kernel compile failed`, ...); empty until the device exists |
+| `prismGpuPreview` (bool) | True while the CPU renders a preview for a GPU device that is preparing; `prismDevice` is then `cpu (preview while the GPU prepares)` and `prismPhase` keeps naming the GPU phase |
 | `prismError` (string) | Last scene-conversion failure; cleared by the next published snapshot |
 
 Counters stay readable after their phase ends and restart when it begins again. Metal reports the device, loading, material and texture phases but not yet the kernel and upload stages.
@@ -224,9 +227,16 @@ The usdview extension turns these into HUD lines under usdview's Hydra/Hgi lines
 | `kernel` | ` Status: Compiling GPU kernel... 42 s` and an indented detail line; the seconds appear from the first second (3 s for other phases) |
 | `upload` | ` Status: Uploading to GPU (images) 5 / 20`, `(buffers)`, `(acceleration structures)` |
 | `rendering` | ` Samples: N / target` and ` State: refining` or `converged` |
+| any, with `prismGpuPreview` | ` Device: cpu (preview while the GPU prepares)`, the GPU phase line (` Status: Compiling GPU kernel... 12 s`) and ` Samples: N / target` counting up from the CPU |
 | `error` | ` Status: Error: ...` in the warning color |
 
 The formatting is in the pure functions `device_line`, `phase_lines` and `hud_lines` (unit tests in `tests/hydra/test_usdview_selection_plugin.py`). `tests/hydra/usdview_sample_hud.py` also checks that the device line and, for a slow start, a phase line appear before the first sample. `tests/hydra/usdview_phase_hud.py` (run it with `testusdview --testScript` and a fresh `PRISM_CACHE_DIR` to force cold compiles) saves a screenshot of the viewport the first time each phase shows, plus a timeline of the statistics and overlay text. Forcing a fallback needs only `PRISM_DEVICE=vulkan PRISM_DXC=<nonexistent path>`.
+
+### CPU preview while the GPU prepares
+
+A cold GPU device spends tens of seconds compiling its kernel and uploading the scene. If that preparation is still running one second after it started (`PRISM_GPU_PREPARATION_PREVIEW_DELAY_MS` changes the delay), the render worker renders on the CPU device instead, with the usual coarse preview, the refinement delay and full-resolution passes. No second scene exists: the CPU device renders the snapshot's own Embree scene and native MDL materials, which every device already needs (picking and geometric AOVs use them too), plus a per-scene light table. The preview is skipped for scenes whose Embree memory exceeds `prism:gpuPreparationPreviewMaxMiB`.
+
+The CPU passes use an eighth of the hardware threads (at least two; `PRISM_GPU_PREPARATION_PREVIEW_THREADS` overrides) so the shader and driver compilers keep the machine: on 28 threads a cold 35 s Vulkan preparation of the chess set took 38 s without the preview, 31-41 s with 2 to 4 preview threads, 45-58 s with 7 and 56-69 s with 14. The first image appears after 6 s instead of 38-62 s. At each pass boundary the worker checks whether the preparation finished; if so, the next pass runs on the GPU **with the same sample index, per-pixel RNG state and accumulated average**, so accumulation continues instead of restarting and the displayed quality never goes backwards (`gpuPreviewHandovers`, `gpuPreviewHandoverSample` and `gpuPreviewPasses` count handovers, the sample where the GPU took over and the passes the CPU rendered). Camera moves and edits during the preparation keep rendering on the CPU; a preparation that a scene edit supersedes finishes first (it cannot be cancelled) and the next one starts then. A GPU device that cannot prepare the scene (`cpu (Vulkan fallback: ...)`) still hands over, to its own CPU device. `PRISM_TEST_GPU_PREPARATION_DELAY_MS` delays the preparation job for tests.
 
 usdview's **default dome** is OpenUSD's Stinson Beach environment, not PrismRT's bundled indoor EXR. It uses intensity 1 and exposure 0. Hydra respects these authored values without the standalone environment's historical extra factor of two. To reproduce standalone lighting, use the same HDR and account for that factor (for example, standalone exposure -0.5 corresponds to a USD dome exposure +0.5 at intensity 1).
 

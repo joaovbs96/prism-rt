@@ -5067,6 +5067,16 @@ public:
             if (!prism::device::ParseDevicePreference(value, &settings.device))
                 TF_WARN("PrismRT: ignoring PRISM_DEVICE=%s (expected auto, cpu, cpu-reference, vulkan or metal)", value);
         }
+        // PRISM_GPU_PREPARATION_PREVIEW=0/1 sets the initial value of
+        // prism:gpuPreparationPreview, which a render setting overrides.
+        if (const char *value = std::getenv("PRISM_GPU_PREPARATION_PREVIEW"); value && *value)
+            settings.gpuPreparationPreview = std::strcmp(value, "0") != 0;
+        if (const char *value = std::getenv("PRISM_GPU_PREPARATION_PREVIEW_MAX_MIB"); value && *value)
+            settings.gpuPreparationPreviewMaxMiB = std::max(0, std::atoi(value));
+        if (const char *value = std::getenv("PRISM_GPU_PREPARATION_PREVIEW_DELAY_MS"); value && *value)
+            gpuPreviewDelayMs = std::max(0, std::atoi(value));
+        if (const char *value = std::getenv("PRISM_GPU_PREPARATION_PREVIEW_THREADS"); value && *value)
+            gpuPreviewThreads = std::max(0, std::atoi(value));
         if (const char *value = std::getenv("PRISM_PROFILE_BUFFERS"))
             profileBufferWrites = value[0] != '\0' && std::strcmp(value, "0") != 0;
         try {
@@ -5186,10 +5196,12 @@ public:
         return renderDevice;
     }
 
-    // Runs the device's per-scene preparation for the displayed snapshot as
-    // a job. Render worker only; false if a stop was requested first.
-    bool PrepareRenderDevice(std::shared_ptr<prism::device::RenderDevice> const &device,
-                             std::shared_ptr<Snapshot> const &prepared)
+    // Advances the device's per-scene preparation for the displayed snapshot
+    // without blocking: finishes a completed job and, once no job is running,
+    // starts the one for the current epoch. Render worker only. True when the
+    // device is prepared for the snapshot.
+    bool AdvanceDevicePreparation(std::shared_ptr<prism::device::RenderDevice> const &device,
+                                  std::shared_ptr<Snapshot> const &prepared)
     {
         uint64_t epoch;
         {
@@ -5197,44 +5209,110 @@ public:
             epoch = deviceSceneEpoch;
             if (devicePreparedEpoch == epoch) return true;
         }
-        if (devicePreparation.valid() && devicePreparationEpoch != epoch) {
+        if (devicePreparation.valid()) {
             // A superseded job still owns the device; it cannot be cancelled.
-            if (!WaitForDeviceJob(devicePreparation)) {
+            if (devicePreparation.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+                return false;
+            try {
+                devicePreparation.get();
+            } catch (std::exception const &e) {
+                TF_WARN("PrismRT: render device preparation failed: %s", e.what());
+            } catch (...) {}
+            ++devicePreparations;
+            std::lock_guard lock(mutex);
+            epoch = deviceSceneEpoch;
+            if (deviceSceneEpoch == devicePreparationEpoch) {
+                devicePreparedEpoch = devicePreparationEpoch;
+                return true;
+            }
+        }
+        devicePreparationEpoch = epoch;
+        devicePreparationStart = std::chrono::steady_clock::now();
+        // The job owns the snapshot, so a published replacement cannot
+        // free or (as an inactive bank) edit the scene it is reading.
+        devicePreparation = std::async(std::launch::async,
+            [this, device, prepared] {
+                const auto start = std::chrono::steady_clock::now();
+                prism::load_profile::Scope profile("device.prepare");
+                // Test hook: stretches the preparation to exercise the CPU
+                // preview that covers it.
+                if (const char *delay = std::getenv("PRISM_TEST_GPU_PREPARATION_DELAY_MS");
+                    delay && *delay)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(std::atoi(delay)));
+                device->Prepare(*prepared->scene);
+                const double seconds = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - start).count();
+                std::lock_guard lock(mutex);
+                devicePreparationSeconds = seconds;
+            });
+        return false;
+    }
+
+    // Runs the device's per-scene preparation for the displayed snapshot as
+    // a job and waits for it. Render worker only; false if a stop was
+    // requested first.
+    bool PrepareRenderDevice(std::shared_ptr<prism::device::RenderDevice> const &device,
+                             std::shared_ptr<Snapshot> const &prepared)
+    {
+        while (!AdvanceDevicePreparation(device, prepared)) {
+            if (devicePreparation.valid() && !WaitForDeviceJob(devicePreparation)) {
                 ++devicePreparationsInterrupted;
                 return false;
             }
-            try { devicePreparation.get(); }
-            catch (...) {}
         }
-        if (!devicePreparation.valid()) {
-            devicePreparationEpoch = epoch;
-            // The job owns the snapshot, so a published replacement cannot
-            // free or (as an inactive bank) edit the scene it is reading.
-            devicePreparation = std::async(std::launch::async,
-                [this, device, prepared] {
-                    const auto start = std::chrono::steady_clock::now();
-                    prism::load_profile::Scope profile("device.prepare");
-                    device->Prepare(*prepared->scene);
-                    const double seconds = std::chrono::duration<double>(
-                        std::chrono::steady_clock::now() - start).count();
-                    std::lock_guard lock(mutex);
-                    devicePreparationSeconds = seconds;
-                });
-        }
-        if (!WaitForDeviceJob(devicePreparation)) {
-            ++devicePreparationsInterrupted;
-            return false;
-        }
-        try {
-            devicePreparation.get();
-        } catch (std::exception const &e) {
-            TF_WARN("PrismRT: render device preparation failed: %s", e.what());
-        }
-        ++devicePreparations;
-        std::lock_guard lock(mutex);
-        if (deviceSceneEpoch == devicePreparationEpoch)
-            devicePreparedEpoch = devicePreparationEpoch;
         return true;
+    }
+
+    enum class PreparationOutcome { Stopped, Ready, Preview };
+
+    // Like PrepareRenderDevice, but a GPU device that is still preparing
+    // after gpuPreviewDelayMs yields Preview: the caller renders on
+    // previewDevice and polls AdvanceDevicePreparation to hand over.
+    PreparationOutcome PrepareOrPreview(std::shared_ptr<prism::device::RenderDevice> const &device,
+                                        std::shared_ptr<Snapshot> const &prepared,
+                                        RenderSettings const &renderSettings)
+    {
+        if (AdvanceDevicePreparation(device, prepared)) return PreparationOutcome::Ready;
+        const auto kind = device->Info().kind;
+        const int64_t limit = int64_t(renderSettings.gpuPreparationPreviewMaxMiB) << 20;
+        const bool eligible = renderSettings.gpuPreparationPreview &&
+            (kind == prism::device::DeviceKind::Vulkan || kind == prism::device::DeviceKind::Metal) &&
+            (limit <= 0 || embreeLiveBytes.load(std::memory_order_relaxed) <= limit);
+        if (!eligible)
+            return PrepareRenderDevice(device, prepared) ? PreparationOutcome::Ready
+                                                         : PreparationOutcome::Stopped;
+        // Fast (cached) preparations never start the CPU preview.
+        const auto deadline = devicePreparationStart + std::chrono::milliseconds(gpuPreviewDelayMs);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (renderThread->IsStopRequested()) {
+                ++devicePreparationsInterrupted;
+                return PreparationOutcome::Stopped;
+            }
+            if (AdvanceDevicePreparation(device, prepared)) return PreparationOutcome::Ready;
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        if (AdvanceDevicePreparation(device, prepared)) return PreparationOutcome::Ready;
+        if (!previewDevice)
+            previewDevice = prism::device::CreateDevice(prism::device::DevicePreference::Cpu);
+        return PreparationOutcome::Preview;
+    }
+
+    static constexpr const char *kGpuPreviewDevice = "cpu (preview while the GPU prepares)";
+
+    // Marks the CPU preview as the displayed device.
+    void BeginGpuPreview()
+    {
+        if (gpuPreviewActive.exchange(true)) return;
+        progress.SetDevice(kGpuPreviewDevice);
+    }
+
+    // Restores the GPU's device line after a handover (unless the device
+    // reported something more specific, such as a CPU fallback).
+    void EndGpuPreview(prism::device::RenderDevice const &gpu, prism::device::DevicePreference preference)
+    {
+        if (!gpuPreviewActive.exchange(false)) return;
+        if (progress.Read().device == kGpuPreviewDevice)
+            progress.SetDevice(DescribeDevice(gpu, preference, {}));
     }
 
     // Builds the second bank for the snapshot just published, from the same
@@ -5359,6 +5437,16 @@ public:
     prism::device::DevicePreference deviceCreationPreference = prism::device::DevicePreference::Auto;
     std::future<void> devicePreparation;
     uint64_t devicePreparationEpoch = 0;
+    std::chrono::steady_clock::time_point devicePreparationStart;
+    // CPU preview while a GPU device prepares (render worker, except the
+    // atomics, which statistics read).
+    std::shared_ptr<prism::device::RenderDevice> previewDevice;
+    int gpuPreviewDelayMs = 1000;
+    int gpuPreviewThreads = 0; // 0: a fraction of the cores
+    std::atomic<bool> gpuPreviewActive{false};
+    std::atomic<uint64_t> gpuPreviewSamples{0};
+    std::atomic<uint64_t> gpuPreviewHandovers{0};
+    std::atomic<uint64_t> gpuPreviewHandoverSample{0};
     // Advanced (under mutex) whenever the device or its view of the scene
     // changes; devicePreparedEpoch records the last epoch fully prepared.
     uint64_t deviceSceneEpoch = 1;
@@ -5688,6 +5776,8 @@ void SceneBridge::SetSettings(RenderSettings const &settings)
             current.textureFiltering == settings.textureFiltering &&
             current.domeLightCameraVisibility == settings.domeLightCameraVisibility &&
             current.environmentSampling == settings.environmentSampling &&
+            current.gpuPreparationPreview == settings.gpuPreparationPreview &&
+            current.gpuPreparationPreviewMaxMiB == settings.gpuPreparationPreviewMaxMiB &&
             current.device == settings.device)
             return;
         imageChanged = current.maxDepth != settings.maxDepth ||
@@ -6834,8 +6924,21 @@ void SceneBridge::Render()
     }
     // Kernel compilation and scene upload happen here, not inside the
     // preview or pass, so a host stop never waits for them.
-    if ((hasColor || hasGeometric) &&
-        !_impl->PrepareRenderDevice(renderDevice, snapshot)) return;
+    // While a GPU device is still preparing, the CPU device renders instead
+    // (activeDevice) and the loop below hands over once the GPU is ready.
+    prism::device::RenderDevice *activeDevice = renderDevice.get();
+    bool previewingGpu = false;
+    if (hasColor || hasGeometric) {
+        using Outcome = Impl::PreparationOutcome;
+        const Outcome outcome = _impl->PrepareOrPreview(renderDevice, snapshot, settings);
+        if (outcome == Outcome::Stopped) return;
+        if (outcome == Outcome::Preview) {
+            previewingGpu = true;
+            activeDevice = _impl->previewDevice.get();
+            _impl->BeginGpuPreview();
+        }
+    }
+    if (!previewingGpu) _impl->EndGpuPreview(*renderDevice, settings.device);
     _impl->progress.Begin(prism::Phase::Rendering);
     for (HdRenderPassAovBinding const &binding : bindings) {
         TfToken const &name = binding.aovName;
@@ -6871,7 +6974,7 @@ void SceneBridge::Render()
         // buffer destruction and resize also stop this worker before changing
         // storage, so no preparation worker ever dereferences a render buffer.
         RenderSettings previewSettings = settings;
-        const auto deviceKind = renderDevice->Info().kind;
+        const auto deviceKind = activeDevice->Info().kind;
         const bool gpuPreview = deviceKind == prism::device::DeviceKind::Metal ||
             deviceKind == prism::device::DeviceKind::Vulkan;
         // The automatic maximum keeps CPU previews coarse; GPU devices afford
@@ -6898,7 +7001,7 @@ void SceneBridge::Render()
         auto const previewStart = std::chrono::steady_clock::now();
         PreviewResult const preview = _RenderPreview(
             snapshot, camera, previewSettings, bindings, width, height,
-            _impl->renderThread, frame, _impl->colorTracedPixels, *renderDevice);
+            _impl->renderThread, frame, _impl->colorTracedPixels, *activeDevice);
         if (_impl->renderThread->IsStopRequested()) return;
         {
             std::lock_guard lock(_impl->mutex);
@@ -7062,6 +7165,20 @@ void SceneBridge::Render()
             if (_impl->renderThread->IsStopRequested()) return;
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
+        // Pass boundary: continue on the GPU from this sample index. The
+        // per-pixel RNG state and the accumulated average carry over, so the
+        // image keeps converging instead of restarting.
+        if (previewingGpu) {
+            if (_impl->AdvanceDevicePreparation(renderDevice, snapshot)) {
+                previewingGpu = false;
+                activeDevice = renderDevice.get();
+                _impl->gpuPreviewHandoverSample.store(static_cast<uint64_t>(sample));
+                _impl->gpuPreviewHandovers.fetch_add(1);
+                _impl->EndGpuPreview(*renderDevice, settings.device);
+            } else {
+                _impl->gpuPreviewSamples.fetch_add(1);
+            }
+        }
         if (sample != 0)
             std::copy(_impl->committedRngStates.begin(),
                       _impl->committedRngStates.end(), rngStates.begin());
@@ -7125,6 +7242,14 @@ void SceneBridge::Render()
         };
         // Reserve execution capacity for the host and coordinator.
         passRequest.concurrency = std::max(1, tbb::this_task_arena::max_concurrency() - 2);
+        // The CPU preview shares the machine with the GPU preparation (DXC and
+        // driver compiles). Measured on 28 threads, 7 or more preview threads
+        // slowed a 35 s preparation by 20-60%, 4 or fewer did not: keep an
+        // eighth of the threads.
+        if (previewingGpu)
+            passRequest.concurrency = std::max(1, std::min(passRequest.concurrency,
+                _impl->gpuPreviewThreads > 0 ? _impl->gpuPreviewThreads
+                    : std::max(2, tbb::this_task_arena::max_concurrency() / 8)));
         passRequest.colorPixels = &_impl->colorTracedPixels;
         passRequest.geometricOnlyPixels = &_impl->geometricOnlyPixels;
         passRequest.rayNanoseconds = &rayNanoseconds;
@@ -7132,13 +7257,14 @@ void SceneBridge::Render()
         // One pass-wide device job replaces the barrier after each 64 tiles.
         // The coordinator alone owns presentation packets. Acquire/release
         // completion flags make only fully written tiles visible to it.
+        prism::device::RenderDevice *const device = activeDevice;
         auto worker = std::async(std::launch::async, [&] {
             auto finish = [&] {
                 { std::lock_guard lock(completionMutex); finished = true; }
                 completion.notify_one();
             };
             try {
-                renderDevice->RenderPass(*snapshot->scene, passRequest);
+                device->RenderPass(*snapshot->scene, passRequest);
             } catch (...) { finish(); throw; }
             finish();
         });
@@ -7405,6 +7531,8 @@ VtDictionary SceneBridge::GetProgressStats() const
     result["prismPhaseSeconds"] = VtValue(progress.phaseSeconds);
     result["prismDevice"] = VtValue(progress.device);
     result["prismError"] = VtValue(progress.error);
+    // True while the CPU device renders a preview for a GPU that is preparing.
+    result["prismGpuPreview"] = VtValue(_impl->gpuPreviewActive.load(std::memory_order_relaxed));
     std::string active;
     for (size_t i = 0; i < progress.phases.size(); ++i) {
         if (!progress.phases[i].active) continue;
@@ -7450,6 +7578,9 @@ VtDictionary SceneBridge::GetStats() const
     result["devicePreparationSeconds"] = VtValue(_impl->devicePreparationSeconds);
     result["deferredEnvironmentCaptures"] = VtValue(
         static_cast<int64_t>(_impl->deferredEnvironmentCaptures));
+    result["gpuPreviewPasses"] = VtValue(static_cast<int64_t>(_impl->gpuPreviewSamples.load()));
+    result["gpuPreviewHandovers"] = VtValue(static_cast<int64_t>(_impl->gpuPreviewHandovers.load()));
+    result["gpuPreviewHandoverSample"] = VtValue(static_cast<int64_t>(_impl->gpuPreviewHandoverSample.load()));
     result["firstPassPrimaryScratchBytes"] = VtValue(static_cast<int64_t>(_impl->firstPassPrimaryScratchBytes));
     result["colorTracedPixels"] = VtValue(static_cast<int64_t>(_impl->colorTracedPixels.load()));
     result["geometricOnlyPixels"] = VtValue(static_cast<int64_t>(_impl->geometricOnlyPixels.load()));
