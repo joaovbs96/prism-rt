@@ -209,6 +209,12 @@ std::string rawSourceStamp(std::filesystem::path const &path,
         options.sourceVersion + "\n" + std::to_string(generation);
 }
 
+std::string &lookupError() noexcept
+{
+    thread_local std::string error;
+    return error;
+}
+
 OIIO::TextureOpt::Wrap wrap(TextureWrap value)
 {
     using W = OIIO::TextureOpt::Wrap;
@@ -1188,10 +1194,15 @@ bool TextureService::lookup(TextureResource const &resource, TextureLookup const
         ? OIIO::TextureOpt::MipModeNoMIP : OIIO::TextureOpt::MipModeAniso;
     options.interpmode = query.nearest ? OIIO::TextureOpt::InterpClosest
                                        : OIIO::TextureOpt::InterpBilinear;
-    return resource.m_impl->system->texture(resource.m_impl->handle,
-        resource.m_impl->system->get_perthread_info(), options, query.s, query.t,
-        query.dsdx, query.dtdx, query.dsdy, query.dtdy, channelCount, result);
+    if (resource.m_impl->system->texture(resource.m_impl->handle,
+            resource.m_impl->system->get_perthread_info(), options, query.s, query.t,
+            query.dsdx, query.dtdx, query.dsdy, query.dtdy, channelCount, result))
+        return true;
+    lookupError() = resource.m_impl->system->geterror();
+    return false;
 }
+
+std::string const &TextureService::lastError() noexcept { return lookupError(); }
 
 bool TextureService::readPixels(TextureResource const &resource, int xb, int yb,
                                 int xe, int ye, int firstChannel, int channelCount,
@@ -1201,10 +1212,13 @@ bool TextureService::readPixels(TextureResource const &resource, int xb, int yb,
         xe <= xb || ye <= yb || firstChannel < 0 || channelCount <= 0 ||
         firstChannel + channelCount > resource.channels()) return false;
     OIIO::TextureOpt options;
-    return resource.m_impl->system->get_texels(resource.m_impl->handle,
-        resource.m_impl->system->get_perthread_info(), options, 0,
-        xb, xe, yb, ye, 0, 1, firstChannel, firstChannel + channelCount,
-        OIIO::TypeDesc::FLOAT, result);
+    if (resource.m_impl->system->get_texels(resource.m_impl->handle,
+            resource.m_impl->system->get_perthread_info(), options, 0,
+            xb, xe, yb, ye, 0, 1, firstChannel, firstChannel + channelCount,
+            OIIO::TypeDesc::FLOAT, result))
+        return true;
+    lookupError() = resource.m_impl->system->geterror();
+    return false;
 }
 
 OIIO::TextureSystem *TextureService::textureSystem() const noexcept { return m_impl->system.get(); }
