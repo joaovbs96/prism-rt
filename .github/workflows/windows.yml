@@ -23,6 +23,7 @@ env:
   DEPS: D:\deps
   OUT: D:\out
   USD_STACK_KEY: usd-26.05-osd-3.6.1-mtlx-1.39.4-tbb-2022.2.0-py3.11-win2022
+  MDL_SDK_KEY: mdl-2026.0.2-nocuda-win2022
   VCPKG_BINARY_CACHE: D:\vcpkg-binary-cache
 
 defaults:
