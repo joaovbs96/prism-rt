@@ -69,9 +69,13 @@ bool CompileHlsl(std::string const& source, HlslTarget target, std::filesystem::
     // No DXC optimization: Metal's and the Vulkan drivers' compilers optimize,
     // and DXC's optimizer on these very large kernels is slow (its DXIL output
     // can also exceed what Metal compiles).
+    // SPIR-V legalization inlines every function and runs out of the default
+    // id bound (0x3FFFFF) on kernels with many materials; DXC then crashes
+    // ("Internal compiler error: stack overflow"). Compacting the ids at the
+    // end brings the final module's bound back down to a fraction of that.
     const std::string targetOptions = target == HlslTarget::Dxil
         ? "-Od -Qstrip_debug -Qstrip_reflect"
-        : "-spirv -fspv-target-env=vulkan1.3 -O0";
+        : "-spirv -fspv-target-env=vulkan1.3 -O0 -fspv-max-id 268435455";
     const std::string command = std::format("\"{}\" -T cs_6_6 -E main -HV 2021 {} -Fo \"{}\" \"{}\" 2>&1",
                                             DxcExecutable(), targetOptions, output.string(), input.string());
 #ifdef _WIN32
