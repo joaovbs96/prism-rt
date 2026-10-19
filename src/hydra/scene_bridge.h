@@ -60,6 +60,12 @@ struct RenderSettings {
         EnvironmentSampling::Mis;
     // Requested render device; unavailable GPU devices fall back to the CPU.
     prism::device::DevicePreference device = prism::device::DevicePreference::Auto;
+    // While a GPU device prepares the scene (kernel compile, upload), render
+    // progressively on the CPU device and hand over when the GPU is ready.
+    bool gpuPreparationPreview = true;
+    // The preview is skipped for scenes whose Embree memory exceeds this
+    // many MiB (0 never skips).
+    int gpuPreparationPreviewMaxMiB = 8192;
 };
 
 enum class SceneDirtyKind : unsigned int {

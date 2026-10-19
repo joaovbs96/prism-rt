@@ -47,6 +47,8 @@ TfToken const _refinementDelayMs("prism:refinementDelayMs");
 TfToken const _environmentSampling("prism:environmentSampling");
 TfToken const _textureFiltering("prism:textureFiltering");
 TfToken const _device("prism:device");
+TfToken const _gpuPreparationPreview("prism:gpuPreparationPreview");
+TfToken const _gpuPreparationPreviewMaxMiB("prism:gpuPreparationPreviewMaxMiB");
 TfToken const _resourceRevision("prism:resourceRevision");
 TfToken const _selectionOutline("prism:selectionOutline");
 TfToken const _selectionOutlineRadius("prism:selectionOutlineRadius");
@@ -203,6 +205,8 @@ HdRenderSettingDescriptorList PrismTaskDelegate::GetRenderSettingDescriptors() c
             {"Environment sampling", _environmentSampling, VtValue(std::string("mis"))},
             {"Texture filtering", _textureFiltering, VtValue(std::string("filtered"))},
             {"Device (auto, cpu, cpu-reference, vulkan, metal)", _device, VtValue(std::string("auto"))},
+            {"CPU preview while the GPU prepares", _gpuPreparationPreview, VtValue(true)},
+            {"CPU preview scene limit (MiB, 0 unlimited)", _gpuPreparationPreviewMaxMiB, VtValue(8192)},
             {"Resource revision", _resourceRevision, VtValue(0)},
             {"Selection outline", _selectionOutline, VtValue(true)},
             {"Selection outline radius", _selectionOutlineRadius, VtValue(2)},
@@ -236,6 +240,8 @@ VtValue PrismTaskDelegate::GetRenderSetting(TfToken const &key) const
     if (key == _textureFiltering) return VtValue(std::string(
         s.textureFiltering == prism::TextureFiltering::Filtered
             ? "filtered" : "bilinear"));
+    if (key == _gpuPreparationPreview) return VtValue(s.gpuPreparationPreview);
+    if (key == _gpuPreparationPreviewMaxMiB) return VtValue(s.gpuPreparationPreviewMaxMiB);
     if (key == _resourceRevision) return VtValue(s.resourceRevision);
     if (key == _device) return VtValue(std::string(prism::device::ToString(s.device)));
     if (key == _selectionOutline)
@@ -372,6 +378,10 @@ void PrismTaskDelegate::SetRenderSetting(TfToken const &key, VtValue const &valu
             s.textureFiltering = prism::TextureFiltering::Bilinear;
         else return;
     }
+    else if (key == _gpuPreparationPreview)
+        s.gpuPreparationPreview = _Get(value, s.gpuPreparationPreview);
+    else if (key == _gpuPreparationPreviewMaxMiB)
+        s.gpuPreparationPreviewMaxMiB = std::max(0, _Get(value, s.gpuPreparationPreviewMaxMiB));
     else if (key == _resourceRevision)
         s.resourceRevision = _Get(value, s.resourceRevision);
     else if (key == _device &&
