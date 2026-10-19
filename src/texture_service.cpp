@@ -953,7 +953,8 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
             throw std::runtime_error("cannot decode texture pixels: " + error);
         }
         decodeInput->close();
-        m_impl->decodeNanoseconds.fetch_add(elapsedNanoseconds(stageStart), std::memory_order_relaxed);
+        const uint64_t decodeNanosecondsThis = elapsedNanoseconds(stageStart);
+        m_impl->decodeNanoseconds.fetch_add(decodeNanosecondsThis, std::memory_order_relaxed);
         stageStart = std::chrono::steady_clock::now();
         const int displayWidth = spec.full_width > 0 ? spec.full_width : spec.width;
         const int displayHeight = spec.full_height > 0 ? spec.full_height : spec.height;
@@ -1043,7 +1044,8 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
         std::vector<float> &pixels = identity ? sourcePixels : outputPixels;
         // make_texture reads a wrapped buffer in place; no copy is needed.
         OIIO::ImageBuf normalized(normalizedSpec, OIIO::span<float>(pixels.data(), pixels.size()));
-        m_impl->pixelNanoseconds.fetch_add(elapsedNanoseconds(stageStart), std::memory_order_relaxed);
+        const uint64_t pixelNanosecondsThis = elapsedNanoseconds(stageStart);
+        m_impl->pixelNanoseconds.fetch_add(pixelNanosecondsThis, std::memory_order_relaxed);
         stageStart = std::chrono::steady_clock::now();
         static std::atomic<uint64_t> serial{0};
         const auto temp = root / (key + "." + std::to_string(processId()) + "." +
@@ -1068,12 +1070,42 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
         };
         config.attribute("maketx:swrap", wrapName(options.wrapS));
         config.attribute("maketx:twrap", wrapName(options.wrapT));
+        const bool profiled = prism::load_profile::Enabled();
+        std::ostringstream makeStats;
+        if (profiled) config.attribute("maketx:stats", 1);
         if (!OIIO::ImageBufAlgo::make_texture(OIIO::ImageBufAlgo::MakeTxTexture,
-                                               normalized, temp.string(), config)) {
+                                               normalized, temp.string(), config,
+                                               profiled ? &makeStats : nullptr)) {
             std::filesystem::remove(temp);
             throw std::runtime_error("cannot prepare texture " + absolute.string() + ": " + OIIO::geterror());
         }
-        m_impl->mipNanoseconds.fetch_add(elapsedNanoseconds(stageStart), std::memory_order_relaxed);
+        const uint64_t makeNanoseconds = elapsedNanoseconds(stageStart);
+        m_impl->mipNanoseconds.fetch_add(makeNanoseconds, std::memory_order_relaxed);
+        if (profiled) {
+            // One line per cold preparation: the source's storage and the
+            // make_texture stages (OIIO's own timers, in seconds).
+            auto stat = [&](std::string const &label) {
+                const std::string text = makeStats.str();
+                const size_t at = text.find(label);
+                if (at == std::string::npos) return 0.0;
+                return std::atof(text.c_str() + at + label.size());
+            };
+            std::error_code sizeError;
+            const auto preparedBytes = std::filesystem::file_size(temp, sizeError);
+            prism::load_profile::Mark("texture.cold", std::string("name=") + absolute.filename().string() +
+                " format=" + sourceInputFormat + " type=" + spec.format.c_str() +
+                " size=" + std::to_string(spec.width) + "x" + std::to_string(spec.height) +
+                " channels=" + std::to_string(spec.nchannels) + " out_channels=" + std::to_string(outChannels) +
+                " gamma=" + std::to_string(options.gamma) + " unassociate=" + std::to_string(unassociateAlpha) +
+                " decode_ms=" + std::to_string(decodeNanosecondsThis / 1000000) +
+                " pixel_ms=" + std::to_string(pixelNanosecondsThis / 1000000) +
+                " make_ms=" + std::to_string(makeNanoseconds / 1000000) +
+                " mip_s=" + std::to_string(stat("mip computation:")) +
+                " write_s=" + std::to_string(stat("file write:")) +
+                " hash_s=" + std::to_string(stat("hash:")) +
+                " stats_s=" + std::to_string(stat("pixelstats:")) +
+                " tx_mb=" + std::to_string((sizeError ? 0 : preparedBytes) >> 20));
+        }
         std::error_code ec;
         lockWaitStart = std::chrono::steady_clock::now();
         publicationLock = std::make_unique<CrossProcessCacheLock>(root);

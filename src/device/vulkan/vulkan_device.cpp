@@ -984,15 +984,23 @@ bool VulkanDevice::Impl::uploadImages(std::string* error)
         VkFormat format = VK_FORMAT_UNDEFINED;
         uint32_t levels = 1;
     };
+    std::atomic<uint64_t> readNanoseconds{0}, convertNanoseconds{0}, stagedBytes{0};
+    auto nanosecondsSince = [](Clock::time_point start) {
+        return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count());
+    };
     auto prepare = [&](size_t i, Prepared& out) {
         auto const& resource = d.images[i];
         const bool floatPrecision = isEnvironment[i];
         int width = resource->width(), height = resource->height();
         const int channels = std::clamp(resource->channels(), 1, 4);
+        const auto readStart = Clock::now();
         std::vector<float> pixels(size_t(width) * height * channels);
         if (!ReadPreparedImage(*resource, channels, pixels.data()) &&
             !service->readPixels(*resource, 0, 0, width, height, 0, channels, pixels.data()))
             std::fill(pixels.begin(), pixels.end(), 0.0f);
+        const uint64_t readTime = nanosecondsSince(readStart);
+        readNanoseconds += readTime;
+        const auto convertStart = Clock::now();
         gpu::Downsample(pixels, width, height, channels, shift[i]);
         struct Scan {
             bool quantized;
@@ -1042,6 +1050,14 @@ bool VulkanDevice::Impl::uploadImages(std::string* error)
                     }
                 }
             });
+        const uint64_t convertTime = nanosecondsSince(convertStart);
+        convertNanoseconds += convertTime;
+        stagedBytes += out.staging.size();
+        if (prism::load_profile::Enabled())
+            prism::load_profile::Mark("vulkan.image",
+                std::format("name={} size={}x{} channels={} shift={} format={} bytes={} read_ms={:.1f} convert_ms={:.1f}",
+                            resource->sourcePath().filename().string(), width, height, channels, shift[i],
+                            int(out.format), out.staging.size(), readTime / 1e6, convertTime / 1e6));
         progress::Add(Phase::Upload);
     };
 
@@ -1126,6 +1142,8 @@ bool VulkanDevice::Impl::uploadImages(std::string* error)
     // Images are prepared in parallel, in batches that bound the host
     // memory, and each batch is uploaded with one submission.
     constexpr uint64_t batchBytes = uint64_t(2) << 30;
+    const auto uploadStart = Clock::now();
+    uint64_t prepareNanoseconds = 0, submitNanoseconds = 0;
     for (size_t first = 0; first < missing.size();) {
         size_t last = first;
         uint64_t bytes = 0;
@@ -1139,7 +1157,10 @@ bool VulkanDevice::Impl::uploadImages(std::string* error)
             ++last;
         }
         std::vector<Prepared> prepared(last - first);
+        const auto batchStart = Clock::now();
         tbb::parallel_for(first, last, [&](size_t m) { prepare(missing[m], prepared[m - first]); });
+        prepareNanoseconds += nanosecondsSince(batchStart);
+        const auto submitStart = Clock::now();
         std::vector<Buffer> staging(prepared.size());
         std::vector<Image> images(prepared.size());
         VkCommandBuffer commands = beginCommands();
@@ -1158,6 +1179,7 @@ bool VulkanDevice::Impl::uploadImages(std::string* error)
             }
         }
         const bool submitted = submit(commands, recorded ? error : nullptr) && recorded;
+        submitNanoseconds += nanosecondsSince(submitStart);
         for (auto& buffer : staging) destroyBuffer(buffer);
         if (!submitted) {
             for (auto& image : images) destroyImage(image);
@@ -1177,11 +1199,17 @@ bool VulkanDevice::Impl::uploadImages(std::string* error)
         vkFreeMemory(device, it->second.image.memory, nullptr);
         it = imageCache.erase(it);
     }
-    if (gpu::GpuVerbose()) {
+    if (gpu::GpuVerbose() || prism::load_profile::Enabled()) {
         VkDeviceSize bytes = 0;
         for (auto const& [key, cached] : imageCache) bytes += cached.image.bytes;
-        std::cerr << std::format("PrismRT Vulkan: {} images ({} uploaded), {:.0f} MiB\n", d.images.size(), missing.size(),
-                                 double(bytes) / 1048576.0);
+        const std::string summary = std::format(
+            "{} images ({} uploaded, {} reduced), {:.0f} MiB of image memory, {:.0f} MiB staged; "
+            "{:.2f} s total: prepare {:.2f} s (read {:.2f} s, convert {:.2f} s summed over threads), "
+            "copy and submit {:.2f} s", d.images.size(), missing.size(), reduced, double(bytes) / 1048576.0,
+            double(stagedBytes.load()) / 1048576.0, SecondsSince(uploadStart), prepareNanoseconds / 1e9,
+            readNanoseconds.load() / 1e9, convertNanoseconds.load() / 1e9, submitNanoseconds / 1e9);
+        if (gpu::GpuVerbose()) std::cerr << "PrismRT Vulkan: " << summary << '\n';
+        prism::load_profile::Mark("vulkan.images", summary);
     }
     return upload(kSlotImages, info.data(), info.size() * sizeof(GpuImage));
 }
