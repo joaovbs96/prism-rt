@@ -29,6 +29,7 @@
 #include <fstream>
 #include <mutex>
 #include <iostream>
+#include <thread>
 #include <unordered_map>
 
 namespace prism::device {
@@ -129,6 +130,39 @@ struct AccelerationStructure {
     VkDeviceAddress address = 0;
 };
 
+// Pipeline-cache data is only valid for the driver that produced it: name the
+// files after the cache UUID and the device and driver identifiers, so a
+// driver update or another GPU reads its own file. The driver checks the
+// data's header again when it is loaded.
+std::string PipelineCacheTag(VkPhysicalDeviceProperties const& properties)
+{
+    std::string tag;
+    for (uint8_t byte : properties.pipelineCacheUUID) tag += std::format("{:02x}", byte);
+    return tag + std::format("-{:x}-{:x}-{:x}", properties.vendorID, properties.deviceID,
+                             properties.driverVersion);
+}
+
+// Publishes a cache file whole: other processes sharing the cache directory
+// read either the previous complete file or this one.
+void WriteCacheFileAtomically(std::filesystem::path const& path, void const* data, size_t size)
+{
+    static std::atomic<uint64_t> serial{0};
+    std::error_code error;
+    std::filesystem::create_directories(path.parent_path(), error);
+    const auto temporary = std::filesystem::path(path.string() + std::format(".{}.{}.tmp",
+        std::hash<std::thread::id>{}(std::this_thread::get_id()), ++serial));
+    {
+        std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
+        if (!out || !out.write(static_cast<const char*>(data), std::streamsize(size))) {
+            out.close();
+            std::filesystem::remove(temporary, error);
+            return;
+        }
+    }
+    std::filesystem::rename(temporary, path, error);
+    if (error) std::filesystem::remove(temporary, error);
+}
+
 } // namespace
 
 bool CompileVulkanKernel(std::string const& mdlCode, std::vector<uint32_t>* spirv, std::string* error,
@@ -179,7 +213,7 @@ bool CompileVulkanKernel(std::string const& mdlCode, std::vector<uint32_t>* spir
         }
         std::error_code ignored;
         std::filesystem::remove(tooLarge, ignored);
-        std::ofstream(cached, std::ios::binary).write(bytes.data(), std::streamsize(bytes.size()));
+        WriteCacheFileAtomically(cached, bytes.data(), bytes.size());
     }
     spirv->resize(bytes.size() / 4);
     std::memcpy(spirv->data(), bytes.data(), bytes.size());
@@ -232,6 +266,8 @@ struct VulkanDevice::Impl {
     VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
     std::unordered_map<std::string, VkPipeline> pipelines;
+    // Identifies this driver's pipeline-cache data (see PipelineCacheTag).
+    std::string pipelineCacheTag;
     // The generated MDL code `pipeline` was built from.
     std::shared_ptr<const gpu::MdlShaderCode> pipelineCode;
     VkQueryPool timestamps = VK_NULL_HANDLE;
@@ -390,6 +426,7 @@ bool VulkanDevice::Impl::initialize(std::string* reason)
     VkPhysicalDeviceProperties2 properties2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
     properties2.pNext = &accelerationProperties;
     vkGetPhysicalDeviceProperties2(physical, &properties2);
+    pipelineCacheTag = PipelineCacheTag(properties2.properties);
 
     createAccelerationStructure = reinterpret_cast<PFN_vkCreateAccelerationStructureKHR>(
         vkGetDeviceProcAddr(device, "vkCreateAccelerationStructureKHR"));
@@ -634,8 +671,35 @@ bool VulkanDevice::Impl::buildPipeline(std::string* error)
     info.stage.module = module;
     info.stage.pName = "main";
     info.layout = pipelineLayout;
-    const VkResult result = vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &info, nullptr, &pipeline);
+    // The driver compiles the SPIR-V to GPU code here, which takes seconds
+    // for a large kernel: keep its result next to the SPIR-V for later runs.
+    const auto pipelineCacheFile = gpu::ShaderCacheDirectory("vulkan") / (key + "-" + pipelineCacheTag + ".vkpc");
+    std::vector<char> cacheData;
+    if (std::ifstream file{pipelineCacheFile, std::ios::binary})
+        cacheData.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+    VkPipelineCacheCreateInfo cacheInfo{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+    cacheInfo.initialDataSize = cacheData.size();
+    cacheInfo.pInitialData = cacheData.empty() ? nullptr : cacheData.data();
+    VkPipelineCache pipelineCache = VK_NULL_HANDLE;
+    if (vkCreatePipelineCache(device, &cacheInfo, nullptr, &pipelineCache) != VK_SUCCESS) {
+        // Data the driver rejects outright: start empty.
+        cacheInfo.initialDataSize = 0;
+        cacheInfo.pInitialData = nullptr;
+        if (vkCreatePipelineCache(device, &cacheInfo, nullptr, &pipelineCache) != VK_SUCCESS)
+            pipelineCache = VK_NULL_HANDLE;
+    }
+    const VkResult result = vkCreateComputePipelines(device, pipelineCache, 1, &info, nullptr, &pipeline);
     vkDestroyShaderModule(device, module, nullptr);
+    if (pipelineCache) {
+        size_t size = 0;
+        if (result == VK_SUCCESS && vkGetPipelineCacheData(device, pipelineCache, &size, nullptr) == VK_SUCCESS &&
+            size > 0 && size != cacheData.size()) {
+            std::vector<char> data(size);
+            if (vkGetPipelineCacheData(device, pipelineCache, &size, data.data()) == VK_SUCCESS)
+                WriteCacheFileAtomically(pipelineCacheFile, data.data(), size);
+        }
+        vkDestroyPipelineCache(device, pipelineCache, nullptr);
+    }
     if (result != VK_SUCCESS) {
         if (error) *error = std::string("cannot create the compute pipeline: ") + ResultText(result);
         pipeline = VK_NULL_HANDLE;
