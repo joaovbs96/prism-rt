@@ -200,6 +200,7 @@ if (-not $SkipUsdview) {
     Invoke-TestUsdview $fixture $smoke "lifecycle"
     Invoke-TestUsdview $fixture $motion "motion"
     Invoke-TestUsdview $instancesFixture $instancesTest "instances"
+    Invoke-TestUsdview $fixture (Join-Path $root "tests\hydra\usdview_sample_hud.py") "sample-hud"
 
     # Exercise the installed usdview extension module with the relocated SDK
     # environment and no build-tree plugin paths in the registry.

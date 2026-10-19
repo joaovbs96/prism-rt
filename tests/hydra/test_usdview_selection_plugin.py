@@ -135,5 +135,132 @@ class UsdviewSelectionPluginTest(unittest.TestCase):
             window.close()
 
 
+class _Engine:
+    def __init__(self, stats):
+        self.stats = stats
+        self.calls = 0
+
+    def GetRenderStats(self):
+        self.calls += 1
+        if isinstance(self.stats, Exception):
+            raise self.stats
+        return self.stats
+
+
+class _HudView(_FakeStageView):
+    def __init__(self, parent, renderer_id, stats, converged):
+        super().__init__(parent, renderer_id)
+        self._renderer = _Engine(stats)
+        self.converged = converged
+        self.resize(400, 300)
+
+    def IsRendererConverged(self):
+        return self.converged
+
+
+class UsdviewSampleHudTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
+    def test_hud_text_refining_converged_and_adaptive(self):
+        self.assertEqual(prismUsdview.hud_text(512, 2048, False),
+                         ("512 / 2048", "refining"))
+        self.assertEqual(prismUsdview.hud_text(2048, 2048, True),
+                         ("2048 / 2048", "converged"))
+        # Adaptive early-out: converged below the target.
+        self.assertEqual(prismUsdview.hud_text(300, 2048, True),
+                         ("300 / 2048", "converged"))
+
+    def test_hud_text_degrades_without_stats(self):
+        self.assertEqual(prismUsdview.hud_text(None, None, True),
+                         (None, "converged"))
+        self.assertEqual(prismUsdview.hud_text(None, 64, False),
+                         (None, "refining"))
+        self.assertEqual(prismUsdview.hud_text(7, None, False),
+                         ("7", "refining"))
+        self.assertEqual(prismUsdview.hud_text(7, 0, False), ("7", "refining"))
+
+    def _hud(self, stats, converged=False, renderer=None, show=True):
+        window = QtWidgets.QWidget()
+        window.resize(400, 300)
+        api = _Api(window, {})
+        api.dataModel.viewSettings = type("ViewSettings", (), {"showHUD": show})()
+        view = _HudView(window, renderer or prismUsdview.RENDERER, stats, converged)
+        window.show()
+        patcher = mock.patch.object(prismUsdview, "StageView", _HudView)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        hud = prismUsdview._SampleHud(api)
+        hud._timer.stop()
+        hud.refresh()
+        return window, hud, view
+
+    def test_overlay_shows_progress_and_converged_state(self):
+        window, hud, view = self._hud({
+            "numCompletedSamples": 512, "targetSamples": 2048})
+        label = hud._labels[view]
+        self.assertTrue(label.isVisible())
+        self.assertEqual([text for text, _ in label.lines()],
+                         ["Samples: 512 / 2048", "  State: refining"])
+        # Below usdview's Hydra line, aligned with its top-right group.
+        self.assertEqual(label.geometry().x(), view.width() - 160)
+        self.assertGreater(label.geometry().y(), 14 + 15)
+        self.assertTrue(label.testAttribute(
+            prismUsdview._enum(prismUsdview.QtCore.Qt, "WidgetAttribute",
+                               "WA_TransparentForMouseEvents")))
+
+        view.converged = True
+        view._renderer.stats = {"numCompletedSamples": 300, "targetSamples": 2048}
+        hud._stats_cache.clear()
+        hud.refresh()
+        self.assertEqual(label.lines()[1][0], "  State: converged")
+        self.assertEqual(label.lines()[0][0], "Samples: 300 / 2048")
+        self.assertEqual(label.lines()[1][1], prismUsdview._CONVERGED_COLOR)
+        window.close()
+
+    def test_overlay_hides_and_survives_missing_stats(self):
+        window, hud, view = self._hud({})
+        self.assertEqual([t for t, _ in hud._labels[view].lines()],
+                         ["  State: refining"])
+        window.close()
+        window, hud, view = self._hud(RuntimeError("no stats"), converged=True)
+        self.assertEqual([t for t, _ in hud._labels[view].lines()],
+                         ["  State: converged"])
+        window.close()
+
+        for kwargs in ({"show": False}, {"renderer": "HdStormRendererPlugin"}):
+            window, hud, view = self._hud({"completedSamples": 1}, **kwargs)
+            self.assertFalse(hud._labels[view].isVisible(), kwargs)
+            window.close()
+
+        window, hud, view = self._hud({"completedSamples": 1})
+        view._renderPauseState = True
+        hud.refresh()
+        self.assertFalse(hud._labels[view].isVisible())
+        window.close()
+
+    def test_stats_are_read_at_most_ten_times_per_second(self):
+        window, hud, view = self._hud({"numCompletedSamples": 1})
+        before = view._renderer.calls
+        for _ in range(5):
+            hud.refresh()
+        self.assertEqual(view._renderer.calls, before)
+        window.close()
+
+    def test_resize_repositions_overlay(self):
+        window, hud, view = self._hud({"numCompletedSamples": 1})
+        label = hud._labels[view]
+        view.resize(640, 300)
+        hud.eventFilter(view, QtCore_event("Resize"))
+        self.assertEqual(label.geometry().x(), 640 - 160)
+        window.close()
+
+
+def QtCore_event(name):
+    return prismUsdview.QtCore.QEvent(
+        getattr(prismUsdview.QtCore.QEvent.Type, name))
+
+
 if __name__ == "__main__":
     unittest.main()
