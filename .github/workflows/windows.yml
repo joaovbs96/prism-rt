@@ -78,9 +78,46 @@ jobs:
             D:\deps\usd
           key: ${{ steps.key.outputs.key }}
 
+  # The MDL SDK build (vendored LLVM) is its own job and cache, keyed on the SDK
+  # version and the build script, so changing it never invalidates the OpenUSD
+  # stack and vice versa. It runs in parallel with the usd job.
+  mdl:
+    name: MDL SDK (no CUDA)
+    runs-on: windows-2022
+    timeout-minutes: 300
+    outputs:
+      key: ${{ steps.key.outputs.key }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache key
+        id: key
+        run: |
+          $hash = "${{ hashFiles('tools/ci/build_mdl_sdk.ps1', 'tools/ci/mdl_vcpkg/vcpkg.json') }}"
+          "key=$env:MDL_SDK_KEY-$hash" >> $env:GITHUB_OUTPUT
+      - name: Look up cache
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: D:\deps\mdl
+          key: ${{ steps.key.outputs.key }}
+          lookup-only: true
+      - uses: actions/setup-python@v5
+        if: steps.cache.outputs.cache-hit != 'true'
+        with:
+          python-version: "3.11"
+      - name: Build the MDL SDK without CUDA
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: ./tools/ci/build_mdl_sdk.ps1 -Prefix "$env:DEPS\mdl" -WorkDir D:\mdl-work
+      - name: Save cache
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: D:\deps\mdl
+          key: ${{ steps.key.outputs.key }}
+
   build:
     name: Build, test and package
-    needs: usd
+    needs: [usd, mdl]
     permissions:
       contents: write # attaching the zip to a release
     runs-on: windows-2022
@@ -105,8 +142,15 @@ jobs:
           key: ${{ needs.usd.outputs.key }}
           fail-on-cache-miss: true
 
-      - name: Fetch oneTBB, Embree and the MDL SDK
-        run: ./tools/ci/fetch_prebuilt.ps1 -Prefix $env:DEPS
+      - name: Restore the MDL SDK
+        uses: actions/cache/restore@v4
+        with:
+          path: D:\deps\mdl
+          key: ${{ needs.mdl.outputs.key }}
+          fail-on-cache-miss: true
+
+      - name: Fetch oneTBB and Embree
+        run: ./tools/ci/fetch_prebuilt.ps1 -Prefix $env:DEPS -Components tbb,embree
 
       - name: Install the Vulkan SDK
         run: |
