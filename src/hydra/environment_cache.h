@@ -35,9 +35,15 @@ public:
                                              : static_cast<const void*>(texture.get()),
             {std::bit_cast<uint32_t>(multiplier.x()), std::bit_cast<uint32_t>(multiplier.y()),
              std::bit_cast<uint32_t>(multiplier.z())}};
-        std::lock_guard lock(mutex);
-        auto& entry=entries[key];
-        if (auto existing=entry.lock()) { ++hits; return existing; }
+        {
+            std::lock_guard lock(mutex);
+            auto found=entries.find(key);
+            if (found!=entries.end())
+                if (auto existing=found->second.lock()) { ++hits; return existing; }
+        }
+        // Building the importance tables of a large sky takes hundreds of
+        // milliseconds. Statistics read this cache from the host thread, so
+        // build outside the lock; a concurrent build of the same key loses.
         const auto sourceIdentity=texture;
         // Freeze the texture handle as well as the tables: publishing edits on
         // a caller's ImageTexture must not change a previously cached sky.
@@ -46,6 +52,9 @@ public:
             texture=std::make_shared<ColorTexture>(*color);
         auto result=std::make_shared<LocalEnvironment>(std::move(texture),multiplier);
         if (!image || !image->resource) result->sourceIdentity=sourceIdentity;
+        std::lock_guard lock(mutex);
+        auto& entry=entries[key];
+        if (auto existing=entry.lock()) { ++hits; return existing; }
         entry=result;
         ++builds;
         // Expired keys must not accumulate during repeated resource edits.
