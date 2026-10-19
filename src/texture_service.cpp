@@ -347,6 +347,10 @@ struct TextureResource::Impl {
     std::shared_ptr<OIIO::TextureSystem> system;
     std::shared_ptr<TextureService> serviceOwner;
     OIIO::TextureSystem::TextureHandle *handle = nullptr;
+    // An alias samples its base resource's OIIO handle, so it keeps the base
+    // alive: otherwise the base could expire and a later preparation of the
+    // same content would invalidate the file while the alias samples it.
+    std::shared_ptr<const TextureResource> base;
     std::filesystem::path pinPath;
     ResourceVersion version;
     ~Impl() { if (!pinPath.empty()) { std::error_code ec; std::filesystem::remove(pinPath, ec); } }
@@ -714,6 +718,7 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
         aliasImpl->system = cached->m_impl->system;
         aliasImpl->serviceOwner = shared_from_this();
         aliasImpl->handle = cached->m_impl->handle;
+        aliasImpl->base = cached;
         aliasImpl->version = {absolute.generic_string(), stamp, rawFingerprint, generation};
         const auto preparedRoot = aliasImpl->prepared.parent_path();
         const auto pinWaitStart = std::chrono::steady_clock::now();
@@ -1037,9 +1042,20 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
     impl->system = m_impl->system;
     impl->serviceOwner = shared_from_this();
     // A previous cache entry at this content path may have been evicted and
-    // recreated while this process kept its TextureSystem alive.
-    m_impl->system->invalidate(OIIO::ustring(tx.string()), true);
+    // recreated while this process kept its TextureSystem alive. Only a file
+    // written just now can be such a recreation; an existing one may be
+    // sampled by render threads right now, and invalidating it under them
+    // clears its level table mid-lookup.
+    if (!cacheFilePresent)
+        m_impl->system->invalidate(OIIO::ustring(tx.string()), true);
     impl->handle = m_impl->system->get_texture_handle(OIIO::ustring(tx.string()));
+    if (impl->handle && !m_impl->system->good(impl->handle)) {
+        // A file OIIO once failed to open stays broken until invalidated.
+        // Nothing samples a broken file, so retrying it is safe.
+        (void)m_impl->system->geterror();
+        m_impl->system->invalidate(OIIO::ustring(tx.string()), true);
+        impl->handle = m_impl->system->get_texture_handle(OIIO::ustring(tx.string()));
+    }
     if (!impl->handle || !m_impl->system->good(impl->handle))
         throw std::runtime_error("cannot open prepared texture: " + m_impl->system->geterror());
     std::error_code accessError;
