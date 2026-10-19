@@ -65,10 +65,11 @@ bool PipelineStatisticsSetting();
 // (the hint bits cover `programs`).
 bool RaygenSource(bool reorder, uint32_t programs, std::string* source, std::string* error);
 // The HLSL of the callable pipeline: the raygen shader, then one callable per
-// program of `code` (the link unit with only that program's dispatch), each
-// compiled alone with the kMaterialCallProfile library profile.
+// program of `code` (that program's dispatch and, with `trim`, only the
+// functions of the link unit it reaches), each compiled alone with the
+// kMaterialCallProfile library profile.
 bool MaterialCallSources(gpu::MdlShaderCode const& code, bool reorder, std::vector<std::string>* sources,
-                         std::string* error);
+                         std::string* error, bool trim = true);
 extern const char* const kMaterialCallProfile; // lib_6_6
 
 // Prints the statistics of every executable of `pipeline` (created with
