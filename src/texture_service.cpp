@@ -48,6 +48,8 @@ namespace {
 std::mutex singletonMutex;
 std::weak_ptr<TextureService> singleton;
 std::atomic<uint64_t> texturePinSerial{0};
+// Prepared resources released so far; a trim can only evict what was released.
+std::atomic<uint64_t> releasedResources{0};
 
 uint64_t elapsedNanoseconds(std::chrono::steady_clock::time_point start)
 {
@@ -394,7 +396,10 @@ struct TextureResource::Impl {
     std::shared_ptr<const TextureResource> base;
     std::filesystem::path pinPath;
     ResourceVersion version;
-    ~Impl() { if (!pinPath.empty()) { std::error_code ec; std::filesystem::remove(pinPath, ec); } }
+    ~Impl() {
+        if (!pinPath.empty()) { std::error_code ec; std::filesystem::remove(pinPath, ec); }
+        releasedResources.fetch_add(1, std::memory_order_relaxed);
+    }
 };
 
 struct TextureService::Impl {
@@ -410,7 +415,7 @@ struct TextureService::Impl {
     std::unordered_map<std::string, std::vector<std::string>> sourcePreparedKeys;
     std::unordered_map<std::string, std::unordered_map<std::string, std::string>> sourceKeyStamps;
     struct DiskUsage {
-        uint64_t bytes = 0, added = 0;
+        uint64_t bytes = 0, added = 0, addedAtTrim = 0, releasedAtTrim = 0;
         std::chrono::steady_clock::time_point lastTrim;
         bool known = false;
     };
@@ -1142,10 +1147,21 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
         auto &usage = m_impl->diskUsage[usageKey];
         usage.bytes += addedBytes;
         usage.added += addedBytes;
-        trim = !usage.known || usage.bytes > limit || now - usage.lastTrim >= kDiskTrimInterval;
+        // When live textures alone exceed the budget a trim cannot get under
+        // it, and trimming again on every publication serializes preparation
+        // on a full directory scan. Over budget, trim again only after this
+        // process added a further slice of the budget, or once a resource was
+        // released (it may now be evictable).
+        const uint64_t released = releasedResources.load(std::memory_order_relaxed);
+        const uint64_t trimStep = std::max<uint64_t>(limit / 32, 64ull * 1024 * 1024);
+        trim = !usage.known || now - usage.lastTrim >= kDiskTrimInterval ||
+            (usage.bytes > limit && (released != usage.releasedAtTrim ||
+                                     usage.added - usage.addedAtTrim >= trimStep));
         if (trim) {
             usage.known = true;
             usage.lastTrim = now;
+            usage.addedAtTrim = usage.added;
+            usage.releasedAtTrim = released;
             addedBeforeTrim = usage.added;
             for (auto const &[resourceKey, weak] : m_impl->resources) {
                 (void)resourceKey;
