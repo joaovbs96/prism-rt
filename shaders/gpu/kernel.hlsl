@@ -71,51 +71,53 @@ void main(uint3 id : SV_DispatchThreadID)
     const uint mode = frame.work.z;
     GpuPathTracer tracer;
 
-    if (mode == kModePreview) {
+    // One call site of renderSample (and of the primary-hit intersection):
+    // DXC inlines every call, so each extra site duplicates every material.
+    const bool preview = mode == kModePreview;
+    uint x, y;
+    uint pixel = 0u;
+    bool replicated = false;
+    uint sampleIndex = 0u;
+    if (preview) {
         const uint previewWidth = frame.size.z;
         const uint previewHeight = frame.size.w;
         const uint px = thread % previewWidth;
         const uint py = thread / previewWidth;
-        const uint y = min(height - 1u, ((2u * py + 1u) * height) / (2u * previewHeight));
-        const uint x = min(width - 1u, ((2u * px + 1u) * width) / (2u * previewWidth));
+        y = min(height - 1u, ((2u * py + 1u) * height) / (2u * previewHeight));
+        x = min(width - 1u, ((2u * px + 1u) * width) / (2u * previewWidth));
         tracer.backend.rng.state = seedPreview(px, py, previewWidth, frame.settings.w);
         const Sampler previewSampler = {0u, tracer.backend.rng.state, 0u};
         tracer.sampler = previewSampler;
-        const SampleResult preview = tracer.renderSample(camera, x, y, width, height, settings);
-        gpu_store_output(thread, float4(preview.color, preview.coverage));
-        if ((flags & kFramePrimaryHits) != 0u)
-            gpu_store_primary_hit(thread, tracer.backend.intersect(pixelCenterRay(camera, x, y, width, height)).surface);
-        return;
+    } else {
+        // Image mode with work.y listed pixels traces several samples of each in
+        // parallel: thread t takes sample counts.z + t / work.y of pixel t % work.y
+        // and writes its own output slots, which the host adds up.
+        replicated = mode == kModeImage && frame.work.y != 0u;
+        const uint replica = replicated ? thread / frame.work.y : 0u;
+        pixel = gpu_pixel(replicated ? thread % frame.work.y : thread);
+        x = pixel % width;
+        y = pixel / width;
+        if (mode == kModePrimary) {
+            gpu_store_primary_hit(pixel, tracer.backend.intersect(pixelCenterRay(camera, x, y, width, height)).surface);
+            return;
+        }
+        sampleIndex = frame.counts.z + replica;
+        // The sampler's sequence is indexed by the sample number, scrambled per pixel.
+        const Sampler sampler = {sampleIndex,
+                                 mode == kModeImage ? seedImage(x, y, width, frame.settings.w)
+                                                    : seedPass(x, y, width, frame.settings.w),
+                                 0u};
+        tracer.sampler = sampler;
+        if ((flags & kFrameSeedRng) != 0u)
+            tracer.backend.rng.state = mode == kModeImage ? seedImage(x, y, width, frame.settings.w)
+                                                          : seedPass(x, y, width, frame.settings.w);
+        else if (replicated)
+            tracer.backend.rng.state = hashCombine(sampler.seed, hashUint(sampleIndex));
+        else
+            tracer.backend.rng.state = gpu_load_rng(pixel);
     }
-
-    // Image mode with work.y listed pixels traces several samples of each in
-    // parallel: thread t takes sample counts.z + t / work.y of pixel t % work.y
-    // and writes its own output slots, which the host adds up.
-    const bool replicated = mode == kModeImage && frame.work.y != 0u;
-    const uint replica = replicated ? thread / frame.work.y : 0u;
-    const uint pixel = gpu_pixel(replicated ? thread % frame.work.y : thread);
-    const uint x = pixel % width;
-    const uint y = pixel / width;
-    if (mode == kModePrimary) {
-        gpu_store_primary_hit(pixel, tracer.backend.intersect(pixelCenterRay(camera, x, y, width, height)).surface);
-        return;
-    }
-    const uint sampleIndex = frame.counts.z + replica;
-    // The sampler's sequence is indexed by the sample number, scrambled per pixel.
-    const Sampler sampler = {sampleIndex,
-                             mode == kModeImage ? seedImage(x, y, width, frame.settings.w)
-                                                : seedPass(x, y, width, frame.settings.w),
-                             0u};
-    tracer.sampler = sampler;
-    if ((flags & kFrameSeedRng) != 0u)
-        tracer.backend.rng.state = mode == kModeImage ? seedImage(x, y, width, frame.settings.w)
-                                                      : seedPass(x, y, width, frame.settings.w);
-    else if (replicated)
-        tracer.backend.rng.state = hashCombine(sampler.seed, hashUint(sampleIndex));
-    else
-        tracer.backend.rng.state = gpu_load_rng(pixel);
     SampleResult result;
-    if (frame.counts.y != 0u) {
+    if (!preview && frame.counts.y != 0u) {
         result.color = debugView(tracer, camera, x, y, width, height, frame.counts.y);
         result.coverage = 1.0f;
     } else {
@@ -126,8 +128,11 @@ void main(uint3 id : SV_DispatchThreadID)
         gpu_store_output(2u * thread + 1u, (sampleIndex & 1u) == 0u ? float4(result.color, 0.0f) : (float4)0.0f);
         return;
     }
-    if (mode == kModePass && (flags & kFramePrimaryHits) != 0u)
-        gpu_store_primary_hit(pixel, tracer.backend.intersect(pixelCenterRay(camera, x, y, width, height)).surface);
+    if (preview) gpu_store_output(thread, float4(result.color, result.coverage));
+    if ((preview || mode == kModePass) && (flags & kFramePrimaryHits) != 0u)
+        gpu_store_primary_hit(preview ? thread : pixel,
+                              tracer.backend.intersect(pixelCenterRay(camera, x, y, width, height)).surface);
+    if (preview) return;
     gpu_store_rng(pixel, tracer.backend.rng.state);
     if (mode == kModeImage) gpu_accumulate(pixel, result.color, (frame.counts.z & 1u) == 0u);
     else gpu_store_output(pixel, float4(result.color, result.coverage));
