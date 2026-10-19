@@ -12,6 +12,7 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
@@ -21,6 +22,7 @@
 #include <cctype>
 #include <memory>
 #include <sstream>
+#include <string_view>
 #include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
@@ -36,6 +38,7 @@
 #include <csignal>
 #include <fcntl.h>
 #include <sys/file.h>
+#include <sys/resource.h>
 #include <unistd.h>
 #endif
 
@@ -95,6 +98,27 @@ std::filesystem::path cacheRoot()
 size_t memoryBudgetMB()
 {
     return static_cast<size_t>(prism::ResourceLimit("PRISM_TEXTURE_CACHE_MB", 512, 65536));
+}
+
+// Files the TextureSystem keeps open. OIIO's default of 100 makes a scene
+// with thousands of textures close and reopen files on nearly every lookup,
+// and each reopen is serialized inside OIIO. The limit stays well inside the
+// process's file limit: OIIO reads through C stdio, which on Windows allows
+// 512 streams unless raised.
+int openFileLimit()
+{
+    int available = 0;
+#ifdef _WIN32
+    available = std::max(_getmaxstdio(), _setmaxstdio(8192));
+#else
+    rlimit limit{};
+    if (getrlimit(RLIMIT_NOFILE, &limit) == 0)
+        available = limit.rlim_cur == RLIM_INFINITY ? 8192
+            : static_cast<int>(std::min<rlim_t>(limit.rlim_cur, 8192));
+#endif
+    const int fallback = std::clamp(available - 512, 100, 7680);
+    return static_cast<int>(prism::ResourceLimit("PRISM_TEXTURE_OPEN_FILES",
+        static_cast<uint64_t>(fallback), 8192));
 }
 
 uint64_t processId()
@@ -229,6 +253,20 @@ OIIO::TextureOpt::Wrap wrap(TextureWrap value)
     }
 }
 
+// Prepared textures are tiled, mipmapped OpenEXR files. They used to be named
+// .tx, which OIIO reads with its TIFF plugin first and then by trying every
+// other format: an expensive, serialized probe on each reopen. The .exr suffix
+// selects the OpenEXR reader directly; legacy .tx entries are still trimmed.
+constexpr char kPreparedSuffix[] = ".tx.exr";
+
+bool isPreparedFile(std::filesystem::path const &path)
+{
+    const std::string name = path.filename().string();
+    const std::string_view suffix(kPreparedSuffix);
+    return path.extension() == ".tx" ||
+        (name.size() > suffix.size() && name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0);
+}
+
 // Returns the bytes of prepared textures left in the cache.
 uintmax_t trimDiskCache(std::filesystem::path const &root, double maxGB,
                         std::unordered_map<std::string, bool> const &pinned,
@@ -241,7 +279,7 @@ uintmax_t trimDiskCache(std::filesystem::path const &root, double maxGB,
     std::error_code ec;
     for (auto const &item : std::filesystem::directory_iterator(root, ec)) {
         if (ec) break;
-        if (!item.is_regular_file(ec) || item.path().extension() != ".tx") continue;
+        if (!item.is_regular_file(ec) || !isPreparedFile(item.path())) continue;
         const auto size = item.file_size(ec);
         if (ec) { ec.clear(); continue; }
         total += size;
@@ -269,7 +307,10 @@ uintmax_t trimDiskCache(std::filesystem::path const &root, double maxGB,
             else if (errno == ESRCH) active = false;
 #endif
         } catch (...) { active = false; }
-        if (active) processPinned.emplace(filename.substr(0, marker) + ".tx", true);
+        if (active) {
+            processPinned.emplace(filename.substr(0, marker) + kPreparedSuffix, true);
+            processPinned.emplace(filename.substr(0, marker) + ".tx", true);
+        }
         else std::filesystem::remove(item.path(), ec);
         ec.clear();
     }
@@ -409,6 +450,7 @@ TextureService::TextureService() : m_impl(std::make_unique<Impl>())
     if (!m_impl->system) throw std::runtime_error("cannot create OIIO TextureSystem");
     if (!m_impl->system->attribute("max_memory_MB", static_cast<int>(memoryBudgetMB())))
         throw std::runtime_error("cannot configure OIIO texture cache budget");
+    m_impl->system->attribute("max_open_files", openFileLimit());
 }
 TextureService::~TextureService() = default;
 
@@ -568,7 +610,7 @@ bool TextureService::invalidate(std::filesystem::path const &source,
     std::error_code ec;
     bool allRemoved = true;
     for (const std::string &key : keys) {
-        const auto tx = root / (key + ".tx");
+        const auto tx = root / (key + kPreparedSuffix);
         bool pinned = false;
         for (auto const &item : std::filesystem::directory_iterator(root, ec)) {
             if (ec) break;
@@ -796,7 +838,7 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
     std::filesystem::create_directories(root);
     auto lockWaitStart = std::chrono::steady_clock::now();
     CrossProcessCacheLock processLock(root, key);
-    const auto tx = root / (key + ".tx");
+    const auto tx = root / (key + kPreparedSuffix);
     auto publicationLock = std::make_unique<CrossProcessCacheLock>(root);
     m_impl->lockWaitNanoseconds.fetch_add(elapsedNanoseconds(lockWaitStart),
                                           std::memory_order_relaxed);
@@ -977,7 +1019,7 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
         stageStart = std::chrono::steady_clock::now();
         static std::atomic<uint64_t> serial{0};
         const auto temp = root / (key + "." + std::to_string(processId()) + "." +
-                                  std::to_string(++serial) + ".tmp.tx");
+                                  std::to_string(++serial) + ".tmp.exr");
         OIIO::ImageSpec config;
         config.format = OIIO::TypeDesc::FLOAT;
         config.tile_width = config.tile_height = 64;
