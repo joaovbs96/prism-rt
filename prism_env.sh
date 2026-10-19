@@ -69,6 +69,9 @@ if [ -f "$_prism_installed/resources/plugInfo.json" ]; then
         "$_prism_installed/usdview_plugins/prismUsdview"
     _prism_prepend PYTHONPATH "$_prism_installed/usdview_plugins"
     _prism_prepend "$_prism_libvar" "$_prism_installed/plugin"
+elif [ -f "$_prism_root/tools/usdview_plugins/prismUsdview/plugInfo.json" ]; then
+    # usdview discovers the extension through its plugInfo.json, not PYTHONPATH.
+    _prism_prepend PXR_PLUGINPATH_NAME "$_prism_root/tools/usdview_plugins/prismUsdview"
 fi
 
 if [ -n "${PRISM_MATERIALX_LIBRARY_PATH:-}" ] && [ -z "${PRISM_MATERIALX_MDL:-}" ]; then
