@@ -74,5 +74,6 @@ Their license files are in the licenses folder where the projects ship them.
   - PyOpenGL (BSD), NumPy (BSD)
   - DirectX Shader Compiler (Microsoft), University of Illinois/NCSA license,
     used at run time to compile the GPU kernel
+  - Khronos Vulkan loader (vulkan-1.dll, LunarG Vulkan SDK), Apache 2.0
   - Microsoft Visual C++ runtime, redistributable under the Visual Studio
     license terms
