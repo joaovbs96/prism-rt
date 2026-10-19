@@ -1,6 +1,10 @@
 #include "../../src/hydra/environment_cache.h"
+#include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <iostream>
 #include <stdexcept>
+#include <thread>
 
 namespace {
 void require(bool value,const char* reason) {
@@ -84,6 +88,35 @@ int main() {
         auto unpublishedLocal=cache.Get(unpublished,multiplier);
         unpublished.reset();
         require(!sourceIdentity.expired(),"Unprepared image key identity can be recycled");
+        {
+            // Hydra statistics read the cache on the host's UI thread while a
+            // render job builds a sky's tables; the reads must not wait for it.
+            std::vector<unsigned char> sky(size_t(4096)*2048*3);
+            for(size_t i=0;i<sky.size();++i) sky[i]=static_cast<unsigned char>((i*131)%251);
+            auto large=std::make_shared<ImageTexture<Color3>>(&sky,4096,2048,3);
+            prism::hydra::EnvironmentCache busy;
+            std::atomic<bool> done{false};
+            double buildMs=0;
+            std::thread builder([&] {
+                const auto start=std::chrono::steady_clock::now();
+                (void)busy.Get(large,multiplier);
+                buildMs=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
+                done=true;
+            });
+            double worstMs=0;
+            while(!done) {
+                const auto start=std::chrono::steady_clock::now();
+                (void)busy.BuildCount(); (void)busy.LiveImportanceBytes();
+                worstMs=std::max(worstMs,std::chrono::duration<double,std::milli>(
+                    std::chrono::steady_clock::now()-start).count());
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            builder.join();
+            std::cout << "Large sky build " << buildMs << " ms; slowest concurrent statistics read "
+                      << worstMs << " ms\n";
+            require(busy.BuildCount()==1,"Large sky not cached");
+            require(buildMs<100 || worstMs<buildMs/4,"Statistics reads waited for a distribution build");
+        }
         std::cout << "One distribution build for five resource/transform reuses; exact RGB/PDF/RNG parity\n";
         return 0;
     } catch(std::exception const& error) { std::cerr << error.what() << '\n'; return 1; }
