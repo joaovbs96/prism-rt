@@ -2,6 +2,7 @@
 
 #include <mi/neuraylib/iimage.h>
 #include <mi/neuraylib/itexture.h>
+#include <tbb/parallel_for.h>
 
 #include <algorithm>
 #include <cmath>
@@ -348,24 +349,43 @@ bool NativeTextureRuntime::prepareImage(const mi::neuraylib::ITexture* texture,
     if (image->is_animated()) return unsupported("animated texture");
     entry.tiled = image->is_uvtile();
     const mi::Size count = image->get_frame_length(0);
-    try {
-        for (mi::Size tile = 0; tile < count; ++tile) {
-            int u = 0, v = 0;
-            if (image->get_uvtile_uv(0, tile, u, v) != 0)
-                return unsupported("invalid UDIM tile coordinates");
-            const char* filename = image->get_filename(0, tile);
-            if (!filename || !*filename)
-                return unsupported("texture without filesystem backing");
-            prism::TexturePrepareOptions options;
-            options.gamma = texture->get_effective_gamma(0, tile);
-            options.unassociateAlpha = true;
-            auto prepared = service->prepare(filename, options);
-            if (!prepared)
-                return unsupported("texture preparation failed: " + std::string(filename));
-            entry.tiles.emplace(std::pair{u, v}, std::move(prepared));
+    struct Tile {
+        int u = 0, v = 0;
+        std::string filename;
+        prism::TexturePrepareOptions options;
+        std::shared_ptr<const prism::TextureResource> prepared;
+        std::string error;
+    };
+    std::vector<Tile> tiles(count);
+    for (mi::Size tile = 0; tile < count; ++tile) {
+        Tile& t = tiles[tile];
+        if (image->get_uvtile_uv(0, tile, t.u, t.v) != 0)
+            return unsupported("invalid UDIM tile coordinates");
+        const char* filename = image->get_filename(0, tile);
+        if (!filename || !*filename)
+            return unsupported("texture without filesystem backing");
+        t.filename = filename;
+        t.options.gamma = texture->get_effective_gamma(0, tile);
+        t.options.unassociateAlpha = true;
+    }
+    // UDIM tiles are independent images; preparing them one after another
+    // made a family's cold preparation the longest step of a scene load.
+    // The service bounds how many cold preparations run at once.
+    auto prepareTile = [&](Tile& t) {
+        try {
+            t.prepared = service->prepare(t.filename, t.options);
+            if (!t.prepared) t.error = "texture preparation failed: " + t.filename;
+        } catch (const std::exception& error) {
+            t.error = error.what();
         }
-    } catch (const std::exception& error) {
-        return unsupported(error.what());
+    };
+    if (tiles.size() > 1)
+        tbb::parallel_for(size_t(0), tiles.size(), [&](size_t i) { prepareTile(tiles[i]); });
+    else if (!tiles.empty())
+        prepareTile(tiles.front());
+    for (Tile& t : tiles) {
+        if (!t.error.empty()) return unsupported(t.error);
+        entry.tiles.emplace(std::pair{t.u, t.v}, std::move(t.prepared));
     }
     if (entry.tiles.empty()) return unsupported("texture has no image tiles");
     return true;
