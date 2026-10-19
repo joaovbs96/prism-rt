@@ -61,6 +61,7 @@
 
 #include <tbb/blocked_range2d.h>
 #include <tbb/parallel_for.h>
+#include <tbb/task_group.h>
 #include <tbb/task_arena.h>
 
 #include <algorithm>
@@ -618,6 +619,9 @@ struct Snapshot {
     uint64_t prototypeBuildCount = 0;
     uint64_t prototypeConversions = 0;
     uint64_t prototypeConversionCacheHits = 0;
+    // Meshes converted alongside material preparation and converted again
+    // because a material turned out to displace (see _PrepareMeshes).
+    uint64_t speculativeMeshRetries = 0;
     double meshConversionSeconds = 0.0;
     double embreeGeometryCommitSeconds = 0.0;
     double embreeSceneCommitSeconds = 0.0;
@@ -1428,7 +1432,7 @@ void _Displace(Mesh &mesh, Material const &material, bool flip)
 // conversion would use (index = level); a single entry, its own face count,
 // for meshes that do not refine. Reads only the topology.
 std::vector<size_t> _RefinementFaces(HdContainerDataSourceHandle const &dataSource,
-                                     Material const *displacer)
+                                     bool displaced)
 {
     HdMeshSchema meshSchema = HdMeshSchema::GetFromParent(dataSource);
     HdMeshTopologySchema topology = meshSchema.GetTopology();
@@ -1441,7 +1445,6 @@ std::vector<size_t> _RefinementFaces(HdContainerDataSourceHandle const &dataSour
         TfToken const value = authored->GetTypedValue(0.0f);
         if (!value.IsEmpty()) scheme = value;
     }
-    const bool displaced = displacer && displacer->hasDisplacement();
     if (displaced && scheme == TfToken("none")) scheme = TfToken("bilinear");
     if (scheme == TfToken("none")) return faces;
     _SubdivisionSettings const &subdivision = _Subdivision();
@@ -3330,14 +3333,31 @@ void _CollectMeshes(HdSceneIndexBaseRefPtr const &scene, SdfPath const &path,
                        candidates, snapshot);
 }
 
+// Whether the material bound to a mesh can displace it: only a network with a
+// connected displacement terminal can. Reads the network, compiles nothing.
+bool _MaterialMayDisplace(HdSceneIndexBaseRefPtr const &scene,
+                          HdContainerDataSourceHandle const &ds)
+{
+    const SdfPath materialPath = _MaterialPath(ds);
+    if (materialPath.IsEmpty()) return false;
+    return MaterialService::MayDisplace(scene->GetPrim(materialPath).dataSource);
+}
+
 // Conversion and Embree prototype builds are independent per prim, so they
 // run on TBB workers. Sharing is resolved serially in traversal order, which
 // keeps storage choice, prim ids and statistics identical to a serial walk.
+//
+// With awaitMaterials, the batch's materials are still being prepared: when
+// no mesh's material can displace, meshes convert meanwhile, and the
+// displacers resolved afterwards must confirm that none displaces (otherwise
+// the speculative work is discarded and the meshes convert again). It
+// returns false when the build was cancelled.
 MeshPreparation _PrepareMeshes(HdSceneIndexBaseRefPtr const &scene,
                                MaterialService *materials,
                                Snapshot *snapshot,
                                TfTokenVector const &renderTags,
-                               std::function<bool()> const &cancelled)
+                               std::function<bool()> const &cancelled,
+                               std::function<bool()> const &awaitMaterials = {})
 {
     MeshPreparation preparation;
     std::vector<std::pair<SdfPath, HdContainerDataSourceHandle>> candidates;
@@ -3345,52 +3365,137 @@ MeshPreparation _PrepareMeshes(HdSceneIndexBaseRefPtr const &scene,
                    &preparation, &candidates, snapshot);
     if (cancelled && cancelled()) return preparation;
 
+    // Meshes whose material may displace wait for the materials; the others
+    // convert meanwhile, against a refinement budget planned with those
+    // displacing. Resolving the materials afterwards must reproduce that plan
+    // for every converted mesh, or the meshes convert again.
+    std::vector<uint8_t> deferred(candidates.size(), 0);
+    bool speculative = bool(awaitMaterials);
+    if (speculative) {
+        size_t count = 0;
+        for (size_t i = 0; i < candidates.size(); ++i)
+            count += deferred[i] = _MaterialMayDisplace(scene, candidates[i].second);
+        speculative = count < candidates.size();
+        if (!speculative) std::fill(deferred.begin(), deferred.end(), 0);
+    }
+    if (awaitMaterials && !speculative && !awaitMaterials()) return preparation;
+
     PrototypePool &pool = *snapshot->prototypePool;
     // Displacing materials, resolved before the parallel conversion.
     std::vector<Material const *> displacers(candidates.size(), nullptr);
-    for (size_t i = 0; i < candidates.size(); ++i)
+    for (size_t i = 0; !speculative && i < candidates.size(); ++i)
         displacers[i] = _DisplacingMaterial(scene, candidates[i].second, materials, snapshot);
     uint64_t build = 0;
+    // Prototypes converted earlier with the same material are reused.
+    auto lookUp = [&](size_t i) {
+        auto const entry = pool.conversions.find(candidates[i].second.get());
+        std::shared_ptr<PrototypeStorage> storage =
+            entry != pool.conversions.end() && entry->second.displacer == displacers[i]
+                ? entry->second.storage.lock() : nullptr;
+        if (!storage) return false;
+        entry->second.lastBuild = build;
+        preparation.meshes[candidates[i].first] =
+            {entry->second.info, std::move(storage), false};
+        return true;
+    };
     std::vector<size_t> misses;
     {
         std::lock_guard lock(pool.mutex);
         build = ++pool.conversionBuilds;
-        for (size_t i = 0; i < candidates.size(); ++i) {
-            auto const entry = pool.conversions.find(candidates[i].second.get());
-            std::shared_ptr<PrototypeStorage> storage =
-                entry != pool.conversions.end() && entry->second.displacer == displacers[i]
-                    ? entry->second.storage.lock() : nullptr;
-            if (!storage) {
-                misses.push_back(i);
-                continue;
-            }
-            entry->second.lastBuild = build;
-            preparation.meshes[candidates[i].first] =
-                {entry->second.info, std::move(storage), false};
-        }
+        for (size_t i = 0; i < candidates.size(); ++i)
+            if (!deferred[i] && !lookUp(i)) misses.push_back(i);
     }
-    snapshot->prototypeConversions = misses.size();
-    snapshot->prototypeConversionCacheHits = candidates.size() - misses.size();
 
     // Refinement budget over every prototype of the build. Cache hits keep
     // the level they were converted at.
     std::vector<std::vector<size_t>> refinementFaces(candidates.size());
     std::vector<bool> fixedLevel(candidates.size(), true);
     for (size_t const i : misses) fixedLevel[i] = false;
-    tbb::parallel_for(size_t(0), candidates.size(), [&](size_t i) {
-        if (cancelled && cancelled()) return;
-        refinementFaces[i] = _RefinementFaces(candidates[i].second, displacers[i]);
+    for (size_t i = 0; i < candidates.size(); ++i) if (deferred[i]) fixedLevel[i] = false;
+    auto refine = [&](size_t i) {
+        refinementFaces[i] = _RefinementFaces(candidates[i].second, deferred[i] && speculative
+            ? true : displacers[i] && displacers[i]->hasDisplacement());
         if (fixedLevel[i]) {
             auto const found = preparation.meshes.find(candidates[i].first);
             const size_t level = found != preparation.meshes.end()
                 ? size_t(std::max(0, found->second.info.subdivisionLevel)) : 0;
             if (refinementFaces[i].size() > level + 1) refinementFaces[i].resize(level + 1);
         }
+    };
+    tbb::parallel_for(size_t(0), candidates.size(), [&](size_t i) {
+        if (cancelled && cancelled()) return;
+        refine(i);
     });
     if (cancelled && cancelled()) return preparation;
     size_t requestedFaces = 0, plannedFaces = 0;
-    const std::vector<int> levelCaps = _BudgetSubdivisionLevels(refinementFaces, fixedLevel,
+    std::vector<int> levelCaps = _BudgetSubdivisionLevels(refinementFaces, fixedLevel,
         _Subdivision().budgetFaces, &plannedFaces, &requestedFaces);
+
+    std::vector<MeshConversion> conversions(misses.size());
+    auto convert = [&](std::vector<size_t> const &indices, std::vector<MeshConversion> &out) {
+        const auto conversionStart = std::chrono::steady_clock::now();
+        tbb::parallel_for(size_t(0), indices.size(), [&](size_t i) {
+            if (cancelled && cancelled()) return;
+            out[i] = _ConvertMesh(candidates[indices[i]].second, displacers[indices[i]],
+                                  levelCaps[indices[i]]);
+        });
+        // Wall time of the parallel phase, covering the whole pure conversion
+        // including tangents, vertex de-duplication and hashing.
+        snapshot->meshConversionSeconds += std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - conversionStart).count();
+    };
+    convert(misses, conversions);
+    if (cancelled && cancelled()) return preparation;
+
+    if (speculative) {
+        if (!awaitMaterials()) return preparation;
+        for (size_t i = 0; i < candidates.size(); ++i)
+            displacers[i] = _DisplacingMaterial(scene, candidates[i].second, materials, snapshot);
+        bool confirmed = true;
+        for (size_t i = 0; i < candidates.size(); ++i)
+            confirmed &= deferred[i] || !displacers[i];
+        std::vector<size_t> later;
+        if (confirmed) {
+            std::lock_guard lock(pool.mutex);
+            for (size_t i = 0; i < candidates.size(); ++i)
+                if (deferred[i] && lookUp(i)) fixedLevel[i] = true;
+                else if (deferred[i]) later.push_back(i);
+        }
+        if (confirmed) {
+            speculative = false;
+            for (size_t i = 0; i < candidates.size(); ++i) if (deferred[i]) refine(i);
+            const std::vector<int> planned = levelCaps;
+            levelCaps = _BudgetSubdivisionLevels(refinementFaces, fixedLevel,
+                _Subdivision().budgetFaces, &plannedFaces, &requestedFaces);
+            for (size_t const i : misses) confirmed &= levelCaps[i] == planned[i];
+        }
+        if (!confirmed) {
+            // Nothing of this batch has entered the pool yet.
+            ++snapshot->speculativeMeshRetries;
+            return _PrepareMeshes(scene, materials, snapshot, renderTags, cancelled);
+        }
+        std::vector<MeshConversion> laterConversions(later.size());
+        convert(later, laterConversions);
+        if (cancelled && cancelled()) return preparation;
+        // Back into candidate order, as the walk below expects.
+        std::vector<size_t> merged;
+        std::vector<MeshConversion> mergedConversions;
+        merged.reserve(misses.size() + later.size());
+        mergedConversions.reserve(misses.size() + later.size());
+        for (size_t a = 0, b = 0; a < misses.size() || b < later.size();) {
+            if (b >= later.size() || (a < misses.size() && misses[a] < later[b])) {
+                merged.push_back(misses[a]);
+                mergedConversions.push_back(std::move(conversions[a++]));
+            } else {
+                merged.push_back(later[b]);
+                mergedConversions.push_back(std::move(laterConversions[b++]));
+            }
+        }
+        misses = std::move(merged);
+        conversions = std::move(mergedConversions);
+    }
+    snapshot->prototypeConversions = misses.size();
+    snapshot->prototypeConversionCacheHits = candidates.size() - misses.size();
     if (plannedFaces < requestedFaces) {
         static std::once_flag warned;
         std::call_once(warned, [&] {
@@ -3399,19 +3504,6 @@ MeshPreparation _PrepareMeshes(HdSceneIndexBaseRefPtr const &scene,
                     requestedFaces, _Subdivision().budgetFaces, plannedFaces);
         });
     }
-
-    std::vector<MeshConversion> conversions(misses.size());
-    const auto conversionStart = std::chrono::steady_clock::now();
-    tbb::parallel_for(size_t(0), misses.size(), [&](size_t i) {
-        if (cancelled && cancelled()) return;
-        conversions[i] = _ConvertMesh(candidates[misses[i]].second, displacers[misses[i]],
-                                      levelCaps[misses[i]]);
-    });
-    // Wall time of the parallel phase, covering the whole pure conversion
-    // including tangents, vertex de-duplication and hashing.
-    snapshot->meshConversionSeconds += std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - conversionStart).count();
-    if (cancelled && cancelled()) return preparation;
 
     // Identical geometry shares one storage, first within this batch (cache
     // hits included), then with the pool. Storage built by this batch keeps
@@ -3472,7 +3564,6 @@ MeshPreparation _PrepareMeshes(HdSceneIndexBaseRefPtr const &scene,
     snapshot->embreeGeometryCommitSeconds += std::chrono::duration<double>(
         std::chrono::steady_clock::now() - commitStart).count();
     if (cancelled && cancelled()) return preparation;
-
     std::lock_guard lock(pool.mutex);
     for (auto const &[storage, conversion] : builds)
         pool.buckets[conversion->info.geometryHash].push_back(storage);
@@ -3695,25 +3786,54 @@ std::shared_ptr<Snapshot> _BuildSnapshot(HdSceneIndexBaseRefPtr const &scene,
         blackEnvironment.get());
     result->environmentTexture = std::move(blackEnvironment);
     result->scene->environment = result->environment.get();
-    if (materials) {
-        prism::load_profile::Scope profile("snapshot.materials");
-        std::unordered_set<SdfPath, SdfPath::Hash> seen;
-        std::vector<MaterialService::Request> requests;
-        _CollectMaterialRequests(scene, SdfPath::AbsoluteRootPath(),
-                                 &seen, &requests, renderTags, cancelled);
-        materials->Prefetch(requests, cancelled);
-    }
-    if (cancelled && cancelled()) return {};
+    // Materials are prepared on this thread while a TBB task prepares the
+    // meshes, which wait for the materials only where one may displace them.
+    std::promise<void> materialsPrepared;
+    std::shared_future<void> materialsReady = materialsPrepared.get_future().share();
+    std::exception_ptr materialError;
+    tbb::task_group meshJob;
+    struct JoinMeshJob {
+        tbb::task_group &job;
+        ~JoinMeshJob() { try { job.wait(); } catch (...) {} }
+    } joinMeshJob{meshJob};
+    MeshPreparation preparation;
     const auto traversalStart = std::chrono::steady_clock::now();
-    std::optional<prism::load_profile::Scope> meshProfile(std::in_place, "snapshot.meshes");
-    MeshPreparation preparation = _PrepareMeshes(
-        scene, materials, result.get(), renderTags, cancelled);
-    if (prism::load_profile::Enabled())
-        meshProfile->detail("conversions=" + std::to_string(result->prototypeConversions) +
-            " cached=" + std::to_string(result->prototypeConversionCacheHits) +
-            " convert_s=" + std::to_string(result->meshConversionSeconds) +
-            " embree_prototypes_s=" + std::to_string(result->embreeGeometryCommitSeconds));
-    meshProfile.reset();
+    auto prepareMeshes = [&, resolverContext = ArGetResolver().GetCurrentContext()] {
+        ArResolverContextBinder binder(resolverContext);
+        prism::load_profile::Scope meshProfile("snapshot.meshes");
+        std::function<bool()> awaitMaterials;
+        if (materials) awaitMaterials = [&] {
+            materialsReady.wait();
+            return !materialError && !(cancelled && cancelled());
+        };
+        preparation = _PrepareMeshes(scene, materials, result.get(), renderTags,
+                                     cancelled, awaitMaterials);
+        if (prism::load_profile::Enabled())
+            meshProfile.detail("conversions=" + std::to_string(result->prototypeConversions) +
+                " cached=" + std::to_string(result->prototypeConversionCacheHits) +
+                " retries=" + std::to_string(result->speculativeMeshRetries) +
+                " convert_s=" + std::to_string(result->meshConversionSeconds) +
+                " embree_prototypes_s=" + std::to_string(result->embreeGeometryCommitSeconds));
+    };
+    if (materials) {
+        meshJob.run(prepareMeshes);
+        try {
+            prism::load_profile::Scope profile("snapshot.materials");
+            std::unordered_set<SdfPath, SdfPath::Hash> seen;
+            std::vector<MaterialService::Request> requests;
+            _CollectMaterialRequests(scene, SdfPath::AbsoluteRootPath(),
+                                     &seen, &requests, renderTags, cancelled);
+            materials->Prefetch(requests, cancelled);
+        } catch (...) {
+            materialError = std::current_exception();
+        }
+        materialsPrepared.set_value();
+        meshJob.wait();
+        if (materialError) std::rethrow_exception(materialError);
+    } else {
+        materialsPrepared.set_value();
+        prepareMeshes();
+    }
     if (cancelled && cancelled()) return {};
     std::optional<prism::load_profile::Scope> walkProfile(std::in_place, "snapshot.walk");
     _Walk(scene, SdfPath::AbsoluteRootPath(), materials, result.get(),
@@ -7424,6 +7544,8 @@ VtDictionary SceneBridge::GetStats() const
         _impl->snapshot ? _impl->snapshot->prototypeConversions : 0));
     result["prototypeConversionCacheHits"] = VtValue(static_cast<int64_t>(
         _impl->snapshot ? _impl->snapshot->prototypeConversionCacheHits : 0));
+    result["speculativeMeshRetries"] = VtValue(static_cast<int64_t>(
+        _impl->snapshot ? _impl->snapshot->speculativeMeshRetries : 0));
     result["meshConversionSeconds"] = VtValue(
         _impl->snapshot ? _impl->snapshot->meshConversionSeconds : 0.0);
     result["embreeGeometryCommitSeconds"] = VtValue(

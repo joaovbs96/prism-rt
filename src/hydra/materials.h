@@ -105,8 +105,13 @@ public:
     // Blocks until the pre-warm of this service's key, if any, has finished.
     void WaitForPrewarm();
 
+    // Whether a material prim can displace geometry: only a network with a
+    // connected displacement terminal can. Reads the network; compiles nothing.
+    static bool MayDisplace(const pxr::HdContainerDataSourceHandle& materialPrimDataSource);
+
     // Captures a batch on the calling Hydra sync thread, then resolves it with
-    // a bounded worker pool. Do not call this from multiple sync threads.
+    // a bounded worker pool, converting on the workers. Do not call this from
+    // multiple sync threads.
     void Prefetch(const std::vector<Request>& requests,
                   const std::function<bool()>& cancelled = {});
     // Partitions process-wide records by the caller's resource generation.

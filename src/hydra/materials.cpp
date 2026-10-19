@@ -22,6 +22,7 @@
 #include <pxr/imaging/hd/materialSchema.h>
 #include <pxr/imaging/hd/materialNetworkInterface.h>
 #include <pxr/imaging/hd/materialNetworkSchema.h>
+#include <pxr/imaging/hd/materialConnectionSchema.h>
 #include <pxr/imaging/hd/materialNodeSchema.h>
 #include <pxr/imaging/hd/materialNodeParameterSchema.h>
 #include <pxr/imaging/hdMtlx/hdMtlx.h>
@@ -1730,6 +1731,19 @@ void MaterialService::Prewarm()
         }
     }
     impl.prewarm = entry;
+}
+
+bool MaterialService::MayDisplace(const HdContainerDataSourceHandle& materialPrimDataSource)
+{
+    HdMaterialSchema material = HdMaterialSchema::GetFromParent(materialPrimDataSource);
+    if (!material) return false;
+    for (const TfToken& context : material.GetRenderContexts()) {
+        HdMaterialNetworkSchema network = material.GetMaterialNetwork(context);
+        if (!network) continue;
+        HdMaterialConnectionSchema terminal = network.GetTerminals().Get(TfToken("displacement"));
+        if (terminal) return true;
+    }
+    return false;
 }
 
 void MaterialService::WaitForPrewarm()
