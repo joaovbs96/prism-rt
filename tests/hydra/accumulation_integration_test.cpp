@@ -94,6 +94,29 @@ void RequireUsefulColor(std::vector<float> const &pixels)
     Require(hasRadiance, "Accumulation fixture produced no nonzero color samples");
 }
 
+// Standard Hydra progress keys read by hosts such as usdview.
+void RequireProgressStats(VtDictionary const &stats, int completed, int target,
+                          bool converged)
+{
+    auto const num = stats.find("numCompletedSamples");
+    auto const tgt = stats.find("targetSamples");
+    auto const pct = stats.find("percentDone");
+    Require(num != stats.end() && num->second.IsHolding<int>() &&
+                tgt != stats.end() && tgt->second.IsHolding<int>() &&
+                pct != stats.end() && pct->second.IsHolding<double>(),
+            "Render stats lack int numCompletedSamples/targetSamples or double percentDone");
+    Require(num->second.UncheckedGet<int>() == completed &&
+                tgt->second.UncheckedGet<int>() == target,
+            "numCompletedSamples/targetSamples do not match the render");
+    const double percent = pct->second.UncheckedGet<double>();
+    if (converged)
+        Require(percent == 100.0, "percentDone is not 100 on convergence");
+    else
+        Require(percent >= 0.0 && percent < 100.0 &&
+                    std::abs(percent - 100.0 * completed / target) < 1e-9,
+                "percentDone does not track completed/target samples");
+}
+
 } // namespace
 
 int RunAccumulationIntegrationTests()
@@ -106,11 +129,16 @@ int RunAccumulationIntegrationTests()
                                           &continued.thread);
         AddScene(continued);
         AddColorBinding(continued, continuedSecond);
+        Prepare(continued, kInitialSize, kInitialSize);
+        RequireProgressStats(continued.bridge->GetStats(), 0, 64, false);
         Render(continued, kInitialSize, kInitialSize, 64);
         auto const first64 = Read<float>(continued.color);
         RequireUsefulColor(first64);
+        RequireProgressStats(continued.bridge->GetStats(), 64, 64, true);
         SetSampleBudget(continued, kContinuedSamples);
         Render(continued, kInitialSize, kInitialSize, kContinuedSamples);
+        RequireProgressStats(continued.bridge->GetStats(), kContinuedSamples,
+                             kContinuedSamples, true);
         auto const continued128 = Read<float>(continued.color);
         RequireCoherentColorFrames(continued, continuedSecond);
         Require(continued128 != first64,

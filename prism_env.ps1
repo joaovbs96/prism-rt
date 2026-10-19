@@ -84,10 +84,15 @@ $pluginRoots = @()
 if (Test-Path -LiteralPath (Join-Path $projectRoot "build\hydra\resources")) {
     $pluginRoots += Join-Path $projectRoot "build\hydra\resources"
 }
+$hasInstalledPlugin = Test-Path -LiteralPath (Join-Path $installedPluginRoot "resources\plugInfo.json")
 if (Test-Path -LiteralPath $sourceUsdviewPlugins) {
     $env:PYTHONPATH = @($sourceUsdviewPlugins, $env:PYTHONPATH) -join ";"
+    # usdview discovers the extension through its plugInfo.json, not PYTHONPATH.
+    if (-not $hasInstalledPlugin) {
+        $pluginRoots += Join-Path $sourceUsdviewPlugins "prismUsdview"
+    }
 }
-if (Test-Path -LiteralPath (Join-Path $installedPluginRoot "resources\plugInfo.json")) {
+if ($hasInstalledPlugin) {
     $pluginRoots += Join-Path $installedPluginRoot "resources"
     $pluginRoots += Join-Path $installedPluginRoot "usdview_plugins\prismUsdview"
     $env:PYTHONPATH = @((Join-Path $installedPluginRoot "usdview_plugins"), $env:PYTHONPATH) -join ";"
