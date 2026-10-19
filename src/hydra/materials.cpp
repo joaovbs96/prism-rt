@@ -8,6 +8,7 @@
 #include "../mdl_material.h"
 #include "../resource_limits.h"
 #include "../load_profile.h"
+#include "../progress.h"
 
 #include <pxr/base/tf/stringUtils.h>
 #include <pxr/base/tf/diagnostic.h>
@@ -740,6 +741,8 @@ public:
             m_profile->detail("items=" + std::to_string(m_work.size()));
         }
         m_running = m_arena.max_concurrency();
+        prism::progress::Begin(prism::Phase::Textures);
+        prism::progress::SetTotal(prism::Phase::Textures, m_work.size());
         m_arena.execute([this] {
             for (int i = 0; i < m_arena.max_concurrency(); ++i)
                 m_group.run([this] {
@@ -750,7 +753,11 @@ public:
     }
     // Preparation jobs must finish before Prefetch returns; the MDL SDK and
     // the texture service may be torn down right after it.
-    ~TexturePrefetch() { m_arena.execute([this] { m_group.wait(); }); }
+    ~TexturePrefetch()
+    {
+        m_arena.execute([this] { m_group.wait(); });
+        prism::progress::End(prism::Phase::Textures);
+    }
     TexturePrefetch(const TexturePrefetch&) = delete;
     TexturePrefetch& operator=(const TexturePrefetch&) = delete;
 
@@ -769,6 +776,7 @@ private:
             if (index >= m_work.size()) return;
             try { m_results[index] = Prepare(m_work[index]); }
             catch (...) {}
+            prism::progress::Add(prism::Phase::Textures);
         }
     }
     Result Prepare(const TextureWork& work)
@@ -1778,6 +1786,8 @@ void MaterialService::Prefetch(const std::vector<Request>& requests,
     prism::load_profile::Scope profile("materials.prefetch");
     profile.detail("requests=" + std::to_string(unique.size()));
     m_impl->jobs += unique.size();
+    prism::progress::Scope progressScope(prism::Phase::Materials);
+    prism::progress::AddTotal(prism::Phase::Materials, unique.size());
     // Capture immutable identities first. Repeated compatible structures need
     // one seed compiled before their variants are prepared, otherwise the old
     // prepare-all ordering would convert every variant before a template could
@@ -1849,6 +1859,8 @@ void MaterialService::Prefetch(const std::vector<Request>& requests,
                              std::vector<uint8_t>* needsFallback,
                              std::vector<std::vector<TemplateValueKey>>* grownKeepSets,
                              const Preparers* preparers = nullptr) {
+        // The main pass is counted up front; seeds and fallbacks add to it.
+        if (!grownKeepSets) prism::progress::AddTotal(prism::Phase::Materials, items.size());
         const unsigned workers = std::min<unsigned>(
             prism::MaterialWorkerCount(), static_cast<unsigned>(items.size()));
         prism::load_profile::Scope poolProfile("materials.compile_pool");
@@ -1892,6 +1904,7 @@ void MaterialService::Prefetch(const std::vector<Request>& requests,
                         TF_WARN("[Hydra Material] Material preparation failed for %s: %s",
                                 items[index].path.GetText(), error.what());
                     }
+                    prism::progress::Add(prism::Phase::Materials);
                     if (results) (*results)[index] = std::move(material);
                     if (needsFallback) (*needsFallback)[index] = fallback ? 1 : 0;
                 }

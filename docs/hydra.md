@@ -193,6 +193,41 @@ and `devicePreparationSeconds`. With `PRISM_GPU_VERBOSE=1`, GPU devices log
 each pass's wall, dispatch, GPU and readback times; per-pass results are read
 back from host-cached memory where the Vulkan driver offers it.
 
+### Progress and the usdview HUD
+
+While a scene cannot render yet (and while an edit is converted), the renderer reports what it is doing through `GetRenderStats()`. The model is `prism::Progress` (`src/progress.h`): one slot per phase with atomic active/done/total counters and start time, plus a few strings (phase detail, device, error) behind the model's own small mutex. It never takes the bridge mutex, and `SceneBridge::GetProgressStats()` returns the keys below without taking any renderer lock (`GetStats()` merges them before it takes the bridge mutex). Instrumented code reports through one-line hooks (`prism::progress::Add(Phase::Materials)` and so on) that ignore the call when no model exists, such as in the standalone renderer; the bridge installs its model as the process's current one. Updates are atomic increments with no per-item allocation. Phases overlap (textures prepare while materials compile; the kernel compile runs inside the GPU upload), so `prismPhase` names the primary one: the latest pipeline stage still running, in the order kernel, upload, materials, textures, loading, device creation, with `rendering` when nothing else runs and `error` over all of them.
+
+| Statistic | Meaning |
+| --- | --- |
+| `prismPhase` (string) | `idle`, `device`, `loading`, `materials`, `textures`, `kernel`, `upload`, `rendering` or `error` |
+| `prismPhaseDetail` (string) | Detail of the primary phase, e.g. `DXC to SPIR-V, 5 MDL programs, 526 KB HLSL`, or `images` while uploading |
+| `prismPhaseSeconds` (double) | Seconds the primary phase has been running |
+| `prismActivePhases` (string) | Comma-separated names of every active phase |
+| `prismMeshesDone` / `prismMeshesTotal` (int) | Mesh prototypes converted in this load (cache hits are not counted) |
+| `prismMaterialsDone` / `prismMaterialsTotal` (int) | Materials compiled; the total grows when template seeds or fallback compiles are added |
+| `prismTexturesDone` / `prismTexturesTotal` (int) | Textures prepared ahead of material compilation |
+| `prismUploadDone` / `prismUploadTotal` (int) | Images prepared for the GPU (zero total outside the image stage; the stage is in `prismPhaseDetail`) |
+| `prismDevice` (string) | `vulkan: <GPU name>`, `cpu`, `cpu-reference`, or `cpu (Vulkan fallback: <reason>)` when the GPU device was unavailable at creation or later could not prepare the scene (`kernel too large`, `kernel compile failed`, ...); empty until the device exists |
+| `prismError` (string) | Last scene-conversion failure; cleared by the next published snapshot |
+
+Counters stay readable after their phase ends and restart when it begins again. Metal reports the device, loading, material and texture phases but not yet the kernel and upload stages.
+
+The usdview extension turns these into HUD lines under usdview's Hydra/Hgi lines (colors: tan like usdview's own text, blue for work in progress, orange for a GPU fallback, green for converged):
+
+| Phase | HUD |
+| --- | --- |
+| any | ` Device: vulkan (RTX 4070 Ti)`, or ` Device: cpu (Vulkan fallback: kernel too large)` in the warning color |
+| `idle` | ` Status: Preparing...` |
+| `loading` | ` Status: Loading scene (meshes 3 / 10)` |
+| `materials` | ` Status: Compiling materials 12 / 35`, plus an indented ` textures 4 / 20` line while those still run |
+| `textures` | ` Status: Preparing textures 4 / 20` |
+| `kernel` | ` Status: Compiling GPU kernel... 42 s` and an indented detail line; the seconds appear from the first second (3 s for other phases) |
+| `upload` | ` Status: Uploading to GPU (images) 5 / 20`, `(buffers)`, `(acceleration structures)` |
+| `rendering` | ` Samples: N / target` and ` State: refining` or `converged` |
+| `error` | ` Status: Error: ...` in the warning color |
+
+The formatting is in the pure functions `device_line`, `phase_lines` and `hud_lines` (unit tests in `tests/hydra/test_usdview_selection_plugin.py`). `tests/hydra/usdview_sample_hud.py` also checks that the device line and, for a slow start, a phase line appear before the first sample. `tests/hydra/usdview_phase_hud.py` (run it with `testusdview --testScript` and a fresh `PRISM_CACHE_DIR` to force cold compiles) saves a screenshot of the viewport the first time each phase shows, plus a timeline of the statistics and overlay text. Forcing a fallback needs only `PRISM_DEVICE=vulkan PRISM_DXC=<nonexistent path>`.
+
 usdview's **default dome** is OpenUSD's Stinson Beach environment, not PrismRT's bundled indoor EXR. It uses intensity 1 and exposure 0. Hydra respects these authored values without the standalone environment's historical extra factor of two. To reproduce standalone lighting, use the same HDR and account for that factor (for example, standalone exposure -0.5 corresponds to a USD dome exposure +0.5 at intensity 1).
 
 The beach HDR contains a small, extremely bright sun. Environment MIS is now the default in both frontends: one importance-sampled environment direction competes with BSDF sampling at supported scattering vertices. The distribution uses exact texel solid angles and a small uniform mixture to cover filtered texture values. Diffuse and MDL materials supply matching BSDF evaluations/PDFs; legacy rough-metal and glTF samplers retain their BSDF-only behavior. The default sample clamp of 10 can still reduce brightness: use zero when measuring energy or variance. "Converged" means the requested sample count was reached, not that a noise threshold was met.

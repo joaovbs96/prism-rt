@@ -89,6 +89,26 @@ Scenes: **Eggs** (MaterialEggs), **OpenPBR** (OpenPBRShaderPlayground),
   - The long-term fix is to stop compiling all materials into one function:
     per-material-program pipelines with wavefront (queued) shading, or
     callable shaders.
+  - Planned order:
+    1. Make the path state explicit: one struct for what a path carries
+       between bounces. Split each bounce into shared step functions
+       (intersect, shade, sample lights, continue). The megakernel and the
+       CPU device keep calling them in a loop, so devices still agree sample
+       for sample.
+    2. On Vulkan, call each material program as a callable shader in a ray
+       tracing pipeline, with shader execution reordering by material where
+       available. Use this only above the kernel-size threshold; the inlined
+       megakernel stays for scenes that fit.
+    3. Profile the large scenes (occupancy, registers, SIMT efficiency).
+    4. Move to wavefront only if callables leave occupancy or divergence
+       limits. That would rearrange the step functions into separate kernels,
+       not rewrite the integrator. It is an architectural change that affects
+       how the CPU and GPU devices share code, so it needs a design decision,
+       not just a feature branch.
+  - Large scenes like ALab also need texture streaming on the GPU: feedback
+    of the needed texture, mip and tile from shading, loaded from the already
+    tiled `.tx.exr` files into a resident tile pool. Whole mip levels first,
+    tiles later. They may also need acceleration-structure compaction.
 - **Denoising** (e.g. Intel Open Image Denoise).
 
 ## Standalone CLI

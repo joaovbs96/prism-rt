@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../device/device.h"
+#include "../progress.h"
 #include "../texture_service.h"
 #include "published_pick_scene.h"
 
@@ -151,6 +152,10 @@ public:
     std::vector<pxr::PrismRenderBuffer *> GetRenderBuffers() const;
     void RemoveRenderBuffer(pxr::HdRenderBuffer *buffer);
     pxr::VtDictionary GetStats() const;
+    // The prism* progress/status keys of GetStats, without taking the bridge
+    // mutex or any other renderer lock.
+    pxr::VtDictionary GetProgressStats() const;
+    prism::Progress::Snapshot GetProgress() const;
 
 private:
     class Impl;

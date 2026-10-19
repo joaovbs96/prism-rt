@@ -29,11 +29,16 @@ def testUsdviewInputFunction(appController):
     def labels():
         return view.findChildren(prismUsdview._SampleLabel)
 
+    seen = []  # every overlay line shown, in order, without repeats
+
     def pump(seconds, until=None):
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
             view.updateGL()
             QtWidgets.QApplication.processEvents()
+            for text in texts():
+                if text not in seen:
+                    seen.append(text)
             if until and until():
                 return True
             time.sleep(0.02)
@@ -50,11 +55,24 @@ def testUsdviewInputFunction(appController):
     # Refining: an unreachable target keeps the renderer busy.
     view.SetRendererSetting("prism:samplesPerPixel", 1000000)
     view.updateView()
+    first_overlay = time.monotonic()
     assert pump(60, lambda: any("/ 1000000" in t for t in texts())), \
         "Refining overlay never appeared: %r" % texts()
+    # The device is named before the first sample, and a slow start (a cold
+    # kernel or material cache) shows a phase line first. Fast starts can
+    # finish between two overlay refreshes, so they are not required to.
+    assert any(t.startswith(" Device: ") for t in seen), seen
+    first_sample = next(i for i, t in enumerate(seen) if "Samples:" in t)
+    phases = [t for t in seen[:first_sample] if t.startswith(" Status: ")]
+    if time.monotonic() - first_overlay > 2.0:
+        assert phases, "No phase line before the first sample: %r" % seen
+    print("Phase lines before the first sample:", phases)
     assert any(t.endswith("refining") for t in texts()), texts()
     label = labels()[0]
-    assert label.geometry().x() == view.width() - 160, label.geometry()
+    # Under usdview's top-right group; wider lines (the device name) extend it
+    # to the left so they stay on screen.
+    assert label.geometry().x() <= view.width() - 160, label.geometry()
+    assert label.geometry().right() < view.width(), label.geometry()
     assert label.geometry().y() > 14 + 15, label.geometry()
     shot("hud-refining.png")
 
@@ -76,7 +94,9 @@ def testUsdviewInputFunction(appController):
 
     # Resizing keeps the overlay on the right edge.
     view.SetPhysicalWindowSize(640, 384)
-    assert pump(5, lambda: label.geometry().x() == view.width() - 160), \
+    assert pump(5, lambda: label.geometry().x() <= view.width() - 160 and
+                label.geometry().right() < view.width() and
+                label.geometry().right() > view.width() - 160), \
         "Overlay did not follow the resize: %r" % label.geometry()
 
     # A different renderer owns the viewport: no PrismRT overlay.

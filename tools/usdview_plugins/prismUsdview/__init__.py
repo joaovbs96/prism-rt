@@ -9,8 +9,12 @@ indices to PrismRT.
 
 Sample HUD: while a viewport uses PrismRT, a transparent, mouse-transparent
 overlay in the HUD's top-right group (under usdview's Hydra/Hgi/AOV lines)
-shows the completed and target sample counts and whether the image is still
-refining or has converged (including adaptive early convergence). usdview stops
+shows the active render device (a GPU fallback in a warning colour), what the
+renderer is doing while it cannot render yet (loading, compiling materials or
+the GPU kernel, preparing textures, uploading; from the `prism*` render
+statistics), and then the completed and target sample counts and whether the
+image is still refining or has converged (including adaptive early
+convergence). usdview stops
 repainting once the renderer converges, so the overlay runs on its own timer.
 It follows the HUD toggle and hides while the renderer is paused or stopped.
 """
@@ -99,7 +103,129 @@ _HUD_TOP = 14
 _HUD_LINE = 15
 _HUD_COLOR = (.733, .604, .333)
 _CONVERGED_COLOR = (.45, .78, .42)
+_BUSY_COLOR = (.45, .72, .95)     # work in progress before the first sample
+_WARNING_COLOR = (1.0, .42, .2)    # GPU fallback, errors
 _STATS_INTERVAL = 0.1  # seconds; GetRenderStats is called at most 10x/s
+
+_KIND_COLORS = {"normal": _HUD_COLOR, "converged": _CONVERGED_COLOR,
+                "busy": _BUSY_COLOR, "warning": _WARNING_COLOR}
+
+# Phase names of the `prismPhase` statistic -> (HUD wording, counter key).
+_PHASE_TEXT = {
+    "device": ("Creating render device", None),
+    "loading": ("Loading scene", "Meshes"),
+    "materials": ("Compiling materials", "Materials"),
+    "textures": ("Preparing textures", "Textures"),
+    "kernel": ("Compiling GPU kernel", None),
+    "upload": ("Uploading to GPU", "Upload"),
+}
+_PHASE_ORDER = ("upload", "kernel", "materials", "textures", "loading", "device")
+_COUNTER_LABELS = {"loading": ("Meshes", "meshes"), "materials": ("Materials", "materials"),
+                   "textures": ("Textures", "textures"), "upload": ("Upload", "upload")}
+_VENDOR_PREFIXES = ("NVIDIA GeForce ", "NVIDIA ", "AMD Radeon ", "AMD ", "Intel(R) ")
+
+
+def _count(stats, name):
+    """(done, total) of a prism<Name>Done/Total statistic pair, or None."""
+    done = stats.get("prism%sDone" % name)
+    total = stats.get("prism%sTotal" % name)
+    if done is None or total is None or int(total) <= 0:
+        return None
+    return min(int(done), int(total)), int(total)
+
+
+def device_line(stats):
+    """(text, kind) for the active render device, or None if not reported.
+
+    "vulkan: NVIDIA GeForce RTX 4070 Ti" -> "vulkan (RTX 4070 Ti)". A CPU
+    device that stands in for a GPU one ("cpu (Vulkan fallback: ...)") is a
+    warning.
+    """
+    device = str(stats.get("prismDevice") or "").strip()
+    if not device:
+        return None
+    kind = "normal"
+    if " fallback" in device:
+        kind = "warning"
+    elif ": " in device:
+        name, _, model = device.partition(": ")
+        for prefix in _VENDOR_PREFIXES:
+            if model.startswith(prefix):
+                model = model[len(prefix):]
+                break
+        device = "%s (%s)" % (name, model)
+    return "Device".rjust(7) + ": " + device, kind
+
+
+def phase_lines(stats):
+    """[(text, kind)] describing work in progress, or [] once rendering.
+
+    Reads the `prismPhase*` statistics: a primary line such as "Compiling
+    materials 12 / 35" (with an elapsed-seconds counter for long phases) and,
+    while several phases overlap, one indented counter line per other active
+    phase that still has work left. Statistics without `prismPhase` (older
+    renderers) yield no lines.
+    """
+    phase = stats.get("prismPhase")
+    if phase is None or phase == "rendering":
+        return []
+    if phase == "error":
+        message = str(stats.get("prismError") or "error")
+        return [("Status".rjust(7) + ": Error: " + message, "warning")]
+    detail = str(stats.get("prismPhaseDetail") or "")
+    if phase == "idle":
+        return [("Status".rjust(7) + ": Preparing...", "busy")]
+    wording, counter = _PHASE_TEXT.get(phase, (str(phase), None))
+    text = wording
+    progress = _count(stats, counter) if counter else None
+    if phase == "loading":
+        text = wording + (" (meshes %d / %d)" % progress if progress else "...")
+    elif phase == "upload":
+        text = wording + (" (%s)" % detail if detail else "...")
+        if progress:
+            text += " %d / %d" % progress
+    elif progress:
+        text = "%s %d / %d" % (wording, progress[0], progress[1])
+    else:
+        text = wording + "..."
+    seconds = stats.get("prismPhaseSeconds") or 0.0
+    if seconds >= (1.0 if phase == "kernel" else 3.0):
+        text += " %d s" % int(seconds)
+    lines = [("Status".rjust(7) + ": " + text, "busy")]
+    if phase == "kernel" and detail:
+        lines.append((" " * 9 + detail, "busy"))
+    active = [name for name in str(stats.get("prismActivePhases") or "").split(",")
+              if name]
+    for name in _PHASE_ORDER:
+        if name == phase or name not in active or name not in _COUNTER_LABELS:
+            continue
+        label, key = _COUNTER_LABELS[name]
+        other = _count(stats, label)
+        if other and other[0] < other[1]:
+            lines.append((" " * 9 + "%s %d / %d" % (key, other[0], other[1]), "busy"))
+    return lines
+
+
+def hud_lines(stats, completed, target, converged):
+    """Every HUD line for one refresh as [(text, kind)].
+
+    The device line comes first; then either the phase lines (nothing is
+    rendering yet, or a scene edit is being converted) or the sample count and
+    state.
+    """
+    lines = []
+    device = device_line(stats)
+    if device:
+        lines.append(device)
+    busy = phase_lines(stats)
+    if busy:
+        return lines + busy
+    samples, state = hud_text(completed, target, converged)
+    if samples is not None:
+        lines.append(("Samples".rjust(7) + ": " + samples, "normal"))
+    lines.append(("State".rjust(7) + ": " + state,
+                  "converged" if converged else "normal"))
+    return lines
 
 
 def _enum(owner, group, name):
@@ -206,16 +332,12 @@ class _SampleHud(QtCore.QObject):
         if not self._wanted(view):
             label.hide()
             return
-        completed, target, converged = self._read(view)
+        completed, target, converged, stats = self._read(view)
         if converged is None:
             label.hide()
             return
-        samples, state = hud_text(completed, target, converged)
-        lines = []
-        if samples is not None:
-            lines.append(("Samples".rjust(7) + ": " + samples, _HUD_COLOR))
-        lines.append(("State".rjust(7) + ": " + state,
-                      _CONVERGED_COLOR if converged else _HUD_COLOR))
+        lines = [(text, _KIND_COLORS[kind]) for text, kind in
+                 hud_lines(stats, completed, target, converged)]
         if lines != label.lines():
             label.set_lines(lines)
         self._place(view, label)
@@ -243,7 +365,7 @@ class _SampleHud(QtCore.QObject):
         label.place(view, rows)
 
     def _read(self, view):
-        """(completed, target, converged); converged is None if unknown."""
+        """(completed, target, converged, stats); converged is None if unknown."""
         converged = view.IsRendererConverged()
         now = time.monotonic()
         cached = self._stats_cache.get(view)
@@ -257,7 +379,8 @@ class _SampleHud(QtCore.QObject):
         target = stats.get("targetSamples")
         if converged is None:
             converged = stats.get("converged")
-        return completed, target, None if converged is None else bool(converged)
+        return (completed, target, None if converged is None else bool(converged),
+                stats)
 
     @staticmethod
     def _stats(view):
