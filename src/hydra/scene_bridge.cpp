@@ -17,6 +17,7 @@
 #include "../material.h"
 #include "../materialx/resolved_resource.h"
 #include "../mdl/context.h"
+#include "../progress.h"
 #include "../rng.h"
 #include "../scene.h"
 #include "../texture.h"
@@ -3368,6 +3369,7 @@ MeshPreparation _PrepareMeshes(HdSceneIndexBaseRefPtr const &scene,
                 {entry->second.info, std::move(storage), false};
         }
     }
+    prism::progress::AddTotal(prism::Phase::Loading, misses.size());
     snapshot->prototypeConversions = misses.size();
     snapshot->prototypeConversionCacheHits = candidates.size() - misses.size();
 
@@ -3405,6 +3407,7 @@ MeshPreparation _PrepareMeshes(HdSceneIndexBaseRefPtr const &scene,
         if (cancelled && cancelled()) return;
         conversions[i] = _ConvertMesh(candidates[misses[i]].second, displacers[misses[i]],
                                       levelCaps[misses[i]]);
+        prism::progress::Add(prism::Phase::Loading);
     });
     // Wall time of the parallel phase, covering the whole pure conversion
     // including tangents, vertex de-duplication and hashing.
@@ -4961,6 +4964,42 @@ public:
         return true;
     }
 
+    // Loading is active from the first scene edit until its snapshot is
+    // published (a spare bank job does not count). Call with mutex held.
+    void RefreshLoadingPhaseLocked()
+    {
+        progress.SetActive(prism::Phase::Loading, sceneDirty || captureActive ||
+            (buildFuture.valid() && !buildIsSpare));
+    }
+
+    // Describes a created device for the host; `note` is CreateDevice's
+    // explanation when it fell back to the CPU.
+    static std::string DescribeDevice(prism::device::RenderDevice const &device,
+        prism::device::DevicePreference preference, std::string const &note)
+    {
+        const auto info = device.Info();
+        std::string name = info.name;
+        for (std::string_view suffix : {" (Vulkan)", " (Metal)"})
+            if (name.size() > suffix.size() &&
+                name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0)
+                name.resize(name.size() - suffix.size());
+        if (info.kind == prism::device::DeviceKind::CpuReference) return "cpu-reference";
+        if (info.kind != prism::device::DeviceKind::Cpu)
+            return std::string(prism::device::ToString(info.kind)) + ": " + name;
+        if (note.empty()) return "cpu";
+        // "no GPU device available (vulkan: reason); using the CPU device"
+        std::string reason = note;
+        const auto open = note.find('('), close = note.rfind(");");
+        if (open != std::string::npos && close != std::string::npos && close > open)
+            reason = note.substr(open + 1, close - open - 1);
+        std::string kind = prism::device::ToString(preference);
+        if (reason.compare(0, kind.size() + 2, kind + ": ") == 0) reason.erase(0, kind.size() + 2);
+        if (kind == "auto") kind = "GPU";
+        else if (!kind.empty()) kind[0] = char(std::toupper(static_cast<unsigned char>(kind[0])));
+        if (reason.size() > 60) reason = reason.substr(0, 57) + "...";
+        return "cpu (" + kind + " fallback: " + reason + ")";
+    }
+
     // Returns the render device for the requested preference, creating it
     // on first use or when the preference changed. Render worker only;
     // returns null if a stop was requested before the device was ready.
@@ -4981,9 +5020,11 @@ public:
         }
         if (!deviceCreation.valid()) {
             deviceCreationPreference = preference;
-            deviceCreation = std::async(std::launch::async, [preference] {
+            progress.Begin(prism::Phase::Device);
+            deviceCreation = std::async(std::launch::async, [preference, this] {
                 CreatedDevice created;
                 created.device = prism::device::CreateDevice(preference, &created.note);
+                progress.End(prism::Phase::Device);
                 return created;
             });
         }
@@ -5001,6 +5042,7 @@ public:
             prism::device::DevicePreference::Cpu, &created.note);
         if (!created.note.empty()) TF_WARN("PrismRT: %s", created.note.c_str());
         const auto info = created.device->Info();
+        progress.SetDevice(DescribeDevice(*created.device, preference, created.note));
         TF_STATUS("PrismRT: rendering on %s device: %s",
             prism::device::ToString(info.kind), info.name.c_str());
         std::lock_guard lock(mutex);
@@ -5155,6 +5197,8 @@ public:
         if (device) rtcReleaseDevice(device);
     }
 
+    // Declared first so it outlives every worker that reports to it.
+    prism::Progress progress;
     HdSceneIndexBaseRefPtr sceneIndex;
     HdRenderThread *renderThread;
     RTCDevice device = nullptr;
@@ -5851,9 +5895,11 @@ bool SceneBridge::Prepare(CameraState const &camera,
             if (completed.needsSpare)
                 _impl->LaunchSpareLocked(completed.generation);
             published = true;
+            _impl->progress.SetError({});
         } else if (!completed.error.empty()) {
             TF_WARN("PrismRT: background snapshot generation failed: %s",
                     completed.error.c_str());
+            _impl->progress.SetError("scene conversion failed: " + completed.error);
         }
     }
 
@@ -5904,6 +5950,7 @@ bool SceneBridge::Prepare(CameraState const &camera,
                 ArGetResolver().GetCurrentContext();
             _impl->capturedPrims = 0;
         }
+        _impl->RefreshLoadingPhaseLocked();
     }
     auto const captureStart = std::chrono::steady_clock::now();
     for (;;) {
@@ -6472,6 +6519,7 @@ bool SceneBridge::Prepare(CameraState const &camera,
     }
 
     std::lock_guard lock(_impl->mutex);
+    _impl->RefreshLoadingPhaseLocked();
     if (spareOnly && !stateChanged && !resumeRequested && !cameraChanged && !bindingsChanged &&
         !renderTagsChanged && !clearNeeded && !published && !captureWorked &&
         !_impl->sceneDirty && !_impl->captureActive) {
@@ -6544,6 +6592,7 @@ void SceneBridge::Render()
              _impl->renderDeviceGeneration != _impl->activeGeneration ||
              _impl->renderDeviceSettings != deviceSettings)) {
             renderDevice->SceneChanged(*snapshot->scene);
+            _impl->progress.End(prism::Phase::Rendering);
             _impl->renderDeviceScene = snapshot->scene.get();
             _impl->renderDeviceGeneration = _impl->activeGeneration;
             _impl->renderDeviceSettings = deviceSettings;
@@ -6592,6 +6641,7 @@ void SceneBridge::Render()
     // preview or pass, so a host stop never waits for them.
     if ((hasColor || hasGeometric) &&
         !_impl->PrepareRenderDevice(renderDevice, snapshot)) return;
+    _impl->progress.Begin(prism::Phase::Rendering);
     for (HdRenderPassAovBinding const &binding : bindings) {
         TfToken const &name = binding.aovName;
         const bool supported = name == HdAovTokens->color ||
@@ -7131,9 +7181,49 @@ void SceneBridge::RemoveRenderBuffer(HdRenderBuffer *buffer)
     _converged.store(false);
 }
 
+prism::Progress::Snapshot SceneBridge::GetProgress() const
+{
+    return _impl->progress.Read();
+}
+
+VtDictionary SceneBridge::GetProgressStats() const
+{
+    const auto progress = _impl->progress.Read();
+    using prism::Phase;
+    auto count = [&](Phase phase, bool total) {
+        auto const &state = progress.phases[size_t(phase)];
+        return VtValue(static_cast<int>(std::min<uint64_t>(
+            total ? state.total : state.done, std::numeric_limits<int>::max())));
+    };
+    VtDictionary result;
+    result["prismPhase"] = VtValue(progress.phase);
+    result["prismPhaseDetail"] = VtValue(progress.detail);
+    result["prismPhaseSeconds"] = VtValue(progress.phaseSeconds);
+    result["prismDevice"] = VtValue(progress.device);
+    result["prismError"] = VtValue(progress.error);
+    std::string active;
+    for (size_t i = 0; i < progress.phases.size(); ++i) {
+        if (!progress.phases[i].active) continue;
+        if (!active.empty()) active += ',';
+        active += prism::PhaseName(Phase(i));
+    }
+    result["prismActivePhases"] = VtValue(active);
+    result["prismMeshesDone"] = count(Phase::Loading, false);
+    result["prismMeshesTotal"] = count(Phase::Loading, true);
+    result["prismMaterialsDone"] = count(Phase::Materials, false);
+    result["prismMaterialsTotal"] = count(Phase::Materials, true);
+    result["prismTexturesDone"] = count(Phase::Textures, false);
+    result["prismTexturesTotal"] = count(Phase::Textures, true);
+    result["prismUploadDone"] = count(Phase::Upload, false);
+    result["prismUploadTotal"] = count(Phase::Upload, true);
+    return result;
+}
+
 VtDictionary SceneBridge::GetStats() const
 {
-    VtDictionary result;
+    // Progress first and lock-free: it must stay current while the bridge
+    // mutex below is busy.
+    VtDictionary result = GetProgressStats();
     const int64_t completed = static_cast<int64_t>(_impl->samples.load());
     const bool converged = _converged.load();
     result["completedSamples"] = VtValue(completed);

@@ -447,6 +447,7 @@ if(PRISM_BUILD_HYDRA)
             tests/hydra/structural_updates_test.cpp
             tests/hydra/accumulation_integration_test.cpp
         tests/hydra/progressive_integration_test.cpp
+            tests/hydra/progress_status_test.cpp
             src/hydra/scene_bridge.cpp
             src/hydra/materials.cpp
             src/hydra/render_buffer.cpp
