@@ -37,8 +37,22 @@ void render(UsdImagingGLEngine& engine, const UsdStageRefPtr& stage,
     engine.SetRendererSetting(TfToken("domeLightCameraVisibility"),
                               VtValue(domeLightCameraVisibility));
     const auto start = std::chrono::steady_clock::now();
+    auto lastErrorCheck = start;
     do {
         engine.Render(stage->GetPseudoRoot(), params);
+        // A scene that cannot be prepared (for example out of memory) is not
+        // retried by the delegate; report it instead of saving an empty image.
+        // Statistics scan the scene, so poll them about once a second.
+        if (engine.IsConverged() ||
+            std::chrono::steady_clock::now() - lastErrorCheck > std::chrono::seconds(1)) {
+            lastErrorCheck = std::chrono::steady_clock::now();
+            const VtDictionary stats = engine.GetRenderStats();
+            if (const auto found = stats.find("snapshotError");
+                found != stats.end() && found->second.IsHolding<std::string>() &&
+                !found->second.UncheckedGet<std::string>().empty())
+                throw std::runtime_error("Scene preparation failed: " +
+                    found->second.UncheckedGet<std::string>());
+        }
         static const int minutes = [] {
             const char* value = std::getenv("PRISM_RENDER_TIMEOUT_MINUTES");
             return value && *value ? std::max(1, std::atoi(value)) : 5;

@@ -1755,9 +1755,20 @@ void MaterialService::Prefetch(const std::vector<Request>& requests,
                     const size_t index = next.fetch_add(1);
                     if (index >= items.size()) break;
                     bool fallback = false;
-                    auto material = m_impl->Compile(
-                        items[index], needsFallback ? &fallback : nullptr,
-                        grownKeepSets ? &(*grownKeepSets)[index] : nullptr);
+                    std::shared_ptr<Material> material;
+                    // An exception leaving a std::thread terminates the
+                    // process; a failed material (for example out of memory)
+                    // renders with the fallback material instead.
+                    try {
+                        material = m_impl->Compile(
+                            items[index], needsFallback ? &fallback : nullptr,
+                            grownKeepSets ? &(*grownKeepSets)[index] : nullptr);
+                    } catch (const std::exception& error) {
+                        ++m_impl->failures;
+                        fallback = false;
+                        TF_WARN("[Hydra Material] Material preparation failed for %s: %s",
+                                items[index].path.GetText(), error.what());
+                    }
                     if (results) (*results)[index] = std::move(material);
                     if (needsFallback) (*needsFallback)[index] = fallback ? 1 : 0;
                 }

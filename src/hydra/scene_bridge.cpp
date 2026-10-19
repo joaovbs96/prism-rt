@@ -4793,6 +4793,8 @@ public:
         std::unique_ptr<MaterialService> materialService;
         double seconds = 0.0;
         std::string error;
+        // The build ran out of memory; rebuilding the same scene would too.
+        bool outOfMemory = false;
         bool reusedBank = false;
         bool residencyUnchanged = false;
         bool pinnedBankFallback = false;
@@ -5027,6 +5029,12 @@ public:
     std::shared_ptr<std::atomic<bool>> buildCancel;
     uint64_t buildingGeneration = 0;
     uint64_t discardedBuilds = 0;
+    // Failed builds of requestedGeneration. After an out-of-memory failure, or
+    // a second failure, the scene is not rebuilt until it changes again;
+    // generationFailure (the snapshotError statistic) then says why.
+    uint64_t failedGeneration = 0;
+    unsigned failedBuildAttempts = 0;
+    std::string generationFailure;
     uint64_t reusedSnapshotBuilds = 0;
     uint64_t prototypeBuilds = 0;
     uint64_t capturedPrims = 0;
@@ -5513,10 +5521,29 @@ bool SceneBridge::Prepare(CameraState const &camera,
                 completed.generation == _impl->requestedGeneration &&
                 !_impl->sceneDirty;
             if (!publish) ++_impl->discardedBuilds;
-            if (!publish && completed.generation == _impl->requestedGeneration &&
+            if (publish) {
+                _impl->failedBuildAttempts = 0;
+                _impl->generationFailure.clear();
+            } else if (completed.generation == _impl->requestedGeneration &&
                 !_impl->sceneDirty) {
-                _impl->sceneDirty = true;
-                _impl->lastRebuildReason = "background generation failed";
+                if (_impl->failedGeneration != completed.generation) {
+                    _impl->failedGeneration = completed.generation;
+                    _impl->failedBuildAttempts = 0;
+                }
+                ++_impl->failedBuildAttempts;
+                if (!completed.error.empty() &&
+                    (completed.outOfMemory || _impl->failedBuildAttempts >= 2)) {
+                    // Rebuilding would fail the same way and, when out of
+                    // memory, keep the process at its peak indefinitely.
+                    // Report the failure and wait for the scene to change.
+                    _impl->generationFailure = completed.error;
+                    _impl->lastRebuildReason = "background generation failed";
+                    TF_RUNTIME_ERROR("PrismRT: scene preparation failed (%s); "
+                        "the scene is not rebuilt until it changes", completed.error.c_str());
+                } else {
+                    _impl->sceneDirty = true;
+                    _impl->lastRebuildReason = "background generation failed";
+                }
             }
         }
         if (publish) {
@@ -6197,6 +6224,11 @@ bool SceneBridge::Prepare(CameraState const &camera,
                             result.snapshot->scene->textureFiltering =
                                 jobSettings.textureFiltering;
                         }
+                    } catch (std::bad_alloc const &) {
+                        // Release the partial scene before reporting.
+                        result.snapshot.reset();
+                        result.error = "out of memory while preparing the scene";
+                        result.outOfMemory = true;
                     } catch (std::exception const &e) {
                         result.error = e.what();
                     } catch (...) {
@@ -7136,6 +7168,10 @@ VtDictionary SceneBridge::GetStats() const
     result["visibilityRecoveryRebuilds"] = VtValue(static_cast<int64_t>(
         _impl->visibilityRecoveryRebuilds));
     result["lastRebuildReason"] = VtValue(_impl->lastRebuildReason);
+    // Why the current scene could not be prepared; empty while it can be.
+    result["snapshotError"] = VtValue(
+        _impl->failedGeneration == _impl->requestedGeneration
+            ? _impl->generationFailure : std::string());
     uint64_t writeNs = 0, publishNs = 0, mapNs = 0, presentationCopyBytes = 0;
     std::unordered_set<PrismRenderBuffer *> measuredBuffers;
     for (auto const &binding : _impl->bindings) {
