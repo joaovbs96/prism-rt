@@ -162,11 +162,7 @@ bool MaterialCallSources(gpu::MdlShaderCode const& code, bool reorder, std::vect
 {
     const uint32_t programs = uint32_t(code.programDispatch.size());
     sources->assign(programs + 1, std::string());
-    // PRISM_VULKAN_SHADER_SALT=<n> changes every module's code, so DXC and
-    // the driver (which keeps its own cache) compile anew: cold measurements.
-    std::string salt;
-    if (const char* value = Setting("PRISM_VULKAN_SHADER_SALT"))
-        salt = std::format("#define PRISM_SHADER_SALT {}u\n", std::strtoul(value, nullptr, 10) | 0x80000000u);
+    const std::string salt = ShaderSaltDefine();
     std::string defines = "#define PRISM_CALL_MATERIALS 1\n" + salt;
     if (reorder) {
         uint32_t bits = 1;
@@ -183,6 +179,15 @@ bool MaterialCallSources(gpu::MdlShaderCode const& code, bool reorder, std::vect
         (*sources)[p + 1] = salt + (*sources)[p + 1];
     }
     return true;
+}
+
+// PRISM_VULKAN_SHADER_SALT=<n> changes every module's code, so DXC and the
+// driver (which keeps its own cache) compile anew: cold measurements.
+std::string ShaderSaltDefine()
+{
+    const char* value = Setting("PRISM_VULKAN_SHADER_SALT");
+    return value ? std::format("#define PRISM_SHADER_SALT {}u\n", std::strtoul(value, nullptr, 10) | 0x80000000u)
+                 : std::string();
 }
 
 CallableMode CallableModeSetting()

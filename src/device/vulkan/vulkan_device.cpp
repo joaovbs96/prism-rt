@@ -182,7 +182,9 @@ static std::string FallbackSummary(std::string const& error)
 
 static bool AssembleVulkanKernel(std::string const& mdlCode, std::string* source, std::string* error)
 {
-    return gpu::AssembleShader("gpu/kernel.hlsl", {"gpu/vulkan"}, mdlCode, source, error);
+    if (!gpu::AssembleShader("gpu/kernel.hlsl", {"gpu/vulkan"}, mdlCode, source, error)) return false;
+    *source = vulkan::ShaderSaltDefine() + *source;
+    return true;
 }
 
 // The marker of a compute kernel DXC could not compile within its memory limit.

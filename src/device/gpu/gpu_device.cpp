@@ -198,17 +198,18 @@ void GpuRenderDevice::RenderPass(SceneManager& scene, PassRequest const& request
     size_t first = 0;
     auto const passStart = Clock::now();
     double passGpuSeconds = 0.0, dispatchSeconds = 0.0, readbackSeconds = 0.0;
+    size_t passPixels = 0;
     struct PassLog {
-        double& gpu; double& dispatch; double& readback; Clock::time_point start;
+        double& gpu; double& dispatch; double& readback; size_t& pixels; Clock::time_point start;
         ~PassLog() {
             static const bool verbose = GpuVerbose();
             if (verbose)
                 std::cerr << std::format("PrismRT GPU pass: wall {:.2f} ms, dispatch {:.2f} ms (GPU {:.2f} ms), "
-                                         "readback {:.2f} ms\n",
+                                         "readback {:.2f} ms, {} pixels\n",
                                          std::chrono::duration<double, std::milli>(Clock::now() - start).count(),
-                                         dispatch * 1e3, gpu * 1e3, readback * 1e3);
+                                         dispatch * 1e3, gpu * 1e3, readback * 1e3, pixels);
         }
-    } passLog{passGpuSeconds, dispatchSeconds, readbackSeconds, passStart};
+    } passLog{passGpuSeconds, dispatchSeconds, readbackSeconds, passPixels, passStart};
     while (first < request.tiles.size()) {
         while (paused()) {
             if (abandoned()) return;
@@ -235,6 +236,7 @@ void GpuRenderDevice::RenderPass(SceneManager& scene, PassRequest const& request
                 std::cerr << LogPrefix() << error << '\n';
                 return;
             }
+            if (traceColor) passPixels += list.size();
         }
         auto const dispatched = Clock::now();
         dispatchSeconds += std::chrono::duration<double>(dispatched - rayStart).count();
@@ -310,10 +312,14 @@ bool GpuRenderDevice::RenderPreview(SceneManager& scene, PreviewRequest const& r
     if (request.tracePrimary) frame.settings.z |= kFramePrimaryHits;
     frame.settings.w = request.seed;
     frame.work = {count, 0, kModePreview, 0};
-    if (!Dispatch(frame, count, nullptr, &error)) {
+    double gpuSeconds = 0.0;
+    if (!Dispatch(frame, count, &gpuSeconds, &error)) {
         std::cerr << LogPrefix() << error << '\n';
         return false;
     }
+    if (GpuVerbose())
+        std::cerr << std::format("PrismRT GPU preview: {}x{}, GPU {:.2f} ms\n", request.previewWidth,
+                                 request.previewHeight, gpuSeconds * 1e3);
     if (request.colorPixels) request.colorPixels->fetch_add(count, std::memory_order_relaxed);
     auto const* values = static_cast<const float*>(RenderBuffer(kSlotOutput, size_t(count) * 16));
     auto const* hits = request.tracePrimary

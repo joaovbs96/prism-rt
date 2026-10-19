@@ -42,6 +42,8 @@ size_t CallableThresholdBytes();
 // Whether to reorder threads by material program (PRISM_VULKAN_REORDER=1, where supported). Off by
 // default: measured 2-8% slower on most scenes, 16% faster on the MaterialEggs countertop.
 bool ReorderSetting();
+// The define of PRISM_VULKAN_SHADER_SALT (empty when unset): unique shaders for cold-compile measurements.
+std::string ShaderSaltDefine();
 // Whether to print the driver's per-shader statistics (PRISM_VULKAN_PIPELINE_STATS=1).
 bool PipelineStatisticsSetting();
 
