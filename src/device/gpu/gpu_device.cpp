@@ -16,10 +16,14 @@
 namespace prism::device::gpu {
 
 
-// A pixel-center hit stored by the kernel (gpu_store_primary_hit), in the
-// RayHit fields that geometric outputs read.
-static RayHit PrimaryHit(float const* h)
+// The pixel-center hit `index` of `count` stored by the kernel
+// (gpu_store_primary_hit: three planes of `count` float4), in the RayHit
+// fields that geometric outputs read.
+static RayHit PrimaryHit(float const* hits, size_t index, size_t count)
 {
+    float h[12];
+    for (size_t plane = 0; plane < 3; ++plane)
+        std::memcpy(h + 4 * plane, hits + 4 * (plane * count + index), 4 * sizeof(float));
     RTCRayHit miss{};
     miss.hit.geomID = RTC_INVALID_GEOMETRY_ID;
     RayHit hit(miss);
@@ -269,7 +273,7 @@ void GpuRenderDevice::RenderPass(SceneManager& scene, PassRequest const& request
                 tbb::parallel_for(tile.y, tile.y + tile.height, [&](unsigned y) {
                     for (unsigned x = tile.x; x < tile.x + tile.width; ++x) {
                         // Without a usable GPU scene, trace on the CPU scene.
-                        const RayHit hit = hits ? PrimaryHit(hits + 12 * (size_t(y) * width + x))
+                        const RayHit hit = hits ? PrimaryHit(hits, size_t(y) * width + x, pixels)
                             : scene.cast_ray(prism::MakeCameraRayWithLens(request.camera,
                                   float(x) + 0.5f, float(y) + 0.5f, width, height, nullptr));
                         request.resolvePrimary(x, y, hit);
@@ -333,7 +337,7 @@ bool GpuRenderDevice::RenderPreview(SceneManager& scene, PreviewRequest const& r
                 request.writePixel(px, py, color, values[4 * i + 3], nullptr);
                 continue;
             }
-            const RayHit primary = PrimaryHit(hits + 12 * i);
+            const RayHit primary = PrimaryHit(hits, i, count);
             request.writePixel(px, py, color, values[4 * i + 3], &primary);
         }
     });

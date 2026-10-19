@@ -57,12 +57,14 @@ void gpu_store_rng(uint pixel, uint value)
 }
 // Preview pixel-center hits for geometric outputs, three entries per pixel
 // in the accumulation buffer (unused by previews otherwise).
-void gpu_store_primary_hit(uint pixel, SurfaceHit hit)
+// Three planes of `count` entries, so each store of a SIMD group is
+// contiguous: the buffer is host memory, written over the bus on discrete GPUs.
+void gpu_store_primary_hit(uint pixel, uint count, SurfaceHit hit)
 {
     RWStructuredBuffer<float4> b = accumulationBuffer();
-    b[3u * pixel] = float4(hit.p, hit.valid ? 1.0f : 0.0f);
-    b[3u * pixel + 1u] = float4(hit.n, 0.0f);
-    b[3u * pixel + 2u] = float4(hit.u, hit.v, asfloat(hit.instance), asfloat(hit.primitive));
+    b[pixel] = float4(hit.p, hit.valid ? 1.0f : 0.0f);
+    b[count + pixel] = float4(hit.n, 0.0f);
+    b[2u * count + pixel] = float4(hit.u, hit.v, asfloat(hit.instance), asfloat(hit.primitive));
 }
 
 void gpu_store_output(uint index, float4 value)

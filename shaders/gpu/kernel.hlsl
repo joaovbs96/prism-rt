@@ -106,7 +106,8 @@ void renderThread(uint thread)
         x = pixel % width;
         y = pixel / width;
         if (mode == kModePrimary) {
-            gpu_store_primary_hit(pixel, tracer.backend.intersect(pixelCenterRay(camera, x, y, width, height)).surface);
+            gpu_store_primary_hit(pixel, width * height,
+                                  tracer.backend.intersect(pixelCenterRay(camera, x, y, width, height)).surface);
             return;
         }
         sampleIndex = frame.counts.z + replica;
@@ -138,7 +139,7 @@ void renderThread(uint thread)
     }
     if (preview) gpu_store_output(thread, float4(result.color, result.coverage));
     if ((preview || mode == kModePass) && (flags & kFramePrimaryHits) != 0u)
-        gpu_store_primary_hit(preview ? thread : pixel,
+        gpu_store_primary_hit(preview ? thread : pixel, preview ? frame.size.z * frame.size.w : width * height,
                               tracer.backend.intersect(pixelCenterRay(camera, x, y, width, height)).surface);
     if (preview) return;
     gpu_store_rng(pixel, tracer.backend.rng.state);
