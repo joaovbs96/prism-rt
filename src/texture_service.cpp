@@ -1,5 +1,6 @@
 #include "texture_service.h"
 #include "resource_limits.h"
+#include "load_profile.h"
 
 #include <OpenImageIO/imagebuf.h>
 #include <OpenImageIO/imagebufalgo.h>
@@ -684,6 +685,8 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
                 std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
         }
     } timer{m_impl->preparationNanoseconds, preparationStart};
+    prism::load_profile::Scope profile("texture.prepare");
+    profile.detail(source.filename().string() + " memory");
     if (!(options.gamma > 0.0f) || !std::isfinite(options.gamma) ||
         !std::isfinite(options.exposure) ||
         options.firstChannel < 0 || options.channelCount < 0 || options.alphaChannel < -2)
@@ -881,6 +884,7 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
     };
     uint64_t publishNanoseconds = 0;
     const bool cacheFilePresent = std::filesystem::exists(tx);
+    profile.detail(source.filename().string() + (cacheFilePresent ? " disk" : " created"));
     auto stageStart = std::chrono::steady_clock::now();
     if (cacheFilePresent) {
         m_impl->diskCacheHits.fetch_add(1, std::memory_order_relaxed);

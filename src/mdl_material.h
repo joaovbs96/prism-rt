@@ -45,6 +45,8 @@ class MDLMaterial : public Material {
 public:
     struct CompilationTimings {
         double generationSeconds = 0.0;
+        // Part of generationSeconds: loading and preprocessing the document.
+        double loadSeconds = 0.0;
         double classCompilationSeconds = 0.0;
         double nativeJitSeconds = 0.0;
         bool persistentGenerationCacheHit = false;
@@ -93,6 +95,8 @@ public:
         DocumentLoader doc_loader(generator.get_stdlib(), true);
 
         MaterialX::DocumentPtr doc = doc_loader.load(mtlx_path);
+        if (timings) timings->loadSeconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - generationStart).count();
         if (!doc) {
             std::cerr << "[MDLMaterial] ERROR: Failed to load " << mtlx_path << "\n";
             m_valid = false;

@@ -7,6 +7,7 @@
 #include "../materialx/prepared_template.h"
 #include "../mdl_material.h"
 #include "../resource_limits.h"
+#include "../load_profile.h"
 
 #include <pxr/base/tf/stringUtils.h>
 #include <pxr/base/tf/diagnostic.h>
@@ -702,9 +703,17 @@ public:
           m_arena(static_cast<int>(std::min<size_t>(
               prism::TexturePreparationThreadCount(), m_work.size())), 0)
     {
+        if (prism::load_profile::Enabled()) {
+            m_profile = std::make_unique<prism::load_profile::Scope>("texture.prefetch");
+            m_profile->detail("items=" + std::to_string(m_work.size()));
+        }
+        m_running = m_arena.max_concurrency();
         m_arena.execute([this] {
             for (int i = 0; i < m_arena.max_concurrency(); ++i)
-                m_group.run([this] { Run(); });
+                m_group.run([this] {
+                    Run();
+                    if (m_running.fetch_sub(1) == 1) m_profile.reset();
+                });
         });
     }
     // Preparation jobs must finish before Prefetch returns; the MDL SDK and
@@ -761,6 +770,8 @@ private:
     std::atomic<uint64_t>* m_bytesRead;
     std::vector<Result> m_results;
     std::atomic<size_t> m_next{0};
+    std::atomic<int> m_running{0};
+    std::unique_ptr<prism::load_profile::Scope> m_profile;
     tbb::task_arena m_arena;
     tbb::task_group m_group;
 };
@@ -846,6 +857,7 @@ PrewarmResult RunPrewarm(mdl::Context* context, const std::string& libraries,
                          const std::string& mdlPath, const std::filesystem::path& cacheDir)
 {
     const auto start = std::chrono::steady_clock::now();
+    prism::load_profile::Scope profile("materials.prewarm");
     PrewarmResult result;
     try {
         // Loaded by the first hdMtlx conversion.
@@ -1167,6 +1179,15 @@ public:
         if (previewSurface && !RewritePreviewSurfaceNetwork(netInterface))
             return result;
         uint64_t resolvedTextureBytes = 0;
+        prism::load_profile::Scope conversionProfile("material.convert");
+        auto profileClock = std::chrono::steady_clock::now();
+        auto profileLap = [&profileClock] {
+            const auto now = std::chrono::steady_clock::now();
+            const double ms = std::chrono::duration<double, std::milli>(now - profileClock).count();
+            profileClock = now;
+            return std::to_string(int(ms));
+        };
+        std::string profileDetail = materialPath.GetString();
         const auto resourceStart = std::chrono::steady_clock::now();
         const std::string resourceFingerprint =
             ResolveTextureAssets(netInterface, cacheDir, result.resolverContext,
@@ -1174,6 +1195,7 @@ public:
                 &resolvedTextureBytes);
         resourceNanoseconds += std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - resourceStart).count();
+        profileDetail += " resources_ms=" + profileLap();
         textureBytes += resolvedTextureBytes;
         HdMtlxTexturePrimvarData mtlxData;
         ++conversionCalls;
@@ -1194,6 +1216,7 @@ public:
         }
         if (previewSurface) FixPreviewSurfaceNormalOutput(doc);
         else AddDisplacementShader(netInterface, doc);
+        profileDetail += (simpleDocument ? " simple_ms=" : " hdmtlx_ms=") + profileLap();
 
         // hdMtlx derives the terminal material name from the USD prim path.
         // That makes otherwise identical M0/M1 graphs generate different MDL
@@ -1207,7 +1230,11 @@ public:
         // the native generator. hdMtlx's definitions are also imported for
         // Hydra's texture/primvar node aliases.
         if (!simpleDocument) doc->importLibrary(HdMtlxStdLibraries());
+        profileDetail += " import_ms=" + profileLap();
         result.xml = prism::materialx::SerializeDocument(doc, libraries);
+        profileDetail += " serialize_ms=" + profileLap() +
+            " xml_kb=" + std::to_string(result.xml.size() / 1024);
+        conversionProfile.detail(profileDetail);
         conversionNanoseconds += std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - conversionStart).count();
         // Native target-code handles are owned by one MDL runtime. Keep the
@@ -1395,6 +1422,7 @@ public:
             return specification;
         };
         std::shared_ptr<MDLMaterial> candidate;
+        prism::load_profile::Scope compileProfile("material.compile");
         try {
             candidate = std::make_shared<MDLMaterial>(
                 prepared.mtlxPath.string(), *context, libraries, mdlPath,
@@ -1434,6 +1462,17 @@ public:
         const auto& target = candidate->get_target_code();
         if (!target.cacheHit) ++nativeJits;
         else ++programCacheHits;
+        if (prism::load_profile::Enabled()) {
+            auto ms = [](double seconds) { return std::to_string(int(seconds * 1000.0)); };
+            compileProfile.detail(prepared.path.GetString() +
+                " load_ms=" + ms(timings.loadSeconds) +
+                " generate_ms=" + ms(timings.generationSeconds - timings.loadSeconds) +
+                " class_ms=" + ms(timings.classCompilationSeconds) +
+                " jit_ms=" + ms(timings.nativeJitSeconds) +
+                " program_wait_ms=" + ms(target.programWaitSeconds) +
+                (target.cacheHit ? " program=reused" : " program=jit") +
+                (timings.templateCacheHit ? " generation=cached" : ""));
+        }
         sdkTranslationCalls += target.translationCalls;
         fallbackTranslations += target.fallbackTranslations;
         programWaitNanoseconds += static_cast<int64_t>(target.programWaitSeconds * 1.0e9);
@@ -1679,6 +1718,8 @@ void MaterialService::Prefetch(const std::vector<Request>& requests,
         if (!request.path.IsEmpty() && seen.insert(request.path).second)
             unique.push_back(request);
     if (unique.empty()) return;
+    prism::load_profile::Scope profile("materials.prefetch");
+    profile.detail("requests=" + std::to_string(unique.size()));
     m_impl->jobs += unique.size();
     // Capture immutable identities first. Repeated compatible structures need
     // one seed compiled before their variants are prepared, otherwise the old
@@ -1686,10 +1727,13 @@ void MaterialService::Prefetch(const std::vector<Request>& requests,
     // be published.
     std::vector<Impl::Prepared> captured;
     captured.reserve(unique.size());
-    for (const Request& request : unique) {
-        if (cancelled && cancelled()) return;
-        captured.push_back(m_impl->Prepare(
-            request.dataSource, request.path, true, true));
+    {
+        prism::load_profile::Scope captureProfile("materials.capture");
+        for (const Request& request : unique) {
+            if (cancelled && cancelled()) return;
+            captured.push_back(m_impl->Prepare(
+                request.dataSource, request.path, true, true));
+        }
     }
     // Every texture of the batch is known now, long before the compile of
     // the material that needs it. Declared after captured so that an early
@@ -1744,6 +1788,9 @@ void MaterialService::Prefetch(const std::vector<Request>& requests,
                              std::vector<std::vector<TemplateValueKey>>* grownKeepSets) {
         const unsigned workers = std::min<unsigned>(
             prism::MaterialWorkerCount(), static_cast<unsigned>(items.size()));
+        prism::load_profile::Scope poolProfile("materials.compile_pool");
+        poolProfile.detail("items=" + std::to_string(items.size()) +
+                           " workers=" + std::to_string(workers));
         std::atomic<size_t> next{0};
         std::vector<std::thread> pool;
         pool.reserve(workers);

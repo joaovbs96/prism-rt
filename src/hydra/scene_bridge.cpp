@@ -10,6 +10,7 @@
 
 #include "../environment.h"
 #include "../lights.h"
+#include "../load_profile.h"
 #include "../batched_spheres.h"
 #include "../camera_rays.h"
 #include "../camera_ray_diagnostics.h"
@@ -3695,6 +3696,7 @@ std::shared_ptr<Snapshot> _BuildSnapshot(HdSceneIndexBaseRefPtr const &scene,
     result->environmentTexture = std::move(blackEnvironment);
     result->scene->environment = result->environment.get();
     if (materials) {
+        prism::load_profile::Scope profile("snapshot.materials");
         std::unordered_set<SdfPath, SdfPath::Hash> seen;
         std::vector<MaterialService::Request> requests;
         _CollectMaterialRequests(scene, SdfPath::AbsoluteRootPath(),
@@ -3703,11 +3705,20 @@ std::shared_ptr<Snapshot> _BuildSnapshot(HdSceneIndexBaseRefPtr const &scene,
     }
     if (cancelled && cancelled()) return {};
     const auto traversalStart = std::chrono::steady_clock::now();
+    std::optional<prism::load_profile::Scope> meshProfile(std::in_place, "snapshot.meshes");
     MeshPreparation preparation = _PrepareMeshes(
         scene, materials, result.get(), renderTags, cancelled);
+    if (prism::load_profile::Enabled())
+        meshProfile->detail("conversions=" + std::to_string(result->prototypeConversions) +
+            " cached=" + std::to_string(result->prototypeConversionCacheHits) +
+            " convert_s=" + std::to_string(result->meshConversionSeconds) +
+            " embree_prototypes_s=" + std::to_string(result->embreeGeometryCommitSeconds));
+    meshProfile.reset();
     if (cancelled && cancelled()) return {};
+    std::optional<prism::load_profile::Scope> walkProfile(std::in_place, "snapshot.walk");
     _Walk(scene, SdfPath::AbsoluteRootPath(), materials, result.get(),
           renderTags, cancelled, &preparation);
+    walkProfile.reset();
     if (cancelled && cancelled()) return {};
     _FlushSphereBatches(result.get());
     _ApplyLinkMasks(scene, result.get());
@@ -3718,6 +3729,7 @@ std::shared_ptr<Snapshot> _BuildSnapshot(HdSceneIndexBaseRefPtr const &scene,
         std::chrono::steady_clock::now() - traversalStart).count();
     const auto sceneCommitStart = std::chrono::steady_clock::now();
     if (cancelled && cancelled()) return {};
+    prism::load_profile::Scope commitProfile("snapshot.embree_commit");
     result->scene->commitScene();
     ++result->prototypePool->topLevelSceneCommits;
     result->embreeSceneCommitSeconds += std::chrono::duration<double>(
@@ -4982,6 +4994,7 @@ public:
         if (!deviceCreation.valid()) {
             deviceCreationPreference = preference;
             deviceCreation = std::async(std::launch::async, [preference] {
+                prism::load_profile::Scope profile("device.create");
                 CreatedDevice created;
                 created.device = prism::device::CreateDevice(preference, &created.note);
                 return created;
@@ -5038,6 +5051,7 @@ public:
             devicePreparation = std::async(std::launch::async,
                 [this, device, prepared] {
                     const auto start = std::chrono::steady_clock::now();
+                    prism::load_profile::Scope profile("device.prepare");
                     device->Prepare(*prepared->scene);
                     const double seconds = std::chrono::duration<double>(
                         std::chrono::steady_clock::now() - start).count();
@@ -5084,6 +5098,7 @@ public:
                 result.spare = true;
                 result.canonicalSeed = canonicalSeed;
                 auto const start = std::chrono::steady_clock::now();
+                prism::load_profile::Scope profile("snapshot.spare");
                 try {
                     ArResolverContextBinder binder(resolverContext);
                     result.spareSnapshot = _BuildSnapshot(
@@ -5442,6 +5457,16 @@ void SceneBridge::MarkSceneDirtyBatch(std::vector<SceneDirtyNotice> const &notic
     if (reason == groups.end()) reason = groups.find(SceneDirtyKind::Structure);
     if (reason == groups.end()) reason = groups.begin();
     _impl->lastRebuildReason = reason->second.reason;
+    if (prism::load_profile::Enabled()) {
+        std::string kinds;
+        for (auto const &[kind, group] : groups)
+            kinds += std::to_string(static_cast<unsigned int>(kind)) + ":" +
+                std::to_string(group.paths.size()) + (group.allPaths ? "(all)" : "") + ",";
+        prism::load_profile::Mark("scene.dirty",
+            "generation=" + std::to_string(_impl->requestedGeneration) +
+            " building=" + std::to_string(_impl->buildingGeneration) +
+            " kinds=" + kinds + " reason=" + reason->second.reason);
+    }
     _converged.store(false);
 }
 
@@ -5750,6 +5775,10 @@ bool SceneBridge::Prepare(CameraState const &camera,
             publish = completed.snapshot && completed.error.empty() &&
                 completed.generation == _impl->requestedGeneration &&
                 !_impl->sceneDirty;
+            prism::load_profile::Mark(publish ? "snapshot.published" : "snapshot.discarded",
+                "generation=" + std::to_string(completed.generation) +
+                " requested=" + std::to_string(_impl->requestedGeneration) +
+                " reason=" + _impl->lastRebuildReason);
             if (!publish) ++_impl->discardedBuilds;
             if (publish) {
                 _impl->failedBuildAttempts = 0;
@@ -5903,6 +5932,11 @@ bool SceneBridge::Prepare(CameraState const &camera,
             _impl->captureResolverContext =
                 ArGetResolver().GetCurrentContext();
             _impl->capturedPrims = 0;
+            prism::load_profile::Mark("capture.start",
+                "generation=" + std::to_string(_impl->captureGeneration) +
+                (_impl->captureFull ? " full" : " incremental") +
+                " kinds=" + std::to_string(_impl->dirtyKinds) +
+                " paths=" + std::to_string(_impl->dirtyPaths.size()));
         }
     }
     auto const captureStart = std::chrono::steady_clock::now();
@@ -5987,6 +6021,10 @@ bool SceneBridge::Prepare(CameraState const &camera,
             }
             _impl->retainedSceneCache = _impl->captureScene;
             const uint64_t generation = _impl->captureGeneration;
+            prism::load_profile::Mark("capture.done",
+                "generation=" + std::to_string(generation) +
+                " prims=" + std::to_string(_impl->capturedPrims) +
+                " capture_ms=" + std::to_string(int(_impl->captureMilliseconds)));
             HdSceneIndexBaseRefPtr retained = _impl->captureScene;
             TfTokenVector tags = _impl->captureRenderTags;
             RenderSettings jobSettings = _impl->settings;
@@ -6117,6 +6155,9 @@ bool SceneBridge::Prepare(CameraState const &camera,
                     result.generation = generation;
                     result.pinnedBankFallback = pinnedBankFallback;
                     auto const start = std::chrono::steady_clock::now();
+                    prism::load_profile::Scope profile("snapshot.build");
+                    profile.detail("generation=" + std::to_string(generation) +
+                                   (bank ? " bank" : " full"));
                     try {
                         bool placementTopologyChanged = false;
                         bool sphereBatchTopologyChanged = false;
@@ -6672,7 +6713,9 @@ void SceneBridge::Render()
             if (preview.published)
                 _impl->previewCostMilliseconds = preview.traceMilliseconds + preview.publicationMilliseconds;
             if (preview.published) {
-                ++_impl->previewPublishes;
+                if (_impl->previewPublishes++ == 0)
+                    prism::load_profile::Mark("frame.first_preview",
+                                              "generation=" + std::to_string(generation));
                 _impl->lastPublishedFrame = frame;
             }
         }
@@ -7071,8 +7114,10 @@ void SceneBridge::Render()
         }
         _impl->committedRngStates.swap(rngStates);
         _impl->samples.store(static_cast<uint64_t>(sample + 1));
-        if (sample == 0)
+        if (sample == 0) {
             std::vector<AovPlane>().swap(primaryPlanes);
+            prism::load_profile::Mark("frame.full_sample", "generation=" + std::to_string(generation));
+        }
     }
     if (_impl->renderThread->IsStopRequested()) return;
     for (HdRenderPassAovBinding const &binding : bindings)

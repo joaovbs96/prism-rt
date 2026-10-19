@@ -12,6 +12,7 @@
 #include "../gpu/shader_sources.h"
 #include "../../scene.h"
 #include "../../texture_service.h"
+#include "../../load_profile.h"
 
 #include <OpenImageIO/imageio.h>
 #include <tbb/parallel_for.h>
@@ -642,6 +643,11 @@ bool VulkanDevice::Impl::buildPipeline(std::string* error)
     }
     pipelines[key] = pipeline;
     pipelineCode = shared;
+    prism::load_profile::Mark("vulkan.pipeline",
+        std::format("mdl_code_s={:.3f} translate_s={:.3f} spirv_s={:.3f} pipeline_s={:.3f} programs={}",
+                    std::chrono::duration<double>(generated - start).count(), code.translateSeconds,
+                    std::chrono::duration<double>(compiled - generated).count(), SecondsSince(compiled),
+                    code.programCount));
     if (gpu::GpuVerbose())
         std::cerr << std::format("PrismRT Vulkan: shader setup {:.1f} s (MDL code {:.1f} s, SPIR-V {:.1f} s, pipeline {:.1f} s)\n",
                                  SecondsSince(start), std::chrono::duration<double>(generated - start).count(),
@@ -1148,6 +1154,7 @@ bool VulkanDevice::Impl::ensureScene(SceneManager& scene, std::string* error)
     dirty = false;
     boundScene = &scene;
     data = std::make_unique<GpuSceneData>(gpu::BuildGpuScene(scene));
+    auto const sceneBuilt = Clock::now();
     for (auto const& warning : data->warnings) std::cerr << "PrismRT Vulkan: " << warning << '\n';
     auto fail = [&] {
         pipeline = VK_NULL_HANDLE;
@@ -1157,6 +1164,7 @@ bool VulkanDevice::Impl::ensureScene(SceneManager& scene, std::string* error)
         return false;
     };
     if (!buildPipeline(error)) return fail();
+    auto const piped = Clock::now();
     GpuSceneData const& d = *data;
     auto bytes = [](auto const& v) { return v.size() * sizeof(v[0]); };
     upload(kSlotPositions, d.positions.data(), bytes(d.positions));
@@ -1190,6 +1198,14 @@ bool VulkanDevice::Impl::ensureScene(SceneManager& scene, std::string* error)
     if (!uploadImages(error)) return fail();
     auto const imaged = Clock::now();
     if (!buildAccelerationStructures(error) || !writeDescriptors(error)) return fail();
+    prism::load_profile::Mark("vulkan.scene",
+        std::format("total_s={:.3f} gpu_scene_s={:.3f} pipeline_s={:.3f} buffers_s={:.3f} images_s={:.3f} "
+                    "acceleration_s={:.3f} images={}",
+                    SecondsSince(sceneStart), std::chrono::duration<double>(sceneBuilt - sceneStart).count(),
+                    std::chrono::duration<double>(piped - sceneBuilt).count(),
+                    std::chrono::duration<double>(uploaded - piped).count(),
+                    std::chrono::duration<double>(imaged - uploaded).count(), SecondsSince(imaged),
+                    d.images.size()));
     if (gpu::GpuVerbose())
         std::cerr << std::format("PrismRT Vulkan: scene {:.3f} s (buffers {:.3f}, images {:.3f}, "
                                  "acceleration structures {:.3f}; {} prototypes, {} instances)\n",

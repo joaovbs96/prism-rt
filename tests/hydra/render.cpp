@@ -9,6 +9,7 @@
 #include <pxr/imaging/hd/tokens.h>
 #include <pxr/base/plug/registry.h>
 #include <OpenImageIO/imagebuf.h>
+#include "../../src/load_profile.h"
 #include <chrono>
 #include <algorithm>
 #include <cmath>
@@ -16,6 +17,7 @@
 #include <filesystem>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <thread>
 #include <utility>
@@ -49,8 +51,14 @@ void render(UsdImagingGLEngine& engine, const UsdStageRefPtr& stage,
     };
     const auto start = std::chrono::steady_clock::now();
     auto lastErrorCheck = start;
+    bool firstRender = true;
     do {
-        engine.Render(stage->GetPseudoRoot(), params);
+        {
+            std::optional<prism::load_profile::Scope> renderProfile;
+            if (firstRender) renderProfile.emplace("cli.first_render_call");
+            firstRender = false;
+            engine.Render(stage->GetPseudoRoot(), params);
+        }
         // Statistics scan the scene, so poll them about once a second.
         if (std::chrono::steady_clock::now() - lastErrorCheck > std::chrono::seconds(1)) {
             lastErrorCheck = std::chrono::steady_clock::now();
@@ -64,6 +72,7 @@ void render(UsdImagingGLEngine& engine, const UsdStageRefPtr& stage,
             throw std::runtime_error("Hydra failed to converge within the time limit (PRISM_RENDER_TIMEOUT_MINUTES)");
         if (!engine.IsConverged()) std::this_thread::sleep_for(std::chrono::milliseconds(10));
     } while (!engine.IsConverged());
+    prism::load_profile::Mark("cli.converged");
     checkPreparation();
 }
 
@@ -322,14 +331,19 @@ int main(int argc, char** argv) {
             throw std::runtime_error("Invalid sampling mode or sample clamp");
         if (width <= 0 || height <= 0 || spp <= 0)
             throw std::runtime_error("Dimensions and spp must be positive");
+        prism::load_profile::Mark("cli.start");
+        std::optional<prism::load_profile::Scope> openProfile(std::in_place, "cli.stage_open");
         auto stage = UsdStage::Open(argv[1]);
+        openProfile.reset();
         if (!stage) throw std::runtime_error("Cannot open USD scene");
         if (!UsdGeomCamera(stage->GetPrimAtPath(SdfPath(argv[2]))))
             throw std::runtime_error("Camera path does not identify a USD camera");
         UsdImagingGLEngine::Parameters parameters;
         parameters.gpuEnabled = false;
         parameters.rendererPluginId = TfToken("HdPrismRendererPlugin");
+        std::optional<prism::load_profile::Scope> engineProfile(std::in_place, "cli.engine_create");
         UsdImagingGLEngine engine(parameters);
+        engineProfile.reset();
         if (engine.GetCurrentRendererId() != parameters.rendererPluginId)
             throw std::runtime_error("PrismRT plugin not loaded; check PXR_PLUGINPATH_NAME and DLL paths");
         engine.SetCameraPath(SdfPath(argv[2]));
