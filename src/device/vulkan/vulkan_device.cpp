@@ -1,10 +1,14 @@
 // Vulkan render device. The kernel is shaders/gpu/kernel.hlsl with the
 // scene's MDL code, compiled to SPIR-V with DXC and cached by source hash
-// (the same source the Metal device compiles to DXIL). Every resource slot is a binding of one descriptor set; the scene is
-// mirrored with one bottom-level acceleration structure per prototype and
-// one top-level structure. The structure follows the Metal device.
+// (the same source the Metal device compiles to DXIL). Material sets too
+// large for one kernel run as a ray tracing pipeline with one callable
+// shader per MDL program instead (vulkan_material_calls.h). Every resource
+// slot is a binding of one descriptor set; the scene is mirrored with one
+// bottom-level acceleration structure per prototype and one top-level
+// structure. The structure follows the Metal device.
 
 #include "vulkan_device.h"
+#include "vulkan_material_calls.h"
 
 #include "../gpu/gpu_materials.h"
 #include "../gpu/texture_budget.h"
@@ -141,11 +145,23 @@ static std::string FallbackSummary(std::string const& error)
     return first.empty() ? "scene not supported" : first;
 }
 
+static bool AssembleVulkanKernel(std::string const& mdlCode, std::string* source, std::string* error)
+{
+    return gpu::AssembleShader("gpu/kernel.hlsl", {"gpu/vulkan"}, mdlCode, source, error);
+}
+
+// The marker of a compute kernel DXC could not compile within its memory limit.
+static std::filesystem::path TooLargeMarker(std::string const& source)
+{
+    return gpu::ShaderCacheDirectory("vulkan") /
+        (gpu::SourceDigest(source + gpu::HlslCompilerSignature(gpu::HlslTarget::Spirv)) + ".too-large");
+}
+
 bool CompileVulkanKernel(std::string const& mdlCode, std::vector<uint32_t>* spirv, std::string* error,
                          uint32_t programCount)
 {
     std::string source;
-    if (!gpu::AssembleShader("gpu/kernel.hlsl", {"gpu/vulkan"}, mdlCode, &source, error)) return false;
+    if (!AssembleVulkanKernel(mdlCode, &source, error)) return false;
     const auto cacheDirectory = gpu::ShaderCacheDirectory("vulkan");
     const auto cached = cacheDirectory / (gpu::SourceDigest(source) + ".spv");
     std::vector<char> bytes;
@@ -165,8 +181,7 @@ bool CompileVulkanKernel(std::string const& mdlCode, std::vector<uint32_t>* spir
         }
         // A kernel too large for DXC stays too large for the same compiler:
         // a marker in the cache skips the minutes-long attempt next time.
-        const auto tooLarge = cacheDirectory /
-            (gpu::SourceDigest(source + gpu::HlslCompilerSignature(gpu::HlslTarget::Spirv)) + ".too-large");
+        const auto tooLarge = TooLargeMarker(source);
         const char* retry = std::getenv("PRISM_VULKAN_RETRY_LARGE");
         if (std::ifstream marker{tooLarge}; marker && !(retry && *retry && *retry != '0')) {
             std::string reason;
@@ -244,6 +259,13 @@ struct VulkanDevice::Impl {
     VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
     std::unordered_map<std::string, VkPipeline> pipelines;
+    // Ray tracing pipelines with material callables, by generated MDL code
+    // and reordering; `callables` is the one in use (null: `pipeline` is the
+    // compute kernel).
+    vulkan::RayTracingSupport rayTracing;
+    std::string pipelineCacheTag;
+    std::unordered_map<std::string, std::unique_ptr<vulkan::MaterialCallPipeline>> callablePipelines;
+    vulkan::MaterialCallPipeline const* callables = nullptr;
     // The generated MDL code `pipeline` was built from.
     std::shared_ptr<const gpu::MdlShaderCode> pipelineCode;
     VkQueryPool timestamps = VK_NULL_HANDLE;
@@ -260,6 +282,8 @@ struct VulkanDevice::Impl {
     bool submit(VkCommandBuffer commands, std::string* error);
     bool ensureScene(SceneManager& scene, std::string* error);
     bool buildPipeline(std::string* error);
+    bool buildCallablePipeline(std::shared_ptr<const gpu::MdlShaderCode> const& code, std::string const& reason,
+                               std::string* error);
     bool uploadImages(std::string* error);
     bool buildAccelerationStructures(std::string* error);
     bool writeDescriptors(std::string* error);
@@ -274,6 +298,8 @@ VulkanDevice::Impl::~Impl()
         return;
     }
     vkDeviceWaitIdle(device);
+    callables = nullptr;
+    callablePipelines.clear();
     for (auto& [key, p] : pipelines) vkDestroyPipeline(device, p, nullptr);
     if (descriptorPool) vkDestroyDescriptorPool(device, descriptorPool, nullptr);
     if (pipelineLayout) vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
@@ -366,8 +392,65 @@ bool VulkanDevice::Impl::initialize(std::string* reason)
         return fail(devices.empty() ? "no Vulkan device"
                                     : "no Vulkan device supports ray queries (" + rejected + ")");
 
+    // Optional: ray tracing pipelines for the material callables, shader
+    // execution reordering, and driver statistics of compiled shaders.
+    std::vector<const char*> enabled(std::begin(required), std::end(required));
+    {
+        uint32_t count = 0;
+        vkEnumerateDeviceExtensionProperties(physical, nullptr, &count, nullptr);
+        std::vector<VkExtensionProperties> deviceExtensions(count);
+        vkEnumerateDeviceExtensionProperties(physical, nullptr, &count, deviceExtensions.data());
+        auto has = [&](const char* name) {
+            for (auto const& e : deviceExtensions)
+                if (std::strcmp(e.extensionName, name) == 0) return true;
+            return false;
+        };
+        VkPhysicalDeviceRayTracingPipelineFeaturesKHR pipelineFeatures{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR};
+        VkPhysicalDeviceRayTracingInvocationReorderFeaturesNV reorderFeatures{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_INVOCATION_REORDER_FEATURES_NV};
+        VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR statisticsFeatures{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR};
+        pipelineFeatures.pNext = &reorderFeatures;
+        reorderFeatures.pNext = &statisticsFeatures;
+        VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+        query.pNext = &pipelineFeatures;
+        vkGetPhysicalDeviceFeatures2(physical, &query);
+        rayTracing.pipeline = has(VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME) && pipelineFeatures.rayTracingPipeline;
+        rayTracing.reorder = rayTracing.pipeline && has(VK_NV_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME) &&
+            reorderFeatures.rayTracingInvocationReorder;
+        rayTracing.executableStatistics = has(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME) &&
+            statisticsFeatures.pipelineExecutableInfo;
+        if (rayTracing.pipeline) enabled.push_back(VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME);
+        if (rayTracing.reorder) enabled.push_back(VK_NV_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME);
+        if (rayTracing.executableStatistics) enabled.push_back(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
+    }
+
+    VkPhysicalDeviceRayTracingPipelineFeaturesKHR pipelineFeature{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR};
+    pipelineFeature.rayTracingPipeline = VK_TRUE;
+    VkPhysicalDeviceRayTracingInvocationReorderFeaturesNV reorderFeature{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_INVOCATION_REORDER_FEATURES_NV};
+    reorderFeature.rayTracingInvocationReorder = VK_TRUE;
+    VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR statisticsFeature{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR};
+    statisticsFeature.pipelineExecutableInfo = VK_TRUE;
+    void* optionalFeatures = nullptr;
+    if (rayTracing.executableStatistics) {
+        statisticsFeature.pNext = optionalFeatures;
+        optionalFeatures = &statisticsFeature;
+    }
+    if (rayTracing.reorder) {
+        reorderFeature.pNext = optionalFeatures;
+        optionalFeatures = &reorderFeature;
+    }
+    if (rayTracing.pipeline) {
+        pipelineFeature.pNext = optionalFeatures;
+        optionalFeatures = &pipelineFeature;
+    }
     VkPhysicalDeviceRayQueryFeaturesKHR rayQuery{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR};
     rayQuery.rayQuery = VK_TRUE;
+    rayQuery.pNext = optionalFeatures;
     VkPhysicalDeviceAccelerationStructureFeaturesKHR acceleration{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR};
     acceleration.accelerationStructure = VK_TRUE;
@@ -392,8 +475,8 @@ bool VulkanDevice::Impl::initialize(std::string* reason)
     deviceInfo.pNext = &features;
     deviceInfo.queueCreateInfoCount = 1;
     deviceInfo.pQueueCreateInfos = &queueInfo;
-    deviceInfo.enabledExtensionCount = uint32_t(std::size(required));
-    deviceInfo.ppEnabledExtensionNames = required;
+    deviceInfo.enabledExtensionCount = uint32_t(enabled.size());
+    deviceInfo.ppEnabledExtensionNames = enabled.data();
     if (VkResult r = vkCreateDevice(physical, &deviceInfo, nullptr, &device); r != VK_SUCCESS)
         return fail(std::string("cannot create the Vulkan device (") + ResultText(r) + ")");
     vkGetDeviceQueue(device, queueFamily, 0, &queue);
@@ -401,7 +484,13 @@ bool VulkanDevice::Impl::initialize(std::string* reason)
     accelerationProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_PROPERTIES_KHR;
     VkPhysicalDeviceProperties2 properties2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
     properties2.pNext = &accelerationProperties;
+    if (rayTracing.pipeline) accelerationProperties.pNext = &rayTracing.properties;
     vkGetPhysicalDeviceProperties2(physical, &properties2);
+    accelerationProperties.pNext = nullptr;
+    rayTracing.properties.pNext = nullptr;
+    for (uint8_t byte : properties2.properties.pipelineCacheUUID) pipelineCacheTag += std::format("{:02x}", byte);
+    pipelineCacheTag += std::format("-{:x}-{:x}-{:x}", properties2.properties.vendorID,
+                                    properties2.properties.deviceID, properties2.properties.driverVersion);
 
     createAccelerationStructure = reinterpret_cast<PFN_vkCreateAccelerationStructureKHR>(
         vkGetDeviceProcAddr(device, "vkCreateAccelerationStructureKHR"));
@@ -446,7 +535,10 @@ bool VulkanDevice::Impl::initialize(std::string* reason)
     }
 
     // One set: a storage buffer per slot, the acceleration structure, and
-    // the image and sampler arrays.
+    // the image and sampler arrays, for the compute kernel and the ray
+    // tracing pipeline's shaders.
+    const VkShaderStageFlags stages = VK_SHADER_STAGE_COMPUTE_BIT |
+        (rayTracing.pipeline ? VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CALLABLE_BIT_KHR : 0);
     std::vector<VkDescriptorSetLayoutBinding> bindings;
     for (uint32_t slot = 0; slot < kSlotCount; ++slot) {
         VkDescriptorSetLayoutBinding binding{};
@@ -454,21 +546,21 @@ bool VulkanDevice::Impl::initialize(std::string* reason)
         binding.descriptorType = slot == kSlotAccel ? VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR
                                                           : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         binding.descriptorCount = 1;
-        binding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        binding.stageFlags = stages;
         bindings.push_back(binding);
     }
     VkDescriptorSetLayoutBinding samplerBinding{};
     samplerBinding.binding = kSlotImageBase + 1;
     samplerBinding.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
     samplerBinding.descriptorCount = kSamplerCount;
-    samplerBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    samplerBinding.stageFlags = stages;
     samplerBinding.pImmutableSamplers = samplers;
     bindings.push_back(samplerBinding);
     VkDescriptorSetLayoutBinding imageBinding{};
     imageBinding.binding = kSlotImageBase;
     imageBinding.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
     imageBinding.descriptorCount = kMaxImages;
-    imageBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    imageBinding.stageFlags = stages;
     bindings.push_back(imageBinding);
     // The image array is partially bound: only the scene's images are written.
     // (A variable count would have to be on the highest binding, the samplers'.)
@@ -625,9 +717,33 @@ bool VulkanDevice::Impl::buildPipeline(std::string* error)
     // The same generated code (an edit that kept the materials) keeps its pipeline.
     if (shared == pipelineCode && pipeline != VK_NULL_HANDLE) return true;
     pipelineCode = nullptr;
+    callables = nullptr;
+    // Material sets too large for one kernel use the callable pipeline: above
+    // the size threshold, when DXC was found unable to compile the kernel, or
+    // when it fails now for lack of memory.
+    const vulkan::CallableMode callableMode = rayTracing.pipeline ? vulkan::CallableModeSetting()
+                                                                  : vulkan::CallableMode::Never;
+    if (callableMode == vulkan::CallableMode::Always)
+        return buildCallablePipeline(shared, "PRISM_VULKAN_CALLABLES=1", error);
+    if (callableMode == vulkan::CallableMode::Auto) {
+        std::string source;
+        if (AssembleVulkanKernel(code.code, &source, nullptr)) {
+            const char* retry = std::getenv("PRISM_VULKAN_RETRY_LARGE");
+            const bool retryLarge = retry && *retry && *retry != '0';
+            if (source.size() > vulkan::CallableThresholdBytes())
+                return buildCallablePipeline(shared, std::format("{} KB kernel above the {} KB threshold",
+                    source.size() >> 10, vulkan::CallableThresholdBytes() >> 10), error);
+            if (!retryLarge && std::filesystem::exists(TooLargeMarker(source)))
+                return buildCallablePipeline(shared, "the kernel was too large for DXC in an earlier run", error);
+        }
+    }
     std::vector<uint32_t> spirv;
     progress::Detail(Phase::Kernel, "SPIR-V kernel");
-    if (!CompileVulkanKernel(code.code, &spirv, error, code.programCount)) return false;
+    if (!CompileVulkanKernel(code.code, &spirv, error, code.programCount)) {
+        if (callableMode == vulkan::CallableMode::Auto && error && gpu::HlslTooLarge(*error))
+            return buildCallablePipeline(shared, "the kernel is too large for DXC", error);
+        return false;
+    }
     auto const compiled = Clock::now();
     const std::string key = gpu::SourceDigest(std::string(reinterpret_cast<const char*>(spirv.data()), spirv.size() * 4));
     if (auto found = pipelines.find(key); found != pipelines.end()) {
@@ -645,6 +761,8 @@ bool VulkanDevice::Impl::buildPipeline(std::string* error)
         return false;
     }
     VkComputePipelineCreateInfo info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    const bool statistics = rayTracing.executableStatistics && vulkan::PipelineStatisticsSetting();
+    if (statistics) info.flags = VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
     info.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
     info.stage.module = module;
@@ -659,11 +777,44 @@ bool VulkanDevice::Impl::buildPipeline(std::string* error)
     }
     pipelines[key] = pipeline;
     pipelineCode = shared;
+    if (statistics) vulkan::PrintPipelineStatistics(device, pipeline, "compute kernel");
     if (gpu::GpuVerbose())
         std::cerr << std::format("PrismRT Vulkan: shader setup {:.1f} s (MDL code {:.1f} s, SPIR-V {:.1f} s, pipeline {:.1f} s)\n",
                                  SecondsSince(start), std::chrono::duration<double>(generated - start).count(),
                                  std::chrono::duration<double>(compiled - generated).count(),
                                  SecondsSince(compiled));
+    return true;
+}
+
+bool VulkanDevice::Impl::buildCallablePipeline(std::shared_ptr<const gpu::MdlShaderCode> const& shared,
+                                               std::string const& reason, std::string* error)
+{
+    gpu::MdlShaderCode const& code = *shared;
+    auto const start = Clock::now();
+    const bool reorder = rayTracing.reorder && vulkan::ReorderSetting();
+    const std::string key = gpu::SourceDigest(code.code) + (reorder ? "|reorder" : "");
+    std::cerr << std::format("PrismRT Vulkan: {} MDL programs as callable shaders ({}){}\n", code.programCount,
+                             reason, reorder ? ", reordered by program" : "");
+    auto found = callablePipelines.find(key);
+    if (found == callablePipelines.end()) {
+        auto built = std::make_unique<vulkan::MaterialCallPipeline>(device, physical, rayTracing, pipelineCacheTag);
+        if (!built->build(code, pipelineLayout, reorder, error)) {
+            if (error) *error = "callable material pipeline: " + *error;
+            return false;
+        }
+        found = callablePipelines.emplace(key, std::move(built)).first;
+        auto const& r = found->second->report();
+        if (gpu::GpuVerbose())
+            std::cerr << std::format(
+                "PrismRT Vulkan: callable pipeline {:.1f} s: {} of {} callables compiled (DXC wall {:.1f} s, "
+                "slowest {:.1f} s, peak {} MiB; raygen {:.1f} s, {} MiB), driver pipeline {:.1f} s ({}, "
+                "+{} MiB commit)\n", SecondsSince(start), r.compiled, r.programs, r.dxcWallSeconds, r.dxcMaxSeconds,
+                r.dxcPeakBytes >> 20, r.raygenSeconds, r.raygenPeakBytes >> 20, r.pipelineSeconds,
+                r.pipelineCacheHit ? "pipeline cache hit" : "no pipeline cache", r.pipelineCommitBytes >> 20);
+    }
+    callables = found->second.get();
+    pipeline = callables->pipeline();
+    pipelineCode = shared;
     return true;
 }
 
@@ -1250,9 +1401,16 @@ bool VulkanDevice::Impl::dispatch(GpuFrame const& frame, uint32_t threads, doubl
     VkCommandBuffer commands = beginCommands();
     vkCmdResetQueryPool(commands, timestamps, 0, 2);
     vkCmdWriteTimestamp(commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, timestamps, 0);
-    vkCmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
-    vkCmdBindDescriptorSets(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
-    vkCmdDispatch(commands, (threads + 63) / 64, 1, 1);
+    if (callables) {
+        vkCmdBindDescriptorSets(commands, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, pipelineLayout, 0, 1,
+                                &descriptorSet, 0, nullptr);
+        callables->trace(commands, threads);
+    } else {
+        vkCmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+        vkCmdBindDescriptorSets(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &descriptorSet, 0,
+                                nullptr);
+        vkCmdDispatch(commands, (threads + 63) / 64, 1, 1);
+    }
     vkCmdWriteTimestamp(commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, timestamps, 1);
     if (!submit(commands, error)) return false;
     if (gpuSeconds) {
