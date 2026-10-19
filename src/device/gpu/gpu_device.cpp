@@ -334,6 +334,14 @@ bool GpuRenderDevice::RenderPreview(SceneManager& scene, PreviewRequest const& r
     return !(request.stopRequested && request.stopRequested());
 }
 
+void GpuRenderDevice::Prepare(SceneManager& scene)
+{
+    std::lock_guard lock(m_renderMutex);
+    std::string error;
+    // Failures are reported again, once, by the render call that needs the scene.
+    (void)PrepareScene(scene, &error);
+}
+
 RTCRayHit GpuRenderDevice::Intersect(SceneManager& scene, prism::PathRay const& ray)
 {
     return scene.intersectRaw(ray);

@@ -176,6 +176,20 @@ times overlap each other and coordinator waiting; they must not be added to
 wall timings as though they were sequential phases. Cancellation drains the
 pass job before releasing its staging or scene references.
 
+Render-device creation and per-scene device preparation (GPU kernel
+compilation, which can take tens of seconds with a cold DXC cache, scene and
+texture upload, and CPU light tables) run as background jobs that the render
+worker waits on while polling for a stop. Hydra's Execute stops the worker on
+camera, binding and scene changes from the host's UI thread, so it never waits
+for this work: an interrupted job keeps running, and the next render resumes
+waiting on it. Until the device is ready the viewport keeps showing its last
+image (or the initial clear). Device creation also runs outside the bridge
+mutex that Execute and `GetRenderStats` take on the UI thread. Statistics
+report `devicePreparing`, `devicePreparations`, `devicePreparationsInterrupted`
+and `devicePreparationSeconds`. With `PRISM_GPU_VERBOSE=1`, GPU devices log
+each pass's wall, dispatch, GPU and readback times; per-pass results are read
+back from host-cached memory where the Vulkan driver offers it.
+
 usdview's **default dome** is OpenUSD's Stinson Beach environment, not PrismRT's bundled indoor EXR. It uses intensity 1 and exposure 0. Hydra respects these authored values without the standalone environment's historical extra factor of two. To reproduce standalone lighting, use the same HDR and account for that factor (for example, standalone exposure -0.5 corresponds to a USD dome exposure +0.5 at intensity 1).
 
 The beach HDR contains a small, extremely bright sun. Environment MIS is now the default in both frontends: one importance-sampled environment direction competes with BSDF sampling at supported scattering vertices. The distribution uses exact texel solid angles and a small uniform mixture to cover filtered texture values. Diffuse and MDL materials supply matching BSDF evaluations/PDFs; legacy rough-metal and glTF samplers retain their BSDF-only behavior. The default sample clamp of 10 can still reduce brightness: use zero when measuring energy or variance. "Converged" means the requested sample count was reached, not that a noise threshold was met.

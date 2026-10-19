@@ -1308,6 +1308,11 @@ bool VulkanDevice::RenderPreview(SceneManager& scene, PreviewRequest const& requ
     return GpuRenderDevice::RenderPreview(scene, request);
 }
 
+void VulkanDevice::Prepare(SceneManager& scene)
+{
+    if (RendersOnCpu(scene)) m_cpu.Prepare(scene);
+}
+
 bool VulkanDevice::PrepareScene(SceneManager& scene, std::string* error) { return m_impl->ensureScene(scene, error); }
 GpuSceneData const& VulkanDevice::Data() const { return *m_impl->data; }
 uint32_t VulkanDevice::MdlTextureCount() const { return m_impl->mdlTextureCount; }

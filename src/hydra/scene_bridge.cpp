@@ -4844,22 +4844,114 @@ public:
         }
     }
 
-    // Returns the render device for the requested preference, creating it on
-    // first use or when the preference changed. Caller holds mutex.
-    std::shared_ptr<prism::device::RenderDevice> RenderDeviceLocked(
+    // Waits for a device job, returning false (and leaving the job running)
+    // as soon as the host asks the render worker to stop.
+    template <class T>
+    bool WaitForDeviceJob(std::future<T> &job) const
+    {
+        while (job.wait_for(std::chrono::milliseconds(2)) != std::future_status::ready)
+            if (renderThread->IsStopRequested()) return false;
+        return true;
+    }
+
+    // Returns the render device for the requested preference, creating it
+    // on first use or when the preference changed. Render worker only;
+    // returns null if a stop was requested before the device was ready.
+    std::shared_ptr<prism::device::RenderDevice> AcquireRenderDevice(
         prism::device::DevicePreference preference)
     {
-        if (!renderDevice || renderDevicePreference != preference) {
-            std::string note;
-            renderDevice = prism::device::CreateDevice(preference, &note);
-            renderDevicePreference = preference;
-            renderDeviceScene = nullptr;
-            if (!note.empty()) TF_WARN("PrismRT: %s", note.c_str());
-            const auto info = renderDevice->Info();
-            TF_STATUS("PrismRT: rendering on %s device: %s",
-                prism::device::ToString(info.kind), info.name.c_str());
+        {
+            std::lock_guard lock(mutex);
+            if (renderDevice && renderDevicePreference == preference) return renderDevice;
         }
+        if (deviceCreation.valid() && deviceCreationPreference != preference) {
+            if (!WaitForDeviceJob(deviceCreation)) {
+                ++devicePreparationsInterrupted;
+                return nullptr;
+            }
+            try { (void)deviceCreation.get(); }
+            catch (...) {}
+        }
+        if (!deviceCreation.valid()) {
+            deviceCreationPreference = preference;
+            deviceCreation = std::async(std::launch::async, [preference] {
+                CreatedDevice created;
+                created.device = prism::device::CreateDevice(preference, &created.note);
+                return created;
+            });
+        }
+        if (!WaitForDeviceJob(deviceCreation)) {
+            ++devicePreparationsInterrupted;
+            return nullptr;
+        }
+        CreatedDevice created;
+        try {
+            created = deviceCreation.get();
+        } catch (std::exception const &e) {
+            TF_WARN("PrismRT: render device creation failed: %s", e.what());
+        }
+        if (!created.device) created.device = prism::device::CreateDevice(
+            prism::device::DevicePreference::Cpu, &created.note);
+        if (!created.note.empty()) TF_WARN("PrismRT: %s", created.note.c_str());
+        const auto info = created.device->Info();
+        TF_STATUS("PrismRT: rendering on %s device: %s",
+            prism::device::ToString(info.kind), info.name.c_str());
+        std::lock_guard lock(mutex);
+        renderDevice = created.device;
+        renderDevicePreference = preference;
+        renderDeviceScene = nullptr;
+        ++deviceSceneEpoch;
         return renderDevice;
+    }
+
+    // Runs the device's per-scene preparation for the displayed snapshot as
+    // a job. Render worker only; false if a stop was requested first.
+    bool PrepareRenderDevice(std::shared_ptr<prism::device::RenderDevice> const &device,
+                             std::shared_ptr<Snapshot> const &prepared)
+    {
+        uint64_t epoch;
+        {
+            std::lock_guard lock(mutex);
+            epoch = deviceSceneEpoch;
+            if (devicePreparedEpoch == epoch) return true;
+        }
+        if (devicePreparation.valid() && devicePreparationEpoch != epoch) {
+            // A superseded job still owns the device; it cannot be cancelled.
+            if (!WaitForDeviceJob(devicePreparation)) {
+                ++devicePreparationsInterrupted;
+                return false;
+            }
+            try { devicePreparation.get(); }
+            catch (...) {}
+        }
+        if (!devicePreparation.valid()) {
+            devicePreparationEpoch = epoch;
+            // The job owns the snapshot, so a published replacement cannot
+            // free or (as an inactive bank) edit the scene it is reading.
+            devicePreparation = std::async(std::launch::async,
+                [this, device, prepared] {
+                    const auto start = std::chrono::steady_clock::now();
+                    device->Prepare(*prepared->scene);
+                    const double seconds = std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - start).count();
+                    std::lock_guard lock(mutex);
+                    devicePreparationSeconds = seconds;
+                });
+        }
+        if (!WaitForDeviceJob(devicePreparation)) {
+            ++devicePreparationsInterrupted;
+            return false;
+        }
+        try {
+            devicePreparation.get();
+        } catch (std::exception const &e) {
+            TF_WARN("PrismRT: render device preparation failed: %s", e.what());
+        }
+        ++devicePreparations;
+        std::lock_guard lock(mutex);
+        if (deviceSceneEpoch == devicePreparationEpoch)
+            devicePreparedEpoch = devicePreparationEpoch;
+        return true;
     }
 
     // Builds the second bank for the snapshot just published, from the same
@@ -4930,6 +5022,16 @@ public:
 
     ~Impl()
     {
+        // Device jobs own their device and snapshot; let them finish before
+        // the snapshots' shared Embree device is released.
+        if (deviceCreation.valid()) {
+            try { (void)deviceCreation.get(); }
+            catch (...) {}
+        }
+        if (devicePreparation.valid()) {
+            try { devicePreparation.get(); }
+            catch (...) {}
+        }
         if (buildCancel) buildCancel->store(true, std::memory_order_relaxed);
         if (buildFuture.valid()) {
             try { (void)buildFuture.get(); }
@@ -4957,6 +5059,27 @@ public:
     // Integrator settings the render device last saw: GPU devices copy them
     // into their scene data, so a change must reach them like an edit.
     std::tuple<int, int, bool, int> renderDeviceSettings{};
+    // Device creation and per-scene device preparation (GPU kernel
+    // compilation, scene and texture upload) can take tens of seconds. They
+    // run as jobs the render worker waits on while polling for a stop, so a
+    // host StopRender never waits for them; an interrupted job keeps running
+    // and the next Render resumes waiting on it. Only the render worker
+    // touches these futures (and ~Impl, after the worker has stopped).
+    struct CreatedDevice {
+        std::shared_ptr<prism::device::RenderDevice> device;
+        std::string note;
+    };
+    std::future<CreatedDevice> deviceCreation;
+    prism::device::DevicePreference deviceCreationPreference = prism::device::DevicePreference::Auto;
+    std::future<void> devicePreparation;
+    uint64_t devicePreparationEpoch = 0;
+    // Advanced (under mutex) whenever the device or its view of the scene
+    // changes; devicePreparedEpoch records the last epoch fully prepared.
+    uint64_t deviceSceneEpoch = 1;
+    uint64_t devicePreparedEpoch = 0;
+    std::atomic<uint64_t> devicePreparationsInterrupted{0};
+    std::atomic<uint64_t> devicePreparations{0};
+    double devicePreparationSeconds = 0.0;
     std::atomic<int64_t> embreeLiveBytes{0};
     std::atomic<int64_t> embreePeakBytes{0};
     mutable std::mutex mutex;
@@ -6261,9 +6384,16 @@ void SceneBridge::Render()
     std::shared_ptr<prism::device::RenderDevice> renderDevice;
     {
         std::lock_guard lock(_impl->mutex);
+        settings = _impl->settings;
+    }
+    // Device creation runs outside the bridge mutex, which Hydra's Execute
+    // and render statistics take on the host thread.
+    renderDevice = _impl->AcquireRenderDevice(settings.device);
+    if (!renderDevice) return;
+    {
+        std::lock_guard lock(_impl->mutex);
         snapshot = _impl->snapshot; camera = _impl->camera;
         bindings = _impl->bindings; settings = _impl->settings;
-        renderDevice = _impl->RenderDeviceLocked(settings.device);
         // Published edits replace the snapshot or advance its generation;
         // camera changes do neither.
         const auto deviceSettings = snapshot && snapshot->scene
@@ -6278,6 +6408,7 @@ void SceneBridge::Render()
             _impl->renderDeviceScene = snapshot->scene.get();
             _impl->renderDeviceGeneration = _impl->activeGeneration;
             _impl->renderDeviceSettings = deviceSettings;
+            ++_impl->deviceSceneEpoch;
         }
         width = _impl->width; height = _impl->height;
         generation = _impl->activeGeneration;
@@ -6318,6 +6449,10 @@ void SceneBridge::Render()
         }
         _converged.store(!preparing); return;
     }
+    // Kernel compilation and scene upload happen here, not inside the
+    // preview or pass, so a host stop never waits for them.
+    if ((hasColor || hasGeometric) &&
+        !_impl->PrepareRenderDevice(renderDevice, snapshot)) return;
     for (HdRenderPassAovBinding const &binding : bindings) {
         TfToken const &name = binding.aovName;
         const bool supported = name == HdAovTokens->color ||
@@ -6875,6 +7010,11 @@ VtDictionary SceneBridge::GetStats() const
     result["percentDone"] = VtValue(converged ? 100.0 :
         std::clamp(100.0 * static_cast<double>(completed) / targetSamples, 0.0, 100.0));
     result["refinementPublishes"] = VtValue(static_cast<int64_t>(_impl->refinementPublishes));
+    result["devicePreparing"] = VtValue(_impl->devicePreparedEpoch != _impl->deviceSceneEpoch);
+    result["devicePreparations"] = VtValue(static_cast<int64_t>(_impl->devicePreparations.load()));
+    result["devicePreparationsInterrupted"] = VtValue(
+        static_cast<int64_t>(_impl->devicePreparationsInterrupted.load()));
+    result["devicePreparationSeconds"] = VtValue(_impl->devicePreparationSeconds);
     result["firstPassPrimaryScratchBytes"] = VtValue(static_cast<int64_t>(_impl->firstPassPrimaryScratchBytes));
     result["colorTracedPixels"] = VtValue(static_cast<int64_t>(_impl->colorTracedPixels.load()));
     result["geometricOnlyPixels"] = VtValue(static_cast<int64_t>(_impl->geometricOnlyPixels.load()));
