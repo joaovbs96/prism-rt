@@ -70,7 +70,15 @@ on the CPU device until the scene changes.
 | First run: MDL codegen + DXC (`-Od`) + Metal shader converter + Metal pipeline | about 30 s |
 | Later runs (metallib cached in `~/Library/Caches/PrismRT/metal`, pipeline in Metal's system cache) | about 1.2 s shader setup, 2.3 s scene setup in total |
 
-The Vulkan device caches its SPIR-V the same way (`.../PrismRT/vulkan`). Uploaded textures
+The Vulkan device caches its SPIR-V the same way (`.../PrismRT/vulkan`, or
+`PRISM_CACHE_DIR/vulkan`). Next to each kernel it keeps the driver's
+pipeline-cache data (`<SPIR-V digest>-<pipeline cache UUID>-<vendor>-<device>-<driver version>.vkpc`),
+so creating the pipeline does not depend on the driver's own shader cache,
+which other applications share and may evict: an evicted 2 MB kernel took 8 s to
+create on an RTX 4070 Ti, against 0.01-0.05 s from either cache. A driver
+update or another GPU reads its own file; the driver checks the data header
+again. Both files are written to a temporary name and renamed, so processes
+sharing the cache directory never read a partial file. Uploaded textures
 are reused across Hydra scene rebuilds.
 
 ## Mac GPU vs CPU

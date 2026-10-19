@@ -239,7 +239,29 @@ USD dome lighting is read when `--env` is absent. Explicit `--env` overrides it 
 
 ## Loading measurements
 
-`GetRenderStats()` exposes material conversion/generation/compilation counters and timings, worker CPU time separately from batch elapsed time, prototype/placement rebuild counters, Embree timings, and buffer publication/mapping timing. Set `PRISM_PROFILE_BUFFERS=1` to measure worker buffer-write time; workers accumulate timings locally and update each buffer once per tile, while ordinary rendering leaves this instrumentation disabled. Material compilation concurrency is configured with `PRISM_MATERIAL_THREADS`; the default is half the hardware threads capped at four, with a minimum of one. `PRISM_MDL_VERBOSE=1` enables compiler diagnostics that would otherwise obscure loading measurements.
+Set `PRISM_LOAD_PROFILE=1` to print a loading timeline to stderr: one
+`[load] t=<seconds since process start> span <phase> start=... wall=... cpu=... par=...`
+line per phase (USD stage open and engine creation in `prism_hydra_render`,
+capture, the snapshot build and its material, mesh, walk and Embree phases,
+each material conversion and compilation with its sub-phase milliseconds,
+texture preparation, render-device creation and preparation, Vulkan shader
+and scene setup) and `mark` lines for events (scene notices with their dirty
+kinds, publication or discard of a generation, first preview and first full
+sample). `cpu` is process CPU time during the phase, so `par` is its average
+parallelism including whatever ran concurrently. Disabled, it costs a flag
+test per phase.
+
+Material conversion (hdMtlx) runs on the material workers, each converting an
+item and then compiling it, largest graphs first; conversions share USD's
+hdMtlx standard library under a reader lock, and a network whose node
+definitions hdMtlx would add to that library converts alone. Meshes convert in
+a TBB task while the materials compile; a mesh whose bound network has a
+connected displacement terminal waits for its material, and the refinement
+budget planned before the materials resolved must hold afterwards, or the
+batch's meshes convert again (counted by `speculativeMeshRetries`). UDIM tiles
+are read, hashed and published in parallel.
+
+`GetRenderStats()` exposes material conversion/generation/compilation counters and timings, worker CPU time separately from batch elapsed time, prototype/placement rebuild counters, Embree timings, and buffer publication/mapping timing. Set `PRISM_PROFILE_BUFFERS=1` to measure worker buffer-write time; workers accumulate timings locally and update each buffer once per tile, while ordinary rendering leaves this instrumentation disabled. Material compilation concurrency is configured with `PRISM_MATERIAL_THREADS`; the default is half the hardware threads capped at eight, with a minimum of one (14 workers measured no faster than 8 on a 28-thread machine: the native JITs slow down in proportion). `PRISM_MDL_VERBOSE=1` enables compiler diagnostics that would otherwise obscure loading measurements.
 
 Supported prototype edits repoint dependent instances while retaining the top-level scene. Placement identity includes every instancer path, authored source index and duplicate occurrence; source-order changes refresh picking ordinals without replacing unchanged instances. Unsupported geometry changes and sphere batch membership use named conservative fallbacks. `lastPlacementRecordsVisited`, `lastPlacementTransformsUpdated`, `lastVisibilityPlacementsUpdated`, `lastPrototypePathsUpdated` and `lastPrototypePlacementsRepointed` distinguish visited records from changed work across each bank's outstanding journal. `topLevelSceneCommits` counts commits separately from scene allocations. Dependency lookup limits geometry updates; picking metadata, geometry ownership cleanup and cached-count refresh may still scan retained scene data.
 
