@@ -10,6 +10,7 @@
 #include "../gpu/texture_budget.h"
 #include "../gpu/hlsl_compiler.h"
 #include "../gpu/shader_sources.h"
+#include "../../progress.h"
 #include "../../scene.h"
 #include "../../texture_service.h"
 
@@ -130,6 +131,16 @@ struct AccelerationStructure {
 
 } // namespace
 
+// A short reason for a scene the GPU cannot render, for the host's status line.
+static std::string FallbackSummary(std::string const& error)
+{
+    if (error.find("too large") != std::string::npos || gpu::HlslTooLarge(error)) return "kernel too large";
+    if (error.starts_with("DXC failed") || error.starts_with("cannot run")) return "kernel compile failed";
+    std::string first = error.substr(0, error.find_first_of("\r\n"));
+    if (first.size() > 60) first = first.substr(0, 57) + "...";
+    return first.empty() ? "scene not supported" : first;
+}
+
 bool CompileVulkanKernel(std::string const& mdlCode, std::vector<uint32_t>* spirv, std::string* error,
                          uint32_t programCount)
 {
@@ -168,6 +179,8 @@ bool CompileVulkanKernel(std::string const& mdlCode, std::vector<uint32_t>* spir
         }
         std::cerr << std::format("PrismRT Vulkan: compiling the GPU kernel ({} MDL programs, {} KB of HLSL); this "
                                  "happens once per material set\n", programCount, source.size() >> 10);
+        progress::Detail(Phase::Kernel, std::format("DXC to SPIR-V, {} MDL programs, {} KB HLSL",
+                                                    programCount, source.size() >> 10));
         std::string reason;
         if (!gpu::CompileHlsl(source, gpu::HlslTarget::Spirv, cacheDirectory, &bytes, &reason)) {
             if (gpu::HlslTooLarge(reason)) std::ofstream(tooLarge) << reason << '\n';
@@ -598,6 +611,8 @@ bool VulkanDevice::Impl::submit(VkCommandBuffer commands, std::string* error)
 bool VulkanDevice::Impl::buildPipeline(std::string* error)
 {
     auto const start = Clock::now();
+    progress::Scope kernelPhase(Phase::Kernel);
+    progress::Detail(Phase::Kernel, "generating MDL shader code");
     const auto shared = gpu::CachedMdlShaderCode(data->mdlMaterials);
     gpu::MdlShaderCode const& code = *shared;
     auto const generated = Clock::now();
@@ -611,6 +626,7 @@ bool VulkanDevice::Impl::buildPipeline(std::string* error)
     if (shared == pipelineCode && pipeline != VK_NULL_HANDLE) return true;
     pipelineCode = nullptr;
     std::vector<uint32_t> spirv;
+    progress::Detail(Phase::Kernel, "SPIR-V kernel");
     if (!CompileVulkanKernel(code.code, &spirv, error, code.programCount)) return false;
     auto const compiled = Clock::now();
     const std::string key = gpu::SourceDigest(std::string(reinterpret_cast<const char*>(spirv.data()), spirv.size() * 4));
@@ -619,6 +635,7 @@ bool VulkanDevice::Impl::buildPipeline(std::string* error)
         pipelineCode = shared;
         return true;
     }
+    progress::Detail(Phase::Kernel, "creating the Vulkan pipeline");
     VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     moduleInfo.codeSize = spirv.size() * 4;
     moduleInfo.pCode = spirv.data();
@@ -705,6 +722,8 @@ bool VulkanDevice::Impl::uploadImages(std::string* error)
         }
         missing.push_back(i);
     }
+    progress::SetTotal(Phase::Upload, missing.size());
+    progress::Detail(Phase::Upload, missing.empty() ? "images (cached)" : "images");
 
     // Texel data of one image, converted for upload. Same storage policy as
     // the Metal device (see UploadImage there).
@@ -772,6 +791,7 @@ bool VulkanDevice::Impl::uploadImages(std::string* error)
                     }
                 }
             });
+        progress::Add(Phase::Upload);
     };
 
     // Creates the image of `prepared`, recording its upload and mipmaps.
@@ -1147,6 +1167,8 @@ bool VulkanDevice::Impl::ensureScene(SceneManager& scene, std::string* error)
     auto const sceneStart = Clock::now();
     dirty = false;
     boundScene = &scene;
+    progress::Scope uploadPhase(Phase::Upload);
+    progress::Detail(Phase::Upload, "converting the scene");
     data = std::make_unique<GpuSceneData>(gpu::BuildGpuScene(scene));
     for (auto const& warning : data->warnings) std::cerr << "PrismRT Vulkan: " << warning << '\n';
     auto fail = [&] {
@@ -1158,6 +1180,7 @@ bool VulkanDevice::Impl::ensureScene(SceneManager& scene, std::string* error)
     };
     if (!buildPipeline(error)) return fail();
     GpuSceneData const& d = *data;
+    progress::Detail(Phase::Upload, "buffers");
     auto bytes = [](auto const& v) { return v.size() * sizeof(v[0]); };
     upload(kSlotPositions, d.positions.data(), bytes(d.positions));
     upload(kSlotNormals, d.normals.data(), bytes(d.normals));
@@ -1189,6 +1212,8 @@ bool VulkanDevice::Impl::ensureScene(SceneManager& scene, std::string* error)
     auto const uploaded = Clock::now();
     if (!uploadImages(error)) return fail();
     auto const imaged = Clock::now();
+    progress::SetTotal(Phase::Upload, 0);
+    progress::Detail(Phase::Upload, "acceleration structures");
     if (!buildAccelerationStructures(error) || !writeDescriptors(error)) return fail();
     if (gpu::GpuVerbose())
         std::cerr << std::format("PrismRT Vulkan: scene {:.3f} s (buffers {:.3f}, images {:.3f}, "
@@ -1278,10 +1303,12 @@ bool VulkanDevice::RendersOnCpu(SceneManager& scene)
     std::lock_guard lock(m_renderMutex);
     std::string error;
     if (m_impl->ensureScene(scene, &error)) {
+        if (!m_cpuReason.empty()) progress::Device("vulkan: " + m_impl->name);
         m_cpuReason.clear();
         return false;
     }
     if (error != m_cpuReason) {
+        progress::Device("cpu (Vulkan fallback: " + FallbackSummary(error) + ")");
         std::cerr << LogPrefix() << error << '\n'
                   << LogPrefix() << "cannot render the scene on the GPU; rendering it with the CPU device\n";
         m_cpuReason = error;
