@@ -65,8 +65,12 @@ int RunLimited(std::string command, uint64_t memoryLimit, std::string* log, bool
     startup.StartupInfo.hStdError = writeEnd;
     startup.lpAttributeList = attributes;
     PROCESS_INFORMATION process{};
+    // A caller running above normal priority (a compile others wait for) passes it on.
+    const DWORD priority = GetThreadPriority(GetCurrentThread()) > THREAD_PRIORITY_NORMAL
+        ? ABOVE_NORMAL_PRIORITY_CLASS : 0;
     const bool started = CreateProcessA(nullptr, command.data(), nullptr, nullptr, TRUE,
-                                        EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_NO_WINDOW,
+                                        EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_NO_WINDOW |
+                                            priority,
                                         nullptr, nullptr, &startup.StartupInfo, &process);
     DeleteProcThreadAttributeList(attributes);
     CloseHandle(writeEnd);

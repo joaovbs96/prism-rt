@@ -134,11 +134,19 @@ private:
 uint32_t AlignUp(uint32_t value, uint32_t alignment) { return (value + alignment - 1) / alignment * alignment; }
 
 // DXC processes run at once (PRISM_DXC_JOBS; each is memory capped by
-// PRISM_DXC_MEMORY_MIB).
+// PRISM_DXC_MEMORY_MIB). DXC is single threaded and a callable's compile
+// takes at most about 450 MiB: by default half the hardware threads, at most
+// 12 and one per 2 GiB of physical memory.
 unsigned DxcJobs()
 {
     if (const char* value = Setting("PRISM_DXC_JOBS")) return unsigned(std::max(1, std::atoi(value)));
-    return std::clamp(std::thread::hardware_concurrency() / 4u, 1u, 4u);
+    unsigned jobs = std::clamp(std::thread::hardware_concurrency() / 2u, 1u, 12u);
+#ifdef _WIN32
+    MEMORYSTATUSEX status{};
+    status.dwLength = sizeof(status);
+    if (GlobalMemoryStatusEx(&status)) jobs = std::clamp(unsigned(status.ullTotalPhys >> 31), 1u, jobs);
+#endif
+    return jobs;
 }
 
 // Shaders compiled at once, DXC and driver (PRISM_VULKAN_COMPILE_THREADS).
@@ -551,6 +559,11 @@ void MaterialCallShaders::prewarmRaygen()
 {
     if (m_prewarm.valid() || !m_libraries) return;
     m_prewarm = std::async(std::launch::async, [this] {
+#ifdef _WIN32
+        // The raygen shader is usually the last shader a first scene waits
+        // for: ahead of the scene loading that runs meanwhile (DXC inherits it).
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+#endif
         std::string source, error;
         if (RaygenSource(false, 0, &source, &error)) (void)shader(source, true);
     });
