@@ -1,6 +1,7 @@
 #include "texture_service.h"
 #include "resource_limits.h"
 #include "load_profile.h"
+#include "texture_writer.h"
 
 #include <OpenImageIO/imagebuf.h>
 #include <OpenImageIO/imagebufalgo.h>
@@ -17,6 +18,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
+#include <condition_variable>
 #include <mutex>
 #include <functional>
 #include <chrono>
@@ -142,6 +144,54 @@ int openFileLimit()
     return static_cast<int>(prism::ResourceLimit("PRISM_TEXTURE_OPEN_FILES",
         static_cast<uint64_t>(fallback), 8192));
 }
+
+// Memory admitted to cold preparations at once. A preparation holds the
+// decoded source, its float copy and the mip chain while it runs (about
+// 2.5 x 4WHC; see TexturePreparationThreadCount), so callers that prepare
+// many images concurrently, such as a UDIM family, wait here instead of
+// exhausting memory. An image larger than the whole budget runs alone.
+class PreparationBudget {
+public:
+    static PreparationBudget &instance()
+    {
+        static PreparationBudget budget;
+        return budget;
+    }
+    class Reservation {
+    public:
+        Reservation(PreparationBudget &budget, uint64_t bytes) : m_budget(budget), m_bytes(bytes)
+        {
+            std::unique_lock lock(m_budget.m_mutex);
+            m_budget.m_changed.wait(lock, [&] {
+                return m_budget.m_used == 0 || m_budget.m_used + m_bytes <= m_budget.m_limit;
+            });
+            m_budget.m_used += m_bytes;
+        }
+        ~Reservation()
+        {
+            {
+                std::lock_guard lock(m_budget.m_mutex);
+                m_budget.m_used -= m_bytes;
+            }
+            m_budget.m_changed.notify_all();
+        }
+        Reservation(Reservation const &) = delete;
+        Reservation &operator=(Reservation const &) = delete;
+    private:
+        PreparationBudget &m_budget;
+        uint64_t m_bytes;
+    };
+private:
+    PreparationBudget()
+    {
+        const uint64_t physical = physicalMemoryMB();
+        const uint64_t fallback = std::clamp<uint64_t>(physical / 8, 2048, 16384);
+        m_limit = prism::ResourceLimit("PRISM_TEXTURE_PREPARE_MB", fallback, 1u << 20) << 20;
+    }
+    std::mutex m_mutex;
+    std::condition_variable m_changed;
+    uint64_t m_used = 0, m_limit = 0;
+};
 
 uint64_t processId()
 {
@@ -923,6 +973,12 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
         throw std::invalid_argument("texture alpha channel is outside source image");
     if (!cacheFilePresent) {
         stageStart = std::chrono::steady_clock::now();
+        const uint64_t estimate = static_cast<uint64_t>(std::max(spec.width, spec.full_width)) *
+            static_cast<uint64_t>(std::max(spec.height, spec.full_height)) *
+            static_cast<uint64_t>(spec.nchannels) * sizeof(float) * 5 / 2;
+        PreparationBudget::Reservation reservation(PreparationBudget::instance(), estimate);
+        m_impl->lockWaitNanoseconds.fetch_add(elapsedNanoseconds(stageStart), std::memory_order_relaxed);
+        stageStart = std::chrono::steady_clock::now();
         std::vector<float> sourcePixels(static_cast<size_t>(spec.width) * spec.height * spec.nchannels);
         std::unique_ptr<OIIO::ImageInput> decodeInput;
         if (decodeInspected) {
@@ -1042,54 +1098,45 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
             std::vector<float>().swap(sourcePixels);
         }
         std::vector<float> &pixels = identity ? sourcePixels : outputPixels;
-        // make_texture reads a wrapped buffer in place; no copy is needed.
-        OIIO::ImageBuf normalized(normalizedSpec, OIIO::span<float>(pixels.data(), pixels.size()));
         const uint64_t pixelNanosecondsThis = elapsedNanoseconds(stageStart);
         m_impl->pixelNanoseconds.fetch_add(pixelNanosecondsThis, std::memory_order_relaxed);
         stageStart = std::chrono::steady_clock::now();
         static std::atomic<uint64_t> serial{0};
         const auto temp = root / (key + "." + std::to_string(processId()) + "." +
                                   std::to_string(++serial) + ".tmp.exr");
-        OIIO::ImageSpec config;
-        config.format = OIIO::TypeDesc::FLOAT;
-        config.tile_width = config.tile_height = 64;
-        config.attribute("maketx:resize", 0);
-        config.attribute("maketx:forcefloat", 1);
-        config.attribute("maketx:fileformatname", "openexr");
-        config.attribute("maketx:nomipmap", 0);
-        auto wrapName = [](TextureWrap value) -> char const * {
-            switch (value) {
-            case TextureWrap::Black: return "black";
-            case TextureWrap::Clamp: return "clamp";
-            case TextureWrap::Periodic: return "periodic";
-            case TextureWrap::Mirror: return "mirror";
-            case TextureWrap::PeriodicPow2: return "periodic, pow2";
-            case TextureWrap::Shadow: return "black";
-            default: return "default";
-            }
-        };
-        config.attribute("maketx:swrap", wrapName(options.wrapS));
-        config.attribute("maketx:twrap", wrapName(options.wrapT));
-        const bool profiled = prism::load_profile::Enabled();
-        std::ostringstream makeStats;
-        if (profiled) config.attribute("maketx:stats", 1);
-        if (!OIIO::ImageBufAlgo::make_texture(OIIO::ImageBufAlgo::MakeTxTexture,
-                                               normalized, temp.string(), config,
-                                               profiled ? &makeStats : nullptr)) {
-            std::filesystem::remove(temp);
-            throw std::runtime_error("cannot prepare texture " + absolute.string() + ": " + OIIO::geterror());
+        // The file make_texture would write for this image (a plain float
+        // texture: black wrap modes in the file, box-filtered mips, 64x64
+        // tiles), written by texture_writer instead; see texture_writer.h.
+        // A lookup with the default wrap mode uses the file's.
+        OIIO::ImageSpec textureSpec = normalizedSpec;
+        textureSpec.tile_width = textureSpec.tile_height = 64;
+        textureSpec.tile_depth = 1;
+        textureSpec.attribute("compression", texture_writer::PreparedCompression());
+        textureSpec.attribute("planarconfig", "contig");
+        textureSpec.attribute("wrapmodes", "black,black");
+        textureSpec.attribute("textureformat", "Plain Texture");
+        textureSpec.attribute("fovcot", static_cast<float>(displayWidth) / static_cast<float>(displayHeight));
+        textureSpec.attribute("openexr:roundingmode", 0);
+        std::vector<texture_writer::Level> levels(1);
+        levels[0].width = displayWidth;
+        levels[0].height = displayHeight;
+        levels[0].pixels = std::move(pixels);
+        texture_writer::BuildMipChain(levels, outChannels);
+        const uint64_t mipNanosecondsThis = elapsedNanoseconds(stageStart);
+        const auto writeStart = std::chrono::steady_clock::now();
+        std::string writeError;
+        if (!texture_writer::WriteMipmappedExr(temp, textureSpec, levels, &writeError)) {
+            std::error_code ignored;
+            std::filesystem::remove(temp, ignored);
+            throw std::runtime_error("cannot prepare texture " + absolute.string() + ": " + writeError);
         }
+        const uint64_t writeNanosecondsThis = elapsedNanoseconds(writeStart);
+        std::vector<texture_writer::Level>().swap(levels);
         const uint64_t makeNanoseconds = elapsedNanoseconds(stageStart);
         m_impl->mipNanoseconds.fetch_add(makeNanoseconds, std::memory_order_relaxed);
-        if (profiled) {
+        if (prism::load_profile::Enabled()) {
             // One line per cold preparation: the source's storage and the
-            // make_texture stages (OIIO's own timers, in seconds).
-            auto stat = [&](std::string const &label) {
-                const std::string text = makeStats.str();
-                const size_t at = text.find(label);
-                if (at == std::string::npos) return 0.0;
-                return std::atof(text.c_str() + at + label.size());
-            };
+            // preparation stages.
             std::error_code sizeError;
             const auto preparedBytes = std::filesystem::file_size(temp, sizeError);
             prism::load_profile::Mark("texture.cold", std::string("name=") + absolute.filename().string() +
@@ -1100,10 +1147,9 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
                 " decode_ms=" + std::to_string(decodeNanosecondsThis / 1000000) +
                 " pixel_ms=" + std::to_string(pixelNanosecondsThis / 1000000) +
                 " make_ms=" + std::to_string(makeNanoseconds / 1000000) +
-                " mip_s=" + std::to_string(stat("mip computation:")) +
-                " write_s=" + std::to_string(stat("file write:")) +
-                " hash_s=" + std::to_string(stat("hash:")) +
-                " stats_s=" + std::to_string(stat("pixelstats:")) +
+                " mip_s=" + std::to_string(mipNanosecondsThis / 1e9) +
+                " write_s=" + std::to_string(writeNanosecondsThis / 1e9) +
+                " hash_s=0 stats_s=0" +
                 " tx_mb=" + std::to_string((sizeError ? 0 : preparedBytes) >> 20));
         }
         std::error_code ec;
@@ -1294,11 +1340,21 @@ std::shared_ptr<const TextureResource> TextureService::prepare(
     static std::atomic<uint64_t> serial{0};
     const auto materialized = root / ("embedded-" + std::to_string(processId()) + "-" +
         std::to_string(++serial) + ".exr");
-    OIIO::ImageBuf copy(source);
+    // The pixels read above, written in the source's own format (which the
+    // OpenEXR writer stores as it would the ImageBuf's), through the
+    // failure-safe writer: OIIO's ImageBuf::write keeps writing after a
+    // failed chunk.
+    OIIO::ImageSpec materializedSpec = spec;
+    materializedSpec.tile_width = materializedSpec.tile_height = materializedSpec.tile_depth = 0;
     if (sourceIsUnassociated)
-        copy.specmod().attribute("oiio:UnassociatedAlpha", 1);
-    if (!copy.write(materialized.string()))
-        throw std::runtime_error("cannot materialize in-memory texture: " + copy.geterror());
+        materializedSpec.attribute("oiio:UnassociatedAlpha", 1);
+    std::string materializeError;
+    if (!texture_writer::WriteImageSafely(materialized, materializedSpec, sourcePixels.data(),
+                                          OIIO::TypeDesc::FLOAT, &materializeError)) {
+        std::error_code ignored;
+        std::filesystem::remove(materialized, ignored);
+        throw std::runtime_error("cannot materialize in-memory texture: " + materializeError);
+    }
     try {
         auto resource = prepareImpl(materialized, options, key);
         std::error_code ec;

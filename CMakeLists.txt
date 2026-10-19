@@ -543,6 +543,11 @@ if(PRISM_BUILD_HYDRA)
     target_link_libraries(prism_texture_service_test PRIVATE PrismRT::core)
     add_test(NAME prism_texture_service_test COMMAND prism_texture_service_test)
 
+    add_executable(prism_texture_writer_test tests/texture_writer.cpp)
+    target_link_libraries(prism_texture_writer_test PRIVATE PrismRT::core)
+    add_test(NAME prism_texture_writer_test COMMAND prism_texture_writer_test)
+    set_tests_properties(prism_texture_writer_test PROPERTIES TIMEOUT 300)
+
     add_executable(prism_resolved_material_resource_test
         tests/resolved_material_resource.cpp)
     target_include_directories(prism_resolved_material_resource_test PRIVATE ${PXR_INCLUDE_DIRS})
