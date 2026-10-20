@@ -69,9 +69,11 @@ Scenes: **Eggs** (MaterialEggs), **OpenPBR** (OpenPBRShaderPlayground),
 
 ## Scale and performance
 
-- **Out-of-core textures for the GPU.** Images that do not fit the GPU budget
-  are uploaded at reduced resolution; ALab's 78 GB 4K texture pack needs
-  streaming or virtual texturing.
+- **Out-of-core textures for the GPU.** *Mip-level streaming on Vulkan: in
+  progress* (see [texture service](texture_service.md#gpu-texture-streaming)):
+  feedback-driven residency of whole mip levels, verification incomplete.
+  Still open: tile-granularity streaming, Metal, and ALab (more images than
+  the descriptor array and the driver's allocation count allow).
 - **GPU kernel compile time** grows with the material set (OpenPBR and Eggs
   take three to six minutes on first use).
 - **Per-material shading for large material sets.** The GPU kernel is one

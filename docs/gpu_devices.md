@@ -421,6 +421,10 @@ they change the image, not just its noise.
   (8-bit when every value is k/255, half below 60000, otherwise float),
   environments as float. Metal still estimates one byte per component and
   reads the `.tx.exr`.
+- `PRISM_GPU_TEXTURE_STREAMING=0`: Vulkan uploads whole textures (reduced to
+  the budget) instead of streaming mip levels; see
+  [texture streaming](texture_service.md#gpu-texture-streaming). Early image
+  uploads below run only then.
 - `PRISM_GPU_TEXTURE_COPIES=0`: Vulkan uploads from the float `.tx.exr`
   files, as before GPU-ready copies.
 - Early image uploads (Vulkan): every texture prepared while the device
