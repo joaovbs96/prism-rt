@@ -74,13 +74,47 @@ What the timeline showed before the change, and what changed:
   UDIM `.tx.exr` creation inside one material's compile) and, on Vulkan, by
   DXC (9-23 s, cached afterwards) and driver pipeline compilation (up to 17 s
   for ALab's kernel, now cached in `.vkpc` files).
-- Teapot on Vulkan spends 6.5-8.9 s per warm run decoding its 94 prepared
-  float textures (5.6 GB) into GPU formats; a GPU-format texture cache would
-  remove most of it.
+- Teapot on Vulkan spent 6.5-8.9 s per warm run decoding its 94 prepared
+  float textures (5.6 GB) into GPU formats; GPU-ready copies now remove most
+  of it (see below).
 - The usdview "discarded first build": usdview edits its default light about
   1.2 s after population, which cancels the first generation. The second
   generation reuses the conversions and programs the first finished, so this
   costs about 1 s now.
+
+## Texture pipeline v2 (October 2026)
+
+Same setup as above (480x270, 4 spp, 24 GB cap), process wall time; cold is
+an empty `PRISM_CACHE_DIR` (Vulkan cold includes DXC and driver compiles),
+warm the next run on that cache. Single rounds on a machine in use; repeated
+identical cold runs varied up to 1.5x. See
+[the texture service](texture_service.md#preparation-pipeline).
+
+| Scene | CPU cold | CPU warm | Vulkan cold | Vulkan warm |
+| --- | ---: | ---: | ---: | ---: |
+| Teapot (94 textures, UDIM) | 30.3 s → 11.8 s | 3.4 s → 2.8 s | 40.5 s → 15.0 s | 12.2 s → 4.9 s |
+| Lion (38, UDIM) | 23.1 s → 10.0–12.9 s | 4.4 s → 3.3 s | 53.5 s → 28.3 s | 9.5 s → 4.9 s |
+| Chess (43) | 5.4 s → 4.9 s | 3.9 s → 3.3 s | 10.0 s → 7.9 s | 5.4 s → 4.3 s |
+| OpenPBR playground (152) | 49.1 s → 25.2 s | 10.6 s → 8.4 s | 85.2 s → 48.1 s | 34.5 s → 17.0 s |
+
+- UDIM tiles are prepared in parallel (Teapot CPU cold 30 s → 12 s, Lion
+  23 s → 11 s); they were prepared one after another inside one material's
+  compile.
+- Vulkan uploads read the GPU-ready copies instead of decoding the float
+  `.tx.exr` files: image preparation 7.4 s → 1.7 s warm on Teapot, 18.2 s →
+  3.5 s on OpenPBR. Image memory went from 5611 to 5334 MiB (Teapot) and 6694
+  to 5392 MiB (OpenPBR): images reduced for the budget stay 8-bit, and the
+  budget counts 16-bit textures at two bytes per component, so more images
+  are reduced (Teapot 4 → 7 of 94, OpenPBR 38 → 42 of 152) and the budget is
+  now actually respected. 8-bit sources already uploaded as 8-bit (every
+  MaterialX texture is prepared with gamma 1), and RGB still needs RGBA
+  storage (the RTX 4070 Ti has no sampled RGB8 format).
+- Background `.tx.exr` writes: Teapot Vulkan cold 0.91x in three alternating
+  rounds (CPU cold unchanged within noise).
+- Warm loads no longer read and hash every source (OpenPBR 1.7 GB, 3.2 s →
+  0.15 s; Teapot 0.6 s → 0.03 s).
+- Vulkan cold loads are now dominated by DXC (Lion 18 s) and, on OpenPBR, by
+  MDL-to-HLSL translation and pipeline creation.
 
 ## Interpretation limits
 

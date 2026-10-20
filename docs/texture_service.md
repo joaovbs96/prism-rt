@@ -1,17 +1,79 @@
-# Texture service cache configuration
+# Texture service
 
 The texture service writes immutable float, tiled and mipmapped OpenEXR files
-(`<content key>.tx.exr`) to a content-addressed disk cache. They used to be
+(`<content key>.tx.exr`) and GPU-ready copies (`<content key>.gpu`) to a
+content-addressed disk cache. They used to be
 named `.tx`, which OIIO opens by trying its TIFF reader and then every other
 format; older `.tx` entries are still trimmed. By default, the cache is `%LOCALAPPDATA%/PrismRT/cache` on Windows,
 with the system temporary directory as the fallback when `LOCALAPPDATA` is
 unavailable. Set `PRISM_CACHE_DIR` to choose another directory.
 
+## Preparation pipeline
+
+A cold preparation decodes the source once, in its own storage (8-bit,
+16-bit, half or float; OIIO converts to float exactly as a float decode
+would), and produces two files from that decode:
+
+- `<key>.gpu`, the GPU-ready copy (`src/texture_gpu_file.h`): the top level at
+  the source's precision with only the texture's own channels (RGB is not
+  padded), after a 256-byte header with a level table and a digest of the
+  payload. 16-bit texels that are all multiples of 257 are stored as 8-bit;
+  a transformed image (unassociated alpha, gamma, exposure, channel or window
+  changes) is stored as float with the statistics a device needs to choose
+  8-bit, half or float storage. It is written to a temporary file, flushed
+  and renamed into place; every read checks size and digest, and a damaged
+  copy is written again from the source.
+- `<key>.tx.exr`, the CPU-side texture: the same float texels and box-filtered
+  mip chain OIIO's `make_texture` produced (bit-identical, checked by
+  `prism_texture_writer_test`), written by `src/texture_writer.h` with
+  `zip:1` compression (`PRISM_TEXTURE_COMPRESSION`; about 3x faster than zip's
+  default level with eight concurrent writers, 5% larger) and mip levels
+  computed in parallel.
+
+Preparation returns once the GPU copy is published; background writers
+(`PRISM_TEXTURE_WRITER_THREADS`, default the hardware threads) build the
+mips and write the `.tx.exr`. Lookups, `readPixels` and `preparedPath()` wait
+for it, so the CPU device and the Metal path see the same textures, while
+the Vulkan device uploads from the GPU copies without waiting. A second
+preparation of content still being written waits on that writer. The service
+finishes queued writes before it is destroyed; a process that is killed
+leaves temporary files, which a later trim removes once their process has
+exited. `PRISM_TEXTURE_BACKGROUND_WRITES=0` writes the `.tx.exr` before
+preparation returns. Cold preparations wait for a memory budget
+(`PRISM_TEXTURE_PREPARE_MB`, default an eighth of physical memory between 2
+and 16 GiB) that a queued write keeps until it finishes; the tiles of a UDIM
+texture are prepared in parallel within it.
+
+The writer exists because of a hang: OpenEXR's `TiledOutputFile::writeTiles`
+waits on a tile buffer's semaphore, writes the compressed tile and posts the
+semaphore. When that write throws (an I/O error, or an allocation failure
+under a memory cap), the semaphore is never posted; OIIO catches the
+exception, and its `write_image` goes on to the next row of tiles, whose
+first task waits on the leaked buffer forever, with every IlmThread worker
+idle. It is not a thread-pool deadlock: it happens with OpenEXR threading off
+too. `texture_writer` writes through a stream that records a failure instead
+of reporting it to OpenEXR, checks each row, and stops at the first failure;
+in-memory sources are materialized through the same stream.
+
+Warm loads trust a source's recorded digest instead of reading and hashing
+it again (`src/fingerprint_records.h`): records in `<cache>/fingerprints`
+are keyed by the file's path, size, modification time, resolver identity
+and source version, plus its change time and file ID, which every write
+updates even when the modification time is restored. A record also names
+the published artifact it vouches for with that artifact's stamp, so a
+replaced artifact is verified again. Materialized resources, UDIM tile
+publications and directly prepared sources use them.
+
+## Cache configuration
+
 `PRISM_TEXTURE_CACHE_MB` sets OIIO's shared texture tile-cache budget in MiB
 (default a sixteenth of physical memory, between 512 and 4096; 512 MiB made
 ALab render about 21 times slower than 4 GiB). `PRISM_DISK_CACHE_GB` sets the disk cache's LRU budget in GiB
-(default 10). Disk trimming skips prepared textures pinned by live resource
-handles in any process. Source files are not modified.
+(default 20; GPU copies add about half again to the float `.tx.exr` files,
+and a budget below a scene's working set evicts, at the start of every warm
+load, files that load prepares again). Disk trimming counts `.tx.exr` and
+`.gpu` files and skips those pinned by live resource handles in any
+process. Source files are not modified.
 
 `PRISM_TEXTURE_OPEN_FILES` sets how many prepared files the TextureSystem keeps
 open. The default is the process's file limit less 512, at most 7680 (on
@@ -56,7 +118,7 @@ finite black in the prepared texture; the MDL SDK canvas currently yields
 nonfinite RGB for that same singular input, so parity is checked strictly for
 positive alpha and the service intentionally keeps the finite result at zero.
 
-`TextureService::invalidate(path, options)` removes the prepared file for the
+`TextureService::invalidate(path, options)` removes the prepared file and GPU copy for the
 source's current content fingerprint when no process holds it. A changed source
 file naturally hashes to a different cache entry. The in-memory texture
 preparation overload hashes pixel values and image specification, so generated

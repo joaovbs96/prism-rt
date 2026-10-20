@@ -353,5 +353,13 @@ they change the image, not just its noise.
   of the device's). Images beyond it are uploaded at reduced resolution,
   reported as `PrismRT Vulkan: N of M images uploaded at reduced resolution
   to fit GPU memory (PRISM_GPU_TEXTURE_BUDGET_MIB)` (`PrismRT Metal:` on
-  Metal).
+  Metal). Vulkan uploads from each texture's GPU-ready copy
+  ([texture service](texture_service.md#preparation-pipeline)) and counts its
+  real storage: 8-bit sources as UNORM8 (also when reduced), 16-bit integer
+  sources as UNORM16, half and float as the float `.tx.exr` rule chose
+  (8-bit when every value is k/255, half below 60000, otherwise float),
+  environments as float. Metal still estimates one byte per component and
+  reads the `.tx.exr`.
+- `PRISM_GPU_TEXTURE_COPIES=0`: Vulkan uploads from the float `.tx.exr`
+  files, as before GPU-ready copies.
 - `PRISM_DISABLE_METAL=1`, `PRISM_DISABLE_VULKAN=1`: hide a device.
