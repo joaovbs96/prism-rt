@@ -90,6 +90,18 @@ transmittance is `transmission_color` whatever the depth, while the graph uses
 depth is cleared on these nodes. A connected `geometry_thin_walled` is left as
 it is (MDL's `thin_walled` is uniform).
 
+## Refraction IOR of uncoated open_pbr_surface transmission
+
+MaterialX's MDL `dielectric_bsdf` gives the material its own IOR, and the coat
+is OpenPBR's outermost dielectric: MDL refracts the transmission with
+`coat_ior` (1.6 by default) rather than `specular_ior`, whether or not there is
+a coat. Without a coat (`coat_weight` 0) `coat_ior` has no other effect, so the
+loader sets it to the constant `specular_ior` on transmissive surfaces. A
+coated surface keeps the mismatch (MDL has a single, uniform IOR), and so does
+a varying `specular_ior`. Material templates keep `specular_ior`, `coat_ior`,
+`coat_weight` and `transmission_weight` structural on transmissive OpenPBR
+surfaces, so a bound variant never refracts with its seed's IOR.
+
 ## standard_surface conductor clamp
 
 Upstream MaterialX bug: `standard_surface` feeds `base_color` and
@@ -121,7 +133,9 @@ clamped; authoring them above one can still reach the same failure.
 `materialx_loader_sss` covers the SSS fallback, `materialx_loader_clamp` the
 conductor clamp, `materialx_loader_types` the color space names, input type
 repairs and layer distribution, and `materialx_loader_transmission` the
-thin-walled expansion. The small standalone test project avoids loading the renderer
+thin-walled expansion and the refraction IOR. `prism_openpbr_transmission_test`
+(main build) samples compiled OpenPBR glass: thin walls transmit undeflected and
+tinted, closed glass refracts with `specular_ior` and carries its medium. The small standalone test project avoids loading the renderer
 and its USD/MDL runtime dependencies:
 
 ```text

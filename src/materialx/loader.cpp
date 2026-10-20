@@ -303,6 +303,57 @@ bool IsTrueConstant(const MaterialX::InputPtr& input)
     return input->getValueString() == "true";
 }
 
+bool IsBound(const MaterialX::InputPtr& input)
+{
+    return input->hasNodeName() || input->hasNodeGraphString() || input->hasOutputString() ||
+           input->hasInterfaceName();
+}
+
+// The constant value of an input, or the declared default when it is absent
+// (empty: bound or unknown).
+std::string ConstantOrDefault(const MaterialX::NodePtr& node, const std::string& name)
+{
+    if (auto input = node->getInput(name)) return IsBound(input) ? std::string() : input->getValueString();
+    auto nodedef = node->getNodeDef();
+    auto declared = nodedef ? nodedef->getActiveInput(name) : nullptr;
+    return declared ? declared->getValueString() : std::string();
+}
+
+bool IsZero(const std::string& value)
+{
+    try { return !value.empty() && std::stod(value) == 0.0; } catch (...) { return false; }
+}
+
+// MaterialX's MDL dielectric_bsdf hands its own IOR to the material
+// (pbrlib_1_9 mx_dielectric_bsdf: `ior: color(mxp_ior)`), and OpenPBR's
+// outermost dielectric is the coat: MDL refracts transmission with coat_ior
+// (1.6 by default) instead of specular_ior, coat or not. Without a coat,
+// coat_ior has no other effect, so a transmissive surface gets its specular
+// IOR there. (A coated one keeps the mismatch: MDL has a single IOR.)
+void RouteUncoatedTransmissionIor(const MaterialX::DocumentPtr& doc)
+{
+    // Collect first: adding an absent coat_ior mutates the tree.
+    std::vector<MaterialX::NodePtr> nodes;
+    for (auto element : doc->traverseTree())
+        if (auto node = element->asA<MaterialX::Node>(); node && node->getCategory() == "open_pbr_surface")
+            nodes.push_back(node);
+    for (auto const& node : nodes) {
+        auto transmission = node->getInput("transmission_weight");
+        if (!transmission || (!IsBound(transmission) && IsZero(transmission->getValueString()))) continue;
+        if (!IsZero(ConstantOrDefault(node, "coat_weight"))) continue;
+        const std::string ior = ConstantOrDefault(node, "specular_ior");
+        if (ior.empty()) continue; // a varying IOR cannot become MDL's uniform one
+        auto coatIor = node->getInput("coat_ior");
+        if (!coatIor) coatIor = node->addInput("coat_ior", "float");
+        if (!IsBound(coatIor) && coatIor->getValueString() == ior) continue;
+        for (const char* attribute : {"nodename", "nodegraph", "output", "interfacename"})
+            coatIor->removeAttribute(attribute);
+        coatIor->setValueString(ior);
+        if (VerboseMdl())
+            std::cout << "[MaterialX] uncoated " << node->getNamePath() << ": coat_ior = specular_ior " << ior << "\n";
+    }
+}
+
 // MaterialX's open_pbr_surface graphs (1.39.4 and 1.39.5, genmdl variant
 // included) never connect geometry_thin_walled to their <surface>
 // constructor, so the MDL material is always closed: thin-walled glass
@@ -526,7 +577,8 @@ MaterialX::DocumentPtr DocumentLoader::load(const std::string& filepath)
         // Attach after preprocessing so shared standard-library graphs retain
         // their original behavior. Validate the final document used for generation.
         AttachLibrary(doc, m_stdlib);
-        // Expanding a node into its implementation needs the library.
+        // Both need the library (declared defaults, graph implementations).
+        RouteUncoatedTransmissionIor(doc);
         ExpandThinWalledOpenPbr(doc);
         std::string validation_errors;
         if (!doc->validate(&validation_errors)) {

@@ -619,6 +619,11 @@ if(PRISM_BUILD_HYDRA)
             COMMAND prism_standalone_material_reuse_test)
         set_tests_properties(prism_standalone_material_reuse_test PROPERTIES
             ENVIRONMENT "${_prism_test_environment}" SKIP_RETURN_CODE 77)
+        add_executable(prism_openpbr_transmission_test tests/openpbr_transmission.cpp)
+        target_link_libraries(prism_openpbr_transmission_test PRIVATE PrismRT::core)
+        add_test(NAME prism_openpbr_transmission_test COMMAND prism_openpbr_transmission_test)
+        set_tests_properties(prism_openpbr_transmission_test PROPERTIES
+            ENVIRONMENT "${_prism_test_environment}" SKIP_RETURN_CODE 77)
         add_executable(prism_scene_export_test tests/scene_export_test.cpp)
         target_link_libraries(prism_scene_export_test PRIVATE PrismRT::core ${PXR_LIBRARIES})
         add_test(NAME prism_scene_export_test COMMAND prism_scene_export_test)

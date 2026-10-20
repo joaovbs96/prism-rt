@@ -2,6 +2,8 @@
 // graph and marks the surface constructor thin-walled (MaterialX's graphs drop
 // geometry_thin_walled); the backface gets the same shader and the
 // transmission depth is cleared so transmission_color tints the thin sheet.
+// An uncoated transmissive surface gets its specular IOR as coat_ior, which
+// MaterialX's MDL makes the refraction IOR.
 
 #include "../src/materialx/loader.h"
 #include <MaterialXCore/Node.h>
@@ -32,6 +34,22 @@ int run() {
       <surfacematerial name="solid_material" type="material">
         <input name="surfaceshader" type="surfaceshader" nodename="solid" />
       </surfacematerial>
+      <open_pbr_surface name="water" type="surfaceshader">
+        <input name="transmission_weight" type="float" value="1" />
+        <input name="specular_ior" type="float" value="1.33" />
+      </open_pbr_surface>
+      <open_pbr_surface name="default_glass" type="surfaceshader">
+        <input name="transmission_weight" type="float" value="0.5" />
+      </open_pbr_surface>
+      <open_pbr_surface name="coated_glass" type="surfaceshader">
+        <input name="transmission_weight" type="float" value="1" />
+        <input name="specular_ior" type="float" value="1.33" />
+        <input name="coat_weight" type="float" value="1" />
+        <input name="coat_ior" type="float" value="1.7" />
+      </open_pbr_surface>
+      <open_pbr_surface name="opaque" type="surfaceshader">
+        <input name="specular_ior" type="float" value="1.33" />
+      </open_pbr_surface>
     </materialx>)";
     { std::ofstream out(path); out << xml; }
 
@@ -41,6 +59,10 @@ int run() {
     nodedef->setInputValue("geometry_thin_walled", false);
     nodedef->setInputValue("transmission_depth", 0.0f);
     nodedef->setInputValue("transmission_color", MaterialX::Color3(1.0f));
+    nodedef->setInputValue("transmission_weight", 0.0f);
+    nodedef->setInputValue("specular_ior", 1.5f);
+    nodedef->setInputValue("coat_weight", 0.0f);
+    nodedef->setInputValue("coat_ior", 1.6f);
     auto surfaceDef = library->addNodeDef("ND_surface", "surfaceshader", "surface");
     surfaceDef->setInputValue("opacity", 1.0f);
     surfaceDef->setInputValue("thin_walled", false);
@@ -88,6 +110,16 @@ int run() {
     require(solid && solid->getCategory() == "open_pbr_surface", "closed surface expanded");
     require(solid->getInput("transmission_depth")->getValueString() == "2", "closed surface depth changed");
     require(!doc->getNode("solid_material")->getInput("backsurfaceshader"), "closed surface got a backface");
+
+    // Refraction IOR of uncoated transmission.
+    auto coatIor = [&](const char* name) {
+        auto input = doc->getNode(name)->getInput("coat_ior");
+        return input ? input->getValueString() : std::string();
+    };
+    require(coatIor("water") == "1.33", "uncoated transmission does not refract with specular_ior");
+    require(coatIor("default_glass") == "1.5", "declared specular_ior default not used");
+    require(coatIor("coated_glass") == "1.7", "coated surface lost its coat IOR");
+    require(coatIor("opaque").empty(), "opaque surface changed");
 
     std::filesystem::remove(path);
     std::cout << "materialx loader transmission ok\n";

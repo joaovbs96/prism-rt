@@ -63,6 +63,21 @@ inline bool IsCompatibleTemplateValue(const CapturedNode& node,
     if ((type.find("standard_surface")!=std::string::npos && name=="subsurface") ||
         (type.find("open_pbr_surface")!=std::string::npos && name=="subsurface_weight"))
         return false;
+    // DocumentLoader gives an uncoated transmissive open_pbr_surface its
+    // specular IOR as coat_ior, which becomes the MDL refraction IOR. The
+    // values that decide and feed it stay structural, so a bound variant never
+    // refracts with its seed's IOR.
+    if (type.find("open_pbr_surface")!=std::string::npos &&
+        (name=="specular_ior" || name=="coat_ior" || name=="coat_weight" || name=="transmission_weight")) {
+        const PXR_NS::TfToken weight("transmission_weight");
+        const bool connected=std::any_of(node.connections.begin(),node.connections.end(),
+            [&](const CapturedConnection& c) { return c.input==weight && !c.connections.empty(); });
+        const auto found=std::find_if(node.parameters.begin(),node.parameters.end(),
+            [&](const CapturedParameter& p) { return p.name==weight; });
+        const bool transmissive=connected || (found!=node.parameters.end() &&
+            !(found->data.value.IsHolding<float>() && found->data.value.UncheckedGet<float>()==0.0f));
+        if (transmissive) return false;
+    }
     return IsCompatibleTemplateValue(parameter);
 }
 
