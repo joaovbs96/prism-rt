@@ -466,6 +466,14 @@ bool TrimCallablesSetting()
     return !value || std::strcmp(value, "0") != 0;
 }
 
+// The program a callable source names (ProgramCallableSource), for logs.
+std::string ProgramTag(std::string const& source)
+{
+    constexpr std::string_view tag = "// MDL program ";
+    if (source.compare(0, tag.size(), tag) != 0) return {};
+    return ", program " + source.substr(tag.size(), source.find('\n') - tag.size());
+}
+
 void ReplaceAll(std::string& text, std::string const& from, std::string const& to)
 {
     for (size_t at = text.find(from); at != std::string::npos; at = text.find(from, at + to.size()))
@@ -549,7 +557,8 @@ bool ProgramCallableSource(gpu::MdlProgramCode const& program, std::string* sour
 {
     if (!gpu::AssembleShader("gpu/vulkan/material_callable.hlsl", {"gpu/vulkan"}, program.code, source, error))
         return false;
-    *source = ShaderSaltDefine() + "#define PRISM_MDL_PROGRAM_TABLES 1\n" + *source;
+    *source = std::format("// MDL program {}\n", program.digest.substr(0, 12)) + ShaderSaltDefine() +
+        "#define PRISM_MDL_PROGRAM_TABLES 1\n" + *source;
     return true;
 }
 
@@ -825,9 +834,9 @@ std::shared_ptr<ShaderBuild> MaterialCallShaders::compile(std::string const& sou
         built->dxcSeconds = stats.seconds;
         built->dxcPeakBytes = stats.peakBytes;
         if (gpu::GpuVerbose())
-            std::cerr << std::format("PrismRT Vulkan: DXC {} {:.1f} s, peak {} MiB, {} KB SPIR-V\n",
+            std::cerr << std::format("PrismRT Vulkan: DXC {} {:.1f} s, peak {} MiB, {} KB SPIR-V{}\n",
                                      raygen ? "raygen" : "callable", stats.seconds, stats.peakBytes >> 20,
-                                     bytes.size() >> 10);
+                                     bytes.size() >> 10, ProgramTag(source));
         if (!ok || !PlausibleSpirv(bytes)) {
             built->error = (raygen ? std::string("raygen shader: ") : std::string("material callable: ")) + reason;
             return built;
@@ -889,9 +898,9 @@ std::shared_ptr<ShaderBuild> MaterialCallShaders::compile(std::string const& sou
     StorePipelineCache(m_device, cache, cacheFile, built->stackSize != recordedStack ? 0 : loaded,
                        result == VK_SUCCESS, built->stackSize);
     if (gpu::GpuVerbose())
-        std::cerr << std::format("PrismRT Vulkan: library {} {:.2f} s{}, stack {} B\n", raygen ? "raygen" : "callable",
+        std::cerr << std::format("PrismRT Vulkan: library {} {:.2f} s{}, stack {} B{}\n", raygen ? "raygen" : "callable",
                                  built->driverSeconds, built->driverCacheHit ? " (pipeline cache)" : "",
-                                 built->stackSize);
+                                 built->stackSize, ProgramTag(source));
     if (result != VK_SUCCESS) {
         built->library = VK_NULL_HANDLE;
         built->error = std::format("cannot create a {} pipeline library (VkResult {})",

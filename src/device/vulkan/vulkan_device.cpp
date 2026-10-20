@@ -507,6 +507,7 @@ struct VulkanDevice::Impl {
     std::thread earlyWorker;
     bool earlyStop = false, earlyPaused = false, earlyBusy = false;
     uint64_t earlyBytes = 0, earlyBudget = 0;
+    std::vector<gpu::ImageFootprint> earlyFootprints; // every image offered since the last scene
     uint32_t earlyUploaded = 0, earlySkipped = 0;
     double earlySeconds = 0.0;
     VkCommandPool earlyPool = VK_NULL_HANDLE;
@@ -981,7 +982,13 @@ bool VulkanDevice::Impl::earlyUpload(prism::TextureResource const& resource)
     const uint64_t estimate = gpu::ImageBytes({int(h.width), int(h.height), channels == 3 ? 4 : channels,
                                                StorageBytes(copy.storage), false}, 0);
     {
+        // An image the budget already reduces among the images seen so far
+        // stays reduced once the scene is complete (its share only shrinks):
+        // the scene uploads it.
         std::lock_guard lock(earlyMutex);
+        earlyFootprints.push_back({int(h.width), int(h.height), channels == 3 ? 4 : channels,
+                                   StorageBytes(copy.storage), false});
+        if (gpu::FitImages(earlyFootprints, earlyBudget).back() > 0) return false;
         if (earlyBytes + estimate > earlyBudget) return false;
         earlyBytes += estimate;
     }
@@ -1053,6 +1060,7 @@ void VulkanDevice::Impl::resumeEarly()
         std::lock_guard lock(earlyMutex);
         earlyPaused = false;
         earlySeen.clear();
+        earlyFootprints.clear();
         earlyUploaded = earlySkipped = 0;
         earlySeconds = 0.0;
     }

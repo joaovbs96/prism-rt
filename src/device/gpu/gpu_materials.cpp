@@ -811,10 +811,15 @@ void ObserveClass(mdl::Context const& context, std::string const& classKey, mi::
         code = failed;
     }
     promise.set_value(code);
-    if (prism::load_profile::Enabled())
-        prism::load_profile::Mark("gpu.program", std::format("translate_ms={:.1f} code_kb={} ok={} early=1",
-                                                             code->translateSeconds * 1e3, code->code.size() >> 10,
-                                                             code->success ? 1 : 0));
+    if (prism::load_profile::Enabled()) {
+        size_t lookups = 0;
+        for (size_t at = code->code.find("_3d("); at != std::string::npos; at = code->code.find("_3d(", at + 4))
+            ++lookups;
+        prism::load_profile::Mark("gpu.program",
+            std::format("translate_ms={:.1f} code_kb={} ok={} early=1 lookups_3d={} digest={}",
+                        code->translateSeconds * 1e3, code->code.size() >> 10, code->success ? 1 : 0, lookups,
+                        code->digest.substr(0, 12)));
+    }
     if (!code->success) return;
     std::vector<std::shared_ptr<const ProgramListener>> listeners;
     {
