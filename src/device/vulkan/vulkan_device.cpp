@@ -1191,7 +1191,10 @@ bool VulkanDevice::Impl::prepareMaterials(std::shared_ptr<const gpu::MdlShaderCo
     const vulkan::CallableMode callableMode = rayTracing.pipeline ? vulkan::CallableModeSetting()
                                                                   : vulkan::CallableMode::Never;
     size_t estimate = 0;
-    if (callableMode == vulkan::CallableMode::Always) {
+    const char* layoutSetting = std::getenv("PRISM_VULKAN_PROGRAM_LAYOUT");
+    if (layoutSetting && std::string_view(layoutSetting) == "0") {
+        // Diagnostics: the link unit for every material set, as before.
+    } else if (callableMode == vulkan::CallableMode::Always) {
         perProgramReason = "PRISM_VULKAN_CALLABLES=1";
     } else if (callableMode == vulkan::CallableMode::Auto && !data->mdlMaterials.empty()) {
         estimate = KernelBaseBytes() + gpu::EstimatedLinkUnitBytes(gpu::ProgramCodes(data->mdlMaterials));

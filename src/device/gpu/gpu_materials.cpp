@@ -1203,7 +1203,13 @@ MdlShaderCode GenerateProgramShaderCode(std::vector<MDLMaterial const*> const& m
             continue;
         }
         context = program->owner_identity;
-        auto [found, inserted] = programIndex.emplace(codes[i]->digest, uint32_t(result.programs.size()));
+        static const bool merge = [] {
+            const char* value = std::getenv("PRISM_GPU_MERGE_PROGRAMS");
+            return !value || std::string_view(value) != "0";
+        }();
+        auto [found, inserted] = programIndex.emplace(
+            merge ? codes[i]->digest : std::format("{}", static_cast<const void*>(codes[i].get())),
+            uint32_t(result.programs.size()));
         if (inserted) result.programs.push_back(codes[i]);
         record.program = found->second;
         record.valid = true;
