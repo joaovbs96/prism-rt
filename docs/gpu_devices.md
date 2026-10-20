@@ -257,6 +257,21 @@ the noise floor is the CPU with seed 1 against seed 0.
   per pass, Teapot 4.5 to 8.4, chess 29.0 to 33.5), and its images had
   non-finite pixels: every run at 16 spp (9 of 9; 1 of 3 at 4 spp), against
   none inlined. The finite images were bit-identical to inlined ones.
+- **Inlined table lookups, rewritten.** The lookup stays inlined but is
+  written for small inlined code: the three axes as vectors, wrap modes and
+  crop checks as selects instead of loops and short-circuit conditions, no
+  per-texel bounds checks (remapped texels always lie inside the table),
+  one branch for the second and third components of RGB tables. Same
+  arithmetic in the same order; the native runtime is unchanged. Lion's
+  callable inlines to 161k SPIR-V instructions, 4.7k blocks and 22k locals
+  (was 325k, 26k and 42k); DXC takes 2 s instead of 18-24 s (peak 137 MiB,
+  SPIR-V 1.3 MB) and the driver 3.5 s instead of 4.6 s; GPU ready 31 to
+  20 s. Every layered program gains (OpenPBR: DXC 76 to 29 s summed, driver
+  34 to 25 s summed), as does the compute kernel's pipeline (CornellBox 3.6
+  to 2.6 s). Time per sample is unchanged or lower (64 spp: Lion 7.7 to
+  7.0 ms, Teapot 3.5 to 3.5, chess 21.5 to 21.2), images are bit-identical
+  (one Teapot pixel differs by 1.5e-6) and free of non-finite values. See
+  [performance.md](performance.md#bsdf-table-lookups).
 - **Shader execution reordering** (hint by program, `PRISM_VULKAN_REORDER=1`)
   is off by default: 2–8% slower on OpenPBR, chess and the eggs, neutral on
   Stirling, 16% faster on the countertop. Reordering by program alone does

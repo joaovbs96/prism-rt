@@ -174,6 +174,73 @@ spread (up to 1.5x on cold runs here).
   CPU images are identical. With the preview on, the before and after images
   differ by how many samples the CPU rendered before the handover.
 
+## BSDF table lookups
+
+MDL's layered BSDFs read the SDK's BSDF data tables (energy compensation)
+through `tex_lookup_float3_3d` at every layer, and each call inlines
+`prism_mdl_lookup_3d` (`shaders/gpu/mdl_runtime.hlsl`). The generic version
+handled every wrap and crop mode per axis, with a loop, short-circuit
+conditions and a bounds check per texel: in Lion's callable, 77 copies made
+70% of the inlined code, and DXC's SSA rewrite of their locals took most of
+its 20 s. The rewrite keeps it inlined (out-of-line calls were tried and
+reverted, see [gpu_devices.md](gpu_devices.md)) and branch-light: vector
+axes, selects for wrap modes and crop checks, no texel bounds checks, and
+one branch reading the second and third components of RGB tables only.
+
+Offline DXC 1.8 (`-T lib_6_6 -HV 2021 -spirv -O0`) on the largest callable
+of each scene, dumped with `PRISM_GPU_DUMP_PROGRAMS` (best of two runs;
+instructions, blocks and locals after `-fcgl` and exhaustive inlining):
+
+| Callable | DXC time | DXC peak | SPIR-V | Inlined instructions / blocks / locals |
+| --- | ---: | ---: | ---: | --- |
+| Lion | 18.3 → 2.0 s | 1600 → 137 MiB | 2366 → 1290 KB | 325k / 26.5k / 41.9k → 161k / 4.7k / 22.4k |
+| Teapot | 1.32 → 0.62 s | 151 → 54 MiB | 527 → 360 KB | 74.7k / 5.8k / 9.4k → 49.2k / 2.4k / 6.4k |
+| Chess | 1.19 → 0.51 s | 135 → 46 MiB | 494 → 327 KB | 70.3k / 5.3k / 9.0k → 44.7k / 1.9k / 5.9k |
+| Damascus egg | 2.94 → 1.0 s | 326 → 86 MiB | 935 → 600 KB | 145k / 11.2k / 17.8k → 94.2k / 4.4k / 11.7k |
+
+Cold loads with `prism_hydra_render` (RTX 4070 Ti, driver 610.88), 480x270,
+4 spp, empty `PRISM_CACHE_DIR`, unique `PRISM_VULKAN_SHADER_SALT`,
+`PRISM_DISK_CACHE_GB=60`; medians of 4 runs before and 2 after, alternating.
+DXC and driver times are summed over the scene's callables (slowest in
+parentheses); the kernel rows are the compute kernel's SPIR-V and pipeline.
+
+| Scene | DXC | DXC peak | SPIR-V | Driver libraries | GPU ready |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Lion (1) | 24.2 → 3.5 s | 1600 → 137 MiB | 2366 → 1289 KB | 4.6 → 3.5 s | 31.3 → 19.6 s |
+| Teapot (2) | 4.7 (2.4) → 2.7 (1.4) s | 151 → 55 MiB | 1042 → 706 KB | 2.1 (1.0) → 1.6 (0.8) s | 25.3 → 28.5 s |
+| Chess (5) | 10.0 (2.5) → 5.0 (1.1) s | 135 → 47 MiB | 2028 → 1357 KB | 3.7 (0.9) → 3.0 (0.7) s | 9.4 → 9.0 s |
+| OpenPBR playground (36) | 75.8 (7.4) → 29.5 (1.8) s | 418 → 72 MiB | 13.6 → 8.9 MB | 33.8 (2.5) → 25.2 (1.7) s | 55.1 → 55.1 s |
+| Damascus egg (6) | 7.2 (3.8) → 3.5 (1.4) s | 326 → 87 MiB | 2194 → 1440 KB | 3.7 (1.6) → 2.4 (1.1) s | 8.1 → 7.8 s |
+| CornellBox (kernel) | SPIR-V 2.8 → 1.6 s | | | pipeline 3.6 → 2.6 s | 7.9 → 5.6 s |
+| Parity fixture (kernel) | SPIR-V 1.3 → 1.3 s | | | pipeline 1.9 → 2.0 s | 4.3 → 4.4 s |
+
+Teapot's and OpenPBR's GPU-ready times are dominated by texture preparation
+and vary by several seconds between runs; their shader work is lower. The
+parity fixture uses no tables.
+
+Time per sample, warm, 960x540: the median GPU pass time of a run, median
+of three alternating runs at 64 spp (five at 16 spp):
+
+| Scene | 64 spp | 16 spp |
+| --- | ---: | ---: |
+| Lion | 7.67 → 7.01 ms | 7.89 → 7.61 ms |
+| Teapot | 3.52 → 3.53 ms | 4.12 → 3.49 ms |
+| Chess | 21.48 → 21.21 ms | 21.63 → 21.81 ms |
+
+- **Images.** With the GPU rendering every sample, Lion and chess are
+  bit-identical to before, Teapot differs in one pixel by 1.5e-6, OpenPBR in
+  7 pixels by 3e-8. (Cold runs differ where the CPU preview rendered a
+  different number of samples before the handover.) A diagnostic build
+  running both versions per lookup found no bit difference on Lion. No
+  run had non-finite pixels: 4, 16 and 64 spp, under GPU-AV, and the
+  fixture sweep under core and synchronization validation. Vulkan against
+  the CPU at 64 spp is unchanged (Lion mean ratio 0.99966, NRMSE 0.0198;
+  Teapot 0.99953, 0.0154; chess 0.99817, 0.0560).
+- **Variant without the component branch** (always three reads per
+  texel): DXC and driver slightly faster (Lion 1.8 s, driver 2.9 s), but 24
+  reads instead of 8 for scalar tables; per sample it was within noise
+  (Lion 7.50 ms at 64 spp).
+
 ## Interpretation limits
 
 MDL variants remain cached for the renderer process lifetime, affecting warm-recreation results. Historical InOneWeekend measurements used coarse tessellated spheres; the current implementation uses analytic spheres. Report this representation change when comparing geometry memory and rendering results. See [Hydra scope and costs](hydra.md) for rendering limitations and supported geometry behavior.
