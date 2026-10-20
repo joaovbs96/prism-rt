@@ -2,6 +2,7 @@
 #include "resource_limits.h"
 #include "load_profile.h"
 #include "texture_writer.h"
+#include "texture_gpu_file.h"
 
 #include <OpenImageIO/imagebuf.h>
 #include <OpenImageIO/imagebufalgo.h>
@@ -9,6 +10,7 @@
 #include <OpenImageIO/filesystem.h>
 #include <tbb/blocked_range.h>
 #include <tbb/parallel_for.h>
+#include <tbb/parallel_reduce.h>
 
 #include <algorithm>
 #include <array>
@@ -330,13 +332,48 @@ OIIO::TextureOpt::Wrap wrap(TextureWrap value)
 // other format: an expensive, serialized probe on each reopen. The .exr suffix
 // selects the OpenEXR reader directly; legacy .tx entries are still trimmed.
 constexpr char kPreparedSuffix[] = ".tx.exr";
+// GPU-ready copies of prepared textures; see texture_gpu_file.h.
+constexpr char kGpuSuffix[] = ".gpu";
 
 bool isPreparedFile(std::filesystem::path const &path)
 {
     const std::string name = path.filename().string();
-    const std::string_view suffix(kPreparedSuffix);
-    return path.extension() == ".tx" ||
-        (name.size() > suffix.size() && name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0);
+    auto endsWith = [&](std::string_view suffix) {
+        return name.size() > suffix.size() && name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0;
+    };
+    return path.extension() == ".tx" || endsWith(kPreparedSuffix) || endsWith(kGpuSuffix);
+}
+
+bool processAlive(unsigned long pid)
+{
+#ifdef _WIN32
+    HANDLE process = OpenProcess(SYNCHRONIZE, FALSE, static_cast<DWORD>(pid));
+    if (!process) return GetLastError() == ERROR_ACCESS_DENIED;
+    const bool alive = WaitForSingleObject(process, 0) != WAIT_OBJECT_0;
+    CloseHandle(process);
+    return alive;
+#else
+    return kill(static_cast<pid_t>(pid), 0) == 0 || errno == EPERM;
+#endif
+}
+
+// A temporary file a preparation writes before renaming it into place
+// (<key>.<pid>.<serial>.tmp.exr, <key>.gpu.<pid>.<serial>.tmp) whose process
+// has exited: a crash or a kill left it behind.
+bool abandonedTemporary(std::string const &filename)
+{
+    std::vector<std::string> parts;
+    for (size_t begin = 0;;) {
+        const size_t dot = filename.find('.', begin);
+        parts.push_back(filename.substr(begin, dot - begin));
+        if (dot == std::string::npos) break;
+        begin = dot + 1;
+    }
+    const auto tmp = std::find(parts.begin(), parts.end(), "tmp");
+    if (tmp == parts.end() || tmp - parts.begin() < 3) return false;
+    const std::string &pid = *(tmp - 2);
+    if (pid.empty() || pid.find_first_not_of("0123456789") != std::string::npos) return false;
+    try { return !processAlive(std::stoul(pid)); } catch (...) { return false; }
 }
 
 // Returns the bytes of prepared textures left in the cache.
@@ -363,6 +400,11 @@ uintmax_t trimDiskCache(std::filesystem::path const &root, double maxGB,
         if (ec) break;
         if (!item.is_regular_file(ec)) { ec.clear(); continue; }
         const std::string filename = item.path().filename().string();
+        if (abandonedTemporary(filename)) {
+            std::filesystem::remove(item.path(), ec);
+            ec.clear();
+            continue;
+        }
         const size_t marker = filename.rfind(".pin.");
         if (marker == std::string::npos) continue;
         bool active = true;
@@ -381,6 +423,7 @@ uintmax_t trimDiskCache(std::filesystem::path const &root, double maxGB,
         } catch (...) { active = false; }
         if (active) {
             processPinned.emplace(filename.substr(0, marker) + kPreparedSuffix, true);
+            processPinned.emplace(filename.substr(0, marker) + kGpuSuffix, true);
             processPinned.emplace(filename.substr(0, marker) + ".tx", true);
         }
         else std::filesystem::remove(item.path(), ec);
@@ -452,6 +495,254 @@ private:
 #endif
 };
 
+// A texture source opened for inspection. JPEG files with Photoshop APP13
+// segments OIIO rejects are read from a copy without them.
+struct SourceImage {
+    std::unique_ptr<OIIO::ImageInput> input;
+    OIIO::ImageSpec spec;
+    std::string format;
+    std::vector<unsigned char> strippedJpeg;
+    std::unique_ptr<OIIO::Filesystem::IOMemReader> strippedReader;
+    void closeInspected()
+    {
+        if (input) input->close();
+        input.reset();
+    }
+};
+
+SourceImage OpenSource(std::filesystem::path const &absolute)
+{
+    SourceImage source;
+    source.input = OIIO::ImageInput::open(absolute.string());
+    if (!source.input) {
+        const std::string inspectError = OIIO::geterror();
+        source.strippedJpeg = jpegWithoutApp13(absolute);
+        if (!source.strippedJpeg.empty()) {
+            source.strippedReader = std::make_unique<OIIO::Filesystem::IOMemReader>(
+                source.strippedJpeg.data(), source.strippedJpeg.size());
+            source.input = OIIO::ImageInput::open(absolute.string(), nullptr, source.strippedReader.get());
+            if (!source.input) (void)OIIO::geterror();
+        }
+        if (!source.input)
+            throw std::runtime_error("cannot inspect texture " + absolute.string() + ": " + inspectError);
+    }
+    source.spec = source.input->spec();
+    source.format = source.input->format_name();
+    return source;
+}
+
+// What a cold preparation of `spec` holds at once (see PreparationBudget).
+uint64_t PreparationBytes(OIIO::ImageSpec const &spec)
+{
+    return static_cast<uint64_t>(std::max(spec.width, spec.full_width)) *
+        static_cast<uint64_t>(std::max(spec.height, spec.full_height)) *
+        static_cast<uint64_t>(spec.nchannels) * sizeof(float) * 5 / 2;
+}
+
+// A source decoded for preparation: the normalized float texels the
+// prepared .tx.exr stores and, when the GPU copy keeps the source's own
+// storage, those texels in it.
+struct DecodedImage {
+    int width = 0, height = 0, channels = 0;
+    OIIO::ImageSpec normalizedSpec;
+    std::vector<float> pixels;
+    gpu_texture::Component component = gpu_texture::Component::Float32;
+    std::vector<uint8_t> gpuNative; // the GPU payload unless component is Float32
+    uint32_t gpuFlags = 0;
+    float gpuPeak = 0.0f;
+    bool unassociateAlpha = false;
+    uint64_t decodeNanoseconds = 0, pixelNanoseconds = 0;
+};
+
+DecodedImage DecodeSource(std::filesystem::path const &absolute, TexturePrepareOptions const &options,
+                          SourceImage &source)
+{
+    DecodedImage result;
+    OIIO::ImageSpec const &spec = source.spec;
+    auto stageStart = std::chrono::steady_clock::now();
+    std::unique_ptr<OIIO::ImageInput> decodeInput;
+    if (source.input) {
+        decodeInput = std::move(source.input);
+    } else if (source.strippedReader) {
+        OIIO::ImageSpec config;
+        if (options.unassociateAlpha) config.attribute("oiio:UnassociatedAlpha", 1);
+        // With a config, the reader takes its proxy from this hint.
+        OIIO::Filesystem::IOProxy *proxy = source.strippedReader.get();
+        config.attribute("oiio:ioproxy", OIIO::TypeDesc::PTR, &proxy);
+        source.strippedReader->seek(0);
+        decodeInput = OIIO::ImageInput::open(absolute.string(), &config, source.strippedReader.get());
+        if (!decodeInput)
+            throw std::runtime_error("cannot read texture " + absolute.string() + ": " + OIIO::geterror());
+    } else {
+        // Exactly what an image-cache backed ImageBuf read passes to the
+        // reader: the cache's unassociatedalpha setting as an explicit
+        // hint. Reading directly skips the cache's own header parse.
+        OIIO::ImageSpec config;
+        config.attribute("oiio:UnassociatedAlpha", options.unassociateAlpha ? 1 : 0);
+        decodeInput = OIIO::ImageInput::open(absolute.string(), &config);
+        if (!decodeInput)
+            throw std::runtime_error("cannot read texture " + absolute.string() + ": " + OIIO::geterror());
+    }
+    // Decoded in the source's own storage when the GPU copy can keep it.
+    // read_image converts to float with OIIO's convert_pixel_values after
+    // decoding natively, so converting here gives the same floats.
+    const OIIO::TypeDesc stored = spec.format;
+    const bool keepNative = spec.channelformats.empty() &&
+        (stored == OIIO::TypeDesc::UINT8 || stored == OIIO::TypeDesc::UINT16 || stored == OIIO::TypeDesc::HALF);
+    const OIIO::TypeDesc decodeType = keepNative ? stored : OIIO::TypeDesc::FLOAT;
+    const size_t values = static_cast<size_t>(spec.width) * spec.height * spec.nchannels;
+    std::vector<float> sourcePixels(values);
+    std::vector<uint8_t> native;
+    if (keepNative) native.resize(values * decodeType.size());
+    void *decodeBuffer = keepNative ? static_cast<void *>(native.data()) : sourcePixels.data();
+    if (!decodeInput->read_image(0, 0, 0, spec.nchannels, decodeType, decodeBuffer)) {
+        const std::string error = decodeInput->geterror();
+        throw std::runtime_error("cannot decode texture pixels: " + error);
+    }
+    decodeInput->close();
+    if (keepNative) {
+        constexpr size_t chunk = size_t(1) << 18;
+        tbb::parallel_for(size_t(0), (values + chunk - 1) / chunk, [&](size_t c) {
+            const size_t begin = c * chunk, count = std::min(chunk, values - begin);
+            OIIO::convert_pixel_values(decodeType, native.data() + begin * decodeType.size(),
+                                       OIIO::TypeDesc::FLOAT, sourcePixels.data() + begin, static_cast<int>(count));
+        });
+    }
+    result.decodeNanoseconds = elapsedNanoseconds(stageStart);
+    stageStart = std::chrono::steady_clock::now();
+    const int displayWidth = spec.full_width > 0 ? spec.full_width : spec.width;
+    const int displayHeight = spec.full_height > 0 ? spec.full_height : spec.height;
+    const int outChannels = options.channelCount ? options.channelCount
+        : spec.nchannels - options.firstChannel;
+    OIIO::ImageSpec normalizedSpec(displayWidth, displayHeight, outChannels, OIIO::TypeDesc::FLOAT);
+    normalizedSpec.full_x = normalizedSpec.x = 0;
+    normalizedSpec.full_y = normalizedSpec.y = 0;
+    normalizedSpec.full_width = displayWidth;
+    normalizedSpec.full_height = displayHeight;
+    const int originX = spec.x - spec.full_x;
+    const int originY = spec.y - spec.full_y;
+    int sourceAlpha = options.alphaChannel;
+    if (sourceAlpha == -1) {
+        sourceAlpha = spec.alpha_channel;
+        if (sourceAlpha < 0 && spec.nchannels == 2) sourceAlpha = 1;
+    }
+    // OIIO's unassociatedalpha read hint above keeps straight-alpha data
+    // from being premultiplied during decode. PNG uses straight alpha by
+    // format convention; other sources are governed by explicit metadata.
+    const bool inputUnassociated =
+        spec.get_int_attribute("oiio:UnassociatedAlpha", 0) != 0 || source.format == "png";
+    const bool unassociateAlpha = options.unassociateAlpha && sourceAlpha >= 0 && !inputUnassociated;
+    const int outputAlpha = sourceAlpha >= options.firstChannel &&
+        sourceAlpha < options.firstChannel + outChannels
+            ? sourceAlpha - options.firstChannel : -1;
+    normalizedSpec.alpha_channel = outputAlpha;
+    if (outputAlpha >= 0 && (unassociateAlpha || inputUnassociated))
+        normalizedSpec.attribute("oiio:UnassociatedAlpha", 1);
+    const std::string sourceColorSpace = options.colorSpace.empty()
+        ? std::string(spec.get_string_attribute("oiio:ColorSpace", "")) : options.colorSpace;
+    if (!sourceColorSpace.empty())
+        normalizedSpec.attribute("oiio:ColorSpace", sourceColorSpace);
+    normalizedSpec.channelnames.clear();
+    for (int c = 0; c < outChannels; ++c) {
+        const int sourceChannel = options.firstChannel + c;
+        normalizedSpec.channelnames.push_back(sourceChannel < spec.nchannels
+            ? std::string(spec.channel_name(sourceChannel)) : "channel" + std::to_string(c));
+    }
+    // Without a channel, window or value change the loop below would
+    // copy every decoded value unchanged; use the decoded buffer instead.
+    const bool identity = !unassociateAlpha && options.gamma == 1.0f &&
+        options.exposure == 0.0f && options.firstChannel == 0 &&
+        outChannels == spec.nchannels && originX == 0 && originY == 0 &&
+        spec.width == displayWidth && spec.height == displayHeight;
+    std::vector<float> outputPixels;
+    if (!identity) {
+        outputPixels.assign(static_cast<size_t>(displayWidth) * displayHeight * outChannels, 0.0f);
+        const int alpha = sourceAlpha;
+        const int colorChannels = std::max(1, std::min(3, spec.nchannels - (alpha >= 0 ? 1 : 0)));
+        const float gain = std::exp2(options.exposure);
+        // Every source row writes its own destination row with the same
+        // per-value arithmetic, so the result does not depend on threads.
+        tbb::parallel_for(tbb::blocked_range<int>(0, spec.height),
+            [&](tbb::blocked_range<int> const &rows) {
+            for (int srcY = rows.begin(); srcY < rows.end(); ++srcY) {
+                const int dstY = originY + srcY;
+                if (dstY < 0 || dstY >= displayHeight) continue;
+                for (int srcX = 0; srcX < spec.width; ++srcX) {
+                    const int dstX = originX + srcX;
+                    if (dstX < 0 || dstX >= displayWidth) continue;
+                    const size_t p = static_cast<size_t>(srcY) * spec.width + srcX;
+                    for (int c = 0; c < outChannels; ++c) {
+                        const int sourceChannel = options.firstChannel + c;
+                        if (sourceChannel >= spec.nchannels) continue;
+                        float value = sourcePixels[p * spec.nchannels + sourceChannel];
+                        const bool color = sourceChannel != alpha &&
+                            sourceChannel - (alpha >= 0 && sourceChannel > alpha ? 1 : 0) < colorChannels;
+                        if (color) {
+                            if (unassociateAlpha) {
+                                const float alphaValue = sourcePixels[p * spec.nchannels + alpha];
+                                value = alphaValue != 0.0f ? value / alphaValue : 0.0f;
+                            }
+                            if (options.gamma != 1.0f)
+                                value = std::pow(std::max(0.0f, value), options.gamma);
+                            if (options.exposure != 0.0f) value *= gain;
+                        }
+                        outputPixels[(static_cast<size_t>(dstY) * displayWidth + dstX) * outChannels + c] = value;
+                    }
+                }
+            }
+        });
+        std::vector<float>().swap(sourcePixels);
+    }
+    result.pixels = identity ? std::move(sourcePixels) : std::move(outputPixels);
+    // The GPU copy: unchanged 8- and 16-bit integer and half texels keep
+    // their storage. 16-bit texels that are all multiples of 257 hold 8-bit
+    // values (k * 257 / 65535 == k / 255), which 8 bits store exactly.
+    if (identity && keepNative && decodeType == OIIO::TypeDesc::UINT16) {
+        auto const *words = reinterpret_cast<uint16_t const *>(native.data());
+        const bool eightBit = tbb::parallel_reduce(
+            tbb::blocked_range<size_t>(0, values, size_t(1) << 16), true,
+            [&](tbb::blocked_range<size_t> const &range, bool all) {
+                for (size_t i = range.begin(); all && i != range.end(); ++i) all = words[i] % 257 == 0;
+                return all;
+            },
+            [](bool a, bool b) { return a && b; });
+        if (eightBit) {
+            std::vector<uint8_t> bytes(values);
+            tbb::parallel_for(size_t(0), values, [&](size_t i) { bytes[i] = uint8_t(words[i] / 257); });
+            native = std::move(bytes);
+            result.component = gpu_texture::Component::Unorm8;
+        } else {
+            result.component = gpu_texture::Component::Unorm16;
+        }
+        result.gpuNative = std::move(native);
+    } else if (identity && keepNative && decodeType == OIIO::TypeDesc::UINT8) {
+        result.component = gpu_texture::Component::Unorm8;
+        result.gpuNative = std::move(native);
+    } else if (identity && keepNative && decodeType == OIIO::TypeDesc::HALF) {
+        result.component = gpu_texture::Component::Float16;
+        result.gpuNative = std::move(native);
+    }
+    if (result.component == gpu_texture::Component::Float16 || result.component == gpu_texture::Component::Float32)
+        gpu_texture::FloatStatistics(result.pixels.data(), result.pixels.size(), &result.gpuFlags, &result.gpuPeak);
+    result.width = displayWidth;
+    result.height = displayHeight;
+    result.channels = outChannels;
+    result.normalizedSpec = std::move(normalizedSpec);
+    result.unassociateAlpha = unassociateAlpha;
+    result.pixelNanoseconds = elapsedNanoseconds(stageStart);
+    return result;
+}
+
+bool WriteGpuFile(std::filesystem::path const &path, DecodedImage const &decoded, std::string *error)
+{
+    const auto header = gpu_texture::MakeHeader(static_cast<uint32_t>(decoded.width),
+        static_cast<uint32_t>(decoded.height), static_cast<uint32_t>(decoded.channels), decoded.component,
+        decoded.gpuFlags, decoded.gpuPeak);
+    const void *payload = decoded.component == gpu_texture::Component::Float32
+        ? static_cast<const void *>(decoded.pixels.data()) : static_cast<const void *>(decoded.gpuNative.data());
+    return gpu_texture::Write(path, header, payload, error);
+}
+
 } // namespace
 
 struct TextureResource::Impl {
@@ -466,6 +757,11 @@ struct TextureResource::Impl {
     std::shared_ptr<const TextureResource> base;
     std::filesystem::path pinPath;
     ResourceVersion version;
+    // The GPU-ready copy (texture_gpu_file.h), and what to write it from if
+    // the cache lacks it: the source (empty for an in-memory one) and the
+    // preparation options.
+    std::filesystem::path gpu;
+    TexturePrepareOptions options;
     ~Impl() {
         if (!pinPath.empty()) { std::error_code ec; std::filesystem::remove(pinPath, ec); }
         releasedResources.fetch_add(1, std::memory_order_relaxed);
@@ -497,6 +793,7 @@ struct TextureService::Impl {
     std::atomic<uint64_t> coldPreparations{0}, inspectNanoseconds{0}, decodeNanoseconds{0};
     std::atomic<uint64_t> pixelNanoseconds{0}, mipNanoseconds{0}, publishNanoseconds{0};
     std::atomic<uint64_t> trimNanoseconds{0}, lockWaitNanoseconds{0};
+    std::atomic<uint64_t> gpuWriteNanoseconds{0}, gpuFilesWritten{0};
     std::atomic<uint64_t> aheadRequests{0}, aheadPreparations{0}, aheadMemoryHits{0};
     // Keys whose resource a prepareAhead call produced; guarded by mutex.
     std::unordered_set<std::string> aheadKeys;
@@ -709,6 +1006,9 @@ bool TextureService::invalidate(std::filesystem::path const &source,
         m_impl->system->invalidate(OIIO::ustring(tx.string()), true);
         if (std::filesystem::exists(tx) && !std::filesystem::remove(tx, ec)) allRemoved = false;
         ec.clear();
+        const auto gpu = root / (key + kGpuSuffix);
+        if (std::filesystem::exists(gpu) && !std::filesystem::remove(gpu, ec)) allRemoved = false;
+        ec.clear();
     }
     return allRemoved;
     } catch (const std::exception& error) {
@@ -831,6 +1131,8 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
         auto aliasImpl = std::make_shared<TextureResource::Impl>();
         aliasImpl->source = absolute;
         aliasImpl->prepared = cached->preparedPath();
+        aliasImpl->gpu = cached->m_impl->gpu;
+        aliasImpl->options = cached->m_impl->options;
         aliasImpl->width = cached->width();
         aliasImpl->height = cached->height();
         aliasImpl->channels = cached->channels();
@@ -943,172 +1245,49 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
     }
     publicationLock.reset();
     stageStart = std::chrono::steady_clock::now();
-    auto sourceInput = OIIO::ImageInput::open(absolute.string());
-    // Kept alive until the end of preparation; readers below borrow it.
-    std::vector<unsigned char> strippedJpeg;
-    std::unique_ptr<OIIO::Filesystem::IOMemReader> strippedReader;
-    if (!sourceInput) {
-        const std::string inspectError = OIIO::geterror();
-        strippedJpeg = jpegWithoutApp13(absolute);
-        if (!strippedJpeg.empty()) {
-            strippedReader = std::make_unique<OIIO::Filesystem::IOMemReader>(
-                strippedJpeg.data(), strippedJpeg.size());
-            sourceInput = OIIO::ImageInput::open(absolute.string(), nullptr, strippedReader.get());
-            if (!sourceInput) (void)OIIO::geterror();
-        }
-        if (!sourceInput)
-            throw std::runtime_error("cannot inspect texture " + absolute.string() + ": " + inspectError);
-    }
-    const OIIO::ImageSpec spec = sourceInput->spec();
-    const std::string sourceInputFormat = sourceInput->format_name();
+    SourceImage sourceImage = OpenSource(absolute);
+    const OIIO::ImageSpec &spec = sourceImage.spec;
+    const std::string sourceInputFormat = sourceImage.format;
     // The JPEG reader ignores the unassociated-alpha hint a decode passes, so
     // the inspected input decodes exactly what a reopened one would. Opening
     // a large JPEG parses all of its metadata and costs more than the decode.
-    const bool decodeInspected = !cacheFilePresent && sourceInputFormat == "jpeg";
-    if (!decodeInspected) sourceInput->close();
+    if (cacheFilePresent || sourceInputFormat != "jpeg") sourceImage.closeInspected();
     m_impl->inspectNanoseconds.fetch_add(elapsedNanoseconds(stageStart), std::memory_order_relaxed);
     if (options.firstChannel >= spec.nchannels)
         throw std::invalid_argument("texture channel range is outside source image");
     if (options.alphaChannel >= spec.nchannels)
         throw std::invalid_argument("texture alpha channel is outside source image");
+    const auto gpuPath = root / (key + kGpuSuffix);
     if (!cacheFilePresent) {
         stageStart = std::chrono::steady_clock::now();
-        const uint64_t estimate = static_cast<uint64_t>(std::max(spec.width, spec.full_width)) *
-            static_cast<uint64_t>(std::max(spec.height, spec.full_height)) *
-            static_cast<uint64_t>(spec.nchannels) * sizeof(float) * 5 / 2;
-        PreparationBudget::Reservation reservation(PreparationBudget::instance(), estimate);
+        PreparationBudget::Reservation reservation(PreparationBudget::instance(), PreparationBytes(spec));
         m_impl->lockWaitNanoseconds.fetch_add(elapsedNanoseconds(stageStart), std::memory_order_relaxed);
+        DecodedImage decoded = DecodeSource(absolute, options, sourceImage);
+        m_impl->decodeNanoseconds.fetch_add(decoded.decodeNanoseconds, std::memory_order_relaxed);
+        m_impl->pixelNanoseconds.fetch_add(decoded.pixelNanoseconds, std::memory_order_relaxed);
+        // The GPU-ready copy, from the same decode (texture_gpu_file.h).
         stageStart = std::chrono::steady_clock::now();
-        std::vector<float> sourcePixels(static_cast<size_t>(spec.width) * spec.height * spec.nchannels);
-        std::unique_ptr<OIIO::ImageInput> decodeInput;
-        if (decodeInspected) {
-            decodeInput = std::move(sourceInput);
-        } else if (strippedReader) {
-            OIIO::ImageSpec config;
-            if (options.unassociateAlpha) config.attribute("oiio:UnassociatedAlpha", 1);
-            // With a config, the reader takes its proxy from this hint.
-            OIIO::Filesystem::IOProxy *proxy = strippedReader.get();
-            config.attribute("oiio:ioproxy", OIIO::TypeDesc::PTR, &proxy);
-            strippedReader->seek(0);
-            decodeInput = OIIO::ImageInput::open(absolute.string(), &config, strippedReader.get());
-            if (!decodeInput)
-                throw std::runtime_error("cannot read texture " + absolute.string() + ": " + OIIO::geterror());
-        } else {
-            // Exactly what an image-cache backed ImageBuf read passes to the
-            // reader: the cache's unassociatedalpha setting as an explicit
-            // hint. Reading directly skips the cache's own header parse.
-            OIIO::ImageSpec config;
-            config.attribute("oiio:UnassociatedAlpha", options.unassociateAlpha ? 1 : 0);
-            decodeInput = OIIO::ImageInput::open(absolute.string(), &config);
-            if (!decodeInput)
-                throw std::runtime_error("cannot read texture " + absolute.string() + ": " + OIIO::geterror());
+        std::string gpuError;
+        if (!gpu_texture::Read(gpuPath, nullptr, nullptr, nullptr)) {
+            if (WriteGpuFile(gpuPath, decoded, &gpuError))
+                m_impl->gpuFilesWritten.fetch_add(1, std::memory_order_relaxed);
+            else
+                std::cerr << "PrismRT: cannot write the GPU copy of " << absolute.filename().string() << ": "
+                          << gpuError << '\n';
         }
-        if (!decodeInput->read_image(0, 0, 0, spec.nchannels, OIIO::TypeDesc::FLOAT,
-                                     sourcePixels.data())) {
-            const std::string error = decodeInput->geterror();
-            throw std::runtime_error("cannot decode texture pixels: " + error);
-        }
-        decodeInput->close();
-        const uint64_t decodeNanosecondsThis = elapsedNanoseconds(stageStart);
-        m_impl->decodeNanoseconds.fetch_add(decodeNanosecondsThis, std::memory_order_relaxed);
-        stageStart = std::chrono::steady_clock::now();
-        const int displayWidth = spec.full_width > 0 ? spec.full_width : spec.width;
-        const int displayHeight = spec.full_height > 0 ? spec.full_height : spec.height;
-        const int outChannels = options.channelCount ? options.channelCount
-            : spec.nchannels - options.firstChannel;
-        OIIO::ImageSpec normalizedSpec(displayWidth, displayHeight, outChannels, OIIO::TypeDesc::FLOAT);
-        normalizedSpec.full_x = normalizedSpec.x = 0;
-        normalizedSpec.full_y = normalizedSpec.y = 0;
-        normalizedSpec.full_width = displayWidth;
-        normalizedSpec.full_height = displayHeight;
-        const int originX = spec.x - spec.full_x;
-        const int originY = spec.y - spec.full_y;
-        int sourceAlpha = options.alphaChannel;
-        if (sourceAlpha == -1) {
-            sourceAlpha = spec.alpha_channel;
-            if (sourceAlpha < 0 && spec.nchannels == 2) sourceAlpha = 1;
-        }
-        // OIIO's unassociatedalpha read hint above keeps straight-alpha data
-        // from being premultiplied during decode. PNG uses straight alpha by
-        // format convention; other sources are governed by explicit metadata.
-        const bool inputUnassociated =
-            spec.get_int_attribute("oiio:UnassociatedAlpha", 0) != 0 ||
-            sourceInputFormat == "png";
-        const bool unassociateAlpha = options.unassociateAlpha && sourceAlpha >= 0 &&
-            !inputUnassociated;
-        const int outputAlpha = sourceAlpha >= options.firstChannel &&
-            sourceAlpha < options.firstChannel + outChannels
-                ? sourceAlpha - options.firstChannel : -1;
-        normalizedSpec.alpha_channel = outputAlpha;
-        if (outputAlpha >= 0 && (unassociateAlpha || inputUnassociated))
-            normalizedSpec.attribute("oiio:UnassociatedAlpha", 1);
-        const std::string sourceColorSpace = options.colorSpace.empty()
-            ? std::string(spec.get_string_attribute("oiio:ColorSpace", "")) : options.colorSpace;
-        if (!sourceColorSpace.empty())
-            normalizedSpec.attribute("oiio:ColorSpace", sourceColorSpace);
-        normalizedSpec.channelnames.clear();
-        for (int c = 0; c < outChannels; ++c) {
-            const int sourceChannel = options.firstChannel + c;
-            normalizedSpec.channelnames.push_back(sourceChannel < spec.nchannels
-                ? std::string(spec.channel_name(sourceChannel)) : "channel" + std::to_string(c));
-        }
-        // Without a channel, window or value change the loop below would
-        // copy every decoded value unchanged; use the decoded buffer instead.
-        const bool identity = !unassociateAlpha && options.gamma == 1.0f &&
-            options.exposure == 0.0f && options.firstChannel == 0 &&
-            outChannels == spec.nchannels && originX == 0 && originY == 0 &&
-            spec.width == displayWidth && spec.height == displayHeight;
-        std::vector<float> outputPixels;
-        if (!identity) {
-            outputPixels.assign(static_cast<size_t>(displayWidth) * displayHeight * outChannels, 0.0f);
-            const int alpha = sourceAlpha;
-            const int colorChannels = std::max(1, std::min(3, spec.nchannels - (alpha >= 0 ? 1 : 0)));
-            const float gain = std::exp2(options.exposure);
-            // Every source row writes its own destination row with the same
-            // per-value arithmetic, so the result does not depend on threads.
-            tbb::parallel_for(tbb::blocked_range<int>(0, spec.height),
-                [&](tbb::blocked_range<int> const &rows) {
-                for (int srcY = rows.begin(); srcY < rows.end(); ++srcY) {
-                    const int dstY = originY + srcY;
-                    if (dstY < 0 || dstY >= displayHeight) continue;
-                    for (int srcX = 0; srcX < spec.width; ++srcX) {
-                        const int dstX = originX + srcX;
-                        if (dstX < 0 || dstX >= displayWidth) continue;
-                        const size_t p = static_cast<size_t>(srcY) * spec.width + srcX;
-                        for (int c = 0; c < outChannels; ++c) {
-                            const int sourceChannel = options.firstChannel + c;
-                            if (sourceChannel >= spec.nchannels) continue;
-                            float value = sourcePixels[p * spec.nchannels + sourceChannel];
-                            const bool color = sourceChannel != alpha &&
-                                sourceChannel - (alpha >= 0 && sourceChannel > alpha ? 1 : 0) < colorChannels;
-                            if (color) {
-                                if (unassociateAlpha) {
-                                    const float alphaValue = sourcePixels[p * spec.nchannels + alpha];
-                                    value = alphaValue != 0.0f ? value / alphaValue : 0.0f;
-                                }
-                                if (options.gamma != 1.0f)
-                                    value = std::pow(std::max(0.0f, value), options.gamma);
-                                if (options.exposure != 0.0f) value *= gain;
-                            }
-                            outputPixels[(static_cast<size_t>(dstY) * displayWidth + dstX) * outChannels + c] = value;
-                        }
-                    }
-                }
-            });
-            std::vector<float>().swap(sourcePixels);
-        }
-        std::vector<float> &pixels = identity ? sourcePixels : outputPixels;
-        const uint64_t pixelNanosecondsThis = elapsedNanoseconds(stageStart);
-        m_impl->pixelNanoseconds.fetch_add(pixelNanosecondsThis, std::memory_order_relaxed);
+        decoded.gpuNative = {};
+        const uint64_t gpuNanosecondsThis = elapsedNanoseconds(stageStart);
+        m_impl->gpuWriteNanoseconds.fetch_add(gpuNanosecondsThis, std::memory_order_relaxed);
         stageStart = std::chrono::steady_clock::now();
         static std::atomic<uint64_t> serial{0};
         const auto temp = root / (key + "." + std::to_string(processId()) + "." +
                                   std::to_string(++serial) + ".tmp.exr");
+        const int displayWidth = decoded.width, displayHeight = decoded.height, outChannels = decoded.channels;
         // The file make_texture would write for this image (a plain float
         // texture: black wrap modes in the file, box-filtered mips, 64x64
         // tiles), written by texture_writer instead; see texture_writer.h.
         // A lookup with the default wrap mode uses the file's.
-        OIIO::ImageSpec textureSpec = normalizedSpec;
+        OIIO::ImageSpec textureSpec = decoded.normalizedSpec;
         textureSpec.tile_width = textureSpec.tile_height = 64;
         textureSpec.tile_depth = 1;
         textureSpec.attribute("compression", texture_writer::PreparedCompression());
@@ -1120,7 +1299,7 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
         std::vector<texture_writer::Level> levels(1);
         levels[0].width = displayWidth;
         levels[0].height = displayHeight;
-        levels[0].pixels = std::move(pixels);
+        levels[0].pixels = std::move(decoded.pixels);
         texture_writer::BuildMipChain(levels, outChannels);
         const uint64_t mipNanosecondsThis = elapsedNanoseconds(stageStart);
         const auto writeStart = std::chrono::steady_clock::now();
@@ -1143,9 +1322,11 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
                 " format=" + sourceInputFormat + " type=" + spec.format.c_str() +
                 " size=" + std::to_string(spec.width) + "x" + std::to_string(spec.height) +
                 " channels=" + std::to_string(spec.nchannels) + " out_channels=" + std::to_string(outChannels) +
-                " gamma=" + std::to_string(options.gamma) + " unassociate=" + std::to_string(unassociateAlpha) +
-                " decode_ms=" + std::to_string(decodeNanosecondsThis / 1000000) +
-                " pixel_ms=" + std::to_string(pixelNanosecondsThis / 1000000) +
+                " gamma=" + std::to_string(options.gamma) + " unassociate=" + std::to_string(decoded.unassociateAlpha) +
+                " decode_ms=" + std::to_string(decoded.decodeNanoseconds / 1000000) +
+                " pixel_ms=" + std::to_string(decoded.pixelNanoseconds / 1000000) +
+                " gpu_ms=" + std::to_string(gpuNanosecondsThis / 1000000) +
+                " gpu_component=" + std::to_string(static_cast<int>(decoded.component)) +
                 " make_ms=" + std::to_string(makeNanoseconds / 1000000) +
                 " mip_s=" + std::to_string(mipNanosecondsThis / 1e9) +
                 " write_s=" + std::to_string(writeNanosecondsThis / 1e9) +
@@ -1179,6 +1360,8 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
     impl->source = absolute.filename().string().rfind("embedded-", 0) == 0
         ? std::filesystem::path{} : absolute;
     impl->prepared = tx;
+    impl->gpu = gpuPath;
+    impl->options = options;
     impl->width = preparedSpec.width;
     impl->height = preparedSpec.height;
     impl->channels = preparedSpec.nchannels;
@@ -1208,6 +1391,7 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
         throw std::runtime_error("cannot open prepared texture: " + m_impl->system->geterror());
     std::error_code accessError;
     std::filesystem::last_write_time(tx, std::filesystem::file_time_type::clock::now(), accessError);
+    std::filesystem::last_write_time(gpuPath, std::filesystem::file_time_type::clock::now(), accessError);
     publishNanoseconds += elapsedNanoseconds(stageStart);
     m_impl->publishNanoseconds.fetch_add(publishNanoseconds, std::memory_order_relaxed);
     uintmax_t addedBytes = 0;
@@ -1266,7 +1450,10 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
             addedBeforeTrim = usage.added;
             for (auto const &[resourceKey, weak] : m_impl->resources) {
                 (void)resourceKey;
-                if (auto live = weak.lock()) pinned.emplace(live->preparedPath().filename().string(), true);
+                if (auto live = weak.lock()) {
+                    pinned.emplace(live->preparedPath().filename().string(), true);
+                    pinned.emplace(live->m_impl->gpu.filename().string(), true);
+                }
             }
         }
     }
@@ -1406,6 +1593,56 @@ bool TextureService::readPixels(TextureResource const &resource, int xb, int yb,
     return false;
 }
 
+std::filesystem::path TextureService::gpuImage(TextureResource const &resource, std::string *error) const
+{
+    TextureResource::Impl const &impl = *resource.m_impl;
+    if (impl.gpu.empty()) {
+        if (error) *error = "no GPU copy for this texture";
+        return {};
+    }
+    std::string readError;
+    if (gpu_texture::Read(impl.gpu, nullptr, nullptr, &readError)) return impl.gpu;
+    // A cache prepared before GPU copies existed, or a copy that was evicted
+    // or damaged: write it from the source, if that is still what the
+    // resource was prepared from.
+    std::error_code ec;
+    if (impl.source.empty() || !std::filesystem::is_regular_file(impl.source, ec)) {
+        if (error) *error = readError + " (and no source file to write it from)";
+        return {};
+    }
+    try {
+        if (sourceStamp(impl.source, impl.options, impl.version.generation) != impl.version.interpretationIdentity) {
+            if (error) *error = "the source changed since it was prepared";
+            return {};
+        }
+        std::shared_ptr<std::mutex> gate;
+        {
+            std::lock_guard lock(m_impl->mutex);
+            auto &slot = m_impl->pending["gpu:" + impl.gpu.generic_string()];
+            if (!slot) slot = std::make_shared<std::mutex>();
+            gate = slot;
+        }
+        std::lock_guard writing(*gate);
+        if (gpu_texture::Read(impl.gpu, nullptr, nullptr, nullptr)) return impl.gpu;
+        const auto start = std::chrono::steady_clock::now();
+        SourceImage source = OpenSource(impl.source);
+        if (source.format != "jpeg") source.closeInspected();
+        PreparationBudget::Reservation reservation(PreparationBudget::instance(), PreparationBytes(source.spec));
+        DecodedImage decoded = DecodeSource(impl.source, impl.options, source);
+        if (decoded.width != impl.width || decoded.height != impl.height || decoded.channels != impl.channels) {
+            if (error) *error = "the source no longer matches its prepared texture";
+            return {};
+        }
+        if (!WriteGpuFile(impl.gpu, decoded, error)) return {};
+        m_impl->gpuFilesWritten.fetch_add(1, std::memory_order_relaxed);
+        m_impl->gpuWriteNanoseconds.fetch_add(elapsedNanoseconds(start), std::memory_order_relaxed);
+        return impl.gpu;
+    } catch (std::exception const &failure) {
+        if (error) *error = failure.what();
+        return {};
+    }
+}
+
 OIIO::TextureSystem *TextureService::textureSystem() const noexcept { return m_impl->system.get(); }
 
 TextureServiceStats TextureService::stats() const noexcept
@@ -1427,6 +1664,8 @@ TextureServiceStats TextureService::stats() const noexcept
     result.publishNanoseconds = m_impl->publishNanoseconds.load(std::memory_order_relaxed);
     result.trimNanoseconds = m_impl->trimNanoseconds.load(std::memory_order_relaxed);
     result.lockWaitNanoseconds = m_impl->lockWaitNanoseconds.load(std::memory_order_relaxed);
+    result.gpuWriteNanoseconds = m_impl->gpuWriteNanoseconds.load(std::memory_order_relaxed);
+    result.gpuFilesWritten = m_impl->gpuFilesWritten.load(std::memory_order_relaxed);
     result.aheadRequests = m_impl->aheadRequests.load(std::memory_order_relaxed);
     result.aheadPreparations = m_impl->aheadPreparations.load(std::memory_order_relaxed);
     result.aheadMemoryHits = m_impl->aheadMemoryHits.load(std::memory_order_relaxed);

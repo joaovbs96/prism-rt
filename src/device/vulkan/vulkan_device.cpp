@@ -17,6 +17,7 @@
 #include "../../progress.h"
 #include "../../scene.h"
 #include "../../texture_service.h"
+#include "../../texture_gpu_file.h"
 #include "../../load_profile.h"
 
 #include <OpenImageIO/imageio.h>
@@ -72,6 +73,108 @@ uint16_t FloatToHalf(float value)
     const uint32_t remainder = mantissa & 0x1FFFu;
     if (remainder > 0x1000u || (remainder == 0x1000u && (half & 1u))) ++half;
     return uint16_t(sign | half);
+}
+
+// How an image's texels are stored on the GPU.
+enum class Storage { Unorm8, Unorm16, Float16, Float32 };
+
+int StorageBytes(Storage s)
+{
+    switch (s) {
+    case Storage::Unorm8: return 1;
+    case Storage::Unorm16: case Storage::Float16: return 2;
+    default: return 4;
+    }
+}
+
+VkFormat StorageFormat(Storage s, int stored)
+{
+    static const VkFormat formats[4][4] = {
+        {VK_FORMAT_R8_UNORM, VK_FORMAT_R8G8_UNORM, VK_FORMAT_UNDEFINED, VK_FORMAT_R8G8B8A8_UNORM},
+        {VK_FORMAT_R16_UNORM, VK_FORMAT_R16G16_UNORM, VK_FORMAT_UNDEFINED, VK_FORMAT_R16G16B16A16_UNORM},
+        {VK_FORMAT_R16_SFLOAT, VK_FORMAT_R16G16_SFLOAT, VK_FORMAT_UNDEFINED, VK_FORMAT_R16G16B16A16_SFLOAT},
+        {VK_FORMAT_R32_SFLOAT, VK_FORMAT_R32G32_SFLOAT, VK_FORMAT_UNDEFINED, VK_FORMAT_R32G32B32A32_SFLOAT}};
+    return formats[int(s)][stored - 1];
+}
+
+// Encodes one texel component as the .tx.exr path always has.
+inline void EncodeTexel(Storage s, float v, uint8_t* texel)
+{
+    switch (s) {
+    case Storage::Unorm8: *texel = uint8_t(std::lround(std::clamp(v, 0.0f, 1.0f) * 255.0f)); break;
+    case Storage::Unorm16: {
+        const uint16_t u = uint16_t(std::lround(std::clamp(v, 0.0f, 1.0f) * 65535.0f));
+        std::memcpy(texel, &u, 2);
+        break;
+    }
+    case Storage::Float16: {
+        const uint16_t h = FloatToHalf(v);
+        std::memcpy(texel, &h, 2);
+        break;
+    }
+    default: std::memcpy(texel, &v, 4);
+    }
+}
+
+bool SameStorage(gpu_texture::Component c, Storage s)
+{
+    return (c == gpu_texture::Component::Unorm8 && s == Storage::Unorm8) ||
+        (c == gpu_texture::Component::Unorm16 && s == Storage::Unorm16) ||
+        (c == gpu_texture::Component::Float16 && s == Storage::Float16) ||
+        (c == gpu_texture::Component::Float32 && s == Storage::Float32);
+}
+
+OIIO::TypeDesc ComponentType(gpu_texture::Component c)
+{
+    switch (c) {
+    case gpu_texture::Component::Unorm8: return OIIO::TypeDesc::UINT8;
+    case gpu_texture::Component::Unorm16: return OIIO::TypeDesc::UINT16;
+    case gpu_texture::Component::Float16: return OIIO::TypeDesc::HALF;
+    default: return OIIO::TypeDesc::FLOAT;
+    }
+}
+
+// The storage of an image with a GPU copy. Integer texels keep their
+// precision; half and float texels follow the rule the float .tx.exr path
+// applies (8-bit when every value is k/255, half below 60000, else float);
+// environments keep float.
+Storage ChooseStorage(gpu_texture::Header const& h, bool floatPrecision, bool unorm16Filterable)
+{
+    if (floatPrecision) return Storage::Float32;
+    switch (h.component) {
+    case gpu_texture::Component::Unorm8: return Storage::Unorm8;
+    case gpu_texture::Component::Unorm16: return unorm16Filterable ? Storage::Unorm16 : Storage::Float16;
+    default:
+        if (h.flags & gpu_texture::kQuantized8) return Storage::Unorm8;
+        return h.peak < 60000.0f ? Storage::Float16 : Storage::Float32;
+    }
+}
+
+// An uninitialized byte buffer (a std::vector would clear it first).
+struct Bytes {
+    std::unique_ptr<uint8_t[]> data;
+    size_t size = 0;
+    Bytes() = default;
+    explicit Bytes(size_t n) : data(new uint8_t[n]), size(n) {}
+    void swap(Bytes& other) noexcept
+    {
+        std::swap(data, other.data);
+        std::swap(size, other.size);
+    }
+};
+
+struct GpuCopy {
+    std::filesystem::path path;
+    gpu_texture::Header header{};
+    Storage storage = Storage::Float32;
+    bool valid = false;
+};
+
+// PRISM_GPU_TEXTURE_COPIES=0 uploads from the float .tx.exr files instead.
+bool GpuCopiesEnabled()
+{
+    const char* value = std::getenv("PRISM_GPU_TEXTURE_COPIES");
+    return !value || std::string_view(value) != "0";
 }
 
 double SecondsSince(Clock::time_point start)
@@ -938,11 +1041,49 @@ bool VulkanDevice::Impl::uploadImages(std::string* error)
     std::vector<bool> isEnvironment(d.images.size(), false);
     for (auto const& environment : d.environments)
         if (environment.info.y < d.images.size()) isEnvironment[environment.info.y] = true;
+    // UNORM16 storage needs sampling, linear filtering and blits (for mips).
+    auto filterable = [&](VkFormat format) {
+        VkFormatProperties properties;
+        vkGetPhysicalDeviceFormatProperties(physical, format, &properties);
+        const VkFormatFeatureFlags needed = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+            VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT | VK_FORMAT_FEATURE_BLIT_SRC_BIT |
+            VK_FORMAT_FEATURE_BLIT_DST_BIT;
+        return (properties.optimalTilingFeatures & needed) == needed;
+    };
+    const bool unorm16Filterable = filterable(VK_FORMAT_R16_UNORM) && filterable(VK_FORMAT_R16G16_UNORM) &&
+        filterable(VK_FORMAT_R16G16B16A16_UNORM);
+    // Each image's GPU-ready copy (texture_gpu_file.h), when it has one: the
+    // texels at the source's precision, uploaded without decoding the float
+    // .tx.exr. Images without one take the .tx.exr path below.
+    std::vector<GpuCopy> copies(d.images.size());
+    const auto uploadStart = Clock::now();
+    const auto copiesStart = Clock::now();
+    if (GpuCopiesEnabled()) {
+        tbb::parallel_for(size_t(0), d.images.size(), [&](size_t i) {
+            auto const& resource = *d.images[i];
+            std::string reason;
+            GpuCopy& copy = copies[i];
+            copy.path = service->gpuImage(resource, &reason);
+            gpu_texture::Header& h = copy.header;
+            copy.valid = !copy.path.empty() && gpu_texture::Read(copy.path, &h, nullptr, &reason) &&
+                int(h.width) == resource.width() && int(h.height) == resource.height() &&
+                int(h.channels) == std::clamp(resource.channels(), 1, 4);
+            if (copy.valid)
+                copy.storage = ChooseStorage(h, isEnvironment[i], unorm16Filterable);
+            else if (gpu::GpuVerbose())
+                std::cerr << std::format("PrismRT Vulkan: no GPU copy of {} ({}); decoding its prepared file\n",
+                                         resource.sourcePath().filename().string(), reason);
+        });
+    }
+    const double copiesSeconds = SecondsSince(copiesStart);
     std::vector<gpu::ImageFootprint> footprints(d.images.size());
     for (size_t i = 0; i < d.images.size(); ++i) {
         const int channels = std::clamp(d.images[i]->channels(), 1, 4);
+        // Without a GPU copy the storage is unknown until the texels are
+        // read; estimate the 8-bit case as before.
+        const int componentBytes = copies[i].valid ? StorageBytes(copies[i].storage) : isEnvironment[i] ? 4 : 1;
         footprints[i] = {d.images[i]->width(), d.images[i]->height(), channels == 3 ? 4 : channels,
-                         isEnvironment[i] ? 4 : 1, bool(isEnvironment[i])};
+                         componentBytes, bool(isEnvironment[i])};
     }
     const std::vector<int> shift = gpu::FitImages(footprints, gpu::TextureBudget(deviceLocal));
     size_t reduced = 0;
@@ -977,18 +1118,111 @@ bool VulkanDevice::Impl::uploadImages(std::string* error)
     progress::Detail(Phase::Upload, missing.empty() ? "images (cached)" : "images");
 
     // Texel data of one image, converted for upload. Same storage policy as
-    // the Metal device (see UploadImage there).
+    // the Metal device (see UploadImage there), except that a GPU copy keeps
+    // 16-bit integer texels as UNORM16 and reduced 8-bit images 8-bit.
     struct Prepared {
-        std::vector<uint8_t> staging;
+        Bytes staging;
         int width = 0, height = 0;
         VkFormat format = VK_FORMAT_UNDEFINED;
         uint32_t levels = 1;
+        bool fromCopy = false;
     };
-    std::atomic<uint64_t> readNanoseconds{0}, convertNanoseconds{0}, stagedBytes{0};
+    std::atomic<uint64_t> readNanoseconds{0}, convertNanoseconds{0}, stagedBytes{0}, copiedImages{0};
     auto nanosecondsSince = [](Clock::time_point start) {
         return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count());
     };
+    auto finish = [&](Prepared& out, int width, int height) {
+        VkFormatProperties formatProperties;
+        vkGetPhysicalDeviceFormatProperties(physical, out.format, &formatProperties);
+        const VkFormatFeatureFlags blit = VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT |
+            VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+        const bool mipmapped = (formatProperties.optimalTilingFeatures & blit) == blit;
+        out.levels = mipmapped ? 1u + uint32_t(std::floor(std::log2(double(std::max(width, height))))) : 1u;
+        out.width = width;
+        out.height = height;
+    };
+    auto profileImage = [&](prism::TextureResource const& resource, Prepared const& out, int channels, int s,
+                            uint64_t readTime, uint64_t convertTime) {
+        readNanoseconds += readTime;
+        convertNanoseconds += convertTime;
+        stagedBytes += out.staging.size;
+        if (prism::load_profile::Enabled())
+            prism::load_profile::Mark("vulkan.image",
+                std::format("name={} size={}x{} channels={} shift={} format={} bytes={} read_ms={:.1f} "
+                            "convert_ms={:.1f} source={}",
+                            resource.sourcePath().filename().string(), out.width, out.height, channels, s,
+                            int(out.format), out.staging.size, readTime / 1e6, convertTime / 1e6,
+                            out.fromCopy ? "gpu" : "tx"));
+    };
+    // From the GPU copy: read, then pad RGB to RGBA, reduce or convert as the
+    // storage needs (usually nothing: the texels are uploaded as stored).
+    auto prepareFromCopy = [&](size_t i, Prepared& out) {
+        GpuCopy const& copy = copies[i];
+        gpu_texture::Header const& h = copy.header;
+        const int channels = int(h.channels), stored = channels == 3 ? 4 : channels;
+        const auto readStart = Clock::now();
+        Bytes payload(size_t(h.payloadBytes));
+        std::string reason;
+        if (!gpu_texture::ReadPayload(copy.path, h, payload.data.get(), &reason)) {
+            std::cerr << std::format("PrismRT Vulkan: cannot read {}: {}; decoding its prepared file\n",
+                                     copy.path.filename().string(), reason);
+            return false;
+        }
+        const uint64_t readTime = nanosecondsSince(readStart);
+        const auto convertStart = Clock::now();
+        int width = int(h.width), height = int(h.height);
+        const Storage storage = copy.storage;
+        const int outBytes = StorageBytes(storage);
+        const size_t texels = size_t(width) * height;
+        const bool asStored = shift[i] == 0 && SameStorage(h.component, storage);
+        if (asStored && stored == channels) {
+            out.staging = std::move(payload);
+        } else if (asStored) {
+            // Pad RGB to RGBA; the fourth component reads as zero.
+            const int cb = outBytes;
+            out.staging = Bytes(texels * stored * cb);
+            tbb::parallel_for(tbb::blocked_range<size_t>(0, texels, size_t(1) << 14),
+                [&](tbb::blocked_range<size_t> const& range) {
+                    for (size_t p = range.begin(); p != range.end(); ++p) {
+                        uint8_t* dst = out.staging.data.get() + p * stored * cb;
+                        std::memcpy(dst, payload.data.get() + p * channels * cb, size_t(channels) * cb);
+                        std::memset(dst + channels * cb, 0, size_t(stored - channels) * cb);
+                    }
+                });
+        } else {
+            // Through float: OIIO's conversion, exactly as the .tx.exr holds it.
+            std::vector<float> pixels(texels * channels);
+            const OIIO::TypeDesc type = ComponentType(h.component);
+            constexpr size_t chunk = size_t(1) << 18;
+            tbb::parallel_for(size_t(0), (pixels.size() + chunk - 1) / chunk, [&](size_t c) {
+                const size_t begin = c * chunk, count = std::min(chunk, pixels.size() - begin);
+                OIIO::convert_pixel_values(type, payload.data.get() + begin * type.size(), OIIO::TypeDesc::FLOAT,
+                                           pixels.data() + begin, int(count));
+            });
+            Bytes().swap(payload);
+            gpu::Downsample(pixels, width, height, channels, shift[i]);
+            const size_t reducedTexels = size_t(width) * height;
+            out.staging = Bytes(reducedTexels * stored * outBytes);
+            tbb::parallel_for(tbb::blocked_range<size_t>(0, reducedTexels, size_t(1) << 14),
+                [&](tbb::blocked_range<size_t> const& range) {
+                    for (size_t p = range.begin(); p != range.end(); ++p)
+                        for (int c = 0; c < stored; ++c)
+                            EncodeTexel(storage, c < channels ? pixels[p * channels + c] : 0.0f,
+                                        out.staging.data.get() + (p * stored + c) * outBytes);
+                });
+        }
+        out.format = StorageFormat(storage, stored);
+        out.fromCopy = true;
+        finish(out, width, height);
+        ++copiedImages;
+        profileImage(*d.images[i], out, channels, shift[i], readTime, nanosecondsSince(convertStart));
+        return true;
+    };
     auto prepare = [&](size_t i, Prepared& out) {
+        if (copies[i].valid && prepareFromCopy(i, out)) {
+            progress::Add(Phase::Upload);
+            return;
+        }
         auto const& resource = d.images[i];
         const bool floatPrecision = isEnvironment[i];
         int width = resource->width(), height = resource->height();
@@ -999,7 +1233,6 @@ bool VulkanDevice::Impl::uploadImages(std::string* error)
             !service->readPixels(*resource, 0, 0, width, height, 0, channels, pixels.data()))
             std::fill(pixels.begin(), pixels.end(), 0.0f);
         const uint64_t readTime = nanosecondsSince(readStart);
-        readNanoseconds += readTime;
         const auto convertStart = Clock::now();
         gpu::Downsample(pixels, width, height, channels, shift[i]);
         struct Scan {
@@ -1020,44 +1253,21 @@ bool VulkanDevice::Impl::uploadImages(std::string* error)
                 return scan;
             },
             [](Scan a, Scan b) { return Scan{a.quantized && b.quantized, std::max(a.peak, b.peak)}; });
-        const bool quantized = scan.quantized;
-        const float peak = scan.peak;
+        const Storage storage = scan.quantized ? Storage::Unorm8
+            : (!floatPrecision && scan.peak < 60000.0f) ? Storage::Float16 : Storage::Float32;
         const int stored = channels == 3 ? 4 : channels;
-        const int componentBytes = quantized ? 1 : (!floatPrecision && peak < 60000.0f) ? 2 : 4;
-        static const VkFormat formats[3][4] = {
-            {VK_FORMAT_R8_UNORM, VK_FORMAT_R8G8_UNORM, VK_FORMAT_UNDEFINED, VK_FORMAT_R8G8B8A8_UNORM},
-            {VK_FORMAT_R16_SFLOAT, VK_FORMAT_R16G16_SFLOAT, VK_FORMAT_UNDEFINED, VK_FORMAT_R16G16B16A16_SFLOAT},
-            {VK_FORMAT_R32_SFLOAT, VK_FORMAT_R32G32_SFLOAT, VK_FORMAT_UNDEFINED, VK_FORMAT_R32G32B32A32_SFLOAT}};
-        out.format = formats[componentBytes == 1 ? 0 : componentBytes == 2 ? 1 : 2][stored - 1];
-        VkFormatProperties formatProperties;
-        vkGetPhysicalDeviceFormatProperties(physical, out.format, &formatProperties);
-        const VkFormatFeatureFlags blit = VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT |
-            VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
-        const bool mipmapped = (formatProperties.optimalTilingFeatures & blit) == blit;
-        out.levels = mipmapped ? 1u + uint32_t(std::floor(std::log2(double(std::max(width, height))))) : 1u;
-        out.width = width;
-        out.height = height;
-        out.staging.resize(size_t(width) * height * stored * componentBytes);
+        const int componentBytes = StorageBytes(storage);
+        out.format = StorageFormat(storage, stored);
+        finish(out, width, height);
+        out.staging = Bytes(size_t(width) * height * stored * componentBytes);
         tbb::parallel_for(tbb::blocked_range<size_t>(0, size_t(width) * height, size_t(1) << 14),
             [&](tbb::blocked_range<size_t> const& range) {
-                for (size_t p = range.begin(); p != range.end(); ++p) {
-                    for (int c = 0; c < stored; ++c) {
-                        const float v = c < channels ? pixels[p * channels + c] : 0.0f;
-                        uint8_t* texel = out.staging.data() + (p * stored + c) * componentBytes;
-                        if (componentBytes == 1) *texel = uint8_t(std::lround(std::clamp(v, 0.0f, 1.0f) * 255.0f));
-                        else if (componentBytes == 2) { const uint16_t h = FloatToHalf(v); std::memcpy(texel, &h, 2); }
-                        else std::memcpy(texel, &v, 4);
-                    }
-                }
+                for (size_t p = range.begin(); p != range.end(); ++p)
+                    for (int c = 0; c < stored; ++c)
+                        EncodeTexel(storage, c < channels ? pixels[p * channels + c] : 0.0f,
+                                    out.staging.data.get() + (p * stored + c) * componentBytes);
             });
-        const uint64_t convertTime = nanosecondsSince(convertStart);
-        convertNanoseconds += convertTime;
-        stagedBytes += out.staging.size();
-        if (prism::load_profile::Enabled())
-            prism::load_profile::Mark("vulkan.image",
-                std::format("name={} size={}x{} channels={} shift={} format={} bytes={} read_ms={:.1f} convert_ms={:.1f}",
-                            resource->sourcePath().filename().string(), width, height, channels, shift[i],
-                            int(out.format), out.staging.size(), readTime / 1e6, convertTime / 1e6));
+        profileImage(*resource, out, channels, shift[i], readTime, nanosecondsSince(convertStart));
         progress::Add(Phase::Upload);
     };
 
@@ -1142,7 +1352,6 @@ bool VulkanDevice::Impl::uploadImages(std::string* error)
     // Images are prepared in parallel, in batches that bound the host
     // memory, and each batch is uploaded with one submission.
     constexpr uint64_t batchBytes = uint64_t(2) << 30;
-    const auto uploadStart = Clock::now();
     uint64_t prepareNanoseconds = 0, submitNanoseconds = 0;
     for (size_t first = 0; first < missing.size();) {
         size_t last = first;
@@ -1166,13 +1375,13 @@ bool VulkanDevice::Impl::uploadImages(std::string* error)
         VkCommandBuffer commands = beginCommands();
         bool recorded = true;
         for (size_t k = 0; k < prepared.size() && recorded; ++k) {
-            if (!createBuffer(prepared[k].staging.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &staging[k])) {
+            if (!createBuffer(prepared[k].staging.size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &staging[k])) {
                 if (error) *error = "cannot allocate an image staging buffer";
                 recorded = false;
                 break;
             }
-            std::memcpy(staging[k].mapped, prepared[k].staging.data(), prepared[k].staging.size());
-            std::vector<uint8_t>().swap(prepared[k].staging);
+            std::memcpy(staging[k].mapped, prepared[k].staging.data.get(), prepared[k].staging.size);
+            Bytes().swap(prepared[k].staging);
             if (!record(commands, prepared[k], staging[k], &images[k])) {
                 if (error) *error = "out of memory for images";
                 recorded = false;
@@ -1205,9 +1414,10 @@ bool VulkanDevice::Impl::uploadImages(std::string* error)
         const std::string summary = std::format(
             "{} images ({} uploaded, {} reduced), {:.0f} MiB of image memory, {:.0f} MiB staged; "
             "{:.2f} s total: prepare {:.2f} s (read {:.2f} s, convert {:.2f} s summed over threads), "
-            "copy and submit {:.2f} s", d.images.size(), missing.size(), reduced, double(bytes) / 1048576.0,
-            double(stagedBytes.load()) / 1048576.0, SecondsSince(uploadStart), prepareNanoseconds / 1e9,
-            readNanoseconds.load() / 1e9, convertNanoseconds.load() / 1e9, submitNanoseconds / 1e9);
+            "copy and submit {:.2f} s; {} from GPU copies (found in {:.2f} s)", d.images.size(), missing.size(),
+            reduced, double(bytes) / 1048576.0, double(stagedBytes.load()) / 1048576.0, SecondsSince(uploadStart),
+            prepareNanoseconds / 1e9, readNanoseconds.load() / 1e9, convertNanoseconds.load() / 1e9,
+            submitNanoseconds / 1e9, copiedImages.load(), copiesSeconds);
         if (gpu::GpuVerbose()) std::cerr << "PrismRT Vulkan: " << summary << '\n';
         prism::load_profile::Mark("vulkan.images", summary);
     }

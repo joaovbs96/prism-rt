@@ -22,8 +22,12 @@ inline std::filesystem::path PersistentCacheRoot() {
     return std::filesystem::temp_directory_path() / "PrismRT" / "cache";
 }
 
+// 20 GiB: a prepared texture now has a GPU-ready copy beside its float
+// .tx.exr (about half as large again), and the OpenPBR playground alone
+// needs 13 GiB with both; a budget below a scene's working set evicts, at
+// the start of every warm load, files that load then prepares again.
 inline uint64_t PersistentDiskBudgetBytes() {
-    double gib = 10.0;
+    double gib = 20.0;
     if (const char* value = std::getenv("PRISM_DISK_CACHE_GB"); value && *value) {
         try {
             size_t consumed = 0;

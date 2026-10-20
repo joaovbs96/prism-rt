@@ -79,6 +79,10 @@ struct TextureServiceStats {
     uint64_t publishNanoseconds = 0;
     uint64_t trimNanoseconds = 0;
     uint64_t lockWaitNanoseconds = 0;
+    // Writing GPU-ready copies (texture_gpu_file.h), during cold
+    // preparations and for prepared textures that lacked one.
+    uint64_t gpuWriteNanoseconds = 0;
+    uint64_t gpuFilesWritten = 0;
     // prepareAhead calls, those that produced the resource (cold or from
     // disk), and later ordinary calls served from memory by such a resource.
     uint64_t aheadRequests = 0;
@@ -150,6 +154,12 @@ public:
     bool readPixels(TextureResource const &resource, int xbegin, int ybegin,
                     int xend, int yend, int firstChannel, int channelCount,
                     float *result) const;
+    // The GPU-ready copy of `resource` (texture_gpu_file.h): its top level
+    // at the source's precision, for GPU devices to upload without decoding
+    // the float .tx.exr. A cache prepared before these copies existed gets
+    // one from the source on first request. Empty when there is none (an
+    // in-memory source, or a failed decode); `error` then says why.
+    std::filesystem::path gpuImage(TextureResource const &resource, std::string *error = nullptr) const;
     // The calling thread's last lookup or readPixels failure.
     static std::string const &lastError() noexcept;
     OIIO::TextureSystem *textureSystem() const noexcept;
