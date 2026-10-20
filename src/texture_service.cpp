@@ -3,6 +3,7 @@
 #include "load_profile.h"
 #include "texture_writer.h"
 #include "texture_gpu_file.h"
+#include "fingerprint_records.h"
 
 #include <OpenImageIO/imagebuf.h>
 #include <OpenImageIO/imagebufalgo.h>
@@ -1209,6 +1210,19 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
                 if (auto it = m_impl->sourceFingerprints.find(rawStamp); it != m_impl->sourceFingerprints.end())
                     rawFingerprint = it->second;
             }
+            // A source an earlier process hashed, unchanged since (see
+            // fingerprint_records.h).
+            const std::string recordIdentity = "texture-source\n" + rawStamp + "\n" +
+                fingerprint_records::FileChangeStamp(absolute);
+            if (rawFingerprint.empty()) {
+                fingerprint_records::Record record;
+                if (fingerprint_records::Read(cacheRoot(), recordIdentity, &record) &&
+                    record.artifactStamp == fingerprint_records::FileStamp(absolute)) {
+                    rawFingerprint = record.fingerprint;
+                    std::lock_guard lock(m_impl->mutex);
+                    m_impl->sourceFingerprints[rawStamp] = rawFingerprint;
+                }
+            }
             if (rawFingerprint.empty()) {
                 // Hash once per stable metadata/version snapshot. A post-hash
                 // stat check prevents publishing a digest for a changing file.
@@ -1228,6 +1242,8 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
                     throw std::runtime_error("texture source changed while fingerprinting: " + absolute.string());
                 rawFingerprint = "sha1:v1:" + hash.digest();
                 m_impl->sourceBytesHashed.fetch_add(bytes, std::memory_order_relaxed);
+                fingerprint_records::Write(cacheRoot(), recordIdentity,
+                    {rawFingerprint, absolute.filename().string(), fingerprint_records::FileStamp(absolute)});
                 std::lock_guard lock(m_impl->mutex);
                 m_impl->sourceFingerprints[rawStamp] = rawFingerprint;
             } else {

@@ -3,6 +3,8 @@
 // src/texture_writer.h).
 
 #include "../src/texture_writer.h"
+#include "../src/texture_gpu_file.h"
+#include "../src/fingerprint_records.h"
 
 #include <OpenImageIO/imagebuf.h>
 #include <OpenImageIO/imagebufalgo.h>
@@ -15,6 +17,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <random>
 #include <string>
@@ -217,6 +220,55 @@ int main()
     check(written == 32, "concurrent writes: " + std::to_string(written) + " of 32 succeeded");
     done = true;
     watchdog.join();
+
+    // GPU-ready copies: a round trip, then a damaged payload and a cut file
+    // are rejected.
+    {
+        std::vector<uint8_t> texels(97 * 33 * 3);
+        for (size_t i = 0; i < texels.size(); ++i) texels[i] = uint8_t(i * 7);
+        const auto path = dir / "copy.gpu";
+        std::string error;
+        const auto header = prism::gpu_texture::MakeHeader(97, 33, 3, prism::gpu_texture::Component::Unorm8, 0, 0.0f);
+        check(prism::gpu_texture::Write(path, header, texels.data(), &error), "GPU copy write: " + error);
+        prism::gpu_texture::Header read{};
+        std::vector<uint8_t> payload;
+        check(prism::gpu_texture::Read(path, &read, &payload, &error) && payload == texels &&
+                  read.width == 97 && read.height == 33 && read.channels == 3,
+              "GPU copy round trip: " + error);
+        {
+            std::fstream file(path, std::ios::in | std::ios::out | std::ios::binary);
+            file.seekp(sizeof(prism::gpu_texture::Header) + 100);
+            file.put(char(texels[100] ^ 0x5a));
+        }
+        check(!prism::gpu_texture::Read(path, &read, &payload, &error), "damaged GPU copy was accepted");
+        std::filesystem::resize_file(path, sizeof(prism::gpu_texture::Header) + 50);
+        check(!prism::gpu_texture::Read(path, &read, nullptr, &error), "truncated GPU copy was accepted");
+    }
+
+    // Fingerprint records: a rewrite that restores the size and modification
+    // time still changes the file's stamp, so its record no longer applies.
+    {
+        const auto source = dir / "source.bin";
+        { std::ofstream(source, std::ios::binary) << "first contents"; }
+        const auto stamp = prism::fingerprint_records::FileStamp(source);
+        prism::fingerprint_records::Write(dir, "identity\nsecond line", {"digest-1", "source.bin", stamp});
+        prism::fingerprint_records::Record record;
+        check(prism::fingerprint_records::Read(dir, "identity\nsecond line", &record) &&
+                  record.fingerprint == "digest-1" && record.artifactStamp == stamp,
+              "fingerprint record round trip");
+        check(!prism::fingerprint_records::Read(dir, "other identity", &record), "record found for another identity");
+        const auto time = std::filesystem::last_write_time(source);
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        { std::ofstream(source, std::ios::binary) << "other contents"; }
+        std::filesystem::last_write_time(source, time);
+        check(prism::fingerprint_records::FileStamp(source) != stamp,
+              "same-size, same-time rewrite kept the file's stamp");
+        {
+            std::ofstream(prism::fingerprint_records::RecordPath(dir, "identity\nsecond line"),
+                          std::ios::binary | std::ios::app) << "x";
+        }
+        check(!prism::fingerprint_records::Read(dir, "identity\nsecond line", &record), "damaged record was accepted");
+    }
 
     std::filesystem::remove_all(dir, ignored);
     if (failures) {

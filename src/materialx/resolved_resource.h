@@ -3,6 +3,7 @@
 #include <cctype>
 
 #include "../texture_service.h"
+#include "../fingerprint_records.h"
 #include <pxr/usd/ar/asset.h>
 #include <pxr/usd/ar/resolver.h>
 #include <pxr/usd/ar/resolverContextBinder.h>
@@ -51,6 +52,8 @@ struct Registry {
     std::map<std::string, std::vector<std::shared_ptr<Entry>>> records;
     std::map<std::string, std::string> verifiedPublications;
     std::atomic<uint64_t> sourceReadCalls{0}, sourceHashCalls{0}, sourceBytesRead{0}, waitNanoseconds{0};
+    // Requests answered by a persistent fingerprint record.
+    std::atomic<uint64_t> recordHits{0};
 };
 inline Registry& GetRegistry() {
     static auto* registry = new Registry;
@@ -221,6 +224,36 @@ inline MaterialResourceResult PrepareMaterialResource(
     }
     std::filesystem::path temporary;
     try {
+        // A file this cache already holds, unchanged since (see
+        // fingerprint_records.h): its digest and artifact come from the
+        // record instead of reading and hashing it again.
+        const std::string recordIdentity = fileBacked
+            ? "material-resource\n" + version + "\n" + fingerprint_records::FileChangeStamp(file) + "\n" + extension
+            : std::string();
+        fingerprint_records::Record record;
+        if (fileBacked && fingerprint_records::Read(cacheDir, recordIdentity, &record) &&
+            record.artifact.find_first_of("/\\") == std::string::npos) {
+            const auto artifact = cacheDir / record.artifact;
+            std::error_code statError;
+            const auto sourceBytes = std::filesystem::file_size(file, statError);
+            if (!statError && fingerprint_records::FileStamp(artifact) == record.artifactStamp &&
+                textures->sourceIdentity(file, options) == version) {
+                auto resource = std::make_shared<ResolvedMaterialResource>();
+                resource->path = artifact;
+                resource->fingerprint = record.fingerprint;
+                resource->sourceBytes = sourceBytes;
+                resource->textureService = textures;
+                {
+                    const auto stamp = textures->sourceIdentity(resource->path);
+                    std::lock_guard lock(registry->mutex);
+                    registry->verifiedPublications[stamp] = resource->fingerprint;
+                }
+                textures->registerTrustedSource(resource->path, {"sha1", "1", resource->fingerprint});
+                registry->recordHits.fetch_add(1, std::memory_order_relaxed);
+                entry->promise.set_value(resource);
+                return {resource, 0};
+            }
+        }
         PXR_NS::ArResolverContextBinder binder(resolverContext);
         registry->sourceReadCalls.fetch_add(1, std::memory_order_relaxed);
         auto asset = PXR_NS::ArGetResolver().OpenAsset(resolved);
@@ -284,6 +317,9 @@ inline MaterialResourceResult PrepareMaterialResource(
                 registry->verifiedPublications.erase(registry->verifiedPublications.begin());
         }
         textures->registerTrustedSource(resource->path, {"sha1", "1", resource->fingerprint});
+        if (fileBacked)
+            fingerprint_records::Write(cacheDir, recordIdentity, {resource->fingerprint,
+                resource->path.filename().string(), fingerprint_records::FileStamp(resource->path)});
         entry->promise.set_value(resource);
         // Bound only unreferenced completed bookkeeping; prepared file policy
         // remains with the existing material cache and TextureService.

@@ -164,6 +164,14 @@ inline MaterialUdimResult PrepareMaterialUdimResource(
             verified = found != registry.verifiedPublications.end() &&
                 found->second == resource->fingerprint;
         }
+        // A tile an earlier process published and recorded, unchanged since.
+        const std::string recordIdentity = "udim-tile\n" + destination.generic_string() + "\n" + resource->fingerprint;
+        if (!verified && std::filesystem::exists(destination, error)) {
+            fingerprint_records::Record record;
+            verified = fingerprint_records::Read(cacheDir, recordIdentity, &record) &&
+                record.fingerprint == resource->fingerprint &&
+                record.artifactStamp == fingerprint_records::FileStamp(destination);
+        }
         if (verified) {
             // Same process/version already verified this immutable family tile.
         } else if (std::filesystem::exists(destination, error)) {
@@ -181,6 +189,9 @@ inline MaterialUdimResult PrepareMaterialUdimResource(
         }
         textures->registerTrustedSource(destination,
             {"sha1", "1", resource->fingerprint});
+        if (!verified)
+            fingerprint_records::Write(cacheDir, recordIdentity, {resource->fingerprint,
+                destination.filename().string(), fingerprint_records::FileStamp(destination)});
         {
             const auto stamp = textures->sourceIdentity(destination);
             auto& registry = resource_detail::GetRegistry();
