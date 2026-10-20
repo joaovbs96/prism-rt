@@ -213,9 +213,11 @@ float4 prism_mdl_texel_2d(int tex, int2 coord, int2 uvTile)
 // (CropAxis, RemapTexel, LoadDfTexel). MDL's layered BSDFs call this at every
 // layer and it is inlined everywhere, so it is written without loops or
 // short-circuit conditions: the three axes as vectors, the wrap modes and
-// crop checks as selects, one branch for the texture and one for the
-// coordinates. Remapped texels always lie inside the cropped table, so the
-// fetches need no bounds checks. Results match the per-axis version exactly.
+// crop checks as selects, one branch for the texture, one for the
+// coordinates and one for the second and third components of RGB tables
+// (most tables are scalar: 8 reads). Remapped texels always lie inside the
+// cropped table, so the reads need no bounds checks. The arithmetic is that
+// of the per-axis, per-texel version, in the same order.
 float4 prism_df_texel(GpuMdlTexture info, int x, int y, int z)
 {
     uint width = info.info.z;
@@ -246,13 +248,17 @@ int3 prism_df_wrap(int3 value, int3 count, int3 mode, int3 offset)
     return select(or(mode == kTexWrapClamp, mode == kTexWrapClip), clamped, local) + offset;
 }
 
-// One table value: the components of the texel at `index`, opaque alpha.
-float4 prism_df_fetch(uint index, uint step)
+// One component of the table, filtered: lerps over x of the four (y, z)
+// texel pairs (indices of the x0 and x1 texels), then over y and z, in the
+// order of the native runtime.
+float prism_df_trilinear(uint4 x0, uint4 x1, float3 f)
 {
-    return float4(gpu_bsdf_data(index), gpu_bsdf_data(index + step), gpu_bsdf_data(index + 2u * step), 1.0f);
+    float4 lower = float4(gpu_bsdf_data(x0.x), gpu_bsdf_data(x0.y), gpu_bsdf_data(x0.z), gpu_bsdf_data(x0.w));
+    float4 upper = float4(gpu_bsdf_data(x1.x), gpu_bsdf_data(x1.y), gpu_bsdf_data(x1.z), gpu_bsdf_data(x1.w));
+    float4 x = lower * (1.0f - f.x) + upper * f.x;
+    float2 y = x.xz * (1.0f - f.y) + x.yw * f.y;
+    return y.x * (1.0f - f.z) + y.y * f.z;
 }
-
-float4 prism_lerp4(float4 a, float4 b, float t) { return a * (1.0f - t) + b * t; }
 
 float4 prism_mdl_lookup_3d(int tex, float3 coord, int wrapU, int wrapV, int wrapW,
                                         float2 cropU, float2 cropV, float2 cropW)
@@ -281,20 +287,23 @@ float4 prism_mdl_lookup_3d(int tex, float3 coord, int wrapU, int wrapV, int wrap
     uint width = info.info.z;
     uint height = info.info.w;
     uint components = info.info2.y;
-    uint step = select(components == 1u, 0u, 1u);
     uint3 lo = uint3(lower);
     uint3 hi = uint3(upper);
-    uint i00 = info.info.y + ((lo.z * height + lo.y) * width) * components;
-    uint i01 = info.info.y + ((lo.z * height + hi.y) * width) * components;
-    uint i10 = info.info.y + ((hi.z * height + lo.y) * width) * components;
-    uint i11 = info.info.y + ((hi.z * height + hi.y) * width) * components;
-    uint x0 = lo.x * components;
-    uint x1 = hi.x * components;
-    float4 a = prism_lerp4(prism_lerp4(prism_df_fetch(i00 + x0, step), prism_df_fetch(i00 + x1, step), f.x),
-                           prism_lerp4(prism_df_fetch(i01 + x0, step), prism_df_fetch(i01 + x1, step), f.x), f.y);
-    float4 b = prism_lerp4(prism_lerp4(prism_df_fetch(i10 + x0, step), prism_df_fetch(i10 + x1, step), f.x),
-                           prism_lerp4(prism_df_fetch(i11 + x0, step), prism_df_fetch(i11 + x1, step), f.x), f.y);
-    return prism_lerp4(a, b, f.z);
+    // Rows (y, z) = (lo, lo), (hi, lo), (lo, hi), (hi, hi), first component.
+    uint4 rows = info.info.y + (uint4(lo.z, lo.z, hi.z, hi.z) * height + uint4(lo.y, hi.y, lo.y, hi.y)) * width * components;
+    uint4 x0 = rows + lo.x * components;
+    uint4 x1 = rows + hi.x * components;
+    float r = prism_df_trilinear(x0, x1, f);
+    float3 value = float3(r, r, r);
+    [branch] if (components != 1u) {
+        value.y = prism_df_trilinear(x0 + 1u, x1 + 1u, f);
+        value.z = prism_df_trilinear(x0 + 2u, x1 + 2u, f);
+    }
+    // Alpha: the same lerps of opaque texels.
+    float w = 1.0f * (1.0f - f.x) + 1.0f * f.x;
+    w = w * (1.0f - f.y) + w * f.y;
+    w = w * (1.0f - f.z) + w * f.z;
+    return float4(value, w);
 }
 
 int3 prism_mdl_resolution_3d(int tex)
