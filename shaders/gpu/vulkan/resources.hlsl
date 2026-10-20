@@ -3,6 +3,11 @@
 
 #pragma once
 
+// Texture streaming (src/device/gpu/texture_streaming.h): images hold only
+// their resident mip levels (GpuImage.info.w is the finest), and lookups
+// record the levels they ask for in the texture feedback buffer.
+#define PRISM_TEXTURE_STREAMING 1
+
 [[vk::binding(kSlotFrame, 0)]] StructuredBuffer<GpuFrame> g_frame;
 [[vk::binding(kSlotPositions, 0)]] StructuredBuffer<float> g_positions;
 [[vk::binding(kSlotNormals, 0)]] StructuredBuffer<float> g_normals;
@@ -33,6 +38,7 @@
 [[vk::binding(kSlotRng, 0)]] RWStructuredBuffer<uint> g_rng;
 [[vk::binding(kSlotOutput, 0)]] RWStructuredBuffer<float4> g_output;
 [[vk::binding(kSlotAccumulation, 0)]] RWStructuredBuffer<float4> g_accumulation;
+[[vk::binding(kSlotTextureFeedback, 0)]] RWStructuredBuffer<uint> g_textureFeedback;
 [[vk::binding(kSlotAccel, 0)]] RaytracingAccelerationStructure g_scene;
 [[vk::binding(kSlotImageBase, 0)]] Texture2D<float4> g_textures[];
 [[vk::binding(kSlotImageBase + 1, 0)]] SamplerState g_samplers[kSamplerCount];
@@ -83,6 +89,7 @@ StructuredBuffer<uint> pixelsBuffer() { return g_pixels; }
 RWStructuredBuffer<uint> rngBuffer() { return g_rng; }
 RWStructuredBuffer<float4> outputBuffer() { return g_output; }
 RWStructuredBuffer<float4> accumulationBuffer() { return g_accumulation; }
+RWStructuredBuffer<uint> textureFeedbackBuffer() { return g_textureFeedback; }
 RaytracingAccelerationStructure sceneStructure() { return g_scene; }
 Texture2D<float4> imageTexture(uint image) { return g_textures[NonUniformResourceIndex(image)]; }
 SamplerState imageSampler(uint index) { return g_samplers[NonUniformResourceIndex(index)]; }

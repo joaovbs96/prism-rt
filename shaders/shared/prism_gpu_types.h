@@ -70,6 +70,7 @@ static const uint kFrameCutouts = 64u;       // some instances are not opaque
 static const uint kFramePrimaryHits = 128u;  // preview, pass: also store each pixel's center-ray hit
 static const uint kFrameLightLinking = 256u; // instances carry light/shadow-link categories
 static const uint kFrameSpatialLights = 512u; // spatial light selection (SampleSettings::spatialLights)
+static const uint kFrameTextureFeedback = 1024u; // record requested texture levels (Vulkan texture streaming)
 
 // Work modes.
 static const uint kModePass = 0u;      // one sample per listed pixel
@@ -109,7 +110,8 @@ static const uint kSlotLights = 27;        // LightRecord (shaders/integrator/li
 static const uint kSlotLightAlias = 28;    // float4 alias table over the lights and the dome
 static const uint kSlotPrimvarValues = 29;     // float, named primvars per vertex
 static const uint kSlotPrimvarDirectory = 30;  // uint4 per named primvar of a prototype
-static const uint kSlotCount = 31;
+static const uint kSlotTextureFeedback = 31;   // uint per image: finest level requested, then request counts
+static const uint kSlotCount = 32;
 // Images follow the fixed slots (HLSL) or form one array binding (GLSL).
 static const uint kSlotImageBase = 32;
 
@@ -158,7 +160,8 @@ struct GpuLegacyTexture {
 };
 
 struct GpuImage {
-    uint4 info;      // x: width, y: height, z: source channels, w: descriptor index
+    uint4 info;      // x: width, y: height, z: source channels, w: finest resident mip level
+                     // (Vulkan texture streaming: the image holds levels w and coarser; else 0)
 };
 
 struct GpuMdlTexture {
@@ -191,6 +194,9 @@ struct GpuFrame {
     uint4 counts;                // x: MDL texture count, y: debug view, z: sample number,
                                  // w: light contribution mask (0: all)
     uint4 lights;                // x: light records, y: analytic lights, z: domes
+    uint4 streaming;             // texture feedback (kFrameTextureFeedback): x: image count (offset of
+                                 // the request counts), y: recording pixel stride, z: phase, w: counting
+                                 // pixel stride (one pixel of each stride x stride block)
 };
 
 

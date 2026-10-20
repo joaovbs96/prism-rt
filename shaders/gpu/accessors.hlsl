@@ -81,13 +81,61 @@ void gpu_accumulate(uint pixel, float3 value, bool even)
     if (even) b[2u * pixel + 1u] = b[2u * pixel + 1u] + float4(value, 0.0f);
 }
 
-// Top row first, mip level 0.
-float4 gpu_image_texel(uint image, int x, int y) { return imageTexture(image).Load(int3(x, y, 0)); }
+#ifdef PRISM_TEXTURE_STREAMING
+// Texture feedback of this thread's lookups (kFrameTextureFeedback): 0 off,
+// 1 record the finest level each image is asked for, 2 also count the
+// lookups (a subset of pixels: the priority of an image's levels). The
+// callables get it from their caller (kMaterialCallFeedback).
+static uint g_prism_feedback = 0u;
+
+void gpu_texture_request(uint image, uint level)
+{
+    RWStructuredBuffer<uint> b = textureFeedbackBuffer();
+    // Most lookups ask for a level already recorded: read before the atomic.
+    if (level < b[image]) InterlockedMin(b[image], level);
+    if (g_prism_feedback == 2u) InterlockedAdd(b[gpu_frame().streaming.x + image], 1u);
+}
+
+// The finest level a 16x anisotropic trilinear lookup with these gradients
+// (in normalized coordinates) reads: Vulkan's LOD rule, lambda =
+// log2(major / N) with N = min(ceil(major / minor), 16) and the axes in
+// level-0 texels, half a level finer for implementations' approximations.
+void gpu_texture_feedback(uint image, float2 dx, float2 dy)
+{
+    const GpuImage img = gpu_image(image);
+    const float2 size = float2(float(img.info.x), float(img.info.y));
+    const float a = length(dx * size);
+    const float b = length(dy * size);
+    const float major = max(a, b);
+    const float minor = min(a, b);
+    const float n = minor > 0.0f ? min(ceil(major / minor), 16.0f) : 16.0f;
+    const float lambda = log2(major / n) - 0.5f;
+    const uint level = lambda >= 15.0f ? 15u : (lambda >= 1.0f ? uint(lambda) : 0u);
+    gpu_texture_request(image, level);
+}
+#endif
+
+// Top row first, in level-0 texels (read from the finest resident level).
+float4 gpu_image_texel(uint image, int x, int y)
+{
+#ifdef PRISM_TEXTURE_STREAMING
+    const uint level = gpu_image(image).info.w;
+    if (g_prism_feedback != 0u) gpu_texture_request(image, 0u);
+    return imageTexture(image).Load(int3(x >> level, y >> level, 0));
+#else
+    return imageTexture(image).Load(int3(x, y, 0));
+#endif
+}
 
 // Mipmapped anisotropic lookup; image coordinates start at the top-left.
 // Samplers are indexed wrapS * 3 + wrapT (0 clamp, 1 repeat, 2 mirror).
+// A streamed image holds only its resident levels, so the lookup's level
+// of detail is clamped to them without a clamp operand.
 float4 gpu_image_sample(uint image, float2 st, float2 dx, float2 dy, uint wrapS, uint wrapT)
 {
+#ifdef PRISM_TEXTURE_STREAMING
+    if (g_prism_feedback != 0u) gpu_texture_feedback(image, dx, dy);
+#endif
     return imageTexture(image).SampleGrad(imageSampler(wrapS * 3u + wrapT), st, dx, dy);
 }
 

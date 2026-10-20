@@ -125,6 +125,18 @@ void renderThread(uint thread)
         else
             tracer.backend.rng.state = gpu_load_rng(pixel);
     }
+#ifdef PRISM_TEXTURE_STREAMING
+    // Texture feedback: one pixel of each recording block records the levels
+    // its lookups ask for, one of each counting block also counts them; the
+    // phase moves the pixels from pass to pass.
+    if ((flags & kFrameTextureFeedback) != 0u) {
+        const uint rs = max(frame.streaming.y, 1u);
+        const uint cs = max(frame.streaming.w, 1u);
+        const bool records = (x % rs) + (y % rs) * rs == frame.streaming.z % (rs * rs);
+        const bool counts = (x % cs) + (y % cs) * cs == frame.streaming.z % (cs * cs);
+        g_prism_feedback = records ? (counts ? 2u : 1u) : 0u;
+    }
+#endif
     SampleResult result;
     if (!preview && frame.counts.y != 0u) {
         result.color = debugView(tracer, camera, x, y, width, height, frame.counts.y);
