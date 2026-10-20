@@ -4,6 +4,7 @@
 #include <OpenImageIO/texture.h>
 
 #include <filesystem>
+#include <functional>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -101,6 +102,8 @@ public:
     int channels() const noexcept;
     std::filesystem::path const &sourcePath() const noexcept;
     std::filesystem::path const &preparedPath() const noexcept;
+    // Where its GPU-ready copy is (or will be) written; empty without one.
+    std::filesystem::path const &gpuCopyPath() const noexcept;
     ResourceVersion const &resourceVersion() const noexcept;
 
 private:
@@ -164,6 +167,13 @@ public:
     // one from the source on first request. Empty when there is none (an
     // in-memory source, or a failed decode); `error` then says why.
     std::filesystem::path gpuImage(TextureResource const &resource, std::string *error = nullptr) const;
+    // Observers of prepared file textures that have a GPU-ready copy, called
+    // on the preparing thread each time prepare(), prepareTrusted() or
+    // prepareAhead() returns one (again for repeated requests), so a GPU
+    // device can upload it while the scene is still loading. Thread safe.
+    using PreparedObserver = std::function<void(std::shared_ptr<const TextureResource> const &)>;
+    static int AddPreparedObserver(PreparedObserver observer);
+    static void RemovePreparedObserver(int token);
     // The calling thread's last lookup or readPixels failure.
     static std::string const &lastError() noexcept;
     OIIO::TextureSystem *textureSystem() const noexcept;

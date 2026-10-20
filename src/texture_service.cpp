@@ -28,6 +28,7 @@
 #include <functional>
 #include <chrono>
 #include <cctype>
+#include <map>
 #include <memory>
 #include <sstream>
 #include <string_view>
@@ -922,6 +923,8 @@ int TextureResource::width() const noexcept { return m_impl->width; }
 int TextureResource::height() const noexcept { return m_impl->height; }
 int TextureResource::channels() const noexcept { return m_impl->channels; }
 std::filesystem::path const &TextureResource::sourcePath() const noexcept { return m_impl->source; }
+std::filesystem::path const &TextureResource::gpuCopyPath() const noexcept { return m_impl->gpu; }
+
 std::filesystem::path const &TextureResource::preparedPath() const noexcept
 {
     // Readers of the file need it finished (see PendingTexture).
@@ -950,10 +953,44 @@ TextureService::TextureService() : m_impl(std::make_unique<Impl>())
 }
 TextureService::~TextureService() = default;
 
+namespace {
+std::mutex gPreparedObserversMutex;
+auto &gPreparedObservers =
+    *new std::map<int, std::shared_ptr<const TextureService::PreparedObserver>>();
+int gNextPreparedObserver = 1;
+
+// Tells the observers about a prepared resource with a GPU copy.
+std::shared_ptr<const TextureResource> Published(std::shared_ptr<const TextureResource> resource)
+{
+    if (!resource || resource->gpuCopyPath().empty()) return resource;
+    std::vector<std::shared_ptr<const TextureService::PreparedObserver>> observers;
+    {
+        std::lock_guard lock(gPreparedObserversMutex);
+        for (auto const &[token, observer] : gPreparedObservers) observers.push_back(observer);
+    }
+    for (auto const &observer : observers) (*observer)(resource);
+    return resource;
+}
+} // namespace
+
+int TextureService::AddPreparedObserver(PreparedObserver observer)
+{
+    std::lock_guard lock(gPreparedObserversMutex);
+    const int token = gNextPreparedObserver++;
+    gPreparedObservers.emplace(token, std::make_shared<const PreparedObserver>(std::move(observer)));
+    return token;
+}
+
+void TextureService::RemovePreparedObserver(int token)
+{
+    std::lock_guard lock(gPreparedObserversMutex);
+    gPreparedObservers.erase(token);
+}
+
 std::shared_ptr<const TextureResource> TextureService::prepare(
     std::filesystem::path const &source, TexturePrepareOptions const &options)
 {
-    return prepareImpl(source, options, {});
+    return Published(prepareImpl(source, options, {}));
 }
 
 std::shared_ptr<const TextureResource> TextureService::prepareTrusted(
@@ -965,13 +1002,13 @@ std::shared_ptr<const TextureResource> TextureService::prepareTrusted(
         throw std::invalid_argument("trusted texture fingerprint requires algorithm, version, and digest");
     registerTrustedSource(source, fingerprint);
     const std::string token = trustedFingerprintToken(fingerprint);
-    return prepareImpl(source, options, token);
+    return Published(prepareImpl(source, options, token));
 }
 
 std::shared_ptr<const TextureResource> TextureService::prepareAhead(
     std::filesystem::path const &source, TexturePrepareOptions const &options)
 {
-    return prepareImpl(source, options, {}, true);
+    return Published(prepareImpl(source, options, {}, true));
 }
 
 void TextureService::registerTrustedSource(std::filesystem::path const &source,
