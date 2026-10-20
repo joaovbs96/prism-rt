@@ -83,6 +83,10 @@ struct TextureServiceStats {
     // preparations and for prepared textures that lacked one.
     uint64_t gpuWriteNanoseconds = 0;
     uint64_t gpuFilesWritten = 0;
+    // .tx.exr files written in the background, and the time lookups and
+    // readers waited for them.
+    uint64_t backgroundWrites = 0;
+    uint64_t backgroundWaitNanoseconds = 0;
     // prepareAhead calls, those that produced the resource (cold or from
     // disk), and later ordinary calls served from memory by such a resource.
     uint64_t aheadRequests = 0;
@@ -173,6 +177,9 @@ private:
         std::filesystem::path const &source,
         TexturePrepareOptions const &options,
         std::string const &trustedFingerprint, bool ahead = false);
+    // The resource's OIIO handle, opened on first use once its .tx.exr is
+    // written (it may still be written in the background); null on failure.
+    OIIO::TextureSystem::TextureHandle *readyHandle(TextureResource const &resource) const;
     std::unique_ptr<Impl> m_impl;
 };
 

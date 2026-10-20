@@ -21,6 +21,8 @@
 #include <fstream>
 #include <iomanip>
 #include <condition_variable>
+#include <deque>
+#include <thread>
 #include <mutex>
 #include <functional>
 #include <chrono>
@@ -743,6 +745,105 @@ bool WriteGpuFile(std::filesystem::path const &path, DecodedImage const &decoded
     return gpu_texture::Write(path, header, payload, error);
 }
 
+// A prepared .tx.exr that a background writer is still producing: lookups
+// and file readers of its resource wait for it.
+struct PendingTexture {
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool finished = false;
+    std::string error;
+    void finish(std::string failure)
+    {
+        {
+            std::lock_guard lock(mutex);
+            finished = true;
+            error = std::move(failure);
+        }
+        changed.notify_all();
+    }
+    // The writer's error, empty on success.
+    std::string const &wait()
+    {
+        std::unique_lock lock(mutex);
+        changed.wait(lock, [&] { return finished; });
+        return error;
+    }
+    bool done()
+    {
+        std::lock_guard lock(mutex);
+        return finished;
+    }
+};
+
+// Threads writing prepared .tx.exr files after their GPU-ready copies were
+// published, so a GPU device need not wait for them. At most
+// TexturePreparationThreadCount() run at once; queued jobs hold their
+// preparation-budget reservation, which bounds their memory. Destruction
+// finishes every queued job.
+// Writers run beside the decodes that feed them and the MDL compiles;
+// fewer than the hardware threads made the budget, held by queued jobs, the
+// bottleneck of cold loads. PRISM_TEXTURE_WRITER_THREADS overrides.
+size_t WriterThreads()
+{
+    static const size_t count = static_cast<size_t>(prism::ResourceLimit("PRISM_TEXTURE_WRITER_THREADS",
+        std::max(1u, std::thread::hardware_concurrency()), 256));
+    return count;
+}
+
+class BackgroundWriters {
+public:
+    ~BackgroundWriters()
+    {
+        {
+            std::lock_guard lock(m_mutex);
+            m_stopping = true;
+        }
+        m_work.notify_all();
+        for (auto &thread : m_threads) thread.join();
+    }
+    void submit(std::function<void()> job)
+    {
+        {
+            std::lock_guard lock(m_mutex);
+            m_queue.push_back(std::move(job));
+            if (m_idle == 0 && m_threads.size() < WriterThreads())
+                m_threads.emplace_back([this] { run(); });
+        }
+        m_work.notify_one();
+    }
+private:
+    void run()
+    {
+        for (;;) {
+            std::function<void()> job;
+            {
+                std::unique_lock lock(m_mutex);
+                ++m_idle;
+                m_work.wait(lock, [&] { return m_stopping || !m_queue.empty(); });
+                --m_idle;
+                if (m_queue.empty()) return;
+                job = std::move(m_queue.front());
+                m_queue.pop_front();
+            }
+            job();
+        }
+    }
+    std::mutex m_mutex;
+    std::condition_variable m_work;
+    std::deque<std::function<void()>> m_queue;
+    std::vector<std::thread> m_threads;
+    size_t m_idle = 0;
+    bool m_stopping = false;
+};
+
+// PRISM_TEXTURE_BACKGROUND_WRITES=0 writes each .tx.exr before preparation
+// returns, as before GPU-ready copies.
+bool BackgroundWritesEnabled()
+{
+    const char *value = std::getenv("PRISM_TEXTURE_BACKGROUND_WRITES");
+    return !value || std::string_view(value) != "0";
+}
+
 } // namespace
 
 struct TextureResource::Impl {
@@ -750,7 +851,13 @@ struct TextureResource::Impl {
     int width = 0, height = 0, channels = 0;
     std::shared_ptr<OIIO::TextureSystem> system;
     std::shared_ptr<TextureService> serviceOwner;
-    OIIO::TextureSystem::TextureHandle *handle = nullptr;
+    // Opened on first use (TextureService::readyHandle); an alias uses its
+    // base's.
+    std::atomic<OIIO::TextureSystem::TextureHandle *> handle{nullptr};
+    std::once_flag handleOnce;
+    std::string handleError;
+    // Set while the .tx.exr is written in the background.
+    std::shared_ptr<PendingTexture> pending;
     // An alias samples its base resource's OIIO handle, so it keeps the base
     // alive: otherwise the base could expire and a later preparation of the
     // same content would invalidate the file while the alias samples it.
@@ -797,6 +904,16 @@ struct TextureService::Impl {
     std::atomic<uint64_t> aheadRequests{0}, aheadPreparations{0}, aheadMemoryHits{0};
     // Keys whose resource a prepareAhead call produced; guarded by mutex.
     std::unordered_set<std::string> aheadKeys;
+    // .tx.exr files being written in the background, by content key, with
+    // the size of their resources; guarded by mutex.
+    struct InFlight {
+        std::weak_ptr<PendingTexture> pending;
+        int width = 0, height = 0, channels = 0;
+    };
+    std::unordered_map<std::string, InFlight> inFlight;
+    std::atomic<uint64_t> backgroundWrites{0}, backgroundWaitNanoseconds{0};
+    // Last: destroyed first, finishing its jobs while the rest is alive.
+    BackgroundWriters writers;
 };
 
 TextureResource::TextureResource(std::shared_ptr<Impl> impl) : m_impl(std::move(impl)) {}
@@ -804,7 +921,13 @@ int TextureResource::width() const noexcept { return m_impl->width; }
 int TextureResource::height() const noexcept { return m_impl->height; }
 int TextureResource::channels() const noexcept { return m_impl->channels; }
 std::filesystem::path const &TextureResource::sourcePath() const noexcept { return m_impl->source; }
-std::filesystem::path const &TextureResource::preparedPath() const noexcept { return m_impl->prepared; }
+std::filesystem::path const &TextureResource::preparedPath() const noexcept
+{
+    // Readers of the file need it finished (see PendingTexture).
+    for (Impl const *impl = m_impl.get(); impl; impl = impl->base ? impl->base->m_impl.get() : nullptr)
+        if (impl->pending) impl->pending->wait();
+    return m_impl->prepared;
+}
 ResourceVersion const &TextureResource::resourceVersion() const noexcept { return m_impl->version; }
 
 std::shared_ptr<TextureService> TextureService::Acquire()
@@ -1130,7 +1253,7 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
             return cached;
         auto aliasImpl = std::make_shared<TextureResource::Impl>();
         aliasImpl->source = absolute;
-        aliasImpl->prepared = cached->preparedPath();
+        aliasImpl->prepared = cached->m_impl->prepared;
         aliasImpl->gpu = cached->m_impl->gpu;
         aliasImpl->options = cached->m_impl->options;
         aliasImpl->width = cached->width();
@@ -1138,7 +1261,6 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
         aliasImpl->channels = cached->channels();
         aliasImpl->system = cached->m_impl->system;
         aliasImpl->serviceOwner = shared_from_this();
-        aliasImpl->handle = cached->m_impl->handle;
         aliasImpl->base = cached;
         aliasImpl->version = {absolute.generic_string(), stamp, rawFingerprint, generation};
         const auto preparedRoot = aliasImpl->prepared.parent_path();
@@ -1169,7 +1291,7 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
         std::lock_guard lock(m_impl->mutex);
         if (auto found = m_impl->resources.find(key); found != m_impl->resources.end())
             if (auto resource = found->second.lock(); resource &&
-                resource->preparedPath().parent_path() == cacheRoot()) {
+                resource->m_impl->prepared.parent_path() == cacheRoot()) {
                 m_impl->memoryCacheHits.fetch_add(1, std::memory_order_relaxed);
                 if (!ahead && m_impl->aheadKeys.contains(key))
                     m_impl->aheadMemoryHits.fetch_add(1, std::memory_order_relaxed);
@@ -1204,7 +1326,7 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
         std::lock_guard lock(m_impl->mutex);
         if (auto found = m_impl->resources.find(key); found != m_impl->resources.end())
             if (auto resource = found->second.lock(); resource &&
-                resource->preparedPath().parent_path() == cacheRoot()) {
+                resource->m_impl->prepared.parent_path() == cacheRoot()) {
                 m_impl->memoryCacheHits.fetch_add(1, std::memory_order_relaxed);
                 if (!ahead && m_impl->aheadKeys.contains(key))
                     m_impl->aheadMemoryHits.fetch_add(1, std::memory_order_relaxed);
@@ -1258,9 +1380,30 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
     if (options.alphaChannel >= spec.nchannels)
         throw std::invalid_argument("texture alpha channel is outside source image");
     const auto gpuPath = root / (key + kGpuSuffix);
+    int preparedWidth = 0, preparedHeight = 0, preparedChannels = 0;
+    // A .tx.exr this process is still writing for the same content (its
+    // resource expired meanwhile): wait on that writer instead of decoding
+    // again.
+    std::shared_ptr<PendingTexture> pendingWrite;
     if (!cacheFilePresent) {
+        std::lock_guard lock(m_impl->mutex);
+        if (auto found = m_impl->inFlight.find(key); found != m_impl->inFlight.end()) {
+            if (auto live = found->second.pending.lock(); live && !live->done()) {
+                pendingWrite = std::move(live);
+                preparedWidth = found->second.width;
+                preparedHeight = found->second.height;
+                preparedChannels = found->second.channels;
+            } else {
+                m_impl->inFlight.erase(found);
+            }
+        }
+    }
+    if (pendingWrite) {
+        writePin();
+    } else if (!cacheFilePresent) {
         stageStart = std::chrono::steady_clock::now();
-        PreparationBudget::Reservation reservation(PreparationBudget::instance(), PreparationBytes(spec));
+        auto reservation = std::make_shared<PreparationBudget::Reservation>(
+            PreparationBudget::instance(), PreparationBytes(spec));
         m_impl->lockWaitNanoseconds.fetch_add(elapsedNanoseconds(stageStart), std::memory_order_relaxed);
         DecodedImage decoded = DecodeSource(absolute, options, sourceImage);
         m_impl->decodeNanoseconds.fetch_add(decoded.decodeNanoseconds, std::memory_order_relaxed);
@@ -1278,11 +1421,9 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
         decoded.gpuNative = {};
         const uint64_t gpuNanosecondsThis = elapsedNanoseconds(stageStart);
         m_impl->gpuWriteNanoseconds.fetch_add(gpuNanosecondsThis, std::memory_order_relaxed);
-        stageStart = std::chrono::steady_clock::now();
-        static std::atomic<uint64_t> serial{0};
-        const auto temp = root / (key + "." + std::to_string(processId()) + "." +
-                                  std::to_string(++serial) + ".tmp.exr");
-        const int displayWidth = decoded.width, displayHeight = decoded.height, outChannels = decoded.channels;
+        preparedWidth = decoded.width;
+        preparedHeight = decoded.height;
+        preparedChannels = decoded.channels;
         // The file make_texture would write for this image (a plain float
         // texture: black wrap modes in the file, box-filtered mips, 64x64
         // tiles), written by texture_writer instead; see texture_writer.h.
@@ -1294,77 +1435,137 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
         textureSpec.attribute("planarconfig", "contig");
         textureSpec.attribute("wrapmodes", "black,black");
         textureSpec.attribute("textureformat", "Plain Texture");
-        textureSpec.attribute("fovcot", static_cast<float>(displayWidth) / static_cast<float>(displayHeight));
+        textureSpec.attribute("fovcot", static_cast<float>(decoded.width) / static_cast<float>(decoded.height));
         textureSpec.attribute("openexr:roundingmode", 0);
-        std::vector<texture_writer::Level> levels(1);
-        levels[0].width = displayWidth;
-        levels[0].height = displayHeight;
-        levels[0].pixels = std::move(decoded.pixels);
-        texture_writer::BuildMipChain(levels, outChannels);
-        const uint64_t mipNanosecondsThis = elapsedNanoseconds(stageStart);
-        const auto writeStart = std::chrono::steady_clock::now();
-        std::string writeError;
-        if (!texture_writer::WriteMipmappedExr(temp, textureSpec, levels, &writeError)) {
-            std::error_code ignored;
-            std::filesystem::remove(temp, ignored);
-            throw std::runtime_error("cannot prepare texture " + absolute.string() + ": " + writeError);
-        }
-        const uint64_t writeNanosecondsThis = elapsedNanoseconds(writeStart);
-        std::vector<texture_writer::Level>().swap(levels);
-        const uint64_t makeNanoseconds = elapsedNanoseconds(stageStart);
-        m_impl->mipNanoseconds.fetch_add(makeNanoseconds, std::memory_order_relaxed);
-        if (prism::load_profile::Enabled()) {
-            // One line per cold preparation: the source's storage and the
-            // preparation stages.
-            std::error_code sizeError;
-            const auto preparedBytes = std::filesystem::file_size(temp, sizeError);
-            prism::load_profile::Mark("texture.cold", std::string("name=") + absolute.filename().string() +
+        static std::atomic<uint64_t> serial{0};
+        struct Job {
+            std::shared_ptr<PreparationBudget::Reservation> reservation;
+            std::vector<texture_writer::Level> levels;
+            OIIO::ImageSpec spec;
+            std::filesystem::path temp, tx, root, source;
+            std::string detail;
+            std::shared_ptr<PendingTexture> pending;
+            std::shared_ptr<OIIO::TextureSystem> system;
+        };
+        auto job = std::make_shared<Job>();
+        job->reservation = std::move(reservation);
+        job->levels.resize(1);
+        job->levels[0].width = decoded.width;
+        job->levels[0].height = decoded.height;
+        job->levels[0].pixels = std::move(decoded.pixels);
+        job->spec = std::move(textureSpec);
+        job->temp = root / (key + "." + std::to_string(processId()) + "." + std::to_string(++serial) + ".tmp.exr");
+        job->tx = tx;
+        job->root = root;
+        job->source = absolute;
+        job->pending = std::make_shared<PendingTexture>();
+        job->system = m_impl->system;
+        if (prism::load_profile::Enabled())
+            job->detail = std::string("name=") + absolute.filename().string() +
                 " format=" + sourceInputFormat + " type=" + spec.format.c_str() +
                 " size=" + std::to_string(spec.width) + "x" + std::to_string(spec.height) +
-                " channels=" + std::to_string(spec.nchannels) + " out_channels=" + std::to_string(outChannels) +
+                " channels=" + std::to_string(spec.nchannels) + " out_channels=" + std::to_string(decoded.channels) +
                 " gamma=" + std::to_string(options.gamma) + " unassociate=" + std::to_string(decoded.unassociateAlpha) +
                 " decode_ms=" + std::to_string(decoded.decodeNanoseconds / 1000000) +
                 " pixel_ms=" + std::to_string(decoded.pixelNanoseconds / 1000000) +
                 " gpu_ms=" + std::to_string(gpuNanosecondsThis / 1000000) +
-                " gpu_component=" + std::to_string(static_cast<int>(decoded.component)) +
-                " make_ms=" + std::to_string(makeNanoseconds / 1000000) +
-                " mip_s=" + std::to_string(mipNanosecondsThis / 1e9) +
-                " write_s=" + std::to_string(writeNanosecondsThis / 1e9) +
-                " hash_s=0 stats_s=0" +
-                " tx_mb=" + std::to_string((sizeError ? 0 : preparedBytes) >> 20));
+                " gpu_component=" + std::to_string(static_cast<int>(decoded.component));
+        // Mips, the .tx.exr and its publication. Runs on a background writer
+        // unless PRISM_TEXTURE_BACKGROUND_WRITES=0.
+        Impl *service = m_impl.get();
+        const std::string usageKey = root.generic_string();
+        auto write = [job, service, usageKey]() {
+            const auto start = std::chrono::steady_clock::now();
+            std::string error;
+            try {
+                texture_writer::BuildMipChain(job->levels, job->spec.nchannels);
+                const uint64_t mipNanoseconds = elapsedNanoseconds(start);
+                const auto writeStart = std::chrono::steady_clock::now();
+                if (!texture_writer::WriteMipmappedExr(job->temp, job->spec, job->levels, &error))
+                    throw std::runtime_error(error);
+                const uint64_t writeNanoseconds = elapsedNanoseconds(writeStart);
+                std::vector<texture_writer::Level>().swap(job->levels);
+                std::error_code sizeError;
+                const auto bytes = std::filesystem::file_size(job->temp, sizeError);
+                {
+                    CrossProcessCacheLock publication(job->root);
+                    std::error_code ec;
+                    std::filesystem::rename(job->temp, job->tx, ec);
+                    if (ec) {
+                        std::filesystem::remove(job->temp, ec);
+                        if (!std::filesystem::exists(job->tx))
+                            throw std::runtime_error("cannot publish prepared texture: " + ec.message());
+                    }
+                }
+                // A previous file at this content path may have been evicted
+                // and recreated while this process kept its TextureSystem
+                // alive; nothing samples this one yet.
+                job->system->invalidate(OIIO::ustring(job->tx.string()), true);
+                service->mipNanoseconds.fetch_add(elapsedNanoseconds(start), std::memory_order_relaxed);
+                {
+                    std::lock_guard lock(service->mutex);
+                    auto &usage = service->diskUsage[usageKey];
+                    usage.bytes += sizeError ? 0 : bytes;
+                    usage.added += sizeError ? 0 : bytes;
+                }
+                if (!job->detail.empty())
+                    prism::load_profile::Mark("texture.cold", job->detail +
+                        " make_ms=" + std::to_string(elapsedNanoseconds(start) / 1000000) +
+                        " mip_s=" + std::to_string(mipNanoseconds / 1e9) +
+                        " write_s=" + std::to_string(writeNanoseconds / 1e9) +
+                        " hash_s=0 stats_s=0 tx_mb=" + std::to_string((sizeError ? 0 : bytes) >> 20));
+            } catch (std::exception const &failure) {
+                error = failure.what();
+                std::error_code ignored;
+                std::filesystem::remove(job->temp, ignored);
+                std::cerr << "PrismRT: cannot prepare texture " << job->source.string() << ": " << error << '\n';
+                if (error.empty()) error = "texture preparation failed";
+            }
+            job->reservation.reset();
+            job->pending->finish(error);
+        };
+        pendingWrite = job->pending;
+        {
+            std::lock_guard lock(m_impl->mutex);
+            m_impl->inFlight[key] = {pendingWrite, preparedWidth, preparedHeight, preparedChannels};
         }
-        std::error_code ec;
+        // Trims and invalidations skip pinned entries, so the file this
+        // writer publishes is pinned from the start.
         lockWaitStart = std::chrono::steady_clock::now();
         publicationLock = std::make_unique<CrossProcessCacheLock>(root);
-        m_impl->lockWaitNanoseconds.fetch_add(elapsedNanoseconds(lockWaitStart),
-                                              std::memory_order_relaxed);
-        stageStart = std::chrono::steady_clock::now();
-        std::filesystem::rename(temp, tx, ec);
-        if (ec) {
-            if (!std::filesystem::exists(tx)) {
-                std::filesystem::remove(temp);
-                throw std::runtime_error("cannot publish prepared texture: " + ec.message());
-            }
-            std::filesystem::remove(temp, ec);
-        }
+        m_impl->lockWaitNanoseconds.fetch_add(elapsedNanoseconds(lockWaitStart), std::memory_order_relaxed);
         writePin();
         publicationLock.reset();
-        publishNanoseconds += elapsedNanoseconds(stageStart);
+        if (BackgroundWritesEnabled()) {
+            m_impl->backgroundWrites.fetch_add(1, std::memory_order_relaxed);
+            m_impl->writers.submit(std::move(write));
+        } else {
+            write();
+            if (!pendingWrite->error.empty())
+                throw std::runtime_error("cannot prepare texture " + absolute.string() + ": " + pendingWrite->error);
+            pendingWrite.reset();
+        }
     }
     stageStart = std::chrono::steady_clock::now();
-    auto preparedInput = OIIO::ImageInput::open(tx.string());
-    if (!preparedInput)
-        throw std::runtime_error("cannot inspect prepared texture: " + OIIO::geterror());
-    const OIIO::ImageSpec preparedSpec = preparedInput->spec();
-    preparedInput->close();
+    if (!pendingWrite) {
+        auto preparedInput = OIIO::ImageInput::open(tx.string());
+        if (!preparedInput)
+            throw std::runtime_error("cannot inspect prepared texture: " + OIIO::geterror());
+        const OIIO::ImageSpec preparedSpec = preparedInput->spec();
+        preparedInput->close();
+        preparedWidth = preparedSpec.width;
+        preparedHeight = preparedSpec.height;
+        preparedChannels = preparedSpec.nchannels;
+    }
     impl->source = absolute.filename().string().rfind("embedded-", 0) == 0
         ? std::filesystem::path{} : absolute;
     impl->prepared = tx;
     impl->gpu = gpuPath;
     impl->options = options;
-    impl->width = preparedSpec.width;
-    impl->height = preparedSpec.height;
-    impl->channels = preparedSpec.nchannels;
+    impl->width = preparedWidth;
+    impl->height = preparedHeight;
+    impl->channels = preparedChannels;
+    impl->pending = pendingWrite;
     const bool embeddedSource = impl->source.empty();
     impl->version.resolvedIdentifier = embeddedSource ? "embedded:" + key : absolute.generic_string();
     impl->version.interpretationIdentity = embeddedSource ? key : stamp;
@@ -1372,23 +1573,16 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
     impl->version.generation = generation;
     impl->system = m_impl->system;
     impl->serviceOwner = shared_from_this();
-    // A previous cache entry at this content path may have been evicted and
-    // recreated while this process kept its TextureSystem alive. Only a file
-    // written just now can be such a recreation; an existing one may be
-    // sampled by render threads right now, and invalidating it under them
-    // clears its level table mid-lookup.
-    if (!cacheFilePresent)
-        m_impl->system->invalidate(OIIO::ustring(tx.string()), true);
-    impl->handle = m_impl->system->get_texture_handle(OIIO::ustring(tx.string()));
-    if (impl->handle && !m_impl->system->good(impl->handle)) {
-        // A file OIIO once failed to open stays broken until invalidated.
-        // Nothing samples a broken file, so retrying it is safe.
-        (void)m_impl->system->geterror();
-        m_impl->system->invalidate(OIIO::ustring(tx.string()), true);
-        impl->handle = m_impl->system->get_texture_handle(OIIO::ustring(tx.string()));
+    if (!pendingWrite) {
+        // A file written just now (synchronously) may replace an evicted one
+        // this process's TextureSystem still has open; an existing one may be
+        // sampled by render threads right now, and invalidating it under them
+        // clears its level table mid-lookup.
+        if (!cacheFilePresent) m_impl->system->invalidate(OIIO::ustring(tx.string()), true);
+        TextureResource probe(impl);
+        if (!readyHandle(probe))
+            throw std::runtime_error("cannot open prepared texture: " + impl->handleError);
     }
-    if (!impl->handle || !m_impl->system->good(impl->handle))
-        throw std::runtime_error("cannot open prepared texture: " + m_impl->system->geterror());
     std::error_code accessError;
     std::filesystem::last_write_time(tx, std::filesystem::file_time_type::clock::now(), accessError);
     std::filesystem::last_write_time(gpuPath, std::filesystem::file_time_type::clock::now(), accessError);
@@ -1451,7 +1645,7 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
             for (auto const &[resourceKey, weak] : m_impl->resources) {
                 (void)resourceKey;
                 if (auto live = weak.lock()) {
-                    pinned.emplace(live->preparedPath().filename().string(), true);
+                    pinned.emplace(live->m_impl->prepared.filename().string(), true);
                     pinned.emplace(live->m_impl->gpu.filename().string(), true);
                 }
             }
@@ -1566,7 +1760,13 @@ bool TextureService::lookup(TextureResource const &resource, TextureLookup const
         ? OIIO::TextureOpt::MipModeNoMIP : OIIO::TextureOpt::MipModeAniso;
     options.interpmode = query.nearest ? OIIO::TextureOpt::InterpClosest
                                        : OIIO::TextureOpt::InterpBilinear;
-    if (resource.m_impl->system->texture(resource.m_impl->handle,
+    auto *handle = readyHandle(resource);
+    if (!handle) {
+        lookupError() = resource.m_impl->base ? resource.m_impl->base->m_impl->handleError
+                                               : resource.m_impl->handleError;
+        return false;
+    }
+    if (resource.m_impl->system->texture(handle,
             resource.m_impl->system->get_perthread_info(), options, query.s, query.t,
             query.dsdx, query.dtdx, query.dsdy, query.dtdy, channelCount, result))
         return true;
@@ -1576,6 +1776,41 @@ bool TextureService::lookup(TextureResource const &resource, TextureLookup const
 
 std::string const &TextureService::lastError() noexcept { return lookupError(); }
 
+OIIO::TextureSystem::TextureHandle *TextureService::readyHandle(TextureResource const &resource) const
+{
+    // An alias samples its base's handle.
+    TextureResource::Impl *impl = resource.m_impl.get();
+    while (impl->base) impl = impl->base->m_impl.get();
+    if (auto *handle = impl->handle.load(std::memory_order_acquire)) return handle;
+    if (impl->pending) {
+        const auto waitStart = std::chrono::steady_clock::now();
+        std::string const &error = impl->pending->wait();
+        m_impl->backgroundWaitNanoseconds.fetch_add(elapsedNanoseconds(waitStart), std::memory_order_relaxed);
+        if (!error.empty()) {
+            std::call_once(impl->handleOnce, [&] { impl->handleError = error; });
+            return nullptr;
+        }
+    }
+    std::call_once(impl->handleOnce, [&] {
+        OIIO::TextureSystem &system = *impl->system;
+        const OIIO::ustring name(impl->prepared.string());
+        auto *handle = system.get_texture_handle(name);
+        if (handle && !system.good(handle)) {
+            // A file OIIO once failed to open stays broken until invalidated.
+            // Nothing samples a broken file, so retrying it is safe.
+            (void)system.geterror();
+            system.invalidate(name, true);
+            handle = system.get_texture_handle(name);
+        }
+        if (!handle || !system.good(handle)) {
+            impl->handleError = "cannot open prepared texture " + impl->prepared.string() + ": " + system.geterror();
+            return;
+        }
+        impl->handle.store(handle, std::memory_order_release);
+    });
+    return impl->handle.load(std::memory_order_acquire);
+}
+
 bool TextureService::readPixels(TextureResource const &resource, int xb, int yb,
                                 int xe, int ye, int firstChannel, int channelCount,
                                 float *result) const
@@ -1584,7 +1819,12 @@ bool TextureService::readPixels(TextureResource const &resource, int xb, int yb,
         xe <= xb || ye <= yb || firstChannel < 0 || channelCount <= 0 ||
         firstChannel + channelCount > resource.channels()) return false;
     OIIO::TextureOpt options;
-    if (resource.m_impl->system->get_texels(resource.m_impl->handle,
+    auto *handle = readyHandle(resource);
+    if (!handle) {
+        lookupError() = "prepared texture unavailable";
+        return false;
+    }
+    if (resource.m_impl->system->get_texels(handle,
             resource.m_impl->system->get_perthread_info(), options, 0,
             xb, xe, yb, ye, 0, 1, firstChannel, firstChannel + channelCount,
             OIIO::TypeDesc::FLOAT, result))
@@ -1666,6 +1906,8 @@ TextureServiceStats TextureService::stats() const noexcept
     result.lockWaitNanoseconds = m_impl->lockWaitNanoseconds.load(std::memory_order_relaxed);
     result.gpuWriteNanoseconds = m_impl->gpuWriteNanoseconds.load(std::memory_order_relaxed);
     result.gpuFilesWritten = m_impl->gpuFilesWritten.load(std::memory_order_relaxed);
+    result.backgroundWrites = m_impl->backgroundWrites.load(std::memory_order_relaxed);
+    result.backgroundWaitNanoseconds = m_impl->backgroundWaitNanoseconds.load(std::memory_order_relaxed);
     result.aheadRequests = m_impl->aheadRequests.load(std::memory_order_relaxed);
     result.aheadPreparations = m_impl->aheadPreparations.load(std::memory_order_relaxed);
     result.aheadMemoryHits = m_impl->aheadMemoryHits.load(std::memory_order_relaxed);
