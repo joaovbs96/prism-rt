@@ -559,6 +559,10 @@ bool ProgramCallableSource(gpu::MdlProgramCode const& program, std::string* sour
         return false;
     *source = std::format("// MDL program {}\n", program.digest.substr(0, 12)) + ShaderSaltDefine() +
         "#define PRISM_MDL_PROGRAM_TABLES 1\n" + *source;
+    if (const char* dir = std::getenv("PRISM_GPU_DUMP_PROGRAMS"); dir && *dir)
+        std::ofstream(std::filesystem::path(dir) / std::format("program_{}.hlsl", program.digest.substr(0, 12)),
+                      std::ios::binary)
+            << *source;
     return true;
 }
 
