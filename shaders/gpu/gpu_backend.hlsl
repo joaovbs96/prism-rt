@@ -602,6 +602,11 @@ void gpu_build_mdl_state(SurfaceHit hit, GpuMaterial material, out Shading_state
     state.object_id = 0;
     state.meters_per_scene_unit = 1.0f;
     state.arg_block_offset = int(material.info.z);
+#ifdef PRISM_MDL_PROGRAM_TABLES
+    g_prism_rodata_base = material.textures.x;
+    g_prism_texture_table = material.textures.y;
+    g_prism_string_table = material.textures.z;
+#endif
 }
 
 float gpu_mdl_opacity(GpuMaterial material, inout Shading_state_material state)

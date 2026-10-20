@@ -4,17 +4,26 @@
 #include "../../mdl/context.h"
 #include "../../mdl/texture_runtime.h"
 #include "../../resource_limits.h"
+#include "../../load_profile.h"
+#include "gpu_device.h"
 
+#include <tbb/parallel_for.h>
+
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstring>
 #include <format>
 #include <filesystem>
 #include <fstream>
+#include <future>
+#include <iostream>
 #include <map>
 #include <mutex>
 #include <regex>
+#include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace prism::device::gpu {
 
@@ -158,6 +167,24 @@ std::string ProgramFunction(uint32_t program, EntryIndex entry)
     return std::format("prism_p{}_{}", program, kEntryPoints[entry].name);
 }
 
+// The entry functions of a program translated alone (MdlProgramCode).
+std::string SingleProgramFunction(EntryIndex entry)
+{
+    return std::format("prism_p_{}", kEntryPoints[entry].name);
+}
+
+void ConfigureHlslBackend(mi::neuraylib::IMdl_backend* backend)
+{
+    backend->set_option("num_texture_spaces", "1");
+    backend->set_option("num_texture_results", std::to_string(kGpuTextureResults).c_str());
+    backend->set_option("enable_auxiliary", "off");
+    backend->set_option("texture_runtime_with_derivs", "on");
+    backend->set_option("enable_ro_segment", "on");
+    backend->set_option("max_const_data", "0");
+    backend->set_option("df_handle_slot_mode", "none");
+    backend->set_option("libbsdf_flags_in_bsdf_data", "off");
+}
+
 // Scene data ids (string constants of the link unit) naming the texture
 // coordinates (mdl_runtime.hlsl).
 std::string GenerateSceneData(mi::neuraylib::ITarget_code const* code)
@@ -173,15 +200,21 @@ std::string GenerateSceneData(mi::neuraylib::ITarget_code const* code)
     return s + "    return false;\n}\n\n";
 }
 
-// The prism_mdl_* dispatch functions. Types are spelled the same in both
+// The prism_mdl_* dispatch functions. With `single`, of one program
+// translated alone: its functions are prism_p_*, and the dispatch reaches
+// them whatever the program index (the callable shader of that program).
 std::string GenerateDispatch(std::vector<std::array<bool, kEntryPointCount>> const& present,
-                             std::vector<ProgramTraits> const& traits)
+                             std::vector<ProgramTraits> const& traits, bool single = false)
 {
     const char* state = "Shading_state_material";
     const char* inoutState = "inout";
+    const char* selector = single ? "    switch (0u) {\n" : "    switch (program) {\n";
+    auto ProgramFunction = [single](uint32_t program, EntryIndex entry) {
+        return single ? SingleProgramFunction(entry) : prism::device::gpu::ProgramFunction(program, entry);
+    };
     std::string s;
     auto cases = [&](EntryIndex entry, const char* call, const char* fallback) {
-        std::string body = "    switch (program) {\n";
+        std::string body = selector;
         for (size_t p = 0; p < present.size(); ++p) {
             if (!present[p][entry]) continue;
             const std::string function = ProgramFunction(uint32_t(p), entry);
@@ -197,7 +230,7 @@ std::string GenerateDispatch(std::vector<std::array<bool, kEntryPointCount>> con
     // The cutout path's own init: only programs with a varying cutout.
     s += std::format("void prism_mdl_init_cutout(uint program, {} {} state)\n{{\n", inoutState, state);
     {
-        std::string body = "    switch (program) {\n";
+        std::string body = selector;
         for (size_t p = 0; p < present.size(); ++p)
             if (present[p][E_CUTOUT])
                 body += std::format("    case {}u: {}(state); break;\n", p, ProgramFunction(uint32_t(p), E_INIT));
@@ -205,7 +238,7 @@ std::string GenerateDispatch(std::vector<std::array<bool, kEntryPointCount>> con
     }
     s += std::format("bool prism_mdl_thin_walled(uint program, {} {} state)\n{{\n", inoutState, state);
     {
-        std::string body = "    switch (program) {\n";
+        std::string body = selector;
         for (size_t p = 0; p < present.size(); ++p) {
             if (present[p][E_THIN_WALLED])
                 body += std::format("    case {}u: return {}(state);\n", p, ProgramFunction(uint32_t(p), E_THIN_WALLED));
@@ -308,8 +341,11 @@ std::filesystem::path StructuralKeyFile(std::string const& identity)
     const std::string stable = colon == std::string::npos ? identity : identity.substr(colon + 1);
     return prism::PersistentCacheRoot() / "gpu-structure" /
         (Digest(stable + "|hlsl" +
-                "|mdl-" MI_NEURAYLIB_PRODUCT_VERSION_STRING "|v2") + ".key");
+                "|mdl-" MI_NEURAYLIB_PRODUCT_VERSION_STRING "|v3") + ".key");
 }
+
+// Defined with the per-program layout below.
+std::shared_ptr<const MdlProgramCode> ProgramCodeFor(mdl::CompiledProgram const& program);
 
 std::mutex gStructuralKeysMutex;
 // Program identity -> structural key. Programs are immutable.
@@ -377,14 +413,7 @@ MdlShaderCode GenerateMdlShaderCode(std::vector<MDLMaterial const*> const& mater
         return result;
     };
     if (!backend) return fail("HLSL backend unavailable");
-    backend->set_option("num_texture_spaces", "1");
-    backend->set_option("num_texture_results", std::to_string(kGpuTextureResults).c_str());
-    backend->set_option("enable_auxiliary", "off");
-    backend->set_option("texture_runtime_with_derivs", "on");
-    backend->set_option("enable_ro_segment", "on");
-    backend->set_option("max_const_data", "0");
-    backend->set_option("df_handle_slot_mode", "none");
-    backend->set_option("libbsdf_flags_in_bsdf_data", "off");
+    ConfigureHlslBackend(backend.get());
 
     // Merge structurally identical programs.
     {
@@ -411,17 +440,24 @@ MdlShaderCode GenerateMdlShaderCode(std::vector<MDLMaterial const*> const& mater
                 }
             }
             if (key.empty()) {
-                mi::base::Handle<const mi::neuraylib::ICompiled_material> compiled(
-                    transaction->access<mi::neuraylib::ICompiled_material>(
-                        programs[p]->compiled_material_name.c_str()));
-                if (compiled)
-                    key = StructuralKey(backend.get(), transaction.get(), executionContext.get(),
-                                        compiled.get(), TraitsOf(compiled.get()));
-                if (const char* dir = std::getenv("PRISM_GPU_DUMP_PROGRAMS"); dir && *dir)
-                    std::ofstream(std::filesystem::path(dir) / std::format("program{}.hlsl", p)) << key;
+                // The program translated alone (usually early, while its
+                // material compiled) gives the structural key.
+                auto alone = ProgramCodeFor(*programs[p]);
+                if (alone && alone->success) {
+                    key = alone->digest;
+                    if (const char* dir = std::getenv("PRISM_GPU_DUMP_PROGRAMS"); dir && *dir)
+                        std::ofstream(std::filesystem::path(dir) / std::format("program{}.hlsl", p)) << alone->code;
+                } else {
+                    mi::base::Handle<const mi::neuraylib::ICompiled_material> compiled(
+                        transaction->access<mi::neuraylib::ICompiled_material>(
+                            programs[p]->compiled_material_name.c_str()));
+                    if (compiled)
+                        key = StructuralKey(backend.get(), transaction.get(), executionContext.get(),
+                                            compiled.get(), TraitsOf(compiled.get()));
+                    if (!key.empty()) key = Digest(key);
+                }
                 if (key.empty()) key = "unique:" + programs[p]->compiled_material_name;
                 else {
-                    key = Digest(key);
                     if (persistent) {
                         std::error_code ignored;
                         std::filesystem::create_directories(keyFile.parent_path(), ignored);
@@ -634,6 +670,570 @@ std::shared_ptr<const MdlShaderCode> CachedMdlShaderCode(std::vector<MDLMaterial
             if (cachedKey == key) return code;
     }
     auto code = std::make_shared<const MdlShaderCode>(GenerateMdlShaderCode(materials));
+    std::lock_guard lock(mutex);
+    constexpr size_t maxEntries = 4;
+    if (cache.size() >= maxEntries) cache.erase(cache.begin());
+    cache.emplace_back(std::move(key), code);
+    return code;
+}
+
+// ---------------------------------------------------------------------------
+// Programs translated alone (MdlProgramCode) and the per-program layout.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Translates one compiled class alone: entry functions prism_p_*, its own
+// texture indices, read-only data and string ids. Valid in any transaction
+// that can access the material (and the module database elements it uses).
+std::shared_ptr<MdlProgramCode> TranslateProgram(mdl::Context const& context,
+                                                 mi::neuraylib::ITransaction* transaction,
+                                                 mi::neuraylib::ICompiled_material const* compiled)
+{
+    auto result = std::make_shared<MdlProgramCode>();
+    const auto start = std::chrono::steady_clock::now();
+    auto fail = [&](std::string message) {
+        result->success = false;
+        result->error = std::move(message);
+        return result;
+    };
+    mi::base::Handle<mi::neuraylib::IMdl_execution_context> executionContext(
+        context.get_factory()->create_execution_context());
+    mi::base::Handle<mi::neuraylib::IMdl_backend_api> backendApi(
+        context.get_neuray()->get_api_component<mi::neuraylib::IMdl_backend_api>());
+    mi::base::Handle<mi::neuraylib::IMdl_backend> backend(
+        backendApi ? backendApi->get_backend(mi::neuraylib::IMdl_backend_api::MB_HLSL) : nullptr);
+    if (!backend) return fail("HLSL backend unavailable");
+    ConfigureHlslBackend(backend.get());
+    const ProgramTraits traits = TraitsOf(compiled);
+    std::vector<std::string> names;
+    std::vector<mi::neuraylib::Target_function_description> descs;
+    std::vector<size_t> entries;
+    names.reserve(kEntryPointCount);
+    for (size_t e = 0; e < kEntryPointCount; ++e) {
+        if (!NeedsEntry(traits, e)) continue;
+        names.push_back(SingleProgramFunction(EntryIndex(e)));
+        descs.emplace_back(kEntryPoints[e].path, names.back().c_str());
+        entries.push_back(e);
+    }
+    mi::base::Handle<const mi::neuraylib::ITarget_code> code;
+    {
+        mi::base::Handle<mi::neuraylib::ILink_unit> unit(backend->create_link_unit(transaction, executionContext.get()));
+        if (!unit) return fail("cannot create link unit: " + MessagesOf(executionContext.get()));
+        if (unit->add_material(compiled, descs.data(), descs.size(), executionContext.get()) != 0)
+            return fail("add_material failed: " + MessagesOf(executionContext.get()));
+        code = mi::base::Handle<const mi::neuraylib::ITarget_code>(
+            backend->translate_link_unit(unit.get(), executionContext.get()));
+    }
+    if (!code) return fail("translate_link_unit failed: " + MessagesOf(executionContext.get()));
+    if (code->get_light_profile_count() > 1 || code->get_bsdf_measurement_count() > 1)
+        return fail("light profiles and measured BSDFs are not supported on GPU devices");
+    if (code->get_ro_data_segment_count() > 1) return fail("multiple read-only data segments");
+    std::vector<std::array<bool, kEntryPointCount>> present(1);
+    present[0].fill(false);
+    for (size_t i = 0; i < entries.size(); ++i) present[0][entries[i]] = descs[i].function_index != ~mi::Size(0);
+    for (mi::Size i = 1; i < code->get_texture_count(); ++i) {
+        MdlProgramCode::Texture texture;
+        const auto shape = code->get_texture_shape(i);
+        const char* name = code->get_texture(i);
+        texture.name = name ? name : "";
+        if (shape == mi::neuraylib::ITarget_code::Texture_shape_bsdf_data) {
+            mi::Size w = 0, h = 0, d = 0;
+            const char* pixelType = nullptr;
+            const float* data = code->get_texture_df_data(i, w, h, d, pixelType);
+            const size_t components = pixelType && std::strcmp(pixelType, "Float32<3>") == 0 ? 3 : 1;
+            texture.image = false;
+            texture.values = std::make_shared<const std::vector<float>>(
+                data, data + (data ? size_t(w) * h * d * components : 0));
+            texture.width = w; texture.height = h; texture.depth = d;
+            texture.components = components;
+        } else if (shape != mi::neuraylib::ITarget_code::Texture_shape_2d) {
+            return fail("unsupported texture shape " + std::to_string(int(shape)));
+        }
+        result->textures.push_back(std::move(texture));
+    }
+    if (code->get_ro_data_segment_count() == 1) {
+        const char* data = code->get_ro_data_segment_data(0);
+        result->roData.assign(data, data + code->get_ro_data_segment_size(0));
+    }
+    result->stringConstants.assign(code->get_string_constant_count(), std::string());
+    for (mi::Size i = 1; i < code->get_string_constant_count(); ++i)
+        if (const char* name = code->get_string_constant(i)) result->stringConstants[i] = name;
+    std::string dispatch = GenerateDispatch(present, std::vector<ProgramTraits>{traits}, true);
+    result->code = code->get_code();
+    result->targetCodeBytes = result->code.size();
+    result->code += "\n// ---- Prism material dispatch ----\n" + dispatch + GenerateSceneData(code.get());
+    // Equal code, textures named by literal index, read-only data and argument
+    // layout make interchangeable programs (StructuralKey).
+    std::string key = result->code;
+    static const std::regex literalTexture(R"(tex_[a-z0-9_]*_2d\(\s*\d)");
+    const bool literalImages = std::regex_search(result->code, literalTexture);
+    for (auto const& texture : result->textures)
+        key += std::format("|t{}:{}", texture.image ? 1 : 0, texture.image && !literalImages ? "" : texture.name);
+    key.append(result->roData.begin(), result->roData.end());
+    mi::base::Handle<mi::neuraylib::ITarget_value_layout const> layout(code->get_argument_block_layout(0));
+    key += std::format("|args{}", layout ? layout->get_size() : 0);
+    result->digest = Digest(key);
+    result->translateSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    result->success = true;
+    return result;
+}
+
+using ProgramFuture = std::shared_future<std::shared_ptr<const MdlProgramCode>>;
+std::mutex gProgramsMutex;
+// Context and class key -> translation (in flight or done). Translations
+// hold no SDK objects, so they may outlive the SDK.
+auto& gPrograms = *new std::unordered_map<std::string, ProgramFuture>();
+auto& gProgramListeners = *new std::map<int, std::shared_ptr<const ProgramListener>>();
+int gNextListener = 1;
+
+std::string RegistryKey(mdl::Context const* context, std::string const& classKey)
+{
+    return std::format("{}|{}", static_cast<const void*>(context), classKey);
+}
+
+void ObserveClass(mdl::Context const& context, std::string const& classKey, mi::neuraylib::ITransaction* transaction,
+                  mi::neuraylib::ICompiled_material const* material)
+{
+    const std::string key = RegistryKey(&context, classKey);
+    std::promise<std::shared_ptr<const MdlProgramCode>> promise;
+    {
+        std::lock_guard lock(gProgramsMutex);
+        if (gPrograms.contains(key)) return;
+        gPrograms.emplace(key, promise.get_future().share());
+    }
+    std::shared_ptr<const MdlProgramCode> code;
+    try {
+        code = TranslateProgram(context, transaction, material);
+    } catch (std::exception const& e) {
+        auto failed = std::make_shared<MdlProgramCode>();
+        failed->error = e.what();
+        code = failed;
+    }
+    promise.set_value(code);
+    if (prism::load_profile::Enabled())
+        prism::load_profile::Mark("gpu.program", std::format("translate_ms={:.1f} code_kb={} ok={} early=1",
+                                                             code->translateSeconds * 1e3, code->code.size() >> 10,
+                                                             code->success ? 1 : 0));
+    if (!code->success) return;
+    std::vector<std::shared_ptr<const ProgramListener>> listeners;
+    {
+        std::lock_guard lock(gProgramsMutex);
+        for (auto const& [token, listener] : gProgramListeners) listeners.push_back(listener);
+    }
+    for (auto const& listener : listeners) (*listener)(code);
+}
+
+// The translation of `program`: the early one, or one made now from its
+// stored class (kept for later scenes when the class is shareable).
+std::shared_ptr<const MdlProgramCode> ProgramCodeFor(mdl::CompiledProgram const& program)
+{
+    const std::string key = program.class_key.empty() ? std::string()
+                                                      : RegistryKey(program.owner_identity, program.class_key);
+    std::promise<std::shared_ptr<const MdlProgramCode>> promise;
+    if (!key.empty()) {
+        ProgramFuture found;
+        {
+            std::lock_guard lock(gProgramsMutex);
+            if (auto it = gPrograms.find(key); it != gPrograms.end()) found = it->second;
+            else gPrograms.emplace(key, promise.get_future().share());
+        }
+        if (found.valid()) {
+            auto code = found.get();
+            if (code && code->success) return code;
+            // A failed early translation is tried again from the stored class.
+            std::lock_guard lock(gProgramsMutex);
+            gPrograms.erase(key);
+            return ProgramCodeFor(program);
+        }
+    }
+    auto translate = [&]() -> std::shared_ptr<const MdlProgramCode> {
+        auto failed = std::make_shared<MdlProgramCode>();
+        mdl::Context const* context = program.owner_identity;
+        if (!context || program.compiled_material_name.empty()) {
+            failed->error = "program has no compiled class";
+            return failed;
+        }
+        mi::base::Handle<mi::neuraylib::IScope> scope(context->get_database()->get_global_scope());
+        mi::base::Handle<mi::neuraylib::ITransaction> transaction(scope->create_transaction());
+        std::shared_ptr<const MdlProgramCode> code;
+        {
+            mi::base::Handle<const mi::neuraylib::ICompiled_material> compiled(
+                transaction->access<mi::neuraylib::ICompiled_material>(program.compiled_material_name.c_str()));
+            if (!compiled) failed->error = "compiled class missing";
+            else code = TranslateProgram(*context, transaction.get(), compiled.get());
+        }
+        transaction->commit();
+        if (prism::load_profile::Enabled() && code)
+            prism::load_profile::Mark("gpu.program", std::format("translate_ms={:.1f} code_kb={} ok={} early=0",
+                                                                 code->translateSeconds * 1e3, code->code.size() >> 10,
+                                                                 code->success ? 1 : 0));
+        return code ? code : failed;
+    };
+    std::shared_ptr<const MdlProgramCode> code;
+    try {
+        code = translate();
+    } catch (std::exception const& e) {
+        auto failed = std::make_shared<MdlProgramCode>();
+        failed->error = e.what();
+        code = failed;
+    }
+    if (!key.empty()) {
+        promise.set_value(code);
+        if (!code->success) {
+            std::lock_guard lock(gProgramsMutex);
+            gPrograms.erase(key);
+        }
+    }
+    return code;
+}
+
+bool IdentifierChar(char c) { return std::isalnum(static_cast<unsigned char>(c)) || c == '_'; }
+
+// The top-level declarations of generated HLSL, as [begin, end) ranges: a
+// function definition ends with its body, anything else with a semicolon at
+// depth zero; preprocessor lines stand alone (as LinkUnitTrimmer splits).
+std::vector<std::pair<size_t, size_t>> TopLevelDeclarations(std::string_view code)
+{
+    std::vector<std::pair<size_t, size_t>> chunks;
+    size_t start = 0, depth = 0, parens = 0;
+    bool sawAssign = false, sawParen = false;
+    for (size_t i = 0; i < code.size();) {
+        const char c = code[i];
+        if (c == '/' && i + 1 < code.size() && code[i + 1] == '/') {
+            const size_t end = code.find('\n', i);
+            i = end == std::string_view::npos ? code.size() : end;
+            continue;
+        }
+        if (c == '/' && i + 1 < code.size() && code[i + 1] == '*') {
+            const size_t end = code.find("*/", i + 2);
+            i = end == std::string_view::npos ? code.size() : end + 2;
+            continue;
+        }
+        if (c == '"' || c == '\'') {
+            size_t j = i + 1;
+            while (j < code.size() && code[j] != c) j += code[j] == '\\' ? 2 : 1;
+            i = j + 1;
+            continue;
+        }
+        if (c == '#' && depth == 0 && parens == 0) {
+            if (i > start) chunks.emplace_back(start, i);
+            const size_t end = code.find('\n', i);
+            const size_t next = end == std::string_view::npos ? code.size() : end + 1;
+            chunks.emplace_back(i, next);
+            i = start = next;
+            sawAssign = sawParen = false;
+            continue;
+        }
+        if (IdentifierChar(c)) {
+            while (i < code.size() && IdentifierChar(code[i])) ++i;
+            continue;
+        }
+        if (depth == 0) {
+            if (c == '(') { if (parens++ == 0 && !sawAssign) sawParen = true; }
+            else if (c == ')') { if (parens > 0) --parens; }
+            else if (c == '=' && parens == 0) sawAssign = true;
+            else if (c == ';' && parens == 0) {
+                chunks.emplace_back(start, ++i);
+                start = i;
+                sawAssign = sawParen = false;
+                continue;
+            }
+        }
+        if (c == '{') ++depth;
+        else if (c == '}' && depth > 0 && --depth == 0 && sawParen && !sawAssign) {
+            chunks.emplace_back(start, ++i);
+            start = i;
+            sawAssign = sawParen = false;
+            continue;
+        }
+        ++i;
+    }
+    if (start < code.size()) chunks.emplace_back(start, code.size());
+    return chunks;
+}
+
+uint64_t TextHash(std::string_view text)
+{
+    uint64_t a = 1469598103934665603ull;
+    for (unsigned char c : text) a = (a ^ c) * 1099511628211ull;
+    return a ^ (uint64_t(text.size()) * 0x9e3779b97f4a7c15ull);
+}
+
+} // namespace
+
+int AddProgramListener(ProgramListener listener)
+{
+    std::lock_guard lock(gProgramsMutex);
+    const int token = gNextListener++;
+    gProgramListeners.emplace(token, std::make_shared<const ProgramListener>(
+        listener ? std::move(listener) : ProgramListener([](auto const&) {})));
+    if (gProgramListeners.size() == 1) mdl::SetClassObserver(ObserveClass);
+    return token;
+}
+
+void RemoveProgramListener(int token)
+{
+    std::lock_guard lock(gProgramsMutex);
+    if (gProgramListeners.erase(token) && gProgramListeners.empty()) mdl::SetClassObserver(nullptr);
+}
+
+void LinkUnitEstimate::add(MdlProgramCode const& program)
+{
+    if (!program.success || !m_programs.insert(program.digest).second) return;
+    std::string_view target(program.code.data(), program.targetCodeBytes);
+    for (auto const& [begin, end] : TopLevelDeclarations(target))
+        if (m_declarations.insert(TextHash(target.substr(begin, end - begin))).second) m_bytes += end - begin;
+    m_bytes += program.code.size() - program.targetCodeBytes;
+}
+
+size_t EstimatedLinkUnitBytes(std::vector<std::shared_ptr<const MdlProgramCode>> const& programs)
+{
+    LinkUnitEstimate estimate;
+    for (auto const& program : programs)
+        if (program) estimate.add(*program);
+    return estimate.bytes();
+}
+
+std::vector<std::shared_ptr<const MdlProgramCode>> ProgramCodes(std::vector<MDLMaterial const*> const& materials)
+{
+    std::vector<std::shared_ptr<const MdlProgramCode>> result(materials.size());
+    std::vector<mdl::CompiledProgram const*> programs;
+    std::unordered_map<mdl::CompiledProgram const*, size_t> index;
+    std::vector<size_t> programOf(materials.size(), ~size_t(0));
+    for (size_t i = 0; i < materials.size(); ++i) {
+        MDLMaterial const* material = materials[i];
+        if (!material || !material->is_valid()) continue;
+        auto const* program = material->get_target_code().program.get();
+        if (!program || program->compiled_material_name.empty() || program->builtin_resources) continue;
+        auto [found, inserted] = index.emplace(program, programs.size());
+        if (inserted) programs.push_back(program);
+        programOf[i] = found->second;
+    }
+    std::vector<std::shared_ptr<const MdlProgramCode>> codes(programs.size());
+    tbb::parallel_for(size_t(0), programs.size(), [&](size_t p) { codes[p] = ProgramCodeFor(*programs[p]); });
+    for (size_t i = 0; i < materials.size(); ++i)
+        if (programOf[i] != ~size_t(0)) result[i] = codes[programOf[i]];
+    return result;
+}
+
+MdlShaderCode GenerateProgramShaderCode(std::vector<MDLMaterial const*> const& materials)
+{
+    MdlShaderCode result;
+    result.perProgram = true;
+    result.materials.resize(materials.size());
+    result.textures.resize(1); // invalid texture
+    result.textureResults = kGpuTextureResults;
+    result.stringConstants.assign(1, std::string());
+    const auto start = std::chrono::steady_clock::now();
+
+    std::vector<std::shared_ptr<const MdlProgramCode>> codes = ProgramCodes(materials);
+    mdl::Context const* context = nullptr;
+    // Distinct programs by digest, in first-use order.
+    std::map<std::string, uint32_t> programIndex;
+    for (size_t i = 0; i < materials.size(); ++i) {
+        auto& record = result.materials[i];
+        MDLMaterial const* material = materials[i];
+        if (!material || !material->is_valid()) { record.error = "invalid MDL material"; continue; }
+        auto const* program = material->get_target_code().program.get();
+        if (!program || program->compiled_material_name.empty()) { record.error = "program has no compiled class"; continue; }
+        if (program->builtin_resources) { record.error = "program uses the SDK resource handler"; continue; }
+        if (context && program->owner_identity != context) { record.error = "materials of different MDL contexts"; continue; }
+        if (!codes[i] || !codes[i]->success) {
+            record.error = codes[i] ? codes[i]->error : std::string("no program code");
+            continue;
+        }
+        context = program->owner_identity;
+        auto [found, inserted] = programIndex.emplace(codes[i]->digest, uint32_t(result.programs.size()));
+        if (inserted) result.programs.push_back(codes[i]);
+        record.program = found->second;
+        record.valid = true;
+        record.constantCutout = material->constant_cutout();
+    }
+    result.programCount = uint32_t(result.programs.size());
+    result.success = true;
+    if (result.programs.empty()) {
+        result.argumentBlocks.resize(16);
+        result.roData.resize(16);
+        return result;
+    }
+
+    // Global texture indices of each program's own textures.
+    std::map<std::vector<const void*>, uint32_t> imageIndex;
+    std::map<std::string, uint32_t> dataIndex;
+    auto addView = [&](mdl::NativeTextureRuntime::ResourceView const& view) -> uint32_t {
+        std::vector<const void*> key;
+        if (view.values) key.push_back(view.owner.get());
+        for (auto const& [tile, resource] : view.tiles) key.push_back(resource.get());
+        if (key.empty()) return 0;
+        auto [found, inserted] = imageIndex.emplace(key, uint32_t(result.textures.size()));
+        if (inserted) {
+            MdlTexture texture;
+            if (view.values) {
+                texture.kind = MdlTexture::Kind::BsdfData;
+                texture.owner = view.owner; texture.values = view.values;
+                texture.width = view.width; texture.height = view.height;
+                texture.depth = view.depth; texture.components = view.components;
+            } else {
+                texture.kind = MdlTexture::Kind::Image;
+                texture.tiled = view.tiled;
+                texture.tiles = view.tiles;
+            }
+            result.textures.push_back(std::move(texture));
+        }
+        return found->second;
+    };
+    std::vector<std::vector<uint32_t>> programTextures(result.programs.size());
+    {
+        mi::base::Handle<mi::neuraylib::IScope> scope(context->get_database()->get_global_scope());
+        mi::base::Handle<mi::neuraylib::ITransaction> transaction(scope->create_transaction());
+        for (size_t p = 0; p < result.programs.size(); ++p) {
+            for (auto const& texture : result.programs[p]->textures) {
+                uint32_t global = 0;
+                if (texture.image) {
+                    mdl::NativeTextureRuntime::ResourceView view;
+                    std::string error;
+                    if (mdl::NativeTextureRuntime::PrepareDatabaseTexture(texture.name.c_str(), transaction.get(),
+                                                                          &view, &error))
+                        global = addView(view);
+                    else if (GpuVerbose())
+                        std::cerr << "PrismRT GPU: texture " << texture.name << " of an MDL program: " << error << '\n';
+                } else if (texture.values) {
+                    const std::string key = std::format("{}|{}x{}x{}x{}", texture.name, texture.width, texture.height,
+                                                        texture.depth, texture.components);
+                    auto [found, inserted] = dataIndex.emplace(key, uint32_t(result.textures.size()));
+                    if (inserted) {
+                        MdlTexture data;
+                        data.kind = MdlTexture::Kind::BsdfData;
+                        data.owner = texture.values;
+                        data.values = texture.values->data();
+                        data.width = texture.width; data.height = texture.height;
+                        data.depth = texture.depth; data.components = texture.components;
+                        result.textures.push_back(std::move(data));
+                    }
+                    global = found->second;
+                }
+                programTextures[p].push_back(global);
+            }
+        }
+        transaction->commit();
+    }
+
+    // Read-only data: a zero header, then each program's segment.
+    result.roData.assign(16, 0);
+    std::vector<uint32_t> roOffset(result.programs.size());
+    for (size_t p = 0; p < result.programs.size(); ++p) {
+        result.roData.resize((result.roData.size() + 15) & ~size_t(15));
+        roOffset[p] = uint32_t(result.roData.size());
+        result.roData.insert(result.roData.end(), result.programs[p]->roData.begin(), result.programs[p]->roData.end());
+    }
+    result.roData.resize((result.roData.size() + 15) & ~size_t(15));
+    // Tables follow as 32-bit words: each program's string ids, each
+    // material's texture indices.
+    std::vector<uint32_t> tables;
+    const uint32_t tableBase = uint32_t(result.roData.size() / 4);
+    std::map<std::string, uint32_t> stringIds;
+    std::vector<uint32_t> stringTable(result.programs.size());
+    for (size_t p = 0; p < result.programs.size(); ++p) {
+        auto const& names = result.programs[p]->stringConstants;
+        stringTable[p] = tableBase + uint32_t(tables.size());
+        tables.push_back(0);
+        for (size_t s = 1; s < names.size(); ++s) {
+            uint32_t id = 0;
+            if (!names[s].empty()) {
+                auto [found, inserted] = stringIds.emplace(names[s], uint32_t(result.stringConstants.size()));
+                if (inserted) result.stringConstants.push_back(names[s]);
+                id = found->second;
+            }
+            tables.push_back(id);
+        }
+    }
+
+    for (size_t i = 0; i < materials.size(); ++i) {
+        auto& record = result.materials[i];
+        if (!record.valid) continue;
+        auto const& target = materials[i]->get_target_code();
+        const uint32_t p = record.program;
+        record.roDataOffset = roOffset[p];
+        record.stringTable = stringTable[p];
+        // The material's texture table: the program's own textures (indices
+        // 1..n of its code), then its argument textures, which the argument
+        // block names by their index in this table.
+        std::vector<uint32_t> table(1, 0u);
+        table.insert(table.end(), programTextures[p].begin(), programTextures[p].end());
+        result.argumentBlocks.resize((result.argumentBlocks.size() + 15) & ~size_t(15));
+        record.argBlockOffset = uint32_t(result.argumentBlocks.size());
+        auto const* block = target.argument_data();
+        if (block && block->get_size() > 0) {
+            std::vector<char> bytes(block->get_data(), block->get_data() + block->get_size());
+            mi::base::Handle<mi::neuraylib::ITarget_value_layout const> layout(
+                target.program->target_code->get_argument_block_layout(0));
+            auto const* runtime = target.binding ? target.binding->texture_runtime.get() : nullptr;
+            bool resourcesOk = true;
+            std::map<uint32_t, uint32_t> local;
+            if (layout) {
+                RemapResources(layout.get(), mi::neuraylib::Target_value_layout_state(), bytes.data(), bytes.size(),
+                    [&](mi::neuraylib::IValue::Kind kind, uint32_t index) -> uint32_t {
+                        if (index == 0) return 0;
+                        if (kind != mi::neuraylib::IValue::VK_TEXTURE || !runtime ||
+                            index >= runtime->resourceCount()) {
+                            resourcesOk = false;
+                            return 0;
+                        }
+                        if (auto found = local.find(index); found != local.end()) return found->second;
+                        const uint32_t global = addView(runtime->resource(index));
+                        if (!global) resourcesOk = false;
+                        const uint32_t slot = uint32_t(table.size());
+                        table.push_back(global);
+                        local.emplace(index, slot);
+                        return slot;
+                    });
+            }
+            if (!resourcesOk) {
+                record.valid = false;
+                record.error = "argument resource without a prepared texture";
+                continue;
+            }
+            result.argumentBlocks.insert(result.argumentBlocks.end(), bytes.begin(), bytes.end());
+        }
+        record.textureTable = tableBase + uint32_t(tables.size());
+        tables.insert(tables.end(), table.begin(), table.end());
+    }
+    result.argumentBlocks.resize(std::max<size_t>(16, (result.argumentBlocks.size() + 15) & ~size_t(15)));
+    const size_t tableBytes = tables.size() * 4;
+    result.roData.resize(result.roData.size() + tableBytes);
+    std::memcpy(result.roData.data() + size_t(tableBase) * 4, tables.data(), tableBytes);
+    result.roData.resize((result.roData.size() + 15) & ~size_t(15));
+    for (auto const& program : result.programs) result.translateSeconds += program->translateSeconds;
+    if (prism::load_profile::Enabled())
+        prism::load_profile::Mark("gpu.program_layout",
+            std::format("programs={} textures={} ro_kb={} assemble_ms={:.1f}", result.programs.size(),
+                        result.textures.size() - 1, result.roData.size() >> 10,
+                        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count()));
+    return result;
+}
+
+std::shared_ptr<const MdlShaderCode> CachedProgramShaderCode(std::vector<MDLMaterial const*> const& materials)
+{
+    static std::mutex mutex;
+    static auto& cache = *new std::vector<std::pair<ShaderCodeKey, std::shared_ptr<const MdlShaderCode>>>();
+    static std::once_flag hookRegistered;
+    std::call_once(hookRegistered, [] {
+        mdl::Context::add_shutdown_hook([] {
+            std::lock_guard lock(mutex);
+            cache.clear();
+        });
+    });
+    ShaderCodeKey key;
+    key.reserve(materials.size());
+    for (MDLMaterial const* material : materials)
+        key.push_back(material && material->is_valid() ? material->get_target_code().binding : nullptr);
+    {
+        std::lock_guard lock(mutex);
+        for (auto const& [cachedKey, code] : cache)
+            if (cachedKey == key) return code;
+    }
+    auto code = std::make_shared<const MdlShaderCode>(GenerateProgramShaderCode(materials));
     std::lock_guard lock(mutex);
     constexpr size_t maxEntries = 4;
     if (cache.size() >= maxEntries) cache.erase(cache.begin());

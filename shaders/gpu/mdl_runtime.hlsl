@@ -24,6 +24,30 @@ float prism_double_bits_to_float(uint lo, uint hi)
     return asfloat(sign | (uint(e) << 23u) | mantissa);
 }
 
+// Code of one program translated alone (PRISM_MDL_PROGRAM_TABLES, the
+// Vulkan callables): its texture indices, read-only data offsets and string
+// ids are its own, placed in the scene's buffers by the material's tables
+// (GpuMaterial.textures, set by gpu_build_mdl_state). A link unit's code
+// uses the scene's indices directly.
+#ifdef PRISM_MDL_PROGRAM_TABLES
+static uint g_prism_rodata_base = 0u;    // bytes
+static uint g_prism_texture_table = 0u;  // words of the read-only data
+static uint g_prism_string_table = 0u;
+int prism_texture_index(int tex)
+{
+    return tex <= 0 ? tex : int(gpu_rodata_word(g_prism_texture_table + uint(tex)));
+}
+int prism_scene_data_global_id(int id)
+{
+    return id <= 0 ? id : int(gpu_rodata_word(g_prism_string_table + uint(id)));
+}
+uint prism_rodata_byte_word(int offs) { return gpu_rodata_word((g_prism_rodata_base + uint(offs)) >> 2u); }
+#else
+int prism_texture_index(int tex) { return tex; }
+int prism_scene_data_global_id(int id) { return id; }
+uint prism_rodata_byte_word(int offs) { return gpu_rodata_word(uint(offs) >> 2u); }
+#endif
+
 uint prism_argblock_byte_word(int offs) { return gpu_argblock_word(uint(offs) >> 2u); }
 float prism_argblock_float(int offs) { return asfloat(prism_argblock_byte_word(offs)); }
 int prism_argblock_int(int offs) { return int(prism_argblock_byte_word(offs)); }
@@ -36,7 +60,6 @@ float prism_argblock_double(int offs)
 {
     return prism_double_bits_to_float(prism_argblock_byte_word(offs), prism_argblock_byte_word(offs + 4));
 }
-uint prism_rodata_byte_word(int offs) { return gpu_rodata_word(uint(offs) >> 2u); }
 float prism_rodata_float(int offs) { return asfloat(prism_rodata_byte_word(offs)); }
 int prism_rodata_int(int offs) { return int(prism_rodata_byte_word(offs)); }
 uint prism_rodata_uint(int offs) { return prism_rodata_byte_word(offs); }
@@ -115,6 +138,7 @@ void prism_crop_axis(float c0, float c1, int size, bool topDown,
 float4 prism_mdl_lookup_2d(int tex, float2 coord, float2 dx, float2 dy, int wrapU,
                                         int wrapV, float2 cropU, float2 cropV)
 {
+    tex = prism_texture_index(tex);
     if (!prism_mdl_texture_valid(tex)) return float4(0.0f, 0.0f, 0.0f, 0.0f);
     GpuMdlTexture info = gpu_mdl_texture(uint(tex));
     if (info.info.x != kMdlTextureImage) return float4(0.0f, 0.0f, 0.0f, 0.0f);
@@ -160,6 +184,7 @@ float4 prism_mdl_lookup_2d(int tex, float2 coord, float2 dx, float2 dy, int wrap
 
 int2 prism_mdl_resolution_2d(int tex, int2 uvTile)
 {
+    tex = prism_texture_index(tex);
     if (!prism_mdl_texture_valid(tex)) return int2(0, 0);
     GpuMdlTexture info = gpu_mdl_texture(uint(tex));
     if (info.info.x != kMdlTextureImage) return int2(0, 0);
@@ -171,6 +196,7 @@ int2 prism_mdl_resolution_2d(int tex, int2 uvTile)
 
 float4 prism_mdl_texel_2d(int tex, int2 coord, int2 uvTile)
 {
+    tex = prism_texture_index(tex);
     if (!prism_mdl_texture_valid(tex)) return float4(0.0f, 0.0f, 0.0f, 0.0f);
     GpuMdlTexture info = gpu_mdl_texture(uint(tex));
     if (info.info.x != kMdlTextureImage) return float4(0.0f, 0.0f, 0.0f, 0.0f);
@@ -248,6 +274,7 @@ float4 prism_lerp4(float4 a, float4 b, float t) { return a * (1.0f - t) + b * t;
 float4 prism_mdl_lookup_3d(int tex, float3 coord, int wrapU, int wrapV, int wrapW,
                                         float2 cropU, float2 cropV, float2 cropW)
 {
+    tex = prism_texture_index(tex);
     if (!prism_mdl_texture_valid(tex)) return float4(0.0f, 0.0f, 0.0f, 0.0f);
     GpuMdlTexture info = gpu_mdl_texture(uint(tex));
     if (info.info.x != kMdlTextureBsdfData) return float4(0.0f, 0.0f, 0.0f, 0.0f);
@@ -283,6 +310,7 @@ float4 prism_mdl_lookup_3d(int tex, float3 coord, int wrapU, int wrapV, int wrap
 
 int3 prism_mdl_resolution_3d(int tex)
 {
+    tex = prism_texture_index(tex);
     if (!prism_mdl_texture_valid(tex)) return int3(0, 0, 0);
     GpuMdlTexture info = gpu_mdl_texture(uint(tex));
     if (info.info.x != kMdlTextureBsdfData) return int3(0, 0, 0);
@@ -291,6 +319,7 @@ int3 prism_mdl_resolution_3d(int tex)
 
 float4 prism_mdl_texel_3d(int tex, int3 coord)
 {
+    tex = prism_texture_index(tex);
     if (!prism_mdl_texture_valid(tex)) return float4(0.0f, 0.0f, 0.0f, 0.0f);
     GpuMdlTexture info = gpu_mdl_texture(uint(tex));
     if (info.info.x != kMdlTextureBsdfData) return float4(0.0f, 0.0f, 0.0f, 0.0f);
@@ -310,7 +339,7 @@ int mdl_read_rodata_as_int(int offs) { return prism_rodata_int(offs); }
 uint mdl_read_rodata_as_uint(int offs) { return prism_rodata_uint(offs); }
 bool mdl_read_rodata_as_bool(int offs) { return prism_rodata_bool(offs); }
 
-bool tex_texture_isvalid(int tex) { return prism_mdl_texture_valid(tex); }
+bool tex_texture_isvalid(int tex) { return prism_mdl_texture_valid(prism_texture_index(tex)); }
 
 // 2D textures
 int tex_width_2d(int tex, int2 uv_tile, float frame) { return prism_mdl_resolution_2d(tex, uv_tile).x; }
@@ -504,7 +533,7 @@ bool prism_primvar(Shading_state_material state, int id, out float4 value)
     const GpuPrototype prototype = gpu_prototype(state.primvar_prototype);
     for (uint i = 0u; i < prototype.info2.z; ++i) {
         const GpuPrimvar primvar = gpu_primvar(prototype.info2.y + i);
-        if (primvar.info.x != uint(id)) continue;
+        if (primvar.info.x != uint(prism_scene_data_global_id(id))) continue;
         const float w[3] = {1.0f - state.primvar_bary.x - state.primvar_bary.y, state.primvar_bary.x,
                             state.primvar_bary.y};
         float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};

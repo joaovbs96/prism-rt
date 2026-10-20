@@ -118,6 +118,15 @@ bool IsProgramCapabilityFailure(std::string_view reason)
         reason.starts_with("BSDF data resource");
 }
 
+std::mutex gClassObserverMutex;
+std::shared_ptr<const ClassObserver> gClassObserver;
+
+std::shared_ptr<const ClassObserver> CurrentClassObserver()
+{
+    std::lock_guard lock(gClassObserverMutex);
+    return gClassObserver;
+}
+
 bool VerboseMdl()
 {
     const char* value = std::getenv("PRISM_MDL_VERBOSE");
@@ -401,6 +410,12 @@ void BackendCompiler::print_context_messages(mi::neuraylib::IMdl_execution_conte
     }
 }
 
+void SetClassObserver(ClassObserver observer)
+{
+    std::lock_guard lock(gClassObserverMutex);
+    gClassObserver = observer ? std::make_shared<const ClassObserver>(std::move(observer)) : nullptr;
+}
+
 TargetCode BackendCompiler::generate_target_code(const CompiledMaterial& compiled) {
     TargetCode result;
     auto program = std::make_shared<CompiledProgram>();
@@ -535,15 +550,19 @@ TargetCode BackendCompiler::generate_target_code(const CompiledMaterial& compile
         (!emissionMode || IsUniformExpression(emissionMode.get(), compiled.compiled_material.get(),
                                               compiled.transaction.get()));
 
-    const std::string materialHash = std::format("{}:{}",
-        static_cast<const void*>(&m_ctx),
-        ClassProgramHash(compiled.compiled_material.get(), m_ctx.get_factory(),
-                         compiled.transaction.get())) +
+    const std::string classHash = ClassProgramHash(compiled.compiled_material.get(), m_ctx.get_factory(),
+                                                   compiled.transaction.get());
+    const std::string materialHash = std::format("{}:{}", static_cast<const void*>(&m_ctx), classHash) +
         ":native-deriv-textures-v3:mdl-" MI_NEURAYLIB_PRODUCT_VERSION_STRING
         ":callables-init-bsdf-edf-cutout-thin-volume-displacement-v4:spaces-1:results-128";
     if (VerboseMdl())
         std::cout << "  class cache key: " << materialHash
                   << " reusable=" << compiled.allowTargetCodeReuse << "\n";
+    // The class hash covers folded constants too, so it identifies the code
+    // of classes the native cache does not keep (allowTargetCodeReuse).
+    program->class_key = classHash;
+    if (auto observer = CurrentClassObserver())
+        (*observer)(m_ctx, classHash, compiled.transaction.get(), compiled.compiled_material.get());
     ResourceRequirements requirements;
     mi::base::Handle<mi::neuraylib::IValue_factory> values(
         m_ctx.get_factory()->create_value_factory(compiled.transaction.get()));

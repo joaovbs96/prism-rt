@@ -10,9 +10,11 @@
 #include "../../texture_service.h"
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -40,13 +42,52 @@ struct MdlMaterialRecord {
     bool valid = false;
     uint32_t program = 0;          // dispatch index
     uint32_t argBlockOffset = 0;   // bytes into argumentBlocks
+    // Per-program layout only (zero otherwise): the program's read-only data
+    // (bytes into roData), and the 32-bit words of roData where the
+    // material's texture table and its program's string table start.
+    uint32_t roDataOffset = 0;
+    uint32_t textureTable = 0;
+    uint32_t stringTable = 0;
     std::optional<float> constantCutout;
     std::string error;
+};
+
+// One MDL program translated alone with the HLSL backend: code that does not
+// depend on the other programs of a scene, so its callable shader can compile
+// as soon as the program's class is compiled. Its resources are local (texture
+// indices, read-only data offsets and string ids start at its own zero); a
+// scene places them with per-material tables (MdlShaderCode::perProgram).
+struct MdlProgramCode {
+    bool success = false;
+    std::string error;
+    // The target code (entry functions prism_p_<entry>), the prism_mdl_*
+    // dispatch reaching only them and the scene data functions of its string
+    // ids: what the program's callable shader inserts for its MDL code.
+    std::string code;
+    size_t targetCodeBytes = 0;    // the target code alone, at the start of `code`
+    std::string digest;            // equal digests: interchangeable programs
+    std::vector<char> roData;
+    std::vector<std::string> stringConstants; // [0] unused
+    // The textures of the target code, in its index order (index i + 1).
+    struct Texture {
+        bool image = true;         // a 2D image (database name) or a BSDF data table
+        std::string name;
+        std::shared_ptr<const std::vector<float>> values;
+        size_t width = 0, height = 0, depth = 0, components = 0;
+    };
+    std::vector<Texture> textures;
+    double translateSeconds = 0.0;
+    bool fromDisk = false;
 };
 
 struct MdlShaderCode {
     bool success = false;
     std::string error;
+    // The per-program layout (GenerateProgramShaderCode): every program has
+    // its own code (`programs`), and materials reach their resources through
+    // tables in roData; `code`, `targetCode` and `programDispatch` are empty.
+    bool perProgram = false;
+    std::vector<std::shared_ptr<const MdlProgramCode>> programs;
     // Generated target code followed by the prism_mdl_* dispatch functions.
     std::string code;
     // The same code for one program at a time (callable shaders): the target
@@ -77,5 +118,42 @@ MdlShaderCode GenerateMdlShaderCode(std::vector<MDLMaterial const*> const& mater
 // (bindings are immutable, so equal bindings give equal code and data). Scene
 // edits that keep the materials then skip the MDL translation.
 std::shared_ptr<const MdlShaderCode> CachedMdlShaderCode(std::vector<MDLMaterial const*> const& materials);
+
+// The per-program layout of the materials: each distinct program's own code
+// (ProgramCodes), with read-only data, texture and string tables placed per
+// program and material. Cached like CachedMdlShaderCode.
+MdlShaderCode GenerateProgramShaderCode(std::vector<MDLMaterial const*> const& materials);
+std::shared_ptr<const MdlShaderCode> CachedProgramShaderCode(std::vector<MDLMaterial const*> const& materials);
+
+// The code of each material's program alone (null for materials without a
+// usable program), translating the programs no early translation produced, in
+// parallel.
+std::vector<std::shared_ptr<const MdlProgramCode>> ProgramCodes(std::vector<MDLMaterial const*> const& materials);
+
+// Early translation: while at least one listener is registered, every
+// reusable MDL class is translated on the thread that compiles it, right
+// after class compilation (before its native code and textures), and each
+// newly translated program is passed to every listener on that thread.
+// Translations are kept for the process (and on disk where they name no
+// image by database name), so later scenes and ProgramCodes reuse them.
+using ProgramListener = std::function<void(std::shared_ptr<const MdlProgramCode> const&)>;
+int AddProgramListener(ProgramListener listener);
+void RemoveProgramListener(int token);
+
+// An estimate, in bytes, of the MDL code a link unit of the added programs
+// would give the compute kernel: their target code with the declarations
+// they share counted once (by text), plus their dispatch. A single program's
+// is its link unit's size; several programs' can exceed it where the SDK
+// specializes shared code per program.
+class LinkUnitEstimate {
+public:
+    void add(MdlProgramCode const& program);
+    size_t bytes() const { return m_bytes; }
+private:
+    std::unordered_set<uint64_t> m_declarations;
+    std::unordered_set<std::string> m_programs;
+    size_t m_bytes = 0;
+};
+size_t EstimatedLinkUnitBytes(std::vector<std::shared_ptr<const MdlProgramCode>> const& programs);
 
 } // namespace prism::device::gpu

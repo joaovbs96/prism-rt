@@ -545,6 +545,8 @@ void ApplyMdlShaderCode(GpuSceneData& data, MdlShaderCode const& code)
         }
         material.info.y = record.program;
         material.info.z = record.argBlockOffset;
+        // Per-program layout: the program's read-only data and tables.
+        material.textures = {record.roDataOffset, record.textureTable, record.stringTable, 0u};
         if (record.constantCutout) {
             material.info.w |= kMaterialConstantCutout;
             material.params.w = *record.constantCutout;

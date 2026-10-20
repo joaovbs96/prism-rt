@@ -143,7 +143,9 @@ struct GpuInstance {
 
 struct GpuMaterial {
     uint4 info;      // x: kind, y: MDL program, z: MDL argument block offset, w: flags
-    uint4 textures;  // legacy texture records (kind dependent)
+    uint4 textures;  // legacy texture records (kind dependent); MDL programs translated alone
+                     // (callables): x read-only data offset (bytes), y texture table, z string
+                     // table (32-bit word indices into the read-only data)
     uint4 textures2; // x: normal texture, y: gltfPBR emission
     float4 params;   // kind dependent scalars; params.w: constant cutout opacity
     float4 emitter;  // x: selection density per unit area of its emissive triangles (0: none),

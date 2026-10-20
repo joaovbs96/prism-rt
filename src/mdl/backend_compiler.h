@@ -4,6 +4,7 @@
 #include "material_compiler.h"
 
 #include <mi/mdl_sdk.h>
+#include <functional>
 #include <string>
 #include <vector>
 #include <iostream>
@@ -15,6 +16,18 @@ class NativeTextureRuntime;
 
 // Releases process cache entries before an MDL SDK context shuts down.
 void ClearTargetCodeCache(const Context* context = nullptr);
+
+// Called on the compiling thread with each compiled class, before its
+// native code is generated, so GPU devices can translate it for their shading
+// language while the material's native code and textures are still being
+// prepared. `key` identifies the class's code (CompiledProgram::class_key):
+// classes with equal keys compile to the same program. The transaction and
+// the material are valid only during the call, which must not commit or
+// abort the transaction. Empty observer: none.
+using ClassObserver = std::function<void(Context const& context, std::string const& key,
+                                         mi::neuraylib::ITransaction* transaction,
+                                         mi::neuraylib::ICompiled_material const* material)>;
+void SetClassObserver(ClassObserver observer);
 
 // Stores the function indices for the generated target code.
 // These indices are used with ITarget_code::execute_*() methods.
@@ -94,6 +107,9 @@ struct CompiledProgram {
     // GPU devices compile it again for their shading language; argument
     // blocks share the layout. Empty if the class could not be stored.
     std::string compiled_material_name;
+    // The key the class observer saw for this program's class (stable across
+    // processes).
+    std::string class_key;
     // geometry.cutout_opacity depends only on the arguments (no state or
     // textures): each binding can evaluate it once.
     bool uniform_cutout = false;
