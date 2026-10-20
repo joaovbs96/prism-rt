@@ -21,8 +21,22 @@ public:
     // Picking uses the CPU scene, which is exact and needs no GPU round trip.
     RTCRayHit Intersect(SceneManager& scene, prism::PathRay const& ray) override;
     void Prepare(SceneManager& scene) override;
+    bool SettleTextures(SceneManager& scene, PassRequest const& request) override;
 
 protected:
+    // Texture streaming (Vulkan; the defaults stream nothing, as on Metal).
+    // BeginWork precedes the dispatches of each pass, image or preview
+    // (`mode` kMode*, `sample` its first sample index).
+    virtual void BeginWork(uint32_t mode, int sample) { (void)mode; (void)sample; }
+    virtual bool StreamsTextures() const { return false; }
+    // Waits until the feedback recorded so far is processed and what it asks
+    // for is resident; true when residency changed.
+    virtual bool SettleResidency() { return false; }
+    // Feedback from every pixel (settling) or the usual subset.
+    virtual void FullFeedback(bool full) { (void)full; }
+    // The next accumulation keeps residency unchanged.
+    virtual void HoldResidency() {}
+
     // Makes the device's copy of the scene current; data() is valid after.
     virtual bool PrepareScene(SceneManager& scene, std::string* error) = 0;
     virtual GpuSceneData const& Data() const = 0;
@@ -40,6 +54,9 @@ protected:
 private:
     GpuFrame BaseFrame(prism::CameraRayParameters const& camera, unsigned width,
                                    unsigned height) const;
+    // Feedback passes of `frame` over every pixel, then SettleResidency, until
+    // residency is stable (at most a few rounds); m_renderMutex held.
+    void SettleWithFrame(GpuFrame const& frame, uint32_t mode, uint32_t pixels);
 };
 
 bool GpuVerbose();

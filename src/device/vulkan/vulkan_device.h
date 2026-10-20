@@ -26,10 +26,18 @@ public:
     void RenderPass(SceneManager& scene, PassRequest const& request) override;
     bool RenderPreview(SceneManager& scene, PreviewRequest const& request) override;
     void Prepare(SceneManager& scene) override;
+    bool AccumulationOutdated(SceneManager& scene) override;
+    bool SettleTextures(SceneManager& scene, PassRequest const& request) override;
+    TextureStreamingStats TextureStreaming() const override;
 
     struct Impl;
 
 protected:
+    void BeginWork(uint32_t mode, int sample) override;
+    bool StreamsTextures() const override;
+    bool SettleResidency() override;
+    void FullFeedback(bool full) override;
+    void HoldResidency() override;
     bool PrepareScene(SceneManager& scene, std::string* error) override;
     gpu::GpuSceneData const& Data() const override;
     uint32_t MdlTextureCount() const override;

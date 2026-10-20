@@ -95,6 +95,12 @@ std::vector<float> GpuRenderDevice::RenderImage(SceneManager& scene, ImageReques
     if (request.nee.spatialLights) frame.settings.z |= kFrameSpatialLights;
     frame.settings.w = request.seed;
     frame.counts.w = request.contributions & 7u;
+    // Streamed textures settle first, so every sample sees the same levels.
+    if (StreamsTextures()) {
+        SettleWithFrame(frame, kModeImage, count);
+        std::memset(RenderBuffer(kSlotAccumulation, size_t(count) * 32), 0, size_t(count) * 32);
+    }
+    BeginWork(kModeImage, 0);
     double gpuSeconds = 0.0;
     // Pixels left active by adaptive sampling get several samples in
     // parallel, so the dispatch still fills the GPU.
@@ -194,6 +200,7 @@ void GpuRenderDevice::RenderPass(SceneManager& scene, PassRequest const& request
             frame.settings.z |= kFramePrimaryHits;
             RenderBuffer(kSlotAccumulation, pixels * 48);
         }
+        if (traceColor) BeginWork(kModePass, request.sample);
     }
 
     // Tiles are dispatched in chunks so callers see progress and can stop.
@@ -316,6 +323,7 @@ bool GpuRenderDevice::RenderPreview(SceneManager& scene, PreviewRequest const& r
     if (request.tracePrimary) frame.settings.z |= kFramePrimaryHits;
     frame.settings.w = request.seed;
     frame.work = {count, 0, kModePreview, 0};
+    BeginWork(kModePreview, 0);
     double gpuSeconds = 0.0;
     if (!Dispatch(frame, count, &gpuSeconds, &error)) {
         std::cerr << LogPrefix() << error << '\n';
@@ -345,6 +353,57 @@ bool GpuRenderDevice::RenderPreview(SceneManager& scene, PreviewRequest const& r
         *request.traceMilliseconds = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - traceStart).count();
     return !(request.stopRequested && request.stopRequested());
+}
+
+void GpuRenderDevice::SettleWithFrame(GpuFrame const& frame, uint32_t mode, uint32_t pixels)
+{
+    (void)mode; // image mode: needs no output buffer, and its sums are discarded
+    std::vector<uint32_t> list(pixels);
+    for (uint32_t p = 0; p < pixels; ++p) list[p] = p;
+    std::memcpy(RenderBuffer(kSlotPixels, size_t(pixels) * 4), list.data(), size_t(pixels) * 4);
+    RenderBuffer(kSlotRng, size_t(pixels) * 4);
+    RenderBuffer(kSlotAccumulation, size_t(pixels) * 32);
+    FullFeedback(true);
+    BeginWork(kModeImage, 0);
+    std::string error;
+    const auto start = std::chrono::steady_clock::now();
+    int rounds = 0;
+    // Each round's levels can change what later lookups ask for (paths
+    // through sharper textures); a few rounds settle it.
+    constexpr int maxRounds = 4;
+    for (; rounds < maxRounds; ++rounds) {
+        GpuFrame f = frame;
+        f.work = {pixels, 0, kModeImage, 0};
+        f.counts.z = uint32_t(rounds);
+        if (rounds == 0) f.settings.z |= kFrameSeedRng;
+        if (!Dispatch(f, pixels, nullptr, &error)) {
+            std::cerr << LogPrefix() << error << '\n';
+            break;
+        }
+        if (!SettleResidency()) break;
+    }
+    FullFeedback(false);
+    HoldResidency();
+    if (GpuVerbose())
+        std::cerr << LogPrefix() << std::format("textures settled in {} feedback round{}, {:.2f} s\n",
+                                                std::min(rounds + 1, maxRounds), rounds ? "s" : "",
+                                                std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                                                              start).count());
+}
+
+bool GpuRenderDevice::SettleTextures(SceneManager& scene, PassRequest const& request)
+{
+    std::lock_guard lock(m_renderMutex);
+    std::string error;
+    if (!PrepareScene(scene, &error) || !StreamsTextures()) return false;
+    GpuFrame frame = BaseFrame(request.camera, request.width, request.height);
+    frame.shading = {request.shading.sampleClamp, request.shading.exposureScale,
+                     request.shading.nee.probabilityMin, float(request.shading.nee.fromDepth)};
+    if (request.shading.nee.spatialLights) frame.settings.z |= kFrameSpatialLights;
+    if (request.shading.transparentEscapes) frame.settings.z |= kFrameTransparentEscapes;
+    frame.settings.w = request.seed;
+    SettleWithFrame(frame, kModeImage, request.width * request.height);
+    return true;
 }
 
 void GpuRenderDevice::Prepare(SceneManager& scene)

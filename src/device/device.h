@@ -142,10 +142,47 @@ struct PreviewRequest {
     double* traceMilliseconds = nullptr;
 };
 
+// Texture streaming state of a device that streams textures (Vulkan; see
+// src/device/gpu/texture_streaming.h). All zero otherwise.
+struct TextureStreamingStats {
+    bool active = false;          // the current scene streams
+    uint64_t budgetBytes = 0;     // for streamed images
+    uint64_t residentBytes = 0;   // their resident levels (estimate)
+    uint64_t imageBytes = 0;      // device memory of every image (allocated)
+    uint64_t deviceBytes = 0;     // device-local memory the process uses (0: unknown)
+    uint32_t images = 0;          // streamed images
+    uint32_t requested = 0;       // requested finer than their tail
+    uint32_t pending = 0;         // planned finer than resident
+    uint32_t belowRequested = 0;  // kept coarser than requested (budget)
+    uint64_t uploads = 0;         // images (re)created by streaming
+    uint64_t uploadedBytes = 0;
+    uint64_t feedbackRounds = 0;
+    uint64_t restarts = 0;        // accumulation restarts asked for
+};
+
 class RenderDevice {
 public:
     virtual ~RenderDevice() = default;
     virtual DeviceInfo Info() const = 0;
+
+    // Texture streaming. Progressive frontends ask at each pass boundary
+    // after the first pass of an accumulation: true means the samples so far
+    // used textures coarser than the device holds now, and the frontend
+    // should start the accumulation again (its next pass is sample 0). A
+    // device asks for a bounded number of restarts per accumulation, once
+    // the residency its feedback asked for is in place.
+    virtual bool AccumulationOutdated(SceneManager& scene) { (void)scene; return false; }
+    // Renders a few passes of `request` (camera, size, seed and shading; no
+    // outputs) that only collect texture feedback, loads what they ask for,
+    // and returns once residency is stable; the next accumulation then keeps
+    // it unchanged, so all of its samples see the same textures (offline
+    // rendering). False when the device does not stream textures.
+    virtual bool SettleTextures(SceneManager& scene, PassRequest const& request)
+    {
+        (void)scene; (void)request;
+        return false;
+    }
+    virtual TextureStreamingStats TextureStreaming() const { return {}; }
 
     // Inform the device that a scene was (re)built or edited before rendering it.
     // The scene must stay alive and unmodified while the device renders it.

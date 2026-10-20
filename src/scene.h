@@ -640,6 +640,9 @@ public:
     bool environmentSampling = true;
     prism::TextureFiltering textureFiltering =
         prism::TextureFiltering::Filtered;
+    // GPU devices that stream textures (Vulkan) load the mip levels shading
+    // asks for instead of whole textures (prism:textureStreaming).
+    bool textureStreaming = true;
 };
 
 
