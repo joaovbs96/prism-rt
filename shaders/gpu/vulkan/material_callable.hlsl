@@ -7,11 +7,6 @@
 // The program runs the megakernel's own material code: the MDL init of the
 // prepared shading point, then GpuBackend::shade, or the cutout opacity.
 
-// The BSDF table lookup stays out of line in callables (mdl_runtime.hlsl);
-// the compute kernel inlines it (out of line, the driver's compile of the
-// kernel took 3.5 times as long).
-#define PRISM_NOINLINE [noinline]
-
 #include "../../shared/prism_gpu_types.h"
 #include "../../integrator/path_tracer.h"
 #include "resources.hlsl"
