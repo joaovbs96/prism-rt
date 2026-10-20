@@ -562,6 +562,10 @@ if(PRISM_BUILD_HYDRA)
     target_link_libraries(prism_texture_service_test PRIVATE PrismRT::core)
     add_test(NAME prism_texture_service_test COMMAND prism_texture_service_test)
 
+    add_executable(prism_texture_streaming_test tests/texture_streaming.cpp)
+    target_link_libraries(prism_texture_streaming_test PRIVATE PrismRT::core)
+    add_test(NAME prism_texture_streaming_test COMMAND prism_texture_streaming_test)
+
     add_executable(prism_texture_writer_test tests/texture_writer.cpp)
     target_link_libraries(prism_texture_writer_test PRIVATE PrismRT::core)
     add_test(NAME prism_texture_writer_test COMMAND prism_texture_writer_test)
