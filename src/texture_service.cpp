@@ -739,12 +739,16 @@ DecodedImage DecodeSource(std::filesystem::path const &absolute, TexturePrepareO
 
 bool WriteGpuFile(std::filesystem::path const &path, DecodedImage const &decoded, std::string *error)
 {
-    const auto header = gpu_texture::MakeHeader(static_cast<uint32_t>(decoded.width),
-        static_cast<uint32_t>(decoded.height), static_cast<uint32_t>(decoded.channels), decoded.component,
-        decoded.gpuFlags, decoded.gpuPeak);
-    const void *payload = decoded.component == gpu_texture::Component::Float32
+    // The whole mip chain, so devices can read only the levels they need.
+    const auto width = static_cast<uint32_t>(decoded.width), height = static_cast<uint32_t>(decoded.height);
+    const auto channels = static_cast<uint32_t>(decoded.channels);
+    const auto header = gpu_texture::MakeHeader(width, height, channels, decoded.component, decoded.gpuFlags,
+                                                decoded.gpuPeak, 0);
+    const void *level0 = decoded.component == gpu_texture::Component::Float32
         ? static_cast<const void *>(decoded.pixels.data()) : static_cast<const void *>(decoded.gpuNative.data());
-    return gpu_texture::Write(path, header, payload, error);
+    const std::vector<uint8_t> payload = gpu_texture::BuildMipChain(level0, width, height, channels,
+                                                                    decoded.component);
+    return gpu_texture::Write(path, header, payload.data(), error);
 }
 
 // A prepared .tx.exr that a background writer is still producing: lookups

@@ -245,6 +245,48 @@ int main()
         check(!prism::gpu_texture::Read(path, &read, nullptr, &error), "truncated GPU copy was accepted");
     }
 
+    // GPU-ready copies with their mip chain: levels follow vkCmdBlitImage's
+    // linear filter (a 2 x 2 box for even sizes, the center bilinear tap for
+    // odd ones), and a range of levels reads without the others.
+    {
+        const uint32_t w = 6, h = 3;
+        std::vector<uint8_t> texels(w * h);
+        for (size_t i = 0; i < texels.size(); ++i) texels[i] = uint8_t(i * 13);
+        const auto payload = prism::gpu_texture::BuildMipChain(texels.data(), w, h, 1,
+                                                               prism::gpu_texture::Component::Unorm8);
+        const auto header = prism::gpu_texture::MakeHeader(w, h, 1, prism::gpu_texture::Component::Unorm8, 0, 0.0f, 0);
+        check(header.levelCount == 3 && header.levels[1].width == 3 && header.levels[1].height == 1 &&
+                  header.levels[2].width == 1 && payload.size() == header.payloadBytes,
+              "mip chain level table");
+        // Level 1 texel 0: rows 0..2 into 1 row (center tap: row 1), columns 0 and 1 averaged.
+        check(payload[header.levels[1].offset] == uint8_t(std::lround((texels[6] + texels[7]) / 2.0)),
+              "mip chain filter: " + std::to_string(payload[header.levels[1].offset]));
+        const auto path = dir / "mips.gpu";
+        std::string error;
+        check(prism::gpu_texture::Write(path, header, payload.data(), &error), "mip chain write: " + error);
+        prism::gpu_texture::Header read{};
+        check(prism::gpu_texture::Read(path, &read, nullptr, &error), "mip chain header: " + error);
+        std::vector<uint8_t> tail(size_t(prism::gpu_texture::LevelRangeBytes(read, 1, 2)));
+        check(prism::gpu_texture::ReadLevels(path, read, 1, 2, tail.data(), &error) &&
+                  std::equal(tail.begin(), tail.end(), payload.begin() + ptrdiff_t(read.levels[1].offset)),
+              "mip level range read: " + error);
+        {
+            std::fstream file(path, std::ios::in | std::ios::out | std::ios::binary);
+            file.seekp(sizeof(prism::gpu_texture::Header) + read.levels[2].offset);
+            file.put(char(payload[read.levels[2].offset] ^ 0x5a));
+        }
+        check(prism::gpu_texture::ReadLevels(path, read, 0, 1, tail.data(), &error),
+              "an intact level of a damaged copy was rejected: " + error);
+        check(!prism::gpu_texture::ReadLevels(path, read, 1, 2, tail.data(), &error),
+              "a damaged level was accepted");
+        // Half texels round to nearest even both ways.
+        for (float v : {0.0f, 1.0f, -2.5f, 65504.0f, 6.1e-5f, 3.0e-7f, 0.333333f})
+            check(prism::gpu_texture::HalfToFloat(prism::gpu_texture::FloatToHalf(v)) ==
+                      prism::gpu_texture::HalfToFloat(prism::gpu_texture::FloatToHalf(
+                          prism::gpu_texture::HalfToFloat(prism::gpu_texture::FloatToHalf(v)))),
+                  "half round trip");
+    }
+
     // Fingerprint records: a rewrite that restores the size and modification
     // time still changes the file's stamp, so its record no longer applies.
     {
