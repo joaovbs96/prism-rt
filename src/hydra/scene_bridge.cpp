@@ -7169,6 +7169,16 @@ void SceneBridge::Render()
         // per-pixel RNG state and the accumulated average carry over, so the
         // image keeps converging instead of restarting.
         if (previewingGpu) {
+            // Test hook: the CPU preview renders at most this many samples
+            // and then waits here for the GPU, so the handover happens
+            // however long the GPU's preparation takes.
+            if (const char *limit = std::getenv("PRISM_TEST_GPU_PREVIEW_MAX_SAMPLES");
+                limit && *limit && std::atoi(limit) > 0 && sample >= std::atoi(limit)) {
+                while (!_impl->AdvanceDevicePreparation(renderDevice, snapshot)) {
+                    if (_impl->renderThread->IsStopRequested()) return;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                }
+            }
             if (_impl->AdvanceDevicePreparation(renderDevice, snapshot)) {
                 previewingGpu = false;
                 activeDevice = renderDevice.get();

@@ -126,8 +126,14 @@ int RunGpuPreparationPreviewTests()
                     "A disabled preview handed over");
         }
 
-        // With the preview, the CPU renders while the GPU preparation is held back.
+        // With the preview, the CPU renders while the GPU preparation is held
+        // back. The CPU stops at a pass boundary after kPreviewSamples and
+        // waits there for the GPU: a 32x32 CPU preview could otherwise finish
+        // every sample before a slow (cold) GPU preparation, leaving no pass
+        // boundary for the handover.
+        constexpr int kPreviewSamples = 64;
         SetEnvironment("PRISM_TEST_GPU_PREPARATION_DELAY_MS", "2500");
+        SetEnvironment("PRISM_TEST_GPU_PREVIEW_MAX_SAMPLES", std::to_string(kPreviewSamples).c_str());
         std::vector<float> handover;
         {
             Fixture fixture;
@@ -153,7 +159,7 @@ int RunGpuPreparationPreviewTests()
                      "The render never handed over to the GPU");
             stats = fixture.bridge->GetStats();
             const auto handoverSample = Stat(stats, "gpuPreviewHandoverSample");
-            Require(handoverSample >= previewSamples && handoverSample > 0 && handoverSample < kSamples,
+            Require(handoverSample >= previewSamples && handoverSample > 0 && handoverSample <= kPreviewSamples,
                     "The handover did not continue from the CPU's sample index");
             Require(Stat(stats, "gpuPreviewHandovers") == 1, "More than one handover");
             Require(!BoolStat(stats, "prismGpuPreview") &&
@@ -192,10 +198,14 @@ int RunGpuPreparationPreviewTests()
         Require(meanError < 0.01, "The handed-over image has a different mean than the GPU render");
 
         SetEnvironment("PRISM_TEST_GPU_PREPARATION_DELAY_MS", "");
+        SetEnvironment("PRISM_TEST_GPU_PREVIEW_MAX_SAMPLES", "");
         SetEnvironment("PRISM_GPU_PREPARATION_PREVIEW_DELAY_MS", "");
         std::cout << "GPU preparation preview checks passed\n";
         return 0;
     } catch (std::exception const &e) {
+        SetEnvironment("PRISM_TEST_GPU_PREPARATION_DELAY_MS", "");
+        SetEnvironment("PRISM_TEST_GPU_PREVIEW_MAX_SAMPLES", "");
+        SetEnvironment("PRISM_GPU_PREPARATION_PREVIEW_DELAY_MS", "");
         std::cerr << "GPU preparation preview test failed: " << e.what() << "\n";
         return 1;
     }
