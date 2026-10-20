@@ -206,12 +206,36 @@ def phase_lines(stats):
     return lines
 
 
+def texture_line(stats):
+    """(text, kind) for GPU texture streaming, or None when it is off.
+
+    "Texture: 412 / 5355 MiB, 12 pending" while the levels shading asks for
+    are being loaded (busy), then the resident memory alone; textures the
+    budget keeps below the requested resolution are a warning.
+    """
+    if not stats.get("prismTextureStreaming"):
+        return None
+    resident = float(stats.get("prismTextureResidentMiB") or 0.0)
+    budget = float(stats.get("prismTextureBudgetMiB") or 0.0)
+    text = "Texture".rjust(7) + ": %d / %d MiB" % (round(resident), round(budget))
+    kind = "normal"
+    pending = int(stats.get("prismTexturesPending") or 0)
+    below = int(stats.get("prismTexturesBelowRequested") or 0)
+    if pending:
+        text += ", %d pending" % pending
+        kind = "busy"
+    if below:
+        text += ", %d below requested" % below
+        kind = "warning"
+    return text, kind
+
+
 def hud_lines(stats, completed, target, converged):
     """Every HUD line for one refresh as [(text, kind)].
 
     The device line comes first; then either the phase lines (nothing is
-    rendering yet, or a scene edit is being converted) or the sample count and
-    state.
+    rendering yet, or a scene edit is being converted) or the texture
+    streaming line, the sample count and state.
     """
     lines = []
     device = device_line(stats)
@@ -225,6 +249,9 @@ def hud_lines(stats, completed, target, converged):
             samples, _ = hud_text(completed, target, converged)
             busy = busy + [("Samples".rjust(7) + ": " + samples, "normal")]
         return lines + busy
+    texture = texture_line(stats)
+    if texture:
+        lines.append(texture)
     samples, state = hud_text(completed, target, converged)
     if samples is not None:
         lines.append(("Samples".rjust(7) + ": " + samples, "normal"))

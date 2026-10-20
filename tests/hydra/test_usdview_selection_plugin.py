@@ -289,6 +289,23 @@ class UsdviewSampleHudTest(unittest.TestCase):
         self.assertEqual(prismUsdview.hud_lines({}, 7, 64, False),
                          [("Samples: 7 / 64", "normal"), ("  State: refining", "normal")])
 
+    def test_texture_streaming_line(self):
+        self.assertIsNone(prismUsdview.texture_line({}))
+        self.assertIsNone(prismUsdview.texture_line({"prismTextureStreaming": False}))
+        stats = {"prismPhase": "rendering", "prismTextureStreaming": True,
+                 "prismTextureResidentMiB": 411.6, "prismTextureBudgetMiB": 5355.2,
+                 "prismTexturesPending": 12, "prismTexturesBelowRequested": 0}
+        self.assertEqual(prismUsdview.texture_line(stats),
+                         ("Texture: 412 / 5355 MiB, 12 pending", "busy"))
+        settled = dict(stats, prismTexturesPending=0)
+        self.assertEqual(prismUsdview.texture_line(settled), ("Texture: 412 / 5355 MiB", "normal"))
+        limited = dict(settled, prismTexturesBelowRequested=7)
+        self.assertEqual(prismUsdview.texture_line(limited),
+                         ("Texture: 412 / 5355 MiB, 7 below requested", "warning"))
+        self.assertEqual(prismUsdview.hud_lines(settled, 9, 64, False),
+                         [("Texture: 412 / 5355 MiB", "normal"), ("Samples: 9 / 64", "normal"),
+                          ("  State: refining", "normal")])
+
     def test_overlay_shows_phase_and_device_colors(self):
         window, hud, view = self._hud({
             "prismPhase": "materials", "prismMaterialsDone": 12,
