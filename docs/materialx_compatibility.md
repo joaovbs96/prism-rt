@@ -102,6 +102,27 @@ a varying `specular_ior`. Material templates keep `specular_ior`, `coat_ior`,
 `coat_weight` and `transmission_weight` structural on transmissive OpenPBR
 surfaces, so a bound variant never refracts with its seed's IOR.
 
+## Deliberate non-repairs
+
+Two differences from the OpenPBR Shader Playground's Arnold reference render
+are intentional; don't "fix" them in preprocessing.
+
+- **Shader overrides vs interface connections.** The asset's
+  `material_assignment.usda` overrides `open_pbr_surface` inputs (for example
+  the bottle's `coat_weight` 0 and `coat_ior` 1), but usdMtlx connects those
+  inputs to the material interface, which carries the `.mtlx` values. Under USD
+  composition a connection wins over an authored value, so every USD renderer
+  sees the `.mtlx` values. The Arnold render came from the original Maya scene.
+  PrismRT renders what USD composes; this is an asset issue (compare its
+  "value and connection conflict" issue #5).
+- **Coat darkening on transmission.** MaterialX's `open_pbr_surface` estimates
+  the base albedo from `base_color` and `subsurface_color`, ignoring
+  `transmission_weight`, and then darkens the whole base, transmitted light
+  included. Coated glass is therefore darkened and tinted by `base_color`. The
+  OpenPBR specification doesn't settle whether darkening applies to transmitted
+  light. PrismRT follows MaterialX here rather than patching its internal graph;
+  reporting it upstream is the right fix.
+
 ## standard_surface conductor clamp
 
 Upstream MaterialX bug: `standard_surface` feeds `base_color` and
