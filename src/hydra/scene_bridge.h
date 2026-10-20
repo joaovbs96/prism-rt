@@ -56,6 +56,12 @@ struct RenderSettings {
     int hiddenGeometryBudgetMiB = 0;
     prism::TextureFiltering textureFiltering =
         prism::TextureFiltering::Filtered;
+    // GPU texture streaming (Vulkan): load the mip levels shading asks for
+    // (prism:textureStreaming), and settle them before an accumulation
+    // starts so all of its samples see the same levels
+    // (prism:textureStreamingPrepass; offline renders).
+    bool textureStreaming = true;
+    bool textureStreamingPrepass = false;
     enum class EnvironmentSampling { Mis, Bsdf } environmentSampling =
         EnvironmentSampling::Mis;
     // Requested render device; unavailable GPU devices fall back to the CPU.

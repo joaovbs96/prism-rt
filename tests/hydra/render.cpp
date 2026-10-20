@@ -93,6 +93,7 @@ std::unique_ptr<UsdImagingGLEngine> makeAnimationEngine(
     engine->SetRendererSetting(TfToken("prism:maxDepth"), VtValue(8));
     engine->SetRendererSetting(TfToken("prism:rrMinDepth"), VtValue(2));
     engine->SetRendererSetting(TfToken("prism:seed"), VtValue(17));
+    engine->SetRendererSetting(TfToken("prism:textureStreamingPrepass"), VtValue(true));
     engine->SetEnablePresentation(false);
     return engine;
 }
@@ -271,7 +272,7 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (argc < 4) {
-            std::cerr << "usage: prism_hydra_render scene.usda /Camera output.exr [width height spp [--exercise] [--animation-exercise] [--hide-dome-background] [--environment-sampling mis|bsdf] [--light-selection spatial|power] [--sample-clamp N] [--seed N] [--sphere-batching]]\n";
+            std::cerr << "usage: prism_hydra_render scene.usda /Camera output.exr [width height spp [--exercise] [--animation-exercise] [--hide-dome-background] [--environment-sampling mis|bsdf] [--light-selection spatial|power] [--sample-clamp N] [--seed N] [--sphere-batching] [--no-texture-streaming] [--progressive-textures]]\n";
             return 2;
         }
         const int width = argc > 4 ? std::stoi(argv[4]) : 128;
@@ -281,6 +282,11 @@ int main(int argc, char** argv) {
         bool animationExercise = false;
         bool sphereBatching = false;
         bool hideDomeBackground = false;
+        // GPU texture streaming: settle the levels the view asks for before
+        // the first sample (deterministic final images), unless the
+        // interactive restart policy is asked for; or no streaming at all.
+        bool textureStreaming = true;
+        bool textureStreamingPrepass = true;
         std::string sampling = "mis";
         std::string filtering = "filtered";
         float sampleClamp = 10.0f;
@@ -300,6 +306,8 @@ int main(int argc, char** argv) {
             if (option == "--animation-exercise") { animationExercise = true; continue; }
             if (option == "--sphere-batching") { sphereBatching = true; continue; }
             if (option == "--hide-dome-background") { hideDomeBackground = true; continue; }
+            if (option == "--no-texture-streaming") { textureStreaming = false; continue; }
+            if (option == "--progressive-textures") { textureStreamingPrepass = false; continue; }
             if (++i >= argc) throw std::runtime_error("Missing option value: " + option);
             if (option == "--environment-sampling") sampling = argv[i];
             else if (option == "--texture-filtering") filtering = argv[i];
@@ -359,6 +367,8 @@ int main(int argc, char** argv) {
         engine.SetRendererSetting(TfToken("prism:neeProbabilityMin"), VtValue(neeProbabilityMin));
         engine.SetRendererSetting(TfToken("prism:lightSelection"), VtValue(TfToken(lightSelection)));
         engine.SetRendererSetting(TfToken("prism:sphereBatching"), VtValue(sphereBatching));
+        engine.SetRendererSetting(TfToken("prism:textureStreaming"), VtValue(textureStreaming));
+        engine.SetRendererSetting(TfToken("prism:textureStreamingPrepass"), VtValue(textureStreamingPrepass));
         engine.SetRendererAovs({HdAovTokens->color, HdAovTokens->depth,
             HdAovTokens->cameraDepth, HdAovTokens->normal, HdAovTokens->Neye,
             HdAovTokens->primId, HdAovTokens->instanceId, HdAovTokens->elementId});

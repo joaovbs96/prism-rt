@@ -3781,6 +3781,7 @@ std::shared_ptr<Snapshot> _BuildSnapshot(HdSceneIndexBaseRefPtr const &scene,
     result->scene->environmentSampling =
         settings.environmentSampling == RenderSettings::EnvironmentSampling::Mis;
     result->scene->textureFiltering = settings.textureFiltering;
+    result->scene->textureStreaming = settings.textureStreaming;
     result->sphereBatching = settings.sphereBatching;
     result->fallbackTexture = std::make_unique<ColorTexture>(Color3(0.5f));
     result->fallbackMaterial = std::make_unique<Diffuse>(result->fallbackTexture.get());
@@ -5422,7 +5423,7 @@ public:
     uint64_t renderDeviceGeneration = 0;
     // Integrator settings the render device last saw: GPU devices copy them
     // into their scene data, so a change must reach them like an edit.
-    std::tuple<int, int, bool, int> renderDeviceSettings{};
+    std::tuple<int, int, bool, int, bool> renderDeviceSettings{};
     // Device creation and per-scene device preparation (GPU kernel
     // compilation, scene and texture upload) can take tens of seconds. They
     // run as jobs the render worker waits on while polling for a stop, so a
@@ -5447,6 +5448,8 @@ public:
     std::atomic<uint64_t> gpuPreviewSamples{0};
     std::atomic<uint64_t> gpuPreviewHandovers{0};
     std::atomic<uint64_t> gpuPreviewHandoverSample{0};
+    // Accumulation restarts after texture streaming made textures finer.
+    std::atomic<uint64_t> textureStreamingRestarts{0};
     // Advanced (under mutex) whenever the device or its view of the scene
     // changes; devicePreparedEpoch records the last epoch fully prepared.
     uint64_t deviceSceneEpoch = 1;
@@ -5774,6 +5777,8 @@ void SceneBridge::SetSettings(RenderSettings const &settings)
             current.sphereBatching == settings.sphereBatching &&
             current.hiddenGeometryBudgetMiB == settings.hiddenGeometryBudgetMiB &&
             current.textureFiltering == settings.textureFiltering &&
+            current.textureStreaming == settings.textureStreaming &&
+            current.textureStreamingPrepass == settings.textureStreamingPrepass &&
             current.domeLightCameraVisibility == settings.domeLightCameraVisibility &&
             current.environmentSampling == settings.environmentSampling &&
             current.gpuPreparationPreview == settings.gpuPreparationPreview &&
@@ -5792,6 +5797,7 @@ void SceneBridge::SetSettings(RenderSettings const &settings)
             current.resourceRevision != settings.resourceRevision ||
             current.sphereBatching != settings.sphereBatching ||
             current.textureFiltering != settings.textureFiltering ||
+            current.textureStreaming != settings.textureStreaming ||
             current.environmentSampling != settings.environmentSampling ||
             current.domeLightCameraVisibility != settings.domeLightCameraVisibility ||
             current.device != settings.device;
@@ -6785,6 +6791,8 @@ bool SceneBridge::Prepare(CameraState const &camera,
                                     RenderSettings::EnvironmentSampling::Mis;
                             result.snapshot->scene->textureFiltering =
                                 jobSettings.textureFiltering;
+                            result.snapshot->scene->textureStreaming =
+                                jobSettings.textureStreaming;
                         }
                     } catch (std::bad_alloc const &) {
                         // Release the partial scene before reporting.
@@ -6823,6 +6831,8 @@ bool SceneBridge::Prepare(CameraState const &camera,
                 RenderSettings::EnvironmentSampling::Mis;
         _impl->snapshot->scene->textureFiltering =
             _impl->settings.textureFiltering;
+        _impl->snapshot->scene->textureStreaming =
+            _impl->settings.textureStreaming;
     }
     if (stateChanged || cameraChanged || bindingsChanged ||
         renderTagsChanged || published) {
@@ -6870,8 +6880,9 @@ void SceneBridge::Render()
         // camera changes do neither.
         const auto deviceSettings = snapshot && snapshot->scene
             ? std::make_tuple(snapshot->scene->max_depth, snapshot->scene->rr_min_depth,
-                  snapshot->scene->environmentSampling, int(snapshot->scene->textureFiltering))
-            : std::tuple<int, int, bool, int>{};
+                  snapshot->scene->environmentSampling, int(snapshot->scene->textureFiltering),
+                  snapshot->scene->textureStreaming)
+            : std::tuple<int, int, bool, int, bool>{};
         if (snapshot && snapshot->scene &&
             (_impl->renderDeviceScene != snapshot->scene.get() ||
              _impl->renderDeviceGeneration != _impl->activeGeneration ||
@@ -7070,6 +7081,25 @@ void SceneBridge::Render()
         _CameraParameters(camera);
     prism::DumpCameraRayDiagnostics(
         cameraParameters, width, height, settings.seed, "hydra");
+    // Offline renders: a device that streams textures loads the levels this
+    // view asks for before the first sample, and keeps them for the whole
+    // accumulation (deterministic images).
+    if (firstSample == 0 && firstSample < sampleCount && hasColor && !previewingGpu &&
+        settings.textureStreamingPrepass) {
+        prism::device::PassRequest settle;
+        settle.camera = cameraParameters;
+        settle.width = width;
+        settle.height = height;
+        settle.seed = static_cast<unsigned int>(settings.seed);
+        settle.shading.sampleClamp = settings.sampleClamp;
+        settle.shading.nee = {settings.neeProbabilityMin, settings.neeFromDepth, settings.spatialLights};
+        settle.shading.exposureScale = camera.linearExposureScale;
+        settle.shading.transparentEscapes =
+            snapshot->domeCount == 0 || !settings.domeLightCameraVisibility;
+        prism::load_profile::Scope settleProfile("frame.texture_settle");
+        activeDevice->SettleTextures(*snapshot->scene, settle);
+        if (_impl->renderThread->IsStopRequested()) return;
+    }
     struct ResolvedBinding { PrismRenderBuffer *buffer; AovKind kind; size_t plane; };
     struct AovPlane {
         AovKind kind;
@@ -7158,6 +7188,9 @@ void SceneBridge::Render()
     auto traced = [&](size_t pixel) {
         return !adaptive.Enabled() || _impl->adaptiveActive.Active(pixel);
     };
+    // Set once texture streaming restarted the accumulation: the geometric
+    // outputs of the first pass are already published.
+    bool restarted = false;
     for (int sample = firstSample; sample < sampleCount; ++sample) {
         if (adaptive.Enabled() && _impl->adaptiveActive.Count() == 0) break;
         if (_impl->renderThread->IsStopRequested()) return;
@@ -7188,6 +7221,25 @@ void SceneBridge::Render()
             } else {
                 _impl->gpuPreviewSamples.fetch_add(1);
             }
+        }
+        // Texture streaming: once the levels the first samples asked for are
+        // resident, the accumulation starts again (the device bounds how
+        // often). Geometric outputs are kept: they do not sample textures.
+        if (!previewingGpu && sample > 0 && hasColor &&
+            activeDevice->AccumulationOutdated(*snapshot->scene)) {
+            for (HdRenderPassAovBinding const &binding : bindings)
+                if (binding.aovName == HdAovTokens->color)
+                    if (auto *buffer = dynamic_cast<PrismRenderBuffer *>(binding.renderBuffer))
+                        buffer->BeginFrame(binding.clearValue, false);
+            if (!_impl->adaptiveSums.empty()) {
+                std::fill(_impl->adaptiveSums.begin(), _impl->adaptiveSums.end(), 0.0f);
+                _impl->adaptiveActive.Reset(width, height);
+            }
+            _impl->samples.store(0);
+            _impl->textureStreamingRestarts.fetch_add(1);
+            prism::load_profile::Mark("frame.texture_restart", "sample=" + std::to_string(sample));
+            restarted = true;
+            sample = 0;
         }
         if (sample != 0)
             std::copy(_impl->committedRngStates.begin(),
@@ -7381,7 +7433,7 @@ void SceneBridge::Render()
                              bindingIndex < bindings.size(); ++bindingIndex) {
                             auto const &resolved = resolvedBindings[bindingIndex];
                             const AovKind kind = resolved.kind;
-                            if (sample != 0 && kind != AovKind::Color)
+                            if ((sample != 0 || restarted) && kind != AovKind::Color)
                                 continue;
                             auto *buffer = resolved.buffer;
                             if (!buffer) continue;
@@ -7421,7 +7473,7 @@ void SceneBridge::Render()
         for (HdRenderPassAovBinding const &binding : bindings) {
             // Geometric AOVs are deterministic and only written on sample 0.
             // Color changes every pass as accumulation progresses.
-            if (sample != 0 && binding.aovName != HdAovTokens->color) continue;
+            if ((sample != 0 || restarted) && binding.aovName != HdAovTokens->color) continue;
             if (auto *buffer = dynamic_cast<PrismRenderBuffer *>(binding.renderBuffer))
                 buffer->Publish(frame);
         }
@@ -7459,7 +7511,7 @@ void SceneBridge::Render()
         }
         _impl->committedRngStates.swap(rngStates);
         _impl->samples.store(static_cast<uint64_t>(sample + 1));
-        if (sample == 0) {
+        if (sample == 0 && !restarted) {
             std::vector<AovPlane>().swap(primaryPlanes);
             prism::load_profile::Mark("frame.full_sample", "generation=" + std::to_string(generation));
         }
@@ -7591,6 +7643,24 @@ VtDictionary SceneBridge::GetStats() const
     result["gpuPreviewPasses"] = VtValue(static_cast<int64_t>(_impl->gpuPreviewSamples.load()));
     result["gpuPreviewHandovers"] = VtValue(static_cast<int64_t>(_impl->gpuPreviewHandovers.load()));
     result["gpuPreviewHandoverSample"] = VtValue(static_cast<int64_t>(_impl->gpuPreviewHandoverSample.load()));
+    // GPU texture streaming (see docs/texture_service.md#gpu-texture-streaming).
+    if (_impl->renderDevice) {
+        const prism::device::TextureStreamingStats streaming = _impl->renderDevice->TextureStreaming();
+        constexpr double mib = 1.0 / 1048576.0;
+        result["prismTextureStreaming"] = VtValue(streaming.active);
+        result["prismTextureResidentMiB"] = VtValue(double(streaming.residentBytes) * mib);
+        result["prismTextureBudgetMiB"] = VtValue(double(streaming.budgetBytes) * mib);
+        result["prismTextureMemoryMiB"] = VtValue(double(streaming.imageBytes) * mib);
+        result["prismDeviceMemoryMiB"] = VtValue(double(streaming.deviceBytes) * mib);
+        result["prismTexturesStreamed"] = VtValue(static_cast<int>(streaming.images));
+        result["prismTexturesRequested"] = VtValue(static_cast<int>(streaming.requested));
+        result["prismTexturesPending"] = VtValue(static_cast<int>(streaming.pending));
+        result["prismTexturesBelowRequested"] = VtValue(static_cast<int>(streaming.belowRequested));
+        result["textureStreamingUploads"] = VtValue(static_cast<int64_t>(streaming.uploads));
+        result["textureStreamingUploadedMiB"] = VtValue(double(streaming.uploadedBytes) * mib);
+        result["textureStreamingFeedbackRounds"] = VtValue(static_cast<int64_t>(streaming.feedbackRounds));
+    }
+    result["textureStreamingRestarts"] = VtValue(static_cast<int64_t>(_impl->textureStreamingRestarts.load()));
     result["firstPassPrimaryScratchBytes"] = VtValue(static_cast<int64_t>(_impl->firstPassPrimaryScratchBytes));
     result["colorTracedPixels"] = VtValue(static_cast<int64_t>(_impl->colorTracedPixels.load()));
     result["geometricOnlyPixels"] = VtValue(static_cast<int64_t>(_impl->geometricOnlyPixels.load()));

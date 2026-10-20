@@ -46,6 +46,8 @@ TfToken const _previewMaxDimension("prism:previewMaxDimension");
 TfToken const _refinementDelayMs("prism:refinementDelayMs");
 TfToken const _environmentSampling("prism:environmentSampling");
 TfToken const _textureFiltering("prism:textureFiltering");
+TfToken const _textureStreaming("prism:textureStreaming");
+TfToken const _textureStreamingPrepass("prism:textureStreamingPrepass");
 TfToken const _device("prism:device");
 TfToken const _gpuPreparationPreview("prism:gpuPreparationPreview");
 TfToken const _gpuPreparationPreviewMaxMiB("prism:gpuPreparationPreviewMaxMiB");
@@ -204,6 +206,8 @@ HdRenderSettingDescriptorList PrismTaskDelegate::GetRenderSettingDescriptors() c
             {"Refinement delay (ms)", _refinementDelayMs, VtValue(100)},
             {"Environment sampling", _environmentSampling, VtValue(std::string("mis"))},
             {"Texture filtering", _textureFiltering, VtValue(std::string("filtered"))},
+            {"GPU texture streaming", _textureStreaming, VtValue(true)},
+            {"Settle streamed textures before rendering", _textureStreamingPrepass, VtValue(false)},
             {"Device (auto, cpu, cpu-reference, vulkan, metal)", _device, VtValue(std::string("auto"))},
             {"CPU preview while the GPU prepares", _gpuPreparationPreview, VtValue(true)},
             {"CPU preview scene limit (MiB, 0 unlimited)", _gpuPreparationPreviewMaxMiB, VtValue(8192)},
@@ -240,6 +244,8 @@ VtValue PrismTaskDelegate::GetRenderSetting(TfToken const &key) const
     if (key == _textureFiltering) return VtValue(std::string(
         s.textureFiltering == prism::TextureFiltering::Filtered
             ? "filtered" : "bilinear"));
+    if (key == _textureStreaming) return VtValue(s.textureStreaming);
+    if (key == _textureStreamingPrepass) return VtValue(s.textureStreamingPrepass);
     if (key == _gpuPreparationPreview) return VtValue(s.gpuPreparationPreview);
     if (key == _gpuPreparationPreviewMaxMiB) return VtValue(s.gpuPreparationPreviewMaxMiB);
     if (key == _resourceRevision) return VtValue(s.resourceRevision);
@@ -378,6 +384,10 @@ void PrismTaskDelegate::SetRenderSetting(TfToken const &key, VtValue const &valu
             s.textureFiltering = prism::TextureFiltering::Bilinear;
         else return;
     }
+    else if (key == _textureStreaming)
+        s.textureStreaming = _Get(value, s.textureStreaming);
+    else if (key == _textureStreamingPrepass)
+        s.textureStreamingPrepass = _Get(value, s.textureStreamingPrepass);
     else if (key == _gpuPreparationPreview)
         s.gpuPreparationPreview = _Get(value, s.gpuPreparationPreview);
     else if (key == _gpuPreparationPreviewMaxMiB)
