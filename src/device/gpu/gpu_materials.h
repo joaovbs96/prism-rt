@@ -77,7 +77,8 @@ struct MdlProgramCode {
     };
     std::vector<Texture> textures;
     double translateSeconds = 0.0;
-    bool fromDisk = false;
+    bool fromDisk = false;          // read from the persistent cache (gpu-programs)
+    std::string classKey;           // the class it was translated from (mdl::CompiledProgram::class_key)
 };
 
 struct MdlShaderCode {

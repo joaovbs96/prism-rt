@@ -792,6 +792,148 @@ std::string RegistryKey(mdl::Context const* context, std::string const& classKey
     return std::format("{}|{}", static_cast<const void*>(context), classKey);
 }
 
+// Translations persist across runs, by class key (stable across processes):
+// a warm load then translates nothing. Images keep their database names, which
+// the scene that loads them resolves again (GenerateProgramShaderCode
+// translates anew if one no longer resolves).
+std::filesystem::path ProgramFile(std::string const& classKey)
+{
+    return prism::PersistentCacheRoot() / "gpu-programs" /
+        (Digest(classKey + "|hlsl-alone|mdl-" MI_NEURAYLIB_PRODUCT_VERSION_STRING "|results-" +
+                std::to_string(kGpuTextureResults) + "|v1") + ".prog");
+}
+
+constexpr char kProgramMagic[8] = {'P', 'R', 'S', 'M', 'P', 'R', 'G', '1'};
+
+struct ProgramWriter {
+    std::string bytes;
+    void u64(uint64_t v) { bytes.append(reinterpret_cast<const char*>(&v), 8); }
+    void str(std::string_view s) { u64(s.size()); bytes.append(s); }
+};
+struct ProgramReader {
+    std::string_view bytes;
+    bool ok = true;
+    uint64_t u64()
+    {
+        if (bytes.size() < 8) { ok = false; return 0; }
+        uint64_t v;
+        std::memcpy(&v, bytes.data(), 8);
+        bytes.remove_prefix(8);
+        return v;
+    }
+    std::string str()
+    {
+        const uint64_t n = u64();
+        if (!ok || n > bytes.size()) { ok = false; return {}; }
+        std::string s(bytes.substr(0, n));
+        bytes.remove_prefix(n);
+        return s;
+    }
+};
+
+uint64_t BytesDigest(std::string_view text)
+{
+    uint64_t a = 1469598103934665603ull;
+    for (unsigned char c : text) a = (a ^ c) * 1099511628211ull;
+    return a ^ (uint64_t(text.size()) * 0x9e3779b97f4a7c15ull);
+}
+
+void SaveProgram(std::string const& classKey, MdlProgramCode const& code)
+{
+    if (!code.success || classKey.empty()) return;
+    ProgramWriter w;
+    w.str(code.code);
+    w.u64(code.targetCodeBytes);
+    w.str(code.digest);
+    w.str(std::string_view(code.roData.data(), code.roData.size()));
+    w.u64(code.stringConstants.size());
+    for (auto const& s : code.stringConstants) w.str(s);
+    w.u64(code.textures.size());
+    for (auto const& t : code.textures) {
+        w.u64(t.image ? 1 : 0);
+        w.str(t.name);
+        w.u64(t.width); w.u64(t.height); w.u64(t.depth); w.u64(t.components);
+        const size_t n = t.values ? t.values->size() : 0;
+        w.str(std::string_view(n ? reinterpret_cast<const char*>(t.values->data()) : "", n * sizeof(float)));
+    }
+    std::string file(kProgramMagic, sizeof(kProgramMagic));
+    const uint64_t digest = BytesDigest(w.bytes);
+    file.append(reinterpret_cast<const char*>(&digest), 8);
+    file += w.bytes;
+    const auto path = ProgramFile(classKey);
+    std::error_code ignored;
+    std::filesystem::create_directories(path.parent_path(), ignored);
+    static std::atomic<uint64_t> serial{0};
+    const auto temporary = std::filesystem::path(path.string() + std::format(".{}.tmp", ++serial));
+    {
+        std::ofstream out(temporary, std::ios::binary);
+        out.write(file.data(), std::streamsize(file.size()));
+        if (!out) {
+            out.close();
+            std::filesystem::remove(temporary, ignored);
+            return;
+        }
+    }
+    std::filesystem::rename(temporary, path, ignored);
+    if (ignored) std::filesystem::remove(temporary, ignored);
+}
+
+std::shared_ptr<MdlProgramCode> LoadProgram(std::string const& classKey)
+{
+    if (classKey.empty()) return nullptr;
+    std::ifstream in(ProgramFile(classKey), std::ios::binary);
+    if (!in) return nullptr;
+    const std::string file((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    if (file.size() < 16 || file.compare(0, 8, std::string_view(kProgramMagic, 8)) != 0) return nullptr;
+    uint64_t digest;
+    std::memcpy(&digest, file.data() + 8, 8);
+    ProgramReader r{std::string_view(file).substr(16)};
+    if (BytesDigest(r.bytes) != digest) return nullptr;
+    auto code = std::make_shared<MdlProgramCode>();
+    code->code = r.str();
+    code->targetCodeBytes = size_t(r.u64());
+    code->digest = r.str();
+    const std::string ro = r.str();
+    code->roData.assign(ro.begin(), ro.end());
+    const uint64_t strings = r.u64();
+    for (uint64_t i = 0; r.ok && i < strings; ++i) code->stringConstants.push_back(r.str());
+    const uint64_t textures = r.u64();
+    for (uint64_t i = 0; r.ok && i < textures; ++i) {
+        MdlProgramCode::Texture t;
+        t.image = r.u64() != 0;
+        t.name = r.str();
+        t.width = size_t(r.u64()); t.height = size_t(r.u64());
+        t.depth = size_t(r.u64()); t.components = size_t(r.u64());
+        const std::string values = r.str();
+        if (!t.image) {
+            auto v = std::make_shared<std::vector<float>>(values.size() / sizeof(float));
+            std::memcpy(v->data(), values.data(), v->size() * sizeof(float));
+            t.values = v;
+        }
+        code->textures.push_back(std::move(t));
+    }
+    if (!r.ok || code->targetCodeBytes > code->code.size()) return nullptr;
+    code->success = true;
+    code->fromDisk = true;
+    return code;
+}
+
+// Class keys whose stored translation named an image the scene could not
+// resolve: translated anew from then on.
+auto& gStaleProgramFiles = *new std::unordered_set<std::string>();
+
+// The stored translation of a class, unless marked stale.
+std::shared_ptr<MdlProgramCode> StoredProgram(std::string const& classKey)
+{
+    {
+        std::lock_guard lock(gProgramsMutex);
+        if (gStaleProgramFiles.contains(classKey)) return nullptr;
+    }
+    auto code = LoadProgram(classKey);
+    if (code) code->classKey = classKey;
+    return code;
+}
+
 void ObserveClass(mdl::Context const& context, std::string const& classKey, mi::neuraylib::ITransaction* transaction,
                   mi::neuraylib::ICompiled_material const* material)
 {
@@ -804,7 +946,13 @@ void ObserveClass(mdl::Context const& context, std::string const& classKey, mi::
     }
     std::shared_ptr<const MdlProgramCode> code;
     try {
-        code = TranslateProgram(context, transaction, material);
+        code = StoredProgram(classKey);
+        if (!code) {
+            auto translated = TranslateProgram(context, transaction, material);
+            translated->classKey = classKey;
+            SaveProgram(classKey, *translated);
+            code = translated;
+        }
     } catch (std::exception const& e) {
         auto failed = std::make_shared<MdlProgramCode>();
         failed->error = e.what();
@@ -816,8 +964,9 @@ void ObserveClass(mdl::Context const& context, std::string const& classKey, mi::
         for (size_t at = code->code.find("_3d("); at != std::string::npos; at = code->code.find("_3d(", at + 4))
             ++lookups;
         prism::load_profile::Mark("gpu.program",
-            std::format("translate_ms={:.1f} code_kb={} ok={} early=1 lookups_3d={} digest={}",
-                        code->translateSeconds * 1e3, code->code.size() >> 10, code->success ? 1 : 0, lookups,
+            std::format("translate_ms={:.1f} code_kb={} ok={} early=1 disk={} lookups_3d={} digest={}",
+                        code->translateSeconds * 1e3, code->code.size() >> 10, code->success ? 1 : 0,
+                        code->fromDisk ? 1 : 0, lookups,
                         code->digest.substr(0, 12)));
     }
     if (!code->success) return;
@@ -866,7 +1015,12 @@ std::shared_ptr<const MdlProgramCode> ProgramCodeFor(mdl::CompiledProgram const&
             mi::base::Handle<const mi::neuraylib::ICompiled_material> compiled(
                 transaction->access<mi::neuraylib::ICompiled_material>(program.compiled_material_name.c_str()));
             if (!compiled) failed->error = "compiled class missing";
-            else code = TranslateProgram(*context, transaction.get(), compiled.get());
+            else if (!(code = StoredProgram(program.class_key))) {
+                auto translated = TranslateProgram(*context, transaction.get(), compiled.get());
+                translated->classKey = program.class_key;
+                SaveProgram(program.class_key, *translated);
+                code = translated;
+            }
         }
         transaction->commit();
         if (prism::load_profile::Enabled() && code)
@@ -1089,6 +1243,7 @@ MdlShaderCode GenerateProgramShaderCode(std::vector<MDLMaterial const*> const& m
         return found->second;
     };
     std::vector<std::vector<uint32_t>> programTextures(result.programs.size());
+    bool stale = false;
     {
         mi::base::Handle<mi::neuraylib::IScope> scope(context->get_database()->get_global_scope());
         mi::base::Handle<mi::neuraylib::ITransaction> transaction(scope->create_transaction());
@@ -1101,7 +1256,14 @@ MdlShaderCode GenerateProgramShaderCode(std::vector<MDLMaterial const*> const& m
                     if (mdl::NativeTextureRuntime::PrepareDatabaseTexture(texture.name.c_str(), transaction.get(),
                                                                           &view, &error))
                         global = addView(view);
-                    else if (GpuVerbose())
+                    else if (result.programs[p]->fromDisk) {
+                        // A stored translation names an image this process
+                        // does not have: translate the class anew.
+                        std::lock_guard lock(gProgramsMutex);
+                        gStaleProgramFiles.insert(result.programs[p]->classKey);
+                        gPrograms.erase(RegistryKey(context, result.programs[p]->classKey));
+                        stale = true;
+                    } else if (GpuVerbose())
                         std::cerr << "PrismRT GPU: texture " << texture.name << " of an MDL program: " << error << '\n';
                 } else if (texture.values) {
                     const std::string key = std::format("{}|{}x{}x{}x{}", texture.name, texture.width, texture.height,
@@ -1123,6 +1285,8 @@ MdlShaderCode GenerateProgramShaderCode(std::vector<MDLMaterial const*> const& m
         }
         transaction->commit();
     }
+    // Once more with those classes translated anew (they are not read again).
+    if (stale) return GenerateProgramShaderCode(materials);
 
     // Read-only data: a zero header, then each program's segment.
     result.roData.assign(16, 0);

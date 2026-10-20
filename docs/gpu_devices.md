@@ -59,6 +59,21 @@ back to the CPU device with a message when no GPU device is usable.
   backend for both devices. Classes that differ only in names
   (MaterialX node names become parameter names) share one program: the 15
   OpenChessSet materials compile as 4.
+- **Programs translated alone.** While a Vulkan device exists
+  (`gpu::AddProgramListener`), every MDL class is also translated with the
+  HLSL backend by itself, on the material worker that compiled it, right
+  after class compilation and before its native code and textures
+  (`mdl::SetClassObserver`; about 0.15–0.4 s per class). Its code has its
+  own texture indices, read-only data offsets and string ids, so it does not
+  depend on the scene's other programs; these translations give the link
+  unit's structural keys, and the callable path uses them directly (the
+  *per-program layout*, `GenerateProgramShaderCode`): each material's
+  `GpuMaterial.textures` names its program's read-only data and two tables in
+  the read-only data buffer, one mapping the program's texture indices (and
+  its argument block's) to the scene's, one its string ids to the scene's
+  (primvar names). Only callables compiled from such code
+  (`PRISM_MDL_PROGRAM_TABLES`) read the tables; the compute kernel, the
+  link-unit callables and Metal are unchanged.
 - **No SDK fork.** Apple GPUs lack FP64. `hlsl_fp32_rewrite.*` rewrites the
   generated HLSL to single precision; on FP64 test code its output is
   byte-identical to the `hlsl_disable_double` option of our MDL SDK fork.
@@ -153,6 +168,24 @@ ray tracing pipeline (`VK_KHR_ray_tracing_pipeline`,
   pipeline is created whole, as a deferred operation joined by worker
   threads, with one cache file per material set
   (`<digest>-<pipeline cache UUID, device, driver>.vkpc`).
+- **Compiled while the materials load.** A program's callable source comes
+  from its own translation (above), so it compiles before the scene is
+  complete: as soon as the programs translated since the last scene make
+  the compute kernel certainly too large (the estimate below above 1.15
+  times the threshold, or `PRISM_VULKAN_CALLABLES=1`), each program's
+  callable is queued for DXC and its pipeline library on background compile
+  threads (`MaterialCallShaders::prefetch`; at most
+  `PRISM_VULKAN_COMPILE_THREADS`, DXC limited as above), while other
+  materials and textures are still being prepared. The scene's pipeline
+  then links what is ready and waits for the rest (`reused=` in the
+  `vulkan.pipeline` mark). The estimate is the kernel without MDL code plus
+  the programs' target code with declarations they share counted once
+  (`gpu::LinkUnitEstimate`); measured against the real link unit: chess 471
+  vs 546 KB, jade egg 592 vs 575 KB, OpenPBR 2975 vs 2926 KB, parity 194 vs
+  194 KB. Within 15% of the threshold the link unit decides as before (and
+  a material set that ends up there uses the link-unit callables, compiled
+  after the scene as before); compute-kernel scenes compile only once all
+  materials are known.
 - **Payload.** 47 words in (the shading point fields the MDL state and BSDF
   read, the BSDF sample point, the light direction, the RNG state) and 21
   out: 272 bytes through the callable's stack per call.
@@ -211,6 +244,17 @@ the noise floor is the CPU with seed 1 against seed 0.
   (the megakernel needed more than 8 GB); the driver compiles the pipeline on
   worker threads (Stirling: 16.5 s on one thread, 7 s on 25) and about 6 s of
   it is the raygen shader alone. Warm starts take 0.1–1.1 s.
+- **Out-of-line table lookups: tried, reverted.** MDL's layered BSDFs call
+  `prism_mdl_lookup_3d` at every layer; inlined, its copies make most of a
+  layered program's code (Lion: 77 copies) and of DXC's SPIR-V legalization.
+  `[noinline]` on it cut Lion's cold DXC from 23 s to 3 s (SPIR-V 2.4 to
+  0.7 MB, DXC peak 1.6 GiB to 84 MiB) and the GPU-ready time from 30 to
+  14 s, but on the NVIDIA 610.88 driver the OpenPBR playground's callable
+  libraries then compiled 12 times slower (489 s summed, slowest 36 s,
+  against 41 s and 3.3 s; ready 38 to 56 s), Teapot's and the damascus egg's
+  3-3.6 times slower, the compute kernel's pipeline (CornellBox) 3.5 times
+  slower, and Teapot rendered non-finite pixels in one of three runs (Lion
+  only under GPU-AV). Images were otherwise bit-identical.
 - **Shader execution reordering** (hint by program, `PRISM_VULKAN_REORDER=1`)
   is off by default: 2–8% slower on OpenPBR, chess and the eggs, neutral on
   Stirling, 16% faster on the countertop. Reordering by program alone does
@@ -362,4 +406,19 @@ they change the image, not just its noise.
   reads the `.tx.exr`.
 - `PRISM_GPU_TEXTURE_COPIES=0`: Vulkan uploads from the float `.tx.exr`
   files, as before GPU-ready copies.
+- Early image uploads (Vulkan): every texture prepared while the device
+  exists (`TextureService::AddPreparedObserver`) is uploaded at full
+  resolution from its GPU copy on a background thread (own command pool and
+  fence; submissions share the queue under a lock), with GPU mipmaps as
+  usual, while the scene still loads. Budgeting needs the whole set, so the
+  uploads estimate as they go: an image is skipped once the texture budget
+  reduces it among the images seen so far, or when the early uploads would
+  exceed the budget. The scene's upload then fits the full set as before,
+  takes the early images it uses at full resolution with the storage it
+  chose, uploads the rest, and frees early images it did not take (images
+  the complete set reduces: 33 of 152 on OpenPBR, none on Teapot or Lion).
+  `vulkan.images` reports `N uploaded early (M taken, K left to the scene)`;
+  `PRISM_VULKAN_EARLY_IMAGES=0` disables them.
+- `PRISM_VULKAN_CHECK_ESTIMATE=1`: also generate the link unit and print the
+  callable estimate against its kernel size.
 - `PRISM_DISABLE_METAL=1`, `PRISM_DISABLE_VULKAN=1`: hide a device.
