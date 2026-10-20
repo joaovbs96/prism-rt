@@ -599,6 +599,9 @@ bool MaterialCallSources(gpu::MdlShaderCode const& code, bool reorder, std::vect
                                  error))
             return false;
         (*sources)[p + 1] = salt + (*sources)[p + 1];
+        if (const char* dir = std::getenv("PRISM_GPU_DUMP_PROGRAMS"); dir && *dir)
+            std::ofstream(std::filesystem::path(dir) / std::format("callable{}.hlsl", p), std::ios::binary)
+                << (*sources)[p + 1];
     }
     return true;
 }
