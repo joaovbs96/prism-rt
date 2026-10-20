@@ -545,9 +545,25 @@ bool RaygenSource(bool reorder, uint32_t programs, std::string* source, std::str
     return true;
 }
 
+bool ProgramCallableSource(gpu::MdlProgramCode const& program, std::string* source, std::string* error)
+{
+    if (!gpu::AssembleShader("gpu/vulkan/material_callable.hlsl", {"gpu/vulkan"}, program.code, source, error))
+        return false;
+    *source = ShaderSaltDefine() + "#define PRISM_MDL_PROGRAM_TABLES 1\n" + *source;
+    return true;
+}
+
 bool MaterialCallSources(gpu::MdlShaderCode const& code, bool reorder, std::vector<std::string>* sources,
                          std::string* error, bool trim)
 {
+    if (code.perProgram) {
+        const uint32_t programs = uint32_t(code.programs.size());
+        sources->assign(programs + 1, std::string());
+        if (!RaygenSource(reorder, programs, &(*sources)[0], error)) return false;
+        for (uint32_t p = 0; p < programs; ++p)
+            if (!ProgramCallableSource(*code.programs[p], &(*sources)[p + 1], error)) return false;
+        return true;
+    }
     const uint32_t programs = uint32_t(code.programDispatch.size());
     sources->assign(programs + 1, std::string());
     if (!RaygenSource(reorder, programs, &(*sources)[0], error)) return false;
@@ -679,6 +695,14 @@ MaterialCallShaders::MaterialCallShaders(VkDevice device, VkPhysicalDeviceProper
 
 MaterialCallShaders::~MaterialCallShaders()
 {
+    {
+        // Queued compiles are dropped; running ones finish.
+        std::lock_guard lock(m_queueMutex);
+        m_stopping = true;
+        m_queue.clear();
+    }
+    m_queueReady.notify_all();
+    for (auto& worker : m_workers) worker.join();
     if (m_prewarm.valid()) m_prewarm.wait();
     std::lock_guard lock(m_mutex);
     for (auto& [key, future] : m_shaders) {
@@ -699,6 +723,52 @@ void MaterialCallShaders::prewarmRaygen()
         std::string source, error;
         if (RaygenSource(false, 0, &source, &error)) (void)shader(source, true);
     });
+}
+
+void MaterialCallShaders::prefetch(std::string source)
+{
+    if (!m_libraries) return;
+    {
+        const std::string key = gpu::SourceDigest(source + gpu::HlslCompilerSignature(gpu::HlslTarget::Spirv,
+                                                                                      kLibraryStage));
+        std::lock_guard lock(m_mutex);
+        if (m_shaders.contains(key)) return;
+    }
+    {
+        std::lock_guard lock(m_queueMutex);
+        if (m_stopping) return;
+        m_queue.push_back(std::move(source));
+        if (m_workers.size() < CompileThreads() && m_workers.size() < m_queue.size() + m_busy)
+            m_workers.emplace_back([this] { prefetchWorker(); });
+    }
+    ++m_prefetched;
+    m_queueReady.notify_one();
+}
+
+void MaterialCallShaders::prefetchWorker()
+{
+    for (;;) {
+        std::string source;
+        {
+            std::unique_lock lock(m_queueMutex);
+            m_queueReady.wait(lock, [&] { return m_stopping || !m_queue.empty(); });
+            if (m_stopping) return;
+            source = std::move(m_queue.front());
+            m_queue.pop_front();
+            ++m_busy;
+        }
+        {
+            // A compile for a scene that is still loading: reported with the
+            // kernel phase, which the material phase outranks meanwhile.
+            progress::Scope kernel(Phase::Kernel);
+            progress::Detail(Phase::Kernel, std::format("material callables ahead of the scene: {} of {}",
+                                                        m_prefetchedDone.load() + 1, m_prefetched.load()));
+            (void)shader(source, false);
+        }
+        ++m_prefetchedDone;
+        std::lock_guard lock(m_queueMutex);
+        --m_busy;
+    }
 }
 
 std::shared_ptr<const ShaderBuild> MaterialCallShaders::shader(std::string const& source, bool raygen)
@@ -723,6 +793,7 @@ std::shared_ptr<const ShaderBuild> MaterialCallShaders::shader(std::string const
         reused->stackSize = built->stackSize;
         reused->error = built->error;
         reused->readySeconds = SecondsSince(start);
+        reused->reused = true;
         if (!built->error.empty()) {
             // A failed compile is tried again by the next request.
             std::lock_guard lock(m_mutex);
@@ -917,7 +988,7 @@ bool MaterialCallPipeline::build(gpu::MdlShaderCode const& code, VkPipelineLayou
     // A trimmed callable that does not compile (a reference the trimming
     // missed) compiles again with the whole link unit.
     std::vector<std::string> full;
-    for (size_t i = 1; i < sources.size(); ++i) {
+    for (size_t i = 1; i < sources.size() && !code.perProgram; ++i) {
         if (shaders[i]->error.empty()) continue;
         if (full.empty() && !MaterialCallSources(code, reorder, &full, error, false)) return false;
         if (full[i] == sources[i]) continue;
@@ -943,6 +1014,10 @@ bool MaterialCallPipeline::build(gpu::MdlShaderCode const& code, VkPipelineLayou
             continue;
         }
         if (s.dxcCompiled) ++m_report.compiled;
+        if (s.reused) {
+            ++m_report.reused;
+            m_report.reusedWaitSeconds = std::max(m_report.reusedWaitSeconds, s.readySeconds);
+        }
         m_report.dxcMaxSeconds = std::max(m_report.dxcMaxSeconds, s.dxcSeconds);
         m_report.dxcPeakBytes = std::max(m_report.dxcPeakBytes, s.dxcPeakBytes);
         if (s.driverSeconds > 0.0) {

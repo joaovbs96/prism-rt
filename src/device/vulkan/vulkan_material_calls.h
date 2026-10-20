@@ -16,17 +16,22 @@
 
 #include <vulkan/vulkan.h>
 
+#include <atomic>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <filesystem>
 #include <future>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
 namespace prism::device::gpu {
 struct MdlShaderCode;
+struct MdlProgramCode;
 }
 
 namespace prism::device::vulkan {
@@ -86,6 +91,9 @@ bool RaygenSource(bool reorder, uint32_t programs, std::string* source, std::str
 // kMaterialCallProfile library profile.
 bool MaterialCallSources(gpu::MdlShaderCode const& code, bool reorder, std::vector<std::string>* sources,
                          std::string* error, bool trim = true);
+// The callable of one program translated alone (MdlProgramCode): the same
+// source in every scene, so it can compile before the scene is complete.
+bool ProgramCallableSource(gpu::MdlProgramCode const& program, std::string* source, std::string* error);
 extern const char* const kMaterialCallProfile; // lib_6_6
 
 // Prints the statistics of every executable of `pipeline` (created with
@@ -104,6 +112,7 @@ struct ShaderBuild {
     double driverSeconds = 0.0;     // the library's vkCreateRayTracingPipelinesKHR
     bool driverCacheHit = false;    // its pipeline cache file existed
     double readySeconds = 0.0;      // seconds after the request that it was ready
+    bool reused = false;            // compiled (or compiling) for an earlier request, such as a prefetch
     // The library's stack size (vkGetRayTracingShaderGroupStackSizeKHR), the
     // largest the driver reported for this SPIR-V, also when it was compiled
     // for an earlier run (kept with its pipeline cache file).
@@ -127,9 +136,17 @@ public:
     void prewarmRaygen();
     // The shader of `source` (SPIR-V and, with libraries, its library); compiles it once.
     std::shared_ptr<const ShaderBuild> shader(std::string const& source, bool raygen);
+    // Compiles the callable of `source` on a background compile thread
+    // (at most CompileThreads() at once, DXC limited as for scenes), for a
+    // later shader() of the same source. Only with libraries.
+    void prefetch(std::string source);
+    // Callables prefetched, and those of them finished (statistics).
+    uint32_t prefetched() const { return m_prefetched.load(); }
+    uint32_t prefetchedDone() const { return m_prefetchedDone.load(); }
 
 private:
     std::shared_ptr<ShaderBuild> compile(std::string const& source, bool raygen);
+    void prefetchWorker();
 
     VkDevice m_device = VK_NULL_HANDLE;
     VkPhysicalDeviceProperties m_properties{};
@@ -141,6 +158,14 @@ private:
     std::mutex m_mutex;
     std::unordered_map<std::string, std::shared_future<std::shared_ptr<const ShaderBuild>>> m_shaders;
     std::future<void> m_prewarm;
+    // Background compiles (prefetch).
+    std::mutex m_queueMutex;
+    std::condition_variable m_queueReady;
+    std::deque<std::string> m_queue;
+    std::vector<std::thread> m_workers;
+    bool m_stopping = false;
+    uint32_t m_busy = 0;
+    std::atomic<uint32_t> m_prefetched{0}, m_prefetchedDone{0};
 };
 
 // Costs of building one pipeline, for PRISM_GPU_VERBOSE.
@@ -149,6 +174,8 @@ struct CallableBuildReport {
     uint32_t compiled = 0;          // callables DXC compiled (others came from the cache)
     uint32_t librariesCompiled = 0; // callable libraries the driver compiled for this pipeline
     uint32_t librariesCached = 0;   // ... of them from a pipeline cache file
+    uint32_t reused = 0;            // callables an earlier request (another scene, a prefetch) compiled
+    double reusedWaitSeconds = 0.0; // longest wait for one of them
     bool libraries = false;         // linked from pipeline libraries
     double shadersSeconds = 0.0;    // all shader work (DXC and, with libraries, driver), in parallel
     double dxcMaxSeconds = 0.0;     // slowest single compile

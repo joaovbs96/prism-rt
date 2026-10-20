@@ -37,7 +37,10 @@
 #include <mutex>
 #include <iostream>
 #include <thread>
+#include <condition_variable>
+#include <deque>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace prism::device {
 
@@ -168,6 +171,17 @@ struct GpuCopy {
     gpu_texture::Header header{};
     Storage storage = Storage::Float32;
     bool valid = false;
+};
+
+// Texel data of one image, converted for upload. Same storage policy as
+// the Metal device (see UploadImage there), except that a GPU copy keeps
+// 16-bit integer texels as UNORM16 and reduced 8-bit images 8-bit.
+struct PreparedImage {
+    Bytes staging;
+    int width = 0, height = 0;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    uint32_t levels = 1;
+    bool fromCopy = false;
 };
 
 // PRISM_GPU_TEXTURE_COPIES=0 uploads from the float .tx.exr files instead.
@@ -336,6 +350,77 @@ bool CompileVulkanKernel(std::string const& mdlCode, std::vector<uint32_t>* spir
     return true;
 }
 
+// The compute kernel without MDL code, in bytes (the part of a kernel's size
+// that does not depend on the materials).
+static size_t KernelBaseBytes()
+{
+    static const size_t bytes = [] {
+        std::string source;
+        return AssembleVulkanKernel(std::string(), &source, nullptr) ? source.size() : size_t(0);
+    }();
+    return bytes;
+}
+
+// Material sets whose estimated compute kernel (KernelBaseBytes plus
+// gpu::LinkUnitEstimate) exceeds the callable threshold by this factor use
+// callables without generating their link unit: the estimate can exceed the
+// link unit's size where per-program code repeats specialized shared code.
+// Closer to the threshold, the link unit decides as before.
+constexpr double kEstimateMargin = 1.15;
+
+// Callables compiled while the scene's materials still compile: every program
+// translated early (gpu::AddProgramListener) gets its callable compiled in the
+// background once the material set is known to use callables. Shared with
+// the listener, which may still run while the device is destroyed.
+struct CallableSpeculation {
+    std::mutex mutex;
+    vulkan::MaterialCallShaders* shaders = nullptr; // null once the device is gone
+    vulkan::CallableMode mode = vulkan::CallableMode::Auto;
+    gpu::LinkUnitEstimate estimate;                 // of the programs since the last scene
+    std::vector<std::shared_ptr<const gpu::MdlProgramCode>> pending;
+    bool active = false;                            // callables are certain: compile as programs come
+
+    void program(std::shared_ptr<const gpu::MdlProgramCode> const& code)
+    {
+        std::vector<std::shared_ptr<const gpu::MdlProgramCode>> start;
+        vulkan::MaterialCallShaders* target = nullptr;
+        {
+            std::lock_guard lock(mutex);
+            if (!shaders || mode == vulkan::CallableMode::Never) return;
+            if (active) {
+                start.push_back(code);
+            } else {
+                pending.push_back(code);
+                estimate.add(*code);
+                const size_t kernel = KernelBaseBytes() + estimate.bytes();
+                if (mode == vulkan::CallableMode::Always ||
+                    double(kernel) > double(vulkan::CallableThresholdBytes()) * kEstimateMargin) {
+                    active = true;
+                    start.swap(pending);
+                    if (prism::load_profile::Enabled())
+                        prism::load_profile::Mark("vulkan.speculate",
+                            std::format("programs={} kernel_estimate_kb={}", start.size(), kernel >> 10));
+                }
+            }
+            target = shaders;
+            // Compile while holding the lock, so the device cannot go away
+            // meanwhile; prefetch only queues the work.
+            for (auto const& program : start) {
+                std::string source, error;
+                if (vulkan::ProgramCallableSource(*program, &source, &error)) target->prefetch(std::move(source));
+            }
+        }
+    }
+    // A scene's preparation starts: later programs belong to the next one.
+    void reset()
+    {
+        std::lock_guard lock(mutex);
+        estimate = gpu::LinkUnitEstimate();
+        pending.clear();
+        active = false;
+    }
+};
+
 struct VulkanDevice::Impl {
     VkInstance instance = VK_NULL_HANDLE;
     VkPhysicalDevice physical = VK_NULL_HANDLE;
@@ -395,7 +480,45 @@ struct VulkanDevice::Impl {
     vulkan::MaterialCallPipeline const* callables = nullptr;
     // The generated MDL code `pipeline` was built from.
     std::shared_ptr<const gpu::MdlShaderCode> pipelineCode;
+    // Why the scene's materials use the per-program layout (callables), for the log.
+    std::string perProgramReason;
     VkQueryPool timestamps = VK_NULL_HANDLE;
+    // Early MDL translations and the callables they start (CallableSpeculation).
+    std::shared_ptr<CallableSpeculation> speculation = std::make_shared<CallableSpeculation>();
+    int programListener = 0;
+
+    // Submissions to `queue` and waits for the device to be idle: the early
+    // image uploads below submit from their own thread.
+    std::mutex queueMutex;
+    // Early image uploads: textures are uploaded at full resolution from
+    // their GPU copies as they are prepared (TextureService prepared
+    // observers), while the scene still loads, until their estimated memory
+    // reaches the texture budget. uploadImages takes those its scene uses,
+    // with the storage and resolution it chose, and frees the others.
+    struct EarlyImage {
+        Image image;
+        Storage storage = Storage::Float32;
+    };
+    std::mutex earlyMutex;
+    std::condition_variable earlyChanged;
+    std::unordered_map<std::string, EarlyImage> earlyImages;      // by GPU copy path
+    std::unordered_set<std::string> earlySeen, residentPaths;   // requested; in imageCache
+    std::deque<std::shared_ptr<const prism::TextureResource>> earlyQueue;
+    std::thread earlyWorker;
+    bool earlyStop = false, earlyPaused = false, earlyBusy = false;
+    uint64_t earlyBytes = 0, earlyBudget = 0;
+    uint32_t earlyUploaded = 0, earlySkipped = 0;
+    double earlySeconds = 0.0;
+    VkCommandPool earlyPool = VK_NULL_HANDLE;
+    VkFence earlyFence = VK_NULL_HANDLE;
+    bool unorm16Filterable = false;
+    int textureObserver = 0;
+    void earlyPrepared(std::shared_ptr<const prism::TextureResource> const& resource);
+    void earlyLoop();
+    bool earlyUpload(prism::TextureResource const& resource);
+    // Stops the early uploads (waits for the one in progress) for uploadImages.
+    void pauseEarly();
+    void resumeEarly();
 
     ~Impl();
     bool initialize(std::string* reason);
@@ -416,6 +539,14 @@ struct VulkanDevice::Impl {
     bool buildCallablePipeline(std::shared_ptr<const gpu::MdlShaderCode> const& code, std::string const& reason,
                                std::string* error);
     bool uploadImages(std::string* error);
+    // Sets the size and mip levels of `out` (format set).
+    void finishImage(PreparedImage& out, int width, int height) const;
+    // The texels of `copy`, reduced `shift` times, in its storage.
+    bool prepareImageFromCopy(GpuCopy const& copy, int shift, PreparedImage& out, uint64_t* readNanoseconds,
+                              uint64_t* convertNanoseconds) const;
+    // Creates the image of `prepared`, recording its upload and mipmaps.
+    bool recordImage(VkCommandBuffer commands, PreparedImage const& prepared, Buffer const& staging, Image* image);
+    void destroyImage(Image& image);
     bool buildAccelerationStructures(std::string* error);
     bool writeDescriptors(std::string* error);
     void* renderBuffer(int slot, size_t bytes);
@@ -428,7 +559,24 @@ VulkanDevice::Impl::~Impl()
         if (instance) vkDestroyInstance(instance, nullptr);
         return;
     }
+    if (programListener) gpu::RemoveProgramListener(programListener);
+    {
+        std::lock_guard lock(speculation->mutex);
+        speculation->shaders = nullptr;
+    }
+    if (textureObserver) prism::TextureService::RemovePreparedObserver(textureObserver);
+    {
+        std::lock_guard lock(earlyMutex);
+        earlyStop = true;
+        earlyQueue.clear();
+    }
+    earlyChanged.notify_all();
+    if (earlyWorker.joinable()) earlyWorker.join();
     vkDeviceWaitIdle(device);
+    for (auto& [path, early] : earlyImages) destroyImage(early.image);
+    earlyImages.clear();
+    if (earlyFence) vkDestroyFence(device, earlyFence, nullptr);
+    if (earlyPool) vkDestroyCommandPool(device, earlyPool, nullptr);
     callables = nullptr;
     callablePipelines.clear();
     callableShaders.reset();
@@ -731,7 +879,184 @@ bool VulkanDevice::Impl::initialize(std::string* reason)
         // The raygen shader depends on no scene: compile it while the scene loads.
         if (vulkan::CallableModeSetting() != vulkan::CallableMode::Never) callableShaders->prewarmRaygen();
     }
+    // MDL classes are translated as they compile; with callables, their
+    // shaders compile meanwhile too.
+    {
+        std::lock_guard lock(speculation->mutex);
+        speculation->shaders = callableShaders && callableShaders->libraries() ? callableShaders.get() : nullptr;
+        speculation->mode = rayTracing.pipeline ? vulkan::CallableModeSetting() : vulkan::CallableMode::Never;
+    }
+    programListener = gpu::AddProgramListener(
+        [speculation = speculation](std::shared_ptr<const gpu::MdlProgramCode> const& code) {
+            speculation->program(code);
+        });
+
+    // Early image uploads (PRISM_VULKAN_EARLY_IMAGES=0 disables them).
+    auto filterable = [&](VkFormat format) {
+        VkFormatProperties properties;
+        vkGetPhysicalDeviceFormatProperties(physical, format, &properties);
+        const VkFormatFeatureFlags needed = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+            VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT | VK_FORMAT_FEATURE_BLIT_SRC_BIT |
+            VK_FORMAT_FEATURE_BLIT_DST_BIT;
+        return (properties.optimalTilingFeatures & needed) == needed;
+    };
+    unorm16Filterable = filterable(VK_FORMAT_R16_UNORM) && filterable(VK_FORMAT_R16G16_UNORM) &&
+        filterable(VK_FORMAT_R16G16B16A16_UNORM);
+    const char* early = std::getenv("PRISM_VULKAN_EARLY_IMAGES");
+    if (GpuCopiesEnabled() && !(early && std::string_view(early) == "0")) {
+        uint64_t deviceLocal = 0;
+        for (uint32_t h = 0; h < memoryProperties.memoryHeapCount; ++h)
+            if (memoryProperties.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+                deviceLocal = std::max<uint64_t>(deviceLocal, memoryProperties.memoryHeaps[h].size);
+        earlyBudget = gpu::TextureBudget(deviceLocal);
+        vkCreateCommandPool(device, &poolInfo, nullptr, &earlyPool);
+        vkCreateFence(device, &fenceInfo, nullptr, &earlyFence);
+        if (earlyPool && earlyFence)
+            textureObserver = prism::TextureService::AddPreparedObserver(
+                [this](std::shared_ptr<const prism::TextureResource> const& resource) { earlyPrepared(resource); });
+    }
     return true;
+}
+
+void VulkanDevice::Impl::earlyPrepared(std::shared_ptr<const prism::TextureResource> const& resource)
+{
+    std::string path = resource->gpuCopyPath().string();
+    {
+        std::lock_guard lock(earlyMutex);
+        if (earlyStop || earlyPaused || residentPaths.contains(path) || !earlySeen.insert(path).second) return;
+        earlyQueue.push_back(resource);
+        if (!earlyWorker.joinable()) earlyWorker = std::thread([this] { earlyLoop(); });
+    }
+    earlyChanged.notify_all();
+}
+
+void VulkanDevice::Impl::earlyLoop()
+{
+    for (;;) {
+        std::shared_ptr<const prism::TextureResource> resource;
+        {
+            std::unique_lock lock(earlyMutex);
+            earlyChanged.wait(lock, [&] { return earlyStop || (!earlyPaused && !earlyQueue.empty()); });
+            if (earlyStop) return;
+            resource = std::move(earlyQueue.front());
+            earlyQueue.pop_front();
+            earlyBusy = true;
+        }
+        const auto start = Clock::now();
+        bool uploaded = false;
+        {
+            progress::Scope phase(Phase::Upload);
+            try {
+                uploaded = earlyUpload(*resource);
+            } catch (std::exception const& e) {
+                if (gpu::GpuVerbose()) std::cerr << "PrismRT Vulkan: early image upload failed: " << e.what() << '\n';
+            }
+        }
+        {
+            std::lock_guard lock(earlyMutex);
+            earlyBusy = false;
+            earlySeconds += SecondsSince(start);
+            if (uploaded) ++earlyUploaded;
+            else ++earlySkipped;
+        }
+        earlyChanged.notify_all();
+    }
+}
+
+bool VulkanDevice::Impl::earlyUpload(prism::TextureResource const& resource)
+{
+    auto service = prism::TextureService::Acquire();
+    GpuCopy copy;
+    std::string reason;
+    copy.path = service->gpuImage(resource, &reason);
+    gpu_texture::Header& h = copy.header;
+    if (copy.path.empty() || !gpu_texture::Read(copy.path, &h, nullptr, &reason) ||
+        int(h.width) != resource.width() || int(h.height) != resource.height() ||
+        int(h.channels) != std::clamp(resource.channels(), 1, 4))
+        return false;
+    // Scene images other than environments: those keep float storage and are
+    // uploaded with the scene.
+    copy.storage = ChooseStorage(h, false, unorm16Filterable);
+    const int channels = int(h.channels);
+    const uint64_t estimate = gpu::ImageBytes({int(h.width), int(h.height), channels == 3 ? 4 : channels,
+                                               StorageBytes(copy.storage), false}, 0);
+    {
+        std::lock_guard lock(earlyMutex);
+        if (earlyBytes + estimate > earlyBudget) return false;
+        earlyBytes += estimate;
+    }
+    PreparedImage prepared;
+    uint64_t readTime = 0, convertTime = 0;
+    Buffer staging;
+    Image image;
+    bool ok = prepareImageFromCopy(copy, 0, prepared, &readTime, &convertTime) &&
+        createBuffer(prepared.staging.size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &staging);
+    if (ok) {
+        std::memcpy(staging.mapped, prepared.staging.data.get(), prepared.staging.size);
+        Bytes().swap(prepared.staging);
+        VkCommandBufferAllocateInfo info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        info.commandPool = earlyPool;
+        info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        info.commandBufferCount = 1;
+        VkCommandBuffer commands = VK_NULL_HANDLE;
+        ok = vkAllocateCommandBuffers(device, &info, &commands) == VK_SUCCESS;
+        if (ok) {
+            VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+            begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            vkBeginCommandBuffer(commands, &begin);
+            const bool recorded = recordImage(commands, prepared, staging, &image);
+            vkEndCommandBuffer(commands);
+            VkResult result = VK_ERROR_UNKNOWN;
+            if (recorded) {
+                VkSubmitInfo submitInfo{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+                submitInfo.commandBufferCount = 1;
+                submitInfo.pCommandBuffers = &commands;
+                vkResetFences(device, 1, &earlyFence);
+                {
+                    std::lock_guard lock(queueMutex);
+                    result = vkQueueSubmit(queue, 1, &submitInfo, earlyFence);
+                }
+                if (result == VK_SUCCESS) result = vkWaitForFences(device, 1, &earlyFence, VK_TRUE, UINT64_MAX);
+            }
+            vkFreeCommandBuffers(device, earlyPool, 1, &commands);
+            ok = recorded && result == VK_SUCCESS;
+        }
+    }
+    destroyBuffer(staging);
+    std::lock_guard lock(earlyMutex);
+    if (!ok) {
+        destroyImage(image);
+        earlyBytes -= estimate;
+        return false;
+    }
+    if (prism::load_profile::Enabled())
+        prism::load_profile::Mark("vulkan.image_early",
+            std::format("name={} size={}x{} format={} read_ms={:.1f} convert_ms={:.1f}",
+                        resource.sourcePath().filename().string(), prepared.width, prepared.height,
+                        int(prepared.format), readTime / 1e6, convertTime / 1e6));
+    earlyImages[copy.path.string()] = {image, copy.storage};
+    return true;
+}
+
+void VulkanDevice::Impl::pauseEarly()
+{
+    std::unique_lock lock(earlyMutex);
+    earlyPaused = true;
+    earlySkipped += uint32_t(earlyQueue.size());
+    earlyQueue.clear();
+    earlyChanged.wait(lock, [&] { return !earlyBusy; });
+}
+
+void VulkanDevice::Impl::resumeEarly()
+{
+    {
+        std::lock_guard lock(earlyMutex);
+        earlyPaused = false;
+        earlySeen.clear();
+        earlyUploaded = earlySkipped = 0;
+        earlySeconds = 0.0;
+    }
+    earlyChanged.notify_all();
 }
 
 uint32_t VulkanDevice::Impl::memoryType(uint32_t bits, VkMemoryPropertyFlags flags) const
@@ -829,7 +1154,11 @@ bool VulkanDevice::Impl::submit(VkCommandBuffer commands, std::string* error)
     info.commandBufferCount = 1;
     info.pCommandBuffers = &commands;
     vkResetFences(device, 1, &fence);
-    VkResult result = vkQueueSubmit(queue, 1, &info, fence);
+    VkResult result;
+    {
+        std::lock_guard lock(queueMutex);
+        result = vkQueueSubmit(queue, 1, &info, fence);
+    }
     if (result == VK_SUCCESS) result = vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX);
     vkFreeCommandBuffers(device, commandPool, 1, &commands);
     if (result != VK_SUCCESS) {
@@ -845,7 +1174,33 @@ bool VulkanDevice::Impl::prepareMaterials(std::shared_ptr<const gpu::MdlShaderCo
     auto const start = Clock::now();
     progress::Scope kernelPhase(Phase::Kernel);
     progress::Detail(Phase::Kernel, "generating MDL shader code");
-    const auto shared = gpu::CachedMdlShaderCode(data->mdlMaterials);
+    speculation->reset();
+    // Material sets that certainly use callables take the per-program layout,
+    // whose callables compiled ahead (CallableSpeculation); the others the
+    // link unit, which decides between the compute kernel and callables
+    // exactly (compilePipeline).
+    perProgramReason.clear();
+    const vulkan::CallableMode callableMode = rayTracing.pipeline ? vulkan::CallableModeSetting()
+                                                                  : vulkan::CallableMode::Never;
+    size_t estimate = 0;
+    if (callableMode == vulkan::CallableMode::Always) {
+        perProgramReason = "PRISM_VULKAN_CALLABLES=1";
+    } else if (callableMode == vulkan::CallableMode::Auto && !data->mdlMaterials.empty()) {
+        estimate = KernelBaseBytes() + gpu::EstimatedLinkUnitBytes(gpu::ProgramCodes(data->mdlMaterials));
+        if (double(estimate) > double(vulkan::CallableThresholdBytes()) * kEstimateMargin)
+            perProgramReason = std::format("{} KB kernel estimate above the {} KB threshold", estimate >> 10,
+                                           vulkan::CallableThresholdBytes() >> 10);
+    }
+    const auto shared = perProgramReason.empty() ? gpu::CachedMdlShaderCode(data->mdlMaterials)
+                                                 : gpu::CachedProgramShaderCode(data->mdlMaterials);
+    if (const char* check = std::getenv("PRISM_VULKAN_CHECK_ESTIMATE"); check && *check == '1' && estimate) {
+        // Diagnostics: the estimate against the link unit's kernel.
+        auto linkUnit = gpu::CachedMdlShaderCode(data->mdlMaterials);
+        std::string source;
+        if (AssembleVulkanKernel(linkUnit->code, &source, nullptr))
+            std::cerr << std::format("PrismRT Vulkan: kernel estimate {} KB, link unit kernel {} KB ({} programs)\n",
+                                     estimate >> 10, source.size() >> 10, linkUnit->programCount);
+    }
     gpu::MdlShaderCode const& code = *shared;
     if (!code.success)
         std::cerr << "PrismRT Vulkan: MDL materials unavailable on the GPU (" << code.error << ")\n";
@@ -853,9 +1208,10 @@ bool VulkanDevice::Impl::prepareMaterials(std::shared_ptr<const gpu::MdlShaderCo
     mdlTextureCount = uint32_t(data->mdlTextures.size());
     upload(kSlotArgumentBlocks, code.argumentBlocks.data(), code.argumentBlocks.size());
     upload(kSlotRoData, code.roData.data(), code.roData.size());
-    prism::load_profile::Mark("vulkan.mdl_code", std::format("mdl_code_s={:.3f} translate_s={:.3f} programs={}",
-                                                            SecondsSince(start), code.translateSeconds,
-                                                            code.programCount));
+    prism::load_profile::Mark("vulkan.mdl_code",
+        std::format("mdl_code_s={:.3f} translate_s={:.3f} programs={} layout={} kernel_estimate_kb={}",
+                    SecondsSince(start), code.translateSeconds, code.programCount,
+                    code.perProgram ? "programs" : "link_unit", estimate >> 10));
     *result = shared;
     // The same generated code (an edit that kept the materials) keeps its pipeline.
     *compile = !(shared == pipelineCode && pipeline != VK_NULL_HANDLE);
@@ -874,6 +1230,7 @@ bool VulkanDevice::Impl::compilePipeline(std::shared_ptr<const gpu::MdlShaderCod
     progress::Scope kernelPhase(Phase::Kernel);
     gpu::MdlShaderCode const& code = *shared;
     auto const generated = start;
+    if (code.perProgram) return buildCallablePipeline(shared, perProgramReason, error);
     // All but the smallest material sets use the callable pipeline: above the
     // size threshold (vulkan_material_calls.h), when DXC was found unable to
     // compile the kernel, or when it fails now for lack of memory.
@@ -977,7 +1334,11 @@ bool VulkanDevice::Impl::buildCallablePipeline(std::shared_ptr<const gpu::MdlSha
     gpu::MdlShaderCode const& code = *shared;
     auto const start = Clock::now();
     const bool reorder = rayTracing.reorder && vulkan::ReorderSetting();
-    const std::string key = gpu::SourceDigest(code.code) + (reorder ? "|reorder" : "");
+    std::string identity = code.code;
+    if (code.perProgram)
+        for (auto const& program : code.programs) identity += "|" + program->digest;
+    const std::string key = gpu::SourceDigest(identity) + (code.perProgram ? "|programs" : "") +
+        (reorder ? "|reorder" : "");
     std::cerr << std::format("PrismRT Vulkan: {} MDL programs as callable shaders ({}){}\n", code.programCount,
                              reason, reorder ? ", reordered by program" : "");
     auto found = callablePipelines.find(key);
@@ -993,11 +1354,12 @@ bool VulkanDevice::Impl::buildCallablePipeline(std::shared_ptr<const gpu::MdlSha
             std::format("callables=1 libraries={} programs={} dxc_compiled={} shaders_s={:.3f} dxc_max_s={:.3f} "
                         "driver_max_s={:.3f} driver_sum_s={:.3f} libraries_compiled={} libraries_cached={} "
                         "raygen_dxc={} raygen_dxc_s={:.3f} raygen_driver_s={:.3f} raygen_wait_s={:.3f} "
-                        "pipeline_s={:.3f} total_s={:.3f}",
+                        "pipeline_s={:.3f} total_s={:.3f} layout={} reused={} reused_wait_s={:.3f}",
                         r.libraries ? 1 : 0, r.programs, r.compiled, r.shadersSeconds, r.dxcMaxSeconds,
                         r.driverMaxSeconds, r.driverSumSeconds, r.librariesCompiled, r.librariesCached,
                         r.raygenCompiled ? 1 : 0, r.raygenSeconds, r.raygenDriverSeconds, r.raygenWaitSeconds,
-                        r.pipelineSeconds, SecondsSince(start)));
+                        r.pipelineSeconds, SecondsSince(start), code.perProgram ? "programs" : "link_unit",
+                        r.reused, r.reusedWaitSeconds));
         if (gpu::GpuVerbose())
             std::cerr << std::format(
                 "PrismRT Vulkan: callable pipeline {:.2f} s: {} programs, {} DXC compiles (slowest {:.1f} s, peak {} "
@@ -1019,6 +1381,168 @@ bool VulkanDevice::Impl::buildCallablePipeline(std::shared_ptr<const gpu::MdlSha
     pipeline = callables->pipeline();
     pipelineCode = shared;
     return true;
+}
+
+// Creates the image of `prepared`, recording its upload and mipmaps.
+void VulkanDevice::Impl::finishImage(PreparedImage& out, int width, int height) const
+{
+    VkFormatProperties formatProperties;
+    vkGetPhysicalDeviceFormatProperties(physical, out.format, &formatProperties);
+    const VkFormatFeatureFlags blit = VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT |
+        VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+    const bool mipmapped = (formatProperties.optimalTilingFeatures & blit) == blit;
+    out.levels = mipmapped ? 1u + uint32_t(std::floor(std::log2(double(std::max(width, height))))) : 1u;
+    out.width = width;
+    out.height = height;
+}
+
+// From the GPU copy: read, then pad RGB to RGBA, reduce or convert as the
+// storage needs (usually nothing: the texels are uploaded as stored).
+bool VulkanDevice::Impl::prepareImageFromCopy(GpuCopy const& copy, int shift, PreparedImage& out,
+                                              uint64_t* readNanoseconds, uint64_t* convertNanoseconds) const
+{
+    auto nanosecondsSince = [](Clock::time_point start) {
+        return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count());
+    };
+    gpu_texture::Header const& h = copy.header;
+    const int channels = int(h.channels), stored = channels == 3 ? 4 : channels;
+    const auto readStart = Clock::now();
+    Bytes payload(size_t(h.payloadBytes));
+    std::string reason;
+    if (!gpu_texture::ReadPayload(copy.path, h, payload.data.get(), &reason)) {
+        std::cerr << std::format("PrismRT Vulkan: cannot read {}: {}; decoding its prepared file\n",
+                                 copy.path.filename().string(), reason);
+        return false;
+    }
+    *readNanoseconds = nanosecondsSince(readStart);
+    const auto convertStart = Clock::now();
+    int width = int(h.width), height = int(h.height);
+    const Storage storage = copy.storage;
+    const int outBytes = StorageBytes(storage);
+    const size_t texels = size_t(width) * height;
+    const bool asStored = shift == 0 && SameStorage(h.component, storage);
+    if (asStored && stored == channels) {
+        out.staging = std::move(payload);
+    } else if (asStored) {
+        // Pad RGB to RGBA; the fourth component reads as zero.
+        const int cb = outBytes;
+        out.staging = Bytes(texels * stored * cb);
+        tbb::parallel_for(tbb::blocked_range<size_t>(0, texels, size_t(1) << 14),
+            [&](tbb::blocked_range<size_t> const& range) {
+                for (size_t p = range.begin(); p != range.end(); ++p) {
+                    uint8_t* dst = out.staging.data.get() + p * stored * cb;
+                    std::memcpy(dst, payload.data.get() + p * channels * cb, size_t(channels) * cb);
+                    std::memset(dst + channels * cb, 0, size_t(stored - channels) * cb);
+                }
+            });
+    } else {
+        // Through float: OIIO's conversion, exactly as the .tx.exr holds it.
+        std::vector<float> pixels(texels * channels);
+        const OIIO::TypeDesc type = ComponentType(h.component);
+        constexpr size_t chunk = size_t(1) << 18;
+        tbb::parallel_for(size_t(0), (pixels.size() + chunk - 1) / chunk, [&](size_t c) {
+            const size_t begin = c * chunk, count = std::min(chunk, pixels.size() - begin);
+            OIIO::convert_pixel_values(type, payload.data.get() + begin * type.size(), OIIO::TypeDesc::FLOAT,
+                                       pixels.data() + begin, int(count));
+        });
+        Bytes().swap(payload);
+        gpu::Downsample(pixels, width, height, channels, shift);
+        const size_t reducedTexels = size_t(width) * height;
+        out.staging = Bytes(reducedTexels * stored * outBytes);
+        tbb::parallel_for(tbb::blocked_range<size_t>(0, reducedTexels, size_t(1) << 14),
+            [&](tbb::blocked_range<size_t> const& range) {
+                for (size_t p = range.begin(); p != range.end(); ++p)
+                    for (int c = 0; c < stored; ++c)
+                        EncodeTexel(storage, c < channels ? pixels[p * channels + c] : 0.0f,
+                                    out.staging.data.get() + (p * stored + c) * outBytes);
+            });
+    }
+    out.format = StorageFormat(storage, stored);
+    out.fromCopy = true;
+    finishImage(out, width, height);
+    *convertNanoseconds = nanosecondsSince(convertStart);
+    return true;
+}
+
+bool VulkanDevice::Impl::recordImage(VkCommandBuffer commands, PreparedImage const& prepared, Buffer const& staging,
+                                     Image* image)
+{
+    VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    imageInfo.imageType = VK_IMAGE_TYPE_2D;
+    imageInfo.format = prepared.format;
+    imageInfo.extent = {uint32_t(prepared.width), uint32_t(prepared.height), 1};
+    imageInfo.mipLevels = prepared.levels;
+    imageInfo.arrayLayers = 1;
+    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+    imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+    imageInfo.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    if (vkCreateImage(device, &imageInfo, nullptr, &image->image) != VK_SUCCESS) return false;
+    VkMemoryRequirements requirements;
+    vkGetImageMemoryRequirements(device, image->image, &requirements);
+    VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    allocation.allocationSize = requirements.size;
+    allocation.memoryTypeIndex = memoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (vkAllocateMemory(device, &allocation, nullptr, &image->memory) != VK_SUCCESS) return false;
+    vkBindImageMemory(device, image->image, image->memory, 0);
+    image->bytes = requirements.size;
+    const uint32_t levels = prepared.levels;
+    auto barrier = [&](uint32_t level, uint32_t count, VkImageLayout from, VkImageLayout to,
+                       VkAccessFlags src, VkAccessFlags dst, VkPipelineStageFlags srcStage,
+                       VkPipelineStageFlags dstStage) {
+        VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        b.oldLayout = from;
+        b.newLayout = to;
+        b.srcAccessMask = src;
+        b.dstAccessMask = dst;
+        b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = image->image;
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, level, count, 0, 1};
+        vkCmdPipelineBarrier(commands, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &b);
+    };
+    barrier(0, levels, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
+            VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    VkBufferImageCopy copy{};
+    copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    copy.imageExtent = {uint32_t(prepared.width), uint32_t(prepared.height), 1};
+    vkCmdCopyBufferToImage(commands, staging.buffer, image->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+    int w = prepared.width, h = prepared.height;
+    for (uint32_t level = 1; level < levels; ++level) {
+        barrier(level - 1, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT);
+        VkImageBlit region{};
+        region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level - 1, 0, 1};
+        region.srcOffsets[1] = {w, h, 1};
+        w = std::max(1, w / 2);
+        h = std::max(1, h / 2);
+        region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0, 1};
+        region.dstOffsets[1] = {w, h, 1};
+        vkCmdBlitImage(commands, image->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, image->image,
+                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region, VK_FILTER_LINEAR);
+        barrier(level - 1, 1, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+    }
+    barrier(levels - 1, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+    VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    viewInfo.image = image->image;
+    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.format = prepared.format;
+    // Absent channels read as zero (Metal semantics for R/RG formats).
+    viewInfo.components = {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
+                           VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
+    viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, levels, 0, 1};
+    return vkCreateImageView(device, &viewInfo, nullptr, &image->view) == VK_SUCCESS;
+}
+
+void VulkanDevice::Impl::destroyImage(Image& image)
+{
+    if (image.view) vkDestroyImageView(device, image.view, nullptr);
+    if (image.image) vkDestroyImage(device, image.image, nullptr);
+    if (image.memory) vkFreeMemory(device, image.memory, nullptr);
+    image = {};
 }
 
 bool VulkanDevice::Impl::uploadImages(std::string* error)
@@ -1094,6 +1618,36 @@ bool VulkanDevice::Impl::uploadImages(std::string* error)
                      "(PRISM_GPU_TEXTURE_BUDGET_MIB)\n";
     }
     reportedReducedImages = reduced;
+    // Images uploaded while the scene loaded: those this scene uses with the
+    // storage and full resolution it chose are taken, the others freed (the
+    // uploads stop meanwhile and continue for later scenes).
+    pauseEarly();
+    uint32_t claimed = 0, earlyUploadedNow = 0, earlySkippedNow = 0;
+    double earlySecondsNow = 0.0;
+    struct EarlyResume {
+        Impl& impl;
+        ~EarlyResume() { impl.resumeEarly(); }
+    } earlyResume{*this};
+    struct EarlyEnd {
+        Impl& impl;
+        std::vector<GpuCopy> const& copies;
+        ~EarlyEnd()
+        {
+            std::lock_guard lock(impl.earlyMutex);
+            for (auto& [path, early] : impl.earlyImages) impl.destroyImage(early.image);
+            impl.earlyImages.clear();
+            impl.earlyBytes = 0;
+            impl.residentPaths.clear();
+            for (auto const& copy : copies)
+                if (copy.valid) impl.residentPaths.insert(copy.path.string());
+        }
+    } earlyEnd{*this, copies};
+    {
+        std::lock_guard lock(earlyMutex);
+        earlyUploadedNow = earlyUploaded;
+        earlySkippedNow = earlySkipped;
+        earlySecondsNow = earlySeconds;
+    }
     std::vector<size_t> missing;
     for (size_t i = 0; i < d.images.size(); ++i) {
         auto const& resource = d.images[i];
@@ -1112,35 +1666,28 @@ bool VulkanDevice::Impl::uploadImages(std::string* error)
             vkFreeMemory(device, found->second.image.memory, nullptr);
             imageCache.erase(found);
         }
+        if (shift[i] == 0 && copies[i].valid && !isEnvironment[i]) {
+            std::lock_guard lock(earlyMutex);
+            auto early = earlyImages.find(copies[i].path.string());
+            if (early != earlyImages.end() && early->second.storage == copies[i].storage) {
+                imageCache[resource.get()] = {resource, early->second.image, false, 0};
+                imageViews[i] = early->second.image.view;
+                earlyImages.erase(early);
+                ++claimed;
+                continue;
+            }
+        }
         missing.push_back(i);
     }
     progress::SetTotal(Phase::Upload, missing.size());
     progress::Detail(Phase::Upload, missing.empty() ? "images (cached)" : "images");
 
-    // Texel data of one image, converted for upload. Same storage policy as
-    // the Metal device (see UploadImage there), except that a GPU copy keeps
-    // 16-bit integer texels as UNORM16 and reduced 8-bit images 8-bit.
-    struct Prepared {
-        Bytes staging;
-        int width = 0, height = 0;
-        VkFormat format = VK_FORMAT_UNDEFINED;
-        uint32_t levels = 1;
-        bool fromCopy = false;
-    };
+    using Prepared = PreparedImage;
     std::atomic<uint64_t> readNanoseconds{0}, convertNanoseconds{0}, stagedBytes{0}, copiedImages{0};
     auto nanosecondsSince = [](Clock::time_point start) {
         return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count());
     };
-    auto finish = [&](Prepared& out, int width, int height) {
-        VkFormatProperties formatProperties;
-        vkGetPhysicalDeviceFormatProperties(physical, out.format, &formatProperties);
-        const VkFormatFeatureFlags blit = VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT |
-            VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
-        const bool mipmapped = (formatProperties.optimalTilingFeatures & blit) == blit;
-        out.levels = mipmapped ? 1u + uint32_t(std::floor(std::log2(double(std::max(width, height))))) : 1u;
-        out.width = width;
-        out.height = height;
-    };
+    auto finish = [&](Prepared& out, int width, int height) { finishImage(out, width, height); };
     auto profileImage = [&](prism::TextureResource const& resource, Prepared const& out, int channels, int s,
                             uint64_t readTime, uint64_t convertTime) {
         readNanoseconds += readTime;
@@ -1157,65 +1704,10 @@ bool VulkanDevice::Impl::uploadImages(std::string* error)
     // From the GPU copy: read, then pad RGB to RGBA, reduce or convert as the
     // storage needs (usually nothing: the texels are uploaded as stored).
     auto prepareFromCopy = [&](size_t i, Prepared& out) {
-        GpuCopy const& copy = copies[i];
-        gpu_texture::Header const& h = copy.header;
-        const int channels = int(h.channels), stored = channels == 3 ? 4 : channels;
-        const auto readStart = Clock::now();
-        Bytes payload(size_t(h.payloadBytes));
-        std::string reason;
-        if (!gpu_texture::ReadPayload(copy.path, h, payload.data.get(), &reason)) {
-            std::cerr << std::format("PrismRT Vulkan: cannot read {}: {}; decoding its prepared file\n",
-                                     copy.path.filename().string(), reason);
-            return false;
-        }
-        const uint64_t readTime = nanosecondsSince(readStart);
-        const auto convertStart = Clock::now();
-        int width = int(h.width), height = int(h.height);
-        const Storage storage = copy.storage;
-        const int outBytes = StorageBytes(storage);
-        const size_t texels = size_t(width) * height;
-        const bool asStored = shift[i] == 0 && SameStorage(h.component, storage);
-        if (asStored && stored == channels) {
-            out.staging = std::move(payload);
-        } else if (asStored) {
-            // Pad RGB to RGBA; the fourth component reads as zero.
-            const int cb = outBytes;
-            out.staging = Bytes(texels * stored * cb);
-            tbb::parallel_for(tbb::blocked_range<size_t>(0, texels, size_t(1) << 14),
-                [&](tbb::blocked_range<size_t> const& range) {
-                    for (size_t p = range.begin(); p != range.end(); ++p) {
-                        uint8_t* dst = out.staging.data.get() + p * stored * cb;
-                        std::memcpy(dst, payload.data.get() + p * channels * cb, size_t(channels) * cb);
-                        std::memset(dst + channels * cb, 0, size_t(stored - channels) * cb);
-                    }
-                });
-        } else {
-            // Through float: OIIO's conversion, exactly as the .tx.exr holds it.
-            std::vector<float> pixels(texels * channels);
-            const OIIO::TypeDesc type = ComponentType(h.component);
-            constexpr size_t chunk = size_t(1) << 18;
-            tbb::parallel_for(size_t(0), (pixels.size() + chunk - 1) / chunk, [&](size_t c) {
-                const size_t begin = c * chunk, count = std::min(chunk, pixels.size() - begin);
-                OIIO::convert_pixel_values(type, payload.data.get() + begin * type.size(), OIIO::TypeDesc::FLOAT,
-                                           pixels.data() + begin, int(count));
-            });
-            Bytes().swap(payload);
-            gpu::Downsample(pixels, width, height, channels, shift[i]);
-            const size_t reducedTexels = size_t(width) * height;
-            out.staging = Bytes(reducedTexels * stored * outBytes);
-            tbb::parallel_for(tbb::blocked_range<size_t>(0, reducedTexels, size_t(1) << 14),
-                [&](tbb::blocked_range<size_t> const& range) {
-                    for (size_t p = range.begin(); p != range.end(); ++p)
-                        for (int c = 0; c < stored; ++c)
-                            EncodeTexel(storage, c < channels ? pixels[p * channels + c] : 0.0f,
-                                        out.staging.data.get() + (p * stored + c) * outBytes);
-                });
-        }
-        out.format = StorageFormat(storage, stored);
-        out.fromCopy = true;
-        finish(out, width, height);
+        uint64_t readTime = 0, convertTime = 0;
+        if (!prepareImageFromCopy(copies[i], shift[i], out, &readTime, &convertTime)) return false;
         ++copiedImages;
-        profileImage(*d.images[i], out, channels, shift[i], readTime, nanosecondsSince(convertStart));
+        profileImage(*d.images[i], out, int(copies[i].header.channels), shift[i], readTime, convertTime);
         return true;
     };
     auto prepare = [&](size_t i, Prepared& out) {
@@ -1271,83 +1763,10 @@ bool VulkanDevice::Impl::uploadImages(std::string* error)
         progress::Add(Phase::Upload);
     };
 
-    // Creates the image of `prepared`, recording its upload and mipmaps.
     auto record = [&](VkCommandBuffer commands, Prepared const& prepared, Buffer const& staging, Image* image) {
-        VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-        imageInfo.imageType = VK_IMAGE_TYPE_2D;
-        imageInfo.format = prepared.format;
-        imageInfo.extent = {uint32_t(prepared.width), uint32_t(prepared.height), 1};
-        imageInfo.mipLevels = prepared.levels;
-        imageInfo.arrayLayers = 1;
-        imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
-        imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
-        imageInfo.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-        if (vkCreateImage(device, &imageInfo, nullptr, &image->image) != VK_SUCCESS) return false;
-        VkMemoryRequirements requirements;
-        vkGetImageMemoryRequirements(device, image->image, &requirements);
-        VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-        allocation.allocationSize = requirements.size;
-        allocation.memoryTypeIndex = memoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        if (vkAllocateMemory(device, &allocation, nullptr, &image->memory) != VK_SUCCESS) return false;
-        vkBindImageMemory(device, image->image, image->memory, 0);
-        image->bytes = requirements.size;
-        const uint32_t levels = prepared.levels;
-        auto barrier = [&](uint32_t level, uint32_t count, VkImageLayout from, VkImageLayout to,
-                           VkAccessFlags src, VkAccessFlags dst, VkPipelineStageFlags srcStage,
-                           VkPipelineStageFlags dstStage) {
-            VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-            b.oldLayout = from;
-            b.newLayout = to;
-            b.srcAccessMask = src;
-            b.dstAccessMask = dst;
-            b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            b.image = image->image;
-            b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, level, count, 0, 1};
-            vkCmdPipelineBarrier(commands, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &b);
-        };
-        barrier(0, levels, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
-                VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-        VkBufferImageCopy copy{};
-        copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        copy.imageExtent = {uint32_t(prepared.width), uint32_t(prepared.height), 1};
-        vkCmdCopyBufferToImage(commands, staging.buffer, image->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
-        int w = prepared.width, h = prepared.height;
-        for (uint32_t level = 1; level < levels; ++level) {
-            barrier(level - 1, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                    VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                    VK_PIPELINE_STAGE_TRANSFER_BIT);
-            VkImageBlit region{};
-            region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level - 1, 0, 1};
-            region.srcOffsets[1] = {w, h, 1};
-            w = std::max(1, w / 2);
-            h = std::max(1, h / 2);
-            region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0, 1};
-            region.dstOffsets[1] = {w, h, 1};
-            vkCmdBlitImage(commands, image->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, image->image,
-                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region, VK_FILTER_LINEAR);
-            barrier(level - 1, 1, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                    VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-        }
-        barrier(levels - 1, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-        VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-        viewInfo.image = image->image;
-        viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        viewInfo.format = prepared.format;
-        // Absent channels read as zero (Metal semantics for R/RG formats).
-        viewInfo.components = {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
-                               VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
-        viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, levels, 0, 1};
-        return vkCreateImageView(device, &viewInfo, nullptr, &image->view) == VK_SUCCESS;
+        return recordImage(commands, prepared, staging, image);
     };
-    auto destroyImage = [&](Image& image) {
-        if (image.view) vkDestroyImageView(device, image.view, nullptr);
-        if (image.image) vkDestroyImage(device, image.image, nullptr);
-        if (image.memory) vkFreeMemory(device, image.memory, nullptr);
-        image = {};
-    };
+    auto destroyImage = [&](Image& image) { this->destroyImage(image); };
 
     // Images are prepared in parallel, in batches that bound the host
     // memory, and each batch is uploaded with one submission.
@@ -1414,10 +1833,11 @@ bool VulkanDevice::Impl::uploadImages(std::string* error)
         const std::string summary = std::format(
             "{} images ({} uploaded, {} reduced), {:.0f} MiB of image memory, {:.0f} MiB staged; "
             "{:.2f} s total: prepare {:.2f} s (read {:.2f} s, convert {:.2f} s summed over threads), "
-            "copy and submit {:.2f} s; {} from GPU copies (found in {:.2f} s)", d.images.size(), missing.size(),
+            "copy and submit {:.2f} s; {} from GPU copies (found in {:.2f} s); {} uploaded early ({} taken, {} left to the scene, {:.2f} s)", d.images.size(), missing.size(),
             reduced, double(bytes) / 1048576.0, double(stagedBytes.load()) / 1048576.0, SecondsSince(uploadStart),
             prepareNanoseconds / 1e9, readNanoseconds.load() / 1e9, convertNanoseconds.load() / 1e9,
-            submitNanoseconds / 1e9, copiedImages.load(), copiesSeconds);
+            submitNanoseconds / 1e9, copiedImages.load(), copiesSeconds, earlyUploadedNow, claimed, earlySkippedNow,
+            earlySecondsNow);
         if (gpu::GpuVerbose()) std::cerr << "PrismRT Vulkan: " << summary << '\n';
         prism::load_profile::Mark("vulkan.images", summary);
     }
@@ -1652,7 +2072,10 @@ bool VulkanDevice::Impl::ensureScene(SceneManager& scene, std::string* error)
         return false;
     }
     failedScene = nullptr;
-    vkDeviceWaitIdle(device);
+    {
+        std::lock_guard lock(queueMutex);
+        vkDeviceWaitIdle(device);
+    }
     auto const sceneStart = Clock::now();
     dirty = false;
     boundScene = &scene;
@@ -1754,7 +2177,10 @@ bool VulkanDevice::Impl::ensureScene(SceneManager& scene, std::string* error)
 void* VulkanDevice::Impl::renderBuffer(int slot, size_t bytes)
 {
     if (buffers[slot].size < bytes) {
-        vkDeviceWaitIdle(device);
+        {
+            std::lock_guard lock(queueMutex);
+            vkDeviceWaitIdle(device);
+        }
         upload(slot, nullptr, bytes);
         if (descriptorSet) {
             VkDescriptorBufferInfo info{buffers[slot].buffer, 0, VK_WHOLE_SIZE};
