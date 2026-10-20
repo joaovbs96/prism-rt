@@ -79,6 +79,20 @@ int RunProgressStatusTests()
             model.Begin(prism::Phase::Materials);
             Require(model.Read().phases[size_t(prism::Phase::Materials)].done == 0,
                     "A new phase did not reset its counters");
+            // GPU work that starts while materials compile (kernel and upload
+            // are active) does not hide them.
+            model.SetError("");
+            Require(model.Read().phase == "materials",
+                    "A kernel compile overlapping the material phase took precedence over it");
+            model.End(prism::Phase::Materials);
+            // Overlapping counted holds end the phase with the last one.
+            model.End(prism::Phase::Kernel);
+            model.Hold(prism::Phase::Kernel);
+            model.Hold(prism::Phase::Kernel);
+            model.Release(prism::Phase::Kernel);
+            Require(model.IsActive(prism::Phase::Kernel), "A counted phase ended with its first holder");
+            model.Release(prism::Phase::Kernel);
+            Require(!model.IsActive(prism::Phase::Kernel), "A counted phase outlived its holders");
         }
 
         // Frontend: statistics progress to rendering/converged and name the device.
