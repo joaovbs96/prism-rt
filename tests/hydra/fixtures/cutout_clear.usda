@@ -1,0 +1,49 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    upAxis = "Y"
+)
+
+# cutout_medium.usda without the medium: its reference image.
+def Xform "World"
+{
+    def Sphere "Ball" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        double radius = 1
+        rel material:binding = </World/Looks/Glass>
+    }
+
+    def Scope "Looks"
+    {
+        def Material "Glass"
+        {
+            token outputs:mtlx:surface.connect = </World/Looks/Glass/Surface.outputs:out>
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_open_pbr_surface_surfaceshader"
+                float inputs:transmission_weight = 1
+                float inputs:specular_roughness = 0
+                float inputs:geometry_opacity = 0.5
+                token outputs:out
+            }
+        }
+    }
+
+    def DomeLight "Dome"
+    {
+        color3f inputs:color = (1, 1, 1)
+        float inputs:intensity = 1
+    }
+
+    def Camera "Camera"
+    {
+        float focalLength = 50
+        float horizontalAperture = 36
+        float verticalAperture = 36
+        double3 xformOp:translate = (0, 0, 4)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+}

@@ -654,6 +654,10 @@ struct PathTracer {
         }
         path.radiance += path.weight * bs.emission *
                          (emissionWeight * contributionWeight(settings.contributions, path.depth));
+        // A cutout hole crossed from the inside leaves the object, and with it
+        // the medium entered by refraction; staying in it absorbed the rest of
+        // the path and lost every path that then escaped to the environment.
+        if (bs.null_event && !hit.surface.front_face) path.inMedium = false;
         if (mis && bs.null_event) {
             path.sampler.dimension = vertex.samplerDimension; // the light sample goes unused
             if (!bs.scattered) path.tracking = false;

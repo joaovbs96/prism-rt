@@ -361,6 +361,25 @@ if(PRISM_BUILD_HYDRA)
             set_tests_properties(prism_hydra_setting_change_test PROPERTIES
                 ENVIRONMENT "${_prism_test_environment}" FIXTURES_REQUIRED prism_depth_change)
         endif()
+        # A path leaving closed glass through a cutout hole leaves its medium:
+        # a negligible medium then renders like none at all.
+        if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/cutout_medium.usda")
+            add_test(NAME prism_hydra_cutout_medium_render
+                COMMAND prism_hydra_render
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/cutout_medium.usda"
+                    "/World/Camera" "${CMAKE_BINARY_DIR}/hydra/cutout_medium.exr" 64 64 16)
+            add_test(NAME prism_hydra_cutout_clear_render
+                COMMAND prism_hydra_render
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/cutout_clear.usda"
+                    "/World/Camera" "${CMAKE_BINARY_DIR}/hydra/cutout_clear.exr" 64 64 16)
+            add_test(NAME prism_hydra_cutout_medium_test
+                COMMAND prism_compare_images
+                    "${CMAKE_BINARY_DIR}/hydra/cutout_clear.exr" "${CMAKE_BINARY_DIR}/hydra/cutout_medium.exr")
+            set_tests_properties(prism_hydra_cutout_medium_render prism_hydra_cutout_clear_render PROPERTIES
+                ENVIRONMENT "${_prism_test_environment}" FIXTURES_SETUP prism_cutout_medium)
+            set_tests_properties(prism_hydra_cutout_medium_test PROPERTIES
+                ENVIRONMENT "${_prism_test_environment}" FIXTURES_REQUIRED prism_cutout_medium)
+        endif()
         if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/animated.usda")
             add_test(NAME prism_hydra_animation_exercise
                 COMMAND prism_hydra_render
