@@ -9,6 +9,8 @@
 
 #include <tbb/parallel_for.h>
 
+#include <array>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -18,6 +20,7 @@
 #include <fstream>
 #include <future>
 #include <iostream>
+#include <iterator>
 #include <map>
 #include <mutex>
 #include <regex>
