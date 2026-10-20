@@ -253,8 +253,10 @@ the noise floor is the CPU with seed 1 against seed 0.
   libraries then compiled 12 times slower (489 s summed, slowest 36 s,
   against 41 s and 3.3 s; ready 38 to 56 s), Teapot's and the damascus egg's
   3-3.6 times slower, the compute kernel's pipeline (CornellBox) 3.5 times
-  slower, and Teapot rendered non-finite pixels in one of three runs (Lion
-  only under GPU-AV). Images were otherwise bit-identical.
+  slower. It also cost time per sample (warm, 960x540: Lion 14.1 to 23.0 ms
+  per pass, Teapot 4.5 to 8.4, chess 29.0 to 33.5), and its images had
+  non-finite pixels: every run at 16 spp (9 of 9; 1 of 3 at 4 spp), against
+  none inlined. The finite images were bit-identical to inlined ones.
 - **Shader execution reordering** (hint by program, `PRISM_VULKAN_REORDER=1`)
   is off by default: 2–8% slower on OpenPBR, chess and the eggs, neutral on
   Stirling, 16% faster on the countertop. Reordering by program alone does

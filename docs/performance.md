@@ -116,6 +116,64 @@ identical cold runs varied up to 1.5x. See
 - Vulkan cold loads are now dominated by DXC (Lion 18 s) and, on OpenPBR, by
   MDL-to-HLSL translation and pipeline creation.
 
+## GPU preparation overlapped with the material phase (October 2026)
+
+The Vulkan device used to start its own work only once the scene was
+published: MDL-to-HLSL translation of one link unit, then DXC and pipeline
+libraries, while images uploaded. Now (see [gpu_devices.md](gpu_devices.md#how-it-fits-together)):
+
+- every MDL class is translated alone with the HLSL backend on the material
+  worker right after class compilation (0.15-0.4 s each, in parallel across
+  workers instead of serially at the end; kept in the disk cache, so warm
+  loads translate nothing);
+- once the programs seen make the compute kernel certainly too large, each
+  program's callable compiles (DXC, then its pipeline library) on background
+  compile threads while other materials and textures are still prepared;
+  the scene's pipeline links what is ready;
+- textures upload from their GPU copies as they are prepared, up to the
+  texture budget; the scene's upload takes them and uploads the rest.
+
+Same setup as above (`prism_hydra_render`, 480x270, 4 spp, 24 GB cap,
+`PRISM_DISK_CACHE_GB=60`); cold is an empty `PRISM_CACHE_DIR` for either
+device and a unique `PRISM_VULKAN_SHADER_SALT`, warm the next run on that
+cache (valid only with zero textures prepared and zero DXC runs). Medians of
+three alternating before/after rounds. The machine was busier than for the
+tables above (Teapot CPU cold 30 s against 12 s then), so compare ratios.
+"GPU ready" is the `vulkan.scene` mark; "tail" is GPU ready minus the
+snapshot's publication.
+
+| Scene | Vulkan cold: GPU ready | tail | Vulkan warm: GPU ready | tail | CPU cold | CPU warm |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Teapot | 33.0 → 29.9 s (0.90) | 4.0 → 0.7 s | 4.6 → 3.4 s (0.73) | 2.3 → 0.8 s | 29.7 → 30.5 s | 2.4 → 2.6 s |
+| Lion | 44.6 → 34.7 s (0.78) | 25.5 → 13.6 s | 4.4 → 3.1 s (0.72) | 1.7 → 0.3 s | 17.5 → 18.0 s | 2.8 → 2.8 s |
+| Chess | 11.6 → 9.5 s (0.82) | 4.4 → 1.3 s | 3.8 → 3.1 s (0.81) | 0.9 → 0.2 s | 6.9 → 6.9 s | 3.1 → 3.1 s |
+| OpenPBR playground | 78.3 → 58.9 s (0.75) | 26.8 → 5.6 s | 18.5 → 13.8 s (0.75) | 11.3 → 5.7 s | 50.8 → 53.9 s | 7.9 → 7.8 s |
+| Jade egg | 8.3 → 8.1 s (0.97) | 5.5 → 4.8 s | 3.1 → 2.4 s (0.79) | 0.8 → 0.2 s | 2.9 → 3.0 s | 2.3 → 2.4 s |
+| Parity fixture (compute kernel) | 4.5 → 4.6 s | 3.6 → 3.5 s | 1.0 → 1.0 s | 0.1 → 0.1 s | 1.0 → 1.0 s | 1.0 → 1.0 s |
+
+CPU times are the first full sample (`frame.full_sample`); the CPU device
+runs none of the new code, and its differences are within the run-to-run
+spread (up to 1.5x on cold runs here).
+
+- **What still serializes.** The lion's one callable takes DXC 25-27 s
+  next to the texture preparation (20 s alone): it starts 3-5 s into the
+  material phase and still ends 13 s after publication. On the jade egg and the parity fixture the tail is the
+  raygen (or compute kernel) pipeline that a cold driver compiles in 5-9 s
+  (unique salt). OpenPBR's remaining 5.6 s is the scene's own image upload
+  (3.8 s: 53 of 152 images left to the scene, 33 of them reduced by the
+  budget after an early full-resolution upload) and the GPU scene
+  conversion. Megakernel scenes still compile only after the scene is known.
+- **Warm.** The tail is now the image upload of whatever the early uploads
+  did not take and the GPU scene conversion; warm material phases are
+  0.0-0.6 s longer than before (the early translations read from the disk
+  cache).
+- **Images.** Bit-identical to before on every scene with the CPU preview off
+  (GPU samples only), except OpenPBR: its programs translated alone round
+  slightly differently from its link unit, and 4% of pixels diverge
+  (NRMSE 0.019 at 4 spp, 0.0073 at 64 spp, mean luminance 0.0009% at 64 spp).
+  CPU images are identical. With the preview on, the before and after images
+  differ by how many samples the CPU rendered before the handover.
+
 ## Interpretation limits
 
 MDL variants remain cached for the renderer process lifetime, affecting warm-recreation results. Historical InOneWeekend measurements used coarse tessellated spheres; the current implementation uses analytic spheres. Report this representation change when comparing geometry memory and rendering results. See [Hydra scope and costs](hydra.md) for rendering limitations and supported geometry behavior.
