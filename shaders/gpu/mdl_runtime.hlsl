@@ -209,50 +209,13 @@ float4 prism_mdl_texel_2d(int tex, int2 coord, int2 uvTile)
                                  img.info.z);
 }
 
-// BSDF data tables: manual trilinear filtering, as in the native runtime.
-bool prism_crop_texels(float c0, float c1, uint size, out uint offset, out uint count)
-{
-    offset = 0u;
-    count = 0u;
-    if (!isfinite(c0) || !isfinite(c1) || c0 < 0.0f || c1 > 1.0f || c1 < c0 || size == 0u)
-        return false;
-    offset = uint(float(size - 1u) * c0);
-    count = max(uint(float(size) * (c1 - c0)), 1u);
-    if (offset >= size) offset = size - 1u;
-    count = min(count, size - offset);
-    return true;
-}
-
-bool prism_remap_texel(float coordinate, uint size, int mode, uint offset,
-                                    out int lower, out int upper, out float fraction)
-{
-    lower = 0;
-    upper = 0;
-    fraction = 0.0f;
-    if (!isfinite(coordinate) || size == 0u) return false;
-    if (mode == kTexWrapClip && (coordinate < 0.0f || coordinate >= 1.0f)) return false;
-    float tex = coordinate * float(size) - 0.5f;
-    float base = floor(tex);
-    fraction = tex - base;
-    int n = int(size);
-    for (int k = 0; k < 2; ++k) {
-        int value = int(base) + k;
-        int mapped;
-        if (mode == kTexWrapClamp || mode == kTexWrapClip) {
-            mapped = clamp(value, 0, n - 1);
-        } else {
-            int cell = value / n;
-            int local = value - cell * n;
-            if (local < 0) { local += n; cell -= 1; }
-            if (mode == kTexWrapMirroredRepeat && (abs(cell) % 2) == 1) local = n - 1 - local;
-            mapped = local;
-        }
-        if (k == 0) lower = mapped + int(offset);
-        else upper = mapped + int(offset);
-    }
-    return true;
-}
-
+// BSDF data tables: manual trilinear filtering, as in the native runtime
+// (CropAxis, RemapTexel, LoadDfTexel). MDL's layered BSDFs call this at every
+// layer and it is inlined everywhere, so it is written without loops or
+// short-circuit conditions: the three axes as vectors, the wrap modes and
+// crop checks as selects, one branch for the texture and one for the
+// coordinates. Remapped texels always lie inside the cropped table, so the
+// fetches need no bounds checks. Results match the per-axis version exactly.
 float4 prism_df_texel(GpuMdlTexture info, int x, int y, int z)
 {
     uint width = info.info.z;
@@ -269,43 +232,69 @@ float4 prism_df_texel(GpuMdlTexture info, int x, int y, int z)
     return float4(gpu_bsdf_data(index), gpu_bsdf_data(index + 1u), gpu_bsdf_data(index + 2u), 1.0f);
 }
 
+// Texel indices of the axes for wrap modes `mode` in a cropped table of
+// `count` texels starting at `offset`.
+int3 prism_df_wrap(int3 value, int3 count, int3 mode, int3 offset)
+{
+    int3 clamped = clamp(value, int3(0, 0, 0), count - 1);
+    int3 cell = value / count;
+    int3 local = value - cell * count;
+    bool3 negative = local < 0;
+    local = select(negative, local + count, local);
+    cell = select(negative, cell - 1, cell);
+    local = select(and(mode == kTexWrapMirroredRepeat, (cell & 1) != 0), count - 1 - local, local);
+    return select(or(mode == kTexWrapClamp, mode == kTexWrapClip), clamped, local) + offset;
+}
+
+// One table value: the components of the texel at `index`, opaque alpha.
+float4 prism_df_fetch(uint index, uint step)
+{
+    return float4(gpu_bsdf_data(index), gpu_bsdf_data(index + step), gpu_bsdf_data(index + 2u * step), 1.0f);
+}
+
 float4 prism_lerp4(float4 a, float4 b, float t) { return a * (1.0f - t) + b * t; }
 
 float4 prism_mdl_lookup_3d(int tex, float3 coord, int wrapU, int wrapV, int wrapW,
                                         float2 cropU, float2 cropV, float2 cropW)
 {
     tex = prism_texture_index(tex);
-    if (!prism_mdl_texture_valid(tex)) return float4(0.0f, 0.0f, 0.0f, 0.0f);
+    if (or(tex <= 0, uint(tex) >= gpu_mdl_texture_count())) return float4(0.0f, 0.0f, 0.0f, 0.0f);
     GpuMdlTexture info = gpu_mdl_texture(uint(tex));
-    if (info.info.x != kMdlTextureBsdfData) return float4(0.0f, 0.0f, 0.0f, 0.0f);
-    uint ox;
-    uint oy;
-    uint oz;
-    uint nx;
-    uint ny;
-    uint nz;
-    if (!prism_crop_texels(cropU.x, cropU.y, info.info.z, ox, nx) ||
-        !prism_crop_texels(cropV.x, cropV.y, info.info.w, oy, ny) ||
-        !prism_crop_texels(cropW.x, cropW.y, info.info2.x, oz, nz))
-        return float4(0.0f, 0.0f, 0.0f, 0.0f);
-    int x0;
-    int x1;
-    int y0;
-    int y1;
-    int z0;
-    int z1;
-    float fx;
-    float fy;
-    float fz;
-    if (!prism_remap_texel(coord.x, nx, wrapU, ox, x0, x1, fx) ||
-        !prism_remap_texel(coord.y, ny, wrapV, oy, y0, y1, fy) ||
-        !prism_remap_texel(coord.z, nz, wrapW, oz, z0, z1, fz))
-        return float4(0.0f, 0.0f, 0.0f, 0.0f);
-    float4 a = prism_lerp4(prism_lerp4(prism_df_texel(info, x0, y0, z0), prism_df_texel(info, x1, y0, z0), fx),
-                           prism_lerp4(prism_df_texel(info, x0, y1, z0), prism_df_texel(info, x1, y1, z0), fx), fy);
-    float4 b = prism_lerp4(prism_lerp4(prism_df_texel(info, x0, y0, z1), prism_df_texel(info, x1, y0, z1), fx),
-                           prism_lerp4(prism_df_texel(info, x0, y1, z1), prism_df_texel(info, x1, y1, z1), fx), fy);
-    return prism_lerp4(a, b, fz);
+    uint3 size = uint3(info.info.z, info.info.w, info.info2.x);
+    // Crop: the texel range [offset, offset + count) of each axis.
+    float3 c0 = float3(cropU.x, cropV.x, cropW.x);
+    float3 c1 = float3(cropU.y, cropV.y, cropW.y);
+    bool3 valid = and(and(isfinite(c0), isfinite(c1)), and(and(c0 >= 0.0f, c1 <= 1.0f), and(c1 >= c0, size != 0u)));
+    uint3 offset = min(uint3(float3(size - 1u) * c0), size - 1u);
+    uint3 count = max(uint3(float3(size) * (c1 - c0)), 1u);
+    count = min(count, size - offset);
+    // Remap: the two texels around the coordinate and the weight between them.
+    int3 mode = int3(wrapU, wrapV, wrapW);
+    valid = and(valid, and(isfinite(coord), !and(mode == kTexWrapClip, or(coord < 0.0f, coord >= 1.0f))));
+    float3 t = coord * float3(count) - 0.5f;
+    float3 base = floor(t);
+    float3 f = t - base;
+    int3 n = int3(max(count, 1u));
+    int3 lower = prism_df_wrap(int3(base), n, mode, int3(offset));
+    int3 upper = prism_df_wrap(int3(base) + 1, n, mode, int3(offset));
+    if (or(info.info.x != kMdlTextureBsdfData, !all(valid))) return float4(0.0f, 0.0f, 0.0f, 0.0f);
+    uint width = info.info.z;
+    uint height = info.info.w;
+    uint components = info.info2.y;
+    uint step = select(components == 1u, 0u, 1u);
+    uint3 lo = uint3(lower);
+    uint3 hi = uint3(upper);
+    uint i00 = info.info.y + ((lo.z * height + lo.y) * width) * components;
+    uint i01 = info.info.y + ((lo.z * height + hi.y) * width) * components;
+    uint i10 = info.info.y + ((hi.z * height + lo.y) * width) * components;
+    uint i11 = info.info.y + ((hi.z * height + hi.y) * width) * components;
+    uint x0 = lo.x * components;
+    uint x1 = hi.x * components;
+    float4 a = prism_lerp4(prism_lerp4(prism_df_fetch(i00 + x0, step), prism_df_fetch(i00 + x1, step), f.x),
+                           prism_lerp4(prism_df_fetch(i01 + x0, step), prism_df_fetch(i01 + x1, step), f.x), f.y);
+    float4 b = prism_lerp4(prism_lerp4(prism_df_fetch(i10 + x0, step), prism_df_fetch(i10 + x1, step), f.x),
+                           prism_lerp4(prism_df_fetch(i11 + x0, step), prism_df_fetch(i11 + x1, step), f.x), f.y);
+    return prism_lerp4(a, b, f.z);
 }
 
 int3 prism_mdl_resolution_3d(int tex)
