@@ -271,7 +271,14 @@ float4 prism_df_texel(GpuMdlTexture info, int x, int y, int z)
 
 float4 prism_lerp4(float4 a, float4 b, float t) { return a * (1.0f - t) + b * t; }
 
-float4 prism_mdl_lookup_3d(int tex, float3 coord, int wrapU, int wrapV, int wrapW,
+// MDL's layered BSDFs look up their tables at every layer: inlined, the copies
+// made most of a layered material's code, and SPIR-V legalization time (Lion:
+// 77 copies, DXC 19.8 s -> 1.6 s out of line). Callable shaders define
+// PRISM_NOINLINE (Vulkan callables: [noinline]; the compute kernel and Metal inline it).
+#ifndef PRISM_NOINLINE
+#define PRISM_NOINLINE
+#endif
+PRISM_NOINLINE float4 prism_mdl_lookup_3d(int tex, float3 coord, int wrapU, int wrapV, int wrapW,
                                         float2 cropU, float2 cropV, float2 cropW)
 {
     tex = prism_texture_index(tex);
