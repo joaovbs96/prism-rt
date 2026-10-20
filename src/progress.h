@@ -99,6 +99,17 @@ public:
     }
     // Ends a phase; its counters stay readable.
     void End(Phase phase) { m_slots[size_t(phase)].active.store(false, std::memory_order_release); }
+    // Counted activity for work that overlaps (background GPU compiles and
+    // uploads during the material phase, then the scene's own): the phase
+    // begins with the first holder and ends with the last.
+    void Hold(Phase phase)
+    {
+        if (m_slots[size_t(phase)].holders.fetch_add(1, std::memory_order_acq_rel) == 0) Begin(phase);
+    }
+    void Release(Phase phase)
+    {
+        if (m_slots[size_t(phase)].holders.fetch_sub(1, std::memory_order_acq_rel) == 1) End(phase);
+    }
     void SetActive(Phase phase, bool active) { active ? Begin(phase) : End(phase); }
     bool IsActive(Phase phase) const { return m_slots[size_t(phase)].active.load(std::memory_order_acquire); }
 
@@ -141,10 +152,12 @@ public:
             out.error = m_error;
             for (size_t i = 0; i < kPhases; ++i) out.phases[i].detail = m_slots[i].detail;
         }
-        // Later stages of the pipeline take precedence (the kernel compile
-        // nests inside the upload); materials come before textures because
-        // compilation is what the scene waits on.
-        constexpr Phase order[] = {Phase::Kernel, Phase::Upload, Phase::Materials, Phase::Textures,
+        // What the scene waits on takes precedence: material compilation
+        // (and the textures it prepares) while it runs, since GPU kernel
+        // compiles and uploads that start meanwhile cannot finish before it;
+        // then the later stages of the pipeline (the kernel compile nests
+        // inside the upload).
+        constexpr Phase order[] = {Phase::Materials, Phase::Textures, Phase::Kernel, Phase::Upload,
                                    Phase::Loading, Phase::Device, Phase::Rendering};
         for (size_t i = 0; i < kPhases; ++i) {
             Slot const& slot = m_slots[i];
@@ -173,6 +186,7 @@ private:
         std::atomic<uint64_t> done{0};
         std::atomic<uint64_t> total{0};
         std::atomic<int64_t> startNs{0};
+        std::atomic<int> holders{0};
         std::string detail; // guarded by m_mutex
     };
     static int64_t NowNs()
@@ -200,15 +214,17 @@ inline void Add(Phase p, uint64_t n = 1) { if (auto* m = Progress::Current()) m-
 inline void Detail(Phase p, std::string_view text) { if (auto* m = Progress::Current()) m->SetDetail(p, text); }
 inline void Device(std::string_view text) { if (auto* m = Progress::Current()) m->SetDevice(text); }
 
-// Keeps a phase active for a scope.
+// Keeps a phase active for a scope (counted: overlapping scopes of one phase
+// end it with the last). Holds the model that was current when it began.
 class Scope {
 public:
-    explicit Scope(Phase p) : m_phase(p) { Begin(p); }
-    ~Scope() { End(m_phase); }
+    explicit Scope(Phase p) : m_phase(p), m_model(Progress::Current()) { if (m_model) m_model->Hold(p); }
+    ~Scope() { if (m_model) m_model->Release(m_phase); }
     Scope(const Scope&) = delete;
     Scope& operator=(const Scope&) = delete;
 private:
     Phase m_phase;
+    Progress* m_model;
 };
 
 } // namespace progress
