@@ -295,6 +295,83 @@ void DistributeLayersOverMixes(const MaterialX::DocumentPtr& doc)
     }
 }
 
+bool IsTrueConstant(const MaterialX::InputPtr& input)
+{
+    if (!input || input->hasNodeName() || input->hasNodeGraphString() || input->hasOutputString() ||
+        input->hasInterfaceName())
+        return false;
+    return input->getValueString() == "true";
+}
+
+// MaterialX's open_pbr_surface graphs (1.39.4 and 1.39.5, genmdl variant
+// included) never connect geometry_thin_walled to their <surface>
+// constructor, so the MDL material is always closed: thin-walled glass
+// refracts like a solid and fills with the transmission_depth medium. Expand
+// such nodes into their genmdl graph and set the constructor's thin_walled
+// flag; a thin-walled MDL material scatters with its backface BSDF from the
+// back, so the material gets the same shader there.
+//
+// OpenPBR's thin wall is an infinitesimal sheet whose transmittance at normal
+// incidence is transmission_color, whatever transmission_depth says. The
+// graph uses transmission_color as the tint only when the depth is zero
+// (otherwise it becomes the volume's absorption, which a thin-walled MDL
+// material ignores), so the depth is cleared as well.
+void ExpandThinWalledOpenPbr(const MaterialX::DocumentPtr& doc)
+{
+    std::vector<MaterialX::NodePtr> nodes;
+    for (auto element : doc->traverseTree())
+        if (auto node = element->asA<MaterialX::Node>();
+            node && node->getCategory() == "open_pbr_surface" && IsTrueConstant(node->getInput("geometry_thin_walled")))
+            nodes.push_back(node);
+    if (nodes.empty()) return;
+
+    // The MDL generator's own choice of implementation (the library's genmdl
+    // target definition selects the MDL variant of the graph).
+    const std::string target = "genmdl";
+
+    for (auto const& node : nodes) {
+        auto graph = node->getParent() ? node->getParent()->asA<MaterialX::GraphElement>() : nullptr;
+        auto implementation = node->getImplementation(target);
+        if (!graph || !implementation || !implementation->isA<MaterialX::NodeGraph>()) {
+            std::cerr << "[MaterialX] WARNING: no graph for thin-walled " << node->getNamePath()
+                      << "; it renders as a closed surface\n";
+            continue;
+        }
+        auto depth = node->getInput("transmission_depth");
+        if (!depth) depth = node->addInput("transmission_depth", "float");
+        for (const char* attribute : {"nodename", "nodegraph", "output", "interfacename"})
+            depth->removeAttribute(attribute);
+        depth->setValue(0.0f);
+
+        const std::string name = node->getName();
+        std::vector<MaterialX::PortElementPtr> downstream = node->getDownstreamPorts();
+        graph->flattenSubgraphs(target, [&](MaterialX::NodePtr candidate) { return candidate == node; });
+        if (graph->getNode(name) == node) continue; // not expanded
+
+        std::vector<MaterialX::NodePtr> surfaces;
+        for (auto const& port : downstream) {
+            auto surface = graph->getNode(port->getNodeName());
+            if (surface && surface->getCategory() == "surface" &&
+                std::find(surfaces.begin(), surfaces.end(), surface) == surfaces.end())
+                surfaces.push_back(surface);
+        }
+        for (auto const& surface : surfaces) {
+            surface->setInputValue("thin_walled", true);
+            for (auto const& material : doc->getMaterialNodes()) {
+                auto front = material->getInput("surfaceshader");
+                if (!front || front->getConnectedNode() != surface) continue;
+                auto back = material->getInput("backsurfaceshader");
+                if (back && (back->hasNodeName() || back->hasNodeGraphString())) continue;
+                if (!back) back = material->addInput("backsurfaceshader", "surfaceshader");
+                back->copyContentFrom(front);
+            }
+        }
+        if (VerboseMdl())
+            std::cout << "[MaterialX] thin-walled " << name << " expanded into its " << target
+                      << " graph (" << surfaces.size() << " surface constructor)\n";
+    }
+}
+
 void NormalizeColorSpaces(const MaterialX::DocumentPtr& doc)
 {
     const std::string& attribute = MaterialX::Element::COLOR_SPACE_ATTRIBUTE;
@@ -449,6 +526,8 @@ MaterialX::DocumentPtr DocumentLoader::load(const std::string& filepath)
         // Attach after preprocessing so shared standard-library graphs retain
         // their original behavior. Validate the final document used for generation.
         AttachLibrary(doc, m_stdlib);
+        // Expanding a node into its implementation needs the library.
+        ExpandThinWalledOpenPbr(doc);
         std::string validation_errors;
         if (!doc->validate(&validation_errors)) {
             std::cerr << "[WARN] Document validation issues: " << validation_errors << "\n";

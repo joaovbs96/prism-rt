@@ -69,6 +69,27 @@ sheen over glaze). Layering is associative, so the loader first rewrites
 
 and then distributes the exposed mix.
 
+## Thin-walled open_pbr_surface
+
+MaterialX's `open_pbr_surface` graphs (1.39.4 and 1.39.5, the genmdl variant
+included) use `geometry_thin_walled` only to pick the subsurface lobe and never
+pass it to their `<surface>` constructor, so the generated MDL material is
+always closed (`thin_walled: false`). Thin-walled glass then refracts like a
+solid and fills with the `transmission_depth` medium; on a single-sided or open
+mesh (a bottle, a jar) that medium has no inside, and a `transmission_color`
+meant as the sheet's tint becomes a strong absorption through the whole object.
+
+The loader expands each `open_pbr_surface` whose `geometry_thin_walled` is a
+constant `true` into its genmdl implementation graph (`flattenSubgraphs`,
+restricted to that node), sets `thin_walled` on the graph's surface
+constructor, and binds the material's `backsurfaceshader` to the same shader
+(a thin-walled MDL material scatters with its backface BSDF from behind).
+OpenPBR's thin wall is an infinitesimal sheet whose normal-incidence
+transmittance is `transmission_color` whatever the depth, while the graph uses
+`transmission_color` as the tint only when `transmission_depth` is zero, so the
+depth is cleared on these nodes. A connected `geometry_thin_walled` is left as
+it is (MDL's `thin_walled` is uniform).
+
 ## standard_surface conductor clamp
 
 Upstream MaterialX bug: `standard_surface` feeds `base_color` and
@@ -98,8 +119,9 @@ clamped; authoring them above one can still reach the same failure.
 ## Regression checks
 
 `materialx_loader_sss` covers the SSS fallback, `materialx_loader_clamp` the
-conductor clamp, and `materialx_loader_types` the color space names, input type
-repairs and layer distribution. The small standalone test project avoids loading the renderer
+conductor clamp, `materialx_loader_types` the color space names, input type
+repairs and layer distribution, and `materialx_loader_transmission` the
+thin-walled expansion. The small standalone test project avoids loading the renderer
 and its USD/MDL runtime dependencies:
 
 ```text
