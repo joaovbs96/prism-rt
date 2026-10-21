@@ -1,15 +1,15 @@
 # PrismRT in Hydra and usdview
 
-`hdPrism` consumes Hydra scene-index data directly and shares the existing PrismRT path tracer and MaterialX/MDL backend with the standalone executable. It targets unmodified OpenUSD 26.05. USD's built-in render-delegate adapter owns the render index and usdview control interface; PrismRT uses the exported `HdRenderDelegate::SetTerminalSceneIndex` and `Update` hooks for scene synchronization. The adapter receives only cameras, buffers, and tasks. Geometry and materials are read from the full upstream scene index and do not have legacy `Sync` implementations.
+`hdPrism` consumes Hydra scene-index data directly and shares the existing PrismRT path tracer and MaterialX/MDL backend with the standalone executable. It targets unmodified OpenUSD 26.08 (the version in `tools/deps.json`). USD's built-in render-delegate adapter owns the render index and usdview control interface; PrismRT uses the exported `HdRenderDelegate::SetTerminalSceneIndex` and `Update` hooks for scene synchronization. The adapter receives only cameras, buffers, and tasks. Geometry and materials are read from the full upstream scene index and do not have legacy `Sync` implementations.
 
-This is a scene-index renderer behind USD's compatibility adapter, not a fully native `HdRenderer` implementation. The adapter is intentional: the 26.05 Windows DLL interface does not export all the symbols needed by an external `HdRenderer` subclass. Using USD's own adapter avoids changing USD headers, exports, or binaries. The build script does not apply USD patches.
+This is a scene-index renderer behind USD's compatibility adapter, not a fully native `HdRenderer` implementation. The adapter is intentional: OpenUSD's Windows DLL interface (checked with 26.05) does not export all the symbols needed by an external `HdRenderer` subclass. Using USD's own adapter avoids changing USD headers, exports, or binaries. The build script does not apply USD patches.
 
 ## Build and launch
 
-The local configuration targets the single OpenUSD source/build/install tree at `external_deps/OpenUSD`, using its 26.05 headers and ABI. Rebuild that installation with Python, imaging, GPU/GL support, and usdview before building the plugin:
+Build OpenUSD with Python, imaging, GPU/GL support and usdview before building the plugin. `tools/build_deps_local.ps1` builds OpenSubdiv, MaterialX and OpenUSD the way CI does, into versioned prefixes; point `cmake/PrismLocalDependencies.cmake` and `prism_local_env.ps1` at them ([deployment.md](deployment.md#local-dependency-stack)):
 
 ```powershell
-python build_script.py --usd-only
+.\tools\build_deps_local.ps1 -TbbRoot C:\deps\oneapi-tbb-2022.2.0 -WorkDir D:\prism-deps\src
 cmake -S . -B build -DPRISM_BUILD_HYDRA=ON -DPRISM_COPY_ASSETS=OFF
 cmake --build build --config RelWithDebInfo
 powershell -NoProfile -ExecutionPolicy Bypass -File run_usdview.ps1 tests/hydra/fixtures/parity.usda

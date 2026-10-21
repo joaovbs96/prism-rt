@@ -97,30 +97,101 @@ a minimal `PATH`:
 `cornell_box.png`) and `usdview.bat --quitAfterStartup` (logs "rendering on
 vulkan device").
 
+## Dependency versions
+
+`tools/deps.json` is the only list of dependency versions: OpenUSD, MaterialX
+and OpenSubdiv tags, oneTBB, Embree, the MDL SDK (tag, release build, clang
+and the SDK's vcpkg baseline), Python and the PySide6/PyOpenGL/numpy pins, the
+Vulkan SDK, PrismRT's vcpkg baseline (OpenImageIO), and `stack_revision`, a
+counter that forces CI to rebuild its cached stacks. Its consumers:
+
+- `tools/deps.psm1`: `Get-PrismDeps` and `Get-PrismCacheKey -Stack usd|mdl`
+  (the versions, `stack_revision`, the runner image and a hash of the build
+  scripts), used by every script below.
+- `tools/ci/export_deps.ps1`: exports the versions and cache keys to each CI job
+  (`GITHUB_ENV` and step outputs, including `setup-python`'s version).
+  `windows.yml` has no version literals.
+- `tools/ci/build_usd_stack.ps1`, `fetch_prebuilt.ps1`, `build_mdl_sdk.ps1`,
+  `tools/build_deps_local.ps1` and `tools/package_windows.ps1`.
+- `cmake/PrismDeps.cmake`: the configure reports the OpenUSD, MaterialX,
+  OpenSubdiv, oneTBB, Embree, OpenImageIO, Python and MDL SDK versions it found
+  and fails when one differs from `deps.json`
+  (`-DPRISM_STRICT_DEPENDENCY_VERSIONS=OFF` turns that into a warning). It also
+  finds `lib/cmake/embree-<version>` for the `.example` file.
+- `tools/check_deps.py` (CTest `prism_deps_consistency_test`, and a CI step):
+  `vcpkg.json` and `tools/ci/mdl_vcpkg/vcpkg.json` repeat their baselines,
+  because vcpkg manifests cannot import JSON, and this check fails when they
+  differ (`--write` updates them). It also fails when `docs/windows_vulkan.md`,
+  this file, `docs/hydra.md`, `README.md` or the package README name another
+  version of a dependency.
+
+### How to upgrade a dependency
+
+1. Edit the version (and tag) in `tools/deps.json`. For OpenImageIO, set
+   `vcpkg.baseline` to a vcpkg commit or release tag whose port has the new
+   version, and `vcpkg.openimageio` to that version.
+2. Run `python tools/check_deps.py --write`. It updates the vcpkg manifests
+   and lists every doc line that still names the old version; fix those.
+3. Rebuild the local stack: `tools/build_deps_local.ps1` (OpenUSD, MaterialX,
+   OpenSubdiv) builds into new versioned prefixes next to the old ones; point
+   `cmake/PrismLocalDependencies.cmake` and `prism_local_env.ps1` at them.
+   For OpenImageIO, rerun vcpkg against the manifest (below).
+4. Reconfigure (the version check confirms the new stack is the one found),
+   build, and run `ctest -j 1`.
+5. Commit and push. The cache keys change with the versions, so CI rebuilds
+   the affected stack on its first run. Bump `stack_revision` to force a rebuild
+   without a version change.
+
+### Local dependency stack
+
+`tools/build_deps_local.ps1` builds OpenSubdiv, MaterialX and OpenUSD with the
+same `tools/ci/build_usd_stack.ps1` as CI (oneTBB through
+`PXR_FIND_TBB_IN_CONFIG=ON`, no legacy TBB headers, Python from `deps.json`,
+imaging, usdview and MaterialX support, `RelWithDebInfo`) into
+`<Root>\opensubdiv-<version>`, `<Root>\materialx-<version>` and
+`<Root>\openusd-<version>`:
+
+```powershell
+.\tools\build_deps_local.ps1 -TbbRoot C:\deps\oneapi-tbb-2022.2.0 -WorkDir D:\prism-deps\src
+```
+
+`-DownloadTbb` fetches the oneTBB release instead of `-TbbRoot`. The developer's
+Python is used as is (`-InstallPip` installs the pinned modules into it), the
+`.pdb` files are kept (`-StripPdb`), and `-Jobs` (default 6) bounds the
+compilers. The work directory takes about 40 GB and can be deleted afterwards.
+OpenUSD 26.08 installs its Python modules into `Lib\site-packages` by default;
+the script keeps the `lib\python` layout that `prism_env.ps1` and the package
+expect.
+
+OpenImageIO comes from the `vcpkg.json` manifest; with vcpkg checked out at
+`deps.json`'s baseline:
+
+```powershell
+vcpkg install --triplet x64-windows --x-manifest-root=. --x-install-root=build\vcpkg_installed
+```
+
 ### CI
 
 `.github/workflows/windows.yml` runs on pushes to `device-abstraction` and
-`main`, pull requests and manual dispatch, on `windows-2022`. All dependencies
-live on `D:`.
+`main`, and on manual dispatch, on `windows-2022`. All dependencies live on
+`D:`. Each job starts with `tools/ci/export_deps.ps1`.
 
-- `usd` job: builds OpenSubdiv 3.6.1, MaterialX 1.39.4 and OpenUSD 26.05 with
-  `tools/ci/build_usd_stack.ps1`, mirroring the development machine (separate
-  prefixes, `RelWithDebInfo`, oneTBB through `PXR_FIND_TBB_IN_CONFIG`, Python 3.11,
-  imaging and usdview). The install, minus `.pdb` files, is cached under a key
-  made of the versions and the hash of the two CI scripts. On a hit the job only
-  does the cache lookup. It does not use `build_usd.py`, which would fetch its
-  own TBB.
-- `mdl` job (parallel to `usd`): builds the NVIDIA MDL SDK 2026.0.2 from source
-  without CUDA with `tools/ci/build_mdl_sdk.ps1` (the binary release imports
+- `usd` job: builds OpenSubdiv, MaterialX and OpenUSD with
+  `tools/ci/build_usd_stack.ps1`, like the development machine. The install,
+  minus `.pdb` files, is cached under `Get-PrismCacheKey -Stack usd`. On a hit
+  the job only does the cache lookup. It does not use `build_usd.py`, which
+  would fetch its own TBB.
+- `mdl` job (parallel to `usd`): builds the NVIDIA MDL SDK from source without
+  CUDA with `tools/ci/build_mdl_sdk.ps1` (the binary release imports
   `nvcuda.dll` and cannot load on a runner without an NVIDIA driver; see
-  `docs/windows_vulkan.md`). It caches `D:\deps\mdl` under a key made of the SDK
-  version and the hash of that script and `tools/ci/mdl_vcpkg/vcpkg.json`, so it
-  never invalidates the OpenUSD cache and vice versa.
-- `build` job: restores both caches, downloads oneTBB 2022.2.0 and Embree 4.4.0
-  (`tools/ci/fetch_prebuilt.ps1 -Components tbb,embree`), installs the Vulkan SDK
-  1.4.321.0 and the LunarG Vulkan runtime (the SDK has no `vulkan-1.dll`),
-  installs OpenImageIO from the `vcpkg.json` manifest with a vcpkg binary cache,
-  configures `prism-hydra` with `PRISM_ENABLE_VULKAN=ON` (using
+  `docs/windows_vulkan.md`). Its cache key (`-Stack mdl`) hashes that script and
+  `tools/ci/mdl_vcpkg/vcpkg.json`, so it never invalidates the OpenUSD cache and
+  vice versa.
+- `build` job: runs `tools/check_deps.py`, restores both caches, downloads oneTBB
+  and Embree (`tools/ci/fetch_prebuilt.ps1 -Components tbb,embree`), installs
+  the Vulkan SDK and the LunarG Vulkan runtime (the SDK has no `vulkan-1.dll`),
+  installs OpenImageIO from the `vcpkg.json` manifest with a vcpkg binary
+  cache, configures `prism-hydra` with `PRISM_ENABLE_VULKAN=ON` (using
   `cmake/PrismLocalDependencies.cmake` created from the `.example`), builds
   `RelWithDebInfo`, runs CTest serially with `PRISM_DISABLE_VULKAN=1` (hosted
   runners have no GPU), runs the package script, smoke-tests the extracted
@@ -130,5 +201,8 @@ live on `D:`.
 - The first run builds everything (several hours, mostly OpenUSD; the MDL SDK
   adds about an hour on a 4-core runner, in parallel with the USD job); later runs
   reuse the caches and take roughly the PrismRT build time plus packaging.
-  Change the versions in `windows.yml` and the scripts together; the cache key
-  follows the script hashes.
+
+CTest labels every test `cpu` or `gpu`; GPU tests also share
+`RESOURCE_LOCK gpu`. `ctest -LE gpu` runs only the CPU tests, so it can run
+beside GPU work; within one ctest run the lock keeps GPU tests from overlapping.
+Keep `-j 1` for full runs, since some Hydra tests share temporary file names.

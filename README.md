@@ -6,7 +6,7 @@
 
 PrismRT is a path tracer for OpenUSD, glTF and OBJ files with MaterialX materials (through NVIDIA MDL). It renders on the CPU (Embree, oneTBB) or on the GPU with hardware ray tracing (Metal on macOS, Vulkan on Windows/Linux), all running the same path tracer.
 
-The optional PrismRT Hydra plugin renders in stock OpenUSD 26.05 usdview. Both frontends use the same render devices and MaterialX-to-MDL shading backend. See [Hydra usage](docs/hydra.md), [material support](docs/hydra_materials.md), and [Windows deployment](docs/deployment.md).
+The optional PrismRT Hydra plugin renders in stock OpenUSD 26.08 usdview. Both frontends use the same render devices and MaterialX-to-MDL shading backend. See [Hydra usage](docs/hydra.md), [material support](docs/hydra_materials.md), and [Windows deployment](docs/deployment.md).
 
 See [texture cache configuration](docs/texture_service.md) and the
 [validation report](docs/round3_validation.md) for measured performance,
@@ -64,7 +64,7 @@ Mean luminance differs by at most 0.05 %. Details, images and diagnostics: [docs
 ---------------------------------------
 
 * Windows x64 with Visual Studio 2022, or macOS on Apple silicon with Xcode (or the Command Line Tools); a C++20 compiler.
-* One stock OpenUSD 26.05 installation, with Python, imaging and GL enabled for usdview.
+* One stock OpenUSD 26.08 installation, with Python, imaging and GL enabled for usdview. `tools/deps.json` lists every dependency version; `tools/build_deps_local.ps1` builds OpenUSD, MaterialX and OpenSubdiv like CI does (see [deployment](docs/deployment.md#dependency-versions)).
 * Embree 4, oneTBB, OpenImageIO, MaterialX and the NVIDIA MDL SDK.
 * Matching development packages for dependencies required by the selected USD build, including OpenSubdiv.
 * GPU devices: DXC (in the Vulkan SDK); the Metal device also needs Apple's Metal shader converter, the Vulkan device the Vulkan SDK.

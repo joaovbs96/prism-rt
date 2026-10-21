@@ -13,8 +13,8 @@ This is the setup validated on Windows 11 x64 with an NVIDIA RTX 4070 Ti. See
 | Git / Git LFS | 2.46 / 3.5.1 |
 | Vulkan SDK | 1.4.321.0, which sets `VULKAN_SDK` and provides `Bin\dxc.exe` (1.8) |
 | NVIDIA driver | 610.88 (Vulkan 1.4.341) |
-| Python | 3.11.9 x64 with PySide6 6.7, PyOpenGL 3.1.7, numpy |
-| vcpkg | `VCPKG_ROOT` set; OpenImageIO 3.1.12 from the manifest |
+| Python | 3.11.9 x64 with PySide6 6.7.2, PyOpenGL 3.1.7, numpy |
+| vcpkg | checked out at `tools/deps.json`'s baseline; OpenImageIO 3.1.14 from the manifest |
 
 The GPU must expose `VK_KHR_ray_query` and `VK_KHR_acceleration_structure`
 (`vulkaninfo`). CMake finds DXC through `$ENV{VULKAN_SDK}/bin`.
@@ -25,15 +25,33 @@ modules, so the interpreter's major and minor version must match the USD build
 
 ## Dependencies
 
+The versions are those of `tools/deps.json`, the single version list; see
+"How to upgrade a dependency" in [deployment.md](deployment.md). CMake checks
+the versions it finds against it, and `prism_deps_consistency_test` checks this
+table.
+
 | Dependency | Version | Notes |
 | --- | --- | --- |
-| OpenUSD | 26.05 | `build_scripts/build_usd.py` with Python, imaging, usdview and MaterialX. Uses oneTBB (`-DPXR_FIND_TBB_IN_CONFIG=ON`); the install must not contain legacy `include\tbb` headers. |
-| OpenSubdiv | 3.6.1 | Built by `build_usd.py`. Static builds export only `osdCPU_static`, which PrismRT accepts. |
-| MaterialX | 1.39.4 | Built by `build_usd.py`; PrismRT needs `libraries\` and `libraries\mdl\`. |
-| oneTBB | 2022.2 | Shared by USD and PrismRT (`tbb12.dll`). |
+| OpenUSD | 26.08 | `tools/build_deps_local.ps1` (the CI script) with Python, imaging, usdview and MaterialX. Uses oneTBB (`-DPXR_FIND_TBB_IN_CONFIG=ON`); the install must not contain legacy `include\tbb` headers. |
+| OpenSubdiv | 3.6.1 | Built by the same script. On Windows it builds static libraries (`osdCPU`); static-only packages exporting `osdCPU_static` also work. |
+| MaterialX | 1.39.5 | Built by the same script (the version OpenUSD 26.08 builds against); PrismRT needs `libraries\` and `libraries\mdl\`. |
+| oneTBB | 2022.2.0 | Binary release, shared by USD and PrismRT (`tbb12.dll`). |
 | Embree | 4.4.0 | Intel binary release. |
 | NVIDIA MDL SDK | 2026.0.2 | Built from source without CUDA, see below. Do not use the binary release zip. |
-| OpenImageIO | 3.1.12 | vcpkg, installed into `build\vcpkg_installed\x64-windows`. |
+| OpenImageIO | 3.1.14 | vcpkg, installed into `build\vcpkg_installed\x64-windows`. |
+
+### OpenUSD, MaterialX and OpenSubdiv
+
+```powershell
+.\tools\build_deps_local.ps1 -TbbRoot C:\deps\oneapi-tbb-2022.2.0 -WorkDir D:\prism-deps\src
+```
+
+builds the three with `tools/ci/build_usd_stack.ps1`, exactly as CI does, into
+`D:\prism-deps\opensubdiv-3.6.1`, `materialx-1.39.5` and `openusd-26.08`
+(about 50 minutes with `-Jobs 6`; the work directory can be deleted
+afterwards). Then point `cmake\PrismLocalDependencies.cmake` and
+`prism_local_env.ps1` at those prefixes (see their `.example` files). See
+[deployment.md](deployment.md#local-dependency-stack) for the options.
 
 ### MDL SDK: build from source, without CUDA
 
@@ -45,7 +63,7 @@ fails with error 126. PrismRT only uses the native (LLVM) and HLSL backends,
 never PTX, so it builds the SDK itself with the GPU baker off:
 
 ```powershell
-.	ools\ciuild_mdl_sdk.ps1 -Prefix C:\deps\mdl-sdk-2026.0.2-nocuda -WorkDir D:\mdl-work
+.\tools\ci\build_mdl_sdk.ps1 -Prefix C:\deps\mdl-sdk-2026.0.2-nocuda -WorkDir D:\mdl-work
 ```
 
 The script (also used by CI) needs Visual Studio 2022, CMake, git, Python 3 and
