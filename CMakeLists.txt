@@ -68,6 +68,8 @@ set(TINYOBJLOADER_BUILD_TEST_LOADER OFF CACHE INTERNAL "" FORCE)
 add_subdirectory(external/tinyobj)
 
 find_package(OpenImageIO CONFIG REQUIRED)
+# Colour management (src/color); vcpkg also builds it for OpenImageIO.
+find_package(OpenColorIO CONFIG REQUIRED)
 find_package(embree 4 REQUIRED)
 find_package(TBB REQUIRED CONFIG)
 find_package(OpenGL REQUIRED)
@@ -267,6 +269,7 @@ target_include_directories(prism_core PUBLIC ${PXR_INCLUDE_DIRS})
 target_include_directories(prism_core PUBLIC ${Python3_INCLUDE_DIRS})
 target_link_libraries(prism_core PUBLIC
     OpenImageIO::OpenImageIO
+    OpenColorIO::OpenColorIO
     embree
     TBB::tbb
     ${PXR_LIBRARIES}

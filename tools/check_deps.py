@@ -39,6 +39,7 @@ def expected_versions(deps):
         "numpy": packages["numpy"],
         "Vulkan SDK": deps["vulkan_sdk"]["version"],
         "OpenImageIO": deps["vcpkg"]["openimageio"],
+        "OpenColorIO": deps["vcpkg"]["opencolorio"],
     }
 
 

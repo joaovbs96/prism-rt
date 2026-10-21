@@ -14,6 +14,7 @@ foreach(_component openusd materialx opensubdiv onetbb embree mdl_sdk python vul
     string(JSON PRISM_DEP_${_upper}_VERSION GET "${_prism_deps_json}" ${_component} version)
 endforeach()
 string(JSON PRISM_DEP_OPENIMAGEIO_VERSION GET "${_prism_deps_json}" vcpkg openimageio)
+string(JSON PRISM_DEP_OPENCOLORIO_VERSION GET "${_prism_deps_json}" vcpkg opencolorio)
 
 # Strict on Windows, whose CI and local stacks are built from deps.json. Other
 # platforms (the macOS/Metal build) may use system packages, so they only warn.
@@ -102,6 +103,7 @@ macro(prism_check_dependency_versions)
     prism_check_dependency_version(oneTBB "${TBB_VERSION}" "${PRISM_DEP_ONETBB_VERSION}")
     prism_check_dependency_version(Embree "${embree_VERSION}" "${PRISM_DEP_EMBREE_VERSION}")
     prism_check_dependency_version(OpenImageIO "${OpenImageIO_VERSION}" "${PRISM_DEP_OPENIMAGEIO_VERSION}")
+    prism_check_dependency_version(OpenColorIO "${OpenColorIO_VERSION}" "${PRISM_DEP_OPENCOLORIO_VERSION}")
     if(Python3_VERSION_MAJOR)
         prism_check_dependency_version(Python
             "${Python3_VERSION_MAJOR}.${Python3_VERSION_MINOR}" "${PRISM_DEP_PYTHON_VERSION}")

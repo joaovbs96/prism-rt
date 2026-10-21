@@ -158,6 +158,10 @@ $binDir = Join-Path $pkg "bin"
 Copy-Dlls $TbbRuntime $binDir @($tbbDll, "tbbmalloc.dll")
 Copy-Dlls $EmbreeRuntime $binDir @($embreeDll)
 Copy-Dlls $VcpkgBin $binDir
+# Colour management links OpenColorIO directly; its built-in configs are
+# compiled into the DLL, so no config files ship.
+$ocioDll = "OpenColorIO_" + (($deps.vcpkg.opencolorio -split "\.")[0..1] -join "_") + ".dll"
+if (-not (Test-Path -LiteralPath (Join-Path $binDir $ocioDll))) { throw "$ocioDll missing from $VcpkgBin" }
 if ($OpenSubdivRoot -and (Test-Path -LiteralPath (Join-Path $OpenSubdivRoot "bin"))) {
     Copy-Dlls (Join-Path $OpenSubdivRoot "bin") $binDir
 }
@@ -245,7 +249,7 @@ foreach ($name in @("usdview.bat", "prism_render.bat", "list_devices.bat", "env_
     $versions = @(
         "  OpenUSD $($deps.openusd.version), MaterialX $($deps.materialx.version), OpenSubdiv $($deps.opensubdiv.version)",
         "  oneTBB $($deps.onetbb.version), Embree $($deps.embree.version), MDL SDK $($deps.mdl_sdk.version)",
-        "  OpenImageIO $($deps.vcpkg.openimageio), Python $($deps.python.version), PySide6 $PySideVersion"
+        "  OpenImageIO $($deps.vcpkg.openimageio), OpenColorIO $($deps.vcpkg.opencolorio), Python $($deps.python.version), PySide6 $PySideVersion"
     ) -join "`n"
     $text = $text.Replace("@PRISM_DEPENDENCY_VERSIONS@", $versions) -replace "`r?`n", "`r`n"
     [IO.File]::WriteAllText((Join-Path $pkg $name), $text, (New-Object Text.UTF8Encoding($false)))

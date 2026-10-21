@@ -21,6 +21,7 @@
   "vcpkg": {
     "baseline": "9eec002df1cd109f8f104cd966a763daf9751489",
     "release": "2026.10.16",
-    "openimageio": "3.1.14"
+    "openimageio": "3.1.14",
+    "opencolorio": "2.6.0"
   }
 }
