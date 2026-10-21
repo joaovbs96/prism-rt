@@ -68,7 +68,7 @@ Their license files are in the licenses folder where the projects ship them.
   - Intel oneTBB, Apache 2.0
   - OpenImageIO, OpenColorIO, OpenEXR/Imath and other libraries from vcpkg
     (BSD / Apache 2.0 / MIT, see licenses\vcpkg)
-  - Python 3.11, PSF License
+  - Python, PSF License
   - PySide6 / Qt 6, LGPL v3. Qt is dynamically linked and its libraries are
     replaceable files in python\Lib\site-packages\PySide6.
   - PyOpenGL (BSD), NumPy (BSD)
@@ -77,3 +77,7 @@ Their license files are in the licenses folder where the projects ship them.
   - Khronos Vulkan loader (vulkan-1.dll, LunarG Vulkan SDK), Apache 2.0
   - Microsoft Visual C++ runtime, redistributable under the Visual Studio
     license terms
+
+Versions
+--------
+@PRISM_DEPENDENCY_VERSIONS@

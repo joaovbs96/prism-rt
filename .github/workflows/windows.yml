@@ -22,8 +22,8 @@ env:
   # Everything heavy lives on D:, the large drive of the hosted runner.
   DEPS: D:\deps
   OUT: D:\out
-  USD_STACK_KEY: usd-26.05-osd-3.6.1-mtlx-1.39.4-tbb-2022.2.0-py3.11-win2022
-  MDL_SDK_KEY: mdl-2026.0.2-nocuda-win2022
+  # Every dependency version comes from tools/deps.json: each job's first step
+  # (tools/ci/export_deps.ps1) exports the versions and the cache keys.
   VCPKG_BINARY_CACHE: D:\vcpkg-binary-cache
 
 defaults:
@@ -39,14 +39,12 @@ jobs:
     runs-on: windows-2022
     timeout-minutes: 300
     outputs:
-      key: ${{ steps.key.outputs.key }}
+      key: ${{ steps.deps.outputs.usd_key }}
     steps:
       - uses: actions/checkout@v4
-      - name: Cache key
-        id: key
-        run: |
-          $hash = "${{ hashFiles('tools/ci/build_usd_stack.ps1', 'tools/ci/fetch_prebuilt.ps1') }}"
-          "key=$env:USD_STACK_KEY-$hash" >> $env:GITHUB_OUTPUT
+      - name: Versions and cache keys from tools/deps.json
+        id: deps
+        run: ./tools/ci/export_deps.ps1
       - name: Look up cache
         id: cache
         uses: actions/cache/restore@v4
@@ -55,12 +53,12 @@ jobs:
             D:\deps\osd
             D:\deps\mtlx
             D:\deps\usd
-          key: ${{ steps.key.outputs.key }}
+          key: ${{ steps.deps.outputs.usd_key }}
           lookup-only: true
       - uses: actions/setup-python@v5
         if: steps.cache.outputs.cache-hit != 'true'
         with:
-          python-version: "3.11"
+          python-version: ${{ steps.deps.outputs.python }}
       - name: Fetch oneTBB
         if: steps.cache.outputs.cache-hit != 'true'
         run: ./tools/ci/fetch_prebuilt.ps1 -Prefix $env:DEPS -Components tbb
@@ -68,7 +66,7 @@ jobs:
         if: steps.cache.outputs.cache-hit != 'true'
         run: |
           ./tools/ci/build_usd_stack.ps1 -Prefix $env:DEPS `
-            -TbbRoot "$env:DEPS\tbb\oneapi-tbb-2022.2.0" -SourceDir D:\src
+            -TbbRoot "$env:DEPS\tbb\oneapi-tbb-$env:PRISM_DEP_ONETBB" -SourceDir D:\src
       - name: Save cache
         if: steps.cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
@@ -77,7 +75,7 @@ jobs:
             D:\deps\osd
             D:\deps\mtlx
             D:\deps\usd
-          key: ${{ steps.key.outputs.key }}
+          key: ${{ steps.deps.outputs.usd_key }}
 
   # The MDL SDK build (vendored LLVM) is its own job and cache, keyed on the SDK
   # version and the build script, so changing it never invalidates the OpenUSD
@@ -87,25 +85,23 @@ jobs:
     runs-on: windows-2022
     timeout-minutes: 300
     outputs:
-      key: ${{ steps.key.outputs.key }}
+      key: ${{ steps.deps.outputs.mdl_key }}
     steps:
       - uses: actions/checkout@v4
-      - name: Cache key
-        id: key
-        run: |
-          $hash = "${{ hashFiles('tools/ci/build_mdl_sdk.ps1', 'tools/ci/mdl_vcpkg/vcpkg.json') }}"
-          "key=$env:MDL_SDK_KEY-$hash" >> $env:GITHUB_OUTPUT
+      - name: Versions and cache keys from tools/deps.json
+        id: deps
+        run: ./tools/ci/export_deps.ps1
       - name: Look up cache
         id: cache
         uses: actions/cache/restore@v4
         with:
           path: D:\deps\mdl
-          key: ${{ steps.key.outputs.key }}
+          key: ${{ steps.deps.outputs.mdl_key }}
           lookup-only: true
       - uses: actions/setup-python@v5
         if: steps.cache.outputs.cache-hit != 'true'
         with:
-          python-version: "3.11"
+          python-version: ${{ steps.deps.outputs.python }}
       - name: Build the MDL SDK without CUDA
         if: steps.cache.outputs.cache-hit != 'true'
         run: ./tools/ci/build_mdl_sdk.ps1 -Prefix "$env:DEPS\mdl" -WorkDir D:\mdl-work
@@ -114,7 +110,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: D:\deps\mdl
-          key: ${{ steps.key.outputs.key }}
+          key: ${{ steps.deps.outputs.mdl_key }}
 
   build:
     name: Build, test and package
@@ -129,9 +125,18 @@ jobs:
           submodules: recursive
           fetch-depth: 0 # the package name uses the git short sha
 
+      - name: Versions from tools/deps.json
+        id: deps
+        run: ./tools/ci/export_deps.ps1
+
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ steps.deps.outputs.python }}
+
+      - name: Check the vcpkg manifests and docs against tools/deps.json
+        run: |
+          python tools/check_deps.py
+          if ($LASTEXITCODE) { throw "the repository disagrees with tools/deps.json" }
 
       - name: Restore OpenUSD stack
         uses: actions/cache/restore@v4
@@ -155,7 +160,7 @@ jobs:
 
       - name: Install the Vulkan SDK
         run: |
-          $version = "1.4.321.0"
+          $version = $env:PRISM_DEP_VULKAN_SDK
           $installer = "$env:RUNNER_TEMP\vulkan-sdk.exe"
           $ProgressPreference = "SilentlyContinue"
           Invoke-WebRequest -Uri "https://sdk.lunarg.com/sdk/download/$version/windows/vulkansdk-windows-X64-$version.exe" `
@@ -187,7 +192,8 @@ jobs:
 
       - name: Install OpenImageIO with vcpkg
         run: |
-          $baseline = (Get-Content vcpkg.json -Raw | ConvertFrom-Json).'builtin-baseline'
+          # check_deps.py verified that vcpkg.json carries the same baseline.
+          $baseline = $env:PRISM_DEP_VCPKG_BASELINE
           git clone --quiet --filter=blob:none https://github.com/microsoft/vcpkg D:\vcpkg
           git -C D:\vcpkg checkout --quiet $baseline
           D:\vcpkg\bootstrap-vcpkg.bat -disableMetrics
@@ -212,8 +218,8 @@ jobs:
           $env:PRISM_OPENUSD_ROOT = "$deps/usd"
           $env:PRISM_OPENSUBDIV_ROOT = "$deps/osd"
           $env:PRISM_MATERIALX_ROOT = "$deps/mtlx"
-          $env:PRISM_TBB_ROOT = "$deps/tbb/oneapi-tbb-2022.2.0"
-          $env:PRISM_TBB_REDIST = "$deps/tbb/oneapi-tbb-2022.2.0/redist/intel64/vc14"
+          $env:PRISM_TBB_ROOT = "$deps/tbb/oneapi-tbb-$env:PRISM_DEP_ONETBB"
+          $env:PRISM_TBB_REDIST = "$deps/tbb/oneapi-tbb-$env:PRISM_DEP_ONETBB/redist/intel64/vc14"
           $env:PRISM_EMBREE_ROOT = "$deps/embree"
           $env:PRISM_EMBREE_RUNTIME_DIR = "$deps/embree/bin"
           $env:PRISM_MDL_SDK_ROOT = "$deps/mdl"

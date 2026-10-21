@@ -5,8 +5,9 @@
 .DESCRIPTION
   Installs PrismRT from an existing build, copies the runtime dependencies
   (OpenUSD, MaterialX libraries, oneTBB, Embree, MDL SDK, vcpkg DLLs, DXC, the
-  MSVC runtime), bundles a private Python 3.11 with PySide6, PyOpenGL and numpy,
-  writes the launcher .bat files and README, and zips the result.
+  MSVC runtime), bundles a private Python with PySide6, PyOpenGL and numpy
+  (versions from tools/deps.json), writes the launcher .bat files and README,
+  and zips the result.
 
   Dependency locations default from the PRISM_* variables used by
   prism_env.ps1, then from an ignored prism_local_env.ps1, then from the
@@ -27,8 +28,6 @@ param(
     [string] $PythonRoot = "",
     [string] $DxcDir = "",
     [string] $VulkanLoader = "",
-    [string] $PySideVersion = "6.7.2",
-    [string[]] $PipPackages = @("numpy==2.2.6", "PyOpenGL==3.1.7"),
     [switch] $SkipPip,
     [switch] $SkipZip
 )
@@ -36,6 +35,13 @@ param(
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 $templates = Join-Path $PSScriptRoot "package"
+Import-Module (Join-Path $PSScriptRoot "deps.psm1") -Force
+$deps = Get-PrismDeps
+$PySideVersion = $deps.python.packages.PySide6
+$PipPackages = Get-PrismPipRequirements -Only numpy, PyOpenGL
+# DLL names follow the ABI: oneTBB's binary interface 12, Embree's major version.
+$tbbDll = "tbb12.dll"
+$embreeDll = "embree$($deps.embree.version.Split('.')[0]).dll"
 
 # Machine-local defaults, then the build's runtime description.
 $localEnv = Join-Path $root "prism_local_env.ps1"
@@ -89,8 +95,8 @@ function Require-Path([string] $label, [string] $path) {
 Require-Path "OpenUSD install (-UsdRoot)" (Join-Path $UsdRoot "lib")
 Require-Path "usdview.py (-UsdviewScript)" $UsdviewScript
 Require-Path "MaterialX libraries (-MaterialXRoot)" (Join-Path $MaterialXRoot "libraries")
-Require-Path "oneTBB runtime (-TbbRuntime)" (Join-Path $TbbRuntime "tbb12.dll")
-Require-Path "Embree runtime (-EmbreeRuntime)" (Join-Path $EmbreeRuntime "embree4.dll")
+Require-Path "oneTBB runtime (-TbbRuntime)" (Join-Path $TbbRuntime $tbbDll)
+Require-Path "Embree runtime (-EmbreeRuntime)" (Join-Path $EmbreeRuntime $embreeDll)
 Require-Path "vcpkg runtime (-VcpkgBin)" $VcpkgBin
 Require-Path "Python (-PythonRoot)" (Join-Path $PythonRoot "python.exe")
 Require-Path "DXC (-DxcDir)" (Join-Path $DxcDir "dxc.exe")
@@ -149,8 +155,8 @@ Remove-Item -LiteralPath $stage -Recurse -Force
 # 2. Runtime dependencies. Every plain DLL goes beside PrismRT.exe (bin), which
 #    is also on PATH for hdPrism.dll.
 $binDir = Join-Path $pkg "bin"
-Copy-Dlls $TbbRuntime $binDir @("tbb12.dll", "tbbmalloc.dll")
-Copy-Dlls $EmbreeRuntime $binDir @("embree4.dll")
+Copy-Dlls $TbbRuntime $binDir @($tbbDll, "tbbmalloc.dll")
+Copy-Dlls $EmbreeRuntime $binDir @($embreeDll)
 Copy-Dlls $VcpkgBin $binDir
 if ($OpenSubdivRoot -and (Test-Path -LiteralPath (Join-Path $OpenSubdivRoot "bin"))) {
     Copy-Dlls (Join-Path $OpenSubdivRoot "bin") $binDir
@@ -235,7 +241,13 @@ if (-not $SkipPip) {
 
 # 4. Launchers and README (CRLF so cmd.exe is happy whatever the checkout's EOLs).
 foreach ($name in @("usdview.bat", "prism_render.bat", "list_devices.bat", "env_setup.bat", "README.txt")) {
-    $text = [IO.File]::ReadAllText((Join-Path $templates $name)) -replace "`r?`n", "`r`n"
+    $text = [IO.File]::ReadAllText((Join-Path $templates $name))
+    $versions = @(
+        "  OpenUSD $($deps.openusd.version), MaterialX $($deps.materialx.version), OpenSubdiv $($deps.opensubdiv.version)",
+        "  oneTBB $($deps.onetbb.version), Embree $($deps.embree.version), MDL SDK $($deps.mdl_sdk.version)",
+        "  OpenImageIO $($deps.vcpkg.openimageio), Python $($deps.python.version), PySide6 $PySideVersion"
+    ) -join "`n"
+    $text = $text.Replace("@PRISM_DEPENDENCY_VERSIONS@", $versions) -replace "`r?`n", "`r`n"
     [IO.File]::WriteAllText((Join-Path $pkg $name), $text, (New-Object Text.UTF8Encoding($false)))
 }
 "$sha`r`n" | Set-Content -LiteralPath (Join-Path $pkg "VERSION.txt") -NoNewline -Encoding ascii

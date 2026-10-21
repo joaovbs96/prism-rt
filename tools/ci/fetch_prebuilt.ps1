@@ -2,16 +2,20 @@
 .SYNOPSIS
   Downloads the prebuilt dependencies for the Windows CI into <Prefix>:
   oneTBB (tbb), Embree (embree) and the MDL SDK (mdl; headers and DLLs only).
+  The versions come from tools/deps.json. The MDL SDK binary release imports
+  nvcuda.dll; CI builds the SDK instead (build_mdl_sdk.ps1).
 #>
 param(
     [Parameter(Mandatory)] [string] $Prefix,
-    [string] $TbbVersion = "2022.2.0",
-    [string] $EmbreeVersion = "4.4.0",
-    [string] $MdlRelease = "2026.0.2",
-    [string] $MdlBuild = "391700.2276",
     [string[]] $Components = @("tbb", "embree", "mdl")
 )
 $ErrorActionPreference = "Stop"
+Import-Module (Join-Path (Split-Path -Parent $PSScriptRoot) "deps.psm1") -Force
+$deps = Get-PrismDeps
+$TbbVersion = $deps.onetbb.version
+$EmbreeVersion = $deps.embree.version
+$MdlRelease = $deps.mdl_sdk.tag
+$MdlBuild = $deps.mdl_sdk.build
 $ProgressPreference = "SilentlyContinue"
 New-Item -ItemType Directory -Force -Path $Prefix | Out-Null
 $tmp = Join-Path $Prefix "_download"
@@ -19,7 +23,12 @@ New-Item -ItemType Directory -Force -Path $tmp | Out-Null
 
 function Get-Zip([string] $url, [string] $name) {
     $file = Join-Path $tmp $name
-    Invoke-WebRequest -Uri $url -OutFile $file -MaximumRetryCount 3 -RetryIntervalSec 5
+    Write-Host "Downloading $url"
+    if ($PSVersionTable.PSVersion.Major -ge 7) {
+        Invoke-WebRequest -Uri $url -OutFile $file -MaximumRetryCount 3 -RetryIntervalSec 5
+    } else {
+        Invoke-WebRequest -Uri $url -OutFile $file -UseBasicParsing # Windows PowerShell
+    }
     return $file
 }
 

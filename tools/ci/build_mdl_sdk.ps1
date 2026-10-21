@@ -14,20 +14,23 @@
   bitcode libraries), and vcpkg at the baseline the SDK was tested with (Boost headers
   and a static OpenImageIO for the image plugin, from tools/ci/mdl_vcpkg/vcpkg.json).
 
-  Keep $MdlTag and the cache key in the workflow in sync. Layout of -Prefix: bin\ with
+  The tag, clang version and vcpkg baseline come from tools/deps.json (mdl_sdk);
+  the workflow's cache key is derived from them. Layout of -Prefix: bin\ with
   the DLLs and tools, include\, LICENSE*.md. Work files go to -WorkDir, which can be
   deleted afterwards (~10 GB).
 #>
 param(
     [Parameter(Mandatory)] [string] $Prefix,
     [Parameter(Mandatory)] [string] $WorkDir,
-    [string] $MdlTag = "2026.0.2",
-    [string] $VcpkgBaseline = "9d7f79f56ae1a9b4704d6a7fb8237e347a974133",
-    [string] $ClangVersion = "12.0.1",
     [string] $Configuration = "Release",
     [int] $Jobs = 0
 )
 $ErrorActionPreference = "Stop"
+Import-Module (Join-Path (Split-Path -Parent $PSScriptRoot) "deps.psm1") -Force
+$deps = Get-PrismDeps
+$MdlTag = $deps.mdl_sdk.tag
+$VcpkgBaseline = $deps.mdl_sdk.vcpkg_baseline
+$ClangVersion = $deps.mdl_sdk.clang
 $ProgressPreference = "SilentlyContinue"
 function Run([string] $what, [scriptblock] $block) {
     Write-Host "::group::$what"
