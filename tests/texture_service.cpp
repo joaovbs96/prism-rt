@@ -554,8 +554,11 @@ int main()
             std::ofstream out(app13Jpeg, std::ios::binary);
             out.write(app13Bytes.data(), static_cast<std::streamsize>(app13Bytes.size()));
         }
-        require(!OIIO::ImageInput::open(app13Jpeg.string()),
-                "OIIO unexpectedly accepts the APP13 JPEG; the fallback is no longer needed");
+        // OIIO 3.1.14 reads such files itself; older releases (still possible
+        // on other platforms' stacks) need the service's fallback. Either way
+        // the prepared texture must match the clean JPEG.
+        if (OIIO::ImageInput::open(app13Jpeg.string()))
+            std::cout << "texture_service: this OIIO reads the APP13 JPEG directly\n";
         (void)OIIO::geterror();
         auto cleanPrepared = service->prepare(cleanJpeg);
         auto app13Prepared = service->prepare(app13Jpeg);

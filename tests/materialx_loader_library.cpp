@@ -33,7 +33,10 @@ int run()
     auto doc = loader.load(path.string());
     require(bool(doc), "data-library fixture failed to load");
     require(doc->hasDataLibrary(), "standard library was copied into the document");
-    require(!doc->getChild("ND_prism_test"), "definition unexpectedly became local content");
+    // getChildren lists local content only; MaterialX 1.39.5's getChild also
+    // falls back to the data library.
+    for (const auto& child : doc->getChildren())
+        require(child->getName() != "ND_prism_test", "definition unexpectedly became local content");
     require(doc->getNodeDef("ND_prism_test") == definition,
             "definition did not resolve through the data library");
     require(doc->getNode("test")->getNodeDef() == definition,
