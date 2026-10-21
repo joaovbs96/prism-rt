@@ -73,7 +73,8 @@ void renderThread(uint thread)
                                      (flags & kFrameTransparentEscapes) != 0u,
                                      frame.counts.w != 0u ? frame.counts.w : kContributionAll,
                                      frame.shading.z, int(frame.shading.w),
-                                     (flags & kFrameSpatialLights) != 0u};
+                                     (flags & kFrameSpatialLights) != 0u,
+                                     float3(frame.color.x, frame.color.y, frame.color.z)};
     const uint width = frame.size.x;
     const uint height = frame.size.y;
     const uint mode = frame.work.z;

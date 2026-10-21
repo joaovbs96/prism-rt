@@ -175,6 +175,8 @@ struct SampleSettings {
     int neeFromDepth;
     // Spatial light selection (see PathTracer::pickLight); false: by power only.
     bool spatialLights;
+    // Luminance weights of the working space (light selection).
+    float3 luminance;
 };
 
 // Spatial light selection loops over the analytic lights: at most this many.
@@ -351,7 +353,7 @@ struct PathTracer {
     float linkedImportance(LightRecord light, float3 p, uint receiver)
     {
         if (light.info.w != 0u && (receiver & light.info.w) == 0u) return 0.0f;
-        return lightImportance(light, p);
+        return lightImportance(light, p, settings.luminance);
     }
 
     AnalyticLightSums analyticSums(float3 p, uint receiver)

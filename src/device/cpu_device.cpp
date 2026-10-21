@@ -5,6 +5,7 @@
 #include "cpu_device.h"
 #include "cpu_backend.h"
 #include "../batched_spheres.h"
+#include "../color/color_management.h"
 #include "../hydra/fallback_material.h"
 #include "../mdl_material.h"
 
@@ -24,6 +25,13 @@
 namespace prism::device {
 
 namespace {
+
+// Light selection weighs radiance by the working space's luminance.
+float3 WorkingLuminance()
+{
+    const auto& w = prism::color::Active()->luminanceWeights();
+    return float3(w[0], w[1], w[2]);
+}
 
 // Count actual ray work once per task, including work abandoned by a stop.
 struct WorkCounter {
@@ -181,7 +189,7 @@ std::vector<float> CpuDevice::RenderImage(SceneManager& scene, ImageRequest cons
     const CameraParams camera = ToCameraParams(request.camera);
     const auto state = PreparedScene(scene);
     const SampleSettings settings = {request.sampleClamp, 1.0f, false, request.contributions,
-        request.nee.probabilityMin, request.nee.fromDepth, request.nee.spatialLights};
+        request.nee.probabilityMin, request.nee.fromDepth, request.nee.spatialLights, WorkingLuminance()};
     const AdaptiveSettings& adaptive = request.adaptive;
     const size_t count = size_t(width) * height;
     std::vector<unsigned> seeds(count);
@@ -252,7 +260,7 @@ void CpuDevice::RenderPass(SceneManager& scene, PassRequest const& request)
     const SampleSettings settings = {request.shading.sampleClamp,
         request.shading.exposureScale, request.shading.transparentEscapes, kContributionAll,
         request.shading.nee.probabilityMin, request.shading.nee.fromDepth,
-        request.shading.nee.spatialLights};
+        request.shading.nee.spatialLights, WorkingLuminance()};
 
     tbb::task_arena renderArena(std::max(1, request.concurrency));
     renderArena.execute([&] {
@@ -365,7 +373,7 @@ bool CpuDevice::RenderPreview(SceneManager& scene, PreviewRequest const& request
     const SampleSettings settings = {request.shading.sampleClamp,
         request.shading.exposureScale, request.shading.transparentEscapes, kContributionAll,
         request.shading.nee.probabilityMin, request.shading.nee.fromDepth,
-        request.shading.nee.spatialLights};
+        request.shading.nee.spatialLights, WorkingLuminance()};
     tbb::parallel_for(
         tbb::blocked_range2d<unsigned int>(
             0, previewHeight, 4, 0, previewWidth, 8),

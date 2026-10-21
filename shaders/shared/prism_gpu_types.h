@@ -197,6 +197,7 @@ struct GpuFrame {
     uint4 streaming;             // texture feedback (kFrameTextureFeedback): x: image count, y: LOD margin
                                  // (1/16 levels), z: phase,
                                  // w: pixel stride (one pixel of each stride x stride block records)
+    float4 color;                // xyz: luminance weights of the working space (light selection)
 };
 
 

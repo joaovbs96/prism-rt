@@ -8,6 +8,7 @@
 #include "hlsl_math.h"
 #include "../../shaders/integrator/lights.h"
 #include "../scene.h"
+#include "../color/color_management.h"
 
 #include <algorithm>
 #include <bit>
@@ -39,7 +40,7 @@ namespace light_table_detail {
 
 inline float Luminance(Color3 const& c)
 {
-    const float l = 0.2126f * c.x() + 0.7152f * c.y() + 0.0722f * c.z();
+    const float l = prism::color::Active()->Luminance(c);
     return std::isfinite(l) ? std::max(0.0f, l) : 0.0f;
 }
 

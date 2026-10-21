@@ -4,6 +4,7 @@
 #include "texture.h"
 #include "ray.h"
 #include "rng.h"
+#include "color/color_management.h"
 #include <algorithm>
 #include <cmath>
 #include <vector>
@@ -75,7 +76,7 @@ class Environment {
             const float r = std::sqrt(std::max(0.0f, 1.0f - y * y));
             const float phi = float(i) * 2.39996322972865332f;
             const Color3 c = radiance(Float3(r * std::cos(phi), y, r * std::sin(phi)));
-            const float lum = 0.2126f * c.x() + 0.7152f * c.y() + 0.0722f * c.z();
+            const float lum = prism::color::Active()->Luminance(c);
             if (std::isfinite(lum) && lum > 0.0f) sum += lum;
         }
         return float(sum / count * 4.0 * 3.14159265358979323846);
@@ -235,13 +236,14 @@ class EnvironmentMap : public Environment {
         const size_t count = static_cast<size_t>(width) * height;
         std::vector<float> weights(count); double total = 0.0;
         std::vector<float> row(static_cast<size_t>(width) * 3);
+        const auto& color = *prism::color::Active();
         for (int y = 0; y < height; ++y) {
             if (!image->readRow(y, row.data(), 3))
                 throw std::runtime_error("Cannot read environment sampling distribution");
             for (int x = 0; x < width; ++x) {
                 const float* pixel = row.data() + 3*x;
                 Color3 c = multiplier * Color3(pixel[0], pixel[1], pixel[2]);
-                float lum = std::max(0.0f, 0.2126f*c.x() + 0.7152f*c.y() + 0.0722f*c.z());
+                float lum = std::max(0.0f, color.Luminance(c));
                 if (!std::isfinite(lum)) lum = 0.0f;
                 weights[static_cast<size_t>(y)*width+x] = lum * texelSolidAngle(y);
                 total += weights[static_cast<size_t>(y)*width+x];

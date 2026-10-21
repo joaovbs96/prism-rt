@@ -290,15 +290,17 @@ inline float cylinderPdfArea(CylinderFrame c, float t)
     return pdfT / (2.0f * c.alpha * c.radius);
 }
 
-inline float luminanceOf(float3 c) { return max(0.0f, 0.2126f * c.x + 0.7152f * c.y + 0.0722f * c.z); }
+// Luminance with the working space's weights (SampleSettings::luminance;
+// prism::color::ColorManagement::luminanceWeights).
+inline float luminanceOf(float3 c, float3 weights) { return max(0.0f, dot(weights, c)); }
 
 // Spatial light selection: about the unoccluded irradiance an analytic light
 // brings to p, without the receiver's cosine (its radiance times the solid
 // angle it subtends, at most a hemisphere). Zero only where the light cannot
 // reach p: behind a one-sided planar light, inside a sphere or cylinder.
-inline float lightImportance(LightRecord light, float3 p)
+inline float lightImportance(LightRecord light, float3 p, float3 luminance)
 {
-    const float l = luminanceOf(xyz(light.radiance));
+    const float l = luminanceOf(xyz(light.radiance), luminance);
     const uint type = light.info.x;
     if (type == kLightDistant) return light.u.w >= 1.0f ? l : l * 2.0f * kPi * (1.0f - light.u.w);
     const float3 d = p - xyz(light.p0);
