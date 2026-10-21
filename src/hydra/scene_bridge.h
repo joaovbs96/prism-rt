@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../device/device.h"
+#include "../color/color_management.h"
 #include "../progress.h"
 #include "../texture_service.h"
 #include "published_pick_scene.h"
@@ -72,6 +73,10 @@ struct RenderSettings {
     // The preview is skipped for scenes whose Embree memory exceeds this
     // many MiB (0 never skips).
     int gpuPreparationPreviewMaxMiB = 8192;
+    // prism:colorManagement:{ocioConfig,workingSpace,display,view}; empty
+    // fields take the defaults (docs/color_management.md). The colour AOV is
+    // linear in the working space; display and view only record the request.
+    prism::color::Options color;
 };
 
 enum class SceneDirtyKind : unsigned int {

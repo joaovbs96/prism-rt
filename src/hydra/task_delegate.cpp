@@ -21,6 +21,7 @@
 #include "pxr/imaging/hd/renderSettingsSchema.h"
 #include "pxr/imaging/hd/selectionsSchema.h"
 #include "pxr/base/tf/diagnostic.h"
+#include "pxr/usd/sdf/assetPath.h"
 
 #include <algorithm>
 #include <limits>
@@ -56,6 +57,10 @@ TfToken const _selectionOutline("prism:selectionOutline");
 TfToken const _selectionOutlineRadius("prism:selectionOutlineRadius");
 TfToken const _selectionUseHostSettings("prism:selectionUseHostSettings");
 TfToken const _usdviewSelection("prism:usdviewSelection");
+TfToken const _colorConfig("prism:colorManagement:ocioConfig");
+TfToken const _colorWorkingSpace("prism:colorManagement:workingSpace");
+TfToken const _colorDisplay("prism:colorManagement:display");
+TfToken const _colorView("prism:colorManagement:view");
 
 template<class T>
 T _Get(VtValue const &v, T fallback)
@@ -214,7 +219,11 @@ HdRenderSettingDescriptorList PrismTaskDelegate::GetRenderSettingDescriptors() c
             {"Resource revision", _resourceRevision, VtValue(0)},
             {"Selection outline", _selectionOutline, VtValue(true)},
             {"Selection outline radius", _selectionOutlineRadius, VtValue(2)},
-            {"Use host selection settings", _selectionUseHostSettings, VtValue(false)}};
+            {"Use host selection settings", _selectionUseHostSettings, VtValue(false)},
+            {"OpenColorIO config (empty: $OCIO, else the studio config)", _colorConfig, VtValue(std::string())},
+            {"Working space (empty: ACEScg)", _colorWorkingSpace, VtValue(std::string())},
+            {"Display (empty: the config's default; recorded only)", _colorDisplay, VtValue(std::string())},
+            {"View (empty: the display's default; recorded only)", _colorView, VtValue(std::string())}};
 }
 
 VtValue PrismTaskDelegate::GetRenderSetting(TfToken const &key) const
@@ -250,6 +259,10 @@ VtValue PrismTaskDelegate::GetRenderSetting(TfToken const &key) const
     if (key == _gpuPreparationPreviewMaxMiB) return VtValue(s.gpuPreparationPreviewMaxMiB);
     if (key == _resourceRevision) return VtValue(s.resourceRevision);
     if (key == _device) return VtValue(std::string(prism::device::ToString(s.device)));
+    if (key == _colorConfig) return VtValue(s.color.config);
+    if (key == _colorWorkingSpace) return VtValue(s.color.workingSpace);
+    if (key == _colorDisplay) return VtValue(s.color.display);
+    if (key == _colorView) return VtValue(s.color.view);
     if (key == _selectionOutline)
         return VtValue(_selectionSettings->enableOutline.load());
     if (key == _selectionOutlineRadius)
@@ -403,6 +416,22 @@ void PrismTaskDelegate::SetRenderSetting(TfToken const &key, VtValue const &valu
             TF_WARN("PrismRT: prism:device must be auto, cpu, cpu-reference, vulkan or metal; retaining the previous device");
             return;
         }
+    }
+    else if ((key == _colorConfig || key == _colorWorkingSpace || key == _colorDisplay ||
+              key == _colorView) &&
+             (value.IsHolding<std::string>() || value.IsHolding<TfToken>() ||
+              value.IsHolding<SdfAssetPath>())) {
+        std::string text;
+        if (value.IsHolding<std::string>()) text = value.UncheckedGet<std::string>();
+        else if (value.IsHolding<TfToken>()) text = value.UncheckedGet<TfToken>().GetString();
+        else {
+            const auto &asset = value.UncheckedGet<SdfAssetPath>();
+            text = asset.GetResolvedPath().empty() ? asset.GetAssetPath() : asset.GetResolvedPath();
+        }
+        if (key == _colorConfig) s.color.config = text;
+        else if (key == _colorWorkingSpace) s.color.workingSpace = text;
+        else if (key == _colorDisplay) s.color.display = text;
+        else s.color.view = text;
     }
     else return;
     if (_bridge) _bridge->SetSettings(s);

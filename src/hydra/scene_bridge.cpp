@@ -5611,7 +5611,16 @@ public:
 };
 
 SceneBridge::SceneBridge(HdSceneIndexBaseRefPtr sceneIndex, HdRenderThread *thread)
-    : _impl(std::make_unique<Impl>(std::move(sceneIndex), thread)) {}
+    : _impl(std::make_unique<Impl>(std::move(sceneIndex), thread))
+{
+    // A new delegate starts from the default colour management, whatever an
+    // earlier one in this process selected.
+    try {
+        prism::color::Activate(_impl->settings.color);
+    } catch (std::exception const &error) {
+        TF_WARN("PrismRT: %s", error.what());
+    }
+}
 SceneBridge::~SceneBridge()
 {
     // Render() retains a local snapshot but continues to read Impl state and
@@ -5749,14 +5758,29 @@ void SceneBridge::RestartAccumulation()
     _converged.store(false);
 }
 
-void SceneBridge::SetSettings(RenderSettings const &settings)
+void SceneBridge::SetSettings(RenderSettings const &requested)
 {
-    if (settings.hiddenGeometryBudgetMiB < 0) {
+    if (requested.hiddenGeometryBudgetMiB < 0) {
         TF_WARN("PrismRT: hidden geometry budget must be non-negative; retaining the previous settings");
         return;
     }
+    RenderSettings settings = requested;
+    {
+        // Colour management is process-wide (prism::color::Active): an
+        // unusable config, working space or view keeps the previous one.
+        RenderSettings const previous = GetSettings();
+        if (settings.color != previous.color) {
+            try {
+                prism::color::Activate(settings.color);
+            } catch (std::exception const &error) {
+                TF_WARN("PrismRT: %s; retaining the previous colour management", error.what());
+                settings.color = previous.color;
+            }
+        }
+    }
     bool imageChanged = false;
     bool budgetChanged = false;
+    bool colorChanged = false;
     {
         std::lock_guard lock(_impl->mutex);
         RenderSettings const &current = _impl->settings;
@@ -5784,8 +5808,11 @@ void SceneBridge::SetSettings(RenderSettings const &settings)
             current.environmentSampling == settings.environmentSampling &&
             current.gpuPreparationPreview == settings.gpuPreparationPreview &&
             current.gpuPreparationPreviewMaxMiB == settings.gpuPreparationPreviewMaxMiB &&
-            current.device == settings.device)
+            current.device == settings.device && current.color == settings.color)
             return;
+        // Display and view do not touch the linear colour AOV.
+        colorChanged = current.color.config != settings.color.config ||
+            current.color.workingSpace != settings.color.workingSpace;
         imageChanged = current.maxDepth != settings.maxDepth ||
             current.rouletteDepth != settings.rouletteDepth ||
             current.seed != settings.seed ||
@@ -5801,7 +5828,7 @@ void SceneBridge::SetSettings(RenderSettings const &settings)
             current.textureStreaming != settings.textureStreaming ||
             current.environmentSampling != settings.environmentSampling ||
             current.domeLightCameraVisibility != settings.domeLightCameraVisibility ||
-            current.device != settings.device;
+            current.device != settings.device || colorChanged;
         budgetChanged = current.samples != settings.samples;
         if (budgetChanged && !imageChanged && _converged.load() &&
             _impl->samples.load() != 0 &&
@@ -5838,6 +5865,23 @@ void SceneBridge::SetSettings(RenderSettings const &settings)
         ++_impl->materialInvalidations;
         ++_impl->environmentInvalidations;
         _impl->lastRebuildReason = "resource revision changed";
+    }
+    // A new working space changes every converted colour: materials (their
+    // generated colour transforms), lights, domes and their textures.
+    if (_impl->snapshot && colorChanged) {
+        if (_impl->materialService) _impl->materialService->InvalidateAll();
+        _impl->sceneDirty = true;
+        if (_impl->buildCancel)
+            _impl->buildCancel->store(true, std::memory_order_relaxed);
+        ++_impl->requestedGeneration;
+        _impl->dirtyJournal.push_back({
+            _impl->requestedGeneration,
+            static_cast<unsigned int>(SceneDirtyKind::Unknown), {}});
+        _impl->dirtyKinds |= static_cast<unsigned int>(SceneDirtyKind::Unknown);
+        ++_impl->materialInvalidations;
+        ++_impl->environmentInvalidations;
+        ++_impl->conservativeRebuilds;
+        _impl->lastRebuildReason = "colour management changed";
     }
     if (_impl->snapshot &&
         _impl->settings.sphereBatching != settings.sphereBatching) {

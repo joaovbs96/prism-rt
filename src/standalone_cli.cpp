@@ -3,6 +3,7 @@
 #include "camera_rays.h"
 #include "camera_ray_diagnostics.h"
 #include "device/device.h"
+#include "color/color_management.h"
 #include <pxr/usd/usdGeom/camera.h>
 #include <pxr/usd/usdLux/blackbody.h>
 #include <pxr/usd/usdLux/cylinderLight.h>
@@ -25,6 +26,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <array>
 #include <sstream>
 #include <chrono>
 
@@ -45,6 +47,7 @@ struct Options {
     int adaptiveMinSamples = 16;
     unsigned contributions = 7;
     prism::device::NeeSettings nee;
+    prism::color::Options color;
 };
 
 void help() {
@@ -69,8 +72,14 @@ void help() {
         "  --texture-filtering filtered|bilinear (default filtered)\n"
         "  --device auto|cpu|cpu-reference|vulkan|metal (default auto: GPU if available, else CPU;\n"
         "                 cpu-reference runs the original CPU integrator)\n"
+        "  --ocio-config FILE|URI (default $OCIO, else ocio://studio-config-latest)\n"
+        "  --working-space NAME (default ACEScg; lin_rec709 renders in linear Rec.709 as before)\n"
+        "  --display NAME --view NAME (8-bit outputs; default the config's: sRGB - Display and\n"
+        "                 ACES 2.0 - SDR 100 nits (Rec.709). The earlier gamma 2.2 output is\n"
+        "                 --display \"Gamma 2.2 Rec.709 - Display\" --view Un-tone-mapped)\n"
         "PrismRT --list-devices\n"
-        "EXR output is linear after the sample clamp; other formats use gamma 2.2.\n"
+        "EXR output is linear in the working space after the sample clamp; other formats go\n"
+        "through the display and view. Light colors are linear Rec.709.\n"
         "The environment option follows the original EnvironmentMap radiance convention.\n"
         "Without --env, USD scenes use their authored dome lighting.\n";
 }
@@ -123,6 +132,10 @@ Options parse(int argc, char** argv) {
         else if (key == "--env") o.environment = value;
         else if (key == "--env-color") o.environmentColor = triple(value);
         else if (key == "--output") o.output = value;
+        else if (key == "--ocio-config") o.color.config = value;
+        else if (key == "--working-space") o.color.workingSpace = value;
+        else if (key == "--display") o.color.display = value;
+        else if (key == "--view") o.color.view = value;
         else if (key == "--width") { o.width = integer(value); o.widthSet = true; }
         else if (key == "--height") { o.height = integer(value); o.heightSet = true; }
         else if (key == "--spp") o.samples = integer(value);
@@ -191,6 +204,24 @@ Options parse(int argc, char** argv) {
     return o;
 }
 
+// The colour space of a light's texture: linear Rec.709, like the light's
+// color. The Hydra delegate cannot see attribute colorSpace metadata, so
+// neither loader reads it (docs/color_management.md).
+std::string TextureColorSpace(UsdAttribute const&) {
+    return prism::color::kLightColorSpace;
+}
+
+// EXR chromaticities of the working spaces MaterialX names (OpenEXR's
+// red, green, blue and white xy).
+std::optional<std::array<float, 8>> Chromaticities(prism::color::ColorManagement const& color) {
+    const std::string& space = color.materialXSpace();
+    if (space == "acescg") return std::array<float, 8>{0.713f, 0.293f, 0.165f, 0.830f, 0.128f, 0.044f, 0.32168f, 0.33767f};
+    if (space == "lin_rec709") return std::array<float, 8>{0.64f, 0.33f, 0.30f, 0.60f, 0.15f, 0.06f, 0.3127f, 0.3290f};
+    if (space == "lin_displayp3") return std::array<float, 8>{0.680f, 0.320f, 0.265f, 0.690f, 0.150f, 0.060f, 0.3127f, 0.3290f};
+    if (space == "lin_adobergb") return std::array<float, 8>{0.64f, 0.33f, 0.21f, 0.71f, 0.15f, 0.06f, 0.3127f, 0.3290f};
+    return std::nullopt;
+}
+
 // Independent USD camera ingestion, deliberately separate from the Hydra adapter.
 struct UsdCameraRays {
     prism::CameraRayParameters parameters;
@@ -255,7 +286,7 @@ int runStandaloneCli(int argc, char** argv) {
             return 0;
         }
         auto start = std::chrono::steady_clock::now();
-        auto seconds = [&] { return std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count(); };
+        auto seconds =[&] { return std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count(); };
         const auto extension = std::filesystem::path(o.scene).extension().string();
         const bool isUsd = extension == ".usd" || extension == ".usda" || extension == ".usdc" || extension == ".usdz";
         UsdStageRefPtr stage;
@@ -271,8 +302,31 @@ int runStandaloneCli(int argc, char** argv) {
                     if (!o.widthSet) o.width = resolution[0];
                     if (!o.heightSet) o.height = resolution[1];
                 }
+                // The Hydra delegate's prism:colorManagement:* render settings;
+                // command-line options take precedence.
+                for (auto [name, field] : {std::pair{"ocioConfig", &o.color.config},
+                         std::pair{"workingSpace", &o.color.workingSpace},
+                         std::pair{"display", &o.color.display}, std::pair{"view", &o.color.view}}) {
+                    if (!settings || !field->empty()) continue;
+                    const VtValue value = [&] {
+                        VtValue v;
+                        settings.GetPrim().GetAttribute(TfToken(std::string("prism:colorManagement:") + name)).Get(&v);
+                        return v;
+                    }();
+                    if (value.IsHolding<std::string>()) *field = value.UncheckedGet<std::string>();
+                    else if (value.IsHolding<TfToken>()) *field = value.UncheckedGet<TfToken>().GetString();
+                    else if (value.IsHolding<SdfAssetPath>()) {
+                        const auto& asset = value.UncheckedGet<SdfAssetPath>();
+                        *field = asset.GetResolvedPath().empty() ? asset.GetAssetPath() : asset.GetResolvedPath();
+                    }
+                }
             }
         }
+        // Before anything loads: materials, lights and textures convert into
+        // the working space as they are read.
+        const auto colorManagement = prism::color::Activate(o.color);
+        std::cout << "Color: working space " << colorManagement->workingSpace() << ", view " << colorManagement->view()
+                  << " on " << colorManagement->display() << " (" << colorManagement->configName() << ")\n";
         const double stageSeconds = seconds();
         if (o.width <= 0 || o.height <= 0 ||
             static_cast<uint64_t>(o.width) * o.height > std::numeric_limits<unsigned>::max() / 4)
@@ -330,12 +384,12 @@ int runStandaloneCli(int argc, char** argv) {
         std::unique_ptr<ColorTexture> domeColor;
         scene.environment = &background;
         if (o.environmentColor) {
-            domeColor = std::make_unique<ColorTexture>(*o.environmentColor * std::exp2(o.exposure));
+            domeColor = std::make_unique<ColorTexture>(colorManagement->FromRec709(*o.environmentColor) * std::exp2(o.exposure));
             env = std::make_unique<ConstantColorBackground>(domeColor.get());
             scene.environment = env.get();
         } else if (!o.environment.empty()) {
             if (!std::filesystem::exists(o.environment)) throw std::runtime_error("Environment does not exist: " + o.environment);
-            envImage = std::make_unique<ImageTexture<Color3>>(o.environment);
+            envImage = std::make_unique<ImageTexture<Color3>>(o.environment, prism::color::kLightColorSpace);
             envImage->adjustExposure(o.exposure);
             env = std::make_unique<EnvironmentMap>(envImage.get());
             scene.environment = env.get();
@@ -360,13 +414,16 @@ int runStandaloneCli(int argc, char** argv) {
                 const bool isDome = prim.IsA<UsdLuxDomeLight>() || prim.IsA<UsdLuxDomeLight_1>();
                 if (isDome) {
                     if (!useDomes) continue;
-                    const Color3 multiplier = Float3(color[0], color[1], color[2]) * (intensity*std::exp2(exposure));
+                    const Color3 multiplier = colorManagement->FromRec709(Float3(color[0], color[1], color[2])) *
+                        (intensity*std::exp2(exposure));
                     SdfAssetPath asset;
-                    prim.GetAttribute(UsdLuxTokens->inputsTextureFile).Get(&asset);
+                    const UsdAttribute file = prim.GetAttribute(UsdLuxTokens->inputsTextureFile);
+                    file.Get(&asset);
                     const std::string texturePath = asset.GetResolvedPath();
                     if (!asset.GetAssetPath().empty() && texturePath.empty())
                         throw std::runtime_error("Cannot resolve dome texture: " + asset.GetAssetPath());
-                    if (!texturePath.empty()) domeTextures.push_back(std::make_unique<ImageTexture<Color3>>(texturePath));
+                    if (!texturePath.empty())
+                        domeTextures.push_back(std::make_unique<ImageTexture<Color3>>(texturePath, TextureColorSpace(file)));
                     else domeTextures.push_back(std::make_unique<ColorTexture>(Color3(1)));
                     const auto inverse = world.GetInverse();
                     std::array<float,9> linear;
@@ -407,9 +464,11 @@ int runStandaloneCli(int argc, char** argv) {
                 prism::SceneLight sceneLight = prism::MakeSceneLight(params, matrix);
                 if (params.shape == prism::LightShape::Rect) {
                     SdfAssetPath asset;
-                    UsdLuxRectLight(prim).GetTextureFileAttr().Get(&asset);
+                    const UsdAttribute file = UsdLuxRectLight(prim).GetTextureFileAttr();
+                    file.Get(&asset);
                     if (!asset.GetResolvedPath().empty())
-                        sceneLight.texture = std::make_shared<ImageTexture<Color3>>(asset.GetResolvedPath());
+                        sceneLight.texture = std::make_shared<ImageTexture<Color3>>(
+                            asset.GetResolvedPath(), TextureColorSpace(file));
                 }
                 scene.lights.push_back(std::move(sceneLight));
             }
@@ -447,12 +506,20 @@ int runStandaloneCli(int argc, char** argv) {
         const std::vector<float> pixels = renderDevice->RenderImage(scene, imageRequest);
         const double renderSeconds = seconds() - loadSeconds;
         OIIO::ImageSpec spec(o.width, o.height, 3, OIIO::TypeDesc::FLOAT);
-        OIIO::ImageBuf image(spec);
-        image.set_pixels(OIIO::ROI(), OIIO::TypeDesc::FLOAT, pixels.data());
-        if (std::filesystem::path(o.output).extension() != ".exr") {
-            OIIO::ImageBufAlgo::clamp(image, image, 0.0f, 1.0f);
-            OIIO::ImageBufAlgo::pow(image, image, 1.0f/2.2f);
+        // EXR: linear working space, tagged. Other formats: display-encoded
+        // through the view, exactly once.
+        const bool linearOutput = std::filesystem::path(o.output).extension() == ".exr";
+        std::vector<float> encoded;
+        if (linearOutput) {
+            spec.attribute("oiio:ColorSpace", colorManagement->workingSpace());
+            if (auto xy = Chromaticities(*colorManagement))
+                spec.attribute("chromaticities", OIIO::TypeDesc(OIIO::TypeDesc::FLOAT, 8), xy->data());
+        } else {
+            encoded = pixels;
+            colorManagement->ApplyView(encoded.data(), size_t(o.width) * o.height, 3);
         }
+        OIIO::ImageBuf image(spec);
+        image.set_pixels(OIIO::ROI(), OIIO::TypeDesc::FLOAT, linearOutput ? pixels.data() : encoded.data());
         if (!image.write(o.output)) throw std::runtime_error("Cannot write image: " + image.geterror());
         std::cout << "Rendered " << o.width << "x" << o.height << " at " << o.samples << " spp";
         if (imageRequest.adaptive.Enabled()) std::cout << " (adaptive, mean " << meanSamples << ")";
