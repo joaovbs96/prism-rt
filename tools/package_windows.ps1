@@ -243,6 +243,13 @@ if (-not $SkipPip) {
     }
 }
 
+# OpenUSD's Hdx (usdview's OpenColorIO colour correction) links the same
+# OpenColorIO as PrismRT and loads the vcpkg DLL in bin: exactly one copy ships.
+$ocioCopies = @(Get-ChildItem -LiteralPath $pkg -Recurse -Filter "OpenColorIO*.dll" -File)
+if ($ocioCopies.Count -ne 1) {
+    throw "Expected one OpenColorIO DLL in the package, found: $($ocioCopies.FullName -join ', ')"
+}
+
 # 4. Launchers and README (CRLF so cmd.exe is happy whatever the checkout's EOLs).
 foreach ($name in @("usdview.bat", "prism_render.bat", "list_devices.bat", "env_setup.bat", "README.txt")) {
     $text = [IO.File]::ReadAllText((Join-Path $templates $name))

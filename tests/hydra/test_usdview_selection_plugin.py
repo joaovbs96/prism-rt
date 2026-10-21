@@ -72,6 +72,63 @@ class UsdviewSelectionPluginTest(unittest.TestCase):
             Vt.StringArray(),
         )
 
+    def test_startup_color_correction(self):
+        start = prismUsdview.startup_color_correction
+        ocio = {"OCIO": "ocio://studio-config-latest"}
+        # $OCIO set: openColorIO whatever usdview saved.
+        self.assertEqual(start("sRGB", ocio), "openColorIO")
+        self.assertEqual(start("disabled", ocio), "openColorIO")
+        # No $OCIO: the saved mode, but never openColorIO.
+        self.assertEqual(start("sRGB", {}), "sRGB")
+        self.assertEqual(start("disabled", {}), "disabled")
+        self.assertEqual(start("openColorIO", {}), "sRGB")
+        # Explicit choices (case-insensitive) and keeping the saved mode.
+        env = prismUsdview.COLOR_CORRECTION_ENV
+        self.assertEqual(start("openColorIO", dict(ocio, **{env: "srgb"})), "sRGB")
+        self.assertEqual(start("sRGB", dict(ocio, **{env: "saved"})), "sRGB")
+        self.assertEqual(start("openColorIO", dict(ocio, **{env: "Saved"})), "openColorIO")
+        self.assertEqual(start("sRGB", {env: "openColorIO"}), "sRGB")
+        self.assertEqual(start("sRGB", dict(ocio, **{env: "bogus"})), "openColorIO")
+
+    def test_startup_ocio_view(self):
+        view = prismUsdview.startup_ocio_view
+        studio = {"OCIO": "ocio://studio-config-latest"}
+        # Hdx cannot render the studio config's default ACES 2.0 view.
+        self.assertEqual(view(studio), ("sRGB - Display", "Un-tone-mapped"))
+        self.assertIsNone(view({"OCIO": "C:/configs/show.ocio"}))
+        self.assertIsNone(view(dict(studio, PRISM_USDVIEW_OCIO_VIEW="default")))
+        self.assertEqual(view(dict(studio, PRISM_USDVIEW_OCIO_VIEW="Raw")),
+                         ("sRGB - Display", "Raw"))
+        self.assertEqual(
+            view({"OCIO": "x.ocio", "PRISM_USDVIEW_OCIO_DISPLAY": "P3",
+                  "PRISM_USDVIEW_OCIO_VIEW": "Film"}), ("P3", "Film"))
+
+    def test_register_plugins_sets_the_startup_mode(self):
+        class ViewSettings:
+            colorCorrectionMode = "sRGB"
+            showHUD = False
+            ocioSettings = type("OCIOSettings", (), {"view": ""})()
+
+            def setOcioSettings(self, colorSpace="", display="", view=""):
+                self.ocio = (display, view)
+
+        window = QtWidgets.QWidget()
+        api = _Api(window, {})
+        api.dataModel.viewSettings = ViewSettings()
+        container = prismUsdview.PrismContainer()
+        with mock.patch.dict(prismUsdview.os.environ,
+                             {"OCIO": "ocio://studio-config-latest"}):
+            for name in (prismUsdview.COLOR_CORRECTION_ENV, prismUsdview.OCIO_VIEW_ENV,
+                         prismUsdview.OCIO_DISPLAY_ENV):
+                prismUsdview.os.environ.pop(name, None)
+            container.registerPlugins(None, api)
+        container._bridge._timer.stop()
+        container._hud._timer.stop()
+        settings = api.dataModel.viewSettings
+        self.assertEqual(settings.colorCorrectionMode, "openColorIO")
+        self.assertEqual(settings.ocio, ("sRGB - Display", "Un-tone-mapped"))
+        window.close()
+
     def test_container_supports_usdview_ui_configuration(self):
         # PluginContainer's default implementation raises NotImplementedError.
         prismUsdview.PrismContainer().configureView(None, None)

@@ -88,8 +88,9 @@ and `MDL_SDK_ROOT`, replace `PATH` with the package directories plus
 `%LOCALAPPDATA%\PrismRT\cache` (set `PRISMRT_CACHE_DIR` to move them). The device
 is automatic; `PRISMRT_DEVICE=cpu` forces the CPU. `OCIO` is kept, and set to
 `ocio://studio-config-latest` when unset, so usdview shows PrismRT's ACEScg
-colour AOV through OpenColorIO's ACES 2.0 SDR view, like the CLI's 8-bit
-images ([color_management.md](color_management.md#usdview)). `usdview.bat` without a scene
+colour AOV through OpenColorIO (the `Un-tone-mapped` sRGB view, as OpenUSD
+26.08 renders the ACES 2.0 views black; see
+[color_management.md](color_management.md#usdview)). `usdview.bat` without a scene
 opens the Cornell box through its camera; with only options it adds the same
 scene; otherwise it passes its arguments to usdview. `README.txt` in the package
 lists requirements and third-party notices.

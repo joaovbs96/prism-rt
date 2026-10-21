@@ -34,6 +34,15 @@ rem this package) under the user profile. Set PRISMRT_CACHE_DIR before running
 rem a launcher to move them.
 set "PRISM_CACHE_DIR=%LOCALAPPDATA%\PrismRT\cache"
 if defined PRISMRT_CACHE_DIR set "PRISM_CACHE_DIR=%PRISMRT_CACHE_DIR%"
+rem Colour management: PrismRT's default OpenColorIO config, also used by
+rem usdview's openColorIO colour correction (Un-tone-mapped view on sRGB). Set
+rem OCIO to another config or URI before running a launcher to change both.
+if not defined OCIO set "OCIO=ocio://studio-config-latest"
+rem usdview starts in openColorIO; PRISMRT_USDVIEW_COLOR_CORRECTION=sRGB,
+rem disabled or saved (usdview's last mode) chooses otherwise.
+if defined PRISMRT_USDVIEW_COLOR_CORRECTION set "PRISM_USDVIEW_COLOR_CORRECTION=%PRISMRT_USDVIEW_COLOR_CORRECTION%"
+if defined PRISMRT_USDVIEW_OCIO_DISPLAY set "PRISM_USDVIEW_OCIO_DISPLAY=%PRISMRT_USDVIEW_OCIO_DISPLAY%"
+if defined PRISMRT_USDVIEW_OCIO_VIEW set "PRISM_USDVIEW_OCIO_VIEW=%PRISMRT_USDVIEW_OCIO_VIEW%"
 rem The device is chosen automatically (Vulkan GPU, else CPU). Override it with
 rem PRISMRT_DEVICE=cpu or vulkan.
 if defined PRISMRT_DEVICE set "PRISM_DEVICE=%PRISMRT_DEVICE%"

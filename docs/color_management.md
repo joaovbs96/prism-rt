@@ -136,25 +136,61 @@ sampling weights only; any weights give the same expected image.
 
 ### usdview
 
-usdview colour-corrects the colour AOV itself:
+usdview colour-corrects the colour AOV itself (Hdx's colour correction task)
+with OpenColorIO, from the config's `scene_linear` role (ACEScg, PrismRT's
+default working space). Because of an OpenUSD bug (below) its default view
+is the studio config's `Un-tone-mapped` sRGB view, not ACES 2.0 SDR like the
+CLI's 8-bit outputs: correct ACEScg-to-sRGB colours, without tone mapping.
 
-- `sRGB` (its default without OCIO) only applies the sRGB curve: an ACEScg
-  render then shows ACEScg values as Rec.709 (less saturated, not tone
-  mapped).
-- `openColorIO` uses `$OCIO`, needs `PyOpenColorIO` for its menus, and Hdx
-  built with OpenColorIO. Set `OCIO=ocio://studio-config-latest` (or a config
-  file) before starting usdview; its input colour space is the config's
-  `scene_linear` role, ACEScg in the studio config, which matches PrismRT's
-  default working space.
-- The local and CI OpenUSD stack (`tools/ci/build_usd_stack.ps1`) is built
-  without OpenColorIO, so usdview's OCIO mode is not available there. Until
-  it is, render with `prism:colorManagement:workingSpace = lin_rec709` for a
-  viewport that looks like before (usdview's sRGB mode then matches the CLI's
-  `Un-tone-mapped` sRGB view), or judge colours in CLI 8-bit outputs.
-
-`prism_env.ps1`/`prism_env.sh` do not set `OCIO`: PrismRT already defaults
-to the studio config, and usdview on this stack would only show an OCIO menu
-entry that cannot work (and print a PyOpenColorIO warning).
+- The OpenUSD stack (`tools/ci/build_usd_stack.ps1`, local and CI) is built
+  with `PXR_BUILD_OPENCOLORIO_PLUGIN=ON` against vcpkg's OpenColorIO 2.6.0,
+  the one PrismRT uses: a single `OpenColorIO_2_6.dll` (vcpkg's) is loaded in
+  usdview, the package and the tests. See
+  [deployment.md](deployment.md#local-dependency-stack).
+- `prism_env.ps1`, `prism_env.sh` and the package's `env_setup.bat` set
+  `OCIO=ocio://studio-config-latest` when `OCIO` is unset (PrismRT's own
+  default config, made explicit). usdview disables its `openColorIO` mode
+  without `$OCIO`.
+- usdview starts in its saved colour correction mode (`sRGB` until changed)
+  and has no option to choose one. The `prismUsdview` extension sets
+  `openColorIO` at start-up when `$OCIO` is set; usdview loads extensions
+  before the stage, so the first image already uses it.
+  `PRISM_USDVIEW_COLOR_CORRECTION=sRGB|disabled|openColorIO|saved` chooses
+  another start-up mode (`saved` keeps usdview's; in the package,
+  `PRISMRT_USDVIEW_COLOR_CORRECTION`). Without `$OCIO` a saved `openColorIO`
+  becomes `sRGB`.
+- **ACES 2.0 views render black in usdview.** OpenUSD 26.08's
+  `HdxColorCorrectionTask` (OCIO v2 path, also unchanged on OpenUSD's `dev`
+  branch) names the sampler of OpenColorIO's 3D LUT textures but not of its
+  1D/2D ones (`sampDesc.debugName` is only set in the 3D loop). On OpenGL and
+  Vulkan, every transform that uses 1D/2D LUTs then fails with "Failed
+  verification: !texInfo.texName.empty() && !texInfo.samplerName.empty()" and
+  the viewport is black. The studio config's ACES 2.0 views use two such
+  tables; its analytic views (`Un-tone-mapped` and `Video (colorimetric)`
+  tested) work. So with the studio config (`OCIO=ocio://studio-config-*`) the
+  extension sets display `sRGB - Display` and view `Un-tone-mapped`.
+  `PRISM_USDVIEW_OCIO_DISPLAY` and `PRISM_USDVIEW_OCIO_VIEW` choose others;
+  `PRISM_USDVIEW_OCIO_VIEW=default` uses the config's default view (ACES 2.0
+  SDR, once OpenUSD is fixed). With another config the extension leaves its
+  defaults alone. The fix is the missing `sampDesc.debugName = samplerName;`
+  in Hdx's 1D/2D LUT loop; PrismRT does not patch OpenUSD.
+- On the CPU device the usdview viewport matches the CLI's
+  `--view Un-tone-mapped` PNG to within one 8-bit level outside the HUD
+  (`tests/hydra/fixtures/color_management.usda` and the Cornell box).
+- usdview fills its *OCIO Config* menu (displays, views, input colour spaces)
+  with `PyOpenColorIO`, which is not installed: vcpkg's port has no Python
+  bindings, and the pip wheel brings its own OpenColorIO library. usdview then
+  prints "Could not import PyOpenColorIO..." and the menu stays empty; the
+  view comes from the extension (above) or from OpenColorIO's
+  `OCIO_ACTIVE_DISPLAYS`/`OCIO_ACTIVE_VIEWS` (these also change the CLI's
+  defaults, as they act on the config).
+- `sRGB` only applies the sRGB curve: an ACEScg render then shows ACEScg
+  values as Rec.709 (less saturated, not tone mapped). It matches the CLI's
+  `Un-tone-mapped` sRGB view when rendering with
+  `prism:colorManagement:workingSpace = lin_rec709`.
+- `usdrecord --colorCorrectionMode openColorIO --renderer PrismRT` uses the
+  config's default view (with `$OCIO` set), so it hits the same ACES 2.0 bug;
+  set `OCIO_ACTIVE_VIEWS=Un-tone-mapped` for it.
 
 ## Tests
 

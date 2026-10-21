@@ -17,8 +17,18 @@ image is still refining or has converged (including adaptive early
 convergence). usdview stops
 repainting once the renderer converges, so the overlay runs on its own timer.
 It follows the HUD toggle and hides while the renderer is paused or stopped.
+
+Colour correction: PrismRT's colour AOV is linear in its working space (ACEScg
+by default), so usdview starts in its openColorIO mode when $OCIO is set (the
+launchers set ocio://studio-config-latest), from the config's scene_linear
+role (ACEScg). usdview saves the mode in its state file and starts in sRGB
+otherwise. Set PRISM_USDVIEW_COLOR_CORRECTION to sRGB, disabled or
+openColorIO to choose another start-up mode, or to "saved" to keep usdview's
+saved one. With the studio config the view is sRGB Un-tone-mapped, because
+OpenUSD 26.08 cannot render its ACES 2.0 views (see startup_ocio_view).
 """
 
+import os
 import time
 
 from pxr import Gf, Tf, Vt
@@ -29,6 +39,76 @@ from pxr.Usdviewq.stageView import StageView
 
 SETTING = "prism:usdviewSelection"
 RENDERER = "HdPrismRendererPlugin"
+
+# usdview's ColorCorrectionModes (HdxColorCorrectionTokens).
+_COLOR_MODES = ("disabled", "sRGB", "openColorIO")
+COLOR_CORRECTION_ENV = "PRISM_USDVIEW_COLOR_CORRECTION"
+
+
+def startup_color_correction(saved, environ=os.environ):
+    """usdview's colour correction mode at start-up, given its saved mode.
+
+    openColorIO when $OCIO is set, unless PRISM_USDVIEW_COLOR_CORRECTION names
+    another mode or "saved". Without $OCIO usdview cannot use openColorIO (it
+    disables the menu entry but would keep a saved openColorIO mode, which
+    OpenColorIO then runs without a config), so that becomes sRGB.
+    """
+    choice = environ.get(COLOR_CORRECTION_ENV, "").strip()
+    has_ocio = bool(environ.get("OCIO"))
+    if choice.lower() == "saved":
+        mode = saved
+    else:
+        mode = next((m for m in _COLOR_MODES if m.lower() == choice.lower()), None)
+        if mode is None:
+            if choice:
+                Tf.Warn("prismUsdview: %s=%s is not one of %s or saved" %
+                        (COLOR_CORRECTION_ENV, choice, ", ".join(_COLOR_MODES)))
+            mode = "openColorIO" if has_ocio else saved
+    if mode == "openColorIO" and not has_ocio:
+        mode = "sRGB"
+    return mode
+
+
+OCIO_DISPLAY_ENV = "PRISM_USDVIEW_OCIO_DISPLAY"
+OCIO_VIEW_ENV = "PRISM_USDVIEW_OCIO_VIEW"
+# OpenUSD 26.08's Hdx names no sampler for OpenColorIO's 1D/2D LUT textures
+# (HdxColorCorrectionTask, OCIO v2 path; only 3D LUTs get one), so on OpenGL
+# and Vulkan every view that uses them renders black, among them the studio
+# config's ACES 2.0 views (their tone-scale tables). Its analytic views work.
+_STUDIO_FALLBACK = ("sRGB - Display", "Un-tone-mapped")
+
+
+def startup_ocio_view(environ=os.environ):
+    """(display, view) for usdview's openColorIO mode, or None for the config's
+    defaults.
+
+    PRISM_USDVIEW_OCIO_DISPLAY/_VIEW choose them ("default" for the config's).
+    Otherwise, with the studio config (ocio://studio-config-*), the sRGB
+    display's Un-tone-mapped view instead of the default ACES 2.0 one, which
+    Hdx cannot render (see _STUDIO_FALLBACK).
+    """
+    display = environ.get(OCIO_DISPLAY_ENV, "").strip()
+    view = environ.get(OCIO_VIEW_ENV, "").strip()
+    if view.lower() == "default":
+        return None
+    if view:
+        return (display or _STUDIO_FALLBACK[0], view)
+    if environ.get("OCIO", "").strip().lower().startswith("ocio://studio-config"):
+        return _STUDIO_FALLBACK
+    return None
+
+
+def _apply_color_correction(api):
+    # Plugins load before the stage and the viewport, so the first image already
+    # uses this mode (usdview documents this order for global settings).
+    settings = api.dataModel.viewSettings
+    mode = startup_color_correction(settings.colorCorrectionMode)
+    if mode != settings.colorCorrectionMode:
+        settings.colorCorrectionMode = mode
+    if mode == "openColorIO":
+        view = startup_ocio_view()
+        if view and not settings.ocioSettings.view:
+            settings.setOcioSettings(display=view[0], view=view[1])
 
 
 def selection_records(selection):
@@ -434,11 +514,15 @@ class _SampleHud(QtCore.QObject):
 
 class PrismContainer(PluginContainer):
     def registerPlugins(self, plugRegistry, usdviewApi):
+        try:
+            _apply_color_correction(usdviewApi)
+        except Exception as error:  # Never stop usdview from starting.
+            Tf.Warn("prismUsdview colour correction: %s" % error)
         self._bridge = _SelectionBridge(usdviewApi)
         self._hud = _SampleHud(usdviewApi)
 
     def configureView(self, plugRegistry, plugUIBuilder):
-        pass  # This extension supplies selection data and needs no menu entry.
+        pass  # This extension needs no menu entry.
 
 
 Tf.Type.Define(PrismContainer)

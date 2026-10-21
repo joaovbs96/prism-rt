@@ -109,6 +109,9 @@ if ($mdlRoot) {
     if ($env:PRISM_MATERIALX_MDL) { $env:PRISM_MATERIALX_MDL_LIBRARIES = $env:PRISM_MATERIALX_MDL }
 }
 if (-not $env:PYOPENGL_USE_ACCELERATE) { $env:PYOPENGL_USE_ACCELERATE = "0" }
+# PrismRT's default config, made explicit so that usdview's OpenColorIO colour
+# correction (Hdx) shows the colour AOV through the same display and view.
+if (-not $env:OCIO) { $env:OCIO = "ocio://studio-config-latest" }
 
 if ($pluginRoots.Count -gt 0) {
     $pluginPaths = $pluginRoots

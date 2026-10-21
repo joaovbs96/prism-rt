@@ -87,5 +87,9 @@ if [ "$(uname)" = "Darwin" ]; then
 fi
 : "${PYOPENGL_USE_ACCELERATE:=0}"
 export PYOPENGL_USE_ACCELERATE
+# PrismRT's default config, made explicit so that usdview's OpenColorIO colour
+# correction (Hdx) shows the colour AOV through the same display and view.
+: "${OCIO:=ocio://studio-config-latest}"
+export OCIO
 unset _prism_script _prism_root _prism_config _prism_candidate _prism_installed _prism_libvar
 unset -f _prism_json _prism_prepend

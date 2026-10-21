@@ -42,6 +42,17 @@ To force one, set PRISMRT_DEVICE before starting a launcher:
     usdview.bat
 Valid values: auto, cpu, vulkan.
 
+Colour
+------
+PrismRT renders in ACEScg. usdview shows the image through OpenColorIO
+(View > Color Correction > openColorIO) with the Un-tone-mapped view for an
+sRGB display: correct colours, but not tone mapped like the PNG/JPEG images
+of prism_render.bat (ACES 2.0 SDR view), which this usdview version cannot
+display. The OpenColorIO config is OCIO, ocio://studio-config-latest unless
+you set it. Set PRISMRT_USDVIEW_COLOR_CORRECTION=sRGB (or disabled, or
+saved: usdview's last mode) to start usdview in another mode, and
+PRISMRT_USDVIEW_OCIO_VIEW (and PRISMRT_USDVIEW_OCIO_DISPLAY) for another view.
+
 Cache
 -----
 Compiled shaders and materials are cached in %LOCALAPPDATA%\PrismRT\cache.
