@@ -67,7 +67,9 @@ if ($pyVersion -ne $deps.python.version) {
 $tbbDir = Fwd (Join-Path $TbbRoot "lib\cmake\tbb")
 if (-not (Test-Path -LiteralPath (Join-Path $TbbRoot "lib\cmake\tbb"))) { throw "No oneTBB CMake package under $TbbRoot" }
 $generator = @("-G", "Visual Studio 17 2022", "-A", "x64")
-$parallel = if ($Jobs -gt 0) { @("--parallel", "$Jobs") } else { @("--parallel") }
+# @() outside the if: a one-element array returned from it unwraps to a string,
+# and splatting a string passes it one character at a time.
+$parallel = @(if ($Jobs -gt 0) { "--parallel", "$Jobs" } else { "--parallel" })
 Write-Host "OpenSubdiv $OpenSubdivTag -> $osdPrefix"
 Write-Host "MaterialX $MaterialXTag -> $mtlxPrefix"
 Write-Host "OpenUSD $UsdTag -> $usdPrefix"
