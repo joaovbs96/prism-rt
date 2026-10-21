@@ -4,6 +4,8 @@
 #include "camera_ray_diagnostics.h"
 #include "device/device.h"
 #include "color/color_management.h"
+#include "output/image_writer.h"
+#include "output/render_products.h"
 #include <pxr/usd/usdGeom/camera.h>
 #include <pxr/usd/usdLux/blackbody.h>
 #include <pxr/usd/usdLux/cylinderLight.h>
@@ -20,6 +22,7 @@
 #include <pxr/base/gf/camera.h>
 #include <pxr/base/gf/frustum.h>
 #include <pxr/imaging/cameraUtil/conformWindow.h>
+#include <pxr/imaging/cameraUtil/framing.h>
 #include <tbb/parallel_for.h>
 #include <charconv>
 #include <cstdlib>
@@ -29,11 +32,17 @@
 #include <array>
 #include <sstream>
 #include <chrono>
+#include <set>
+#include <tuple>
+#include <type_traits>
 
 namespace {
 struct Options {
     std::string scene, camera, environment, output = "output.exr";
     std::string exportScene, environmentSampling = "mis", textureFiltering = "filtered";
+    // UsdRender settings prim (empty: the stage's renderSettingsPrimPath) and
+    // the directory its relative product names resolve against.
+    std::string renderSettings, outputDirectory;
     prism::device::DevicePreference device = prism::device::DevicePreference::Auto;
     std::optional<Float3> cameraPosition, cameraTarget;
     std::optional<Color3> environmentColor;
@@ -48,6 +57,9 @@ struct Options {
     unsigned contributions = 7;
     prism::device::NeeSettings nee;
     prism::color::Options color;
+    // Options given on the command line (they take precedence over prism:*
+    // render settings).
+    std::set<std::string> given;
 };
 
 void help() {
@@ -60,6 +72,12 @@ void help() {
         "  --width 1280 --height 720 --spp 256\n"
         "  --max-depth 32 --rr-min-depth 4 --seed 0\n"
         "  --max-sample-radiance 10 --output output.exr\n"
+        "  --render-settings /Render/Settings (default: the stage's renderSettingsPrimPath)\n"
+        "  --output-dir DIR (where relative render product names are written; default .)\n"
+        "                 USD scenes with RenderSettings take resolution, camera, pixel aspect\n"
+        "                 ratio, data window, material binding purposes and prism:* settings from\n"
+        "                 it; without --output or a camera option, each RenderProduct is written\n"
+        "                 with its RenderVars (see docs/hydra.md)\n"
         "  --adaptive-threshold 0 (e.g. 0.01; 0 disables) --adaptive-min-samples 16\n"
         "                 with adaptive sampling, --spp is the per-pixel maximum\n"
         "  --debug-contributions all|visible|direct|indirect (noise analysis: keep only light seen\n"
@@ -114,6 +132,7 @@ Options parse(int argc, char** argv) {
         const std::string key = argv[i];
         if (i + 1 == argc) throw std::runtime_error("Missing value for " + key);
         const std::string value = argv[++i];
+        o.given.insert(key);
         if (key == "--scene") o.scene = value;
         else if (key == "--export-scene") o.exportScene = value;
         else if (key == "--camera") o.camera = value;
@@ -132,6 +151,8 @@ Options parse(int argc, char** argv) {
         else if (key == "--env") o.environment = value;
         else if (key == "--env-color") o.environmentColor = triple(value);
         else if (key == "--output") o.output = value;
+        else if (key == "--render-settings") o.renderSettings = value;
+        else if (key == "--output-dir") o.outputDirectory = value;
         else if (key == "--ocio-config") o.color.config = value;
         else if (key == "--working-space") o.color.workingSpace = value;
         else if (key == "--display") o.color.display = value;
@@ -175,9 +196,10 @@ Options parse(int argc, char** argv) {
             throw std::runtime_error("--export-scene cannot be combined with scene or camera options");
         return o;
     }
-    const bool explicitCamera = o.cameraPosition.has_value() && o.cameraTarget.has_value();
-    if (o.scene.empty() || (o.camera.empty() && !explicitCamera))
+    // The camera may also come from the stage's render settings.
+    if (o.scene.empty())
         throw std::runtime_error("--scene and an explicit camera source are required (see --help)");
+    const bool explicitCamera = o.cameraPosition.has_value() && o.cameraTarget.has_value();
     if ((!o.camera.empty() && (o.cameraPosition || o.cameraTarget || o.explicitLens)) ||
         (o.cameraPosition.has_value() != o.cameraTarget.has_value()))
         throw std::runtime_error("Choose --camera or both --camera-position and --camera-target");
@@ -186,6 +208,11 @@ Options parse(int argc, char** argv) {
         (*o.cameraPosition - *o.cameraTarget).is_near_zero() ||
         cross(*o.cameraPosition - *o.cameraTarget, o.cameraUp).is_near_zero()))
         throw std::runtime_error("Invalid camera basis or lens parameters");
+    return o;
+}
+
+// Range checks, after the render settings filled what the command line left.
+void validate(Options const& o) {
     if (o.textureFiltering != "filtered" && o.textureFiltering != "bilinear")
         throw std::runtime_error("--texture-filtering must be filtered or bilinear");
     if (o.environmentSampling != "mis" && o.environmentSampling != "bsdf")
@@ -201,7 +228,58 @@ Options parse(int argc, char** argv) {
         throw std::runtime_error("--adaptive-threshold must be nonnegative and --adaptive-min-samples positive");
     if (static_cast<uint64_t>(o.width) * o.height > std::numeric_limits<unsigned>::max() / 4)
         throw std::runtime_error("Image dimensions are too large");
-    return o;
+}
+
+// The Hydra delegate's prism:* render settings that the CLI honours, from
+// the RenderSettings prim; command-line options take precedence.
+void applyRenderSettings(VtDictionary const& settings, Options& o) {
+    using prism::output::SettingText;
+    auto value = [&](const char* name) -> VtValue const* {
+        const auto found = settings.find(std::string("prism:") + name);
+        return found == settings.end() ? nullptr : &found->second;
+    };
+    auto integerSetting = [&](const char* name, const char* flag, auto* field) {
+        if (o.given.count(flag)) return;
+        if (auto const* v = value(name); v && v->CanCast<int>())
+            *field = static_cast<std::remove_pointer_t<decltype(field)>>(
+                VtValue::Cast<int>(*v).UncheckedGet<int>());
+    };
+    auto floatSetting = [&](const char* name, const char* flag, float* field) {
+        if (o.given.count(flag)) return;
+        if (auto const* v = value(name); v && v->CanCast<float>())
+            *field = VtValue::Cast<float>(*v).UncheckedGet<float>();
+    };
+    auto textSetting = [&](std::string const& name, const char* flag) -> std::string {
+        return o.given.count(flag) ? std::string() : SettingText(settings, "prism:" + name);
+    };
+    integerSetting("samplesPerPixel", "--spp", &o.samples);
+    integerSetting("maxDepth", "--max-depth", &o.depth);
+    integerSetting("rrMinDepth", "--rr-min-depth", &o.roulette);
+    integerSetting("seed", "--seed", &o.seed);
+    floatSetting("maxSampleRadiance", "--max-sample-radiance", &o.clamp);
+    floatSetting("adaptiveThreshold", "--adaptive-threshold", &o.adaptiveThreshold);
+    integerSetting("adaptiveMinSamples", "--adaptive-min-samples", &o.adaptiveMinSamples);
+    floatSetting("neeProbabilityMin", "--nee-probability-min", &o.nee.probabilityMin);
+    integerSetting("neeFromDepth", "--nee-from-depth", &o.nee.fromDepth);
+    if (auto mode = textSetting("lightSelection", "--light-selection"); !mode.empty()) {
+        if (mode != "spatial" && mode != "power")
+            throw std::runtime_error("prism:lightSelection takes spatial or power");
+        o.nee.spatialLights = mode == "spatial";
+    }
+    if (auto mode = textSetting("environmentSampling", "--environment-sampling"); !mode.empty())
+        o.environmentSampling = mode;
+    if (auto mode = textSetting("textureFiltering", "--texture-filtering"); !mode.empty())
+        o.textureFiltering = mode;
+    if (auto name = textSetting("device", "--device"); !name.empty() &&
+        !prism::device::ParseDevicePreference(name, &o.device))
+        throw std::runtime_error("prism:device must be auto, cpu, cpu-reference, vulkan or metal");
+    for (auto [name, field, flag] : {std::tuple{"ocioConfig", &o.color.config, "--ocio-config"},
+             std::tuple{"workingSpace", &o.color.workingSpace, "--working-space"},
+             std::tuple{"display", &o.color.display, "--display"},
+             std::tuple{"view", &o.color.view, "--view"}}) {
+        if (auto text = textSetting(std::string("colorManagement:") + name, flag); !text.empty())
+            *field = text;
+    }
 }
 
 // The colour space of a light's texture: linear Rec.709, like the light's
@@ -211,25 +289,26 @@ std::string TextureColorSpace(UsdAttribute const&) {
     return prism::color::kLightColorSpace;
 }
 
-// EXR chromaticities of the working spaces MaterialX names (OpenEXR's
-// red, green, blue and white xy).
-std::optional<std::array<float, 8>> Chromaticities(prism::color::ColorManagement const& color) {
-    const std::string& space = color.materialXSpace();
-    if (space == "acescg") return std::array<float, 8>{0.713f, 0.293f, 0.165f, 0.830f, 0.128f, 0.044f, 0.32168f, 0.33767f};
-    if (space == "lin_rec709") return std::array<float, 8>{0.64f, 0.33f, 0.30f, 0.60f, 0.15f, 0.06f, 0.3127f, 0.3290f};
-    if (space == "lin_displayp3") return std::array<float, 8>{0.680f, 0.320f, 0.265f, 0.690f, 0.150f, 0.060f, 0.3127f, 0.3290f};
-    if (space == "lin_adobergb") return std::array<float, 8>{0.64f, 0.33f, 0.21f, 0.71f, 0.15f, 0.06f, 0.3127f, 0.3290f};
-    return std::nullopt;
-}
-
 // Independent USD camera ingestion, deliberately separate from the Hydra adapter.
 struct UsdCameraRays {
     prism::CameraRayParameters parameters;
 
-    UsdCameraRays(const GfCamera& c, int width, int height) {
-        parameters.inverseProjection = CameraUtilConformedWindow(
-            c.GetFrustum().ComputeProjectionMatrix(), CameraUtilFit,
-            double(width) / height).GetInverse();
+    // The view's display window, pixel aspect ratio and data window, framed
+    // as Hydra frames a render pass (CameraUtilFraming).
+    UsdCameraRays(const GfCamera& c, prism::output::RenderProductRequest const& view) {
+        const GfMatrix4d projection = c.GetFrustum().ComputeProjectionMatrix();
+        if (view.FullDataWindow() && view.pixelAspectRatio == 1.0f &&
+            prism::output::ConformPolicy(view.aspectRatioConformPolicy) == CameraUtilFit) {
+            parameters.inverseProjection = CameraUtilConformedWindow(
+                projection, CameraUtilFit, double(view.width) / view.height).GetInverse();
+        } else {
+            const CameraUtilFraming framing(
+                GfRange2f(GfVec2f(0.0f), GfVec2f(float(view.width), float(view.height))),
+                GfRect2i(GfVec2i(view.dataX, view.dataY), view.dataWidth, view.dataHeight),
+                view.pixelAspectRatio);
+            parameters.inverseProjection = framing.ApplyToProjectionMatrix(
+                projection, prism::output::ConformPolicy(view.aspectRatioConformPolicy)).GetInverse();
+        }
         parameters.cameraToWorld = c.GetTransform();
         const GfRange1f clipping = c.GetClippingRange();
         parameters.nearClip = static_cast<float>(clipping.GetMin());
@@ -290,37 +369,65 @@ int runStandaloneCli(int argc, char** argv) {
         const auto extension = std::filesystem::path(o.scene).extension().string();
         const bool isUsd = extension == ".usd" || extension == ".usda" || extension == ".usdc" || extension == ".usdz";
         UsdStageRefPtr stage;
+        std::optional<prism::output::RenderJob> job;
         if (isUsd) {
             stage = UsdStage::Open(o.scene);
             if (!stage) throw std::runtime_error("Cannot open USD scene: " + o.scene);
-            std::string settingsPath;
-            stage->GetMetadata(TfToken("renderSettingsPrimPath"), &settingsPath);
-            if (!settingsPath.empty()) {
-                UsdRenderSettings settings(stage->GetPrimAtPath(SdfPath(settingsPath)));
-                GfVec2i resolution;
-                if (settings && settings.GetResolutionAttr().Get(&resolution)) {
-                    if (!o.widthSet) o.width = resolution[0];
-                    if (!o.heightSet) o.height = resolution[1];
-                }
-                // The Hydra delegate's prism:colorManagement:* render settings;
-                // command-line options take precedence.
-                for (auto [name, field] : {std::pair{"ocioConfig", &o.color.config},
-                         std::pair{"workingSpace", &o.color.workingSpace},
-                         std::pair{"display", &o.color.display}, std::pair{"view", &o.color.view}}) {
-                    if (!settings || !field->empty()) continue;
-                    const VtValue value = [&] {
-                        VtValue v;
-                        settings.GetPrim().GetAttribute(TfToken(std::string("prism:colorManagement:") + name)).Get(&v);
-                        return v;
-                    }();
-                    if (value.IsHolding<std::string>()) *field = value.UncheckedGet<std::string>();
-                    else if (value.IsHolding<TfToken>()) *field = value.UncheckedGet<TfToken>().GetString();
-                    else if (value.IsHolding<SdfAssetPath>()) {
-                        const auto& asset = value.UncheckedGet<SdfAssetPath>();
-                        *field = asset.GetResolvedPath().empty() ? asset.GetAssetPath() : asset.GetResolvedPath();
-                    }
-                }
+            // RenderSettings, products and vars, as prism_hydra_render
+            // resolves them (src/output/render_products.h).
+            std::vector<std::string> warnings;
+            job = prism::output::ResolveRenderJob(stage, o.renderSettings, o.outputDirectory, &warnings);
+            for (auto const& warning : warnings) std::cerr << "PrismRT: " << warning << '\n';
+            if (job) {
+                applyRenderSettings(job->namespacedSettings, o);
+                if (!o.widthSet && job->base.width > 0) o.width = job->base.width;
+                if (!o.heightSet && job->base.height > 0) o.height = job->base.height;
             }
+        } else if (!o.renderSettings.empty()) {
+            throw std::runtime_error("--render-settings requires a USD scene");
+        }
+        validate(o);
+        const bool explicitCamera = o.cameraPosition.has_value() && o.cameraTarget.has_value();
+        // Without --output or a camera option, the render settings' products
+        // are the outputs; otherwise one colour image as before.
+        const bool productMode = job && !job->products.empty() && !o.given.count("--output") &&
+            o.camera.empty() && !explicitCamera;
+        std::vector<prism::output::RenderProductRequest> views;
+        if (productMode) {
+            views = job->products;
+            if (o.widthSet || o.heightSet)
+                std::cerr << "PrismRT: --width/--height do not apply to render products; ignored\n";
+        } else {
+            prism::output::RenderProductRequest view;
+            if (job) view = job->base;
+            if (o.camera.empty() && !explicitCamera) o.camera = view.camera.GetString();
+            if (o.camera.empty() && !explicitCamera)
+                throw std::runtime_error("--scene and an explicit camera source are required (see --help)");
+            view.camera = o.camera.empty() ? SdfPath() : SdfPath(o.camera);
+            // The authored data window applies to the requested size.
+            view.width = o.width;
+            view.height = o.height;
+            if (!job) view.dataWindowNDC = GfRange2f(GfVec2f(0.0f), GfVec2f(1.0f));
+            prism::output::DataWindowPixels(view.dataWindowNDC, view.width, view.height,
+                &view.dataX, &view.dataY, &view.dataWidth, &view.dataHeight);
+            if (view.dataWidth <= 0 || view.dataHeight <= 0)
+                throw std::runtime_error("The render settings' data window is empty");
+            view.output = o.output;
+            prism::output::RenderVarRequest color;
+            color.name = "color";
+            color.kind = prism::output::AovKind::Color;
+            color.components = 3;
+            view.vars.push_back(color);
+            views.push_back(std::move(view));
+        }
+        if (job && !job->includedPurposes.empty()) {
+            const auto& purposes = job->includedPurposes;
+            const bool onlyDefaults = std::all_of(purposes.begin(), purposes.end(), [](TfToken const& p) {
+                return p == UsdGeomTokens->default_ || p == UsdGeomTokens->render;
+            });
+            if (!onlyDefaults)
+                std::cerr << "PrismRT: includedPurposes other than default and render are not supported by the "
+                             "standalone loader yet; ignored\n";
         }
         // Before anything loads: materials, lights and textures convert into
         // the working space as they are read.
@@ -328,38 +435,50 @@ int runStandaloneCli(int argc, char** argv) {
         std::cout << "Color: working space " << colorManagement->workingSpace() << ", view " << colorManagement->view()
                   << " on " << colorManagement->display() << " (" << colorManagement->configName() << ")\n";
         const double stageSeconds = seconds();
-        if (o.width <= 0 || o.height <= 0 ||
-            static_cast<uint64_t>(o.width) * o.height > std::numeric_limits<unsigned>::max() / 4)
-            throw std::runtime_error("Authored render resolution is invalid or too large");
-        GfCamera camera;
-        if (!o.camera.empty()) {
-            if (!stage) throw std::runtime_error("--camera prim paths require a USD scene");
-            UsdGeomCamera authored(stage->GetPrimAtPath(SdfPath(o.camera)));
-            if (!authored) throw std::runtime_error("Not a USD camera: " + o.camera);
-            camera = authored.GetCamera(UsdTimeCode::Default());
-        } else {
-            auto asGf = [](Float3 v) { return GfVec3d(v.x(),v.y(),v.z()); };
-            GfMatrix4d view(1); view.SetLookAt(asGf(*o.cameraPosition), asGf(*o.cameraTarget), asGf(o.cameraUp));
-            camera.SetTransform(view.GetInverse());
-            camera.SetPerspectiveFromAspectRatioAndFieldOfView(double(o.width)/o.height, o.verticalFov, GfCamera::FOVVertical);
-            camera.SetFocusDistance(o.focusDistance);
-            const float radius = o.focusDistance * std::tan(deg2rad(o.defocusAngle/2));
-            camera.SetFStop(radius > 0 ? camera.GetFocalLength()*0.1f/(2*radius) : 0);
-            camera.SetClippingRange(GfRange1f(0.001f, 1e30f));
+        for (auto const& view : views) {
+            if (view.width <= 0 || view.height <= 0 ||
+                static_cast<uint64_t>(view.dataWidth) * view.dataHeight > std::numeric_limits<unsigned>::max() / 4)
+                throw std::runtime_error("Authored render resolution is invalid or too large");
+            if (view.camera.IsEmpty() && !explicitCamera)
+                throw std::runtime_error("Render product <" + view.path.GetString() + "> has no camera");
         }
-        if (o.width <= 0 || o.height <= 0 || uint64_t(o.width)*o.height > std::numeric_limits<unsigned>::max()/4)
-            throw std::runtime_error("Invalid authored image dimensions");
-        const UsdCameraRays rays(camera, o.width, o.height);
+        auto cameraFor = [&](prism::output::RenderProductRequest const& view) {
+            GfCamera camera;
+            if (!view.camera.IsEmpty()) {
+                if (!stage) throw std::runtime_error("--camera prim paths require a USD scene");
+                UsdGeomCamera authored(stage->GetPrimAtPath(view.camera));
+                if (!authored) throw std::runtime_error("Not a USD camera: " + view.camera.GetString());
+                camera = authored.GetCamera(UsdTimeCode::Default());
+            } else {
+                auto asGf = [](Float3 v) { return GfVec3d(v.x(),v.y(),v.z()); };
+                GfMatrix4d viewMatrix(1); viewMatrix.SetLookAt(asGf(*o.cameraPosition), asGf(*o.cameraTarget), asGf(o.cameraUp));
+                camera.SetTransform(viewMatrix.GetInverse());
+                camera.SetPerspectiveFromAspectRatioAndFieldOfView(double(view.width)/view.height, o.verticalFov, GfCamera::FOVVertical);
+                camera.SetFocusDistance(o.focusDistance);
+                const float radius = o.focusDistance * std::tan(deg2rad(o.defocusAngle/2));
+                camera.SetFStop(radius > 0 ? camera.GetFocalLength()*0.1f/(2*radius) : 0);
+                camera.SetClippingRange(GfRange1f(0.001f, 1e30f));
+            }
+            return UsdCameraRays(camera, view);
+        };
+        // Cameras are checked before the scene loads.
+        std::vector<UsdCameraRays> viewRays;
+        for (auto const& view : views) viewRays.push_back(cameraFor(view));
         prism::DumpCameraRayDiagnostics(
-            rays.parameters, static_cast<unsigned int>(o.width),
-            static_cast<unsigned int>(o.height), o.seed, "standalone");
+            viewRays.front().parameters, static_cast<unsigned int>(views.front().dataWidth),
+            static_cast<unsigned int>(views.front().dataHeight), o.seed, "standalone");
         mdl::Context context;
         if (!context.is_valid()) throw std::runtime_error(context.get_error());
         SceneManager scene(device.value);
         const char* libraries = std::getenv("PRISM_MATERIALX_LIBRARY_PATH");
         const std::string libraryPath = libraries ? libraries : "";
         std::unique_ptr<Mesh> mesh;
-        if (isUsd) mesh = std::make_unique<USDMesh>(o.scene, &context, libraryPath, libraryPath + "/mdl");
+        if (isUsd) {
+            std::vector<TfToken> bindingPurposes;
+            if (job) bindingPurposes.assign(job->materialBindingPurposes.begin(), job->materialBindingPurposes.end());
+            mesh = std::make_unique<USDMesh>(o.scene, &context, libraryPath, libraryPath + "/mdl",
+                                             std::move(bindingPurposes));
+        }
         else if (extension == ".gltf" || extension == ".glb") {
             mesh = std::make_unique<glTFMesh>(o.scene);
             std::cerr << "PrismRT glTF: legacy materials retain BSDF-only sampling where no matching PDF is available\n";
@@ -490,46 +609,94 @@ int runStandaloneCli(int argc, char** argv) {
                   << deviceInfo.name << '\n';
         renderDevice->SceneChanged(scene);
         const double loadSeconds = seconds();
-        prism::device::ImageRequest imageRequest;
-        imageRequest.camera = rays.parameters;
-        imageRequest.width = static_cast<unsigned>(o.width);
-        imageRequest.height = static_cast<unsigned>(o.height);
-        imageRequest.samples = o.samples;
-        imageRequest.seed = o.seed;
-        imageRequest.sampleClamp = o.clamp;
-        imageRequest.adaptive.threshold = o.adaptiveThreshold;
-        imageRequest.adaptive.minSamples = o.adaptiveMinSamples;
-        imageRequest.contributions = o.contributions;
-        imageRequest.nee = o.nee;
-        double meanSamples = o.samples;
-        imageRequest.meanSamples = &meanSamples;
-        const std::vector<float> pixels = renderDevice->RenderImage(scene, imageRequest);
-        const double renderSeconds = seconds() - loadSeconds;
-        OIIO::ImageSpec spec(o.width, o.height, 3, OIIO::TypeDesc::FLOAT);
-        // EXR: linear working space, tagged. Other formats: display-encoded
-        // through the view, exactly once.
-        const bool linearOutput = std::filesystem::path(o.output).extension() == ".exr";
-        std::vector<float> encoded;
-        if (linearOutput) {
-            spec.attribute("oiio:ColorSpace", colorManagement->workingSpace());
-            if (auto xy = Chromaticities(*colorManagement))
-                spec.attribute("chromaticities", OIIO::TypeDesc(OIIO::TypeDesc::FLOAT, 8), xy->data());
-        } else {
-            encoded = pixels;
-            colorManagement->ApplyView(encoded.data(), size_t(o.width) * o.height, 3);
+        using prism::output::AovKind;
+        double renderSeconds = 0, meanSamples = o.samples;
+        std::vector<prism::output::RenderedAov> rendered;
+        for (size_t index = 0; index < views.size(); ++index) {
+            auto const& view = views[index];
+            const auto& rays = viewRays[index];
+            const unsigned width = static_cast<unsigned>(view.dataWidth);
+            const unsigned height = static_cast<unsigned>(view.dataHeight);
+            // Products that differ only in their vars share one render.
+            if (index == 0 || !view.SameView(views[index - 1])) rendered.clear();
+            const double renderStart = seconds();
+            auto renderedKind = [&](AovKind kind) {
+                return std::any_of(rendered.begin(), rendered.end(),
+                                   [&](auto const& aov) { return aov.kind == kind; });
+            };
+            std::vector<AovKind> geometric;
+            for (auto const& var : view.vars) {
+                auto const* info = prism::output::FindAov(var.kind);
+                if (!info || renderedKind(var.kind)) continue;
+                if (!info->standalone) {
+                    std::cerr << "PrismRT: render var <" << var.path << "> ('" << var.sourceName
+                              << "') is only available in the Hydra delegate; skipped\n";
+                    continue;
+                }
+                if (var.kind == AovKind::Color) {
+                    prism::device::ImageRequest imageRequest;
+                    imageRequest.camera = rays.parameters;
+                    imageRequest.width = width;
+                    imageRequest.height = height;
+                    imageRequest.samples = o.samples;
+                    imageRequest.seed = o.seed;
+                    imageRequest.sampleClamp = o.clamp;
+                    imageRequest.adaptive.threshold = o.adaptiveThreshold;
+                    imageRequest.adaptive.minSamples = o.adaptiveMinSamples;
+                    imageRequest.contributions = o.contributions;
+                    imageRequest.nee = o.nee;
+                    imageRequest.meanSamples = &meanSamples;
+                    rendered.push_back({AovKind::Color, 3, renderDevice->RenderImage(scene, imageRequest)});
+                } else if (std::find(geometric.begin(), geometric.end(), var.kind) == geometric.end()) {
+                    geometric.push_back(var.kind);
+                }
+            }
+            if (!geometric.empty()) {
+                // Pixel-centre primary hits, as the Hydra delegate resolves
+                // its geometric AOVs.
+                const GfMatrix4d worldToView = rays.parameters.cameraToWorld.GetInverse();
+                const GfMatrix4d projection = rays.parameters.inverseProjection.GetInverse();
+                std::vector<prism::output::RenderedAov> planes;
+                for (AovKind kind : geometric)
+                    planes.push_back({kind, prism::output::AovComponents(kind),
+                        std::vector<float>(size_t(width) * height * prism::output::AovComponents(kind))});
+                tbb::parallel_for(0u, height, [&](unsigned y) {
+                    for (unsigned x = 0; x < width; ++x) {
+                        const RayHit hit = scene.cast_ray(prism::MakeCameraRayWithLens(rays.parameters,
+                            float(x) + 0.5f, float(y) + 0.5f, width, height, nullptr));
+                        for (auto& plane : planes)
+                            prism::output::ResolveGeometricAov(plane.kind, hit, worldToView, projection,
+                                plane.pixels.data() + (size_t(y) * width + x) * plane.components);
+                    }
+                });
+                for (auto& plane : planes) rendered.push_back(std::move(plane));
+            }
+            renderSeconds += seconds() - renderStart;
+            std::vector<std::string> warnings;
+            const prism::output::Image image = prism::output::BuildProductImage(view, rendered, &warnings);
+            if (image.layers.empty()) {
+                for (auto const& warning : warnings) std::cerr << "PrismRT: " << warning << '\n';
+                std::cerr << "PrismRT: nothing to write to " << view.output << '\n';
+                continue;
+            }
+            // EXR: every layer, linear working space, tagged. Other formats:
+            // the colour display-encoded through the view, exactly once.
+            prism::output::WriteImage(view.output, image, *colorManagement, &warnings);
+            for (auto const& warning : warnings) std::cerr << "PrismRT: " << warning << '\n';
+            std::cout << "Rendered " << view.dataWidth << "x" << view.dataHeight;
+            if (!view.FullDataWindow())
+                std::cout << " (data window of " << view.width << "x" << view.height << ")";
+            std::cout << " at " << o.samples << " spp";
+            if (o.adaptiveThreshold > 0) std::cout << " (adaptive, mean " << meanSamples << ")";
+            std::cout << " to " << view.output << '\n';
         }
-        OIIO::ImageBuf image(spec);
-        image.set_pixels(OIIO::ROI(), OIIO::TypeDesc::FLOAT, linearOutput ? pixels.data() : encoded.data());
-        if (!image.write(o.output)) throw std::runtime_error("Cannot write image: " + image.geterror());
-        std::cout << "Rendered " << o.width << "x" << o.height << " at " << o.samples << " spp";
-        if (imageRequest.adaptive.Enabled()) std::cout << " (adaptive, mean " << meanSamples << ")";
-        std::cout << " to " << o.output << '\n';
+        const double outputSeconds = seconds() - loadSeconds - renderSeconds;
         const auto textureStats = prism::TextureService::Acquire()->stats();
         std::cout << "[PrismProfile] {\"stageSeconds\":" << stageSeconds
                   << ",\"loadSeconds\":" << loadSeconds
                   << ",\"renderSeconds\":" << renderSeconds
                   << ",\"meanSamples\":" << meanSamples
-                  << ",\"outputSeconds\":" << seconds()-loadSeconds-renderSeconds
+                  << ",\"outputSeconds\":" << outputSeconds
                   << ",\"textureFiltering\":\"" << o.textureFiltering << "\""
                   << ",\"texturePrepareCalls\":" << textureStats.prepareCalls
                   << ",\"textureMemoryCacheHits\":" << textureStats.memoryCacheHits

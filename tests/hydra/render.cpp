@@ -10,6 +10,12 @@
 #include <pxr/base/plug/registry.h>
 #include <OpenImageIO/imagebuf.h>
 #include "../../src/load_profile.h"
+#include "../../src/color/color_management.h"
+#include "../../src/output/render_products.h"
+#include <pxr/usd/usd/editContext.h>
+#include <pxr/usd/usdGeom/tokens.h>
+#include <pxr/imaging/cameraUtil/framing.h>
+#include <pxr/imaging/hd/types.h>
 #include <chrono>
 #include <algorithm>
 #include <cmath>
@@ -18,6 +24,7 @@
 #include <iostream>
 #include <memory>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <thread>
 #include <utility>
@@ -26,16 +33,23 @@
 PXR_NAMESPACE_USING_DIRECTIVE
 
 namespace {
+// The purposes rendered besides default geometry (UsdRenderSettings
+// includedPurposes). Final frames: render-purpose geometry instead of the
+// viewport's proxies.
+struct Purposes {
+    bool render = true, proxy = false, guide = false;
+};
+
 void render(UsdImagingGLEngine& engine, const UsdStageRefPtr& stage,
             UsdTimeCode frame = UsdTimeCode::Default(),
-            bool domeLightCameraVisibility = true) {
+            bool domeLightCameraVisibility = true, Purposes purposes = {}) {
     UsdImagingGLRenderParams params;
     params.frame = frame;
     params.enableSceneMaterials = true;
     params.enableSceneLights = true;
-    // Final frames: render-purpose geometry instead of the viewport's proxies.
-    params.showRender = true;
-    params.showProxy = false;
+    params.showRender = purposes.render;
+    params.showProxy = purposes.proxy;
+    params.showGuides = purposes.guide;
     engine.SetRendererSetting(TfToken("domeLightCameraVisibility"),
                               VtValue(domeLightCameraVisibility));
     // A scene that cannot be prepared (for example out of memory) is not
@@ -245,6 +259,69 @@ void checkFixtureAovs(UsdImagingGLEngine& engine) {
         center<int>(engine,HdAovTokens->instanceId,HdFormatInt32) != -1)
         throw std::runtime_error("Incorrect prim/instance/coarse-face AOV");
 }
+
+// A rendered AOV of the engine, top row first, as floats (integer AOVs
+// converted exactly below 2^24).
+prism::output::RenderedAov readAov(UsdImagingGLEngine& engine, prism::output::AovKind kind,
+                                   int width, int height) {
+    auto const* info = prism::output::FindAov(kind);
+    if (!info) throw std::runtime_error("Unknown AOV");
+    const TfToken name(std::string(info->name));
+    auto* buffer = engine.GetAovRenderBuffer(name);
+    if (!buffer || buffer->GetWidth() != unsigned(width) || buffer->GetHeight() != unsigned(height))
+        throw std::runtime_error("Missing or invalid AOV: " + name.GetString());
+    const HdFormat format = buffer->GetFormat();
+    const HdFormat component = HdGetComponentFormat(format);
+    const size_t components = HdGetComponentCount(format);
+    if (component != HdFormatFloat32 && component != HdFormatInt32)
+        throw std::runtime_error("Unsupported AOV format: " + name.GetString());
+    buffer->Resolve();
+    const void* data = buffer->Map();
+    if (!data) { buffer->Unmap(); throw std::runtime_error("Cannot map " + name.GetString()); }
+    prism::output::RenderedAov aov{kind, int(components),
+        std::vector<float>(size_t(width) * height * components)};
+    // Hydra's raster origin is bottom-left; image files use top-left.
+    for (int y = 0; y < height; ++y) {
+        const size_t source = size_t(height - 1 - y) * width * components;
+        float* row = aov.pixels.data() + size_t(y) * width * components;
+        for (size_t i = 0; i < size_t(width) * components; ++i)
+            row[i] = component == HdFormatFloat32
+                ? static_cast<const float*>(data)[source + i]
+                : float(static_cast<const int32_t*>(data)[source + i]);
+    }
+    buffer->Unmap();
+    if (kind == prism::output::AovKind::Color)
+        for (float v : aov.pixels) if (!std::isfinite(v))
+            throw std::runtime_error("Non-finite color AOV");
+    return aov;
+}
+
+void printWarnings(std::vector<std::string> const& warnings) {
+    for (auto const& warning : warnings) std::cerr << "prism_hydra_render: " << warning << '\n';
+}
+
+// Command-line options that are also prism:* render settings: authored values
+// on the settings prim would win in the delegate, so the options override
+// them in the session layer (the CLI's precedence).
+void overrideAuthoredSettings(const UsdStageRefPtr& stage, SdfPath const& settings,
+                              std::vector<std::pair<std::string, VtValue>> const& given) {
+    UsdPrim prim = stage->GetPrimAtPath(settings);
+    if (!prim) return;
+    UsdEditContext session(stage, stage->GetSessionLayer());
+    for (auto const& [name, value] : given) {
+        UsdAttribute attribute = prim.GetAttribute(TfToken("prism:" + name));
+        if (!attribute || !attribute.HasAuthoredValue()) continue;
+        const SdfValueTypeName type = attribute.GetTypeName();
+        VtValue converted = value;
+        if (type == SdfValueTypeNames->Token && value.IsHolding<std::string>())
+            converted = VtValue(TfToken(value.UncheckedGet<std::string>()));
+        else if (type == SdfValueTypeNames->Asset && value.IsHolding<std::string>())
+            converted = VtValue(SdfAssetPath(value.UncheckedGet<std::string>()));
+        else converted = VtValue::CastToTypeOf(value, type.GetDefaultValue());
+        if (converted.IsEmpty() || !attribute.Set(converted))
+            throw std::runtime_error("Cannot override " + attribute.GetPath().GetString());
+    }
+}
 }
 
 int main(int argc, char** argv) {
@@ -271,13 +348,17 @@ int main(int argc, char** argv) {
             std::cout << "Transparent export alpha verified: " << argv[2] << '\n';
             return 0;
         }
-        if (argc < 4) {
-            std::cerr << "usage: prism_hydra_render scene.usda /Camera output.exr [width height spp [--exercise] [--animation-exercise] [--hide-dome-background] [--environment-sampling mis|bsdf] [--light-selection spatial|power] [--sample-clamp N] [--seed N] [--sphere-batching] [--no-texture-streaming] [--progressive-textures]]\n";
+        // prism_hydra_render scene.usda --render-settings PATH|default OUTPUT_DIR [options]
+        // renders the RenderProducts of a RenderSettings prim.
+        const bool productMode = argc >= 3 && std::string(argv[2]) == "--render-settings";
+        if (argc < 4 || (productMode && (argc < 5 || std::string(argv[4]).rfind("--", 0) == 0))) {
+            std::cerr << "usage: prism_hydra_render scene.usda /Camera output.exr [width height spp [--exercise] [--animation-exercise] [--hide-dome-background] [--environment-sampling mis|bsdf] [--light-selection spatial|power] [--sample-clamp N] [--seed N] [--sphere-batching] [--no-texture-streaming] [--progressive-textures] [--render-settings /Render/Settings]]\n"
+                         "       prism_hydra_render scene.usda --render-settings /Render/Settings|default OUTPUT_DIR [--spp N] [options]\n";
             return 2;
         }
-        const int width = argc > 4 ? std::stoi(argv[4]) : 128;
-        const int height = argc > 5 ? std::stoi(argv[5]) : 128;
-        const int spp = argc > 6 ? std::stoi(argv[6]) : 64;
+        const int width = !productMode && argc > 4 ? std::stoi(argv[4]) : 128;
+        const int height = !productMode && argc > 5 ? std::stoi(argv[5]) : 128;
+        int spp = !productMode && argc > 6 ? std::stoi(argv[6]) : 64;
         bool exercise = false;
         bool animationExercise = false;
         bool sphereBatching = false;
@@ -302,8 +383,14 @@ int main(int argc, char** argv) {
         int seed = 0;
         // prism:colorManagement:* render settings, set only when given.
         std::vector<std::pair<std::string, std::string>> colorSettings;
-        for (int i = 7; i < argc; ++i) {
+        // Options given (product mode sets only these renderer settings).
+        std::set<std::string> given;
+        // The RenderSettings prim (empty: the stage's renderSettingsPrimPath).
+        std::string settingsPath = productMode && std::string(argv[3]) != "default"
+            ? std::string(argv[3]) : std::string();
+        for (int i = productMode ? 5 : 7; i < argc; ++i) {
             const std::string option(argv[i]);
+            given.insert(option);
             if (option == "--exercise") { exercise = true; continue; }
             if (option == "--animation-exercise") { animationExercise = true; continue; }
             if (option == "--sphere-batching") { sphereBatching = true; continue; }
@@ -315,6 +402,8 @@ int main(int argc, char** argv) {
             else if (option == "--ocio-config") colorSettings.emplace_back("ocioConfig", argv[i]);
             else if (option == "--display") colorSettings.emplace_back("display", argv[i]);
             else if (option == "--view") colorSettings.emplace_back("view", argv[i]);
+            else if (option == "--spp" && productMode) spp = std::stoi(argv[i]);
+            else if (option == "--render-settings" && !productMode) settingsPath = argv[i];
             else if (option == "--environment-sampling") sampling = argv[i];
             else if (option == "--texture-filtering") filtering = argv[i];
             else if (option == "--sample-clamp") sampleClamp = std::stof(argv[i]);
@@ -345,13 +434,82 @@ int main(int argc, char** argv) {
             throw std::runtime_error("Invalid sampling mode or sample clamp");
         if (width <= 0 || height <= 0 || spp <= 0)
             throw std::runtime_error("Dimensions and spp must be positive");
+        if (productMode && (exercise || animationExercise || previewSequence || editSequence ||
+                            changeDepth || hideDomeBackground))
+            throw std::runtime_error("Validation exercises take an explicit camera and output");
         prism::load_profile::Mark("cli.start");
         std::optional<prism::load_profile::Scope> openProfile(std::in_place, "cli.stage_open");
         auto stage = UsdStage::Open(argv[1]);
         openProfile.reset();
         if (!stage) throw std::runtime_error("Cannot open USD scene");
-        if (!UsdGeomCamera(stage->GetPrimAtPath(SdfPath(argv[2]))))
-            throw std::runtime_error("Camera path does not identify a USD camera");
+        // RenderSettings, products and vars, as the CLI resolves them
+        // (src/output/render_products.h).
+        std::vector<std::string> warnings;
+        const auto job = prism::output::ResolveRenderJob(stage, settingsPath,
+            productMode ? argv[4] : "", &warnings);
+        printWarnings(warnings);
+        if (productMode && (!job || job->products.empty()))
+            throw std::runtime_error("The render settings have no render products to write");
+        std::vector<prism::output::RenderProductRequest> views;
+        if (productMode) {
+            views = job->products;
+        } else {
+            if (!UsdGeomCamera(stage->GetPrimAtPath(SdfPath(argv[2]))))
+                throw std::runtime_error("Camera path does not identify a USD camera");
+            // The settings' pixel aspect ratio, conform policy and data
+            // window apply at the requested size.
+            prism::output::RenderProductRequest view;
+            if (job) view = job->base;
+            view.camera = SdfPath(argv[2]);
+            view.width = width;
+            view.height = height;
+            if (!job) view.dataWindowNDC = GfRange2f(GfVec2f(0.0f), GfVec2f(1.0f));
+            prism::output::DataWindowPixels(view.dataWindowNDC, width, height,
+                &view.dataX, &view.dataY, &view.dataWidth, &view.dataHeight);
+            if (view.dataWidth <= 0 || view.dataHeight <= 0)
+                throw std::runtime_error("The render settings' data window is empty");
+            view.output = argv[3];
+            prism::output::RenderVarRequest color;
+            color.name = "color";
+            color.kind = prism::output::AovKind::Color;
+            color.components = 4;
+            view.vars.push_back(color);
+            views.push_back(std::move(view));
+        }
+        for (auto const& view : views)
+            if (!UsdGeomCamera(stage->GetPrimAtPath(view.camera)))
+                throw std::runtime_error("Render product <" + view.path.GetString() + "> has no USD camera");
+        // includedPurposes: default geometry always renders.
+        Purposes purposes;
+        if (job) {
+            auto has = [&](TfToken const& purpose) {
+                return std::find(job->includedPurposes.begin(), job->includedPurposes.end(), purpose) !=
+                    job->includedPurposes.end();
+            };
+            purposes.render = has(UsdGeomTokens->render);
+            purposes.proxy = has(UsdGeomTokens->proxy);
+            purposes.guide = has(UsdGeomTokens->guide);
+        }
+        if (job) {
+            // The renderer settings this tool sets: all of them with an
+            // explicit camera, the given options in product mode.
+            std::vector<std::pair<std::string, VtValue>> overrides;
+            auto add = [&](const char* option, const char* name, VtValue value) {
+                if (!productMode || given.count(option)) overrides.emplace_back(name, std::move(value));
+            };
+            add("--spp", "samplesPerPixel", VtValue(spp));
+            add("--max-depth", "maxDepth", VtValue(maxDepth));
+            add("--sample-clamp", "maxSampleRadiance", VtValue(sampleClamp));
+            add("--seed", "seed", VtValue(seed));
+            add("--adaptive-threshold", "adaptiveThreshold", VtValue(adaptiveThreshold));
+            add("--nee-probability-min", "neeProbabilityMin", VtValue(neeProbabilityMin));
+            add("--environment-sampling", "environmentSampling", VtValue(sampling));
+            add("--texture-filtering", "textureFiltering", VtValue(filtering));
+            add("--light-selection", "lightSelection", VtValue(lightSelection));
+            for (auto const& [name, value] : colorSettings)
+                overrides.emplace_back("colorManagement:" + name, VtValue(value));
+            overrideAuthoredSettings(stage, job->settings, overrides);
+        }
         UsdImagingGLEngine::Parameters parameters;
         parameters.gpuEnabled = false;
         parameters.rendererPluginId = TfToken("HdPrismRendererPlugin");
@@ -360,33 +518,93 @@ int main(int argc, char** argv) {
         engineProfile.reset();
         if (engine.GetCurrentRendererId() != parameters.rendererPluginId)
             throw std::runtime_error("PrismRT plugin not loaded; check PXR_PLUGINPATH_NAME and DLL paths");
-        engine.SetCameraPath(SdfPath(argv[2]));
-        engine.SetRenderViewport(GfVec4d(0, 0, width, height));
-        engine.SetRendererSetting(TfToken("prism:samplesPerPixel"), VtValue(spp));
-        engine.SetRendererSetting(TfToken("prism:maxDepth"), VtValue(maxDepth));
-        engine.SetRendererSetting(TfToken("prism:rrMinDepth"), VtValue(4));
-        engine.SetRendererSetting(TfToken("prism:maxSampleRadiance"), VtValue(sampleClamp));
-        engine.SetRendererSetting(TfToken("prism:environmentSampling"), VtValue(TfToken(sampling)));
-        engine.SetRendererSetting(TfToken("prism:textureFiltering"), VtValue(TfToken(filtering)));
-        engine.SetRendererSetting(TfToken("prism:seed"), VtValue(seed));
-        engine.SetRendererSetting(TfToken("prism:adaptiveThreshold"), VtValue(adaptiveThreshold));
-        engine.SetRendererSetting(TfToken("prism:neeProbabilityMin"), VtValue(neeProbabilityMin));
-        engine.SetRendererSetting(TfToken("prism:lightSelection"), VtValue(TfToken(lightSelection)));
+        // The delegate reads prism:* settings and materialBindingPurposes
+        // from the active settings prim.
+        if (job) engine.SetActiveRenderSettingsPrimPath(job->settings);
+        // Product mode sets only the given options: the rest come from the
+        // settings prim's prism:* attributes or the delegate's defaults.
+        auto setting = [&](const char* option, const char* name, VtValue value) {
+            if (!productMode || given.count(option))
+                engine.SetRendererSetting(TfToken(name), std::move(value));
+        };
+        setting("--spp", "prism:samplesPerPixel", VtValue(spp));
+        setting("--max-depth", "prism:maxDepth", VtValue(maxDepth));
+        setting("--rr-min-depth", "prism:rrMinDepth", VtValue(4));
+        setting("--sample-clamp", "prism:maxSampleRadiance", VtValue(sampleClamp));
+        setting("--environment-sampling", "prism:environmentSampling", VtValue(TfToken(sampling)));
+        setting("--texture-filtering", "prism:textureFiltering", VtValue(TfToken(filtering)));
+        setting("--seed", "prism:seed", VtValue(seed));
+        setting("--adaptive-threshold", "prism:adaptiveThreshold", VtValue(adaptiveThreshold));
+        setting("--nee-probability-min", "prism:neeProbabilityMin", VtValue(neeProbabilityMin));
+        setting("--light-selection", "prism:lightSelection", VtValue(TfToken(lightSelection)));
         engine.SetRendererSetting(TfToken("prism:sphereBatching"), VtValue(sphereBatching));
         engine.SetRendererSetting(TfToken("prism:textureStreaming"), VtValue(textureStreaming));
         engine.SetRendererSetting(TfToken("prism:textureStreamingPrepass"), VtValue(textureStreamingPrepass));
         for (auto const& [name, value] : colorSettings)
             engine.SetRendererSetting(TfToken("prism:colorManagement:" + name), VtValue(value));
+        engine.SetEnablePresentation(false);
+        // Frames a view: a plain viewport for a full window at pixel aspect
+        // ratio 1 (as before render settings), else the display and data
+        // windows with the conform policy (CameraUtilFraming, as the CLI).
+        auto frame = [&](prism::output::RenderProductRequest const& view) {
+            engine.SetCameraPath(view.camera);
+            if (view.FullDataWindow() && view.pixelAspectRatio == 1.0f &&
+                prism::output::ConformPolicy(view.aspectRatioConformPolicy) == CameraUtilFit) {
+                engine.SetRenderViewport(GfVec4d(0, 0, view.width, view.height));
+                return;
+            }
+            engine.SetFraming(CameraUtilFraming(
+                GfRange2f(GfVec2f(0.0f), GfVec2f(float(view.width), float(view.height))),
+                GfRect2i(GfVec2i(view.dataX, view.dataY), view.dataWidth, view.dataHeight),
+                view.pixelAspectRatio));
+            engine.SetOverrideWindowPolicy(prism::output::ConformPolicy(view.aspectRatioConformPolicy));
+            engine.SetRenderBufferSize(GfVec2i(view.dataWidth, view.dataHeight));
+        };
+        if (productMode) {
+            std::vector<prism::output::RenderedAov> rendered;
+            for (size_t index = 0; index < views.size(); ++index) {
+                auto const& view = views[index];
+                if (index == 0 || !view.SameView(views[index - 1])) {
+                    // Every AOV of the products sharing this view, colour first.
+                    std::vector<prism::output::AovKind> kinds{prism::output::AovKind::Color};
+                    for (size_t other = index; other < views.size() && views[other].SameView(view); ++other)
+                        for (auto const& var : views[other].vars)
+                            if (std::find(kinds.begin(), kinds.end(), var.kind) == kinds.end())
+                                kinds.push_back(var.kind);
+                    TfTokenVector aovs;
+                    for (auto kind : kinds)
+                        aovs.emplace_back(std::string(prism::output::FindAov(kind)->name));
+                    frame(view);
+                    engine.SetRendererAovs(aovs);
+                    render(engine, stage, renderTime, true, purposes);
+                    rendered.clear();
+                    for (auto kind : kinds)
+                        rendered.push_back(readAov(engine, kind, view.dataWidth, view.dataHeight));
+                }
+                std::vector<std::string> productWarnings;
+                const auto image = prism::output::BuildProductImage(view, rendered, &productWarnings);
+                if (!image.layers.empty())
+                    prism::output::WriteImage(view.output, image, *prism::color::Active(), &productWarnings);
+                printWarnings(productWarnings);
+                if (image.layers.empty()) {
+                    std::cerr << "prism_hydra_render: nothing to write to " << view.output << '\n';
+                    continue;
+                }
+                std::cout << "Hydra render converged and saved " << view.output << '\n';
+            }
+            return 0;
+        }
+        auto const& view = views.front();
+        frame(view);
         engine.SetRendererAovs({HdAovTokens->color, HdAovTokens->depth,
             HdAovTokens->cameraDepth, HdAovTokens->normal, HdAovTokens->Neye,
             HdAovTokens->primId, HdAovTokens->instanceId, HdAovTokens->elementId});
-        engine.SetEnablePresentation(false);
         if (animationExercise) {
             runAnimationExercise(argv[1], argv[2], width, height, spp);
             std::cout << "Hydra animation exercise passed\n";
             return 0;
         }
-        render(engine, stage, renderTime, !hideDomeBackground);
+        render(engine, stage, renderTime, !hideDomeBackground, purposes);
         for (int step = 1; step <= previewSequence; ++step) {
             UsdGeomXformable camera(stage->GetPrimAtPath(SdfPath(argv[2])));
             bool resets = false;
@@ -395,7 +613,7 @@ int main(int argc, char** argv) {
             transform.SetTranslateOnly(transform.ExtractTranslation() + GfVec3d(0.002, 0.0, 0.0));
             camera.ClearXformOpOrder();
             camera.AddTransformOp().Set(transform);
-            render(engine, stage, renderTime, !hideDomeBackground);
+            render(engine, stage, renderTime, !hideDomeBackground, purposes);
             const auto stats = engine.GetRenderStats();
             const auto stat = [&](const char* name) {
                 auto found = stats.find(name);
@@ -414,7 +632,7 @@ int main(int argc, char** argv) {
             const auto start = std::chrono::steady_clock::now();
             prim.ClearXformOpOrder();
             prim.AddTransformOp().Set(transform);
-            render(engine, stage, renderTime, !hideDomeBackground);
+            render(engine, stage, renderTime, !hideDomeBackground, purposes);
             const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
             const auto stats = engine.GetRenderStats();
             const auto stat = [&](const char* name) {
@@ -426,7 +644,7 @@ int main(int argc, char** argv) {
         }
         if (changeDepth > 0) {
             engine.SetRendererSetting(TfToken("prism:maxDepth"), VtValue(changeDepth));
-            render(engine, stage, renderTime, !hideDomeBackground);
+            render(engine, stage, renderTime, !hideDomeBackground, purposes);
         }
         for (const auto& [name,value] : engine.GetRenderStats())
             std::cout << "Render stat " << name << ": " << value << '\n';
@@ -435,9 +653,10 @@ int main(int argc, char** argv) {
         // statistics before image encoding so automated validators can rely
         // on them even in those runtimes.
         std::cout.flush();
-        const auto initial = pixels(engine, width, height);
+        const int outputWidth = view.dataWidth, outputHeight = view.dataHeight;
+        const auto initial = pixels(engine, outputWidth, outputHeight);
         const size_t backgroundAlpha = 3;
-        const size_t centerAlpha = (size_t(height / 2) * width + width / 2) * 4 + 3;
+        const size_t centerAlpha = (size_t(outputHeight / 2) * outputWidth + outputWidth / 2) * 4 + 3;
         if (hideDomeBackground) {
             if (initial[backgroundAlpha] != 0.0f || initial[centerAlpha] < 0.99f)
                 throw std::runtime_error(
@@ -447,16 +666,20 @@ int main(int argc, char** argv) {
                   << center<GfVec3f>(engine, HdAovTokens->normal, HdFormatFloat32Vec3)
                   << "; camera depth: "
                   << center<float>(engine, HdAovTokens->cameraDepth, HdFormatFloat32) << '\n';
-        OIIO::ImageBuf image(OIIO::ImageSpec(width, height, 4, OIIO::TypeDesc::FLOAT));
-        image.set_pixels(OIIO::ROI(), OIIO::TypeDesc::FLOAT, initial.data());
-        if (!image.write(argv[3])) throw std::runtime_error(image.geterror());
+        {
+            std::vector<std::string> outputWarnings;
+            const auto image = prism::output::BuildProductImage(view,
+                {{prism::output::AovKind::Color, 4, initial}}, &outputWarnings);
+            prism::output::WriteImage(argv[3], image, *prism::color::Active(), &outputWarnings);
+            printWarnings(outputWarnings);
+        }
         if (hideDomeBackground) {
             OIIO::ImageBuf saved(argv[3]);
             if (!saved.read(0, 0, true, OIIO::TypeDesc::FLOAT))
                 throw std::runtime_error("Cannot read back transparent export: " + saved.geterror());
             if (saved.spec().nchannels != 4)
                 throw std::runtime_error("Transparent export did not preserve four color channels");
-            std::vector<float> exported(size_t(width) * height * 4);
+            std::vector<float> exported(size_t(outputWidth) * outputHeight * 4);
             if (!saved.get_pixels(OIIO::ROI(), OIIO::TypeDesc::FLOAT, exported.data()))
                 throw std::runtime_error("Cannot inspect exported color channels: " + saved.geterror());
             if (exported[backgroundAlpha] != 0.0f || exported[centerAlpha] < 0.99f)
@@ -466,24 +689,24 @@ int main(int argc, char** argv) {
         if (exercise) {
             checkFixtureAovs(engine);
             // Same scene + seed must remain stable when asked to render again.
-            render(engine, stage);
-            if (pixels(engine, width, height) != initial)
+            render(engine, stage, UsdTimeCode::Default(), true, purposes);
+            if (pixels(engine, outputWidth, outputHeight) != initial)
                 throw std::runtime_error("Converged image changed without a scene edit");
             auto panel = UsdGeomImageable(stage->GetPrimAtPath(SdfPath("/World/Panel")));
             if (!panel) throw std::runtime_error("Exercise mode requires parity fixture /World/Panel");
             panel.MakeInvisible();
-            render(engine, stage);
-            if (pixels(engine, width, height) == initial)
+            render(engine, stage, UsdTimeCode::Default(), true, purposes);
+            if (pixels(engine, outputWidth, outputHeight) == initial)
                 throw std::runtime_error("Visibility edit did not invalidate rendering");
             panel.MakeVisible();
-            render(engine, stage);
-            if (pixels(engine, width, height) != initial)
+            render(engine, stage, UsdTimeCode::Default(), true, purposes);
+            if (pixels(engine, outputWidth, outputHeight) != initial)
                 throw std::runtime_error("Restoring visibility did not reproduce deterministic rendering");
             engine.SetRenderViewport(GfVec4d(0,0,32,24));
-            render(engine, stage);
+            render(engine, stage, UsdTimeCode::Default(), true, purposes);
             pixels(engine,32,24);
             stage->RemovePrim(SdfPath("/World/Panel"));
-            render(engine,stage);
+            render(engine, stage, UsdTimeCode::Default(), true, purposes);
             pixels(engine,32,24);
         }
         std::cout << "Hydra render converged and saved " << argv[3] << '\n';

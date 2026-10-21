@@ -1,12 +1,50 @@
 #include <OpenImageIO/imagebuf.h>
+#include <algorithm>
 #include <cmath>
 #include <iostream>
 #include <string>
 #include <vector>
 
+namespace {
+// The three channels compared: R, G, B (or <layer>.R/G/B, X/Y/Z, U/V), else
+// the first three.
+bool Channels(OIIO::ImageSpec const& spec, std::string const& layer, int* indices) {
+    const std::string prefix = layer.empty() ? std::string() : layer + ".";
+    static const char* const color[] = {"R", "G", "B"};
+    static const char* const vector[] = {"X", "Y", "Z"};
+    for (const char* const* names : {color, vector}) {
+        bool found = true;
+        for (int c = 0; c < 3 && found; ++c) {
+            indices[c] = spec.channelindex(prefix + names[c]);
+            found = indices[c] >= 0;
+        }
+        if (found) return true;
+    }
+    if (!layer.empty() || spec.nchannels < 3) return false;
+    for (int c = 0; c < 3; ++c) indices[c] = c;
+    return true;
+}
+}
+
 int main(int argc, char** argv) {
-    if (argc != 3 && !(argc == 4 && std::string(argv[3]) == "--exact")) {
-        std::cerr << "usage: prism_compare_images reference.exr actual.exr [--exact]\n";
+    // Both metrics must be within the tolerance: 1% by default, 0 with --exact.
+    // --mean-tolerance sets the mean luminance one separately (noisy images
+    // whose renderers sample differently).
+    double tolerance = .01, meanTolerance = -1;
+    std::string layer;
+    bool usage = argc < 3;
+    for (int i = 3; i < argc && !usage; ++i) {
+        const std::string option = argv[i];
+        if (option == "--exact") tolerance = 0.0;
+        else if (option == "--tolerance" && i + 1 < argc) tolerance = std::stod(argv[++i]);
+        else if (option == "--mean-tolerance" && i + 1 < argc) meanTolerance = std::stod(argv[++i]);
+        else if (option == "--layer" && i + 1 < argc) layer = argv[++i];
+        else usage = true;
+    }
+    if (meanTolerance < 0) meanTolerance = tolerance;
+    if (usage || !(tolerance >= 0)) {
+        std::cerr << "usage: prism_compare_images reference.exr actual.exr [--exact | --tolerance 0.01]"
+                     " [--mean-tolerance 0.01] [--layer NAME]\n";
         return 2;
     }
     OIIO::ImageBuf reference(argv[1]), actual(argv[2]);
@@ -17,30 +55,33 @@ int main(int argc, char** argv) {
     }
     const auto& a = reference.spec();
     const auto& b = actual.spec();
-    if (a.width != b.width || a.height != b.height || a.nchannels < 3 || b.nchannels < 3) {
+    int ca[3], cb[3];
+    if (a.width != b.width || a.height != b.height || !Channels(a, layer, ca) || !Channels(b, layer, cb)) {
         std::cerr << "Image dimensions/channels differ\n";
         return 1;
     }
     double error = 0, energy = 0, referenceLuminance = 0, actualLuminance = 0;
     std::vector<float> p(a.nchannels), q(b.nchannels);
+    const double weights[3] = {.2126, .7152, .0722};
     for (int y = 0; y < a.height; ++y) {
         for (int x = 0; x < a.width; ++x) {
-            reference.getpixel(x, y, p.data()); actual.getpixel(x, y, q.data());
+            reference.getpixel(a.x + x, a.y + y, p.data()); actual.getpixel(b.x + x, b.y + y, q.data());
             for (int c = 0; c < 3; ++c) {
-                if (!std::isfinite(p[c]) || !std::isfinite(q[c])) {
+                const double u = p[ca[c]], v = q[cb[c]];
+                if (!std::isfinite(u) || !std::isfinite(v)) {
                     std::cerr << "Non-finite pixel at " << x << ',' << y << '\n';
                     return 1;
                 }
-                error += std::pow(double(p[c])-q[c], 2);
-                energy += double(p[c])*p[c];
+                error += (u - v) * (u - v);
+                energy += u * u;
+                referenceLuminance += weights[c] * u;
+                actualLuminance += weights[c] * v;
             }
-            referenceLuminance += .2126*p[0]+.7152*p[1]+.0722*p[2];
-            actualLuminance += .2126*q[0]+.7152*q[1]+.0722*q[2];
         }
     }
     const double nrmse = std::sqrt(error / std::max(energy, 1e-20));
     const double luminanceDelta = std::abs(actualLuminance-referenceLuminance) / std::max(std::abs(referenceLuminance), 1e-20);
-    std::cout << "Normalized RMSE: " << nrmse << "; relative mean luminance error: " << luminanceDelta << '\n';
-    const double tolerance = argc == 4 ? 0.0 : .01;
-    return nrmse <= tolerance && luminanceDelta <= tolerance ? 0 : 1;
+    std::cout << "Normalized RMSE: " << nrmse << "; relative mean luminance error: " << luminanceDelta
+              << " (tolerances " << tolerance << ", " << meanTolerance << ")\n";
+    return nrmse <= tolerance && luminanceDelta <= meanTolerance ? 0 : 1;
 }
