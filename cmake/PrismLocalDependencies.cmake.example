@@ -2,10 +2,20 @@
 # your machine. The copied file is ignored by git. CMake package discovery
 # through CMAKE_PREFIX_PATH works without this file when dependencies are
 # installed in standard locations.
+#
+# The roots come from PRISM_* environment variables (CI sets them), or edit
+# them directly. tools/build_deps_local.ps1 builds OpenSubdiv, MaterialX and
+# OpenUSD into versioned prefixes, for example:
+#   PRISM_OPENUSD_ROOT     D:/prism-deps/openusd-26.08
+#   PRISM_MATERIALX_ROOT   D:/prism-deps/materialx-1.39.5
+#   PRISM_OPENSUBDIV_ROOT  D:/prism-deps/opensubdiv-3.6.1
+# The versions themselves live only in tools/deps.json; the configure checks
+# that what it finds matches (cmake/PrismDeps.cmake).
 set(pxr_DIR "$ENV{PRISM_OPENUSD_ROOT}" CACHE PATH "OpenUSD package config directory")
 set(TBB_DIR "$ENV{PRISM_TBB_ROOT}/lib/cmake/tbb" CACHE PATH "oneTBB package config")
 set(MaterialX_DIR "$ENV{PRISM_MATERIALX_ROOT}/lib/cmake/MaterialX" CACHE PATH "MaterialX package config")
-set(embree_DIR "$ENV{PRISM_EMBREE_ROOT}/lib/cmake/embree-4.4.0" CACHE PATH "Embree package config")
+prism_find_embree_dir(_prism_embree_dir "$ENV{PRISM_EMBREE_ROOT}")
+set(embree_DIR "${_prism_embree_dir}" CACHE PATH "Embree package config")
 set(OpenSubdiv_DIR "$ENV{PRISM_OPENSUBDIV_ROOT}/lib/cmake/OpenSubdiv" CACHE PATH "OpenSubdiv package config required by OpenUSD")
 set(PRISM_EMBREE_RUNTIME_DIR "$ENV{PRISM_EMBREE_RUNTIME_DIR}" CACHE PATH "Embree runtime directory")
 set(PRISM_EMBREE_BUILD_RUNTIME "$ENV{PRISM_EMBREE_BUILD_RUNTIME}" CACHE PATH "Additional Embree runtime directory")

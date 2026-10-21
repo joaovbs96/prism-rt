@@ -1,0 +1,26 @@
+{
+  "_comment": "The only list of PrismRT dependency versions. CI, the build scripts, CMake and the docs-drift test read it. See 'How to upgrade a dependency' in docs/deployment.md.",
+  "stack_revision": 1,
+  "openusd": { "version": "26.08", "tag": "v26.08" },
+  "materialx": { "version": "1.39.5", "tag": "v1.39.5" },
+  "opensubdiv": { "version": "3.6.1", "tag": "v3_6_1" },
+  "onetbb": { "version": "2022.2.0" },
+  "embree": { "version": "4.4.0" },
+  "mdl_sdk": {
+    "version": "2026.0.2",
+    "tag": "2026.0.2",
+    "build": "391700.2276",
+    "clang": "12.0.1",
+    "vcpkg_baseline": "9d7f79f56ae1a9b4704d6a7fb8237e347a974133"
+  },
+  "python": {
+    "version": "3.11",
+    "packages": { "PySide6": "6.7.2", "PyOpenGL": "3.1.7", "numpy": "2.2.6" }
+  },
+  "vulkan_sdk": { "version": "1.4.321.0" },
+  "vcpkg": {
+    "baseline": "9eec002df1cd109f8f104cd966a763daf9751489",
+    "release": "2026.10.16",
+    "openimageio": "3.1.14"
+  }
+}
