@@ -54,7 +54,9 @@ Scenes: **Eggs** (MaterialEggs), **OpenPBR** (OpenPBRShaderPlayground),
 
 - **Curves** (`BasisCurves`): ALab's fur and cloth (baked procedurals package).
   Embree has curve primitives; the GPU devices need a procedural intersector.
-- **Volumes** (`Volume` + OpenVDB): the Eggs' jade egg interior.
+- **Volumes** (`Volume` + OpenVDB): the Eggs' jade egg interior. The current
+  state and a staged plan (volume terminal, NEE in media, nested media,
+  heterogeneous media, OpenVDB) are in [volumes.md](volumes.md).
 - **Points** and particle fields (ALab's optional Gaussian splats).
 - **Motion blur**: camera shutters and time-sampled transforms (Eggs, ALab).
 - **Adaptive subdivision and dicing.** Subdivision is uniform per mesh under a
