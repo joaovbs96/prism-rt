@@ -5,6 +5,7 @@
 #include "resolved_resource.h"
 #include "udim_resource.h"
 #include "../materialx/mdl_generator.h"
+#include "../color/color_management.h"
 #include "../mdl_material.h"
 #include "../resource_limits.h"
 #include <pxr/base/gf/vec3f.h>
@@ -334,10 +335,12 @@ public:
               const std::string& mdlPath,
               const CapturedMaterialGraph& structure,
               CompatibleMaterialTemplate* result) const {
+        // Compiled code holds the working space's colour transforms.
+        const std::string color=prism::color::Active()->identity();
         std::lock_guard lock(m_mutex);
         for (auto it = m_entries.rbegin(); it != m_entries.rend(); ++it) {
             auto prototype=it->prototype.lock();
-            if (it->context == context && it->libraries == libraries &&
+            if (it->context == context && it->libraries == libraries && it->color == color &&
                 it->mdlPath == mdlPath && it->structure == structure &&
                 prototype && prototype->is_valid()) {
                 *result = {it->context,it->libraries,it->mdlPath,it->structure,
@@ -369,15 +372,16 @@ public:
     }
     void publish(CompatibleMaterialTemplate entry) {
         if (!IsBindable(entry)) return;
+        const std::string color=prism::color::Active()->identity();
         std::lock_guard lock(m_mutex);
         std::erase_if(m_entries, [&](const auto& old) {
-            return old.context == entry.context && old.libraries == entry.libraries &&
+            return old.context == entry.context && old.libraries == entry.libraries && old.color == color &&
                 old.mdlPath == entry.mdlPath && old.structure == entry.structure;
         });
         if (m_entries.size() >= 512) m_entries.erase(m_entries.begin());
         m_entries.push_back({entry.context,std::move(entry.libraries),
             std::move(entry.mdlPath),std::move(entry.structure),entry.prototype,
-            std::move(entry.bindings)});
+            std::move(entry.bindings),color});
     }
     void eraseContext(mdl::Context* context) {
         std::lock_guard lock(m_mutex);
@@ -392,6 +396,7 @@ private:
         CapturedMaterialGraph structure;
         std::weak_ptr<MDLMaterial> prototype;
         std::vector<CompatibleBinding> bindings;
+        std::string color;
     };
     mutable std::mutex m_mutex;
     std::vector<StoredTemplate> m_entries;

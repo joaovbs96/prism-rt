@@ -46,8 +46,11 @@ std::string CanonicalColorSpace(std::string const& name)
         {"srgb_tx", "srgb_texture"}, {"srgb", "srgb_texture"}, {"srgb - texture", "srgb_texture"},
         {"utility - srgb - texture", "srgb_texture"}, {"srgb texture", "srgb_texture"},
         {"srgb_rec709_scene", "srgb_texture"}, {"srgb encoded rec.709 (srgb)", "srgb_texture"},
-        {"raw", "lin_rec709"}, {"utility - raw", "lin_rec709"}, {"non-color", "lin_rec709"},
-        {"data", "lin_rec709"}, {"linear", "lin_rec709"}, {"lin_srgb", "lin_rec709"},
+        // Data is never converted: MaterialX has no transform from "none" into
+        // any working space (lin_rec709 would convert into ACEScg).
+        {"raw", "none"}, {"utility - raw", "none"}, {"non-color", "none"},
+        {"data", "none"}, {"linear", "lin_rec709"}, {"lin_srgb", "lin_rec709"},
+        {"lin_rec709_srgb", "lin_rec709"},
         {"linear rec.709 (srgb)", "lin_rec709"}, {"lin_rec709_scene", "lin_rec709"},
         {"utility - linear - srgb", "lin_rec709"}, {"scene-linear rec.709-srgb", "lin_rec709"},
         {"acescg", "acescg"}, {"aces - acescg", "acescg"}, {"lin_ap1", "acescg"},

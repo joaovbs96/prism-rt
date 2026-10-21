@@ -1,5 +1,6 @@
 #include "mdl_generator.h"
 #include "generated_cache.h"
+#include "../color/color_management.h"
 #include "../resource_limits.h"
 #include <MaterialXCore/Generated.h>
 #include <MaterialXFormat/XmlIo.h>
@@ -17,6 +18,7 @@
 #include <filesystem>
 #include <array>
 #include <unordered_map>
+#include <set>
 #include <MaterialXGenShader/TypeDesc.h>
 #include <MaterialXGenShader/Syntax.h>
 
@@ -71,6 +73,84 @@ std::string GeneratorOptionsIdentity(MaterialX::GenOptions const& o) {
         std::to_string(o.hwWriteAlbedoTable)+"|"+
         std::to_string(o.hwWriteEnvPrefilter)+"|"+
         std::to_string(o.hwImplicitBitangents);
+}
+
+// MaterialX's default colour management only has transforms into lin_rec709
+// (cmlib's ND_<space>_to_lin_rec709_*); with another target it finds none and
+// silently leaves tagged colours and textures undecoded. For other working
+// spaces this library adds ND_<space>_to_<target>_color3/4: the cmlib decode
+// to lin_rec709 followed by the working space's matrix, plus lin_rec709 to
+// the target. Spaces already in the target get no transform, so every tagged
+// value converts exactly once. The standard library stays the data library.
+MaterialX::DocumentPtr ColorTransformLibrary(MaterialX::DocumentPtr const& stdlib,
+                                             prism::color::ColorManagement const& color) {
+    const std::string target=color.materialXSpace();
+    if(target=="lin_rec709") return stdlib;
+    static std::mutex mutex;
+    static std::map<std::pair<const void*,std::string>,MaterialX::DocumentPtr> libraries;
+    std::lock_guard lock(mutex);
+    auto& library=libraries[{stdlib.get(),color.identity()+"|"+target}];
+    if(library) return library;
+    auto doc=MaterialX::createDocument();
+    doc->setDataLibrary(stdlib);
+    // transformmatrix multiplies a row vector (cmlib's matrices are the
+    // transposes of the usual column-vector ones).
+    const auto& a=color.fromRec709();
+    const MaterialX::Matrix33 matrix(a[0],a[3],a[6],a[1],a[4],a[7],a[2],a[5],a[8]);
+    std::set<std::string> sources{"lin_rec709"};
+    const std::string suffix="_to_lin_rec709";
+    for(const auto& nodeDef:stdlib->getNodeDefs()) {
+        const std::string node=nodeDef->getNodeString();
+        if(node.size()>suffix.size()&&node.ends_with(suffix))
+            sources.insert(node.substr(0,node.size()-suffix.size()));
+    }
+    for(const auto& source:sources) {
+        if(source==target) continue;
+        const std::string node=source+"_to_"+target;
+        for(const std::string type:{"color3","color4"}) {
+            const std::string nodeDefName="ND_"+node+"_"+type;
+            auto nodeDef=doc->addNodeDef(nodeDefName,type,node);
+            nodeDef->setNodeGroup("colortransform");
+            nodeDef->addInput("in",type)->setValueString(type=="color3"?"0, 0, 0":"0, 0, 0, 1");
+            auto graph=doc->addNodeGraph("NG_"+node+"_"+type);
+            graph->setNodeDefString(nodeDefName);
+            if(type=="color3") {
+                MaterialX::NodePtr linear;
+                if(source!="lin_rec709") {
+                    linear=graph->addNode(source+suffix,"decode","color3");
+                    linear->addInput("in","color3")->setInterfaceName("in");
+                }
+                auto constant=graph->addNode("constant","mat","matrix33");
+                constant->setInputValue("value",matrix);
+                auto vector=graph->addNode("convert","asVec","vector3");
+                auto vectorIn=vector->addInput("in","color3");
+                if(linear) vectorIn->setConnectedNode(linear); else vectorIn->setInterfaceName("in");
+                auto transform=graph->addNode("transformmatrix","transform","vector3");
+                transform->addInput("in","vector3")->setConnectedNode(vector);
+                transform->addInput("mat","matrix33")->setConnectedNode(constant);
+                auto colorOut=graph->addNode("convert","asColor","color3");
+                colorOut->addInput("in","vector3")->setConnectedNode(transform);
+                graph->addOutput("out","color3")->setConnectedNode(colorOut);
+            } else {
+                auto rgb=graph->addNode("convert","asColor3","color3");
+                rgb->addInput("in","color4")->setInterfaceName("in");
+                auto transform=graph->addNode(node,"transform","color3");
+                transform->addInput("in","color3")->setConnectedNode(rgb);
+                auto alpha=graph->addNode("extract","alpha","float");
+                alpha->addInput("in","color4")->setInterfaceName("in");
+                alpha->setInputValue("index",3);
+                auto rgba=graph->addNode("combine2","asColor4","color4");
+                rgba->addInput("in1","color3")->setConnectedNode(transform);
+                rgba->addInput("in2","float")->setConnectedNode(alpha);
+                graph->addOutput("out","color4")->setConnectedNode(rgba);
+            }
+        }
+    }
+    std::string errors;
+    if(!doc->validate(&errors))
+        throw std::runtime_error("PrismRT: invalid colour transform library for "+target+": "+errors);
+    library=doc;
+    return library;
 }
 
 bool HasExternalImplementationSources(MaterialX::DocumentPtr const& doc) {
@@ -164,14 +244,7 @@ public:
         m_stdlib = SharedStandardLibrary(mx_libraries_path);
         m_libraryDigest = SharedLibraryDigest(mx_libraries_path);
 
-        // Decode authored color spaces in the graph, leaving scalar/vector data
-        // textures (roughness, metallic, normals) in their original linear form.
-        auto color_management = MaterialX::DefaultColorManagementSystem::create(
-            m_generator->getTarget());
-        color_management->loadLibrary(m_stdlib);
-        m_generator->setColorManagementSystem(color_management);
-        m_context.getOptions().targetColorSpaceOverride = "lin_rec709";
-        m_optionsIdentity = GeneratorOptionsIdentity(m_context.getOptions());
+        syncColorManagement();
         m_diskCache=std::make_unique<prism::materialx::GeneratedTemplateDiskCache>(
             prism::PersistentCacheRoot(),prism::GeneratedArtifactBudgetBytes());
 
@@ -190,6 +263,26 @@ public:
     }
 
     MaterialX::DocumentPtr get_stdlib() const { return m_stdlib; }
+
+    // Decode authored color spaces in the graph into the active working
+    // space, leaving scalar/vector data textures (roughness, metallic,
+    // normals) and untagged colours as they are. Called with generate_mutex
+    // held (or from the constructor), before each generation.
+    void syncColorManagement() {
+        const auto color=prism::color::Active();
+        if(color->identity()==m_colorIdentity) return;
+        auto color_management = MaterialX::DefaultColorManagementSystem::create(
+            m_generator->getTarget());
+        color_management->loadLibrary(ColorTransformLibrary(m_stdlib,*color));
+        m_generator->setColorManagementSystem(color_management);
+        m_context.clearNodeImplementations();
+        m_context.getOptions().targetColorSpaceOverride = color->materialXSpace();
+        m_optionsIdentity = GeneratorOptionsIdentity(m_context.getOptions());
+        // Matrices of a working space MaterialX has no name for differ in the
+        // generated source only; linear Rec.709 keeps its earlier identity.
+        if(!color->rec709()) m_optionsIdentity += "|"+color->identity();
+        m_colorIdentity=color->identity();
+    }
 
 GeneratedMDL generateCached(MaterialX::DocumentPtr doc, const std::string& material_name) {
     std::vector<MaterialX::InputPtr> colors;
@@ -460,6 +553,7 @@ private:
     MaterialX::DocumentPtr        m_stdlib;
     std::string m_libraryDigest;
     std::string m_optionsIdentity;
+    std::string m_colorIdentity;
     std::unique_ptr<prism::materialx::GeneratedTemplateDiskCache> m_diskCache;
 };
 
@@ -552,11 +646,13 @@ void MDLGenerator::reserveWorkers(const std::string& mx_libraries_path, size_t c
 GeneratedMDL MDLGenerator::generate(MaterialX::DocumentPtr doc,
                                     const std::string& material_name) {
     std::lock_guard<std::mutex> lock(m_impl->generate_mutex);
+    m_impl->syncColorManagement();
     return m_impl->generateCached(doc, material_name);
 }
 
 GeneratedMDL MDLGenerator::generate(MaterialX::OutputPtr output) {
     std::lock_guard<std::mutex> lock(m_impl->generate_mutex);
+    m_impl->syncColorManagement();
     std::string name = output->getName();
     return m_impl->generate_from_output(output, name);
 }
