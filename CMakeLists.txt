@@ -607,6 +607,13 @@ if(PRISM_BUILD_HYDRA)
         target_link_libraries(prism_lights_test PRIVATE PrismRT::core)
         add_test(NAME prism_lights_test COMMAND prism_lights_test)
     endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/color_management.cpp")
+        add_executable(prism_color_management_test tests/color_management.cpp)
+        target_link_libraries(prism_color_management_test PRIVATE PrismRT::core)
+        add_test(NAME prism_color_management_test COMMAND prism_color_management_test)
+        set_tests_properties(prism_color_management_test PROPERTIES
+            ENVIRONMENT "${_prism_test_environment}")
+    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/camera_rays.cpp")
         add_executable(prism_camera_rays_test tests/camera_rays.cpp)
         target_link_libraries(prism_camera_rays_test PRIVATE PrismRT::core)
@@ -717,6 +724,82 @@ if(TARGET prism_hydra_render AND TARGET prism_compare_images)
         COMMAND prism_compare_images "${_prism_streaming}/warm.exr" "${_prism_streaming}/cold.exr" --exact)
     set_tests_properties(prism_hydra_streaming_cold_matches_whole prism_hydra_streaming_warm_matches_whole
         prism_hydra_streaming_cold_matches_warm PROPERTIES FIXTURES_REQUIRED prism_streaming_renders)
+endif()
+
+# Colour management (docs/color_management.md), on the CPU device:
+# - each tagged colour of the colour fixture reaches the image converted into
+#   the working space exactly once, through both loaders and both working
+#   spaces, and the loaders agree;
+# - an 8-bit output is the linear output through the view, applied once;
+# - linear Rec.709 with the gamma 2.2 view reproduces images stored from the
+#   renderer before colour management (tests/hydra/fixtures/legacy_rec709,
+#   bit-identical on the machine that made them; regenerate them with the
+#   options below only for intended image changes).
+if(TARGET prism_hydra_render AND TARGET prism_compare_images AND TARGET prism_color_management_test)
+    set(_prism_color "${CMAKE_BINARY_DIR}/color")
+    file(MAKE_DIRECTORY "${_prism_color}")
+    set(_prism_color_fixture "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/color_management.usda")
+    set(_prism_color_env ${_prism_test_environment} "PRISM_DEVICE=cpu"
+        "PRISM_CACHE_DIR=${CMAKE_BINARY_DIR}/test-cache")
+    foreach(_space acescg lin_rec709)
+        add_test(NAME prism_color_cli_${_space}_render
+            COMMAND PrismRT --scene "${_prism_color_fixture}" --camera /World/Camera
+                --width 128 --height 64 --spp 4 --max-depth 1 --device cpu --working-space ${_space}
+                --output "${_prism_color}/cli_${_space}.exr")
+        add_test(NAME prism_color_hydra_${_space}_render
+            COMMAND prism_hydra_render "${_prism_color_fixture}" /World/Camera
+                "${_prism_color}/hydra_${_space}.exr" 128 64 4 --max-depth 1 --working-space ${_space})
+        set_tests_properties(prism_color_cli_${_space}_render prism_color_hydra_${_space}_render PROPERTIES
+            ENVIRONMENT "${_prism_color_env}" FIXTURES_SETUP prism_color_${_space})
+        foreach(_loader cli hydra)
+            add_test(NAME prism_color_${_loader}_${_space}_patches
+                COMMAND prism_color_management_test --check-patches "${_prism_color}/${_loader}_${_space}.exr" ${_space})
+        endforeach()
+        add_test(NAME prism_color_loaders_${_space}_match
+            COMMAND prism_compare_images "${_prism_color}/cli_${_space}.exr" "${_prism_color}/hydra_${_space}.exr")
+        set_tests_properties(prism_color_cli_${_space}_patches prism_color_hydra_${_space}_patches
+            prism_color_loaders_${_space}_match PROPERTIES
+            ENVIRONMENT "${_prism_color_env}" FIXTURES_REQUIRED prism_color_${_space})
+    endforeach()
+    add_test(NAME prism_color_view_render
+        COMMAND PrismRT --scene "${_prism_color_fixture}" --camera /World/Camera
+            --width 128 --height 64 --spp 4 --max-depth 1 --device cpu --output "${_prism_color}/cli_view.png")
+    set_tests_properties(prism_color_view_render PROPERTIES
+        ENVIRONMENT "${_prism_color_env}" FIXTURES_SETUP prism_color_view)
+    add_test(NAME prism_color_view_once_test
+        COMMAND prism_color_management_test --check-view "${_prism_color}/cli_acescg.exr"
+            "${_prism_color}/cli_view.png" ACEScg "sRGB - Display" "ACES 2.0 - SDR 100 nits (Rec.709)")
+    set_tests_properties(prism_color_view_once_test PROPERTIES
+        ENVIRONMENT "${_prism_color_env}" FIXTURES_REQUIRED "prism_color_view;prism_color_acescg")
+
+    set(_prism_legacy "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/legacy_rec709")
+    set(_prism_legacy_view --working-space lin_rec709 --display "Gamma 2.2 Rec.709 - Display" --view Un-tone-mapped)
+    foreach(_output CornellBox.png QuadTest.png QuadTest.exr)
+        string(REGEX REPLACE "\\..*$" "" _scene "${_output}")
+        string(REPLACE "." "_" _name "${_output}")
+        add_test(NAME prism_color_legacy_cli_${_name}_render
+            COMMAND PrismRT --scene "${CMAKE_CURRENT_SOURCE_DIR}/assets/scenes/${_scene}.usda"
+                --camera /World/Camera --width 96 --height 64 --spp 16 --device cpu ${_prism_legacy_view}
+                --output "${_prism_color}/legacy_cli_${_output}")
+        add_test(NAME prism_color_legacy_cli_${_name}_test
+            COMMAND prism_compare_images "${_prism_legacy}/cli_${_output}" "${_prism_color}/legacy_cli_${_output}")
+        set_tests_properties(prism_color_legacy_cli_${_name}_render PROPERTIES
+            ENVIRONMENT "${_prism_color_env}" FIXTURES_SETUP prism_color_legacy_${_name})
+        set_tests_properties(prism_color_legacy_cli_${_name}_test PROPERTIES
+            FIXTURES_REQUIRED prism_color_legacy_${_name})
+    endforeach()
+    foreach(_fixture parity lights)
+        add_test(NAME prism_color_legacy_hydra_${_fixture}_render
+            COMMAND prism_hydra_render "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/${_fixture}.usda"
+                /World/Camera "${_prism_color}/legacy_hydra_${_fixture}.exr" 64 64 16 --working-space lin_rec709)
+        add_test(NAME prism_color_legacy_hydra_${_fixture}_test
+            COMMAND prism_compare_images "${_prism_legacy}/hydra_${_fixture}.exr"
+                "${_prism_color}/legacy_hydra_${_fixture}.exr")
+        set_tests_properties(prism_color_legacy_hydra_${_fixture}_render PROPERTIES
+            ENVIRONMENT "${_prism_color_env}" FIXTURES_SETUP prism_color_legacy_hydra_${_fixture})
+        set_tests_properties(prism_color_legacy_hydra_${_fixture}_test PROPERTIES
+            FIXTURES_REQUIRED prism_color_legacy_hydra_${_fixture})
+    endforeach()
 endif()
 
 # Every test is labelled cpu or gpu. GPU tests are those that may open a render

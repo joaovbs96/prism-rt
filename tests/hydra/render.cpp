@@ -300,6 +300,8 @@ int main(int argc, char** argv) {
         UsdTimeCode renderTime = UsdTimeCode::Default();
         std::string editPrim;
         int seed = 0;
+        // prism:colorManagement:* render settings, set only when given.
+        std::vector<std::pair<std::string, std::string>> colorSettings;
         for (int i = 7; i < argc; ++i) {
             const std::string option(argv[i]);
             if (option == "--exercise") { exercise = true; continue; }
@@ -309,7 +311,11 @@ int main(int argc, char** argv) {
             if (option == "--no-texture-streaming") { textureStreaming = false; continue; }
             if (option == "--progressive-textures") { textureStreamingPrepass = false; continue; }
             if (++i >= argc) throw std::runtime_error("Missing option value: " + option);
-            if (option == "--environment-sampling") sampling = argv[i];
+            if (option == "--working-space") colorSettings.emplace_back("workingSpace", argv[i]);
+            else if (option == "--ocio-config") colorSettings.emplace_back("ocioConfig", argv[i]);
+            else if (option == "--display") colorSettings.emplace_back("display", argv[i]);
+            else if (option == "--view") colorSettings.emplace_back("view", argv[i]);
+            else if (option == "--environment-sampling") sampling = argv[i];
             else if (option == "--texture-filtering") filtering = argv[i];
             else if (option == "--sample-clamp") sampleClamp = std::stof(argv[i]);
             else if (option == "--seed") seed = std::stoi(argv[i]);
@@ -369,6 +375,8 @@ int main(int argc, char** argv) {
         engine.SetRendererSetting(TfToken("prism:sphereBatching"), VtValue(sphereBatching));
         engine.SetRendererSetting(TfToken("prism:textureStreaming"), VtValue(textureStreaming));
         engine.SetRendererSetting(TfToken("prism:textureStreamingPrepass"), VtValue(textureStreamingPrepass));
+        for (auto const& [name, value] : colorSettings)
+            engine.SetRendererSetting(TfToken("prism:colorManagement:" + name), VtValue(value));
         engine.SetRendererAovs({HdAovTokens->color, HdAovTokens->depth,
             HdAovTokens->cameraDepth, HdAovTokens->normal, HdAovTokens->Neye,
             HdAovTokens->primId, HdAovTokens->instanceId, HdAovTokens->elementId});

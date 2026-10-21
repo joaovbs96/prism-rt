@@ -1,0 +1,152 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    upAxis = "Y"
+)
+
+# Colour management (prism_color_management_test): four emissive patches seen
+# straight on, each the same colour (0.5, 0.2, 0.1) authored differently, in
+# front of a constant dome. Rendered through both loaders and both working
+# spaces; every tagged colour must reach the image converted exactly once.
+#   Untagged   x = -3   the value as is, in the working space
+#   Rec709     x = -1   colorSpace lin_rec709
+#   Srgb       x =  1   colorSpace srgb_texture
+#   Texture    x =  3   a (128, 51, 26) image tagged srgb_texture
+#   dome              (0.2, 0.5, 0.8), linear Rec.709 as UsdLux authors it
+def Xform "World"
+{
+    def Mesh "Untagged" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 1, 2, 3]
+        point3f[] points = [(-3.8, -1, 0), (-2.2, -1, 0), (-2.2, 1, 0), (-3.8, 1, 0)]
+        rel material:binding = </World/Looks/Untagged>
+    }
+
+    def Mesh "Rec709" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 1, 2, 3]
+        point3f[] points = [(-1.8, -1, 0), (-0.2, -1, 0), (-0.2, 1, 0), (-1.8, 1, 0)]
+        rel material:binding = </World/Looks/Rec709>
+    }
+
+    def Mesh "Srgb" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 1, 2, 3]
+        point3f[] points = [(0.2, -1, 0), (1.8, -1, 0), (1.8, 1, 0), (0.2, 1, 0)]
+        rel material:binding = </World/Looks/Srgb>
+    }
+
+    def Mesh "Texture" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 1, 2, 3]
+        point3f[] points = [(2.2, -1, 0), (3.8, -1, 0), (3.8, 1, 0), (2.2, 1, 0)]
+        texCoord2f[] primvars:st = [(0, 0), (1, 0), (1, 1), (0, 1)] (
+            interpolation = "vertex"
+        )
+        rel material:binding = </World/Looks/Texture>
+    }
+
+    def DomeLight "Dome"
+    {
+        color3f inputs:color = (0.2, 0.5, 0.8)
+        float inputs:intensity = 1
+    }
+
+    def Scope "Looks"
+    {
+        def Material "Untagged"
+        {
+            token outputs:mtlx:surface.connect = </World/Looks/Untagged/Surface.outputs:out>
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_standard_surface_surfaceshader"
+                float inputs:base = 0
+                float inputs:specular = 0
+                float inputs:emission = 1
+                color3f inputs:emission_color = (0.5, 0.2, 0.1)
+                token outputs:out
+            }
+        }
+
+        def Material "Rec709"
+        {
+            token outputs:mtlx:surface.connect = </World/Looks/Rec709/Surface.outputs:out>
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_standard_surface_surfaceshader"
+                float inputs:base = 0
+                float inputs:specular = 0
+                float inputs:emission = 1
+                color3f inputs:emission_color = (0.5, 0.2, 0.1) (
+                    colorSpace = "lin_rec709"
+                )
+                token outputs:out
+            }
+        }
+
+        def Material "Srgb"
+        {
+            token outputs:mtlx:surface.connect = </World/Looks/Srgb/Surface.outputs:out>
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_standard_surface_surfaceshader"
+                float inputs:base = 0
+                float inputs:specular = 0
+                float inputs:emission = 1
+                color3f inputs:emission_color = (0.5, 0.2, 0.1) (
+                    colorSpace = "srgb_texture"
+                )
+                token outputs:out
+            }
+        }
+
+        def Material "Texture"
+        {
+            token outputs:mtlx:surface.connect = </World/Looks/Texture/Surface.outputs:out>
+
+            def Shader "Image"
+            {
+                uniform token info:id = "ND_image_color3"
+                asset inputs:file = @./color_patch.ppm@ (
+                    colorSpace = "srgb_texture"
+                )
+                color3f outputs:out
+            }
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_standard_surface_surfaceshader"
+                float inputs:base = 0
+                float inputs:specular = 0
+                float inputs:emission = 1
+                color3f inputs:emission_color.connect = </World/Looks/Texture/Image.outputs:out>
+                token outputs:out
+            }
+        }
+    }
+
+    def Camera "Camera"
+    {
+        token projection = "orthographic"
+        float horizontalAperture = 100
+        float verticalAperture = 50
+        float2 clippingRange = (0.1, 100)
+        double3 xformOp:translate = (0, 0, 5)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+}
