@@ -1266,6 +1266,8 @@ public:
         }
         if (previewSurface) FixPreviewSurfaceNormalOutput(doc);
         else AddDisplacementShader(netInterface, doc, library);
+        prism::materialx::ShortenHdMtlxNodeNames(doc,
+            prism::materialx::ShortHdMtlxNodeNames(netInterface.GetNodeNames()));
         profileDetail += (simpleDocument ? " simple_ms=" : " hdmtlx_ms=") + profileLap();
 
         // hdMtlx derives the terminal material name from the USD prim path.

@@ -288,6 +288,7 @@ RecoverMtlxDocumentFromUsdShade(const UsdPrim& materialPrim,
         mtlxLibraries,
         &mxHdData
     );
+    prism::materialx::ShortenHdMtlxNetworkNodeNames(converted, network2.nodes);
     if (converted && reusable) {
         auto shared = sharedKey;
         shared.document = converted;
@@ -531,6 +532,8 @@ CompileMtlxMaterial(const ResolvedMtlxMaterial& resolved,
                     document=HdMtlxCreateMtlxDocumentFromHdNetwork(
                         *conversionNetwork,node->second,resolved.terminalNodePath,
                         resolved.materialPath,resolved.libraries,&data);
+                    prism::materialx::ShortenHdMtlxNetworkNodeNames(
+                        document,conversionNetwork->nodes);
                 }
             }
             if (document) {

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "captured_material.h"
+#include "hdmtlx_names.h"
 #include "resolved_resource.h"
 #include "udim_resource.h"
 #include "../materialx/mdl_generator.h"
@@ -103,13 +104,17 @@ inline bool BuildCompatibleBindings(const CapturedMaterialGraph& graph,
         if (IsCompatibleTemplateValue(node,parameter))
             ++eligibleParameterCounts[parameter.name.GetString()];
     std::set<size_t> claimedUniforms;
+    auto sourceOf=[](const CapturedNode& node) {
+        return node.sourceName.IsEmpty() ? node.name : node.sourceName;
+    };
+    std::vector<PXR_NS::TfToken> sources;
+    for (const auto& node : graph.nodes) sources.push_back(sourceOf(node));
+    // The same naming the converted documents use (see hdmtlx_names.h).
+    const auto shortNames=ShortHdMtlxNodeNames(sources);
     for (const auto& node : graph.nodes) for (const auto& parameter : node.parameters) {
         if (!IsCompatibleTemplateValue(node,parameter)) continue;
         const std::string parameterName=parameter.name.GetString();
-        const std::string source=node.sourceName.IsEmpty()
-            ? node.name.GetString() : node.sourceName.GetString();
-        const std::string mxNode=PXR_NS::HdMtlxCreateNameFromPath(
-            PXR_NS::SdfPath(source));
+        const std::string mxNode=HdMtlxNodeName(sourceOf(node).GetString(),shortNames);
         const std::string exactSuffix="/"+mxNode+"/"+parameterName;
         std::vector<size_t> matches;
         for (size_t i=0;i<uniforms.size();++i) {
