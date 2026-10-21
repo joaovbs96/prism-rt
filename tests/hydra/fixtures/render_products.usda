@@ -1,0 +1,111 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    upAxis = "Y"
+    metersPerUnit = 1
+    renderSettingsPrimPath = "/Render/Settings"
+    subLayers = [@parity.usda@]
+)
+
+# Two products of the parity scene (docs/hydra.md, "Render settings and
+# products"): a beauty EXR with geometric AOVs (and an unsupported var, which
+# is skipped with a warning), an 8-bit PNG of the same view, and an EXR of a
+# second camera at another resolution. Products sharing a view share one
+# render.
+over "World"
+{
+    def Camera "Side"
+    {
+        float focalLength = 35
+        float horizontalAperture = 20
+        float verticalAperture = 20
+        float2 clippingRange = (0.1, 100)
+        double3 xformOp:translate = (1.5, 0.5, 4)
+        float3 xformOp:rotateXYZ = (0, 20, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
+    }
+}
+
+def Scope "Render"
+{
+    def RenderSettings "Settings"
+    {
+        rel camera = </World/Camera>
+        uniform int2 resolution = (64, 64)
+        rel products = [</Render/Products/Beauty>, </Render/Products/Preview>, </Render/Products/Side>]
+        int prism:samplesPerPixel = 8
+        int prism:maxDepth = 8
+    }
+
+    def Scope "Products"
+    {
+        def RenderProduct "Beauty"
+        {
+            uniform token productName = "render_products_beauty.exr"
+            rel orderedVars = [</Render/Vars/Color>, </Render/Vars/Depth>, </Render/Vars/Normal>, </Render/Vars/Diffuse>]
+        }
+
+        def RenderProduct "Preview"
+        {
+            uniform token productName = "render_products_beauty.png"
+            rel orderedVars = [</Render/Vars/Color>]
+        }
+
+        def RenderProduct "Side"
+        {
+            rel camera = </World/Side>
+            uniform int2 resolution = (48, 32)
+            uniform token productName = "render_products_side.exr"
+            rel orderedVars = [</Render/Vars/Beauty>, </Render/Vars/Neye>, </Render/Vars/St>]
+        }
+    }
+
+    def Scope "Vars"
+    {
+        def RenderVar "Color"
+        {
+            uniform token dataType = "color4f"
+            uniform string sourceName = "color"
+        }
+
+        def RenderVar "Beauty"
+        {
+            uniform token dataType = "color3f"
+            uniform string sourceName = "C.*"
+            uniform token sourceType = "lpe"
+        }
+
+        def RenderVar "Depth"
+        {
+            uniform token dataType = "float"
+            uniform string sourceName = "cameraDepth"
+        }
+
+        def RenderVar "Normal"
+        {
+            uniform token dataType = "normal3f"
+            uniform string sourceName = "normal"
+        }
+
+        def RenderVar "Neye"
+        {
+            uniform token dataType = "normal3f"
+            uniform string sourceName = "Neye"
+        }
+
+        def RenderVar "St"
+        {
+            uniform token dataType = "float2"
+            uniform string sourceName = "st"
+            uniform token sourceType = "primvar"
+        }
+
+        # Not an AOV PrismRT has: skipped with a warning.
+        def RenderVar "Diffuse"
+        {
+            uniform token dataType = "color3f"
+            uniform string sourceName = "C<RD>.*L"
+            uniform token sourceType = "lpe"
+        }
+    }
+}

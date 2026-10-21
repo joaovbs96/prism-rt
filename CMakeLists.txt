@@ -297,6 +297,7 @@ if(PRISM_COPY_ASSETS)
 endif()
 
 if(PRISM_BUILD_HYDRA)
+    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/PrismParity.cmake")
     set(PRISM_HYDRA_RESOURCES_DIR "${CMAKE_BINARY_DIR}/hydra/resources")
     add_subdirectory(src/hydra)
     enable_testing()
@@ -401,6 +402,22 @@ if(PRISM_BUILD_HYDRA)
             set_tests_properties(prism_hydra_animation_exercise PROPERTIES
                 ENVIRONMENT "${_prism_test_environment}")
         endif()
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/render_settings_test.cpp")
+        # UsdRender settings, products and vars (docs/hydra.md).
+        add_executable(prism_render_settings_test tests/hydra/render_settings_test.cpp)
+        target_include_directories(prism_render_settings_test PRIVATE ${PXR_INCLUDE_DIRS})
+        target_link_libraries(prism_render_settings_test PRIVATE
+            PrismRT::core usdImagingGL hd ${PXR_LIBRARIES} OpenImageIO::OpenImageIO)
+        set_target_properties(prism_render_settings_test PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY "$<1:${CMAKE_BINARY_DIR}/hydra/plugin>")
+        add_test(NAME prism_render_settings_test
+            COMMAND prism_render_settings_test --unit "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures"
+                "${CMAKE_BINARY_DIR}/render_settings")
+        add_test(NAME prism_render_settings_hydra_test
+            COMMAND prism_render_settings_test --hydra "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures")
+        set_tests_properties(prism_render_settings_test prism_render_settings_hydra_test PROPERTIES
+            ENVIRONMENT "${_prism_test_environment};PRISM_DEVICE=cpu")
     endif()
     add_executable(prism_hydra_ext_computation_test
         tests/hydra/ext_computation_test.cpp)
@@ -741,25 +758,18 @@ if(TARGET prism_hydra_render AND TARGET prism_compare_images AND TARGET prism_co
     set(_prism_color_fixture "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/color_management.usda")
     set(_prism_color_env ${_prism_test_environment} "PRISM_DEVICE=cpu"
         "PRISM_CACHE_DIR=${CMAKE_BINARY_DIR}/test-cache")
+    # Both loaders render the colour fixture (the parity harness, which also
+    # compares them); each checks its patches.
     foreach(_space acescg lin_rec709)
-        add_test(NAME prism_color_cli_${_space}_render
-            COMMAND PrismRT --scene "${_prism_color_fixture}" --camera /World/Camera
-                --width 128 --height 64 --spp 4 --max-depth 1 --device cpu --working-space ${_space}
-                --output "${_prism_color}/cli_${_space}.exr")
-        add_test(NAME prism_color_hydra_${_space}_render
-            COMMAND prism_hydra_render "${_prism_color_fixture}" /World/Camera
-                "${_prism_color}/hydra_${_space}.exr" 128 64 4 --max-depth 1 --working-space ${_space})
-        set_tests_properties(prism_color_cli_${_space}_render prism_color_hydra_${_space}_render PROPERTIES
-            ENVIRONMENT "${_prism_color_env}" FIXTURES_SETUP prism_color_${_space})
+        prism_add_parity_fixture(NAME color_${_space} SCENE tests/hydra/fixtures/color_management.usda
+            WIDTH 128 HEIGHT 64 SPP 4 ARGS --max-depth 1 --working-space ${_space})
         foreach(_loader cli hydra)
             add_test(NAME prism_color_${_loader}_${_space}_patches
-                COMMAND prism_color_management_test --check-patches "${_prism_color}/${_loader}_${_space}.exr" ${_space})
+                COMMAND prism_color_management_test --check-patches
+                    "${prism_parity_color_${_space}_dir}/${_loader}/image.exr" ${_space})
+            set_tests_properties(prism_color_${_loader}_${_space}_patches PROPERTIES
+                ENVIRONMENT "${_prism_color_env}" FIXTURES_REQUIRED prism_parity_color_${_space})
         endforeach()
-        add_test(NAME prism_color_loaders_${_space}_match
-            COMMAND prism_compare_images "${_prism_color}/cli_${_space}.exr" "${_prism_color}/hydra_${_space}.exr")
-        set_tests_properties(prism_color_cli_${_space}_patches prism_color_hydra_${_space}_patches
-            prism_color_loaders_${_space}_match PROPERTIES
-            ENVIRONMENT "${_prism_color_env}" FIXTURES_REQUIRED prism_color_${_space})
     endforeach()
     add_test(NAME prism_color_view_render
         COMMAND PrismRT --scene "${_prism_color_fixture}" --camera /World/Camera
@@ -767,10 +777,10 @@ if(TARGET prism_hydra_render AND TARGET prism_compare_images AND TARGET prism_co
     set_tests_properties(prism_color_view_render PROPERTIES
         ENVIRONMENT "${_prism_color_env}" FIXTURES_SETUP prism_color_view)
     add_test(NAME prism_color_view_once_test
-        COMMAND prism_color_management_test --check-view "${_prism_color}/cli_acescg.exr"
+        COMMAND prism_color_management_test --check-view "${prism_parity_color_acescg_dir}/cli/image.exr"
             "${_prism_color}/cli_view.png" ACEScg "sRGB - Display" "ACES 2.0 - SDR 100 nits (Rec.709)")
     set_tests_properties(prism_color_view_once_test PROPERTIES
-        ENVIRONMENT "${_prism_color_env}" FIXTURES_REQUIRED "prism_color_view;prism_color_acescg")
+        ENVIRONMENT "${_prism_color_env}" FIXTURES_REQUIRED "prism_color_view;prism_parity_color_acescg")
 
     set(_prism_legacy "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/legacy_rec709")
     set(_prism_legacy_view --working-space lin_rec709 --display "Gamma 2.2 Rec.709 - Display" --view Un-tone-mapped)
@@ -800,6 +810,71 @@ if(TARGET prism_hydra_render AND TARGET prism_compare_images AND TARGET prism_co
         set_tests_properties(prism_color_legacy_hydra_${_fixture}_test PROPERTIES
             FIXTURES_REQUIRED prism_color_legacy_hydra_${_fixture})
     endforeach()
+endif()
+
+# CLI-vs-Hydra parity (cmake/PrismParity.cmake, docs/hydra.md): every scene
+# feature both loaders support has a fixture here, rendered by both on the CPU
+# device and compared. Add one prism_add_parity_fixture call per fixture.
+# Not here yet, because the standalone loader lacks the feature (phase 7):
+# emissive.usda (a MaterialX graph the CLI cannot generate), instances.usda
+# (native instancing), linking.usda (light linking) and
+# native_instance_bindings.usda.
+if(TARGET prism_hydra_render AND TARGET prism_compare_images)
+    prism_add_parity_fixture(NAME parity SCENE tests/hydra/fixtures/parity.usda)
+    # Lights are sampled in another order: noise, not bias (the mean agrees).
+    prism_add_parity_fixture(NAME lights SCENE tests/hydra/fixtures/lights.usda
+        TOLERANCE 0.1 MEAN_TOLERANCE 0.01)
+    prism_add_parity_fixture(NAME cutout_clear SCENE tests/hydra/fixtures/cutout_clear.usda)
+    prism_add_parity_fixture(NAME cutout_medium SCENE tests/hydra/fixtures/cutout_medium.usda)
+    prism_add_parity_fixture(NAME sss_furnace SCENE tests/hydra/fixtures/sss_furnace.usda)
+    prism_add_parity_fixture(NAME preview_mtlx SCENE tests/hydra/fixtures/preview_mtlx_parity.usda)
+    prism_add_parity_fixture(NAME cornell_box SCENE assets/scenes/CornellBox.usda)
+    prism_add_parity_fixture(NAME quad_test SCENE assets/scenes/QuadTest.usda)
+    prism_add_parity_fixture(NAME in_one_weekend SCENE assets/scenes/InOneWeekend.usda)
+    # Render settings: material binding purposes and prism:* settings of the
+    # chosen settings prim, and RenderProducts with their RenderVars.
+    foreach(_settings Preview AllPurpose)
+        string(TOLOWER "${_settings}" _name)
+        prism_add_parity_fixture(NAME binding_${_name} SCENE tests/hydra/fixtures/render_settings_binding.usda
+            WIDTH 32 HEIGHT 32 SPP 4 ARGS --render-settings /Render/${_settings})
+    endforeach()
+    prism_add_parity_fixture(NAME render_products SCENE tests/hydra/fixtures/render_products.usda
+        PRODUCTS render_products_beauty.exr render_products_beauty.png render_products_side.exr
+        EXACT_LAYERS render_products_beauty.exr:Normal render_products_side.exr:Neye)
+    prism_add_parity_fixture(NAME render_crop SCENE tests/hydra/fixtures/render_settings_crop.usda
+        PRODUCTS crop_full.exr crop_window.exr crop_wide.exr ARGS --spp 16
+        EXACT_LAYERS crop_window.exr:Normal)
+    if(TARGET prism_render_settings_test)
+        # Named channels and sane values in both frontends' products; the
+        # crop matches its region of the full frame (Hydra accumulates it
+        # progressively, a pass per sample).
+        foreach(_frontend cli hydra)
+            add_test(NAME prism_render_products_${_frontend}_channels
+                COMMAND prism_render_settings_test --check-products
+                    "${prism_parity_render_products_dir}/${_frontend}")
+            set_tests_properties(prism_render_products_${_frontend}_channels PROPERTIES
+                FIXTURES_REQUIRED prism_parity_render_products)
+            add_test(NAME prism_render_crop_${_frontend}_test
+                COMMAND prism_render_settings_test --check-crop
+                    "${prism_parity_render_crop_dir}/${_frontend}/crop_full.exr"
+                    "${prism_parity_render_crop_dir}/${_frontend}/crop_window.exr")
+            set_tests_properties(prism_render_crop_${_frontend}_test PROPERTIES
+                FIXTURES_REQUIRED prism_parity_render_crop)
+        endforeach()
+    endif()
+    # The validation scripts, headless on the CPU device.
+    add_test(NAME prism_hydra_validate_script
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/validate.py"
+            --build "${CMAKE_BINARY_DIR}" --config $<CONFIG> --spp 64 --device cpu
+            --standalone $<TARGET_FILE:PrismRT> --hydra $<TARGET_FILE:prism_hydra_render>
+            --compare $<TARGET_FILE:prism_compare_images>)
+    add_test(NAME prism_hydra_validate_exports_script
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/validate_exports.py"
+            --build "${CMAKE_BINARY_DIR}" --config $<CONFIG> --spp 64 --inoneweekend-spp 256 --device cpu
+            --standalone $<TARGET_FILE:PrismRT> --hydra $<TARGET_FILE:prism_hydra_render>
+            --compare $<TARGET_FILE:prism_compare_images>)
+    set_tests_properties(prism_hydra_validate_script prism_hydra_validate_exports_script PROPERTIES
+        ENVIRONMENT "${_prism_test_environment};PRISM_DEVICE=cpu" TIMEOUT 1800)
 endif()
 
 # Every test is labelled cpu or gpu. GPU tests are those that may open a render

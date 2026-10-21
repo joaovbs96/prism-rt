@@ -1,0 +1,61 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    upAxis = "Y"
+    metersPerUnit = 1
+    renderSettingsPrimPath = "/Render/Settings"
+    subLayers = [@parity.usda@]
+)
+
+# dataWindowNDC and pixelAspectRatio: the whole 96x64 frame, a crop of it
+# (columns 24-71, rows 6-50; a pixel is in when its centre is inside the
+# window), and the frame at pixel aspect ratio 2. Progressive Hydra renders
+# of the crop must keep to it on every pass.
+def Scope "Render"
+{
+    def RenderSettings "Settings"
+    {
+        rel camera = </World/Camera>
+        uniform int2 resolution = (96, 64)
+        rel products = [</Render/Products/Full>, </Render/Products/Crop>, </Render/Products/Wide>]
+    }
+
+    def Scope "Products"
+    {
+        def RenderProduct "Full"
+        {
+            uniform token productName = "crop_full.exr"
+            rel orderedVars = [</Render/Vars/Color>, </Render/Vars/Normal>]
+        }
+
+        def RenderProduct "Crop"
+        {
+            uniform float4 dataWindowNDC = (0.25, 0.2, 0.75, 0.9)
+            uniform token productName = "crop_window.exr"
+            rel orderedVars = [</Render/Vars/Color>, </Render/Vars/Normal>]
+        }
+
+        def RenderProduct "Wide"
+        {
+            uniform int2 resolution = (48, 64)
+            uniform float pixelAspectRatio = 2
+            uniform token productName = "crop_wide.exr"
+            rel orderedVars = [</Render/Vars/Color>]
+        }
+    }
+
+    def Scope "Vars"
+    {
+        def RenderVar "Color"
+        {
+            uniform token dataType = "color4f"
+            uniform string sourceName = "color"
+        }
+
+        def RenderVar "Normal"
+        {
+            uniform token dataType = "normal3f"
+            uniform string sourceName = "normal"
+        }
+    }
+}

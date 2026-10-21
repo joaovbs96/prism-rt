@@ -2,6 +2,7 @@
 package needed."""
 import argparse
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -28,7 +29,12 @@ def main():
                         help="override the Hydra render helper (for installed-plugin validation)")
     parser.add_argument("--compare", type=Path,
                         help="override the image comparison helper")
+    parser.add_argument("--device", choices=["auto", "cpu", "cpu-reference", "vulkan", "metal"],
+                        help="render device of both frontends (default: their auto)")
     args = parser.parse_args()
+    env = dict(os.environ)
+    if args.device:
+        env["PRISM_DEVICE"] = args.device
     root = Path(__file__).resolve().parents[2]
     build = args.build.resolve()
     out = build / ("hydra-validation-" + args.texture_filtering)
@@ -44,10 +50,12 @@ def main():
     def run(name, command):
         if command[0] in (standalone, hydra):
             command = [*command, "--texture-filtering", args.texture_filtering]
+        if command[0] == standalone and args.device:
+            command = [*command, "--device", args.device]
         start = time.monotonic()
         with (out / (name + ".log")).open("w", encoding="utf-8") as log:
             proc = subprocess.run([str(x) for x in command], cwd=root, stdout=log,
-                                  stderr=subprocess.STDOUT, timeout=600)
+                                  stderr=subprocess.STDOUT, timeout=600, env=env)
         result = dict(name=name, seconds=time.monotonic() - start, exit_code=proc.returncode)
         results.append(result)
         (out / "results.json").write_text(json.dumps(results, indent=2), encoding="utf-8")

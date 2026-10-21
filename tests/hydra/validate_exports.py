@@ -6,6 +6,7 @@ this script does not claim a cold filesystem-cache benchmark.
 """
 import argparse
 import json
+import os
 from pathlib import Path
 import subprocess
 import time
@@ -26,7 +27,12 @@ def main():
                         help="override the Hydra render helper (for installed-plugin validation)")
     parser.add_argument("--compare", type=Path,
                         help="override the image comparison helper")
+    parser.add_argument("--device", choices=["auto", "cpu", "cpu-reference", "vulkan", "metal"],
+                        help="render device of both frontends (default: their auto)")
     args = parser.parse_args()
+    env = dict(os.environ)
+    if args.device:
+        env["PRISM_DEVICE"] = args.device
     root = Path(__file__).resolve().parents[2]
     build = args.build.resolve()
     output = build / ("export-validation-" + args.texture_filtering)
@@ -39,10 +45,12 @@ def main():
     def run(name, command):
         if command[0] in (standalone, hydra) and "--export-scene" not in command:
             command = [*command, "--texture-filtering", args.texture_filtering]
+            if command[0] == standalone and args.device:
+                command = [*command, "--device", args.device]
         start = time.perf_counter()
         with (output / f"{name}.log").open("w", encoding="utf-8") as log:
             result = subprocess.run([str(x) for x in command], cwd=root,
-                                    stdout=log, stderr=subprocess.STDOUT, timeout=1800)
+                                    stdout=log, stderr=subprocess.STDOUT, timeout=1800, env=env)
         results.append(dict(name=name, seconds=time.perf_counter()-start, exitCode=result.returncode))
         (output / "results.json").write_text(json.dumps(results, indent=2), encoding="utf-8")
         if result.returncode:
