@@ -354,13 +354,14 @@ void RouteUncoatedTransmissionIor(const MaterialX::DocumentPtr& doc)
     }
 }
 
-// MaterialX's open_pbr_surface graphs (1.39.4 and 1.39.5, genmdl variant
-// included) never connect geometry_thin_walled to their <surface>
-// constructor, so the MDL material is always closed: thin-walled glass
-// refracts like a solid and fills with the transmission_depth medium. Expand
-// such nodes into their genmdl graph and set the constructor's thin_walled
-// flag; a thin-walled MDL material scatters with its backface BSDF from the
-// back, so the material gets the same shader there.
+// MaterialX 1.39.4's open_pbr_surface graphs (genmdl variant included) never
+// connect geometry_thin_walled to their <surface> constructor, so the MDL
+// material is always closed: thin-walled glass refracts like a solid and
+// fills with the transmission_depth medium. 1.39.5 (OpenPBR 1.1.1, a single
+// graph) connects it, but the material still has no backface shader and keeps
+// the depth. Expand such nodes into their genmdl graph and set the
+// constructor's thin_walled flag; a thin-walled MDL material scatters with
+// its backface BSDF from the back, so the material gets the same shader there.
 //
 // OpenPBR's thin wall is an infinitesimal sheet whose transmittance at normal
 // incidence is transmission_color, whatever transmission_depth says. The

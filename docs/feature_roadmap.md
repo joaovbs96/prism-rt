@@ -16,14 +16,12 @@ Scenes: **Eggs** (MaterialEggs), **OpenPBR** (OpenPBRShaderPlayground),
 
 ## Materials
 
-- **MaterialX 1.39.5.** Stirling's car paint uses `flake3d`, which the local
-  MaterialX 1.39.4 lacks (usdMtlx drops the node, so the paint renders without
-  flakes). Updating MaterialX does not fix the MDL layer-over-mix limitation;
-  the loader works around that (`docs/materialx_compatibility.md`).
-- **usdMtlx `dielectric_bsdf` lookup.** USD's usdMtlx reader fails to find the
-  node definition of some Stirling `dielectric_bsdf` nodes (`Unable to find the
-  nodedef`), so their layers lose the coat. The failure happens before Prism
-  sees the network; it needs investigating on the USD side.
+- **MaterialX 1.39.5 (done).** Stirling's car paint uses `flake3d`, which
+  MaterialX 1.39.4 lacked, and usdMtlx could not match some of its
+  `dielectric_bsdf` nodes against the 1.39.4 definitions ("Unable to find the
+  nodedef"), so the paint lost its flakes and coat. With OpenUSD 26.08 and
+  MaterialX 1.39.5 both resolve and the paint renders as authored. The MDL layer-over-mix limitation
+  remains; the loader works around it (`docs/materialx_compatibility.md`).
 - **Procedural noise parity.** The Eggs' noise-driven patterns (ore swirl
   stripes, displacement relief) differ from the Karma references: Karma
   evaluates MaterialX noise in its own implementation, Prism in MaterialX's MDL

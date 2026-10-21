@@ -71,10 +71,12 @@ and then distributes the exposed mix.
 
 ## Thin-walled open_pbr_surface
 
-MaterialX's `open_pbr_surface` graphs (1.39.4 and 1.39.5, the genmdl variant
-included) use `geometry_thin_walled` only to pick the subsurface lobe and never
-pass it to their `<surface>` constructor, so the generated MDL material is
-always closed (`thin_walled: false`). Thin-walled glass then refracts like a
+MaterialX 1.39.4's `open_pbr_surface` graphs (the genmdl variant included) use
+`geometry_thin_walled` only to pick the subsurface lobe and never pass it to
+their `<surface>` constructor, so the generated MDL material is always closed
+(`thin_walled: false`). 1.39.5 (OpenPBR 1.1.1, one graph for every target)
+passes it on, but still leaves the material without a backface shader and
+keeps the `transmission_depth` medium, so the repair below still applies. Thin-walled glass then refracts like a
 solid and fills with the `transmission_depth` medium; on a single-sided or open
 mesh (a bottle, a jar) that medium has no inside, and a `transmission_color`
 meant as the sheet's tint becomes a strong absorption through the whole object.
