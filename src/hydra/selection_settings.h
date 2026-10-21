@@ -19,8 +19,10 @@ struct SelectionSettings {
     std::atomic<bool> overrideTaskSettings{true};
     std::atomic<std::uint64_t> revision{0};
 
-    // usdview 26.05 drops the authored point-instance index while converting
-    // its selection model to HdSelectionsSchema.  The public usdview plugin
+    // usdview (26.05, still in 26.08) drops the authored point-instance index
+    // while converting its selection model to HdSelectionsSchema:
+    // UsdImagingGLEngine::AddSelected ignores instanceIndex on the scene-index
+    // path.  The public usdview plugin
     // transports those source indices through a renderer setting instead.
     mutable std::mutex usdviewMutex;
     bool usdviewSelectionActive = false;

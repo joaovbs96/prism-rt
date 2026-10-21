@@ -3,9 +3,9 @@
 Two roles, both built on usdview's plugin API and public StageView methods; the
 extension neither patches USD nor replaces any usdview implementation.
 
-Selection: OpenUSD 26.05's scene-index selection path loses AddSelected's
-instance index. This extension passes the selection model's original source
-indices to PrismRT.
+Selection: OpenUSD's scene-index selection path loses AddSelected's instance
+index (UsdImagingGLEngine::AddSelected ignores it; 26.05 and 26.08). This
+extension passes the selection model's original source indices to PrismRT.
 
 Sample HUD: while a viewport uses PrismRT, a transparent, mouse-transparent
 overlay in the HUD's top-right group (under usdview's Hydra/Hgi/AOV lines)

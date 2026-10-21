@@ -279,7 +279,7 @@ public:
                 };
                 const int elementTable = append(elements,0);
                 // HdxColorizeSelectionTask's CPU decoder uses 3 for INSTANCE
-                // in OpenUSD 26.05 (the GPU shader's newer enum uses 4).
+                // in OpenUSD 26.05 and 26.08 (the GPU shader's newer enum uses 4).
                 const int instanceTable = append(instances,3);
                 if (instanceTable) {
                     if (elementTable) for (int i : instances)
