@@ -7,6 +7,7 @@
 
 #include "float3.h"
 #include "texture.h"
+#include "color/color_management.h"
 
 #include <algorithm>
 #include <array>
@@ -40,7 +41,8 @@ struct SceneLight {
 };
 
 // The UsdLux inputs of one light. `color` already includes any color
-// temperature (UsdLuxBlackbodyTemperatureAsRgb).
+// temperature (UsdLuxBlackbodyTemperatureAsRgb); it is linear Rec.709, as
+// UsdLux authors it, and MakeSceneLight converts it into the working space.
 struct LightParameters {
     LightShape shape = LightShape::Sphere;
     Color3 color = Color3(1.0f);
@@ -140,7 +142,7 @@ inline SceneLight MakeSceneLight(LightParameters const& params, std::array<doubl
         // A sphere light shrunk to a point keeps the intensity of its radius.
         scale *= pi * light.radius * light.radius;
     }
-    light.radiance = params.color * scale;
+    light.radiance = prism::color::Active()->FromRec709(params.color) * scale;
     return light;
 }
 
@@ -149,8 +151,7 @@ inline SceneLight MakeSceneLight(LightParameters const& params, std::array<doubl
 inline float LightPower(SceneLight const& light, float sceneRadius)
 {
     constexpr float pi = 3.14159265358979323846f;
-    const float luminance = std::max(0.0f, 0.2126f * light.radiance.x() + 0.7152f * light.radiance.y() +
-                                     0.0722f * light.radiance.z());
+    const float luminance = std::max(0.0f, prism::color::Active()->Luminance(light.radiance));
     switch (light.shape) {
     case LightShape::Point: return 4.0f * pi * luminance;
     case LightShape::Distant: {

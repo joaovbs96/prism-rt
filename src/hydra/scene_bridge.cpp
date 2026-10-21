@@ -3158,7 +3158,8 @@ void _SetDomeEnvironment(HdSceneIndexBaseRefPtr const &scene,
     const float intensity = _ContainerValue(light, HdLightTokens->intensity, 1.0f);
     const float exposure = _ContainerValue(light, HdLightTokens->exposure, 0.0f);
     const float scale = intensity * std::exp2(exposure);
-    const Color3 multiplier(color[0] * scale, color[1] * scale, color[2] * scale);
+    // UsdLux colours are linear Rec.709; the texture converts on preparation.
+    const Color3 multiplier = prism::color::Active()->FromRec709(Color3(color[0], color[1], color[2])) * scale;
     const SdfAssetPath asset = _ContainerValue(
         light, HdLightTokens->textureFile, SdfAssetPath());
     std::string resolved = asset.GetResolvedPath();
@@ -3167,7 +3168,7 @@ void _SetDomeEnvironment(HdSceneIndexBaseRefPtr const &scene,
     try {
         if (!resolved.empty() && std::filesystem::exists(resolved)) {
             snapshot->environmentTexture =
-                std::make_unique<ImageTexture<Color3>>(resolved);
+                std::make_unique<ImageTexture<Color3>>(resolved, prism::color::kLightColorSpace);
         } else {
             snapshot->environmentTexture =
                 std::make_unique<ColorTexture>(Color3(1.0f));
@@ -3272,7 +3273,7 @@ void _AddAnalyticLight(HdSceneIndexBaseRefPtr const &scene,
             resolved = ArGetResolver().Resolve(asset.GetAssetPath()).GetPathString();
         if (!resolved.empty() && std::filesystem::exists(resolved)) {
             try {
-                result.texture = std::make_shared<ImageTexture<Color3>>(resolved);
+                result.texture = std::make_shared<ImageTexture<Color3>>(resolved, prism::color::kLightColorSpace);
             } catch (std::exception const &e) {
                 TF_WARN("PrismRT: failed to load light texture '%s': %s", resolved.c_str(), e.what());
             }

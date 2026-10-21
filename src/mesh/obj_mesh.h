@@ -96,6 +96,8 @@ class ObjMesh : public Mesh {
                     texture = new ImageMixTexture<Color3>(file_path.parent_path() / mp.diffuse_texname, diffuse);
                 } else
                     texture = new ColorTexture(diffuse);
+                // MTL colours and maps are read as linear Rec.709.
+                texture->convertToWorkingSpace(prism::color::kLightColorSpace);
 
                 // Assign texture index to the Material's name
                 materials[m] = new Diffuse(texture);

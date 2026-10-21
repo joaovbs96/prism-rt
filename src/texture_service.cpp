@@ -4,6 +4,7 @@
 #include "texture_writer.h"
 #include "texture_gpu_file.h"
 #include "fingerprint_records.h"
+#include "color/color_management.h"
 
 #include <OpenImageIO/imagebuf.h>
 #include <OpenImageIO/imagebufalgo.h>
@@ -253,6 +254,8 @@ std::string contentKey(std::filesystem::path const &path,
     appendString(options.resolverIdentity);
     appendString(options.sourceVersion);
     appendString(options.colorSpace);
+    // Absent before colour conversion: unconverted textures keep their digests.
+    if (!options.workingSpace.empty()) appendString(options.workingSpace);
     return hash.digest();
 }
 
@@ -279,6 +282,7 @@ std::string sourceStamp(std::filesystem::path const &path,
         << options.firstChannel << ',' << options.channelCount << ','
         << static_cast<int>(options.wrapS) << ',' << static_cast<int>(options.wrapT) << ','
         << options.alphaChannel << ',' << options.unassociateAlpha << ',' << options.colorSpace;
+    if (!options.workingSpace.empty()) out << '\n' << options.workingSpace;
     return out.str();
 }
 
@@ -644,7 +648,22 @@ DecodedImage DecodeSource(std::filesystem::path const &absolute, TexturePrepareO
         normalizedSpec.attribute("oiio:UnassociatedAlpha", 1);
     const std::string sourceColorSpace = options.colorSpace.empty()
         ? std::string(spec.get_string_attribute("oiio:ColorSpace", "")) : options.colorSpace;
-    if (!sourceColorSpace.empty())
+    // Colour conversion into the working space (TexturePrepareOptions::workingSpace).
+    std::shared_ptr<const prism::color::ColorManagement> conversion;
+    if (!options.workingSpace.empty() && !options.colorSpace.empty()) {
+        conversion = prism::color::Active();
+        if (conversion->identity() != options.workingSpace)
+            throw std::runtime_error("texture working space is not the active one: " + absolute.string());
+        if (!conversion->NeedsConversion(options.colorSpace)) {
+            if (conversion->Resolve(options.colorSpace).empty())
+                throw std::runtime_error("unknown texture colour space '" + options.colorSpace + "': " +
+                                         absolute.string());
+            conversion.reset();
+        }
+    }
+    if (conversion)
+        normalizedSpec.attribute("oiio:ColorSpace", conversion->workingSpace());
+    else if (!sourceColorSpace.empty())
         normalizedSpec.attribute("oiio:ColorSpace", sourceColorSpace);
     normalizedSpec.channelnames.clear();
     for (int c = 0; c < outChannels; ++c) {
@@ -654,7 +673,7 @@ DecodedImage DecodeSource(std::filesystem::path const &absolute, TexturePrepareO
     }
     // Without a channel, window or value change the loop below would
     // copy every decoded value unchanged; use the decoded buffer instead.
-    const bool identity = !unassociateAlpha && options.gamma == 1.0f &&
+    const bool identity = !conversion && !unassociateAlpha && options.gamma == 1.0f &&
         options.exposure == 0.0f && options.firstChannel == 0 &&
         outChannels == spec.nchannels && originX == 0 && originY == 0 &&
         spec.width == displayWidth && spec.height == displayHeight;
@@ -696,6 +715,10 @@ DecodedImage DecodeSource(std::filesystem::path const &absolute, TexturePrepareO
             }
         });
         std::vector<float>().swap(sourcePixels);
+        // RGB in the first three output channels (alpha, if any, after them).
+        if (conversion && outChannels >= 3 && (outputAlpha < 0 || outputAlpha >= 3))
+            conversion->ToWorkingSpace(options.colorSpace, outputPixels.data(),
+                                  static_cast<size_t>(displayWidth) * displayHeight, outChannels);
     }
     result.pixels = identity ? std::move(sourcePixels) : std::move(outputPixels);
     // The GPU copy: unchanged 8- and 16-bit integer and half texels keep

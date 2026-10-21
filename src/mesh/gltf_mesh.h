@@ -411,6 +411,8 @@ class glTFMesh : public Mesh {
                 } else {
                     base_texture = new ColorTexture(base_factor);
                 }
+                // glTF colours are linear Rec.709 (after the decode above).
+                base_texture->convertToWorkingSpace(prism::color::kLightColorSpace);
                 gltf_material->setBaseColor(base_texture);
 
                 // TODO: occlusion is currently ignored
@@ -461,6 +463,7 @@ class glTFMesh : public Mesh {
                 } else {
                     emission_texture = new ValueTexture<Color3>(emission_factor);
                 }
+                emission_texture->convertToWorkingSpace(prism::color::kLightColorSpace);
                 gltf_material->setEmission(emission_texture, emission_strength);
 
                 if (mp.extensions.contains("KHR_materials_transmission")) {
