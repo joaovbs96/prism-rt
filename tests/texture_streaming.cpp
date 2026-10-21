@@ -34,9 +34,14 @@ StreamedImage Square(uint32_t size)
     return image;
 }
 
-std::vector<uint32_t> Requests(size_t n, uint32_t level)
+// One feedback round: image i asked for level finest[i] (kNoRequest: none)
+// with weight counts[i] (1 without counts).
+bool Feed(StreamingPlanner& planner, std::vector<uint32_t> const& finest, std::vector<uint32_t> const& counts = {})
 {
-    return std::vector<uint32_t>(n, level);
+    std::vector<uint32_t> bins(finest.size() * kFeedbackLevels, 0);
+    for (size_t i = 0; i < finest.size(); ++i)
+        if (finest[i] != kNoRequest) bins[i * kFeedbackLevels + finest[i]] = counts.empty() ? 1u : counts[i];
+    return planner.addFeedback(bins.data(), finest.size());
 }
 
 std::string Levels(std::vector<uint32_t> const& plan)
@@ -65,8 +70,7 @@ int main()
         StreamingPlanner planner;
         planner.reset({k1, k1}, uint64_t(1) << 30);
         check(planner.plan() == std::vector<uint32_t>({3, 3}), "no requests: tails");
-        const uint32_t finest[] = {5, kNoRequest};
-        check(!planner.addFeedback(finest, nullptr, 2), "a request coarser than the tail is not finer");
+        check(!Feed(planner, {5, kNoRequest}), "a request coarser than the tail is not finer");
         check(planner.plan() == std::vector<uint32_t>({3, 3}), "coarse request: tails");
         check(planner.stats(planner.plan()).requested == 0, "coarse requests are not streamed");
     }
@@ -76,8 +80,7 @@ int main()
     {
         StreamingPlanner planner;
         planner.reset({k1, k1, Square(64)}, uint64_t(1) << 30);
-        const uint32_t finest[] = {0, 2, 0};
-        check(planner.addFeedback(finest, nullptr, 3), "finer requests");
+        check(Feed(planner, {0, 2, 0}), "finer requests");
         const auto plan = planner.plan();
         check(plan == std::vector<uint32_t>({0, 2, 0}), "ample budget plans the requests: " + Levels(plan));
         const auto stats = planner.stats(plan);
@@ -93,9 +96,7 @@ int main()
             (StreamedBytes(k1, 2) - StreamedBytes(k1, 3)) + 1000;
         StreamingPlanner planner;
         planner.reset({k1, k1}, budget);
-        const uint32_t finest[] = {0, 0};
-        const uint32_t counts[] = {100, 1};
-        planner.addFeedback(finest, counts, 2);
+        Feed(planner, {0, 0}, {100, 1});
         const auto plan = planner.plan();
         check(plan == std::vector<uint32_t>({1, 2}), "priority by count per byte: " + Levels(plan));
         const auto stats = planner.stats(plan);
@@ -103,13 +104,35 @@ int main()
         // Same feedback, same plan.
         StreamingPlanner again;
         again.reset({k1, k1}, budget);
-        again.addFeedback(finest, counts, 2);
+        Feed(again, {0, 0}, {100, 1});
         check(again.plan() == plan, "plans are deterministic");
         // A budget below the tails keeps the tails.
         StreamingPlanner tiny;
         tiny.reset({k1, k1}, 1000);
-        tiny.addFeedback(finest, counts, 2);
+        Feed(tiny, {0, 0}, {100, 1});
         check(tiny.plan() == std::vector<uint32_t>({3, 3}), "tails always stay");
+    }
+
+    // Weighted requests: levels asked for by at most `threshold` of an image's
+    // lookup weight are left out; with threshold 0 every lookup counts.
+    {
+        StreamingPlanner planner;
+        planner.reset({k1}, uint64_t(1) << 30, {}, 0.01);
+        std::vector<uint32_t> bins(kFeedbackLevels, 0);
+        bins[0] = 5;     // 0.5% of the weight asks for level 0
+        bins[2] = 995;
+        planner.addFeedback(bins.data(), 1);
+        check(planner.request(0) == 2, "a negligible fine request is left out");
+        bins[0] = 20;    // now 1.5% overall: level 0 is needed
+        bins[2] = 0;
+        check(planner.addFeedback(bins.data(), 1) && planner.request(0) == 0, "a significant fine request counts");
+        StreamingPlanner exact;
+        exact.reset({k1}, uint64_t(1) << 30, {}, 0.0);
+        bins = std::vector<uint32_t>(kFeedbackLevels, 0);
+        bins[1] = 1;
+        bins[4] = 100000;
+        exact.addFeedback(bins.data(), 1);
+        check(exact.request(0) == 1, "threshold 0 keeps the finest request");
     }
 
     // Levels resident and requested in this accumulation are never demoted
@@ -118,13 +141,10 @@ int main()
         const uint64_t budget = 2 * StreamedBytes(k1, 3) + (StreamedBytes(k1, 1) - StreamedBytes(k1, 3)) + 1000;
         StreamingPlanner planner;
         planner.reset({k1, k1}, budget);
-        const uint32_t first[] = {1, kNoRequest};
-        planner.addFeedback(first, nullptr, 2);
+        Feed(planner, {1, kNoRequest});
         check(planner.plan() == std::vector<uint32_t>({1, 3}), "first request planned");
         planner.setResident(0, 1);
-        const uint32_t second[] = {kNoRequest, 0};
-        const uint32_t counts[] = {0, 1000};
-        planner.addFeedback(second, counts, 2);
+        Feed(planner, {kNoRequest, 0}, {0, 1000});
         const auto plan = planner.plan();
         check(plan[0] == 1, "a converging image keeps its levels: " + Levels(plan));
         check(plan[1] == 3, "the newer request waits for budget: " + Levels(plan));
@@ -139,28 +159,23 @@ int main()
         const uint64_t budget = 3 * StreamedBytes(k2, 2) + 2 * fineA + 1000;
         StreamingPlanner planner;
         planner.reset({k2, k2, k2}, budget);
-        const uint32_t a[] = {0, kNoRequest, kNoRequest};
-        planner.addFeedback(a, nullptr, 3); // image 0, round 1
-        const uint32_t b[] = {kNoRequest, 0, kNoRequest};
-        planner.addFeedback(b, nullptr, 3); // image 1, round 2
+        Feed(planner, {0, kNoRequest, kNoRequest}); // image 0, round 1
+        Feed(planner, {kNoRequest, 0, kNoRequest}); // image 1, round 2
         planner.setResident(0, 0);
         planner.setResident(1, 0);
         check(planner.plan() == std::vector<uint32_t>({0, 0, 2}), "both resident");
         planner.beginAccumulation();
         check(planner.plan() == std::vector<uint32_t>({0, 0, 2}), "a new view keeps what fits");
-        const uint32_t c[] = {kNoRequest, kNoRequest, 0};
-        planner.addFeedback(c, nullptr, 3); // image 2 needs one image's levels
+        Feed(planner, {kNoRequest, kNoRequest, 0}); // image 2 needs one image's levels
         const auto plan = planner.plan();
         check(plan == std::vector<uint32_t>({2, 0, 0}), "least recently requested evicted: " + Levels(plan));
         // Partial eviction: levels go finest first while coarser ones fit.
         StreamingPlanner partial;
         partial.reset({k2, k2}, 2 * StreamedBytes(k2, 2) + 2 * StreamedLevelBytes(k2, 1) + 100);
-        const uint32_t both[] = {0, kNoRequest};
-        partial.addFeedback(both, nullptr, 2);
+        Feed(partial, {0, kNoRequest});
         partial.setResident(0, 0);
         partial.beginAccumulation();
-        const uint32_t other[] = {kNoRequest, 1};
-        partial.addFeedback(other, nullptr, 2);
+        Feed(partial, {kNoRequest, 1});
         const auto kept = partial.plan();
         check(kept[1] == 1 && kept[0] == 1, "eviction keeps the coarser levels that fit: " + Levels(kept));
     }

@@ -131,6 +131,9 @@ struct CpuBackend {
         return result;
     }
 
+    // Texture streaming feedback weight (GPU devices only).
+    void pathWeight(float3 const&) {}
+
     MaterialResult shade(CpuShading const& shading, MaterialQuery const& query)
     {
         MaterialResult result;

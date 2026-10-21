@@ -23,7 +23,8 @@ void material(inout MaterialCall call)
 #ifdef PRISM_SHADER_SALT
     if (call.material == PRISM_SHADER_SALT) return; // never: makes the code unique (cold-compile measurements)
 #endif
-    g_prism_feedback = (call.flags & kMaterialCallFeedbackMask) >> kMaterialCallFeedbackShift;
+    g_prism_feedback = (call.flags & kMaterialCallFeedback) != 0u ? 1u : 0u;
+    g_prism_feedback_weight = (call.flags >> kMaterialCallFeedbackWeightShift) & kMaterialCallFeedbackWeightMask;
     const GpuMaterial material = gpu_material(call.material);
     if ((call.flags & kMaterialCallModeMask) == kMaterialCallCutout) {
         call.pdf = gpu_mdl_cutout_opacity(materialCallSurface(call), material);

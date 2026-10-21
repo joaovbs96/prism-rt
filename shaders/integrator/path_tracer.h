@@ -745,6 +745,7 @@ struct PathTracer {
         const SurfaceVertex vertex = chooseLight(hit, canNee);
         query.lightWi = vertex.light.wi;
         query.evaluateLight = vertex.light.valid;
+        backend.pathWeight(path.throughput); // texture streaming feedback (GPU)
         const MaterialResult material = backend.shade(shading, query);
         if (!arrive(hit, vertex, material.sample)) return;
         connectLight(hit, vertex, material.light);

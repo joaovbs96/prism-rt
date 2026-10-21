@@ -29,8 +29,10 @@ uint32_t TailLevel(uint32_t width, uint32_t height, uint32_t levels, uint32_t ta
     return level;
 }
 
-void StreamingPlanner::reset(std::vector<StreamedImage> images, uint64_t budget, std::vector<uint32_t> resident)
+void StreamingPlanner::reset(std::vector<StreamedImage> images, uint64_t budget, std::vector<uint32_t> resident,
+                             double threshold)
 {
+    m_threshold = threshold;
     m_images.clear();
     m_images.reserve(images.size());
     for (size_t i = 0; i < images.size(); ++i) {
@@ -51,25 +53,38 @@ void StreamingPlanner::beginAccumulation()
     for (State& state : m_images) {
         state.request = kNoRequest;
         state.count = 0;
+        for (uint64_t& m : state.mass) m = 0;
     }
     m_accumulationRound = m_round;
 }
 
-bool StreamingPlanner::addFeedback(uint32_t const* finest, uint32_t const* counts, size_t count)
+bool StreamingPlanner::addFeedback(uint32_t const* histograms, size_t count)
 {
     ++m_round;
     bool finer = false;
     const size_t n = std::min(count, m_images.size());
     for (size_t i = 0; i < n; ++i) {
-        if (finest[i] == kNoRequest) continue;
+        uint32_t const* bins = histograms + i * kFeedbackLevels;
         State& state = m_images[i];
-        const uint32_t level = std::min(finest[i], state.image.levels - 1);
+        uint64_t added = 0;
+        for (uint32_t l = 0; l < kFeedbackLevels; ++l) {
+            if (!bins[l]) continue;
+            state.mass[std::min(l, state.image.levels - 1)] += bins[l];
+            added += bins[l];
+        }
+        if (!added) continue;
+        state.count += added;
+        state.lastRequested = m_round;
+        // The coarsest level that leaves out at most `threshold` of the weight.
+        const double allowed = m_threshold * double(state.count);
+        uint64_t finerMass = 0;
+        uint32_t level = 0;
+        while (level + 1 < state.image.levels && double(finerMass + state.mass[level]) <= allowed)
+            finerMass += state.mass[level++];
         // Requests at the tail or coarser need nothing streamed, but still
         // mark the image as in use (eviction order).
         if (level < std::min(state.request, state.image.tailLevel)) finer = true;
-        state.request = std::min(state.request, level);
-        state.count += counts ? counts[i] : 1u;
-        state.lastRequested = m_round;
+        state.request = level;
     }
     return finer;
 }

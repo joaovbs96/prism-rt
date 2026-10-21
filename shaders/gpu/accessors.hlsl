@@ -82,18 +82,21 @@ void gpu_accumulate(uint pixel, float3 value, bool even)
 }
 
 #ifdef PRISM_TEXTURE_STREAMING
-// Texture feedback of this thread's lookups (kFrameTextureFeedback): 0 off,
-// 1 record the finest level each image is asked for, 2 also count the
-// lookups (a subset of pixels: the priority of an image's levels). The
-// callables get it from their caller (kMaterialCallFeedback).
+// Texture feedback of this thread's lookups (kFrameTextureFeedback; a
+// subset of pixels): each lookup adds the path's weight to the histogram
+// bin of the level it asks for, so the host can leave out levels only paths
+// of negligible contribution ask for. The weight is the path throughput's
+// largest component, clamped to 1, in 1/256 (gpu_backend: pathWeight). The
+// callables get both from their caller (kMaterialCallFeedback).
 static uint g_prism_feedback = 0u;
+static uint g_prism_feedback_weight = 256u;
+static const uint kFeedbackLevels = 16u; // histogram bins per image
 
 void gpu_texture_request(uint image, uint level)
 {
+    if (g_prism_feedback == 0u || g_prism_feedback_weight == 0u) return;
     RWStructuredBuffer<uint> b = textureFeedbackBuffer();
-    // Most lookups ask for a level already recorded: read before the atomic.
-    if (level < b[image]) InterlockedMin(b[image], level);
-    if (g_prism_feedback == 2u) InterlockedAdd(b[gpu_frame().streaming.x + image], 1u);
+    InterlockedAdd(b[image * kFeedbackLevels + min(level, kFeedbackLevels - 1u)], g_prism_feedback_weight);
 }
 
 // The finest level a 16x anisotropic trilinear lookup with these gradients
@@ -109,7 +112,7 @@ void gpu_texture_feedback(uint image, float2 dx, float2 dy)
     const float major = max(a, b);
     const float minor = min(a, b);
     const float n = minor > 0.0f ? min(ceil(major / minor), 16.0f) : 16.0f;
-    const float lambda = log2(major / n) - 0.5f;
+    const float lambda = log2(major / n) - float(gpu_frame().streaming.y) / 16.0f; // margin, 1/16 levels
     const uint level = lambda >= 15.0f ? 15u : (lambda >= 1.0f ? uint(lambda) : 0u);
     gpu_texture_request(image, level);
 }
@@ -120,7 +123,7 @@ float4 gpu_image_texel(uint image, int x, int y)
 {
 #ifdef PRISM_TEXTURE_STREAMING
     const uint level = gpu_image(image).info.w;
-    if (g_prism_feedback != 0u) gpu_texture_request(image, 0u);
+    gpu_texture_request(image, 0u);
     return imageTexture(image).Load(int3(x >> level, y >> level, 0));
 #else
     return imageTexture(image).Load(int3(x, y, 0));

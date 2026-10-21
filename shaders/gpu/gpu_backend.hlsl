@@ -963,6 +963,16 @@ float gpu_environment_pdf(GpuEnvironment env, float3 direction)
 struct GpuBackend {
     Rng rng;
 
+    // The weight of the path's texture lookups from here on (texture
+    // streaming feedback); a no-op without streaming (Metal).
+    void pathWeight(float3 throughput)
+    {
+#ifdef PRISM_TEXTURE_STREAMING
+        const float w = saturate(max(throughput.x, max(throughput.y, throughput.z)));
+        g_prism_feedback_weight = uint(w * 256.0f + 0.5f);
+#endif
+    }
+
     GpuHit intersect(PathRay ray) { return gpu_intersect(ray, kMaskAll); }
     GpuHit intersectNonOpaque(PathRay ray) { return gpu_intersect(ray, kMaskNonOpaque); }
     bool occludedByOpaque(PathRay ray) { return gpu_occluded_by_opaque(ray.ray); }

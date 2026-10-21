@@ -110,7 +110,7 @@ static const uint kSlotLights = 27;        // LightRecord (shaders/integrator/li
 static const uint kSlotLightAlias = 28;    // float4 alias table over the lights and the dome
 static const uint kSlotPrimvarValues = 29;     // float, named primvars per vertex
 static const uint kSlotPrimvarDirectory = 30;  // uint4 per named primvar of a prototype
-static const uint kSlotTextureFeedback = 31;   // uint per image: finest level requested, then request counts
+static const uint kSlotTextureFeedback = 31;   // uint per image and level (16): weighted requests
 static const uint kSlotCount = 32;
 // Images follow the fixed slots (HLSL) or form one array binding (GLSL).
 static const uint kSlotImageBase = 32;
@@ -194,9 +194,9 @@ struct GpuFrame {
     uint4 counts;                // x: MDL texture count, y: debug view, z: sample number,
                                  // w: light contribution mask (0: all)
     uint4 lights;                // x: light records, y: analytic lights, z: domes
-    uint4 streaming;             // texture feedback (kFrameTextureFeedback): x: image count (offset of
-                                 // the request counts), y: recording pixel stride, z: phase, w: counting
-                                 // pixel stride (one pixel of each stride x stride block)
+    uint4 streaming;             // texture feedback (kFrameTextureFeedback): x: image count, y: LOD margin
+                                 // (1/16 levels), z: phase,
+                                 // w: pixel stride (one pixel of each stride x stride block records)
 };
 
 

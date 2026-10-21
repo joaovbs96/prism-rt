@@ -18,8 +18,10 @@ static const uint kMaterialCallModeMask = 1u;
 static const uint kMaterialCallFrontFace = 2u;
 static const uint kMaterialCallFiltered = 4u;
 static const uint kMaterialCallEvaluateLight = 8u;
-static const uint kMaterialCallFeedbackShift = 10u; // 2 bits: the caller's texture feedback mode
-static const uint kMaterialCallFeedbackMask = 3072u;
+// The caller's texture feedback: on, and its path weight (9 bits from bit 12).
+static const uint kMaterialCallFeedback = 1024u;
+static const uint kMaterialCallFeedbackWeightShift = 12u;
+static const uint kMaterialCallFeedbackWeightMask = 511u;
 // flags: outputs
 static const uint kMaterialCallScattered = 16u;
 static const uint kMaterialCallDelta = 32u;
@@ -88,7 +90,8 @@ MaterialCall materialCall(SurfaceHit hit, uint material, uint mode)
     call.flags = mode | (hit.front_face ? kMaterialCallFrontFace : 0u) |
                  (hit.texture_footprint.filtered ? kMaterialCallFiltered : 0u);
 #ifdef PRISM_TEXTURE_STREAMING
-    call.flags |= g_prism_feedback << kMaterialCallFeedbackShift;
+    if (g_prism_feedback != 0u)
+        call.flags |= kMaterialCallFeedback | (g_prism_feedback_weight << kMaterialCallFeedbackWeightShift);
 #endif
     call.rng = 0u;
     call.xi = (float4)0.0f;

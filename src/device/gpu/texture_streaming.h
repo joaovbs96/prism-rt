@@ -7,9 +7,13 @@
 //
 // Each image keeps a contiguous range of levels resident, [finest, coarsest],
 // and never less than its tail (the levels at most PRISM_GPU_STREAMING_TAIL
-// texels on a side), so every lookup has something to sample. A request is
-// the finest level any lookup asked for during the current accumulation (a
-// camera or scene change starts a new one). Planning:
+// texels on a side), so every lookup has something to sample. Feedback is a
+// histogram per image of the levels lookups asked for, each weighted by its
+// path's throughput, over the current accumulation (a camera or scene change
+// starts a new one). An image's request is the coarsest level that serves
+// all but a fraction `threshold` of that weight: levels only negligible
+// paths ask for are left out. That is a bounded bias in filter footprint
+// (those lookups read a blurrier level), never in radiance. Planning:
 //
 // 1. Tails always; levels both resident and requested in this accumulation
 //    stay (never demoted while the image converges).
@@ -30,6 +34,7 @@
 namespace prism::device::gpu {
 
 constexpr uint32_t kNoRequest = 0xffffffffu;
+constexpr uint32_t kFeedbackLevels = 16; // histogram bins per image (accessors.hlsl)
 
 struct StreamedImage {
     uint32_t width = 0, height = 0; // level 0
@@ -56,14 +61,17 @@ public:
         uint32_t pending = 0;        // planned finer than resident
     };
 
-    // `resident` (optional): each image's finest resident level (default its tail).
-    void reset(std::vector<StreamedImage> images, uint64_t budget, std::vector<uint32_t> resident = {});
+    // `resident` (optional): each image's finest resident level (default its
+    // tail). `threshold`: the fraction of an image's lookup weight its
+    // request may leave out.
+    void reset(std::vector<StreamedImage> images, uint64_t budget, std::vector<uint32_t> resident = {},
+               double threshold = 0.001);
     // A new accumulation: requests start over; earlier ones only order eviction.
     void beginAccumulation();
-    // One feedback round: per image the finest level requested (kNoRequest:
-    // none) and how many lookups asked (counts may be null). True when some
-    // image's request became finer than before in this accumulation.
-    bool addFeedback(uint32_t const* finest, uint32_t const* counts, size_t count);
+    // One feedback round: per image kFeedbackLevels weights, one per level
+    // asked for. True when some image's request became finer than before in
+    // this accumulation.
+    bool addFeedback(uint32_t const* histograms, size_t count);
     // The finest level each image should keep resident.
     std::vector<uint32_t> plan() const;
     void setResident(size_t image, uint32_t finest);
@@ -82,11 +90,13 @@ private:
         StreamedImage image;
         uint32_t resident = 0;
         uint32_t request = kNoRequest; // this accumulation
-        uint64_t count = 0;            // this accumulation's requests
+        uint64_t count = 0;            // this accumulation's lookup weight
+        uint64_t mass[kFeedbackLevels] = {}; // ... by level asked for
         uint64_t lastRequested = 0;    // round + 1 of the last request (0: never)
     };
     std::vector<State> m_images;
     uint64_t m_budget = 0;
+    double m_threshold = 0.001;
     uint64_t m_round = 0;
     uint64_t m_accumulationRound = 0; // round at which this accumulation began
 };
