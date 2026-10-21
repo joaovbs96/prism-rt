@@ -79,6 +79,30 @@ namespace mx = MaterialX;
 // MaterialX material recovery from USD stages
 // ============================================================================
 
+// The material bound for the first of `purposes` with a binding (the empty
+// token is allPurpose), as Hydra resolves UsdRenderSettings
+// materialBindingPurposes. Empty `purposes`: full, then allPurpose.
+inline UsdShadeMaterial ComputeBoundMaterialFor(UsdPrim const& prim,
+                                                std::vector<TfToken> const& purposes)
+{
+    static const std::vector<TfToken> defaults{UsdShadeTokens->full, UsdShadeTokens->allPurpose};
+    for (TfToken const& purpose : purposes.empty() ? defaults : purposes) {
+        UsdRelationship binding;
+        UsdShadeMaterial material = UsdShadeMaterialBindingAPI(prim).ComputeBoundMaterial(purpose, &binding);
+        if (!material) continue;
+        if (purpose.IsEmpty()) return material;
+        // ComputeBoundMaterial falls back to allPurpose bindings; here only
+        // bindings of this purpose count (material:binding:<purpose> or
+        // material:binding:collection:<purpose>:<name>).
+        const std::vector<std::string> parts = TfStringSplit(binding.GetName(), ":");
+        const bool collection = parts.size() > 2 && parts[2] == "collection";
+        const std::string bound = collection ? (parts.size() == 5 ? parts[3] : std::string())
+                                             : (parts.size() == 3 ? parts[2] : std::string());
+        if (bound == purpose.GetString()) return material;
+    }
+    return UsdShadeMaterial(UsdPrim());
+}
+
 /// Describes how a MaterialX material was found in the USD stage.
 inline bool UsdMaterialVerbose() {
     const char* value = std::getenv("PRISM_MDL_VERBOSE");
@@ -307,7 +331,8 @@ RecoverMtlxDocumentFromUsdShade(const UsdPrim& materialPrim,
 
 static std::map<SdfPath, ResolvedMtlxMaterial>
 CollectMaterialXMaterials(const UsdStageRefPtr& stage,
-                          const std::string& mx_libraries_path)
+                          const std::string& mx_libraries_path,
+                          std::vector<TfToken> const& bindingPurposes = {})
 {
     std::map<SdfPath, ResolvedMtlxMaterial> result;
 
@@ -326,7 +351,7 @@ CollectMaterialXMaterials(const UsdStageRefPtr& stage,
             const TfToken purpose = sphere.ComputePurpose();
             if (purpose == UsdGeomTokens->guide || purpose == UsdGeomTokens->proxy) continue;
         }
-        if (auto material = UsdShadeMaterialBindingAPI(geometry).ComputeBoundMaterial())
+        if (auto material = ComputeBoundMaterialFor(geometry, bindingPurposes))
             required.insert(material.GetPath());
     }
     for (const SdfPath& materialPath : required) {
@@ -690,11 +715,15 @@ public:
         : USDMesh(file_path, nullptr, "", "")
     {}
 
-    // Full constructor with MDL/MaterialX material support
+    // Full constructor with MDL/MaterialX material support. Material bindings
+    // resolve for the first of bindingPurposes that has one (UsdRenderSettings
+    // materialBindingPurposes; empty: full, then allPurpose).
     USDMesh(const std::filesystem::path& file_path,
             mdl::Context* mdl_context,
             const std::string& mx_libraries_path,
-            const std::string& mx_mdl_path)
+            const std::string& mx_mdl_path,
+            std::vector<pxr::TfToken> bindingPurposes = {})
+        : m_bindingPurposes(std::move(bindingPurposes))
     {
         pxr::UsdStageRefPtr stage = pxr::UsdStage::Open(file_path.string());
         if (!stage) {
@@ -715,7 +744,7 @@ public:
                 (prism::PersistentCacheRoot() / "materials").string());
             std::cout << "[USDMesh] Scanning for MaterialX materials...\n";
 
-            auto mtlxMaterials = CollectMaterialXMaterials(stage, mx_libraries_path);
+            auto mtlxMaterials = CollectMaterialXMaterials(stage, mx_libraries_path, m_bindingPurposes);
 
             // Cache only within this mesh load: SDK context, libraries and loader
             // options are identical here. USD prim paths remain separate bindings.
@@ -851,6 +880,7 @@ private:
     std::vector<std::unique_ptr<ColorTexture>> m_owned_fallback_textures;
     std::vector<std::unique_ptr<Diffuse>> m_owned_fallback_materials;
     std::map<SdfPath, int>                    m_mdl_material_lookup;
+    std::vector<pxr::TfToken>                 m_bindingPurposes;
 
     // -----------------------------------------------------------------------
     // appendMeshData — commit a fully-built MeshData into the global buffers
@@ -887,8 +917,7 @@ private:
                           pxr::UsdTimeCode timeCode)
     {
         if (!m_mdl_material_lookup.empty()) {
-            pxr::UsdShadeMaterialBindingAPI bindingAPI(prim);
-            pxr::UsdShadeMaterial boundMat = bindingAPI.ComputeBoundMaterial();
+            pxr::UsdShadeMaterial boundMat = ComputeBoundMaterialFor(prim, m_bindingPurposes);
             if (boundMat) {
                 auto it = m_mdl_material_lookup.find(
                     boundMat.GetPrim().GetPath());

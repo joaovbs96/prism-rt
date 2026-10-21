@@ -11,6 +11,7 @@
 #include "../environment.h"
 #include "../lights.h"
 #include "../load_profile.h"
+#include "../output/aov.h"
 #include "../batched_spheres.h"
 #include "../camera_rays.h"
 #include "../camera_ray_diagnostics.h"
@@ -336,12 +337,24 @@ bool _PurposeMatches(HdContainerDataSourceHandle const &ds,
     return std::find(renderTags.begin(), renderTags.end(), value) != renderTags.end();
 }
 
+// RenderSettings::materialBindingPurposes of the latest SetSettings: read by
+// every snapshot build and refresh, which do not carry the settings.
+std::atomic<std::shared_ptr<const TfTokenVector>> &_BindingPurposes()
+{
+    static std::atomic<std::shared_ptr<const TfTokenVector>> purposes{
+        std::make_shared<const TfTokenVector>(RenderSettings{}.materialBindingPurposes)};
+    return purposes;
+}
+
 SdfPath _MaterialPath(HdContainerDataSourceHandle const &ds)
 {
     HdMaterialBindingsSchema bindings = HdMaterialBindingsSchema::GetFromParent(ds);
-    HdMaterialBindingSchema binding = bindings.GetMaterialBinding(HdTokens->full);
-    if (!binding) binding = bindings.GetMaterialBinding();
-    if (auto p = binding.GetPath()) return p->GetTypedValue(0.0f);
+    if (!bindings) return {};
+    const auto purposes = _BindingPurposes().load();
+    for (TfToken const &purpose : *purposes) {
+        if (auto p = bindings.GetMaterialBinding(purpose).GetPath())
+            return p->GetTypedValue(0.0f);
+    }
     return {};
 }
 
@@ -4796,36 +4809,18 @@ struct PreviewResult {
     uint64_t boundAovCount = 0;
 };
 
-enum class AovKind { Color, Depth, CameraDepth, Normal, Neye, Peye, St, PrimId, ElementId, InstanceId, Unknown };
+using prism::output::AovKind;
 
 AovKind _AovKind(TfToken const &name)
 {
-    if (name == HdAovTokens->color) return AovKind::Color;
-    if (name == HdAovTokens->depth) return AovKind::Depth;
-    if (name == HdAovTokens->cameraDepth) return AovKind::CameraDepth;
-    if (name == HdAovTokens->normal) return AovKind::Normal;
-    if (name == HdAovTokens->Neye) return AovKind::Neye;
-    if (name == HdAovTokens->Peye) return AovKind::Peye;
-    // Constructing a token looks it up in USD's locked global registry.
-    static const TfToken st("primvars:st");
-    if (name == st) return AovKind::St;
-    if (name == HdAovTokens->primId) return AovKind::PrimId;
-    if (name == HdAovTokens->elementId) return AovKind::ElementId;
-    if (name == HdAovTokens->instanceId) return AovKind::InstanceId;
-    return AovKind::Unknown;
+    return prism::output::AovKindFromName(name.GetString());
 }
 
-bool _IntegerAov(AovKind kind)
-{
-    return kind == AovKind::PrimId || kind == AovKind::ElementId || kind == AovKind::InstanceId;
-}
+bool _IntegerAov(AovKind kind) { return prism::output::IntegerAov(kind); }
 
 size_t _AovComponents(AovKind kind)
 {
-    if (kind == AovKind::Color) return 4;
-    if (kind == AovKind::Normal || kind == AovKind::Neye || kind == AovKind::Peye) return 3;
-    if (kind == AovKind::St) return 2;
-    return kind == AovKind::Unknown ? 0 : 1;
+    return static_cast<size_t>(prism::output::AovComponents(kind));
 }
 
 // Convert while the center-ray hit is local; only requested final outputs are
@@ -4846,32 +4841,8 @@ void _ResolvePrimaryAov(AovKind kind, RayHit const &hit, CameraState const &came
             if (it != snapshot->geomToCoarseFaces.end() && hit.primid >= 0 &&
                 static_cast<size_t>(hit.primid) < it->second.size()) *id = it->second[hit.primid];
         }
-    } else if (kind == AovKind::Depth || kind == AovKind::CameraDepth) {
-        values[0] = kind == AovKind::Depth ? 1.0f : std::numeric_limits<float>::infinity();
-        if (!valid) return;
-        GfVec4d view(hit.p.x(), hit.p.y(), hit.p.z(), 1.0);
-        view = view * camera.worldToView;
-        if (kind == AovKind::CameraDepth) values[0] = static_cast<float>(-view[2]);
-        else {
-            const GfVec4d clip = view * camera.projection;
-            if (std::abs(clip[3]) > 1e-12) values[0] = static_cast<float>(.5 * clip[2] / clip[3] + .5);
-        }
-    } else if (kind == AovKind::Peye) {
-        values[0] = values[1] = values[2] = 0;
-        if (valid) {
-            const GfVec3d eye = camera.worldToView.Transform(GfVec3d(hit.p.x(), hit.p.y(), hit.p.z()));
-            for (size_t i = 0; i < 3; ++i) values[i] = static_cast<float>(eye[i]);
-        }
-    } else if (kind == AovKind::St) {
-        values[0] = valid ? hit.u : 0; values[1] = valid ? hit.v : 0;
-    } else if (kind == AovKind::Normal || kind == AovKind::Neye) {
-        Float3 normal = hit.n;
-        if (kind == AovKind::Neye && valid) {
-            const GfVec3d eye = camera.worldToView.TransformDir(
-                GfVec3d(normal.x(), normal.y(), normal.z())).GetNormalized();
-            normal = Float3(static_cast<float>(eye[0]), static_cast<float>(eye[1]), static_cast<float>(eye[2]));
-        }
-        values[0] = normal.x(); values[1] = normal.y(); values[2] = normal.z();
+    } else {
+        prism::output::ResolveGeometricAov(kind, hit, camera.worldToView, camera.projection, values);
     }
 }
 
@@ -5781,6 +5752,7 @@ void SceneBridge::SetSettings(RenderSettings const &requested)
     bool imageChanged = false;
     bool budgetChanged = false;
     bool colorChanged = false;
+    bool bindingsChanged = false;
     {
         std::lock_guard lock(_impl->mutex);
         RenderSettings const &current = _impl->settings;
@@ -5808,8 +5780,10 @@ void SceneBridge::SetSettings(RenderSettings const &requested)
             current.environmentSampling == settings.environmentSampling &&
             current.gpuPreparationPreview == settings.gpuPreparationPreview &&
             current.gpuPreparationPreviewMaxMiB == settings.gpuPreparationPreviewMaxMiB &&
-            current.device == settings.device && current.color == settings.color)
+            current.device == settings.device && current.color == settings.color &&
+            current.materialBindingPurposes == settings.materialBindingPurposes)
             return;
+        bindingsChanged = current.materialBindingPurposes != settings.materialBindingPurposes;
         // Display and view do not touch the linear colour AOV.
         colorChanged = current.color.config != settings.color.config ||
             current.color.workingSpace != settings.color.workingSpace;
@@ -5828,7 +5802,7 @@ void SceneBridge::SetSettings(RenderSettings const &requested)
             current.textureStreaming != settings.textureStreaming ||
             current.environmentSampling != settings.environmentSampling ||
             current.domeLightCameraVisibility != settings.domeLightCameraVisibility ||
-            current.device != settings.device || colorChanged;
+            current.device != settings.device || colorChanged || bindingsChanged;
         budgetChanged = current.samples != settings.samples;
         if (budgetChanged && !imageChanged && _converged.load() &&
             _impl->samples.load() != 0 &&
@@ -5865,6 +5839,24 @@ void SceneBridge::SetSettings(RenderSettings const &requested)
         ++_impl->materialInvalidations;
         ++_impl->environmentInvalidations;
         _impl->lastRebuildReason = "resource revision changed";
+    }
+    if (bindingsChanged) {
+        _BindingPurposes().store(
+            std::make_shared<const TfTokenVector>(settings.materialBindingPurposes));
+        // Every prim may bind another material.
+        if (_impl->snapshot) {
+            _impl->sceneDirty = true;
+            if (_impl->buildCancel)
+                _impl->buildCancel->store(true, std::memory_order_relaxed);
+            ++_impl->requestedGeneration;
+            _impl->dirtyJournal.push_back({
+                _impl->requestedGeneration,
+                static_cast<unsigned int>(SceneDirtyKind::Unknown), {}});
+            _impl->dirtyKinds |= static_cast<unsigned int>(SceneDirtyKind::Unknown);
+            ++_impl->materialInvalidations;
+            ++_impl->conservativeRebuilds;
+            _impl->lastRebuildReason = "material binding purposes changed";
+        }
     }
     // A new working space changes every converted colour: materials (their
     // generated colour transforms), lights, domes and their textures.

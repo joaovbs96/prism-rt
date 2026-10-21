@@ -19,6 +19,8 @@
 #include "pxr/imaging/hd/legacyTaskSchema.h"
 #include "pxr/imaging/hd/lightSchema.h"
 #include "pxr/imaging/hd/renderSettingsSchema.h"
+#include "pxr/imaging/hd/sceneGlobalsSchema.h"
+#include "pxr/imaging/hd/utils.h"
 #include "pxr/imaging/hd/selectionsSchema.h"
 #include "pxr/base/tf/diagnostic.h"
 #include "pxr/usd/sdf/assetPath.h"
@@ -440,6 +442,7 @@ void PrismTaskDelegate::SetRenderSetting(TfToken const &key, VtValue const &valu
 VtDictionary PrismTaskDelegate::GetRenderStats() const
 {
     VtDictionary result = _bridge ? _bridge->GetStats() : VtDictionary{};
+    result["activeRenderSettings"] = VtValue(_activeRenderSettings.GetString());
     result["selectionOffsetMilliseconds"] = VtValue(
         _taskContext->selectionOffsetNanoseconds.load(
             std::memory_order_relaxed) / 1.0e6);
@@ -484,21 +487,51 @@ void PrismTaskDelegate::_SyncAuthoredSettings()
     if (!_authoredSettingsDirty || !_sourceSceneIndex || !_bridge) return;
     _authoredSettingsDirty = false;
     VtDictionary authored;
-    bool foundActive = false;
-    for (const SdfPath &path : _renderSettingsPaths) {
-        const auto prim = _sourceSceneIndex->GetPrim(path);
-        if (prim.primType == HdPrimTypeTokens->renderSettings) {
+    // The active render settings prim: the scene globals' path (the stage's
+    // renderSettingsPrimPath, usdview's render settings menu, or the batch
+    // renderer's choice), else the first prim flagged active.
+    // HdsiRenderSettingsFilteringSceneIndex (plugin.cpp) computes the flag
+    // and keeps only prism:* namespaced settings. The host owns the camera,
+    // resolution, framing and purposes; prism_hydra_render reads those from
+    // the same prim itself (src/output/render_products.h).
+    SdfPath activePath;
+    HdRenderSettingsSchema active{nullptr};
+    if (HdUtils::HasActiveRenderSettingsPrim(_sourceSceneIndex, &activePath)) {
+        active = HdRenderSettingsSchema::GetFromParent(
+            _sourceSceneIndex->GetPrim(activePath).dataSource);
+    } else {
+        activePath = SdfPath();
+        for (const SdfPath &path : _renderSettingsPaths) {
+            const auto prim = _sourceSceneIndex->GetPrim(path);
+            if (prim.primType != HdPrimTypeTokens->renderSettings) continue;
             const auto settings = HdRenderSettingsSchema::GetFromParent(prim.dataSource);
-            const auto active = settings.GetActive();
-            if (!foundActive && active && active->GetTypedValue(0)) {
-                foundActive = true;
-                const auto namespaced = settings.GetNamespacedSettings();
-                for (const auto& name : namespaced.GetNames()) {
-                    if (name.GetString().rfind("prism:", 0) == 0)
-                        if (const auto value = namespaced.Get(name))
-                            authored[name.GetString()] = value->GetValue(0);
-                }
+            const auto flag = settings.GetActive();
+            if (flag && flag->GetTypedValue(0)) {
+                active = settings;
+                activePath = path;
+                break;
             }
+        }
+    }
+    _activeRenderSettings = active ? activePath : SdfPath();
+    TfTokenVector bindingPurposes = prism::hydra::RenderSettings{}.materialBindingPurposes;
+    if (active) {
+        const auto namespaced = active.GetNamespacedSettings();
+        for (const auto& name : namespaced.GetNames()) {
+            if (name.GetString().rfind("prism:", 0) == 0)
+                if (const auto value = namespaced.Get(name))
+                    authored[name.GetString()] = value->GetValue(0);
+        }
+        if (const auto purposes = active.GetMaterialBindingPurposes()) {
+            const VtArray<TfToken> value = purposes->GetTypedValue(0);
+            bindingPurposes.assign(value.begin(), value.end());
+        }
+    }
+    {
+        prism::hydra::RenderSettings s = _bridge->GetSettings();
+        if (s.materialBindingPurposes != bindingPurposes) {
+            s.materialBindingPurposes = bindingPurposes;
+            _bridge->SetSettings(s);
         }
     }
     for (const auto& descriptor : GetRenderSettingDescriptors()) {
@@ -696,7 +729,13 @@ void PrismTaskDelegate::PrimsDirtied(HdSceneIndexBase const &sender,
         // values from those prims, so the root notice must not force a global
         // scene recapture and cancel that targeted work.
         if (entry.primPath == SdfPath::AbsoluteRootPath() &&
-            prim.primType.IsEmpty()) continue;
+            prim.primType.IsEmpty()) {
+            // A new active render settings prim (scene globals).
+            for (HdDataSourceLocator const &locator : entry.dirtyLocators)
+                if (locator.Intersects(HdSceneGlobalsSchema::GetActiveRenderSettingsPrimLocator()))
+                    _authoredSettingsDirty = true;
+            continue;
+        }
         if (_NeedsSceneRebuild(prim)) {
             if (_bridge) {
                 bool marked = false;

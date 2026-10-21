@@ -77,6 +77,11 @@ struct RenderSettings {
     // fields take the defaults (docs/color_management.md). The colour AOV is
     // linear in the working space; display and view only record the request.
     prism::color::Options color;
+    // The active render settings prim's materialBindingPurposes: a prim's
+    // material is its binding for the first of these purposes that it has
+    // (the empty token is allPurpose). Process-wide, like the colour
+    // management.
+    pxr::TfTokenVector materialBindingPurposes{pxr::TfToken("full"), pxr::TfToken()};
 };
 
 enum class SceneDirtyKind : unsigned int {

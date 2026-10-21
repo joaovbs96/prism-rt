@@ -14,6 +14,7 @@
 #include "pxr/imaging/hdsi/implicitSurfaceSceneIndex.h"
 #include "pxr/imaging/hdsi/lightLinkingSceneIndex.h"
 #include "pxr/imaging/hdsi/extComputationPrimvarPruningSceneIndex.h"
+#include "pxr/imaging/hdsi/renderSettingsFilteringSceneIndex.h"
 
 PXR_NAMESPACE_OPEN_SCOPE
 
@@ -65,7 +66,15 @@ std::unique_ptr<HdRenderer> HdPrismRendererPlugin::_CreateRenderer(
     auto computed = HdSiExtComputationPrimvarPruningSceneIndex::New(converted);
     // Light/shadow-link collections become categories on lights and geometry.
     auto linked = HdsiLightLinkingSceneIndex::New(computed, nullptr);
-    auto transport = PrismTransportFilter::New(linked, context);
+    // Render settings prims get their `active` flag (from the scene globals'
+    // active render settings path) and only prism:* namespaced settings
+    // (docs/hydra.md, "Render settings and products").
+    VtArray<TfToken> prefixes{TfToken("prism:")};
+    auto settings = HdsiRenderSettingsFilteringSceneIndex::New(linked,
+        HdRetainedContainerDataSource::New(
+            HdsiRenderSettingsFilteringSceneIndexTokens->namespacePrefixes,
+            HdRetainedTypedSampledDataSource<VtArray<TfToken>>::New(prefixes)));
+    auto transport = PrismTransportFilter::New(settings, context);
     // Let OpenUSD allocate the stock adapter.  This keeps HdRenderer and the
     // terminal HdRenderIndex constructor entirely on the OpenUSD side of the
     // DLL boundary while SetTerminalSceneIndex gives our delegate native scene

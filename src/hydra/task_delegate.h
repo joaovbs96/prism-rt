@@ -89,6 +89,9 @@ private:
     SdfPathVector _renderSettingsPaths;
     std::map<SdfPath, std::vector<size_t>> _renderSettingsOrder;
     VtDictionary _authoredSettings;
+    // The render settings prim the prism:* settings and the material binding
+    // purposes came from (empty: none).
+    SdfPath _activeRenderSettings;
     std::map<SdfPath, TfToken> _knownPrimTypes;
 };
 
