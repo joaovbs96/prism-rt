@@ -69,10 +69,10 @@ Scenes: **Eggs** (MaterialEggs), **OpenPBR** (OpenPBRShaderPlayground),
 
 ## Scale and performance
 
-- **Out-of-core textures for the GPU.** *Mip-level streaming on Vulkan: in
-  progress* (see [texture service](texture_service.md#gpu-texture-streaming)):
-  feedback-driven residency of whole mip levels, verification incomplete.
-  Still open: tile-granularity streaming, Metal, and ALab (more images than
+- **Out-of-core textures for the GPU.** *Whole-mip-level streaming on
+  Vulkan: done* (see [texture service](texture_service.md#gpu-texture-streaming)).
+  Still open: tile-granularity streaming, Metal (whole uploads), GPU levels
+  taken from the `.tx.exr` mips the CPU samples, and ALab (more images than
   the descriptor array and the driver's allocation count allow).
 - **GPU kernel compile time** grows with the material set (OpenPBR and Eggs
   take three to six minutes on first use).

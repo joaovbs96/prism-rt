@@ -421,17 +421,21 @@ they change the image, not just its noise.
   (8-bit when every value is k/255, half below 60000, otherwise float),
   environments as float. Metal still estimates one byte per component and
   reads the `.tx.exr`.
-- `PRISM_GPU_TEXTURE_STREAMING=0`: Vulkan uploads whole textures (reduced to
-  the budget) instead of streaming mip levels; see
-  [texture streaming](texture_service.md#gpu-texture-streaming). Early image
-  uploads below run only then.
+- Texture streaming (Vulkan, default): only the mip levels shading asks for
+  are resident, within the budget; see
+  [texture streaming](texture_service.md#gpu-texture-streaming).
+  `PRISM_GPU_TEXTURE_STREAMING=0` (or `prism:textureStreaming false`)
+  uploads whole textures, reduced to the budget; early image uploads below
+  run only then. Every Vulkan image path uploads the GPU copy's stored mip
+  levels (a reduced image starts at a stored level);
+  `PRISM_GPU_TEXTURE_BLIT_MIPS=1` generates mips with blits as before.
 - `PRISM_GPU_TEXTURE_COPIES=0`: Vulkan uploads from the float `.tx.exr`
   files, as before GPU-ready copies.
 - Early image uploads (Vulkan): every texture prepared while the device
   exists (`TextureService::AddPreparedObserver`) is uploaded at full
   resolution from its GPU copy on a background thread (own command pool and
-  fence; submissions share the queue under a lock), with GPU mipmaps as
-  usual, while the scene still loads. Budgeting needs the whole set, so the
+  fence; submissions share the queue under a lock), with its stored mip
+  levels, while the scene still loads. Budgeting needs the whole set, so the
   uploads estimate as they go: an image is skipped once the texture budget
   reduces it among the images seen so far, or when the early uploads would
   exceed the budget. The scene's upload then fits the full set as before,

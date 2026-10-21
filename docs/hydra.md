@@ -50,6 +50,8 @@ python tests/hydra/validate.py
 | `prism:environmentSampling` | `mis` | Environment next-event sampling with MIS, or `bsdf` |
 | `prism:lightSelection` | `spatial` | NEE picks among the analytic (UsdLux) lights by their estimated irradiance at the shading point (`spatial`, for 2 to 64 analytic lights), or by power only (`power`); see [Sampling](gpu_devices.md#sampling) |
 | `prism:textureFiltering` | `filtered` | Footprint-based anisotropic mip filtering, or highest-resolution `bilinear` reference mode |
+| `prism:textureStreaming` | true | GPU devices that stream textures (Vulkan) keep only the mip levels shading asks for, within the texture budget; false uploads whole textures reduced to the budget (env `PRISM_GPU_TEXTURE_STREAMING=0`); see [texture streaming](texture_service.md#gpu-texture-streaming) |
+| `prism:textureStreamingPrepass` | false | Settle streamed textures with feedback-only passes before an accumulation and hold them for all of its samples (deterministic final images; `prism_hydra_render` sets it). Otherwise an accumulation restarts at most once, early, and later loads sharpen it in place |
 | `prism:sphereBatching` | false | Experimental batches of at most 1,024 eligible analytic spheres; ordinary instancing remains the default |
 | `prism:hiddenGeometryBudgetMiB` | 0 | Soft budget for retained hidden converted geometry; zero keeps unlimited retention |
 | `prism:resourceRevision` | 0 | Increment to invalidate cached material and external texture fingerprints and reload dome resources without rebuilding geometry |
@@ -226,7 +228,7 @@ The usdview extension turns these into HUD lines under usdview's Hydra/Hgi lines
 | `textures` | ` Status: Preparing textures 4 / 20` |
 | `kernel` | ` Status: Compiling GPU kernel... 42 s` and an indented detail line; the seconds appear from the first second (3 s for other phases) |
 | `upload` | ` Status: Uploading to GPU (images) 5 / 20`, `(buffers)`, `(acceleration structures)` |
-| `rendering` | ` Samples: N / target` and ` State: refining` or `converged` |
+| `rendering` | ` Samples: N / target` and ` State: refining` or `converged`; with GPU texture streaming first `Texture: resident / budget MiB` (`, N pending` while levels load, `, N below requested` in the warning color when the budget is short) |
 | any, with `prismGpuPreview` | ` Device: cpu (preview while the GPU prepares)`, the GPU phase line (` Status: Compiling GPU kernel... 12 s`) and ` Samples: N / target` counting up from the CPU |
 | `error` | ` Status: Error: ...` in the warning color |
 

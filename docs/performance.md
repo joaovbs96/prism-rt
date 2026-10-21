@@ -241,6 +241,81 @@ of three alternating runs at 64 spp (five at 16 spp):
   reads instead of 8 for scalar tables; per sample it was within noise
   (Lion 7.50 ms at 64 spp).
 
+## GPU texture streaming (October 2026)
+
+Vulkan streams whole mip levels from feedback instead of uploading every
+texture (see [the texture service](texture_service.md#gpu-texture-streaming)).
+Measured with `prism_hydra_render` (its settling pre-pass, then 64 spp with
+residency held), 960x540, RTX 4070 Ti (driver 610.88), default texture
+budget (45% of 12 GB), each process under a 24 GB job cap. **Another
+application (a game) was running on the GPU during every run, so all times
+are indicative only**; before and after ran alternately. Warm: the mean of
+two alternating runs on the same cache; cold: an empty `PRISM_CACHE_DIR`
+and a unique `PRISM_VULKAN_SHADER_SALT`, one run each. "Ready" is the
+`vulkan.scene` mark, "first sample" the first full sample (with streaming it
+includes settling), times since process start. Texture memory is the
+images' estimated levels (resident) and allocated device memory;
+"device-local" is the process's own use from `VK_EXT_memory_budget`.
+
+| Scene | Texture memory | Ready, warm | First sample, warm | Converged, warm | Ready, cold | GPU ms per pass |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| OpenPBR playground | 5392 MiB, 42 of 152 reduced → 2644 MiB resident, 2687 allocated (device-local 3512) | 14.1 → 8.7 s | 14.3 → 10.0 s | 19.4 → 15.2 s | 59.1 → 61.2 s | 76.1 → 77.9 |
+| Teapot | 5334 MiB, 7 of 94 reduced → 615 / 786 MiB (1050) | 3.25 → 2.32 s | 3.40 → 2.63 s | 3.86 → 3.06 s | 34.3 → 39.5 s | 3.56 → 3.38 |
+| Lion | 4437 MiB → 769 / 939 MiB (1267) | 3.07 → 2.71 s | 3.23 → 3.11 s | 3.96 → 3.82 s | 20.8 → 23.1 s | 7.42 → 7.17 |
+| Chess | 763 MiB → 520 / 691 MiB (977) | 3.01 → 2.99 s | 3.21 → 3.29 s | 4.86 → 4.90 s | 9.1 → 10.7 s | 20.97 → 21.01 |
+| Jade egg | 171 MiB (no streamed textures) | 2.31 → 2.27 s | 2.48 → 2.44 s | 4.05 → 3.98 s | 9.6 → 9.2 s | 20.2 → 20.0 |
+
+- **Memory and warm start.** Scenes upload only 128-texel tails (OpenPBR:
+  9.7 MiB for 151 images) before the first pass, then what the view asks
+  for: OpenPBR needs 2.6 GB at this view, so nothing is reduced any more,
+  and GPU ready and the first sample come 4-6 s earlier. Settling takes 2-3
+  feedback rounds (OpenPBR 0.8-1.1 s, others 0.1-0.4 s). `nvidia-smi` used
+  memory (whole GPU, including the game) during the OpenPBR render: 7814 →
+  5114 MiB.
+- **Cold.** Slower by 1.5-5 s: preparation now also filters and writes each
+  texture's mip chain into its GPU copy (a third more bytes), and the first
+  run on a cache rewrites version 1 copies. Single runs; cold times varied
+  by up to 1.5x before.
+- **Feedback cost.** The same settled residency rendered with feedback
+  recorded on every pass (`PRISM_GPU_STREAMING_FEEDBACK=1`, one pixel of
+  each 4 x 4 block) against none: Teapot 3.35 / 3.38 ms, Lion 7.47 / 7.26,
+  chess 20.89 / 21.23, OpenPBR 77.0 / 76.9 per pass: within the run-to-run
+  noise (at most 3%). Offline renders stop recording once residency is held;
+  interactive rendering records on every pass.
+- **Parity with the CPU device** (64 spp, same seed; 8 x 8 block NRMSE with
+  samples clamped at 4, and mean ratio): OpenPBR 0.0162 / 0.9983 →
+  0.0164 / 1.0034, Teapot 0.0028 / 0.9995 → 0.0030 / 1.0001, Lion
+  0.0029 / 0.9996 → 0.0030 / 1.0004, chess 0.0083 / 0.9982 → 0.0081 / 1.0015,
+  jade egg unchanged. Per-pixel NRMSE (OpenPBR 0.077 → 0.078) is dominated by
+  paths that diverge between devices, not by texture resolution: an upload
+  of every full-resolution level gives the same 0.078. The mean moves
+  because all Vulkan images now take the stored box-filtered mips; the blit
+  mips were darker (OpenPBR 0.65%); the CPU's OIIO mips lie between.
+- **Identity.** With every level resident the streamed image is
+  bit-identical to whole images; with the default request rule, OpenPBR
+  differs from it in 328 of 518,400 pixels (block NRMSE 0.0003), and with
+  exact requests in 39 (see the texture service).
+- **Determinism.** Repeated runs are bit-identical on every scene, also with
+  a budget the requests do not fit.
+- **Interactive policy** (`--progressive-textures`: restart at most once,
+  before 16 samples): converged images bit-identical to the settled ones on
+  every scene here.
+
+Reduced budget (`PRISM_GPU_TEXTURE_BUDGET_MIB`), against streaming with the
+default budget (8 x 8 block NRMSE):
+
+| Scene, budget | Streaming | Whole images reduced to the budget (before) |
+| --- | --- | --- |
+| OpenPBR, 1500 MiB | 1457 MiB resident, 34 of 148 requested textures below their request; 0.0004 | 123 of 152 images reduced; 0.0174 |
+| Teapot, 1500 MiB | everything requested fits; bit-identical | 7 of 94 reduced at the default budget already |
+| Teapot, 300 MiB | 60 of 86 below their request; 0.00009 | 93 of 94 reduced; 0.00005 |
+
+Streaming keeps the most-used levels within the budget, so OpenPBR at
+1500 MiB stays within noise of the unrestricted image where uniform
+reduction does not; Teapot's textures barely show at this view either way.
+Runs at a constrained budget are deterministic: residency is planned from
+the requests alone while settling.
+
 ## Interpretation limits
 
 MDL variants remain cached for the renderer process lifetime, affecting warm-recreation results. Historical InOneWeekend measurements used coarse tessellated spheres; the current implementation uses analytic spheres. Report this representation change when comparing geometry memory and rendering results. See [Hydra scope and costs](hydra.md) for rendering limitations and supported geometry behavior.

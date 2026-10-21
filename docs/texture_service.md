@@ -67,17 +67,28 @@ publications and directly prepared sources use them.
 GPU copies are format version 2: a 1 KiB header with a level table and one
 digest per level, and the whole mip chain (`BuildMipChain`: each level the
 2 x 2 box of the previous one for even sizes, the bilinear center tap of
-`vkCmdBlitImage` for odd ones, rounded to the stored precision). A device
+`vkCmdBlitImage` for odd ones, rounded to the stored precision; checked
+against a reference box filter on every OpenPBR and Teapot copy). A device
 reads any range of levels (`ReadLevels`) and checks only their digests.
 Version 1 copies fail validation and are written again from the source on
 first use.
 
+The stored chain is the single reference for every Vulkan image: whole
+images (streaming off, reduced to fit the budget, early uploads, domes) and
+streamed ones upload its levels, so an image's texels never depend on
+which levels are resident. Mips generated with blits depend on the level
+they start from (on OpenPBR they differ enough to move the mean by 0.65%);
+`PRISM_GPU_TEXTURE_BLIT_MIPS=1` restores them for diagnostics. The CPU
+device samples the `.tx.exr` mips OIIO filters in float; taking the GPU
+levels from those files (instead of a box chain at the source's precision)
+is not done yet.
+
 ## GPU texture streaming
 
 The Vulkan device keeps only the mip levels shading asks for
-(`src/device/gpu/texture_streaming.h`, `PRISM_GPU_TEXTURE_STREAMING=0` or
-`prism:textureStreaming false` turn it off; images are then uploaded whole
-and reduced to fit the budget, as before):
+(`src/device/gpu/texture_streaming.h`; `PRISM_GPU_TEXTURE_STREAMING=0` or
+`prism:textureStreaming false` turn it off and upload whole images, reduced
+to fit the budget, as before):
 
 - **Residency.** Each streamed image (every image with a version 2 GPU copy,
   except domes) holds a contiguous range of levels, from its finest resident
@@ -88,50 +99,71 @@ and reduced to fit the budget, as before):
   (`gpu_image_texel`), and `info.xy` the full size (resolution queries and
   crops match the CPU). At scene setup only the tails (levels at most
   `PRISM_GPU_STREAMING_TAIL`, default 128, texels on a side) are read.
-- **Feedback.** While residency can still change, every dispatch records per
-  image the finest level its lookups ask for (Vulkan's anisotropic LOD rule
-  on the ray-footprint gradients, half a level finer for implementation
-  approximations; texel loads ask for level 0) with a read-before-atomic
-  `InterlockedMin`, and one pixel of each 4 x 4 block
-  (`PRISM_GPU_STREAMING_COUNT_STRIDE`) counts its lookups. The same
-  submission copies the buffer into one of three host buffers and resets it;
-  the streaming thread reads them (no stall: without a free buffer the
-  feedback stays for the next copy). Metal compiles none of it
-  (`PRISM_TEXTURE_STREAMING` is defined only by the Vulkan resources).
+- **Feedback.** One pixel of each 4 x 4 block (`PRISM_GPU_STREAMING_FEEDBACK_STRIDE`,
+  moving every pass; every pixel while settling) adds, for each lookup, the
+  path's weight to a per-image histogram of the levels asked for. The level
+  is Vulkan's anisotropic LOD rule on the ray-footprint gradients, half a
+  level finer (`PRISM_GPU_STREAMING_LOD_MARGIN`) for implementations'
+  approximations; texel loads ask for level 0. The weight is the path
+  throughput's largest component, clamped to 1 (`pathWeight`, set before each
+  material call). The same submission as the dispatch copies the histograms
+  into one of three host buffers and clears them; the streaming thread reads
+  them (no stall: without a free buffer they stay for the next copy). Metal
+  compiles none of it (`PRISM_TEXTURE_STREAMING` is defined only by the
+  Vulkan resources).
+- **Requests.** An image's request is the coarsest level that serves all but
+  `PRISM_GPU_STREAMING_THRESHOLD` (default 0.001) of its lookup weight in the
+  current view; per image, and therefore in total. Levels only negligible
+  paths ask for are left out: a bounded bias in filter footprint (those
+  lookups read a blurrier level), never in radiance. Without the weighting,
+  the finest level any path ever asks for keeps getting finer as samples
+  accumulate (OpenPBR: still changing after 8 feedback rounds); with it,
+  requests settle in 2-3 rounds.
 - **Planning** (deterministic): tails always; levels resident and requested
-  in the current accumulation are never demoted; missing requested levels
-  one at a time by request count per byte within the budget
+  in the current view are never demoted; missing requested levels one at a
+  time by lookup weight per byte within the budget
   (`PRISM_GPU_TEXTURE_BUDGET_MIB` less the whole images); then other
   resident levels while they fit, least recently requested evicted first.
-  Requests the budget cannot hold are reported once:
+  Requests the budget cannot hold are reported once per view:
   `N of M streamed textures below the requested resolution`.
 - **Uploads.** A streaming thread creates each changed image anew from the
   copy's levels (read straight into host-cached staging, batches of
   `PRISM_GPU_STREAMING_BATCH_MIB`, own command pool and fence); the render
   thread swaps descriptors and records before its next dispatch, when none
   of its submissions is pending, and frees the old image.
-- **Convergence.** Offline renders (`prism:textureStreamingPrepass`, set by
-  `prism_hydra_render`, and the standalone renderer) render feedback-only
-  passes over every pixel and wait for the uploads, up to four rounds, then
-  keep residency for the whole accumulation. Progressive rendering restarts
-  the accumulation once the requested levels are resident and the last
-  feedback rounds asked for nothing finer, at most
-  `PRISM_GPU_STREAMING_RESTARTS` (3) times per view; then residency stays.
+- **Offline renders** (`prism:textureStreamingPrepass`, which
+  `prism_hydra_render` sets, and the standalone renderer) trace the first
+  samples of the accumulation (same mode, seeds and random numbers) as
+  feedback-only rounds until a round changes nothing (at most
+  `PRISM_GPU_STREAMING_SETTLE_ROUNDS`, 8), then freeze residency and stop
+  recording feedback for the whole accumulation: the freeze makes final
+  images deterministic (repeated runs are bit-identical).
+- **Interactive rendering** restarts an accumulation at most once, before
+  `PRISM_GPU_STREAMING_RESTART_SAMPLES` (16) samples, once the levels the
+  first feedback asked for are resident; a new view or scene starts a new
+  accumulation as usual. Later residency changes apply in place: the image
+  sharpens, and the few samples taken with coarser levels wash out.
+- **Identity.** With every level resident (`PRISM_GPU_STREAMING_TAIL=65536`)
+  the streamed image is bit-identical to whole images. Leaving levels out
+  can only differ where a lookup asked for a level the feedback did not
+  record: on OpenPBR at 960 x 540, 64 spp, with exact requests (threshold 0),
+  39 of 518,400 pixels differ (NRMSE 0.0012). Feedback over all 64 samples
+  leaves 4, and a 1.5-level margin as well leaves none (the hardware picks a
+  level up to 1.5 finer than the specification's rule for a few lookups);
+  there is no level-shift error. The default margin of 0.5 keeps memory
+  lower (4.1 GB against 6.5 GB there).
 - Statistics: `prismTextureStreaming`, `prismTextureResidentMiB`,
   `prismTextureBudgetMiB`, `prismTextureMemoryMiB`, `prismDeviceMemoryMiB`,
   `prismTexturesPending`, `prismTexturesBelowRequested`,
   `textureStreamingRestarts`; the usdview HUD shows
-  `Texture: resident / budget MiB`.
+  `Texture: resident / budget MiB` (with pending and below-requested counts).
+- **Descriptors and allocations.** Every image, streamed or not, is still one
+  descriptor (`kMaxImages`, 4096) and one `vkAllocateMemory` (NVIDIA allows
+  4096): streaming does not lift ALab's limits. Tiles would add a page table
+  per image and sparse or suballocated memory; the per-level offsets of the
+  GPU copy and the planner's budget and priority rules carry over.
 
-Measured so far (RTX 4070 Ti, 960 x 540, 64 spp, warm, OpenPBR playground;
-another application used the GPU, so times are indicative only): resident
-textures 3981 MiB instead of 5392 MiB with 42 of 152 images reduced; GPU
-ready 16.5 s to 10.9 s; first full sample 16.8 s to 13.9 s (settling 2.6 s);
-images deterministic across runs. Against an upload of every level from the
-same copies, the streamed image differs in 43 of 518,400 pixels (NRMSE
-0.0012). Open: the stored box mips and the driver's blit mips give images
-0.65% apart in mean on OpenPBR, so streaming does not reproduce the blit
-path's image; and settling still found finer requests in its fourth round.
+Measurements: [performance.md](performance.md#gpu-texture-streaming-october-2026).
 
 ## Cache configuration
 
