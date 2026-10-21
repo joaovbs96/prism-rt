@@ -662,6 +662,52 @@ foreach(_test IN LISTS _prism_tests)
         "PRISM_CACHE_DIR=${CMAKE_BINARY_DIR}/test-cache")
 endforeach()
 
+# GPU texture streaming converges to the image of whole textures: a textured
+# plane rendered with streamed mip levels from an empty cache (textures
+# prepared during the run) and again from the warm cache, against whole
+# textures. Exact requests (threshold 0) and settled residency make the
+# streamed renders deterministic; they match the whole-texture image within
+# the comparison's 1% (only lookups the feedback did not see read a coarser
+# level). On the CPU device all three are the same render.
+if(TARGET prism_hydra_render AND TARGET prism_compare_images)
+    set(_prism_streaming "${CMAKE_BINARY_DIR}/hydra/streaming")
+    add_test(NAME prism_hydra_streaming_fixture
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/make_streaming_fixture.py"
+            "${_prism_streaming}")
+    add_test(NAME prism_hydra_streaming_clear_cache
+        COMMAND "${CMAKE_COMMAND}" -E rm -rf "${_prism_streaming}/cache")
+    set_tests_properties(prism_hydra_streaming_fixture prism_hydra_streaming_clear_cache PROPERTIES
+        FIXTURES_SETUP prism_streaming_fixture)
+    set(_prism_streaming_env ${_prism_test_environment} "PRISM_CACHE_DIR=${_prism_streaming}/cache"
+        "PRISM_GPU_STREAMING_THRESHOLD=0")
+    add_test(NAME prism_hydra_streaming_cold
+        COMMAND prism_hydra_render "${_prism_streaming}/streaming.usda" /World/Camera
+            "${_prism_streaming}/cold.exr" 160 120 16)
+    add_test(NAME prism_hydra_streaming_warm
+        COMMAND prism_hydra_render "${_prism_streaming}/streaming.usda" /World/Camera
+            "${_prism_streaming}/warm.exr" 160 120 16)
+    add_test(NAME prism_hydra_streaming_whole
+        COMMAND prism_hydra_render "${_prism_streaming}/streaming.usda" /World/Camera
+            "${_prism_streaming}/whole.exr" 160 120 16 --no-texture-streaming)
+    set_tests_properties(prism_hydra_streaming_cold PROPERTIES
+        ENVIRONMENT "${_prism_streaming_env}" FIXTURES_REQUIRED prism_streaming_fixture
+        FIXTURES_SETUP prism_streaming_renders)
+    set_tests_properties(prism_hydra_streaming_warm PROPERTIES
+        ENVIRONMENT "${_prism_streaming_env}"
+        DEPENDS prism_hydra_streaming_cold FIXTURES_SETUP prism_streaming_renders)
+    set_tests_properties(prism_hydra_streaming_whole PROPERTIES
+        ENVIRONMENT "${_prism_streaming_env};PRISM_GPU_TEXTURE_BUDGET_MIB=9000"
+        DEPENDS prism_hydra_streaming_warm FIXTURES_SETUP prism_streaming_renders)
+    add_test(NAME prism_hydra_streaming_cold_matches_whole
+        COMMAND prism_compare_images "${_prism_streaming}/whole.exr" "${_prism_streaming}/cold.exr")
+    add_test(NAME prism_hydra_streaming_warm_matches_whole
+        COMMAND prism_compare_images "${_prism_streaming}/whole.exr" "${_prism_streaming}/warm.exr")
+    add_test(NAME prism_hydra_streaming_cold_matches_warm
+        COMMAND prism_compare_images "${_prism_streaming}/warm.exr" "${_prism_streaming}/cold.exr" --exact)
+    set_tests_properties(prism_hydra_streaming_cold_matches_whole prism_hydra_streaming_warm_matches_whole
+        prism_hydra_streaming_cold_matches_warm PROPERTIES FIXTURES_REQUIRED prism_streaming_renders)
+endif()
+
 include(GNUInstallDirs)
 install(TARGETS PrismRT RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
 install(FILES prism_env.ps1 run_usdview.ps1 prism_env.sh
