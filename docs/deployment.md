@@ -102,7 +102,7 @@ vulkan device").
 `tools/deps.json` is the only list of dependency versions: OpenUSD, MaterialX
 and OpenSubdiv tags, oneTBB, Embree, the MDL SDK (tag, release build, clang
 and the SDK's vcpkg baseline), Python and the PySide6/PyOpenGL/numpy pins, the
-Vulkan SDK, PrismRT's vcpkg baseline (OpenImageIO), and `stack_revision`, a
+Vulkan SDK, PrismRT's vcpkg baseline (OpenImageIO, OpenColorIO), and `stack_revision`, a
 counter that forces CI to rebuild its cached stacks. Its consumers:
 
 - `tools/deps.psm1`: `Get-PrismDeps` and `Get-PrismCacheKey -Stack usd|mdl`
@@ -114,7 +114,7 @@ counter that forces CI to rebuild its cached stacks. Its consumers:
 - `tools/ci/build_usd_stack.ps1`, `fetch_prebuilt.ps1`, `build_mdl_sdk.ps1`,
   `tools/build_deps_local.ps1` and `tools/package_windows.ps1`.
 - `cmake/PrismDeps.cmake`: the configure reports the OpenUSD, MaterialX,
-  OpenSubdiv, oneTBB, Embree, OpenImageIO, Python and MDL SDK versions it found
+  OpenSubdiv, oneTBB, Embree, OpenImageIO, OpenColorIO, Python and MDL SDK versions it found
   and, on Windows, fails when one differs from `deps.json`
   (`-DPRISM_STRICT_DEPENDENCY_VERSIONS=OFF` turns that into a warning, the
   default on other platforms, whose stacks may come from system packages). It also

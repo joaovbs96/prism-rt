@@ -385,6 +385,31 @@ group, and Russian roulette from depth 2 (worse) or 8 (CornellBox -14% MSE,
 OpenChessSet +18% time). Pixel filters other than the box were not tried:
 they change the image, not just its noise.
 
+## Metal checklist
+
+Changes to code the Metal device shares, to verify on a Mac (build, then the
+listed runs on `--device metal` against `--device cpu`) before the change is
+called done there.
+
+- **Colour management** ([color_management.md](color_management.md)):
+  - Build: OpenColorIO 2.6 must be found (`find_package(OpenColorIO CONFIG)`;
+    Homebrew's `opencolorio` or vcpkg), and `prism_core` links it.
+  - Shared shader code: `SampleSettings::luminance` (a `float3`) and
+    `lightImportance(light, p, luminance)` in `shaders/integrator/`,
+    `GpuFrame::color` (a `float4` appended to `shaders/shared/prism_gpu_types.h`,
+    filled by `GpuRenderDevice::BaseFrame`, read in `shaders/gpu/kernel.hlsl`).
+    No new binding; check the Metal frame buffer still matches `sizeof(GpuFrame)`.
+  - Shared host code: `src/device/light_table.h`, `src/environment.h`,
+    `src/lights.h`, the texture service's texel conversion
+    (`src/texture_service.cpp`), the MaterialX generator's colour transforms
+    (`src/materialx/mdl_generator.cpp`, `prepared_template.h`, `loader.cpp`),
+    `src/hydra/scene_bridge.cpp` and `task_delegate.cpp`.
+  - Runs: `ctest -R prism_color` (CPU), then
+    `tests/hydra/fixtures/color_management.usda` with `prism_hydra_render
+    ... --working-space acescg` on Metal and `prism_color_management_test
+    --check-patches <exr> acescg`; an egg and OpenPBR on Metal vs CPU with
+    `prism_compare_images`.
+
 ## Diagnostics
 
 - `PRISM_GPU_VERBOSE=1`: compile and upload timings.

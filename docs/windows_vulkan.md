@@ -39,6 +39,7 @@ table.
 | Embree | 4.4.0 | Intel binary release. |
 | NVIDIA MDL SDK | 2026.0.2 | Built from source without CUDA, see below. Do not use the binary release zip. |
 | OpenImageIO | 3.1.14 | vcpkg, installed into `build\vcpkg_installed\x64-windows`. |
+| OpenColorIO | 2.6.0 | vcpkg (also an OpenImageIO dependency). Colour management ([color_management.md](color_management.md)); its built-in configs ship inside `OpenColorIO_2_6.dll`. |
 
 ### OpenUSD, MaterialX and OpenSubdiv
 

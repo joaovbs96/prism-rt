@@ -58,6 +58,9 @@ python tests/hydra/validate.py
 | `prism:selectionOutline` | true | Draw selection as an outline; false uses filled highlighting |
 | `prism:selectionOutlineRadius` | 2 | Outline thickness in pixels |
 | `prism:selectionUseHostSettings` | false | Use the host's Hdx outline parameters instead of PrismRT's overrides |
+| `prism:colorManagement:ocioConfig` | empty | OpenColorIO config; empty uses `$OCIO`, else `ocio://studio-config-latest`. See [colour management](color_management.md) |
+| `prism:colorManagement:workingSpace` | empty | Working space; empty is ACEScg. `lin_rec709` renders as before colour management. Changing it (or the config) rebuilds the scene |
+| `prism:colorManagement:display`, `prism:colorManagement:view` | empty | Recorded only: the colour AOV stays linear in the working space and usdview applies its own colour correction (`OCIO=ocio://studio-config-latest` for its OCIO mode) |
 
 PrismRT follows usdview's dome-visibility and background controls. With dome
 camera visibility enabled, the environment remains visible to primary rays.
@@ -91,7 +94,7 @@ after a topology notice until the replacement picking table publishes.
 
 The launcher also loads PrismRT's Python usdview extension from `tools/usdview_plugins`. Stock usdview drops the selected instance index when forwarding selection to its scene index (`UsdImagingGLEngine::AddSelected` ignores it on the scene-index path in 26.05 and still in 26.08). Our extension forwards the selection model's original indices through the internal `prism:usdviewSelection` renderer setting, preserving individual-instance outlines without patching USD. It uses usdview's plugin registration and `StageView` renderer-setting methods; it does not replace usdview functions. Other hosts can supply complete Hydra selection data directly. Without the extension, stock usdview still renders and picks correctly, but individual-instance highlighting follows its upstream whole-prim selection limitation.
 
-The render buffers expose linear floating-point `color`, projected `depth` in `[0,1]`, `cameraDepth`, world `normal`, eye-space `Neye` and `Peye`, `primvars:st`, and integer `primId`, `instanceId`, and `elementId`. IDs and geometric AOVs use a deterministic center ray independent of antialiasing and depth-of-field samples. `Peye` is the hit position transformed into eye space; `primvars:st` is the interpolated first UV set, with hit UVs used when that primvar is absent. `Pworld` is not currently exposed. `elementId` refers to the coarse polygon face. Prim, instance, and face picking use visible primary intersections; edge, vertex, and deep picking are deferred. Signed and unsigned 16-bit integer AOV buffers and signed 32-bit integer buffers are supported; Int32 IDs retain their exact values. Packed float32/uint8 buffers are rejected with a Hydra warning. Extra Hydra camera clip planes are not applied to ray intersections.
+The render buffers expose linear floating-point `color` (in the working space, ACEScg by default), projected `depth` in `[0,1]`, `cameraDepth`, world `normal`, eye-space `Neye` and `Peye`, `primvars:st`, and integer `primId`, `instanceId`, and `elementId`. IDs and geometric AOVs use a deterministic center ray independent of antialiasing and depth-of-field samples. `Peye` is the hit position transformed into eye space; `primvars:st` is the interpolated first UV set, with hit UVs used when that primvar is absent. `Pworld` is not currently exposed. `elementId` refers to the coarse polygon face. Prim, instance, and face picking use visible primary intersections; edge, vertex, and deep picking are deferred. Signed and unsigned 16-bit integer AOV buffers and signed 32-bit integer buffers are supported; Int32 IDs retain their exact values. Packed float32/uint8 buffers are rejected with a Hydra warning. Extra Hydra camera clip planes are not applied to ray intersections.
 
 Color alpha accumulates primary coverage, including stochastic cutouts and silhouette samples. With no dome, or `domeLightCameraVisibility=false`, primary rays that escape the scene produce transparent black; unresolved early terminations retain coverage. A visible dome keeps opaque alpha. Changing dome camera visibility restarts preview and full accumulation.
 
@@ -112,7 +115,7 @@ The no-argument executable displays help. Rendering uses scene files and require
   --output build/standalone.exr
 ```
 
-EXR output preserves linear HDR values after the configured sample clamp. Other output formats use the existing display clamp and gamma 2.2 conversion. The standalone environment retains its original factor of two; an otherwise identical Hydra dome therefore needs intensity `2` for comparison with `--env-exposure 0`.
+EXR output preserves linear HDR values in the working space after the configured sample clamp. Other output formats go through the display and view ([colour management](color_management.md)); compare Hydra's linear AOV with the CLI's EXR. The standalone environment retains its original factor of two; an otherwise identical Hydra dome therefore needs intensity `2` for comparison with `--env-exposure 0`.
 
 `tests/hydra/validate.py` independently ingests the same fixture through standalone USD ingestion and the real Hydra plugin, renders twice, checks exact deterministic reruns, and compares linear EXRs. Its acceptance thresholds are normalized RGB RMSE and relative mean luminance error both at most 1%. It also compares an equivalent PreviewSurface fixture. Logs, EXRs, and timings are written to `build/hydra-validation`.
 

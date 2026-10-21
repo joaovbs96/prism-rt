@@ -8,11 +8,12 @@ Scenes: **Eggs** (MaterialEggs), **OpenPBR** (OpenPBRShaderPlayground),
 
 ## Color management
 
-- **ACEScg rendering space.** The Eggs references are rendered in ACEScg and
-  several scenes author ACEScg textures and documents (Eggs, Stirling RenderMan
-  stage, ALab). Prism renders in linear Rec.709: MaterialX converts texture
-  color spaces into it, but the light and dome colors, the comparison with the
-  references and the output need a selectable working space.
+- **ACEScg rendering space (done).** Prism renders in an OpenColorIO working
+  space, ACEScg by default, with ACES 2.0 SDR views for 8-bit outputs
+  ([color_management.md](color_management.md)). Remaining: light textures'
+  `colorSpace` metadata (the Hydra scene index does not carry it), sRGB
+  decoding of 8-bit dome textures, UsdUVTexture `sourceColorSpace`, and an
+  OpenUSD stack built with OpenColorIO so usdview can apply the same views.
 
 ## Materials
 
