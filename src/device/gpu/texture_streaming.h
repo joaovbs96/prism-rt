@@ -72,8 +72,11 @@ public:
     // asked for. True when some image's request became finer than before in
     // this accumulation.
     bool addFeedback(uint32_t const* histograms, size_t count);
-    // The finest level each image should keep resident.
-    std::vector<uint32_t> plan() const;
+    // The finest level each image should keep resident. `fromRequests`:
+    // from the requests alone (steps 2 only: no levels kept for being
+    // resident), so the plan does not depend on what earlier uploads made
+    // resident when; settling uses it for deterministic residency.
+    std::vector<uint32_t> plan(bool fromRequests = false) const;
     void setResident(size_t image, uint32_t finest);
 
     size_t size() const { return m_images.size(); }

@@ -1472,7 +1472,7 @@ void VulkanDevice::Impl::streamLoop()
             }
             if (!s.replan || s.frozen) continue;
             s.replan = false;
-            s.lastPlan = s.planner.plan();
+            s.lastPlan = s.planner.plan(s.fullFeedback); // settling: from the requests alone (deterministic)
             // Evictions first (they free memory), then promotions, smallest first.
             std::vector<std::pair<uint64_t, size_t>> promotions, demotions;
             uint32_t pending = 0;

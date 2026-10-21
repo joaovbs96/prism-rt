@@ -89,7 +89,7 @@ bool StreamingPlanner::addFeedback(uint32_t const* histograms, size_t count)
     return finer;
 }
 
-std::vector<uint32_t> StreamingPlanner::plan() const
+std::vector<uint32_t> StreamingPlanner::plan(bool fromRequests) const
 {
     const size_t n = m_images.size();
     std::vector<uint32_t> target(n);
@@ -98,7 +98,7 @@ std::vector<uint32_t> StreamingPlanner::plan() const
     for (size_t i = 0; i < n; ++i) {
         State const& s = m_images[i];
         uint32_t level = s.image.tailLevel;
-        if (s.request != kNoRequest) level = std::min(level, std::max(s.resident, s.request));
+        if (s.request != kNoRequest && !fromRequests) level = std::min(level, std::max(s.resident, s.request));
         target[i] = level;
         used += StreamedBytes(s.image, level);
     }
@@ -123,6 +123,7 @@ std::vector<uint32_t> StreamingPlanner::plan() const
         target[i] = level;
         push(i);
     }
+    if (fromRequests) return target;
     // 3. Other resident levels while they fit, most recently requested first.
     std::vector<size_t> keep;
     for (size_t i = 0; i < n; ++i)

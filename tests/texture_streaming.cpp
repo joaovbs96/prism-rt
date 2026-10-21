@@ -149,6 +149,13 @@ int main()
         check(plan[0] == 1, "a converging image keeps its levels: " + Levels(plan));
         check(plan[1] == 3, "the newer request waits for budget: " + Levels(plan));
         check(planner.stats(plan).belowRequested == 1, "newer request below requested");
+        // Planned from the requests alone, residency does not matter.
+        StreamingPlanner other;
+        other.reset({k1, k1}, budget);
+        Feed(other, {1, kNoRequest});
+        Feed(other, {kNoRequest, 0}, {0, 1000});
+        check(other.plan(true) == planner.plan(true), "request-only plans ignore residency: " +
+                                                          Levels(other.plan(true)) + "/ " + Levels(planner.plan(true)));
     }
 
     // A new accumulation: earlier levels stay while the budget allows, and
