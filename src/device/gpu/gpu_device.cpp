@@ -357,30 +357,44 @@ bool GpuRenderDevice::RenderPreview(SceneManager& scene, PreviewRequest const& r
 
 void GpuRenderDevice::SettleWithFrame(GpuFrame const& frame, uint32_t mode, uint32_t pixels)
 {
-    (void)mode; // image mode: needs no output buffer, and its sums are discarded
+    // The rounds trace the first samples of the accumulation that follows,
+    // in its mode (its seeds and random numbers), so the feedback covers the
+    // paths it will trace; their results are discarded.
     std::vector<uint32_t> list(pixels);
     for (uint32_t p = 0; p < pixels; ++p) list[p] = p;
     std::memcpy(RenderBuffer(kSlotPixels, size_t(pixels) * 4), list.data(), size_t(pixels) * 4);
     RenderBuffer(kSlotRng, size_t(pixels) * 4);
     RenderBuffer(kSlotAccumulation, size_t(pixels) * 32);
+    if (mode == kModePass) RenderBuffer(kSlotOutput, size_t(pixels) * 16);
     FullFeedback(true);
-    BeginWork(kModeImage, 0);
+    BeginWork(mode, 0);
     std::string error;
     const auto start = std::chrono::steady_clock::now();
     int rounds = 0;
     // Each round's levels can change what later lookups ask for (paths
     // through sharper textures); a few rounds settle it.
-    constexpr int maxRounds = 4;
+    // Rounds stop once one changes nothing: requests leave out levels only
+    // negligible paths ask for (PRISM_GPU_STREAMING_THRESHOLD), so they
+    // settle; the cap bounds the time.
+    static const int maxRounds = [] {
+        const char* value = std::getenv("PRISM_GPU_STREAMING_SETTLE_ROUNDS");
+        return value && *value ? std::max(1, std::atoi(value)) : 8;
+    }();
     for (; rounds < maxRounds; ++rounds) {
         GpuFrame f = frame;
-        f.work = {pixels, 0, kModeImage, 0};
+        f.work = {pixels, 0, mode, 0};
         f.counts.z = uint32_t(rounds);
         if (rounds == 0) f.settings.z |= kFrameSeedRng;
         if (!Dispatch(f, pixels, nullptr, &error)) {
             std::cerr << LogPrefix() << error << '\n';
             break;
         }
-        if (!SettleResidency()) break;
+        // PRISM_GPU_STREAMING_SETTLE_MIN_ROUNDS (diagnostics): rounds even without changes.
+        static const int minRounds = [] {
+            const char* value = std::getenv("PRISM_GPU_STREAMING_SETTLE_MIN_ROUNDS");
+            return value && *value ? std::atoi(value) : 0;
+        }();
+        if (!SettleResidency() && rounds + 1 >= minRounds) break;
     }
     FullFeedback(false);
     HoldResidency();
@@ -402,7 +416,7 @@ bool GpuRenderDevice::SettleTextures(SceneManager& scene, PassRequest const& req
     if (request.shading.nee.spatialLights) frame.settings.z |= kFrameSpatialLights;
     if (request.shading.transparentEscapes) frame.settings.z |= kFrameTransparentEscapes;
     frame.settings.w = request.seed;
-    SettleWithFrame(frame, kModeImage, request.width * request.height);
+    SettleWithFrame(frame, kModePass, request.width * request.height);
     return true;
 }
 

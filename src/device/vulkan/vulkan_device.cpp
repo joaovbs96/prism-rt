@@ -167,6 +167,20 @@ bool GpuCopiesEnabled()
     return !value || std::string_view(value) != "0";
 }
 
+// Whole images take their levels from the GPU copy's stored mip chain, the
+// single reference every GPU path (streamed or not) samples; mips generated
+// with blits depend on the level they start from.
+// PRISM_GPU_TEXTURE_BLIT_MIPS=1 generates them with blits as before
+// (diagnostics).
+bool UsesStoredMips(gpu_texture::Header const& h)
+{
+    static const bool blits = [] {
+        const char* value = std::getenv("PRISM_GPU_TEXTURE_BLIT_MIPS");
+        return value && *value == '1';
+    }();
+    return !blits && h.levelCount == gpu_texture::FullChainLevels(h.width, h.height);
+}
+
 // Texture streaming (texture_streaming.h): PRISM_GPU_TEXTURE_STREAMING=0 (or
 // the prism:textureStreaming setting) uploads whole textures, reduced to fit
 // the budget, as before.
@@ -185,13 +199,25 @@ uint32_t StreamingSetting(const char* name, uint32_t fallback, uint32_t minimum 
 
 // The always resident tail: levels at most this many texels on a side.
 uint32_t StreamingTailSize() { return StreamingSetting("PRISM_GPU_STREAMING_TAIL", 128, 1); }
-// Restarts of an accumulation streaming may ask for.
-uint32_t StreamingRestarts() { return StreamingSetting("PRISM_GPU_STREAMING_RESTARTS", 3); }
-// One pixel per block of this size counts its lookups (request priority);
-// every pixel records the levels it asks for, unless the recording stride
-// is raised.
-uint32_t StreamingCountStride() { return StreamingSetting("PRISM_GPU_STREAMING_COUNT_STRIDE", 4, 1); }
-uint32_t StreamingRecordStride() { return StreamingSetting("PRISM_GPU_STREAMING_RECORD_STRIDE", 1, 1); }
+// Progressive rendering restarts an accumulation at most once, and only
+// before this many samples; later residency changes sharpen it in place.
+uint32_t StreamingRestartSamples() { return StreamingSetting("PRISM_GPU_STREAMING_RESTART_SAMPLES", 16); }
+// One pixel of each block of this size records its lookups (1 while settling).
+uint32_t StreamingFeedbackStride() { return StreamingSetting("PRISM_GPU_STREAMING_FEEDBACK_STRIDE", 4, 1); }
+// Levels finer than the estimated level of detail a request adds, in 1/16
+// (implementations approximate the LOD; Vulkan allows sqrt(2) in scale).
+uint32_t StreamingLodMargin()
+{
+    const char* value = std::getenv("PRISM_GPU_STREAMING_LOD_MARGIN");
+    return uint32_t(std::lround(std::clamp(value && *value ? std::atof(value) : 0.5, 0.0, 15.0) * 16.0));
+}
+// The fraction of an image's throughput-weighted lookups its request may
+// leave out (texture_streaming.h); 0 serves every lookup.
+double StreamingThreshold()
+{
+    const char* value = std::getenv("PRISM_GPU_STREAMING_THRESHOLD");
+    return value && *value ? std::max(0.0, std::atof(value)) : 0.001;
+}
 // Staging per upload batch of the streaming thread.
 uint64_t StreamingBatchBytes() { return uint64_t(StreamingSetting("PRISM_GPU_STREAMING_BATCH_MIB", 256, 1)) << 20; }
 
@@ -623,6 +649,7 @@ struct VulkanDevice::Impl {
         bool hold = false, frozen = false, restartPending = false, upgraded = false, settleChanged = false;
         bool fullFeedback = false, afterPreview = false, resetFeedback = false;
         uint32_t restarts = 0;
+        int sample = 0; // of the current pass
         uint64_t roundsSinceFiner = 0;
         std::thread worker;
         VkCommandPool pool = VK_NULL_HANDLE;
@@ -1147,6 +1174,19 @@ bool VulkanDevice::Impl::earlyUpload(prism::TextureResource const& resource)
         if (earlyBytes + estimate > earlyBudget) return false;
         earlyBytes += estimate;
     }
+    if (UsesStoredMips(h)) {
+        // The copy's own mip chain, as every GPU path uses it.
+        std::vector<Image> images;
+        std::string reason;
+        const bool ok = createStreamedImages({{&copy, 0}}, earlyPool, earlyFence, &images, nullptr, &reason);
+        std::lock_guard lock(earlyMutex);
+        if (!ok) {
+            earlyBytes -= estimate;
+            return false;
+        }
+        earlyImages[copy.path.string()] = {images[0], copy.storage};
+        return true;
+    }
     PreparedImage prepared;
     uint64_t readTime = 0, convertTime = 0;
     Buffer staging;
@@ -1393,7 +1433,7 @@ bool VulkanDevice::Impl::createStreamedImages(std::vector<StreamJob> const& jobs
 void VulkanDevice::Impl::streamLoop()
 {
     Streaming& s = streaming;
-    std::vector<uint32_t> finest, counts;
+    std::vector<uint32_t> histograms;
     std::vector<uint8_t> failed;
     for (;;) {
         std::vector<StreamJob> jobs;
@@ -1414,13 +1454,12 @@ void VulkanDevice::Impl::streamLoop()
                 if (s.readbackState[k] != 2) continue;
                 if (s.readbackAccumulation[k] == s.accumulation && n) {
                     auto const* data = static_cast<uint32_t const*>(s.readback[k].mapped);
-                    finest.resize(n);
-                    counts.resize(n);
-                    for (size_t p = 0; p < n; ++p) {
-                        finest[p] = data[s.sources[p].image];
-                        counts[p] = data[s.feedbackImages + s.sources[p].image];
-                    }
-                    const bool finer = s.planner.addFeedback(finest.data(), counts.data(), n);
+                    histograms.resize(n * gpu::kFeedbackLevels);
+                    for (size_t p = 0; p < n; ++p)
+                        std::memcpy(histograms.data() + p * gpu::kFeedbackLevels,
+                                    data + size_t(s.sources[p].image) * gpu::kFeedbackLevels,
+                                    gpu::kFeedbackLevels * sizeof(uint32_t));
+                    const bool finer = s.planner.addFeedback(histograms.data(), n);
                     ++s.feedbackRounds;
                     if (finer) {
                         s.roundsSinceFiner = 0;
@@ -1431,7 +1470,7 @@ void VulkanDevice::Impl::streamLoop()
                 }
                 s.readbackState[k] = 0;
             }
-            if (!s.replan || s.frozen || s.restarts >= StreamingRestarts()) continue;
+            if (!s.replan || s.frozen) continue;
             s.replan = false;
             s.lastPlan = s.planner.plan();
             // Evictions first (they free memory), then promotions, smallest first.
@@ -1528,8 +1567,8 @@ void VulkanDevice::Impl::applyStreaming(bool newAccumulation)
     {
         std::lock_guard lock(s.mutex);
         if (s.ready.empty()) return;
-        // Within an accumulation that may not restart any more, residency stays.
-        if (!newAccumulation && (s.frozen || s.restarts >= StreamingRestarts())) return;
+        // A settled (offline) accumulation keeps its residency.
+        if (!newAccumulation && s.frozen) return;
         ready.swap(s.ready);
     }
     auto* records = static_cast<GpuImage*>(buffers[kSlotImages].mapped);
@@ -1585,8 +1624,8 @@ bool VulkanDevice::Impl::createFeedbackBuffers(uint32_t images, std::string* err
     Streaming& s = streaming;
     destroyBuffer(buffers[kSlotTextureFeedback]);
     for (auto& readback : s.readback) destroyBuffer(readback);
-    const VkDeviceSize half = VkDeviceSize(images) * 4;
-    if (!createBuffer(std::max<VkDeviceSize>(16, 2 * half),
+    const VkDeviceSize bytes = VkDeviceSize(images) * gpu::kFeedbackLevels * 4;
+    if (!createBuffer(std::max<VkDeviceSize>(16, bytes),
                       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
                           VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                       &buffers[kSlotTextureFeedback], false)) {
@@ -1596,13 +1635,12 @@ bool VulkanDevice::Impl::createFeedbackBuffers(uint32_t images, std::string* err
     s.feedbackImages = images;
     if (!images) return true;
     for (auto& readback : s.readback)
-        if (!createBuffer(2 * half, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &readback, true, true)) {
+        if (!createBuffer(bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &readback, true, true)) {
             if (error) *error = "cannot allocate texture feedback readbacks";
             return false;
         }
     VkCommandBuffer commands = beginCommands();
-    vkCmdFillBuffer(commands, buffers[kSlotTextureFeedback].buffer, 0, half, ~0u);
-    vkCmdFillBuffer(commands, buffers[kSlotTextureFeedback].buffer, half, half, 0u);
+    vkCmdFillBuffer(commands, buffers[kSlotTextureFeedback].buffer, 0, bytes, 0u);
     VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
@@ -1619,6 +1657,10 @@ void VulkanDevice::Impl::beginWork(uint32_t mode, int sample)
     if (!s.active) return;
     const bool preview = mode == kModePreview;
     const bool begins = preview || ((mode == kModePass || mode == kModeImage) && sample == 0);
+    if (mode == kModePass || mode == kModeImage) {
+        std::lock_guard lock(s.mutex);
+        s.sample = sample;
+    }
     if (begins) {
         std::lock_guard lock(s.mutex);
         if (s.restartPending) {
@@ -1656,9 +1698,10 @@ bool VulkanDevice::Impl::accumulationOutdated()
     if (!s.active) return false;
     applyStreaming(false);
     std::lock_guard lock(s.mutex);
-    if (s.frozen || !s.upgraded || s.restarts >= StreamingRestarts()) return false;
-    // Restart once the residency the feedback asks for is in place and the
-    // last rounds asked for nothing finer.
+    // One restart, early in the accumulation, once the residency the first
+    // feedback asked for is in place; later changes sharpen it in place (the
+    // samples before them washing out), never restart it.
+    if (s.frozen || !s.upgraded || s.restarts >= 1 || s.sample >= int(StreamingRestartSamples())) return false;
     if (s.busy || !s.ready.empty() || s.replan || s.lastPending != 0 || s.roundsSinceFiner < 2) return false;
     ++s.restarts;
     ++s.restartsTotal;
@@ -2412,7 +2455,16 @@ bool VulkanDevice::Impl::uploadImages(std::string* error)
         }
         missing.push_back(i);
     }
-    progress::SetTotal(Phase::Upload, missing.size());
+    // Whole images with a stored mip chain upload its levels from `shift`
+    // on (the reduced resolution is then a stored level too).
+    std::vector<size_t> storedMissing;
+    {
+        std::vector<size_t> rest;
+        for (size_t i : missing)
+            (copies[i].valid && UsesStoredMips(copies[i].header) ? storedMissing : rest).push_back(i);
+        missing.swap(rest);
+    }
+    progress::SetTotal(Phase::Upload, missing.size() + storedMissing.size());
     progress::Detail(Phase::Upload, missing.empty() ? "images (cached)" : "images");
 
     using Prepared = PreparedImage;
@@ -2553,6 +2605,32 @@ bool VulkanDevice::Impl::uploadImages(std::string* error)
         }
         first = last;
     }
+    for (size_t first = 0; first < storedMissing.size();) {
+        std::vector<StreamJob> jobs;
+        uint64_t bytes = 0;
+        size_t last = first;
+        while (last < storedMissing.size() && (last == first || bytes < StreamingBatchBytes())) {
+            const size_t i = storedMissing[last++];
+            jobs.push_back({&copies[i], uint32_t(shift[i])});
+            bytes += gpu_texture::LevelRangeBytes(copies[i].header, uint32_t(shift[i]),
+                                                  copies[i].header.levelCount - uint32_t(shift[i]));
+        }
+        std::vector<Image> images;
+        uint64_t staged = 0;
+        if (!createStreamedImages(jobs, commandPool, fence, &images, &staged, error)) return false;
+        stagedBytes += staged;
+        copiedImages += images.size();
+        for (size_t k = 0; k < images.size(); ++k) {
+            const size_t i = storedMissing[first + k];
+            CachedImage cached{d.images[i], images[k], bool(isEnvironment[i]), shift[i]};
+            cached.storage = copies[i].storage;
+            imageCache[d.images[i].get()] = cached;
+            imageViews[i] = images[k].view;
+            progress::Add(Phase::Upload);
+        }
+        first = last;
+    }
+    missing.insert(missing.end(), storedMissing.begin(), storedMissing.end()); // counted in the summary
     // Streamed images: their tails, in batches.
     const auto streamStart = Clock::now();
     uint64_t tailBytes = 0;
@@ -2582,7 +2660,7 @@ bool VulkanDevice::Impl::uploadImages(std::string* error)
     {
         std::lock_guard lock(s.mutex);
         const uint64_t streamBudget = textureBudget > pinnedBytes ? textureBudget - pinnedBytes : 0;
-        s.planner.reset(streamImages, streamBudget, streamResident);
+        s.planner.reset(streamImages, streamBudget, streamResident, StreamingThreshold());
         s.inFlight.assign(s.sources.size(), gpu::kNoRequest);
         s.lastPlan.clear();
         s.lastPending = 0;
@@ -3012,13 +3090,13 @@ bool VulkanDevice::Impl::dispatch(GpuFrame const& work, uint32_t threads, double
     if (s.active) {
         std::lock_guard lock(s.mutex);
         feedback = s.fullFeedback || feedbackMode == 1 ||
-            (feedbackMode != 0 && !s.frozen && s.restarts < StreamingRestarts());
+            (feedbackMode != 0 && !s.frozen);
     }
     if (feedback) {
         std::lock_guard lock(s.mutex);
         frame.settings.z |= kFrameTextureFeedback;
-        frame.streaming = {s.feedbackImages, s.fullFeedback ? 1u : StreamingRecordStride(), uint32_t(s.phase++),
-                           s.fullFeedback ? 2u : StreamingCountStride()};
+        frame.streaming = {s.feedbackImages, StreamingLodMargin(), uint32_t(s.phase++),
+                           s.fullFeedback ? 1u : StreamingFeedbackStride()};
         for (int k = 0; k < Streaming::kReadbacks && readback < 0; ++k)
             if (s.readbackState[k] == 0) {
                 readback = k;
@@ -3035,7 +3113,7 @@ bool VulkanDevice::Impl::dispatch(GpuFrame const& work, uint32_t threads, double
     }
     if (resetFeedback) {
         // A new view: what earlier dispatches recorded without a readback goes.
-        const VkDeviceSize half = VkDeviceSize(s.feedbackImages) * 4;
+        const VkDeviceSize bytes = VkDeviceSize(s.feedbackImages) * gpu::kFeedbackLevels * 4;
         const VkPipelineStageFlags shaderStages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
             (rayTracing.pipeline ? VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR : 0);
         VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
@@ -3043,8 +3121,7 @@ bool VulkanDevice::Impl::dispatch(GpuFrame const& work, uint32_t threads, double
         before.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         vkCmdPipelineBarrier(commands, shaderStages, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &before, 0, nullptr, 0,
                              nullptr);
-        vkCmdFillBuffer(commands, buffers[kSlotTextureFeedback].buffer, 0, half, ~0u);
-        vkCmdFillBuffer(commands, buffers[kSlotTextureFeedback].buffer, half, half, 0u);
+        vkCmdFillBuffer(commands, buffers[kSlotTextureFeedback].buffer, 0, bytes, 0u);
         VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
@@ -3068,21 +3145,20 @@ bool VulkanDevice::Impl::dispatch(GpuFrame const& work, uint32_t threads, double
         const VkPipelineStageFlags shaderStages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
             (rayTracing.pipeline ? VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR : 0);
         Buffer const& feedback = buffers[kSlotTextureFeedback];
-        const VkDeviceSize half = VkDeviceSize(s.feedbackImages) * 4;
+        const VkDeviceSize bytes = VkDeviceSize(s.feedbackImages) * gpu::kFeedbackLevels * 4;
         VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
         barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
         vkCmdPipelineBarrier(commands, shaderStages, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &barrier, 0, nullptr, 0,
                              nullptr);
-        VkBufferCopy region{0, 0, 2 * half};
+        VkBufferCopy region{0, 0, bytes};
         vkCmdCopyBuffer(commands, feedback.buffer, s.readback[readback].buffer, 1, &region);
         VkMemoryBarrier copied{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         copied.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
         copied.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &copied, 0,
                              nullptr, 0, nullptr);
-        vkCmdFillBuffer(commands, feedback.buffer, 0, half, ~0u);
-        vkCmdFillBuffer(commands, feedback.buffer, half, half, 0u);
+        vkCmdFillBuffer(commands, feedback.buffer, 0, bytes, 0u);
         VkMemoryBarrier reset{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         reset.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         reset.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
