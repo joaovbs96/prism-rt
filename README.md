@@ -84,6 +84,8 @@ For standalone rendering, initialize the same environment with `. ./prism_env.ps
 ```powershell
 ./build/RelWithDebInfo/PrismRT.exe --export-scene InOneWeekend --seed 0 --output scene.usda
 ./build/RelWithDebInfo/PrismRT.exe --scene scene.usda --camera /World/Camera --spp 256 --output render.exr
+# or every RenderProduct of the scene's RenderSettings, with its RenderVars as EXR layers:
+./build/RelWithDebInfo/PrismRT.exe --scene scene.usda --output-dir renders
 ```
 
 On macOS, use the `prism-hydra-mac` preset (`cmake --preset prism-hydra-mac`, `cmake --build --preset prism-hydra-mac`), `. ./prism_env.sh` for the environment, and `./run_usdview.sh scene.usda` for usdview. Pick a device for usdview with `PRISM_DEVICE`:

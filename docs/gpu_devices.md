@@ -409,6 +409,21 @@ called done there.
     ... --working-space acescg` on Metal and `prism_color_management_test
     --check-patches <exr> acescg`; an egg and OpenPBR on Metal vs CPU with
     `prism_compare_images`.
+- **Render settings and products** ([hydra.md](hydra.md#render-settings-and-products)):
+  - No shader or device change: `shaders/` and `src/device/` are untouched.
+  - Shared host code: `src/hydra/plugin.cpp` (the
+    `HdsiRenderSettingsFilteringSceneIndex` in the chain),
+    `src/hydra/task_delegate.cpp` (the active settings prim),
+    `src/hydra/scene_bridge.cpp` (material binding purposes, the AOV table of
+    `src/output/aov.h`), `src/output/` (resolver and image writer, also used
+    by the CLI) and `src/mesh/usd_mesh.h` (binding purposes).
+  - Runs: `ctest -R "prism_parity|prism_render_"` (CPU); then
+    `PRISM_DEVICE=metal prism_hydra_render tests/hydra/fixtures/render_products.usda
+    --render-settings default out-metal` against the same with
+    `PRISM_DEVICE=cpu`, comparing each product with `prism_compare_images`
+    (`--layer Normal --exact` for the geometric layer); and in usdview,
+    `render_settings_binding.usda` turns from green to red when the render
+    settings menu picks `/Render/AllPurpose`.
 
 ## Diagnostics
 

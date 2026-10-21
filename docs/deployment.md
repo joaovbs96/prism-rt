@@ -42,6 +42,10 @@ then runs the usdview lifecycle script against the installed plugin. Use `-SkipU
 when `testusdview` is unavailable. The Python CLI, export and instance-binding
 checks use the configured Python interpreter with `OpenImageIO` and `numpy`
 available, and require the Hydra render helper produced by the build.
+CTest also runs the CLI-vs-Hydra parity tests (`prism_parity_*`) and the
+`validate.py`/`validate_exports.py` comparisons on the CPU device; they are
+labelled `cpu`, so `ctest -LE gpu` includes them
+([hydra.md](hydra.md#cli-and-hydra-parity)).
 Pass `-BuildDirectory build-clean-validation` to select a new build directory
 without inheriting a previous CMake cache. The override must be inside the
 checkout; external SDK installations are reused. The directory can contain

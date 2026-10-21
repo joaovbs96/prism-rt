@@ -251,10 +251,14 @@ GPUs from every vendor. To close the gaps, in order:
    - Textured emissive meshes as NEE lights.
    - A light BVH for scenes with hundreds of lights.
 4. **Production output.**
-   - `RenderSettings`, `RenderProduct` and `RenderVar`, and batch rendering
-     through `usdrender` and Houdini's husk.
-   - Light path expressions and light groups, a `Pworld` AOV, and multilayer
-     EXR output.
+   - `RenderSettings`, `RenderProduct` and `RenderVar` (done in
+     `prism_hydra_render` and the CLI: resolution, camera, data window, pixel
+     aspect ratio, purposes, `prism:*` settings and products with named AOV
+     channels; see [hydra.md](hydra.md#render-settings-and-products)).
+     Remaining: batch rendering through `usdrender` and Houdini's husk, and
+     `disableDepthOfField`.
+   - Light path expressions and light groups, a `Pworld` AOV, more AOVs
+     (albedo, diffuse, specular) and multi-part EXR output.
    - A selectable working space such as ACEScg (see
      [Color management](#color-management)).
    - Adaptive subdivision by screen-space edge length, as Typhoon does it.
@@ -269,9 +273,14 @@ GPUs from every vendor. To close the gaps, in order:
 ## Standalone CLI
 
 The `PrismRT` CLI loads USD through its own path (`src/mesh/usd_mesh.h`): it
-reads analytic lights and combines domes, but it has no subdivision,
-displacement, named primvars, light linking or UsdPreviewSurface translation.
-Hydra (`prism_hydra_render`, usdview) is the reference path.
+reads analytic lights and combines domes, and follows the stage's render
+settings and products as `prism_hydra_render` does. It has no subdivision,
+displacement, named primvars, light linking, native instancing, mesh purpose
+or UsdPreviewSurface translation, and no Hydra id AOVs (`primId`,
+`instanceId`, `elementId`). Hydra (`prism_hydra_render`, usdview) is the
+reference path. The parity tests ([hydra.md](hydra.md#cli-and-hydra-parity))
+compare the two on every fixture both can load; the fixtures the CLI cannot
+load yet are listed there.
 
 ## Not worth porting from the OptiX path tracer
 

@@ -102,9 +102,86 @@ Picking traces deterministic full-resolution rays against the camera and immutab
 
 Hydra caches local-space environment importance distributions by prepared texture identity and exact RGB multiplier. Dome rotation and bank reuse share the distribution while each wrapper keeps its authored direction transform and PDF. Multiplier or texture-resource changes rebuild it. Statistics expose distribution builds, cache hits and uniquely shared importance-table bytes. The exact RGB multiplier is part of the cache key, so intensity/multiplier-only edits rebuild the table; reusing it across those edits remains deferred.
 
+## Render settings and products
+
+PrismRT reads UsdRender prims in both frontends. The **active** settings prim
+is the stage's `renderSettingsPrimPath`, or the prim the host picks: usdview's
+render settings menu, `prism_hydra_render --render-settings` and
+`PrismRT --render-settings`.
+
+| Attribute | usdview (host owns the view) | `prism_hydra_render` (batch) | `PrismRT` CLI |
+| --- | --- | --- | --- |
+| `prism:*` (the settings above) | yes | yes; its options override authored values | yes; its options take precedence |
+| `materialBindingPurposes` | yes | yes | yes |
+| `camera` | host | yes | yes, unless `--camera` or a camera position |
+| `resolution` | host | yes | yes, unless `--width`/`--height` |
+| `pixelAspectRatio`, `aspectRatioConformPolicy` | host | yes | yes |
+| `dataWindowNDC` | host | yes | yes |
+| `includedPurposes` | host | `render`, `proxy`, `guide` | spheres only skip `guide` and `proxy` (meshes: phase 7) |
+| `products` (`RenderProduct`, `RenderVar`) | no | yes | yes, without `--output` and camera options |
+| `disableMotionBlur` | no motion blur yet | no motion blur yet | no motion blur yet |
+| `disableDepthOfField` | no (warning) | no (warning) | no (warning) |
+| `instantaneousShutter`, `renderingColorSpace` | no | no | no |
+
+- **In the delegate.** `HdsiRenderSettingsFilteringSceneIndex`
+  (`src/hydra/plugin.cpp`) marks the active prim and keeps only `prism:`
+  namespaced settings. `PrismTaskDelegate::_SyncAuthoredSettings` reads the
+  prim named by `HdSceneGlobalsSchema`'s active render settings path: its
+  `prism:*` settings and its `materialBindingPurposes`. A prim's material is
+  its binding for the first of those purposes that it has; the empty token is
+  `allPurpose`, and the default is `full`, then `allPurpose`. Changing the
+  purposes rebuilds the scene. Like the colour management, the purposes are
+  process-wide. Render stats report the prim as `activeRenderSettings`.
+- **Batch.** `prism_hydra_render` and the CLI resolve the settings with
+  `UsdRenderComputeSpec` (`src/output/render_products.{h,cpp}`). A view is
+  framed with `CameraUtilFraming`: display window = resolution, data window =
+  the pixels whose centres lie inside `dataWindowNDC` (NDC y up, pixel rows
+  down), pixel aspect ratio, and the conform policy as CameraUtil's window
+  policy. A cropped image holds only its data window. The EXR keeps that
+  window inside the display window.
+- **Products.** Each `RenderProduct` of type `raster` is written to its
+  `productName`, relative to `--output-dir` (CLI) or the output directory
+  (`prism_hydra_render`). Its `orderedVars` become layers:
+
+  | RenderVar `sourceName` (`sourceType`) | AOV | Channels |
+  | --- | --- | --- |
+  | `color`, `Ci`, `C` (`raw`); `C.*`, `C.*[<L.>O]` (`lpe`) | colour | the first colour var: `R G B` (`A` for `color4f`), unprefixed; later ones `<var>.R` ... |
+  | `depth`, `cameraDepth` (`raw`) | NDC depth, camera distance | `<var>.Z` |
+  | `normal`, `Neye`, `Peye` (`raw`) | world/eye normal, eye position | `<var>.X/Y/Z` |
+  | `primvars:st` (`raw`), `st` (`primvar`) | hit texture coordinates | `<var>.U/V` |
+  | `primId`, `instanceId`, `elementId` (`raw`) | Hydra ids (not in the CLI) | `<var>.id` |
+
+  `<var>` is the RenderVar prim's name. Geometric AOVs come from the
+  pixel-centre hit in both frontends, so the two give the same values. The
+  CLI renders RGB only, so its alpha is 1, as the delegate's is with the dome
+  visible to the camera. A var with another source is skipped with a warning,
+  as is a product with no supported var. Products that differ only in their
+  vars share one render.
+- **Outputs** (`src/output/image_writer.{h,cpp}`, shared by both frontends).
+  An EXR holds every layer as float channels. It is linear in the working
+  space and tagged (`oiio:ColorSpace`, chromaticities). An 8-bit file (PNG,
+  JPEG, ...) holds the colour layer only, through the display and view once.
+  The layers it drops are reported.
+- **The AOV table** (`src/output/aov.h`) lists the AOVs, their channels and
+  how geometric ones resolve from a hit, for the delegate's render buffers and
+  both writers. Phase 6 adds AOVs there.
+
+```powershell
+# Every product of the stage's render settings, into build/products:
+./build/RelWithDebInfo/PrismRT.exe --scene tests/hydra/fixtures/render_products.usda --output-dir build/products
+./build/hydra/plugin/prism_hydra_render.exe tests/hydra/fixtures/render_products.usda `
+  --render-settings default build/products-hydra [--spp N] [options]
+```
+
+Without RenderSettings, both frontends behave as before. With a settings prim
+but `--output` or a camera option, the CLI writes one colour image as before,
+taking the prim's resolution, camera, data window, pixel aspect ratio and
+`prism:*` settings unless overridden. `prism_hydra_render scene /Camera out
+...` does the same with `--render-settings PATH`.
+
 ## Standalone comparisons
 
-The no-argument executable displays help. Rendering uses scene files and requires an explicit camera. USD camera paths and explicit camera position/target are supported; glTF/GLB and OBJ use an explicit camera position/target:
+The no-argument executable displays help. Rendering uses scene files and a camera: a USD camera path, an explicit camera position/target, or the USD stage's render settings ([Render settings and products](#render-settings-and-products)); glTF/GLB and OBJ use an explicit camera position/target:
 
 ```powershell
 ./build/RelWithDebInfo/PrismRT.exe `
@@ -117,11 +194,58 @@ The no-argument executable displays help. Rendering uses scene files and require
 
 EXR output preserves linear HDR values in the working space after the configured sample clamp. Other output formats go through the display and view ([colour management](color_management.md)); compare Hydra's linear AOV with the CLI's EXR. The standalone environment retains its original factor of two; an otherwise identical Hydra dome therefore needs intensity `2` for comparison with `--env-exposure 0`.
 
-`tests/hydra/validate.py` independently ingests the same fixture through standalone USD ingestion and the real Hydra plugin, renders twice, checks exact deterministic reruns, and compares linear EXRs. Its acceptance thresholds are normalized RGB RMSE and relative mean luminance error both at most 1%. It also compares an equivalent PreviewSurface fixture. Logs, EXRs, and timings are written to `build/hydra-validation`.
+`tests/hydra/validate.py` independently ingests the same fixture through standalone USD ingestion and the real Hydra plugin, renders twice, checks exact deterministic reruns, and compares linear EXRs. Its acceptance thresholds are normalized RGB RMSE and relative mean luminance error both at most 1%. It also compares an equivalent PreviewSurface fixture. Logs, EXRs, and timings are written to `build/hydra-validation-<filtering>`. `--device cpu` (as CTest runs it) renders both frontends on the CPU device. The [parity harness](#cli-and-hydra-parity) runs the same comparison for many fixtures.
 
 Multisampled Hydra-buffer tests validate allocation, rendering, `Resolve()` and mapped pixels, but do not validate presentation through usdview or another host GL compositor.
 
 The usdview interaction script is `tests/hydra/usdview_smoke.py`, for the rebuilt USD's `testusdview --testScript` runner. It exercises picking, selection outlines and thickness, filled highlighting, visibility edits, AOV switching, resizing, and renderer teardown/recreation, saving screenshots for inspection. Scripts being present does not itself establish acceptance: consult the generated logs and images from an actual run.
+
+## CLI and Hydra parity
+
+PrismRT has two USD loaders: the CLI's (`src/mesh/usd_mesh.h`,
+`src/standalone_cli.cpp`) and the delegate's scene index bridge. CTest keeps
+them in agreement. `prism_add_parity_fixture` (`cmake/PrismParity.cmake`)
+renders a fixture with both on the CPU device, then compares the results
+with `prism_compare_images`: normalized RMSE and relative mean luminance,
+each within the fixture's tolerance.
+
+To add a fixture, add one call to the list in `CMakeLists.txt` (after the
+colour management tests):
+
+```cmake
+prism_add_parity_fixture(NAME my_feature SCENE tests/hydra/fixtures/my_feature.usda
+    [CAMERA /World/Camera] [WIDTH 64] [HEIGHT 64] [SPP 16]
+    [TOLERANCE 0.01] [MEAN_TOLERANCE 0.01]
+    [ARGS <options of both>] [CLI_ARGS ...] [HYDRA_ARGS ...]
+    [PRODUCTS <product files>...] [EXACT_LAYERS <file>:<layer>...])
+```
+
+This creates `prism_parity_my_feature_{cli,hydra}` and the comparison
+`prism_parity_my_feature_match`. With `PRODUCTS`, both write the stage's
+RenderProducts and each file gets a `..._<file>_<ext>_match`;
+`EXACT_LAYERS` also compares geometric layers exactly. Outputs go to
+`build/parity/<name>/{cli,hydra}`. Both frontends seed pixels the same way,
+so most fixtures agree to about 1e-8. A tolerance above 1% needs a reason
+next to the call: `lights` samples its lights in another order, which adds
+noise but no bias.
+
+| Fixture | NRMSE | Tolerance |
+| --- | --- | --- |
+| parity, cutout_clear, cutout_medium, sss_furnace, preview_mtlx, quad_test, color (both spaces), binding (both), render_products, render_crop | below 1e-7 | 1% |
+| cornell_box | 1.4e-3 | 1% |
+| in_one_weekend | 6.2e-5 | 1% |
+| lights | 0.068 (mean 0.2%) | 10% (mean 1%) |
+
+The CLI does not load these fixtures like Hydra yet (phase 7):
+
+- `emissive.usda`: a MaterialX graph the CLI cannot generate;
+- `instances.usda`: native instancing;
+- `linking.usda`: light linking;
+- `native_instance_bindings.usda`.
+
+`tests/hydra/validate.py` and `validate_exports.py` also run under CTest, on
+the CPU device (`--device cpu`), as `prism_hydra_validate_script` and
+`prism_hydra_validate_exports_script`. They need no display or GPU.
 
 ## Scope and costs
 
