@@ -46,6 +46,9 @@ if(NOT MSVC)
     endforeach()
 endif()
 
+# Versions come from tools/deps.json; checked below once the packages are found.
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/PrismDeps.cmake")
+
 # Optional per-machine hints live in the ignored cmake/PrismLocalDependencies.cmake.
 # Normal package discovery through CMAKE_PREFIX_PATH remains the portable default.
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/cmake/PrismLocalDependencies.cmake")
@@ -78,6 +81,7 @@ else()
 endif()
 find_package(MaterialX REQUIRED)
 find_package(Python3 COMPONENTS Development Interpreter REQUIRED)
+prism_check_dependency_versions()
 
 # OpenUSD built against a Python whose interpreter statically links libpython
 # (PXR_PY_UNDEFINED_DYNAMIC_LOOKUP) leaves Python symbols unresolved in its
@@ -295,6 +299,10 @@ if(PRISM_BUILD_HYDRA)
     enable_testing()
     # Keep the original MaterialX compatibility regressions in clean builds.
     add_subdirectory(tests "${CMAKE_BINARY_DIR}/materialx-tests")
+
+    # vcpkg manifests and the docs agree with tools/deps.json.
+    add_test(NAME prism_deps_consistency_test
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/check_deps.py")
 
     # Tests that compare renders exactly must not depend on whether the CPU
     # preview covered a slow GPU preparation.
@@ -707,6 +715,25 @@ if(TARGET prism_hydra_render AND TARGET prism_compare_images)
     set_tests_properties(prism_hydra_streaming_cold_matches_whole prism_hydra_streaming_warm_matches_whole
         prism_hydra_streaming_cold_matches_warm PROPERTIES FIXTURES_REQUIRED prism_streaming_renders)
 endif()
+
+# Every test is labelled cpu or gpu. GPU tests are those that may open a render
+# device (the Hydra delegate's default "auto" picks Vulkan or Metal when one
+# is available), plus the comparisons whose fixtures are GPU renders, since
+# CTest runs a required fixture's setup tests even when their label is
+# excluded. GPU tests share RESOURCE_LOCK gpu, so `ctest -LE gpu -j N` can run
+# beside GPU work and a parallel run never puts two GPU tests on the device.
+set(_prism_gpu_test_regex
+    "^prism_hydra_(render_exercise|transparent_background_export|depth1_render|depth_change_render|setting_change_test|cutout_(medium|clear)_render|cutout_medium_test|animation_exercise|pass_camera_test|scene_bridge_test|streaming_(cold|warm|whole)|streaming_.*_matches_.*)$"
+    "|^prism_(gpu_shader_compile_test|device_selection_test|cli_clean_exit_vulkan)$")
+string(JOIN "" _prism_gpu_test_regex ${_prism_gpu_test_regex})
+get_property(_prism_tests DIRECTORY PROPERTY TESTS)
+foreach(_test IN LISTS _prism_tests)
+    if(_test MATCHES "${_prism_gpu_test_regex}")
+        set_tests_properties(${_test} PROPERTIES LABELS gpu RESOURCE_LOCK gpu)
+    else()
+        set_tests_properties(${_test} PROPERTIES LABELS cpu)
+    endif()
+endforeach()
 
 include(GNUInstallDirs)
 install(TARGETS PrismRT RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")

@@ -22,3 +22,7 @@ add_executable(materialx_loader_transmission materialx_loader_transmission.cpp .
 target_compile_features(materialx_loader_transmission PRIVATE cxx_std_20)
 target_link_libraries(materialx_loader_transmission PRIVATE MaterialXCore MaterialXFormat)
 add_test(NAME materialx_loader_transmission COMMAND materialx_loader_transmission)
+
+# CPU-only; see the labels in the top-level CMakeLists.txt.
+get_property(_prism_materialx_tests DIRECTORY PROPERTY TESTS)
+set_tests_properties(${_prism_materialx_tests} PROPERTIES LABELS cpu)
