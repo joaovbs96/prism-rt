@@ -25,7 +25,7 @@
 param(
     # oneTBB binary release root (with lib\cmake\tbb). See -DownloadTbb.
     [string] $TbbRoot = "",
-    # Clones and build trees; can be deleted afterwards (~40 GB).
+    # Clones and build trees; can be deleted afterwards (~20 GB).
     [Parameter(Mandatory)] [string] $WorkDir,
     # Where the versioned prefixes go.
     [string] $Root = "",

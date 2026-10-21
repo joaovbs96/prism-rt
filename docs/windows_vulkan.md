@@ -48,8 +48,8 @@ table.
 
 builds the three with `tools/ci/build_usd_stack.ps1`, exactly as CI does, into
 `D:\prism-deps\opensubdiv-3.6.1`, `materialx-1.39.5` and `openusd-26.08`
-(about 50 minutes with `-Jobs 6`; the work directory can be deleted
-afterwards). Then point `cmake\PrismLocalDependencies.cmake` and
+(about 100 minutes with `-Jobs 6`, almost all of it OpenUSD; the work
+directory, about 20 GB, can be deleted afterwards). Then point `cmake\PrismLocalDependencies.cmake` and
 `prism_local_env.ps1` at those prefixes (see their `.example` files). See
 [deployment.md](deployment.md#local-dependency-stack) for the options.
 

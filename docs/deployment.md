@@ -158,7 +158,7 @@ imaging, usdview and MaterialX support, `RelWithDebInfo`) into
 `-DownloadTbb` fetches the oneTBB release instead of `-TbbRoot`. The developer's
 Python is used as is (`-InstallPip` installs the pinned modules into it), the
 `.pdb` files are kept (`-StripPdb`), and `-Jobs` (default 6) bounds the
-compilers. The work directory takes about 40 GB and can be deleted afterwards.
+compilers. The work directory takes about 20 GB and can be deleted afterwards.
 OpenUSD 26.08 installs its Python modules into `Lib\site-packages` by default;
 the script keeps the `lib\python` layout that `prism_env.ps1` and the package
 expect.
