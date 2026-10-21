@@ -62,11 +62,29 @@ jobs:
       - name: Fetch oneTBB
         if: steps.cache.outputs.cache-hit != 'true'
         run: ./tools/ci/fetch_prebuilt.ps1 -Prefix $env:DEPS -Components tbb
+      # OpenUSD's OpenColorIO support links vcpkg's OpenColorIO at the same
+      # baseline as vcpkg.json, so PrismRT and usdview share one DLL (the build
+      # job's). The build job's vcpkg binary cache is only read here: saving it
+      # under the same key would hide the OpenImageIO binaries from that job.
+      - name: Restore vcpkg binary cache
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.VCPKG_BINARY_CACHE }}
+          key: vcpkg-binaries-${{ hashFiles('vcpkg.json') }}-win2022
+          restore-keys: vcpkg-binaries-
+      - name: Install OpenColorIO with vcpkg
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          New-Item -ItemType Directory -Force $env:VCPKG_BINARY_CACHE | Out-Null
+          $env:VCPKG_BINARY_SOURCES = "clear;files,$env:VCPKG_BINARY_CACHE,readwrite"
+          ./tools/ci/install_ocio.ps1 -VcpkgRoot D:\vcpkg -Clone -InstallRoot D:\ocio-vcpkg
       - name: Build OpenSubdiv, MaterialX and OpenUSD
         if: steps.cache.outputs.cache-hit != 'true'
         run: |
           ./tools/ci/build_usd_stack.ps1 -Prefix $env:DEPS `
-            -TbbRoot "$env:DEPS\tbb\oneapi-tbb-$env:PRISM_DEP_ONETBB" -SourceDir D:\src
+            -TbbRoot "$env:DEPS\tbb\oneapi-tbb-$env:PRISM_DEP_ONETBB" `
+            -OcioRoot D:\ocio-vcpkg\x64-windows -SourceDir D:\src
       - name: Save cache
         if: steps.cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4

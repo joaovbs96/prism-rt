@@ -7,20 +7,32 @@
   Versions come from tools/deps.json. Each component goes to its own versioned
   prefix, so an upgrade never overwrites the stack in use:
 
-    <Root>\opensubdiv-<version>   <Root>\materialx-<version>   <Root>\openusd-<version>
+    <Root>\opensubdiv-<version>   <Root>\materialx-<version>
+    <Root>\openusd-<version>-ocio<OpenColorIO version>
 
   Like CI: oneTBB (PXR_FIND_TBB_IN_CONFIG=ON, no legacy TBB headers), Python
-  from deps.json, imaging, usdview and MaterialX support on, RelWithDebInfo.
-  Unlike CI, the .pdb files are kept (pass -StripPdb to drop them) and the
-  developer's Python is used as is (pass -InstallPip to install the pinned
-  PySide6/PyOpenGL/numpy into it).
+  from deps.json, imaging, usdview, MaterialX and OpenColorIO support on,
+  RelWithDebInfo. Unlike CI, the .pdb files are kept (pass -StripPdb to drop
+  them) and the developer's Python is used as is (pass -InstallPip to install
+  the pinned PySide6/PyOpenGL/numpy into it).
+
+  OpenColorIO is vcpkg's, the version PrismRT's vcpkg.json uses: the script
+  installs the opencolorio port with tools/ci/install_ocio.ps1 from the vcpkg
+  clone -VcpkgRoot (checked out at deps.json's vcpkg baseline) into
+  <Root>\opencolorio-<version>-vcpkg, or takes an existing x64-windows prefix
+  from -OcioRoot. OpenUSD only links its import library; at run time PrismRT's
+  own vcpkg OpenColorIO DLL is the one loaded.
+
+  -UsdOnly rebuilds OpenUSD alone against the existing OpenSubdiv and
+  MaterialX prefixes (for an OpenUSD-only change such as adding OpenColorIO).
 
   Afterwards point cmake/PrismLocalDependencies.cmake and prism_local_env.ps1
   at the printed prefixes (see the .example files).
 
 .EXAMPLE
-  ./tools/build_deps_local.ps1 -TbbRoot C:\deps\oneapi-tbb-2022.2.0 -WorkDir D:\prism-deps\src
+  ./tools/build_deps_local.ps1 -TbbRoot C:\deps\oneapi-tbb-2022.2.0 -WorkDir D:\prism-deps\src -VcpkgRoot D:\prism-deps\vcpkg
   ./tools/build_deps_local.ps1 -DownloadTbb -WorkDir D:\prism-deps\src
+  ./tools/build_deps_local.ps1 -UsdOnly -TbbRoot C:\deps\oneapi-tbb-2022.2.0 -WorkDir D:\prism-deps\src-usd
 #>
 param(
     # oneTBB binary release root (with lib\cmake\tbb). See -DownloadTbb.
@@ -34,7 +46,14 @@ param(
     # Fetch the oneTBB release named in deps.json into <Root>\onetbb-<version>.
     [switch] $DownloadTbb,
     [switch] $InstallPip,
-    [switch] $StripPdb
+    [switch] $StripPdb,
+    # vcpkg clone at deps.json's vcpkg baseline (default <Root>\vcpkg); unused
+    # with -OcioRoot.
+    [string] $VcpkgRoot = "",
+    # An existing vcpkg x64-windows prefix with OpenColorIO from that baseline.
+    [string] $OcioRoot = "",
+    # Rebuild OpenUSD only; OpenSubdiv and MaterialX prefixes must exist.
+    [switch] $UsdOnly
 )
 $ErrorActionPreference = "Stop"
 Import-Module (Join-Path $PSScriptRoot "deps.psm1") -Force
@@ -66,19 +85,29 @@ $env:PATH = "$PythonRoot;$(Join-Path $PythonRoot 'Scripts');$env:PATH"
 # MSBuild's /m alone does not bound the load: _CL_ is appended last and wins.
 if ($Jobs -gt 0) { $env:_CL_ = "/MP1" }
 
+$ocioVersion = $deps.vcpkg.opencolorio
+if (-not $OcioRoot) {
+    if (-not $VcpkgRoot) { $VcpkgRoot = Join-Path $Root "vcpkg" }
+    $ocioInstall = Join-Path $Root "opencolorio-$ocioVersion-vcpkg"
+    & (Join-Path $PSScriptRoot "ci\install_ocio.ps1") -VcpkgRoot $VcpkgRoot -InstallRoot $ocioInstall
+    $OcioRoot = Join-Path $ocioInstall "x64-windows"
+}
+
+# The OpenUSD prefix names the OpenColorIO it was built against: hdx links it.
 $prefixes = @{
     Osd  = Join-Path $Root "opensubdiv-$($deps.opensubdiv.version)"
     Mtlx = Join-Path $Root "materialx-$($deps.materialx.version)"
-    Usd  = Join-Path $Root "openusd-$($deps.openusd.version)"
+    Usd  = Join-Path $Root "openusd-$($deps.openusd.version)-ocio$ocioVersion"
 }
 $sw = [Diagnostics.Stopwatch]::StartNew()
 $arguments = @{
-    TbbRoot = $TbbRoot; SourceDir = $WorkDir; Jobs = $Jobs
+    TbbRoot = $TbbRoot; OcioRoot = $OcioRoot; SourceDir = $WorkDir; Jobs = $Jobs
     OsdPrefix = $prefixes.Osd; MaterialXPrefix = $prefixes.Mtlx; UsdPrefix = $prefixes.Usd
-    SkipPipInstall = (-not $InstallPip); KeepPdb = (-not $StripPdb)
+    SkipPipInstall = (-not $InstallPip); KeepPdb = (-not $StripPdb); UsdOnly = $UsdOnly
 }
 & (Join-Path $PSScriptRoot "ci\build_usd_stack.ps1") @arguments
 Write-Host ("Stack built in {0:N1} min:" -f $sw.Elapsed.TotalMinutes)
 $prefixes.GetEnumerator() | Sort-Object Name | ForEach-Object { Write-Host "  $($_.Value)" }
 Write-Host "  oneTBB: $TbbRoot"
+Write-Host "  OpenColorIO (build only): $OcioRoot"
 Write-Host "  Python: $PythonRoot"

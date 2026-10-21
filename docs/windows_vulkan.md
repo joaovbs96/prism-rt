@@ -32,25 +32,29 @@ table.
 
 | Dependency | Version | Notes |
 | --- | --- | --- |
-| OpenUSD | 26.08 | `tools/build_deps_local.ps1` (the CI script) with Python, imaging, usdview and MaterialX. Uses oneTBB (`-DPXR_FIND_TBB_IN_CONFIG=ON`); the install must not contain legacy `include\tbb` headers. |
+| OpenUSD | 26.08 | `tools/build_deps_local.ps1` (the CI script) with Python, imaging, usdview, MaterialX and OpenColorIO (`-DPXR_BUILD_OPENCOLORIO_PLUGIN=ON`, linked to vcpkg's OpenColorIO below). Uses oneTBB (`-DPXR_FIND_TBB_IN_CONFIG=ON`); the install must not contain legacy `include\tbb` headers. |
 | OpenSubdiv | 3.6.1 | Built by the same script. On Windows it builds static libraries (`osdCPU`); static-only packages exporting `osdCPU_static` also work. |
 | MaterialX | 1.39.5 | Built by the same script (the version OpenUSD 26.08 builds against); PrismRT needs `libraries\` and `libraries\mdl\`. |
 | oneTBB | 2022.2.0 | Binary release, shared by USD and PrismRT (`tbb12.dll`). |
 | Embree | 4.4.0 | Intel binary release. |
 | NVIDIA MDL SDK | 2026.0.2 | Built from source without CUDA, see below. Do not use the binary release zip. |
 | OpenImageIO | 3.1.14 | vcpkg, installed into `build\vcpkg_installed\x64-windows`. |
-| OpenColorIO | 2.6.0 | vcpkg (also an OpenImageIO dependency). Colour management ([color_management.md](color_management.md)); its built-in configs ship inside `OpenColorIO_2_6.dll`. |
+| OpenColorIO | 2.6.0 | vcpkg (also an OpenImageIO dependency). Colour management ([color_management.md](color_management.md)); its built-in configs ship inside `OpenColorIO_2_6.dll`. OpenUSD's Hdx (usdview's OpenColorIO colour correction) links the same version, so one `OpenColorIO_2_6.dll`, vcpkg's, serves both. |
 
 ### OpenUSD, MaterialX and OpenSubdiv
 
 ```powershell
-.\tools\build_deps_local.ps1 -TbbRoot C:\deps\oneapi-tbb-2022.2.0 -WorkDir D:\prism-deps\src
+.\tools\build_deps_local.ps1 -TbbRoot C:\deps\oneapi-tbb-2022.2.0 -WorkDir D:\prism-deps\src -VcpkgRoot D:\prism-deps\vcpkg
 ```
 
 builds the three with `tools/ci/build_usd_stack.ps1`, exactly as CI does, into
-`D:\prism-deps\opensubdiv-3.6.1`, `materialx-1.39.5` and `openusd-26.08`
-(about 100 minutes with `-Jobs 6`, almost all of it OpenUSD; the work
-directory, about 20 GB, can be deleted afterwards). Then point `cmake\PrismLocalDependencies.cmake` and
+`D:\prism-deps\opensubdiv-3.6.1`, `materialx-1.39.5` and
+`openusd-26.08-ocio2.6.0` (about 100 minutes with `-Jobs 6`, almost all of it
+OpenUSD; the work directory, about 20 GB, can be deleted afterwards). First it
+installs vcpkg's OpenColorIO (`tools/ci/install_ocio.ps1`, from the vcpkg clone
+at `deps.json`'s baseline) into `D:\prism-deps\opencolorio-2.6.0-vcpkg` for
+OpenUSD to link. `-UsdOnly` rebuilds only OpenUSD against the existing
+OpenSubdiv and MaterialX prefixes. Then point `cmake\PrismLocalDependencies.cmake` and
 `prism_local_env.ps1` at those prefixes (see their `.example` files). See
 [deployment.md](deployment.md#local-dependency-stack) for the options.
 

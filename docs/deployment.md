@@ -86,7 +86,10 @@ to themselves. They first clear inherited `PRISM_*`, `PXR_*`, `PYTHON*`, `QT_*`
 and `MDL_SDK_ROOT`, replace `PATH` with the package directories plus
 `System32`, and then set what usdview needs. Shader and material caches live in
 `%LOCALAPPDATA%\PrismRT\cache` (set `PRISMRT_CACHE_DIR` to move them). The device
-is automatic; `PRISMRT_DEVICE=cpu` forces the CPU. `usdview.bat` without a scene
+is automatic; `PRISMRT_DEVICE=cpu` forces the CPU. `OCIO` is kept, and set to
+`ocio://studio-config-latest` when unset, so usdview shows PrismRT's ACEScg
+colour AOV through OpenColorIO's ACES 2.0 SDR view, like the CLI's 8-bit
+images ([color_management.md](color_management.md#usdview)). `usdview.bat` without a scene
 opens the Cornell box through its camera; with only options it adds the same
 scene; otherwise it passes its arguments to usdview. `README.txt` in the package
 lists requirements and third-party notices.
@@ -136,7 +139,9 @@ counter that forces CI to rebuild its cached stacks. Its consumers:
 3. Rebuild the local stack: `tools/build_deps_local.ps1` (OpenUSD, MaterialX,
    OpenSubdiv) builds into new versioned prefixes next to the old ones; point
    `cmake/PrismLocalDependencies.cmake` and `prism_local_env.ps1` at them.
-   For OpenImageIO, rerun vcpkg against the manifest (below).
+   For OpenImageIO, rerun vcpkg against the manifest (below). A new vcpkg
+   baseline or OpenColorIO version also needs OpenUSD rebuilt against it
+   (`-UsdOnly`); CI's OpenUSD cache key changes with both.
 4. Reconfigure (the version check confirms the new stack is the one found),
    build, and run `ctest -j 1`.
 5. Commit and push. The cache keys change with the versions, so CI rebuilds
@@ -148,12 +153,35 @@ counter that forces CI to rebuild its cached stacks. Its consumers:
 `tools/build_deps_local.ps1` builds OpenSubdiv, MaterialX and OpenUSD with the
 same `tools/ci/build_usd_stack.ps1` as CI (oneTBB through
 `PXR_FIND_TBB_IN_CONFIG=ON`, no legacy TBB headers, Python from `deps.json`,
-imaging, usdview and MaterialX support, `RelWithDebInfo`) into
+imaging, usdview, MaterialX and OpenColorIO support, `RelWithDebInfo`) into
 `<Root>\opensubdiv-<version>`, `<Root>\materialx-<version>` and
-`<Root>\openusd-<version>`:
+`<Root>\openusd-<version>-ocio<OpenColorIO version>`:
 
 ```powershell
-.\tools\build_deps_local.ps1 -TbbRoot C:\deps\oneapi-tbb-2022.2.0 -WorkDir D:\prism-deps\src
+.\tools\build_deps_local.ps1 -TbbRoot C:\deps\oneapi-tbb-2022.2.0 -WorkDir D:\prism-deps\src -VcpkgRoot D:\prism-deps\vcpkg
+```
+
+OpenUSD's OpenColorIO support (`PXR_BUILD_OPENCOLORIO_PLUGIN`, used by Hdx's
+colour correction in usdview and usdrecord) links the OpenColorIO of
+PrismRT's `vcpkg.json`. `tools/ci/install_ocio.ps1` installs the `opencolorio`
+port, in classic mode, from a vcpkg clone at `deps.json`'s baseline
+(`-VcpkgRoot`, default `<Root>\vcpkg`) into `<Root>\opencolorio-<version>-vcpkg`;
+`-OcioRoot` takes an existing `x64-windows` prefix from that baseline instead.
+The port, triplet and compiler are those of the manifest install, so the
+package ABI is the same and a vcpkg binary cache serves both. OpenUSD only
+links the import library: at run time the `OpenColorIO_2_6.dll` of PrismRT's
+vcpkg install is the one loaded, and the OpenUSD install has none. After the
+install, `build_usd_stack.ps1` replaces the import library's absolute path in
+`pxrTargets*.cmake` with `OpenColorIO::OpenColorIO` and adds
+`find_dependency(OpenColorIO ...)` to `pxrConfig.cmake`, so PrismRT links the
+OpenColorIO it found itself, and checks that `usd_hdx.dll` imports
+`OpenColorIO_2_6.dll`.
+
+`-UsdOnly` rebuilds OpenUSD alone against the existing OpenSubdiv and
+MaterialX prefixes, for example after an OpenColorIO change:
+
+```powershell
+.\tools\build_deps_local.ps1 -UsdOnly -TbbRoot C:\deps\oneapi-tbb-2022.2.0 -WorkDir D:\prism-deps\src-usd
 ```
 
 `-DownloadTbb` fetches the oneTBB release instead of `-TbbRoot`. The developer's
@@ -179,9 +207,13 @@ vcpkg install --triplet x64-windows --x-manifest-root=. --x-install-root=build\v
 
 - `usd` job: builds OpenSubdiv, MaterialX and OpenUSD with
   `tools/ci/build_usd_stack.ps1`, like the development machine. The install,
-  minus `.pdb` files, is cached under `Get-PrismCacheKey -Stack usd`. On a hit
-  the job only does the cache lookup. It does not use `build_usd.py`, which
-  would fetch its own TBB.
+  minus `.pdb` files, is cached under `Get-PrismCacheKey -Stack usd`, which
+  includes the OpenColorIO version and PrismRT's vcpkg baseline. On a hit
+  the job only does the cache lookup. Otherwise it restores the `build` job's
+  vcpkg binary cache (read-only) and installs vcpkg's OpenColorIO with
+  `tools/ci/install_ocio.ps1` for OpenUSD to link. It does not use
+  `build_usd.py`, which would fetch its own TBB (and build its own
+  OpenColorIO).
 - `mdl` job (parallel to `usd`): builds the NVIDIA MDL SDK from source without
   CUDA with `tools/ci/build_mdl_sdk.ps1` (the binary release imports
   `nvcuda.dll` and cannot load on a runner without an NVIDIA driver; see

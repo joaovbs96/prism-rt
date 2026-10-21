@@ -5,7 +5,7 @@
 .EXAMPLE
   Import-Module ./tools/deps.psm1
   (Get-PrismDeps).openusd.tag          # v26.08
-  Get-PrismCacheKey -Stack usd         # usd-26.08-osd-3.6.1-...-<script hash>
+  Get-PrismCacheKey -Stack usd         # usd-26.08-osd-3.6.1-...-ocio-2.6.0-vcpkg-...-<script hash>
 #>
 $script:DepsJson = Join-Path $PSScriptRoot "deps.json"
 $script:RepoRoot = Split-Path -Parent $PSScriptRoot
@@ -51,9 +51,12 @@ function Get-PrismCacheKey {
     $d = Get-PrismDeps
     switch ($Stack) {
         "usd" {
-            $files = @("tools/ci/build_usd_stack.ps1", "tools/ci/fetch_prebuilt.ps1")
+            # OpenUSD links vcpkg's OpenColorIO (tools/ci/install_ocio.ps1).
+            $files = @("tools/ci/build_usd_stack.ps1", "tools/ci/fetch_prebuilt.ps1",
+                "tools/ci/install_ocio.ps1")
             $parts = @("usd-$($d.openusd.version)", "osd-$($d.opensubdiv.version)",
                 "mtlx-$($d.materialx.version)", "tbb-$($d.onetbb.version)",
+                "ocio-$($d.vcpkg.opencolorio)", "vcpkg-$($d.vcpkg.baseline.Substring(0, 10))",
                 "py$($d.python.version)", ("pip-" + ((Get-PrismPipRequirements) -join "_").Replace("==", "")))
         }
         "mdl" {
