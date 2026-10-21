@@ -9,16 +9,14 @@ class HdPrismRendererPlugin final : public HdRendererPlugin
 public:
     HdRenderDelegate *CreateRenderDelegate() override;
     void DeleteRenderDelegate(HdRenderDelegate *delegate) override;
-    bool IsSupported(HdContainerDataSourceHandle const &,
+    bool IsSupported(HdRendererCreateArgsSchema const &,
                      std::string *reasonWhyNot = nullptr) const override;
-    bool IsSupported(HdRendererCreateArgs const &,
-                     std::string *reasonWhyNot = nullptr) const override;
-    HdContainerDataSourceHandle GetSceneIndexInputArgs() const override;
+    HdContainerDataSourceHandle GetSceneIndexCreateArgs() const override;
 
 protected:
     std::unique_ptr<HdRenderer> _CreateRenderer(
         HdSceneIndexBaseRefPtr const &sceneIndex,
-        HdContainerDataSourceHandle const &createArgs) override;
+        HdRendererCreateArgsSchema const &createArgs) override;
 };
 
 PXR_NAMESPACE_CLOSE_SCOPE

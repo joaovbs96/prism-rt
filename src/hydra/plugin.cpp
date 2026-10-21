@@ -6,10 +6,10 @@
 
 #include "pxr/imaging/hd/renderDelegateInfo.h"
 #include "pxr/imaging/hd/renderer.h"
-#include "pxr/imaging/hd/rendererCreateArgs.h"
+#include "pxr/imaging/hd/rendererCreateArgsSchema.h"
 #include "pxr/imaging/hd/rendererPluginRegistry.h"
 #include "pxr/imaging/hd/retainedDataSource.h"
-#include "pxr/imaging/hd/sceneIndexInputArgsSchema.h"
+#include "pxr/imaging/hd/sceneIndexCreateArgsSchema.h"
 #include "pxr/imaging/hd/tokens.h"
 #include "pxr/imaging/hdsi/implicitSurfaceSceneIndex.h"
 #include "pxr/imaging/hdsi/lightLinkingSceneIndex.h"
@@ -26,15 +26,11 @@ HdRenderDelegate *HdPrismRendererPlugin::CreateRenderDelegate()
 { return new PrismTaskDelegate(); }
 void HdPrismRendererPlugin::DeleteRenderDelegate(HdRenderDelegate *d) { delete d; }
 
-bool HdPrismRendererPlugin::IsSupported(HdContainerDataSourceHandle const &,
+bool HdPrismRendererPlugin::IsSupported(HdRendererCreateArgsSchema const &,
                                         std::string *) const
 { return true; }
 
-bool HdPrismRendererPlugin::IsSupported(HdRendererCreateArgs const &,
-                                        std::string *) const
-{ return true; }
-
-HdContainerDataSourceHandle HdPrismRendererPlugin::GetSceneIndexInputArgs() const
+HdContainerDataSourceHandle HdPrismRendererPlugin::GetSceneIndexCreateArgs() const
 {
     HdRenderDelegateInfo info;
     info.materialBindingPurpose = HdTokens->full;
@@ -42,7 +38,7 @@ HdContainerDataSourceHandle HdPrismRendererPlugin::GetSceneIndexInputArgs() cons
     info.renderSettingsNamespaces = {TfToken("prism")};
     info.isPrimvarFilteringNeeded = false;
     info.isCoordSysSupported = false;
-    return HdSceneIndexInputArgsSchema::Builder()
+    return HdSceneIndexCreateArgsSchema::Builder()
         .SetMotionBlurSupport(HdRetainedTypedSampledDataSource<bool>::New(false))
         .SetCameraMotionBlurSupport(HdRetainedTypedSampledDataSource<bool>::New(false))
         .SetLegacyRenderDelegateInfo(
@@ -52,7 +48,7 @@ HdContainerDataSourceHandle HdPrismRendererPlugin::GetSceneIndexInputArgs() cons
 
 std::unique_ptr<HdRenderer> HdPrismRendererPlugin::_CreateRenderer(
     HdSceneIndexBaseRefPtr const &sceneIndex,
-    HdContainerDataSourceHandle const &createArgs)
+    HdRendererCreateArgsSchema const &createArgs)
 {
     const auto toMesh = HdRetainedTypedSampledDataSource<TfToken>::New(
         HdsiImplicitSurfaceSceneIndexTokens->toMesh);
