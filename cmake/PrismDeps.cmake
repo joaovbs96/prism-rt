@@ -15,8 +15,16 @@ foreach(_component openusd materialx opensubdiv onetbb embree mdl_sdk python vul
 endforeach()
 string(JSON PRISM_DEP_OPENIMAGEIO_VERSION GET "${_prism_deps_json}" vcpkg openimageio)
 
+# Strict on Windows, whose CI and local stacks are built from deps.json. Other
+# platforms (the macOS/Metal build) may use system packages, so they only warn.
+if(WIN32)
+    set(_prism_strict_default ON)
+else()
+    set(_prism_strict_default OFF)
+endif()
 option(PRISM_STRICT_DEPENDENCY_VERSIONS
-    "Fail the configure when a dependency's version differs from tools/deps.json (OFF: warn)" ON)
+    "Fail the configure when a dependency's version differs from tools/deps.json (OFF: warn)"
+    ${_prism_strict_default})
 
 # <out> = the lib/cmake/embree-<version> directory under <root>: the one
 # deps.json names when present, else the newest.

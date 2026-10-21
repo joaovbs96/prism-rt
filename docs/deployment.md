@@ -115,8 +115,9 @@ counter that forces CI to rebuild its cached stacks. Its consumers:
   `tools/build_deps_local.ps1` and `tools/package_windows.ps1`.
 - `cmake/PrismDeps.cmake`: the configure reports the OpenUSD, MaterialX,
   OpenSubdiv, oneTBB, Embree, OpenImageIO, Python and MDL SDK versions it found
-  and fails when one differs from `deps.json`
-  (`-DPRISM_STRICT_DEPENDENCY_VERSIONS=OFF` turns that into a warning). It also
+  and, on Windows, fails when one differs from `deps.json`
+  (`-DPRISM_STRICT_DEPENDENCY_VERSIONS=OFF` turns that into a warning, the
+  default on other platforms, whose stacks may come from system packages). It also
   finds `lib/cmake/embree-<version>` for the `.example` file.
 - `tools/check_deps.py` (CTest `prism_deps_consistency_test`, and a CI step):
   `vcpkg.json` and `tools/ci/mdl_vcpkg/vcpkg.json` repeat their baselines,
