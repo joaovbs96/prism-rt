@@ -1,0 +1,16 @@
+# Copy to prism_local_env.ps1 (ignored by git) and edit the roots for your
+# machine; prism_env.ps1, run_usdview.ps1 and tools/package_windows.ps1 load it.
+# The layout below is what tools/build_deps_local.ps1 produces: one versioned
+# prefix per component, named after tools/deps.json.
+$env:PRISM_USD_ROOT = "D:\prism-deps\openusd-26.08"
+$env:PRISM_OPENSUBDIV_ROOT = "D:\prism-deps\opensubdiv-3.6.1"
+$env:PRISM_MATERIALX_ROOT = "D:\prism-deps\materialx-1.39.5"
+$env:PRISM_MATERIALX_LIBRARY_PATH = Join-Path $env:PRISM_MATERIALX_ROOT "libraries"
+$env:PRISM_MATERIALX_MDL = Join-Path $env:PRISM_MATERIALX_LIBRARY_PATH "mdl"
+$env:PRISM_MDL_SDK_ROOT = "C:\deps\mdl-sdk-2026.0.2-nocuda"
+$env:PRISM_EMBREE_RUNTIME_DIR = "C:\deps\embree-4.4.0\bin"
+$env:PRISM_TBB_REDIST = "C:\deps\oneapi-tbb-2022.2.0\redist\intel64\vc14"
+$env:PRISM_VCPKG_BIN = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) "build\vcpkg_installed\x64-windows\bin"
+$env:PRISM_PYTHON_ROOT = Join-Path $env:LOCALAPPDATA "Programs\Python\Python311"
+# build_usd_stack.ps1 copies usdview's entry point into the install.
+$env:PRISM_USDVIEW = Join-Path $env:PRISM_USD_ROOT "lib\python\usdview.py"
