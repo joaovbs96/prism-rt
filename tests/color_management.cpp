@@ -10,6 +10,11 @@
 //
 // --check-view IMAGE.exr IMAGE.png WORKING_SPACE DISPLAY VIEW: the 8-bit
 // output is the linear output through the view, applied once.
+//
+// Diagnostics for comparing renders made in different working spaces:
+// --encode IN.exr OUT.png WORKING_SPACE DISPLAY VIEW (the CLI's 8-bit output)
+// --to-rec709 IN.exr OUT.exr WORKING_SPACE (linear Rec.709 primaries)
+// --side-by-side OUT.png IN.png... (one row)
 
 #include "../src/color/color_management.h"
 #include "../src/lights.h"
@@ -18,6 +23,7 @@
 
 #include <MaterialXFormat/XmlIo.h>
 #include <OpenImageIO/imagebuf.h>
+#include <OpenImageIO/imagebufalgo.h>
 
 #include <cmath>
 #include <cstdio>
@@ -311,6 +317,67 @@ int CheckView(std::string const& linear, std::string const& encoded, prism::colo
     return failures ? 1 : 0;
 }
 
+bool ReadRgb(std::string const& path, std::vector<float>& pixels, int& width, int& height)
+{
+    OIIO::ImageBuf image(path);
+    if (!image.read(0, 0, true, OIIO::TypeDesc::FLOAT)) return false;
+    width = image.spec().width;
+    height = image.spec().height;
+    pixels.assign(size_t(width) * height * 3, 0.0f);
+    const int channels = std::min(3, image.spec().nchannels);
+    return image.get_pixels(OIIO::ROI(0, width, 0, height, 0, 1, 0, channels), OIIO::TypeDesc::FLOAT,
+                            pixels.data(), 3 * sizeof(float));
+}
+
+bool WriteRgb(std::string const& path, std::vector<float> const& pixels, int width, int height)
+{
+    OIIO::ImageBuf image(OIIO::ImageSpec(width, height, 3, OIIO::TypeDesc::FLOAT));
+    image.set_pixels(OIIO::ROI(0, width, 0, height, 0, 1, 0, 3), OIIO::TypeDesc::FLOAT, pixels.data());
+    return image.write(path);
+}
+
+int Encode(std::string const& in, std::string const& out, prism::color::Options const& options)
+{
+    std::vector<float> pixels;
+    int width = 0, height = 0;
+    if (!ReadRgb(in, pixels, width, height)) return 1;
+    prism::color::ColorManagement::Create(options)->ApplyView(pixels.data(), size_t(width) * height, 3);
+    return WriteRgb(out, pixels, width, height) ? 0 : 1;
+}
+
+int ToRec709(std::string const& in, std::string const& out, std::string const& workingSpace)
+{
+    std::vector<float> pixels;
+    int width = 0, height = 0;
+    if (!ReadRgb(in, pixels, width, height)) return 1;
+    auto color = prism::color::ColorManagement::Create({"", workingSpace, "", ""});
+    for (size_t p = 0; p < size_t(width) * height; ++p) {
+        const Float3 c = prism::color::Apply(color->toRec709(), Float3(pixels[3 * p], pixels[3 * p + 1], pixels[3 * p + 2]));
+        for (int i = 0; i < 3; ++i) pixels[3 * p + i] = c[i];
+    }
+    return WriteRgb(out, pixels, width, height) ? 0 : 1;
+}
+
+int SideBySide(std::string const& out, std::vector<std::string> const& inputs)
+{
+    std::vector<OIIO::ImageBuf> images;
+    int width = 0, height = 0;
+    for (auto const& input : inputs) {
+        images.emplace_back(input);
+        if (!images.back().read(0, 0, true, OIIO::TypeDesc::FLOAT)) return 1;
+        width += images.back().spec().width + (images.size() > 1 ? 8 : 0);
+        height = std::max(height, images.back().spec().height);
+    }
+    OIIO::ImageBuf row(OIIO::ImageSpec(width, height, 3, OIIO::TypeDesc::FLOAT));
+    OIIO::ImageBufAlgo::fill(row, {0.5f, 0.5f, 0.5f});
+    int x = 0;
+    for (auto const& image : images) {
+        OIIO::ImageBufAlgo::paste(row, x, 0, 0, 0, image, OIIO::ROI(), 3);
+        x += image.spec().width + 8;
+    }
+    return row.write(out) ? 0 : 1;
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -319,6 +386,11 @@ int main(int argc, char** argv)
         if (argc == 4 && std::string(argv[1]) == "--check-patches") return CheckPatches(argv[2], argv[3]);
         if (argc == 7 && std::string(argv[1]) == "--check-view")
             return CheckView(argv[2], argv[3], {"", argv[4], argv[5], argv[6]});
+        if (argc == 7 && std::string(argv[1]) == "--encode")
+            return Encode(argv[2], argv[3], {"", argv[4], argv[5], argv[6]});
+        if (argc == 5 && std::string(argv[1]) == "--to-rec709") return ToRec709(argv[2], argv[3], argv[4]);
+        if (argc >= 4 && std::string(argv[1]) == "--side-by-side")
+            return SideBySide(argv[2], std::vector<std::string>(argv + 3, argv + argc));
         TestMatrices();
         TestViews();
         TestConversions();
