@@ -275,7 +275,8 @@ int main()
             file.seekp(sizeof(prism::gpu_texture::Header) + read.levels[2].offset);
             file.put(char(payload[read.levels[2].offset] ^ 0x5a));
         }
-        check(prism::gpu_texture::ReadLevels(path, read, 0, 1, tail.data(), &error),
+        std::vector<uint8_t> level0(size_t(read.levels[0].bytes));
+        check(prism::gpu_texture::ReadLevels(path, read, 0, 1, level0.data(), &error),
               "an intact level of a damaged copy was rejected: " + error);
         check(!prism::gpu_texture::ReadLevels(path, read, 1, 2, tail.data(), &error),
               "a damaged level was accepted");
