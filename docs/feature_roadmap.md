@@ -139,6 +139,76 @@ Scenes: **Eggs** (MaterialEggs), **OpenPBR** (OpenPBRShaderPlayground),
     tiles later. They may also need acceleration-structure compaction.
 - **Denoising** (e.g. Intel Open Image Denoise).
 
+## Closing the gap to other Hydra renderers
+
+Compared on 2026-10-21 from each project's README. Gatling, Aurora and
+hdOSPRay document little, so a gap may be missing from their columns rather
+than from the renderer.
+
+| | Prism | Gatling | Typhoon | Aurora | hdOSPRay | hdMoonRay |
+| --- | --- | --- | --- | --- | --- | --- |
+| Device | CPU, Vulkan, Metal | Vulkan, Metal (M3+) | CPU | DXR, Hgi RT | CPU, GPU | CPU, XPU |
+| Materials | MaterialX via MDL | MaterialX via MDL | MaterialX (own compiler) | Standard Surface | Principled | MoonRay shaders |
+| Light linking | yes | ? | ? | no | ? | yes |
+| SSS | yes | ? | yes | ? | ? | yes |
+| Volumes | material media | no | material media | ? | ? | yes |
+| Curves | no | no | yes | ? | yes | yes |
+| Subdivision | uniform | no | adaptive | ? | yes | yes |
+| Displacement | yes | no | yes | ? | ? | yes |
+| Motion blur | no | ? | no | ? | ? | yes |
+| IES / shaping | no | no | yes | ? | ? | yes |
+| Adaptive sampling | no | ? | yes | ? | ? | yes |
+| Denoiser | no | ? | ? | planned | OIDN | yes |
+| LPEs / light groups | no | ? | no | ? | ? | yes |
+| Status | active | active | branch on hold (refactor) | in progress | archived 2025-08 | production |
+
+Cycles' delegate is the other complete one. Typhoon (NVIDIA's proposed OpenUSD
+reference renderer, an hdEmbree extension) is the nearest CPU peer, and Gatling
+the nearest GPU peer. No other delegate here runs one integrator on CPU and
+GPUs from every vendor. To close the gaps, in order:
+
+1. **Common features.** These are the items the table marks "no" for Prism
+   and "yes" for most of the others.
+   - **Denoising** with Open Image Denoise, fed by albedo and normal AOVs. It
+     runs on the CPU and on NVIDIA, AMD and Intel GPUs.
+   - **Adaptive sampling** from per-pixel variance, the way Typhoon does it,
+     paired with the denoiser.
+   - **Motion blur** (see [Geometry](#geometry)). Do it on the CPU first,
+     because Embree has time-sampled geometry. Vulkan's motion-blur extension
+     is NVIDIA-only, so the other GPUs need several time steps or the CPU.
+   - **Curves** (see [Geometry](#geometry)). Typhoon's coverage is the target:
+     linear, Bézier, B-spline and Catmull-Rom curves, drawn as tubes or as
+     ribbons when normals are authored.
+   - **Volumes** as staged in [volumes.md](volumes.md). UsdVol and OpenVDB
+     would put Prism ahead of Typhoon and Gatling, which read neither.
+2. **Large scenes on every GPU.**
+   - Port the callable-shader split to Metal with visible function tables.
+   - Stream textures at tile granularity, and lift ALab's limits on the
+     descriptor array and allocation count (see
+     [Scale and performance](#scale-and-performance)).
+3. **Lights** (see [Lights](#lights)).
+   - IES profiles and `ShapingAPI`.
+   - Light filters and portals.
+   - Path guiding (crust-render has an SD-tree), for interiors lit through
+     openings or by bounced light, where light sampling cannot aim.
+   - Textured emissive meshes as NEE lights.
+   - A light BVH for scenes with hundreds of lights.
+4. **Production output.**
+   - `RenderSettings`, `RenderProduct` and `RenderVar`, and batch rendering
+     through `usdrender` and Houdini's husk.
+   - Light path expressions and light groups, a `Pworld` AOV, and multilayer
+     EXR output.
+   - A selectable working space such as ACEScg (see
+     [Color management](#color-management)).
+   - Adaptive subdivision by screen-space edge length, as Typhoon does it.
+5. **Showing that it works.**
+   - Run Typhoon's `typhoon-test-suite` and the MaterialX and OpenPBR
+     reference scenes, and publish comparisons against Typhoon and Karma.
+   - CI on Linux and macOS, so Vulkan on Linux and Metal get run as well as
+     built.
+   - Prebuilt binaries for current USD and Houdini versions, and an updated
+     README with build steps.
+
 ## Standalone CLI
 
 The `PrismRT` CLI loads USD through its own path (`src/mesh/usd_mesh.h`): it
