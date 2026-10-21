@@ -49,6 +49,62 @@ Scenes: **Eggs** (MaterialEggs), **OpenPBR** (OpenPBRShaderPlayground),
 - **Solid-angle sampling of emissive triangles and disk lights** (spherical
   triangles, Arvo 1995); both are area-sampled. On CornellBox direct light is
   under 1% of the noise, so it was not pursued.
+- **Shadows through glass and caustics.** In the OpenPBR scene the shadow
+  under the green bottle is green in the reference and neutral in Prism.
+  Shadow rays pass only cutouts (`visible()` in
+  `shaders/integrator/path_tracer.h`); any transmissive surface blocks them,
+  so NEE leaves the floor under the bottle in full shadow. Light reaches it
+  only by a BSDF path (floor, through the glass, onto the light by chance):
+  slow, speckled noise for area lights, and never for distant lights or
+  zero-radius sphere lights, which a sampled ray cannot hit. Options, in
+  order:
+  1. **Transmissive shadows** (biased; Typhoon's mode when caustics are off,
+     and likely what the reference used). Shadow rays continue straight
+     through transmissive surfaces, multiplied by the transmission tint (the
+     MDL BSDF's weight for a straight-through transmission sample) and by
+     `exp(-sigma_a * d)` over each segment inside a medium. No refraction or
+     focusing. Behind a setting such as `prism:transmissiveShadows`. Costs
+     material code in the shadow loop, which the Vulkan callable path makes
+     practical.
+  2. **Manifold NEE** (Hanika et al. 2015; Cycles' shadow caustics).
+     Unbiased caustics: from the receiver, pick a light point, seed a path
+     through the glass (the straight line) and move it with Newton steps
+     until it obeys refraction at each interface. Best for smooth geometry
+     with one or two refractive interfaces. Each path must belong to one
+     estimator: Cycles marks caster and receiver objects and drops BSDF paths
+     that reach the light through a caster.
+  3. **Path guiding** (see below) converges area-lit caustics faster over
+     long renders, but does not fix them at our sample counts.
+
+  Before building either, render the scene at a high sample count. Green
+  speckles forming under the bottle mean light already gets through and
+  show what option 1 should converge to.
+- **Path guiding.** Learn, per region of space, the directions light arrives
+  from, and sample a mix of the BSDF and that learned distribution under MIS:
+  Müller et al. 2017 (SD-tree, crust-render) or Intel Open PGL (fitted
+  mixtures, used by Cycles; CPU only). Renders in passes: paths that deliver
+  light train the structure, later passes sample from it. It targets bright
+  directions NEE cannot aim at (light through openings, sunlit walls, bounced
+  light), so it suits interiors such as ALab and Stirling. Limits:
+  - It learns only from paths that already found the light, so rare paths
+    (caustics) need long training, often minutes. At tens to hundreds of
+    samples per pixel the distribution is still nearly empty.
+  - It chooses directions at diffuse and glossy vertices only. Inside smooth
+    glass, refraction fixes the direction, so a caustic needs a floor
+    direction inside a tiny cone. Coarse bins smear that cone, and it never
+    finds distant or zero-radius lights.
+  - Camera moves and edits restart accumulation. Interactive use needs the
+    learned structure kept across restarts.
+
+  Combined with manifold NEE: guiding cannot help MNEE's own connection,
+  which samples no direction at the receiver. If guiding trains on MNEE's
+  contributions, it learns that caustic-lit regions are bright and steers
+  later bounces toward them, so indirect caustics converge. This is required
+  anyway, since MNEE drops the BSDF paths through casters and guiding would
+  otherwise learn nothing near them. Learned seed distributions for MNEE
+  ("Manifold Path Guiding", Fan et al. 2023) help only if straight-line seeds
+  often fail to converge (bumpy or layered glass). Order: transmissive
+  shadows or MNEE first, then guiding trained on all estimators.
 
 ## Geometry
 
@@ -189,8 +245,10 @@ GPUs from every vendor. To close the gaps, in order:
 3. **Lights** (see [Lights](#lights)).
    - IES profiles and `ShapingAPI`.
    - Light filters and portals.
-   - Path guiding (crust-render has an SD-tree), for interiors lit through
-     openings or by bounced light, where light sampling cannot aim.
+   - Transmissive shadows, then manifold NEE, for colored shadows and
+     caustics through glass (see [Lights](#lights)).
+   - Path guiding, for interiors lit through openings or by bounced light,
+     where light sampling cannot aim (see [Lights](#lights)).
    - Textured emissive meshes as NEE lights.
    - A light BVH for scenes with hundreds of lights.
 4. **Production output.**
