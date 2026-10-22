@@ -52,6 +52,7 @@ python tests/hydra/validate.py
 | `prism:textureFiltering` | `filtered` | Footprint-based anisotropic mip filtering, or highest-resolution `bilinear` reference mode |
 | `prism:textureStreaming` | true | GPU devices that stream textures (Vulkan) keep only the mip levels shading asks for, within the texture budget; false uploads whole textures reduced to the budget (env `PRISM_GPU_TEXTURE_STREAMING=0`); see [texture streaming](texture_service.md#gpu-texture-streaming) |
 | `prism:textureStreamingPrepass` | false | Settle streamed textures with feedback-only passes before an accumulation and hold them for all of its samples (deterministic final images; `prism_hydra_render` sets it). Otherwise an accumulation restarts at most once, early, and later loads sharpen it in place |
+| `prism:honorDoubleSided` | false | Honour USD `doubleSided`: back faces of single-sided meshes (`doubleSided` false, USD's default) are not hit, unless their material transmits. Off, every mesh is two-sided as before (most path tracers ignore `doubleSided`). Changing it rebuilds the scene. CLI: `--honor-double-sided true\|false`. See [Scene features](#scene-features) |
 | `prism:sphereBatching` | false | Experimental batches of at most 1,024 eligible analytic spheres; ordinary instancing remains the default |
 | `prism:hiddenGeometryBudgetMiB` | 0 | Soft budget for retained hidden converted geometry; zero keeps unlimited retention |
 | `prism:resourceRevision` | 0 | Increment to invalidate cached material and external texture fingerprints and reload dome resources without rebuilding geometry |
@@ -241,11 +242,71 @@ The CLI does not load these fixtures like Hydra yet (phase 7):
 - `emissive.usda`: a MaterialX graph the CLI cannot generate;
 - `instances.usda`: native instancing;
 - `linking.usda`: light linking;
-- `native_instance_bindings.usda`.
+- `native_instance_bindings.usda`;
+- `instance_primvars.usda`: per-instance primvars and MDL `geompropvalue`.
 
 `tests/hydra/validate.py` and `validate_exports.py` also run under CTest, on
 the CPU device (`--device cpu`), as `prism_hydra_validate_script` and
 `prism_hydra_validate_exports_script`. They need no display or GPU.
+
+## Scene features
+
+UsdLux and geometry details both loaders read (the CLI as noted), with a
+parity fixture each and a check in `prism_scene_features_test`:
+
+- **Light camera visibility.** A light is seen by camera rays when it has
+  Hydra's `light:cameraVisibility`, which UsdImaging reads from a bool
+  `cameraVisibility` attribute on the light prim (not `inputs:`; the CLI reads
+  the same attribute). Default false, as before; a visible light covers its
+  pixels (alpha 1). Domes follow `domeLightCameraVisibility`. Fixture
+  `light_camera_visibility.usda`.
+- **Dome colour temperature.** `inputs:enableColorTemperature` and
+  `inputs:colorTemperature` tint domes like the other lights (blackbody in linear
+  Rec.709, converted to the working space). Fixture `dome_color_temperature.usda`.
+- **PointInstancer `invisibleIds`** (and `inactiveIds`): hidden. The delegate takes
+  the instancer topology mask through `HdInstancerTopologySchema::ComputeInstanceIndicesForProto`,
+  which compacts the instance ordinals; `instanceId` and picking keep Hydra's
+  compacted numbering, which `HdxPickTask` and the selection observer resolve
+  against (numbering by authored slot would select the wrong instances). The
+  CLI applies `ComputeMaskAtTime`. Fixture `pointinstancer_invisible_ids.usda`.
+- **`displayColor` / `displayOpacity`** of every interpolation (constant, uniform,
+  vertex, varying, faceVarying, and indexed) drive the fallback material:
+  constant values are material constants, the others mesh primvars read at
+  the hit (CPU `FallbackMaterial`; GPU `gpu_fallback_*` through the primvar
+  directory's `kPrimvarDisplay*` roles). A primvar whose size does not fit its
+  interpolation uses its first value. The CLI expands meshes with per-face
+  values and now also honours `displayOpacity`. Fixture `display_color_interpolation.usda`.
+- **Light `inputs:diffuse` / `inputs:specular`** (analytic lights and domes): the
+  light as diffuse and as glossy BSDF lobes see it. Next-event estimation
+  weighs the BSDF's diffuse part (MDL's `bsdf_diffuse`; legacy diffuse
+  materials are all diffuse) by `diffuse` and the rest by `specular`; a
+  BSDF-sampled hit on a light or dome scales by the diffuse fraction of the
+  BSDF in the sampled direction (one more BSDF evaluation per bounce), so both
+  strategies stay unbiased and the MIS densities are unchanged. Camera rays
+  see lights unscaled; media scattering counts as diffuse. MDL reports its
+  multiscatter compensation of glossy lobes in `bsdf_diffuse` (about 1% of a
+  metal). The integrator does this only when some light or dome sets a
+  multiplier other than 1 (`kFrameLightLobes`); otherwise images are
+  bit-identical to before. Fixtures `light_lobes.usda` and its `_diffuse` /
+  `_specular` variants: they add up to the full image, and MIS and BSDF-only
+  sampling agree per lobe.
+- **`doubleSided`** behind `prism:honorDoubleSided` (off by default). With it, a
+  back-face hit (the integrator's `front_face`: the transformed winding, so a
+  mirroring transform turns a mesh around) on a single-sided triangle is
+  skipped, unless the triangle's material transmits (legacy glass; MDL
+  materials whose BSDF shows a transmission event when probed at load).
+  Camera, BSDF and shadow rays and the geometric AOVs see the same surfaces.
+  CPU: the device's ray casts continue past culled back faces
+  (`SceneManager::castRayCulled`; `cpu-reference` does not cull); GPU: a cull bit
+  in each primitive's material-table entry and non-opaque instances, tested
+  in the ray query (`gpu_culled_triangle`). Fixture `double_sided.usda`.
+- **Per-instance primvars** (the delegate only): instance-rate primvars of
+  PointInstancers and the inherited constant primvars of native instances
+  answer MDL `geompropvalue` lookups, before the mesh's own primvars; nested
+  instancers contribute outer to inner. CPU: `InstancePrimvars` per placement;
+  GPU: `GpuInstance.links.z/w` index entries of the primvar directory.
+  Fixture `instance_primvars.usda` (not a parity fixture: the CLI has no
+  instancer primvars or general MDL primvars yet).
 
 ## Scope and costs
 

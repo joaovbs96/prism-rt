@@ -36,6 +36,9 @@ Scenes: **Eggs** (MaterialEggs), **OpenPBR** (OpenPBRShaderPlayground),
 
 ## Lights
 
+- **Per-light camera visibility, dome `colorTemperature`, `inputs:diffuse` /
+  `inputs:specular` multipliers (done).** In both loaders, on every device; see
+  [hydra.md](hydra.md#scene-features).
 - **Shaping and IES profiles** (`ShapingAPI`; ALab's are empty files).
 - **Light filters** and portal lights.
 - **Dome texture formats** other than lat-long (angular, mirrored ball,
@@ -107,6 +110,11 @@ Scenes: **Eggs** (MaterialEggs), **OpenPBR** (OpenPBRShaderPlayground),
 
 ## Geometry
 
+- **`displayColor`/`displayOpacity` of every interpolation, PointInstancer
+  `invisibleIds`, `doubleSided` (behind `prism:honorDoubleSided`, off by default)
+  and per-instance primvars (done).** Both loaders, except per-instance
+  primvars (the delegate only; the CLI has no instancer or MDL primvars yet).
+  See [hydra.md](hydra.md#scene-features).
 - **Curves** (`BasisCurves`): ALab's fur and cloth (baked procedurals package).
   Embree has curve primitives; the GPU devices need a procedural intersector.
 - **Volumes** (`Volume` + OpenVDB): the Eggs' jade egg interior. The current
@@ -275,7 +283,8 @@ GPUs from every vendor. To close the gaps, in order:
 The `PrismRT` CLI loads USD through its own path (`src/mesh/usd_mesh.h`): it
 reads analytic lights and combines domes, and follows the stage's render
 settings and products as `prism_hydra_render` does. It has no subdivision,
-displacement, named primvars, light linking, native instancing, mesh purpose
+displacement, named primvars (other than `displayColor`/`displayOpacity`),
+instance primvars, light linking, native instancing, mesh purpose
 or UsdPreviewSurface translation, and no Hydra id AOVs (`primId`,
 `instanceId`, `elementId`). Hydra (`prism_hydra_render`, usdview) is the
 reference path. The parity tests ([hydra.md](hydra.md#cli-and-hydra-parity))

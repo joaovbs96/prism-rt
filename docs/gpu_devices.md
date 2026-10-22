@@ -424,6 +424,42 @@ called done there.
     (`--layer Normal --exact` for the geometric layer); and in usdview,
     `render_settings_binding.usda` turns from green to red when the render
     settings menu picks `/Render/AllPurpose`.
+- **Scene features** ([hydra.md](hydra.md#scene-features)):
+  - Shared shader code:
+    - `shaders/integrator/path_tracer.h`: a camera ray that sees a
+      camera-visible light covers its pixel; the light-lobe paths
+      (`lobes`, `lobeScale`, `LightConnection::radianceSpecular`,
+      `PathState::previousDiffuse`, `backend.lightLobes()` /
+      `environmentLobes()`).
+    - `shaders/integrator/types.h`: `BsdfEvaluation::diffuse`,
+      `MaterialQuery::lobes`, `MaterialResult::sampleDiffuse`, `EnvironmentLobes`,
+      `SurfaceHit::instanceRecord`; `lights.h`: `LightRecord::lobes` (one more
+      `float4`: 112-byte records; check the Metal light buffer stride).
+    - `shaders/shared/prism_gpu_types.h`: `kFrameLightLobes`,
+      `kMaterialPrimvarColor/Opacity`, `kPrimvarComponents/Display*` (role bits
+      in `GpuPrimvar.info.y`), `kInstanceCullBackFaces`,
+      `kPrimitiveMaterialMask/CullBackFace` (bit 31 of primitive material entries),
+      `GpuEnvironment.selection.yz` (dome multipliers), `GpuInstance.links.zw`
+      (per-instance primvars).
+    - `shaders/gpu/gpu_backend.hlsl` (fallback display primvars, BSDF diffuse
+      parts, `environmentLobes`, masked material index), `geometry.hlsl`
+      (`gpu_culled_triangle` in both ray queries), `mdl_runtime.hlsl` (instance
+      primvars first in `prism_primvar`), `mdl_types.hlsl` (`primvar_instance`),
+      `material_call.hlsl` (Vulkan callables only: payload 48 words in, 24 out).
+  - Device code: `src/device/metal/metal_device.mm` sets
+    `MTLAccelerationStructureInstanceOptionNonOpaque` on instances with
+    `kInstanceCullBackFaces` (Vulkan: `FORCE_NO_OPAQUE`); untested, check that
+    it compiles and that the ray query then sees their triangles as
+    candidates. Shared host code: `src/device/gpu/gpu_scene.cpp`,
+    `gpu_device.cpp`, `light_table.h`, `src/scene.h`, `src/environment.h`,
+    `src/hydra/*`.
+  - Runs: `ctest -R "prism_parity|prism_scene_features"` (CPU); then on Metal vs
+    CPU, each fixture of [Scene features](hydra.md#scene-features) with the
+    CLI (`--device metal`; `double_sided.usda` with `--render-settings
+    /Render/Settings`) and `instance_primvars.usda` with
+    `PRISM_DEVICE=metal prism_hydra_render`, checked with
+    `prism_scene_features_test` and `prism_compare_images`; then chess and an
+    egg (light lobes off: unchanged).
 
 ## Diagnostics
 
