@@ -1,0 +1,119 @@
+// UsdLux and geometry features of both USD loaders (docs/hydra.md, "Scene
+// features"), checked on renders of their fixtures in tests/hydra/fixtures.
+// The parity harness renders each fixture with the CLI and the Hydra
+// delegate; this checks that each render shows the feature.
+//
+// prism_scene_features_test FEATURE IMAGE.exr
+//
+//   camera_visibility  light_camera_visibility.usda: the light with
+//                      cameraVisibility = 1 is seen by the camera (and
+//                      covers its pixels), the other is not; both light the floor.
+
+#include <OpenImageIO/imagebuf.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <functional>
+#include <map>
+#include <string>
+#include <vector>
+
+namespace {
+
+int failures = 0;
+
+void Check(bool ok, std::string const& what)
+{
+    if (!ok) {
+        std::printf("FAIL: %s\n", what.c_str());
+        ++failures;
+    } else {
+        std::printf("ok: %s\n", what.c_str());
+    }
+}
+
+struct Image {
+    int width = 0, height = 0, channels = 0;
+    std::vector<float> pixels;
+
+    bool Load(std::string const& path)
+    {
+        OIIO::ImageBuf buffer(path);
+        if (!buffer.read(0, 0, true, OIIO::TypeDesc::FLOAT)) return false;
+        auto const& spec = buffer.spec();
+        width = spec.width;
+        height = spec.height;
+        channels = spec.nchannels;
+        pixels.resize(size_t(width) * height * channels);
+        return buffer.get_pixels(OIIO::ROI(spec.x, spec.x + width, spec.y, spec.y + height, 0, 1, 0, channels),
+                                 OIIO::TypeDesc::FLOAT, pixels.data());
+    }
+
+    float At(int x, int y, int c) const { return pixels[(size_t(y) * width + x) * channels + c]; }
+
+    // Mean of channel c over the (2r+1)^2 box around (x, y).
+    float Mean(int x, int y, int c, int r = 1) const
+    {
+        double sum = 0;
+        int count = 0;
+        for (int j = std::max(0, y - r); j <= std::min(height - 1, y + r); ++j)
+            for (int i = std::max(0, x - r); i <= std::min(width - 1, x + r); ++i) {
+                sum += At(i, j, c);
+                ++count;
+            }
+        return count ? float(sum / count) : 0.0f;
+    }
+
+    // Mean of the RGB channels over the box.
+    float Gray(int x, int y, int r = 1) const
+    {
+        return (Mean(x, y, 0, r) + Mean(x, y, 1, r) + Mean(x, y, 2, r)) / 3.0f;
+    }
+
+    bool HasAlpha() const { return channels >= 4; }
+};
+
+std::string Describe(char const* what, float value)
+{
+    char text[256];
+    std::snprintf(text, sizeof(text), "%s (%g)", what, value);
+    return text;
+}
+
+// light_camera_visibility.usda, 64x64: the visible light projects to about
+// (15, 32), the hidden one to about (49, 32); nothing is behind them.
+void CameraVisibility(Image const& image)
+{
+    Check(image.Gray(15, 32) > 1.0f, Describe("the camera-visible light is seen", image.Gray(15, 32)));
+    Check(image.Gray(49, 32) < 1e-4f, Describe("the hidden light is not seen", image.Gray(49, 32)));
+    Check(image.Gray(15, 55, 2) > 0.01f, Describe("the visible light lights the floor", image.Gray(15, 55, 2)));
+    Check(image.Gray(49, 55, 2) > 0.01f, Describe("the hidden light lights the floor", image.Gray(49, 55, 2)));
+    if (image.HasAlpha()) {
+        Check(image.Mean(15, 32, 3, 0) > 0.99f, Describe("the visible light covers its pixel", image.Mean(15, 32, 3, 0)));
+        Check(image.Mean(49, 32, 3, 0) < 0.01f, Describe("the hidden light leaves its pixel transparent",
+                                                         image.Mean(49, 32, 3, 0)));
+    }
+}
+
+} // namespace
+
+int main(int argc, char** argv)
+{
+    std::map<std::string, std::function<void(Image const&)>> const checks = {
+        {"camera_visibility", CameraVisibility},
+    };
+    if (argc != 3 || !checks.contains(argv[1])) {
+        std::printf("usage: prism_scene_features_test FEATURE IMAGE.exr\nfeatures:");
+        for (auto const& [name, check] : checks) std::printf(" %s", name.c_str());
+        std::printf("\n");
+        return 2;
+    }
+    Image image;
+    if (!image.Load(argv[2])) {
+        std::printf("FAIL: cannot read %s\n", argv[2]);
+        return 1;
+    }
+    checks.at(argv[1])(image);
+    return failures == 0 ? 0 : 1;
+}

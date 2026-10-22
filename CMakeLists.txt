@@ -624,6 +624,10 @@ if(PRISM_BUILD_HYDRA)
         target_link_libraries(prism_lights_test PRIVATE PrismRT::core)
         add_test(NAME prism_lights_test COMMAND prism_lights_test)
     endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/scene_features.cpp")
+        add_executable(prism_scene_features_test tests/scene_features.cpp)
+        target_link_libraries(prism_scene_features_test PRIVATE OpenImageIO::OpenImageIO)
+    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/color_management.cpp")
         add_executable(prism_color_management_test tests/color_management.cpp)
         target_link_libraries(prism_color_management_test PRIVATE PrismRT::core)
@@ -844,6 +848,26 @@ if(TARGET prism_hydra_render AND TARGET prism_compare_images)
     prism_add_parity_fixture(NAME render_crop SCENE tests/hydra/fixtures/render_settings_crop.usda
         PRODUCTS crop_full.exr crop_window.exr crop_wide.exr ARGS --spp 16
         EXACT_LAYERS crop_window.exr:Normal)
+    # UsdLux and geometry features (docs/hydra.md, "Scene features"): both
+    # loaders render the fixture, prism_scene_features_test checks each render.
+    # <feature>:<fixture>
+    set(_prism_scene_features
+        camera_visibility:light_camera_visibility)
+    foreach(_entry IN LISTS _prism_scene_features)
+        string(REPLACE ":" ";" _parts "${_entry}")
+        list(GET _parts 0 _feature)
+        list(GET _parts 1 _scene)
+        prism_add_parity_fixture(NAME ${_scene} SCENE tests/hydra/fixtures/${_scene}.usda)
+        if(TARGET prism_scene_features_test)
+            foreach(_frontend cli hydra)
+                add_test(NAME prism_scene_features_${_feature}_${_frontend}
+                    COMMAND prism_scene_features_test ${_feature}
+                        "${prism_parity_${_scene}_dir}/${_frontend}/image.exr")
+                set_tests_properties(prism_scene_features_${_feature}_${_frontend} PROPERTIES
+                    FIXTURES_REQUIRED prism_parity_${_scene})
+            endforeach()
+        endif()
+    endforeach()
     if(TARGET prism_render_settings_test)
         # Named channels and sane values in both frontends' products; the
         # crop matches its region of the full frame (Hydra accumulates it

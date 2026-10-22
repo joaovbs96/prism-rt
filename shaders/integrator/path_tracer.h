@@ -553,15 +553,18 @@ struct PathTracer {
             }
         }
         const bool weighted = mis && path.previousNee;
+        // A camera ray that sees a light visible to the camera covers its pixel.
+        bool sawLight = false;
         if (!inMedium && backend.analyticLightCount() > 0u) {
             const float3 crossed = crossedLights(path.ray, hit.surface.valid ? hit.surface.t : path.ray.ray.tfar,
                                                  !hit.surface.valid, path.depth == 0, weighted, path.previousPdf,
                                                  path.previousNeeProbability, path.receiver, path.previousPosition,
                                                  spatial);
             path.radiance += path.weight * crossed * contributionWeight(settings.contributions, path.depth);
+            sawLight = path.depth == 0 && maxComponent(crossed) > 0.0f;
         }
         if (!hit.surface.valid) {
-            if (path.tracking) path.outcome = kPrimaryEscaped;
+            if (path.tracking) path.outcome = sawLight ? kPrimaryAccepted : kPrimaryEscaped;
             const float3 direction = normalize(path.ray.ray.direction);
             const float3 li = backend.environmentRadiance(direction, angularRadius(path.ray.footprint));
             float misWeight = 1.0f;

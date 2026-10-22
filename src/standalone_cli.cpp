@@ -577,6 +577,10 @@ int runStandaloneCli(int argc, char** argv) {
                 params.intensity = intensity;
                 params.exposure = exposure;
                 light.GetNormalizeAttr().Get(&params.normalize);
+                // Hydra's light:cameraVisibility, which UsdImaging reads from
+                // the prim's `cameraVisibility` attribute.
+                if (const UsdAttribute visibility = prim.GetAttribute(TfToken("cameraVisibility")))
+                    visibility.Get(&params.cameraVisible);
                 std::array<double, 16> matrix{};
                 for (int row = 0; row < 4; ++row)
                     for (int column = 0; column < 4; ++column) matrix[row * 4 + column] = world[row][column];
