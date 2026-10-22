@@ -138,9 +138,9 @@ sampling weights only; any weights give the same expected image.
 
 usdview colour-corrects the colour AOV itself (Hdx's colour correction task)
 with OpenColorIO, from the config's `scene_linear` role (ACEScg, PrismRT's
-default working space). Because of an OpenUSD bug (below) its default view
-is the studio config's `Un-tone-mapped` sRGB view, not ACES 2.0 SDR like the
-CLI's 8-bit outputs: correct ACEScg-to-sRGB colours, without tone mapping.
+default working space), through the config's default display and view: with
+the studio config `sRGB - Display` / `ACES 2.0 - SDR 100 nits (Rec.709)`,
+like the CLI's 8-bit outputs. That needs PrismRT's OpenUSD patch (below).
 
 - The OpenUSD stack (`tools/ci/build_usd_stack.ps1`, local and CI) is built
   with `PXR_BUILD_OPENCOLORIO_PLUGIN=ON` against vcpkg's OpenColorIO 2.6.0,
@@ -159,23 +159,38 @@ CLI's 8-bit outputs: correct ACEScg-to-sRGB colours, without tone mapping.
   another start-up mode (`saved` keeps usdview's; in the package,
   `PRISMRT_USDVIEW_COLOR_CORRECTION`). Without `$OCIO` a saved `openColorIO`
   becomes `sRGB`.
-- **ACES 2.0 views render black in usdview.** OpenUSD 26.08's
-  `HdxColorCorrectionTask` (OCIO v2 path, also unchanged on OpenUSD's `dev`
-  branch) names the sampler of OpenColorIO's 3D LUT textures but not of its
-  1D/2D ones (`sampDesc.debugName` is only set in the 3D loop). On OpenGL and
-  Vulkan, every transform that uses 1D/2D LUTs then fails with "Failed
-  verification: !texInfo.texName.empty() && !texInfo.samplerName.empty()" and
-  the viewport is black. The studio config's ACES 2.0 views use two such
-  tables; its analytic views (`Un-tone-mapped` and `Video (colorimetric)`
-  tested) work. So with the studio config (`OCIO=ocio://studio-config-*`) the
-  extension sets display `sRGB - Display` and view `Un-tone-mapped`.
-  `PRISM_USDVIEW_OCIO_DISPLAY` and `PRISM_USDVIEW_OCIO_VIEW` choose others;
-  `PRISM_USDVIEW_OCIO_VIEW=default` uses the config's default view (ACES 2.0
-  SDR, once OpenUSD is fixed). With another config the extension leaves its
-  defaults alone. The fix is the missing `sampDesc.debugName = samplerName;`
-  in Hdx's 1D/2D LUT loop; PrismRT does not patch OpenUSD.
-- On the CPU device the usdview viewport matches the CLI's
-  `--view Un-tone-mapped` PNG to within one 8-bit level outside the HUD
+- The extension leaves the display and view to the config's defaults.
+  `PRISM_USDVIEW_OCIO_VIEW` chooses another view (`default`: the config's), on
+  `PRISM_USDVIEW_OCIO_DISPLAY` (default `sRGB - Display`; usdview ignores a
+  display without a view). In the package: `PRISMRT_USDVIEW_OCIO_VIEW` and
+  `PRISMRT_USDVIEW_OCIO_DISPLAY`.
+- **OpenUSD patch for the ACES 2.0 views.** Unpatched, OpenUSD 26.08's
+  `HdxColorCorrectionTask` (OCIO v2 path; unchanged on OpenUSD's `dev` branch
+  at `bc32a655a417`, 2026-10-13) renders every view that uses OpenColorIO's
+  1D/2D LUT textures black on OpenGL and Vulkan, among them the studio
+  config's ACES 2.0 views (a single-channel and an RGB 363-entry table): it
+  names the sampler of 3D LUTs only ("Failed verification:
+  !texInfo.texName.empty() && !texInfo.samplerName.empty()"), creates
+  single-channel LUTs without data and counts RGB LUTs as 4 floats per texel.
+  The analytic views (`Un-tone-mapped`, `Video (colorimetric)`) were not
+  affected. `tools/ci/patches/openusd-26.08-hdx-ocio-lut-sampler.patch` fixes
+  all three; `build_usd_stack.ps1` applies every
+  `tools/ci/patches/openusd-<version>-*.patch` for deps.json's OpenUSD
+  version after cloning (`git apply --check`, then `git apply`; the build
+  stops if one does not apply), copies them to `<prefix>\patches` (the package
+  ships them with OpenUSD's licence) and the patch hash goes into the CI cache
+  key and the local prefix name (`openusd-26.08-ocio2.6.0-p<hash>`, see
+  [deployment.md](deployment.md#local-dependency-stack)). Upstream: OpenUSD
+  PR #3419 (open since 2024-11; fixes the first two) and issue #3274.
+  **Dropping the patch:** when an OpenUSD release has the fix, the upgrade
+  (deps.json's `openusd` version) no longer picks up the `openusd-26.08-`
+  patch; delete it then. If a new release still has the bug, rebase the patch
+  as `openusd-<new version>-hdx-ocio-lut-sampler.patch` (the build fails if it
+  no longer applies). With an unpatched OpenUSD (an older prefix), set
+  `PRISM_USDVIEW_OCIO_VIEW=Un-tone-mapped`.
+- On the CPU device the usdview viewport matches the CLI's PNG of the same
+  view (the default ACES 2.0 SDR one, and `--view Un-tone-mapped` with that
+  view) to within one 8-bit level outside the HUD
   (`tests/hydra/fixtures/color_management.usda` and the Cornell box).
 - usdview fills its *OCIO Config* menu (displays, views, input colour spaces)
   with `PyOpenColorIO`, which is not installed: vcpkg's port has no Python
@@ -189,8 +204,8 @@ CLI's 8-bit outputs: correct ACEScg-to-sRGB colours, without tone mapping.
   `Un-tone-mapped` sRGB view when rendering with
   `prism:colorManagement:workingSpace = lin_rec709`.
 - `usdrecord --colorCorrectionMode openColorIO --renderer PrismRT` uses the
-  config's default view (with `$OCIO` set), so it hits the same ACES 2.0 bug;
-  set `OCIO_ACTIVE_VIEWS=Un-tone-mapped` for it.
+  config's default view (with `$OCIO` set): ACES 2.0 SDR with the studio
+  config, like the CLI. `OCIO_ACTIVE_VIEWS` chooses another.
 
 ## Tests
 

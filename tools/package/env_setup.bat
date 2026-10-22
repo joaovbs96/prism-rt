@@ -35,7 +35,7 @@ rem a launcher to move them.
 set "PRISM_CACHE_DIR=%LOCALAPPDATA%\PrismRT\cache"
 if defined PRISMRT_CACHE_DIR set "PRISM_CACHE_DIR=%PRISMRT_CACHE_DIR%"
 rem Colour management: PrismRT's default OpenColorIO config, also used by
-rem usdview's openColorIO colour correction (Un-tone-mapped view on sRGB). Set
+rem usdview's openColorIO colour correction (the config's default view). Set
 rem OCIO to another config or URI before running a launcher to change both.
 if not defined OCIO set "OCIO=ocio://studio-config-latest"
 rem usdview starts in openColorIO; PRISMRT_USDVIEW_COLOR_CORRECTION=sRGB,

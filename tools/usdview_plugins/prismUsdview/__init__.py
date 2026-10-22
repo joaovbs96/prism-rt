@@ -24,8 +24,9 @@ launchers set ocio://studio-config-latest), from the config's scene_linear
 role (ACEScg). usdview saves the mode in its state file and starts in sRGB
 otherwise. Set PRISM_USDVIEW_COLOR_CORRECTION to sRGB, disabled or
 openColorIO to choose another start-up mode, or to "saved" to keep usdview's
-saved one. With the studio config the view is sRGB Un-tone-mapped, because
-OpenUSD 26.08 cannot render its ACES 2.0 views (see startup_ocio_view).
+saved one. The view is the config's default (for the studio config ACES 2.0
+SDR on sRGB, like the CLI's 8-bit images) unless PRISM_USDVIEW_OCIO_DISPLAY
+or PRISM_USDVIEW_OCIO_VIEW choose another (see startup_ocio_view).
 """
 
 import os
@@ -71,31 +72,23 @@ def startup_color_correction(saved, environ=os.environ):
 
 OCIO_DISPLAY_ENV = "PRISM_USDVIEW_OCIO_DISPLAY"
 OCIO_VIEW_ENV = "PRISM_USDVIEW_OCIO_VIEW"
-# OpenUSD 26.08's Hdx names no sampler for OpenColorIO's 1D/2D LUT textures
-# (HdxColorCorrectionTask, OCIO v2 path; only 3D LUTs get one), so on OpenGL
-# and Vulkan every view that uses them renders black, among them the studio
-# config's ACES 2.0 views (their tone-scale tables). Its analytic views work.
-_STUDIO_FALLBACK = ("sRGB - Display", "Un-tone-mapped")
-
-
+_STUDIO_DISPLAY = "sRGB - Display"
 def startup_ocio_view(environ=os.environ):
     """(display, view) for usdview's openColorIO mode, or None for the config's
     defaults.
 
-    PRISM_USDVIEW_OCIO_DISPLAY/_VIEW choose them ("default" for the config's).
-    Otherwise, with the studio config (ocio://studio-config-*), the sRGB
-    display's Un-tone-mapped view instead of the default ACES 2.0 one, which
-    Hdx cannot render (see _STUDIO_FALLBACK).
+    PRISM_USDVIEW_OCIO_VIEW chooses the view ("default" or unset: the
+    config's defaults), on PRISM_USDVIEW_OCIO_DISPLAY (default: the studio
+    config's "sRGB - Display"); usdview takes a display only with a view. The
+    studio config's default ACES 2.0 views need PrismRT's OpenUSD patch
+    (tools/ci/patches/openusd-*-hdx-ocio-lut-sampler.patch); with an
+    unpatched OpenUSD set PRISM_USDVIEW_OCIO_VIEW=Un-tone-mapped.
     """
     display = environ.get(OCIO_DISPLAY_ENV, "").strip()
     view = environ.get(OCIO_VIEW_ENV, "").strip()
-    if view.lower() == "default":
+    if not view or view.lower() == "default":
         return None
-    if view:
-        return (display or _STUDIO_FALLBACK[0], view)
-    if environ.get("OCIO", "").strip().lower().startswith("ocio://studio-config"):
-        return _STUDIO_FALLBACK
-    return None
+    return (display or _STUDIO_DISPLAY, view)
 
 
 def _apply_color_correction(api):

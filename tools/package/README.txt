@@ -45,10 +45,9 @@ Valid values: auto, cpu, vulkan.
 Colour
 ------
 PrismRT renders in ACEScg. usdview shows the image through OpenColorIO
-(View > Color Correction > openColorIO) with the Un-tone-mapped view for an
-sRGB display: correct colours, but not tone mapped like the PNG/JPEG images
-of prism_render.bat (ACES 2.0 SDR view), which this usdview version cannot
-display. The OpenColorIO config is OCIO, ocio://studio-config-latest unless
+(View > Color Correction > openColorIO) with the config's default view, ACES
+2.0 SDR for an sRGB display, like the PNG/JPEG images of prism_render.bat.
+The OpenColorIO config is OCIO, ocio://studio-config-latest unless
 you set it. Set PRISMRT_USDVIEW_COLOR_CORRECTION=sRGB (or disabled, or
 saved: usdview's last mode) to start usdview in another mode, and
 PRISMRT_USDVIEW_OCIO_VIEW (and PRISMRT_USDVIEW_OCIO_DISPLAY) for another view.
@@ -71,7 +70,8 @@ Third-party software
 --------------------
 This package redistributes the following components under their own licenses.
 Their license files are in the licenses folder where the projects ship them.
-  - OpenUSD (Pixar), Modified Apache 2.0
+  - OpenUSD (Pixar), Modified Apache 2.0; built with the changes in
+    licenses\OpenUSD-patches
   - MaterialX (Academy Software Foundation), Apache 2.0
   - OpenSubdiv (Pixar), Modified Apache 2.0 (linked statically)
   - NVIDIA MDL SDK, BSD 3-clause

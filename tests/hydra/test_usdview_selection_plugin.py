@@ -93,10 +93,14 @@ class UsdviewSelectionPluginTest(unittest.TestCase):
     def test_startup_ocio_view(self):
         view = prismUsdview.startup_ocio_view
         studio = {"OCIO": "ocio://studio-config-latest"}
-        # Hdx cannot render the studio config's default ACES 2.0 view.
-        self.assertEqual(view(studio), ("sRGB - Display", "Un-tone-mapped"))
+        # The config's defaults (the studio config's ACES 2.0 SDR view, which
+        # the patched OpenUSD renders).
+        self.assertIsNone(view(studio))
         self.assertIsNone(view({"OCIO": "C:/configs/show.ocio"}))
         self.assertIsNone(view(dict(studio, PRISM_USDVIEW_OCIO_VIEW="default")))
+        self.assertIsNone(view(dict(studio, PRISM_USDVIEW_OCIO_DISPLAY="P3")))
+        self.assertEqual(view(dict(studio, PRISM_USDVIEW_OCIO_VIEW="Un-tone-mapped")),
+                         ("sRGB - Display", "Un-tone-mapped"))
         self.assertEqual(view(dict(studio, PRISM_USDVIEW_OCIO_VIEW="Raw")),
                          ("sRGB - Display", "Raw"))
         self.assertEqual(
@@ -108,6 +112,7 @@ class UsdviewSelectionPluginTest(unittest.TestCase):
             colorCorrectionMode = "sRGB"
             showHUD = False
             ocioSettings = type("OCIOSettings", (), {"view": ""})()
+            ocio = None
 
             def setOcioSettings(self, colorSpace="", display="", view=""):
                 self.ocio = (display, view)
@@ -126,7 +131,8 @@ class UsdviewSelectionPluginTest(unittest.TestCase):
         container._hud._timer.stop()
         settings = api.dataModel.viewSettings
         self.assertEqual(settings.colorCorrectionMode, "openColorIO")
-        self.assertEqual(settings.ocio, ("sRGB - Display", "Un-tone-mapped"))
+        # The config's default display and view: nothing is set.
+        self.assertIsNone(settings.ocio)
         window.close()
 
     def test_container_supports_usdview_ui_configuration(self):
