@@ -1360,7 +1360,12 @@ private:
         std::cout << "[PointInstancer] Processing " << protoIndices.size()
                 << " instance(s) on " << instancer.GetPrim().GetPath() << "\n";
 
+        // invisibleIds (and inactiveIds): the instances to skip, as Hydra's
+        // instancer topology mask does.
+        const std::vector<bool> mask = instancer.ComputeMaskAtTime(timeCode);
+
         for (size_t i = 0; i < protoIndices.size(); ++i) {
+            if (i < mask.size() && !mask[i]) continue;
             int protoIdx = protoIndices[i];
             if (protoIdx < 0 || protoIdx >= static_cast<int>(protoPaths.size())) {
                 std::cerr << "[PointInstancer] Invalid proto index " << protoIdx

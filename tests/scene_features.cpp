@@ -10,6 +10,8 @@
 //                      covers its pixels), the other is not; both light the floor.
 //   dome_temperature   dome_color_temperature.usda: the dome's colour
 //                      temperature tints it.
+//   invisible_ids      pointinstancer_invisible_ids.usda: invisibleIds hide
+//                      their instances.
 
 #include <OpenImageIO/imagebuf.h>
 
@@ -108,6 +110,23 @@ void DomeTemperature(Image const& image)
     Check(r > 2.0f * b, Describe("the tint is strong, red / blue", b > 0.0f ? r / b : r));
 }
 
+// pointinstancer_invisible_ids.usda: red cards at about x = 7, 24, 40, 57
+// (row 32) over a white dome; invisibleIds hides the second and fourth.
+void InvisibleIds(Image const& image)
+{
+    const int columns[4] = {7, 24, 40, 57};
+    for (int i = 0; i < 4; ++i) {
+        const bool hidden = i == 1 || i == 3;
+        const float r = image.Mean(columns[i], 32, 0), g = image.Mean(columns[i], 32, 1);
+        const std::string name = "instance " + std::to_string(i);
+        if (hidden) {
+            Check(g > 0.7f, Describe((name + " is hidden: the dome shows (green)").c_str(), g));
+        } else {
+            Check(r > 0.4f && g < 0.3f, Describe((name + " is drawn (green)").c_str(), g));
+        }
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -115,6 +134,7 @@ int main(int argc, char** argv)
     std::map<std::string, std::function<void(Image const&)>> const checks = {
         {"camera_visibility", CameraVisibility},
         {"dome_temperature", DomeTemperature},
+        {"invisible_ids", InvisibleIds},
     };
     if (argc != 3 || !checks.contains(argv[1])) {
         std::printf("usage: prism_scene_features_test FEATURE IMAGE.exr\nfeatures:");
