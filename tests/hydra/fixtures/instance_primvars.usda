@@ -1,0 +1,100 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    upAxis = "Y"
+    metersPerUnit = 1
+)
+
+# Per-instance primvars for MDL scene data lookups (geompropvalue "tint",
+# default grey) under a white dome:
+#   top:    three PointInstancer cards, tint red, green, blue (instance-rate)
+#   bottom: two native instances, tint yellow and cyan (inherited constants)
+class "Prototype"
+{
+    def Mesh "Card" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 1, 2, 3]
+        point3f[] points = [(-0.2, -0.3, 0), (0.2, -0.3, 0), (0.2, 0.3, 0), (-0.2, 0.3, 0)]
+        uniform token subdivisionScheme = "none"
+        rel material:binding = </World/TintMaterial>
+    }
+}
+
+def Xform "World"
+{
+    def Camera "Camera"
+    {
+        float focalLength = 35
+        float horizontalAperture = 20
+        float verticalAperture = 20
+        float2 clippingRange = (0.1, 100)
+        double3 xformOp:translate = (0, 0, 4)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+
+    def Material "TintMaterial"
+    {
+        token outputs:mtlx:surface.connect = </World/TintMaterial/Surface.outputs:out>
+        def Shader "Surface"
+        {
+            uniform token info:id = "ND_standard_surface_surfaceshader"
+            float inputs:base = 1
+            color3f inputs:base_color.connect = </World/TintMaterial/Tint.outputs:out>
+            float inputs:specular = 0
+            float inputs:metalness = 0
+            token outputs:out
+        }
+        def Shader "Tint"
+        {
+            uniform token info:id = "ND_geompropvalue_color3"
+            string inputs:geomprop = "tint"
+            color3f inputs:default = (0.5, 0.5, 0.5)
+            color3f outputs:out
+        }
+    }
+
+    def PointInstancer "Cards"
+    {
+        point3f[] positions = [(-0.6, 0.4, 0), (0, 0.4, 0), (0.6, 0.4, 0)]
+        int[] protoIndices = [0, 0, 0]
+        color3f[] primvars:tint = [(0.8, 0.1, 0.1), (0.1, 0.8, 0.1), (0.1, 0.1, 0.8)] (interpolation = "vertex")
+        rel prototypes = </World/Cards/Prototypes/Card>
+
+        def Scope "Prototypes"
+        {
+            def "Card" (
+                prepend inherits = </Prototype>
+            )
+            {
+            }
+        }
+    }
+
+    def Xform "Yellow" (
+        instanceable = true
+        prepend references = </Prototype>
+    )
+    {
+        color3f primvars:tint = (0.8, 0.8, 0.1) (interpolation = "constant")
+        double3 xformOp:translate = (-0.3, -0.4, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+
+    def Xform "Cyan" (
+        instanceable = true
+        prepend references = </Prototype>
+    )
+    {
+        color3f primvars:tint = (0.1, 0.8, 0.8) (interpolation = "constant")
+        double3 xformOp:translate = (0.3, -0.4, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+
+    def DomeLight "Dome"
+    {
+        float inputs:intensity = 1
+    }
+}

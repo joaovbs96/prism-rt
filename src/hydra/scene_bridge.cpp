@@ -3789,6 +3789,7 @@ void _CollectMaterialRequests(HdSceneIndexBaseRefPtr const &scene,
 }
 
 void _ApplyLinkMasks(HdSceneIndexBaseRefPtr const &index, Snapshot *snapshot);
+void _ApplyInstancePrimvars(HdSceneIndexBaseRefPtr const &index, Snapshot *snapshot);
 
 std::shared_ptr<Snapshot> _BuildSnapshot(HdSceneIndexBaseRefPtr const &scene,
                                          MaterialService *materials,
@@ -3889,6 +3890,7 @@ std::shared_ptr<Snapshot> _BuildSnapshot(HdSceneIndexBaseRefPtr const &scene,
     if (cancelled && cancelled()) return {};
     _FlushSphereBatches(result.get());
     _ApplyLinkMasks(scene, result.get());
+    _ApplyInstancePrimvars(scene, result.get());
     _IndexPlacementDependencies(result.get());
     _ApplyHiddenGeometryBudget(result.get());
     _CachePlacementInputs(scene, result.get());
@@ -4574,6 +4576,60 @@ void _ApplyLinkMasks(HdSceneIndexBaseRefPtr const &index, Snapshot *snapshot)
             cached = byPath.emplace(path, masks).first;
         }
         scene.placement_link_masks[int(id)] = cached->second;
+    }
+}
+
+// Instance-rate primvars of instanced placements (PointInstancer primvars,
+// and the inherited primvars UsdImaging gives native instancers) for MDL
+// scene data lookups: every level of a placement's chain contributes its
+// instancer's value at the placement's source index, inner levels over outer
+// ones. Instancer transforms and namespaced primvars are not primvars here.
+void _ApplyInstancePrimvars(HdSceneIndexBaseRefPtr const &index, Snapshot *snapshot)
+{
+    SceneManager &scene = *snapshot->scene;
+    scene.placement_primvars.clear();
+    if (snapshot->geomToInstanceChain.empty()) return;
+    struct Column {
+        std::string name;
+        int components = 0;
+        std::vector<float> values;
+    };
+    std::unordered_map<SdfPath, std::vector<Column>, SdfPath::Hash> columns;
+    auto columnsOf = [&](SdfPath const &path) -> std::vector<Column> const & {
+        auto [it, added] = columns.try_emplace(path);
+        if (!added) return it->second;
+        HdPrimvarsSchema primvars = HdPrimvarsSchema::GetFromParent(index->GetPrim(path).dataSource);
+        if (!primvars) return it->second;
+        for (TfToken const &name : primvars.GetPrimvarNames()) {
+            if (_InstanceTransformToken(name) || name.GetString().find(':') != std::string::npos) continue;
+            PrimvarData data = _Primvar(primvars, name);
+            if (data.interpolation != HdPrimvarSchemaTokens->instance) continue;
+            Column column;
+            column.name = name.GetString();
+            if (!_PrimvarFloats(data.value, &column.values, &column.components) ||
+                column.components < 1 || column.components > 4) continue;
+            it->second.push_back(std::move(column));
+        }
+        return it->second;
+    };
+    for (auto const &[geomId, chain] : snapshot->geomToInstanceChain) {
+        auto values = std::make_shared<InstancePrimvars>();
+        for (auto const &level : chain) {
+            for (auto const &column : columnsOf(level.instancerPath)) {
+                const size_t n = column.values.size() / size_t(column.components);
+                if (level.sourceIndex < 0 || size_t(level.sourceIndex) >= n) continue;
+                InstancePrimvars::Value value;
+                value.name = column.name;
+                value.components = column.components;
+                std::copy_n(column.values.begin() + size_t(level.sourceIndex) * size_t(column.components),
+                            column.components, value.value.begin());
+                auto existing = std::find_if(values->values.begin(), values->values.end(),
+                    [&](auto const &v) { return v.name == value.name; });
+                if (existing != values->values.end()) *existing = value;
+                else values->values.push_back(std::move(value));
+            }
+        }
+        if (!values->values.empty()) scene.placement_primvars[int(geomId)] = std::move(values);
     }
 }
 
@@ -6757,6 +6813,7 @@ bool SceneBridge::Prepare(CameraState const &camera,
                                     retained, SdfPath::AbsoluteRootPath(), bank.get());
                                 _ApplyLinkMasks(retained, bank.get());
                             }
+                            _ApplyInstancePrimvars(retained, bank.get());
                             result.residencyUnchanged =
                                 jobDirtyKinds == static_cast<unsigned int>(SceneDirtyKind::Placement) &&
                                 !restoredPrototypes && !placementTopologyChanged && !sphereBatchTopologyChanged &&

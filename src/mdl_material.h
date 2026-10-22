@@ -586,6 +586,9 @@ private:
         mdl::NativeTextureRuntime::primvarContext = {hit.primvarMesh, unsigned(hit.primid), hit.bary_u, hit.bary_v,
             [](const void* mesh, const char* name, unsigned primitive, float u, float v, float* out, int count) {
                 return static_cast<Mesh const*>(mesh)->interpolatePrimvar(name, primitive, u, v, out, count);
+            }, hit.instancePrimvars,
+            [](const void* instance, const char* name, float* out, int count) {
+                return static_cast<InstancePrimvars const*>(instance)->lookup(name, out, count);
             }};
 
         // UV

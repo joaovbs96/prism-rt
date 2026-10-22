@@ -204,6 +204,8 @@ struct SurfaceHit {
     uint vertex1;
     uint vertex2;
     uint prototype;
+    // GPU devices: the instance record (per-instance primvars); ~0u: none.
+    uint instanceRecord;
 };
 
 struct BsdfSample {

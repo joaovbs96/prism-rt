@@ -1,6 +1,8 @@
 #pragma once
 
 #include <string>
+#include <array>
+#include <vector>
 
 
 // STD Lib deps
@@ -310,6 +312,26 @@ class Sphere : public Geometry {
         Float3 pos;
         float r;
         Material* material;
+};
+
+// Instance-rate primvars of one placement (PointInstancer primvars, the
+// inherited primvars of native instances): constant over the placement.
+// MDL scene data lookups read them before the mesh's own primvars.
+struct InstancePrimvars {
+    struct Value {
+        std::string name;
+        int components = 0;
+        std::array<float, 4> value{};
+    };
+    std::vector<Value> values;
+    bool lookup(const char* name, float* out, int count) const {
+        for (auto const& v : values) {
+            if (v.name != name) continue;
+            for (int c = 0; c < count; ++c) out[c] = c < v.components ? v.value[size_t(c)] : 0.0f;
+            return true;
+        }
+        return false;
+    }
 };
 
 class Mesh : public Geometry {

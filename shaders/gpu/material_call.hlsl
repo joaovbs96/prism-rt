@@ -4,8 +4,8 @@
 // shading point and the material query; the program answers with
 // backend.shade's MaterialResult, or with the cutout opacity of a hit.
 //
-// Only what the MDL state and the BSDF read travels: 47 words in, 24 out
-// (284 bytes). The payload goes through the callable's stack, so every word
+// Only what the MDL state and the BSDF read travels: 48 words in, 24 out
+// (288 bytes). The payload goes through the callable's stack, so every word
 // costs memory traffic on each call.
 
 #pragma once
@@ -49,6 +49,7 @@ struct MaterialCall {
     uint vertex1;
     uint vertex2;
     uint prototype;
+    uint instanceRecord;  // per-instance primvars
     uint material;
     uint flags;
     uint rng;             // in and out: backend.rng
@@ -100,6 +101,7 @@ MaterialCall materialCall(SurfaceHit hit, uint material, uint mode)
     call.vertex1 = hit.vertex1;
     call.vertex2 = hit.vertex2;
     call.prototype = hit.prototype;
+    call.instanceRecord = hit.instanceRecord;
     call.material = material;
     call.flags = mode | (hit.front_face ? kMaterialCallFrontFace : 0u) |
                  (hit.texture_footprint.filtered ? kMaterialCallFiltered : 0u);
@@ -160,6 +162,7 @@ SurfaceHit materialCallSurface(MaterialCall call)
     hit.vertex1 = call.vertex1;
     hit.vertex2 = call.vertex2;
     hit.prototype = call.prototype;
+    hit.instanceRecord = call.instanceRecord;
     return hit;
 }
 

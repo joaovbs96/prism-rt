@@ -206,6 +206,9 @@ public:
             }
             RayHit hit(e_rayhit, &interpolation, geom->type, analyticNormal);
             if (geom->type == RTC_GEOMETRY_TYPE_TRIANGLE) hit.primvarMesh = dynamic_cast<Mesh const*>(geom);
+            if (!placement_primvars.empty())
+                if (auto found = placement_primvars.find(int(placementId)); found != placement_primvars.end())
+                    hit.instancePrimvars = found->second.get();
             hit.ray_footprint = pathRay.footprint;
             hit.geomid = static_cast<int>(placementId);
             if (placement != placement_transforms.end()) {
@@ -649,6 +652,8 @@ public:
     // triangles Mesh::single_sided marks (the CLI's merged mesh).
     bool honorDoubleSided = false;
     std::unordered_set<int> single_sided_placements;
+    // Instance-rate primvars by placement (InstancePrimvars).
+    std::unordered_map<int, std::shared_ptr<const InstancePrimvars>> placement_primvars;
 
     // Whether some geometry is single-sided while doubleSided is honoured.
     bool cullsBackFaces() const

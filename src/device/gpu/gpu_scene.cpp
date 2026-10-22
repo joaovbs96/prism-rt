@@ -475,6 +475,21 @@ GpuSceneData BuildGpuScene(SceneManager& scene)
             instance.links.x = masks != scene.placement_link_masks.end() ? masks->second.first : 0u;
             instance.links.y = masks != scene.placement_link_masks.end() ? masks->second.second : 0u;
         }
+        // Per-instance primvars: directory entries after the prototypes',
+        // their value at an absolute offset (GpuInstance.links.z, .w).
+        if (!scene.placement_primvars.empty())
+            if (auto pv = scene.placement_primvars.find(id); pv != scene.placement_primvars.end() && pv->second) {
+                instance.links.z = uint32_t(data.primvars.size());
+                instance.links.w = uint32_t(pv->second->values.size());
+                for (auto const& value : pv->second->values) {
+                    GpuPrimvar entry;
+                    entry.info = {0u, uint32_t(value.components), uint32_t(data.primvarValues.size()), 0u};
+                    data.primvarValues.insert(data.primvarValues.end(), value.value.begin(),
+                                              value.value.begin() + value.components);
+                    data.primvars.push_back(entry);
+                    data.primvarNames.push_back(value.name);
+                }
+            }
         std::array<float, 12> transform{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
         const bool instanced = scene.intersection_geometry.contains(id);
         if (instanced) {

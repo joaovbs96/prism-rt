@@ -157,7 +157,8 @@ struct GpuInstance {
     float4 normalColumns[3];
     float4 tangentColumns[3];
     uint4 info;   // x: prototype, y: flags, z: first primitive material, w: placement id
-    uint4 links;  // x: light-link categories, y: shadow-link categories (~0u without linking)
+    uint4 links;  // x: light-link categories, y: shadow-link categories (~0u without linking),
+                  // z: first per-instance primvar directory entry, w: their count
 };
 
 struct GpuMaterial {

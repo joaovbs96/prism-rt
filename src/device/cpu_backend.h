@@ -21,6 +21,7 @@ struct CpuHit {
     SurfaceHit surface;
     ::Material* material = nullptr;
     const void* primvarMesh = nullptr;
+    const void* instancePrimvars = nullptr;
 };
 
 struct CpuShading {
@@ -88,6 +89,7 @@ struct CpuBackend {
         CpuHit hit;
         hit.surface = FromRayHit(rh);
         hit.primvarMesh = rh.primvarMesh;
+        hit.instancePrimvars = rh.instancePrimvars;
         if (hit.surface.valid) hit.material = scene->getMaterial(rh);
         return hit;
     }
@@ -97,6 +99,7 @@ struct CpuBackend {
         CpuShading shading;
         shading.hit = ToRayHit(hit.surface);
         shading.hit->primvarMesh = hit.primvarMesh;
+        shading.hit->instancePrimvars = hit.instancePrimvars;
         shading.material = hit.material;
         hit.material->perturbNormal(*shading.hit);
         hit.material->prepare(*shading.hit, shading.prepared);
@@ -158,6 +161,7 @@ struct CpuBackend {
     {
         RayHit rh = ToRayHit(hit.surface);
         rh.primvarMesh = hit.primvarMesh;
+        rh.instancePrimvars = hit.instancePrimvars;
         return hit.material->cutoutOpacity(rh);
     }
 
@@ -272,6 +276,7 @@ struct CpuBackend {
         hit.bary_v = rh.bary_v;
         hit.vertex0 = hit.vertex1 = hit.vertex2 = 0u;
         hit.prototype = 0u;
+        hit.instanceRecord = 0xffffffffu;
         return hit;
     }
 

@@ -63,6 +63,7 @@ SurfaceHit gpu_empty_hit(PathRay ray)
     h.vertex1 = 0u;
     h.vertex2 = 0u;
     h.prototype = 0xffffffffu;
+    h.instanceRecord = 0xffffffffu;
     return h;
 }
 
@@ -217,6 +218,7 @@ GpuHit gpu_intersect(PathRay ray, uint mask)
     result.material = gpu_primitive_material(inst.info.z + localPrimitive) & kPrimitiveMaterialMask;
     result.sphere = type == kProtoSpheres;
     result.instanceIndex = raw.instance;
+    hit.instanceRecord = raw.instance;
 
     // Geometric normal in the prototype's space (Embree conventions).
     float3 ng = (float3)0.0f;
@@ -609,6 +611,7 @@ void gpu_build_mdl_state(SurfaceHit hit, GpuMaterial material, out Shading_state
     state.primvar_vertex[1] = hit.vertex1;
     state.primvar_vertex[2] = hit.vertex2;
     state.primvar_bary = float2(hit.bary_u, hit.bary_v);
+    state.primvar_instance = hit.instanceRecord;
     state.text_coords[0].val = float3(hit.u, hit.v, 0.0f);
     bool filtered = hit.texture_footprint.filtered;
     state.text_coords[0].dx = filtered ? float3(hit.texture_footprint.dudx, hit.texture_footprint.dvdx, 0.0f)

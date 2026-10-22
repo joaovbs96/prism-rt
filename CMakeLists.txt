@@ -885,6 +885,20 @@ if(TARGET prism_hydra_render AND TARGET prism_compare_images)
                 FIXTURES_REQUIRED prism_parity_double_sided)
         endforeach()
     endif()
+    # Per-instance primvars (PointInstancer and native instancing) for MDL
+    # geompropvalue: the delegate only (the CLI has neither, phase 7).
+    if(TARGET prism_scene_features_test)
+        add_test(NAME prism_scene_features_instance_primvars_render
+            COMMAND prism_hydra_render "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/instance_primvars.usda"
+                /World/Camera "${CMAKE_BINARY_DIR}/scene_features/instance_primvars.exr" 64 64 16)
+        set_tests_properties(prism_scene_features_instance_primvars_render PROPERTIES
+            ENVIRONMENT "${_prism_test_environment};PRISM_DEVICE=cpu"
+            FIXTURES_SETUP prism_scene_features_instance_primvars)
+        add_test(NAME prism_scene_features_instance_primvars_hydra
+            COMMAND prism_scene_features_test instance_primvars "${CMAKE_BINARY_DIR}/scene_features/instance_primvars.exr")
+        set_tests_properties(prism_scene_features_instance_primvars_hydra PROPERTIES
+            FIXTURES_REQUIRED prism_scene_features_instance_primvars)
+    endif()
     # Light inputs:diffuse / inputs:specular: the full image and its
     # diffuse-only and specular-only variants. As for "lights", the loaders
     # order the lights differently: noise, not bias (the mean agrees).

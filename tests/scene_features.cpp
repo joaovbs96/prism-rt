@@ -20,6 +20,8 @@
 //   double_sided       double_sided.usda: with prism:honorDoubleSided,
 //                      back faces of single-sided, non-transmissive meshes
 //                      are not hit.
+//   instance_primvars  instance_primvars.usda (Hydra only): per-instance
+//                      primvars reach MDL geompropvalue lookups.
 //   lobes_consistency  MIS BSDF: a light_lobes variant rendered with MIS and
 //                      with BSDF sampling only agrees on every card.
 
@@ -235,6 +237,30 @@ void DoubleSided(Image const& image)
     Check(glassB < 0.6f * backdropB, Describe("the transmissive card facing away is drawn (tints the backdrop)", glassB));
 }
 
+// instance_primvars.usda: cards whose material reads the geompropvalue
+// "tint" (default grey): PointInstancer cards at (15, 21), (32, 21), (49, 21),
+// native instances at (24, 43) and (40, 43).
+void InstancePrimvars(Image const& image)
+{
+    struct Expected {
+        char const* what;
+        int x, y;
+        float r, g, b;
+    };
+    const Expected expected[] = {{"PointInstancer red", 15, 21, 0.8f, 0.1f, 0.1f},
+                                 {"PointInstancer green", 32, 21, 0.1f, 0.8f, 0.1f},
+                                 {"PointInstancer blue", 49, 21, 0.1f, 0.1f, 0.8f},
+                                 {"native instance yellow", 24, 43, 0.8f, 0.8f, 0.1f},
+                                 {"native instance cyan", 40, 43, 0.1f, 0.8f, 0.8f}};
+    for (auto const& e : expected) {
+        const float r = image.Mean(e.x, e.y, 0), g = image.Mean(e.x, e.y, 1), b = image.Mean(e.x, e.y, 2);
+        const float error = std::max({std::abs(r - e.r), std::abs(g - e.g), std::abs(b - e.b)});
+        char text[256];
+        std::snprintf(text, sizeof(text), "%s: (%.3f, %.3f, %.3f)", e.what, r, g, b);
+        Check(error <= 0.1f, text);
+    }
+}
+
 // A light_lobes variant rendered with MIS (next-event estimation splits the
 // BSDF evaluation by lobe) and with BSDF sampling only (light hits are scaled
 // by the sampled direction's diffuse fraction): the card means agree (the
@@ -272,6 +298,7 @@ int main(int argc, char** argv)
         {"display_color", single(DisplayColor)},
         {"light_lobes", {3, LightLobes}},
         {"double_sided", single(DoubleSided)},
+        {"instance_primvars", single(InstancePrimvars)},
         // Diagnostics: the pixels where two images differ most.
         {"diff", {2, [](std::vector<Image> const& images) {
             std::vector<std::pair<float, int>> d;

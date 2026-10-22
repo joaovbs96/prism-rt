@@ -527,7 +527,22 @@ bool prism_scene_data_is_camera_position(int id);
 bool prism_primvar(Shading_state_material state, int id, out float4 value)
 {
     value = (float4)0.0f;
-    if (state.primvar_prototype == 0xffffffffu || id <= 0) return false;
+    if (id <= 0) return false;
+    // Per-instance primvars first (GpuInstance.links.z, .w: directory entries
+    // with the value's offset in z).
+    if (state.primvar_instance != 0xffffffffu) {
+        const GpuInstance instance = gpu_instance(state.primvar_instance);
+        for (uint i = 0u; i < instance.links.w; ++i) {
+            const GpuPrimvar primvar = gpu_primvar(instance.links.z + i);
+            if (primvar.info.x != uint(prism_scene_data_global_id(id))) continue;
+            float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            for (uint c = 0u; c < 4u; ++c)
+                if (c < (primvar.info.y & kPrimvarComponents)) result[c] = gpu_primvar_value(primvar.info.z + c);
+            value = float4(result[0], result[1], result[2], result[3]);
+            return true;
+        }
+    }
+    if (state.primvar_prototype == 0xffffffffu) return false;
     const GpuPrototype prototype = gpu_prototype(state.primvar_prototype);
     for (uint i = 0u; i < prototype.info2.z; ++i) {
         const GpuPrimvar primvar = gpu_primvar(prototype.info2.y + i);

@@ -33,6 +33,8 @@ struct Shading_state_material {
     uint primvar_prototype;
     uint primvar_vertex[3];
     float2 primvar_bary;
+    // The hit's instance record, for its per-instance primvars (~0u: none).
+    uint primvar_instance;
 };
 
 

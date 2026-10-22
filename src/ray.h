@@ -138,6 +138,8 @@ class RayHit {
         // Triangle barycentrics and the mesh, for named primvar lookups.
         float bary_u = 0.0f, bary_v = 0.0f;
         const void* primvarMesh = nullptr;
+        // The placement's InstancePrimvars (geometry.h), if any.
+        const void* instancePrimvars = nullptr;
         int geomid, primid, instid;
         int prototypeid = RTC_INVALID_GEOMETRY_ID;
         prism::RayFootprint ray_footprint;

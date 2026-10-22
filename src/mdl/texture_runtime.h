@@ -23,6 +23,9 @@ struct PrimvarContext {
     float u = 0.0f, v = 0.0f;
     bool (*lookup)(const void* mesh, const char* name, unsigned primitive, float u, float v,
                    float* out, int count) = nullptr;
+    // The placement's instance-rate primvars, read first.
+    const void* instance = nullptr;
+    bool (*instanceLookup)(const void* instance, const char* name, float* out, int count) = nullptr;
 };
 
 class NativeTextureRuntime {
@@ -100,7 +103,10 @@ public:
     // Scene data `id` (a string constant) of the current point into out[count].
     bool lookupPrimvar(unsigned id, float* out, int count) const {
         auto const& c = primvarContext;
-        if (!c.mesh || !c.lookup || id >= m_sceneDataNames.size() || m_sceneDataNames[id].empty()) return false;
+        if (id >= m_sceneDataNames.size() || m_sceneDataNames[id].empty()) return false;
+        if (c.instance && c.instanceLookup && c.instanceLookup(c.instance, m_sceneDataNames[id].c_str(), out, count))
+            return true;
+        if (!c.mesh || !c.lookup) return false;
         return c.lookup(c.mesh, m_sceneDataNames[id].c_str(), c.primitive, c.u, c.v, out, count);
     }
     ResourceView resource(size_t index) const;
