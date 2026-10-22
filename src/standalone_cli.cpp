@@ -548,6 +548,8 @@ int runStandaloneCli(int argc, char** argv) {
                     std::array<float,9> linear;
                     for (int row=0; row<3; ++row) for (int col=0; col<3; ++col) linear[row*3+col] = float(inverse[col][row]);
                     domes.push_back(std::make_unique<TransformedEnvironmentMap>(domeTextures.back().get(), multiplier, linear));
+                    light.GetDiffuseAttr().Get(&domes.back()->diffuseFactor);
+                    light.GetSpecularAttr().Get(&domes.back()->specularFactor);
                     continue;
                 }
                 prism::LightParameters params;
@@ -577,6 +579,8 @@ int runStandaloneCli(int argc, char** argv) {
                 params.intensity = intensity;
                 params.exposure = exposure;
                 light.GetNormalizeAttr().Get(&params.normalize);
+                light.GetDiffuseAttr().Get(&params.diffuse);
+                light.GetSpecularAttr().Get(&params.specular);
                 // Hydra's light:cameraVisibility, which UsdImaging reads from
                 // the prim's `cameraVisibility` attribute.
                 if (const UsdAttribute visibility = prim.GetAttribute(TfToken("cameraVisibility")))

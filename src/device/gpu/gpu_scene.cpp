@@ -329,7 +329,7 @@ GpuEnvironment BuildEnvironmentRecord(Environment const* environment, Builder& b
     SetMatrixRows(record.toLocal, {1, 0, 0, 0, 1, 0, 0, 0, 1});
     SetMatrixRows(record.toWorld, {1, 0, 0, 0, 1, 0, 0, 0, 1});
     record.multiplier.w = 1.0f;
-    record.selection.x = 1.0f;
+    record.selection = {1.0f, 1.0f, 1.0f, 0.0f}; // x: selection, y, z: diffuse / specular multipliers
     *map = nullptr;
     if (!environment) return record;
 
@@ -401,6 +401,10 @@ void BuildEnvironment(Environment const* environment, Builder& builder, GpuScene
         EnvironmentMap const* map = nullptr;
         GpuEnvironment record = BuildEnvironmentRecord(parts[i], builder, data, &map);
         record.selection.x = weights[i];
+        if (parts[i]) {
+            record.selection.y = parts[i]->diffuseFactor;
+            record.selection.z = parts[i]->specularFactor;
+        }
         data.environments.push_back(record);
         maps.push_back(map);
     }
@@ -527,6 +531,7 @@ GpuSceneData BuildGpuScene(SceneManager& scene)
     data.lights = lights.records;
     data.lightAlias = lights.alias;
     data.analyticLights = lights.analyticCount;
+    data.lightLobes = lights.lobes;
     for (auto& record : data.lights) {
         if ((record.info.y & kLightTextured) == 0u) continue;
         auto const* image = dynamic_cast<ImageTexture<Color3> const*>(lights.textures[record.info.z].get());

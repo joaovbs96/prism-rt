@@ -1,0 +1,109 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    upAxis = "Y"
+    metersPerUnit = 1
+)
+
+# UsdLux inputs:diffuse and inputs:specular (light_lobes_diffuse.usda and
+# light_lobes_specular.usda override them on every light): a matte card
+# (displayColor, diffuse only), a plastic card (standard_surface: diffuse base
+# under a glossy specular layer) and a metal card (glossy only), lit by a
+# rect light, a sphere light and a dome. With the default multipliers of 1
+# this is the full image; the diffuse-only and specular-only images add up
+# to it.
+def Xform "World"
+{
+    def Camera "Camera"
+    {
+        float focalLength = 35
+        float horizontalAperture = 20
+        float verticalAperture = 20
+        float2 clippingRange = (0.1, 100)
+        double3 xformOp:translate = (0, 0, 4)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+
+    def Mesh "Matte"
+    {
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 1, 2, 3]
+        point3f[] points = [(-1.1, -0.5, 0), (-0.4, -0.5, 0), (-0.4, 0.5, 0), (-1.1, 0.5, 0)]
+        color3f[] primvars:displayColor = [(0.8, 0.8, 0.8)]
+        uniform token subdivisionScheme = "none"
+    }
+
+    def Mesh "Plastic" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 1, 2, 3]
+        point3f[] points = [(-0.35, -0.5, 0), (0.35, -0.5, 0), (0.35, 0.5, 0), (-0.35, 0.5, 0)]
+        uniform token subdivisionScheme = "none"
+        rel material:binding = </World/PlasticMaterial>
+    }
+
+    def Mesh "Metal" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 1, 2, 3]
+        point3f[] points = [(0.4, -0.5, 0), (1.1, -0.5, 0), (1.1, 0.5, 0), (0.4, 0.5, 0)]
+        uniform token subdivisionScheme = "none"
+        rel material:binding = </World/MetalMaterial>
+    }
+
+    def Material "PlasticMaterial"
+    {
+        token outputs:mtlx:surface.connect = </World/PlasticMaterial/Surface.outputs:out>
+        def Shader "Surface"
+        {
+            uniform token info:id = "ND_standard_surface_surfaceshader"
+            float inputs:base = 1
+            color3f inputs:base_color = (0.6, 0.6, 0.6)
+            float inputs:specular = 1
+            float inputs:specular_roughness = 0.35
+            float inputs:metalness = 0
+            token outputs:out
+        }
+    }
+
+    def Material "MetalMaterial"
+    {
+        token outputs:mtlx:surface.connect = </World/MetalMaterial/Surface.outputs:out>
+        def Shader "Surface"
+        {
+            uniform token info:id = "ND_standard_surface_surfaceshader"
+            float inputs:base = 1
+            color3f inputs:base_color = (0.9, 0.9, 0.9)
+            float inputs:specular = 0
+            float inputs:specular_roughness = 0.35
+            float inputs:metalness = 1
+            token outputs:out
+        }
+    }
+
+    def RectLight "Key"
+    {
+        float inputs:width = 3
+        float inputs:height = 2
+        float inputs:intensity = 2
+        double3 xformOp:translate = (0, 0.3, 2.5)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+
+    def SphereLight "Bulb"
+    {
+        float inputs:radius = 0.2
+        float inputs:intensity = 15
+        double3 xformOp:translate = (0, 1.2, 1)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+
+    def DomeLight "Dome"
+    {
+        float inputs:intensity = 0.5
+    }
+}

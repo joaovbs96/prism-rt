@@ -722,6 +722,7 @@ BsdfEvaluation gpu_mdl_evaluate(SurfaceHit hit, GpuMaterial material, inout Shad
     result.value = (float3)0.0f;
     result.pdf = 0.0f;
     result.valid = false;
+    result.diffuse = (float3)0.0f;
     bool backface = !hit.front_face;
     bool thinWalled = prism_mdl_thin_walled(material.info.y, state);
     Bsdf_evaluate_data data;
@@ -740,6 +741,7 @@ BsdfEvaluation gpu_mdl_evaluate(SurfaceHit hit, GpuMaterial material, inout Shad
     data.flags = 0;
     if (!prism_mdl_bsdf_evaluate(material.info.y, backface && thinWalled, data, state)) return result;
     result.value = data.bsdf_diffuse + data.bsdf_glossy;
+    result.diffuse = data.bsdf_diffuse;
     result.pdf = data.pdf;
     result.valid = result.pdf >= 0.0f && isfinite(result.pdf);
     return result;
@@ -1062,13 +1064,14 @@ struct GpuBackend {
 #ifndef PRISM_CALL_MATERIALS
         if (material.info.x == kMaterialMdl) return gpu_mdl_evaluate(shading.surface, material, shading.state, wi);
 #endif
-        BsdfEvaluation e = {(float3)0.0f, 0.0f, false};
+        BsdfEvaluation e = {(float3)0.0f, 0.0f, false, (float3)0.0f};
         if (material.info.x == kMaterialDiffuse || material.info.x == kMaterialFallback) {
             // Diffuse::evaluate
             const float cosine = max(0.0f, dot(shading.surface.n, normalize(wi)));
             float3 color = gpu_texture3(material.textures.x, shading.surface, true);
             if (material.info.x == kMaterialFallback) color = gpu_fallback_color(shading.surface, material, color);
             e.value = color * (cosine / kPi);
+            e.diffuse = e.value;
             e.pdf = cosine / kPi;
             e.valid = cosine > 0.0f;
         }
@@ -1096,6 +1099,7 @@ struct GpuBackend {
             call.xi = query.xi;
             call.lightWi = query.lightWi;
             if (query.evaluateLight) call.flags |= kMaterialCallEvaluateLight;
+            if (query.lobes) call.flags |= kMaterialCallLobes;
             call.rng = rng.state;
 #ifdef PRISM_REORDER_MATERIALS
             // Threads that run the same program continue together.
@@ -1112,6 +1116,10 @@ struct GpuBackend {
         if (evaluatesLight(query, result.sample)) result.light = evaluate(shading, query.lightWi);
         result.medium = noMedium();
         if (entersMedium(result.sample, shading.surface.front_face)) result.medium = medium(shading);
+        // The diffuse part of the BSDF towards the sample (light lobes).
+        result.sampleDiffuse = (float3)0.0f;
+        if (query.lobes && result.sample.scattered && !result.sample.delta && !result.sample.null_event)
+            result.sampleDiffuse = diffuseFraction(evaluate(shading, result.sample.wi));
         return result;
     }
 
@@ -1223,4 +1231,21 @@ struct GpuBackend {
     int maxDepth() { return int(gpu_frame().settings.x); }
     int rouletteDepth() { return int(gpu_frame().settings.y); }
     bool environmentMis() { return (gpu_frame().settings.z & kFrameEnvironmentMis) != 0u; }
+    bool lightLobes() { return (gpu_frame().settings.z & kFrameLightLobes) != 0u; }
+
+    // The domes' radiance as diffuse and as glossy lobes see it.
+    EnvironmentLobes environmentLobes(float3 direction, float angularRadius)
+    {
+        EnvironmentLobes result;
+        result.diffuse = (float3)0.0f;
+        result.specular = (float3)0.0f;
+        const uint count = gpu_environment_count();
+        for (uint i = 0u; i < count; ++i) {
+            const GpuEnvironment env = gpu_environment(i);
+            const float3 radiance = gpu_environment_radiance(env, direction, angularRadius);
+            result.diffuse += radiance * env.selection.y;
+            result.specular += radiance * env.selection.z;
+        }
+        return result;
+    }
 };

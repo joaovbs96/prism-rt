@@ -1,0 +1,24 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    subLayers = [@light_lobes.usda@]
+)
+
+# light_lobes.usda with every light seen by glossy lobes only.
+over "World"
+{
+    over "Key"
+    {
+        float inputs:diffuse = 0
+    }
+
+    over "Bulb"
+    {
+        float inputs:diffuse = 0
+    }
+
+    over "Dome"
+    {
+        float inputs:diffuse = 0
+    }
+}

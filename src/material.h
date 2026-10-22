@@ -32,6 +32,7 @@ struct BRDFEvaluation {
     Color3 value = Color3(0.0f); // BSDF times abs(n.wi), in solid-angle measure
     float pdf = 0.0f;
     bool valid = false;
+    Color3 diffuse = Color3(0.0f); // the diffuse lobes' part of value (the rest is glossy)
 };
 
 // Emission that is the same at every point and in every direction of a
@@ -201,7 +202,7 @@ class Diffuse : public Material {
             BRDFEvaluation e;
             e.value = diffuse_color->sample(
                 hit.u, hit.v, hit.p, hit.texture_footprint) * (cosine / PI);
-            e.pdf = cosine / PI; e.valid = cosine > 0.0f; return e;
+            e.pdf = cosine / PI; e.valid = cosine > 0.0f; e.diffuse = e.value; return e;
         }
         bool supportsNee(const RayHit&) const override { return true; }
 

@@ -72,6 +72,7 @@ struct GpuSceneData {
     // Light/shadow linking (GpuInstance.links); shadow links keep the
     // instances outside some shadow set off the opaque shadow query.
     bool lightLinking = false;
+    bool lightLobes = false;      // LightTable::lobes (kFrameLightLobes)
     bool shadowLinks = false;
     int maxDepth = 32;
     int rouletteDepth = 4;

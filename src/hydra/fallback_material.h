@@ -49,7 +49,7 @@ public:
         BRDFEvaluation e = Diffuse::evaluate(hit, wi);
         float color[3];
         if (_primvarColor && _Primvar(hit, "displayColor", color, 3))
-            e.value = Color3(color[0], color[1], color[2]) * e.pdf; // pdf = cosine / pi
+            e.value = e.diffuse = Color3(color[0], color[1], color[2]) * e.pdf; // pdf = cosine / pi
         return e;
     }
 

@@ -3,7 +3,7 @@
 // The parity harness renders each fixture with the CLI and the Hydra
 // delegate; this checks that each render shows the feature.
 //
-// prism_scene_features_test FEATURE IMAGE.exr
+// prism_scene_features_test FEATURE IMAGE.exr...
 //
 //   camera_visibility  light_camera_visibility.usda: the light with
 //                      cameraVisibility = 1 is seen by the camera (and
@@ -14,6 +14,11 @@
 //                      their instances.
 //   display_color      display_color_interpolation.usda: displayColor and
 //                      displayOpacity of every interpolation (and indexed).
+//   light_lobes        FULL DIFFUSE SPECULAR: light_lobes.usda and its
+//                      variants: inputs:diffuse / inputs:specular light
+//                      multipliers split the image by BSDF lobe.
+//   lobes_consistency  MIS BSDF: a light_lobes variant rendered with MIS and
+//                      with BSDF sampling only agrees on every card.
 
 #include <OpenImageIO/imagebuf.h>
 
@@ -167,27 +172,93 @@ void DisplayColor(Image const& image)
     }
 }
 
+// light_lobes.usda (full), light_lobes_diffuse.usda, light_lobes_specular.usda:
+// cards at columns 11 (matte), 32 (plastic), 53 (metal), rows 18 to 46. The
+// matte card has no glossy lobe; the metal card's diffuse part is only MDL's
+// multiscatter compensation of its glossy lobe (about 1%). On every card the
+// diffuse-only and specular-only images add up to the full one.
+void LightLobes(std::vector<Image> const& images)
+{
+    Image const& full = images[0];
+    Image const& diffuse = images[1];
+    Image const& specular = images[2];
+    struct Card {
+        char const* name;
+        int x;
+    };
+    const Card cards[] = {{"matte", 11}, {"plastic", 32}, {"metal", 53}};
+    for (auto const& card : cards) {
+        for (int y : {23, 32, 41}) {
+            const float f = full.Gray(card.x, y, 4), d = diffuse.Gray(card.x, y, 4), s = specular.Gray(card.x, y, 4);
+            char text[256];
+            std::snprintf(text, sizeof(text), "%s card, row %d: diffuse %.4f + specular %.4f = full %.4f", card.name,
+                          y, d, s, f);
+            Check(f > 0.01f && std::abs(d + s - f) <= 0.04f * f, text);
+            if (std::string(card.name) == "matte")
+                Check(s < 1e-5f, Describe("the matte card has no glossy lobe: specular-only image", s));
+            if (std::string(card.name) == "metal")
+                Check(d < 0.02f * f, Describe("the metal card has no diffuse lobe: diffuse-only image", d));
+            if (std::string(card.name) == "plastic")
+                Check(d > 0.05f * f && s > 0.05f * f, Describe("the plastic card has both lobes (specular)", s));
+        }
+    }
+    // The camera sees the dome unscaled.
+    Check(std::abs(diffuse.Gray(32, 3) - full.Gray(32, 3)) < 0.01f * full.Gray(32, 3) &&
+              std::abs(specular.Gray(32, 3) - full.Gray(32, 3)) < 0.01f * full.Gray(32, 3),
+          Describe("the camera sees the dome unscaled", full.Gray(32, 3)));
+}
+
+// A light_lobes variant rendered with MIS (next-event estimation splits the
+// BSDF evaluation by lobe) and with BSDF sampling only (light hits are scaled
+// by the sampled direction's diffuse fraction): the card means agree (the
+// two estimators of each lobe are unbiased). Any resolution.
+void LobesConsistency(std::vector<Image> const& images)
+{
+    Image const& mis = images[0];
+    Image const& bsdf = images[1];
+    const float columns[] = {11.0f / 64.0f, 32.0f / 64.0f, 53.0f / 64.0f};
+    char const* names[] = {"matte", "plastic", "metal"};
+    for (int i = 0; i < 3; ++i) {
+        const int x = int(columns[i] * float(mis.width)), y = mis.height / 2;
+        const int r = std::max(1, mis.width * 5 / 64);
+        const float a = mis.Gray(x, y, r), b = bsdf.Gray(x, y, r);
+        char text[256];
+        std::snprintf(text, sizeof(text), "%s card: MIS %.4f, BSDF sampling %.4f", names[i], a, b);
+        Check(std::abs(a - b) <= 0.03f * std::max(a, b) + 1e-4f, text);
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv)
 {
-    std::map<std::string, std::function<void(Image const&)>> const checks = {
-        {"camera_visibility", CameraVisibility},
-        {"dome_temperature", DomeTemperature},
-        {"invisible_ids", InvisibleIds},
-        {"display_color", DisplayColor},
+    using Single = std::function<void(Image const&)>;
+    auto single = [](Single check) {
+        return std::make_pair(1, std::function<void(std::vector<Image> const&)>(
+            [check](std::vector<Image> const& images) { check(images[0]); }));
     };
-    if (argc != 3 || !checks.contains(argv[1])) {
-        std::printf("usage: prism_scene_features_test FEATURE IMAGE.exr\nfeatures:");
-        for (auto const& [name, check] : checks) std::printf(" %s", name.c_str());
+    // Each check and the number of images it takes.
+    std::map<std::string, std::pair<int, std::function<void(std::vector<Image> const&)>>> const checks = {
+        {"camera_visibility", single(CameraVisibility)},
+        {"dome_temperature", single(DomeTemperature)},
+        {"invisible_ids", single(InvisibleIds)},
+        {"display_color", single(DisplayColor)},
+        {"light_lobes", {3, LightLobes}},
+        {"lobes_consistency", {2, LobesConsistency}},
+    };
+    if (argc < 3 || !checks.contains(argv[1]) || argc - 2 != checks.at(argv[1]).first) {
+        std::printf("usage: prism_scene_features_test FEATURE IMAGE.exr...\nfeatures:");
+        for (auto const& [name, check] : checks) std::printf(" %s (%d)", name.c_str(), check.first);
         std::printf("\n");
         return 2;
     }
-    Image image;
-    if (!image.Load(argv[2])) {
-        std::printf("FAIL: cannot read %s\n", argv[2]);
-        return 1;
+    std::vector<Image> images(size_t(argc - 2));
+    for (int i = 2; i < argc; ++i) {
+        if (!images[size_t(i - 2)].Load(argv[i])) {
+            std::printf("FAIL: cannot read %s\n", argv[i]);
+            return 1;
+        }
     }
-    checks.at(argv[1])(image);
+    checks.at(argv[1]).second(images);
     return failures == 0 ? 0 : 1;
 }

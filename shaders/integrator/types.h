@@ -229,6 +229,7 @@ struct BsdfEvaluation {
     float3 value;      // bsdf * |cos|
     float pdf;
     bool valid;
+    float3 diffuse;    // the diffuse lobes' part of value (the rest is glossy)
 };
 
 // One material invocation per surface vertex: the BSDF sample, the BSDF
@@ -240,13 +241,27 @@ struct MaterialQuery {
     float4 xi;          // the BSDF's sample point
     float3 lightWi;     // the light direction of next-event estimation
     bool evaluateLight; // evaluate the BSDF towards lightWi
+    bool lobes;         // also the diffuse fraction of the BSDF towards the sample
 };
 
 struct MaterialResult {
     BsdfSample sample;
     BsdfEvaluation light;      // valid false unless evaluated
     MediumCoefficients medium; // valid false unless the path enters it
+    // With query.lobes: per channel, the part of the BSDF towards the sampled
+    // direction that is diffuse (0 for delta and unevaluated samples).
+    float3 sampleDiffuse;
 };
+
+// The diffuse part of an evaluation, per channel (0 where it is zero).
+inline float3 diffuseFraction(BsdfEvaluation e)
+{
+    if (!e.valid) return (float3)0.0f;
+    const float3 v = e.value;
+    return float3(v.x > 0.0f ? clamp(e.diffuse.x / v.x, 0.0f, 1.0f) : 0.0f,
+                  v.y > 0.0f ? clamp(e.diffuse.y / v.y, 0.0f, 1.0f) : 0.0f,
+                  v.z > 0.0f ? clamp(e.diffuse.z / v.z, 0.0f, 1.0f) : 0.0f);
+}
 
 // Which parts of a MaterialQuery a backend computes after sampling: a cutout
 // crossing (null event) neither connects to the light nor enters a medium.
@@ -261,7 +276,7 @@ inline bool entersMedium(BsdfSample sample, bool frontFace)
 
 inline BsdfEvaluation invalidBsdfEvaluation()
 {
-    const BsdfEvaluation e = {(float3)0.0f, 0.0f, false};
+    const BsdfEvaluation e = {(float3)0.0f, 0.0f, false, (float3)0.0f};
     return e;
 }
 
@@ -275,6 +290,13 @@ struct EnvironmentLightSample {
     float3 wi;
     float3 radiance;
     float pdf;
+};
+
+// The domes' radiance as diffuse and as glossy lobes see it: each dome's
+// radiance times its UsdLux diffuse or specular multiplier.
+struct EnvironmentLobes {
+    float3 diffuse;
+    float3 specular;
 };
 
 inline RayFootprint emptyFootprint()

@@ -31,6 +31,9 @@ struct LightTable {
     std::unordered_map<const Material*, Emitter> emitters;
     size_t emitterTriangles = 0;
     bool emittersOverBudget = false;
+    // Some light or dome has UsdLux diffuse or specular multipliers other
+    // than 1 (the integrator's light lobes).
+    bool lobes = false;
 };
 
 // Emissive triangles beyond this many are left to BSDF sampling.
@@ -99,10 +102,13 @@ inline LightTable BuildLightTable(SceneManager& scene, size_t maxEmitterTriangle
         if (std::isfinite(r) && r > 0.0f) sceneRadius = r;
     }
 
+    table.lobes = EnvironmentHasLobes(scene.environment);
     std::vector<double> weights;
     for (prism::SceneLight const& light : scene.lights) {
         if (!(Luminance(light.radiance) > 0.0f)) continue;
+        table.lobes |= light.diffuse != 1.0f || light.specular != 1.0f;
         LightRecord record{};
+        record.lobes = float4(light.diffuse, light.specular, 0.0f, 0.0f);
         record.info.y = (light.cameraVisible ? kLightCameraVisible : 0u);
         record.info.z = kLightTextureNone;
         record.info.w = light.lightLinkBit;
@@ -242,6 +248,7 @@ inline LightTable BuildLightTable(SceneManager& scene, size_t maxEmitterTriangle
         record.v = F4(t.p[2], area);
         record.n = F4(n.normalize(), 0.0f);
         record.radiance = F4(t.emission.radiance, 0.0f);
+        record.lobes = float4(1.0f, 1.0f, 0.0f, 0.0f);
         table.records.push_back(record);
         weights.push_back(double(pi) * luminance * area * (t.emission.twoSided ? 2.0 : 1.0));
         table.emitters[t.material].twoSided = t.emission.twoSided;

@@ -871,6 +871,46 @@ if(TARGET prism_hydra_render AND TARGET prism_compare_images)
             endforeach()
         endif()
     endforeach()
+    # Light inputs:diffuse / inputs:specular: the full image and its
+    # diffuse-only and specular-only variants. As for "lights", the loaders
+    # order the lights differently: noise, not bias (the mean agrees).
+    foreach(_variant light_lobes light_lobes_diffuse light_lobes_specular)
+        prism_add_parity_fixture(NAME ${_variant} SCENE tests/hydra/fixtures/${_variant}.usda SPP 64
+            TOLERANCE 0.05 MEAN_TOLERANCE 0.01)
+    endforeach()
+    if(TARGET prism_scene_features_test)
+        foreach(_frontend cli hydra)
+            add_test(NAME prism_scene_features_light_lobes_${_frontend}
+                COMMAND prism_scene_features_test light_lobes
+                    "${prism_parity_light_lobes_dir}/${_frontend}/image.exr"
+                    "${prism_parity_light_lobes_diffuse_dir}/${_frontend}/image.exr"
+                    "${prism_parity_light_lobes_specular_dir}/${_frontend}/image.exr")
+            set_tests_properties(prism_scene_features_light_lobes_${_frontend} PROPERTIES
+                FIXTURES_REQUIRED "prism_parity_light_lobes;prism_parity_light_lobes_diffuse;prism_parity_light_lobes_specular")
+        endforeach()
+        # Each lobe is unbiased: next-event estimation (which splits the BSDF
+        # evaluation) and BSDF sampling alone (which scales light hits by the
+        # sample's diffuse fraction) agree. No sample clamp: it would bias the
+        # BSDF-only render.
+        foreach(_variant light_lobes_diffuse light_lobes_specular)
+            foreach(_sampling mis bsdf)
+                add_test(NAME prism_scene_features_${_variant}_${_sampling}_render
+                    COMMAND PrismRT --scene "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/${_variant}.usda"
+                        --camera /World/Camera --width 32 --height 32 --spp 1024 --device cpu
+                        --max-sample-radiance 0 --environment-sampling ${_sampling}
+                        --output "${CMAKE_BINARY_DIR}/scene_features/${_variant}_${_sampling}.exr")
+                set_tests_properties(prism_scene_features_${_variant}_${_sampling}_render PROPERTIES
+                    ENVIRONMENT "${_prism_test_environment};PRISM_DEVICE=cpu"
+                    FIXTURES_SETUP prism_scene_features_${_variant}_sampling)
+            endforeach()
+            add_test(NAME prism_scene_features_${_variant}_consistency
+                COMMAND prism_scene_features_test lobes_consistency
+                    "${CMAKE_BINARY_DIR}/scene_features/${_variant}_mis.exr"
+                    "${CMAKE_BINARY_DIR}/scene_features/${_variant}_bsdf.exr")
+            set_tests_properties(prism_scene_features_${_variant}_consistency PROPERTIES
+                FIXTURES_REQUIRED prism_scene_features_${_variant}_sampling)
+        endforeach()
+    endif()
     if(TARGET prism_render_settings_test)
         # Named channels and sane values in both frontends' products; the
         # crop matches its region of the full frame (Hydra accumulates it

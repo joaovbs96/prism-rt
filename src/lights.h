@@ -33,6 +33,10 @@ struct SceneLight {
     float area = 0.0f;            // world-space surface area
     Color3 radiance = Color3(0.0f); // point light: intensity; parallel distant light: irradiance
     bool cameraVisible = false;
+    // UsdLux diffuse and specular multipliers: the light as diffuse and as
+    // glossy BSDF lobes see it.
+    float diffuse = 1.0f;
+    float specular = 1.0f;
     std::shared_ptr<Texture<Color3>> texture; // rect lights
     // Light and shadow linking: the category bit of the surfaces the light
     // illuminates, and of those casting its shadows (0: every surface).
@@ -56,6 +60,8 @@ struct LightParameters {
     float angle = 0.53f;          // degrees, distant lights
     bool treatAsPoint = false;
     bool cameraVisible = false;
+    float diffuse = 1.0f;         // inputs:diffuse
+    float specular = 1.0f;        // inputs:specular
 };
 
 // localToWorld in GfMatrix4d layout: row-vector convention, m[row * 4 + column],
@@ -76,6 +82,8 @@ inline SceneLight MakeSceneLight(LightParameters const& params, std::array<doubl
     SceneLight light;
     light.shape = params.shape;
     light.cameraVisible = params.cameraVisible;
+    light.diffuse = params.diffuse;
+    light.specular = params.specular;
     light.position = point(0.0f, 0.0f, 0.0f);
     const Float3 x = vector(1.0f, 0.0f, 0.0f), y = vector(0.0f, 1.0f, 0.0f), z = vector(0.0f, 0.0f, 1.0f);
     // Emission side of planar lights: the transformed -Z, kept perpendicular

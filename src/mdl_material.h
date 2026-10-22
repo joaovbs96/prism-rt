@@ -398,6 +398,7 @@ private:
         result.value = Color3(ed.bsdf_diffuse.x + ed.bsdf_glossy.x,
                               ed.bsdf_diffuse.y + ed.bsdf_glossy.y,
                               ed.bsdf_diffuse.z + ed.bsdf_glossy.z);
+        result.diffuse = Color3(ed.bsdf_diffuse.x, ed.bsdf_diffuse.y, ed.bsdf_diffuse.z);
         result.pdf = ed.pdf;
         result.valid = result.pdf >= 0.0f && std::isfinite(result.pdf);
         return result;

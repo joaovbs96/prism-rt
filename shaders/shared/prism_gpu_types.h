@@ -75,6 +75,7 @@ static const uint kFramePrimaryHits = 128u;  // preview, pass: also store each p
 static const uint kFrameLightLinking = 256u; // instances carry light/shadow-link categories
 static const uint kFrameSpatialLights = 512u; // spatial light selection (SampleSettings::spatialLights)
 static const uint kFrameTextureFeedback = 1024u; // record requested texture levels (Vulkan texture streaming)
+static const uint kFrameLightLobes = 2048u;   // UsdLux diffuse/specular light multipliers (LightTable::lobes)
 
 // Work modes.
 static const uint kModePass = 0u;      // one sample per listed pixel
@@ -186,7 +187,8 @@ struct GpuEnvironment {
     float4 multiplier; // xyz: lat-long multiplier, w: transform determinant
     float4 toLocal[3]; // rows of the world-to-environment matrix
     float4 toWorld[3]; // rows of its inverse
-    float4 selection;  // x: probability of sampling this dome among the domes
+    float4 selection;  // x: probability of sampling this dome among the domes, y: UsdLux diffuse
+                       // multiplier, z: specular multiplier
     uint4 info3;       // x: offset of its importance tables
 };
 

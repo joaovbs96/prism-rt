@@ -4,8 +4,8 @@
 // shading point and the material query; the program answers with
 // backend.shade's MaterialResult, or with the cutout opacity of a hit.
 //
-// Only what the MDL state and the BSDF read travels: 47 words in, 21 out
-// (272 bytes). The payload goes through the callable's stack, so every word
+// Only what the MDL state and the BSDF read travels: 47 words in, 24 out
+// (284 bytes). The payload goes through the callable's stack, so every word
 // costs memory traffic on each call.
 
 #pragma once
@@ -18,6 +18,7 @@ static const uint kMaterialCallModeMask = 1u;
 static const uint kMaterialCallFrontFace = 2u;
 static const uint kMaterialCallFiltered = 4u;
 static const uint kMaterialCallEvaluateLight = 8u;
+static const uint kMaterialCallLobes = 2048u;   // MaterialQuery::lobes
 // The caller's texture feedback: on, and its path weight (9 bits from bit 12).
 static const uint kMaterialCallFeedback = 1024u;
 static const uint kMaterialCallFeedbackWeightShift = 12u;
@@ -64,7 +65,20 @@ struct MaterialCall {
     float3 sigmaA;
     float3 sigmaS;
     float g;
+    // Light lobes (kMaterialCallLobes): the diffuse fractions of the light
+    // evaluation (diffuseFraction) and of the sample (sampleDiffuse), as six
+    // 16-bit unorms.
+    uint lobes0;
+    uint lobes1;
+    uint lobes2;
 };
+
+uint packUnorm16x2(float a, float b)
+{
+    return uint(saturate(a) * 65535.0f + 0.5f) | (uint(saturate(b) * 65535.0f + 0.5f) << 16u);
+}
+
+float unpackUnorm16(uint word, uint shift) { return float((word >> shift) & 0xffffu) / 65535.0f; }
 
 MaterialCall materialCall(SurfaceHit hit, uint material, uint mode)
 {
@@ -105,6 +119,9 @@ MaterialCall materialCall(SurfaceHit hit, uint material, uint mode)
     call.sigmaA = (float3)0.0f;
     call.sigmaS = (float3)0.0f;
     call.g = 0.0f;
+    call.lobes0 = 0u;
+    call.lobes1 = 0u;
+    call.lobes2 = 0u;
     return call;
 }
 
@@ -157,8 +174,14 @@ void storeMaterialResult(inout MaterialCall call, MaterialResult result)
     call.sigmaA = result.medium.sigmaA;
     call.sigmaS = result.medium.sigmaS;
     call.g = result.medium.g;
+    if ((call.flags & kMaterialCallLobes) != 0u) {
+        const float3 light = diffuseFraction(result.light);
+        call.lobes0 = packUnorm16x2(light.x, light.y);
+        call.lobes1 = packUnorm16x2(light.z, result.sampleDiffuse.x);
+        call.lobes2 = packUnorm16x2(result.sampleDiffuse.y, result.sampleDiffuse.z);
+    }
     uint flags = call.flags & (kMaterialCallModeMask | kMaterialCallFrontFace | kMaterialCallFiltered |
-                               kMaterialCallEvaluateLight);
+                               kMaterialCallEvaluateLight | kMaterialCallLobes);
     if (result.sample.scattered) flags |= kMaterialCallScattered;
     if (result.sample.delta) flags |= kMaterialCallDelta;
     if (result.sample.null_event) flags |= kMaterialCallNullEvent;
@@ -186,5 +209,13 @@ MaterialResult loadMaterialResult(MaterialCall call)
     result.medium.sigmaS = call.sigmaS;
     result.medium.g = call.g;
     result.medium.valid = (call.flags & kMaterialCallMediumValid) != 0u;
+    result.light.diffuse = (float3)0.0f;
+    result.sampleDiffuse = (float3)0.0f;
+    if ((call.flags & kMaterialCallLobes) != 0u) {
+        result.light.diffuse = result.light.value * float3(unpackUnorm16(call.lobes0, 0u),
+            unpackUnorm16(call.lobes0, 16u), unpackUnorm16(call.lobes1, 0u));
+        result.sampleDiffuse = float3(unpackUnorm16(call.lobes1, 16u), unpackUnorm16(call.lobes2, 0u),
+                                      unpackUnorm16(call.lobes2, 16u));
+    }
     return result;
 }

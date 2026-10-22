@@ -40,6 +40,7 @@ void material(inout MaterialCall call)
     query.xi = call.xi;
     query.lightWi = call.lightWi;
     query.evaluateLight = (call.flags & kMaterialCallEvaluateLight) != 0u;
+    query.lobes = (call.flags & kMaterialCallLobes) != 0u;
     const MaterialResult result = backend.shade(shading, query);
     storeMaterialResult(call, result);
     call.rng = backend.rng.state;

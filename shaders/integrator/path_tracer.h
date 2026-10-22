@@ -40,6 +40,9 @@
 //                                                 emissive triangle (0: not a light)
 //   int      backend.maxDepth(), backend.rouletteDepth()
 //   bool     backend.environmentMis()
+//   bool     backend.lightLobes()             some light or dome has UsdLux diffuse or specular
+//                                                 multipliers other than 1
+//   EnvironmentLobes backend.environmentLobes(float3 direction, float angularRadius)
 //   Rng      backend.rng                          white noise for materials and cutouts
 //
 // The integrator's own dimensions (pixel, lens, BSDF, light and roulette
@@ -245,6 +248,9 @@ struct PathState {
     // the light the next segment may hit.
     float3 previousPosition;
     float previousPdf;         // BSDF density of the segment's direction
+    // With light lobes: per channel, the diffuse part of the BSDF that sampled
+    // the segment (MaterialResult::sampleDiffuse); 0 for camera rays.
+    float3 previousDiffuse;
     float previousNeeProbability;
     bool previousNee;          // that vertex sampled lights: weight hits with MIS
     uint receiver;             // light-link categories of the last surface
@@ -265,7 +271,8 @@ struct PathState {
 // both samples the BSDF and evaluates it towards the light.
 struct LightConnection {
     float3 wi;
-    float3 radiance;
+    float3 radiance;           // with light lobes: as diffuse lobes see it
+    float3 radianceSpecular;   // with light lobes: as glossy lobes see it
     float distance;            // infinity: the dome or a distant light
     float pdf;                 // neeProbability * selection * light density
     uint shadowBit;            // shadow-link category of the light (0: all)
@@ -294,6 +301,7 @@ struct PathTracer {
     int maxDepth;
     int rouletteDepth;
     bool spatial;              // spatial light selection
+    bool lobes;                // UsdLux diffuse / specular light multipliers (backend.lightLobes)
 
     // SceneManager::environmentVisible: stochastic transmission through cutouts.
     // Opaque geometry anywhere on the ray blocks it whatever cutouts lie in
@@ -427,10 +435,18 @@ struct PathTracer {
                 const float pmf = spatial ? analyticPmf(light, from, receiver, sums) : light.n.w;
                 misWeight = powerHeuristic(bsdfPdf, neeProbability * pmf * crossing.pdf);
             }
-            sum += crossing.radiance * misWeight;
+            if (lobes && !cameraRay)
+                sum += crossing.radiance * lobeScale(light.lobes.x, light.lobes.y) * misWeight;
+            else
+                sum += crossing.radiance * misWeight;
         }
         return sum;
     }
+
+    // UsdLux diffuse (kd) and specular (ks) light multipliers for a light the
+    // path's last BSDF sample reached: the BSDF's diffuse part sees kd, the
+    // rest ks (with light lobes).
+    float3 lobeScale(float kd, float ks) { return (float3)ks + (kd - ks) * path.previousDiffuse; }
 
     // -----------------------------------------------------------------------
     // The steps of a path. A bounce is extend (trace the segment, media,
@@ -450,6 +466,7 @@ struct PathTracer {
     {
         settings = sampleSettings;
         mis = backend.environmentMis();
+        lobes = backend.lightLobes();
         maxDepth = backend.maxDepth();
         rouletteDepth = backend.rouletteDepth();
         spatial = spatialSelection(settings.spatialLights);
@@ -461,6 +478,7 @@ struct PathTracer {
         path.previousPdf = 0.0f;
         path.previousNeeProbability = 1.0f;
         path.previousNee = false;
+        path.previousDiffuse = (float3)0.0f;
         path.receiver = ~0u;
         path.depth = 0;
         path.nullCrossings = 0;
@@ -506,6 +524,7 @@ struct PathTracer {
         path.ray.footprint = footprint;
         path.ray.footprint.exact = false;
         path.previousNee = false;
+        path.previousDiffuse = (float3)1.0f; // lights see scattering in media as diffuse
     }
 
     // Traces the path's next segment. Returns the surface the path goes on
@@ -566,7 +585,13 @@ struct PathTracer {
         if (!hit.surface.valid) {
             if (path.tracking) path.outcome = sawLight ? kPrimaryAccepted : kPrimaryEscaped;
             const float3 direction = normalize(path.ray.ray.direction);
-            const float3 li = backend.environmentRadiance(direction, angularRadius(path.ray.footprint));
+            float3 li;
+            if (lobes && path.depth > 0) {
+                const EnvironmentLobes l = backend.environmentLobes(direction, angularRadius(path.ray.footprint));
+                li = l.specular + (l.diffuse - l.specular) * path.previousDiffuse;
+            } else {
+                li = backend.environmentRadiance(direction, angularRadius(path.ray.footprint));
+            }
             float misWeight = 1.0f;
             if (weighted)
                 misWeight = powerHeuristic(path.previousPdf, path.previousNeeProbability * domeSelectionProbability() *
@@ -586,6 +611,7 @@ struct PathTracer {
         vertex.samplerDimension = path.sampler.dimension;
         vertex.light.wi = (float3)0.0f;
         vertex.light.radiance = (float3)0.0f;
+        vertex.light.radianceSpecular = (float3)0.0f;
         vertex.light.distance = infinity();
         vertex.light.pdf = 0.0f;
         vertex.light.shadowBit = 0u;
@@ -614,6 +640,9 @@ struct PathTracer {
             }
         }
         LightSample light = invalidLightSample();
+        // With light lobes: the light as glossy lobes see it (light.radiance:
+        // as diffuse lobes see it).
+        float3 specular = (float3)0.0f;
         if (pick.index >= lightCount) {
             const EnvironmentLightSample dome =
                 backend.sampleEnvironment(path.sampler.next4(), angularRadius(hit.surface.ray_footprint));
@@ -623,6 +652,12 @@ struct PathTracer {
             light.distance = infinity();
             light.delta = false;
             light.valid = dome.pdf > 0.0f && isfinite(dome.pdf);
+            if (lobes && light.valid) {
+                const EnvironmentLobes l =
+                    backend.environmentLobes(dome.wi, angularRadius(hit.surface.ray_footprint));
+                light.radiance = l.diffuse;
+                specular = l.specular;
+            }
         } else {
             const LightRecord record = backend.light(pick.index);
             const float4 u = path.sampler.next4();
@@ -632,10 +667,15 @@ struct PathTracer {
             if (record.info.w != 0u && (vertex.receiver & record.info.w) == 0u) light.valid = false;
             if (light.valid && (record.info.y & kLightTextured) != 0u)
                 light.radiance *= backend.lightTexture(record.info.z, sampled.texcoord);
+            if (lobes) {
+                specular = light.radiance * record.lobes.y;
+                light.radiance *= record.lobes.x;
+            }
         }
         vertex.light.valid = light.valid && pick.pmf > 0.0f;
         vertex.light.wi = light.wi;
         vertex.light.radiance = light.radiance;
+        vertex.light.radianceSpecular = specular;
         vertex.light.distance = light.distance;
         vertex.light.delta = light.delta;
         vertex.light.pdf = vertex.neeProbability * pick.pmf * light.pdf;
@@ -692,7 +732,13 @@ struct PathTracer {
         if (!(f.valid && f.pdf >= 0.0f && isfinite(f.pdf))) return;
         const float lightPdf = vertex.light.pdf;
         const float misWeight = vertex.light.delta ? 1.0f : powerHeuristic(lightPdf, f.pdf);
-        const float3 contribution = path.weight * f.value * vertex.light.radiance * (misWeight / lightPdf);
+        float3 contribution;
+        if (lobes)
+            contribution = path.weight *
+                (f.diffuse * vertex.light.radiance + (f.value - f.diffuse) * vertex.light.radianceSpecular) *
+                (misWeight / lightPdf);
+        else
+            contribution = path.weight * f.value * vertex.light.radiance * (misWeight / lightPdf);
         PathRay shadow = spawnRay(hit.surface, vertex.light.wi, false);
         if (isfinite(vertex.light.distance)) shadow.ray.tfar = vertex.light.distance * (1.0f - 1e-4f);
         if (maxComponent(contribution) > 0.0f && visible(shadow, vertex.light.shadowBit))
@@ -732,6 +778,7 @@ struct PathTracer {
         path.previousPdf = bs.pdf;
         path.previousNeeProbability = vertex.neeProbability;
         path.previousPosition = hit.surface.p;
+        path.previousDiffuse = material.sampleDiffuse;
         path.weight *= bs.color * rouletteWeight;
         path.ray = spawnRay(hit.surface, bs.wi, bs.null_event);
         ++path.depth;
@@ -750,6 +797,7 @@ struct PathTracer {
         const SurfaceVertex vertex = chooseLight(hit, canNee);
         query.lightWi = vertex.light.wi;
         query.evaluateLight = vertex.light.valid;
+        query.lobes = lobes;
         backend.pathWeight(path.throughput); // texture streaming feedback (GPU)
         const MaterialResult material = backend.shade(shading, query);
         if (!arrive(hit, vertex, material.sample)) return;

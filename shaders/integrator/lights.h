@@ -40,7 +40,8 @@ static const uint kLightTextureNone = 0xffffffffu;
 // v.w is the area of area lights, n.w the selection probability, radiance
 // the emitted radiance (irradiance for a parallel distant light); radiance.w
 // is 1 + the index of the shadow-link category bit (0: every surface casts
-// shadows).
+// shadows). lobes holds the UsdLux diffuse (x) and specular (y) multipliers:
+// the light as diffuse and as glossy BSDF lobes see it (1 for triangles).
 struct LightRecord {
     uint4 info;      // x: type, y: flags, z: texture (rect), w: light-link category bit (0: all)
     float4 p0;
@@ -48,6 +49,7 @@ struct LightRecord {
     float4 v;
     float4 n;
     float4 radiance;
+    float4 lobes;
 };
 
 struct LightSample {

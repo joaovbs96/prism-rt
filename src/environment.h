@@ -81,6 +81,12 @@ class Environment {
         }
         return float(sum / count * 4.0 * 3.14159265358979323846);
     }
+
+    // UsdLux diffuse and specular multipliers of a dome: its radiance as
+    // diffuse and as glossy BSDF lobes see it (the integrator's light lobes;
+    // camera rays see the radiance unscaled). Set by the loaders.
+    float diffuseFactor = 1.0f;
+    float specularFactor = 1.0f;
 };
 
 class ConstantColorBackground : public Environment {
@@ -458,3 +464,35 @@ public:
     std::vector<const Environment*> parts;
     std::vector<float> weights; // selection probabilities
 };
+
+// Whether an environment (or a part of a composite) has diffuse or specular
+// multipliers other than 1.
+inline bool EnvironmentHasLobes(Environment const* environment)
+{
+    if (!environment) return false;
+    if (auto const* composite = dynamic_cast<CompositeEnvironment const*>(environment)) {
+        for (auto const* part : composite->parts)
+            if (EnvironmentHasLobes(part)) return true;
+        return false;
+    }
+    return environment->diffuseFactor != 1.0f || environment->specularFactor != 1.0f;
+}
+
+// The radiance from `direction` as diffuse and as glossy lobes see it: each
+// dome's radiance times its diffuseFactor / specularFactor, summed.
+inline void EnvironmentRadianceLobes(Environment const* environment, Float3 const& direction,
+                                     prism::DirectionFootprint const& footprint, Color3* diffuse, Color3* specular)
+{
+    *diffuse = Color3(0.0f);
+    *specular = Color3(0.0f);
+    if (!environment) return;
+    auto add = [&](Environment const* part) {
+        const Color3 radiance = part->radiance(direction, footprint);
+        *diffuse += radiance * part->diffuseFactor;
+        *specular += radiance * part->specularFactor;
+    };
+    if (auto const* composite = dynamic_cast<CompositeEnvironment const*>(environment))
+        for (auto const* part : composite->parts) add(part);
+    else
+        add(environment);
+}

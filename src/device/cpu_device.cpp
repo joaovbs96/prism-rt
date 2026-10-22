@@ -111,6 +111,7 @@ SampleResult TraceSample(SceneManager& scene, CpuSceneState const& state, Camera
     tracer.backend.scene = &scene;
     tracer.backend.opaqueScene = state.opaque;
     tracer.backend.lights = state.lights.get();
+    tracer.backend.lobes = state.lights && state.lights->lobes;
     tracer.backend.rng.state = seed;
     tracer.path.sampler = {sample, pixelSeed, 0u};
     const SampleResult result = tracer.renderSample(camera, x, y, width, height, settings);

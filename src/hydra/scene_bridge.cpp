@@ -241,7 +241,8 @@ HdContainerDataSourceHandle _MakeStaticPrimCopy(
             HdLightTokens->enableColorTemperature, HdLightTokens->colorTemperature,
             HdLightTokens->radius, HdLightTokens->width, HdLightTokens->height,
             HdLightTokens->length, HdLightTokens->angle, _LightTokens().treatAsPoint,
-            _LightTokens().cameraVisibility, HdTokens->lightLink, HdTokens->shadowLink};
+            _LightTokens().cameraVisibility, HdLightTokens->diffuse, HdLightTokens->specular,
+            HdTokens->lightLink, HdTokens->shadowLink};
         for (TfToken const &token : consumed) {
             if (light->Get(token) &&
                 std::find(lightNames.begin(), lightNames.end(), token) ==
@@ -3215,6 +3216,8 @@ void _SetDomeEnvironment(HdSceneIndexBaseRefPtr const &scene,
             texture = std::make_shared<ImageTexture<Color3>>(*image);
         auto local = snapshot->prototypePool->environmentCache.Get(std::move(texture), multiplier);
         auto dome = std::make_unique<CachedTransformedEnvironment>(std::move(local), linear);
+        dome->diffuseFactor = _ContainerValue(light, HdLightTokens->diffuse, 1.0f);
+        dome->specularFactor = _ContainerValue(light, HdLightTokens->specular, 1.0f);
         // Several domes light the scene together (CompositeEnvironment).
         if (++snapshot->domeCount == 1) {
             snapshot->environment = std::move(dome);
@@ -3271,6 +3274,8 @@ void _AddAnalyticLight(HdSceneIndexBaseRefPtr const &scene,
     params.angle = _ContainerValue(light, HdLightTokens->angle, 0.53f);
     params.treatAsPoint = _ContainerValue(light, _LightTokens().treatAsPoint, false);
     params.cameraVisible = _ContainerValue(light, _LightTokens().cameraVisibility, false);
+    params.diffuse = _ContainerValue(light, HdLightTokens->diffuse, 1.0f);
+    params.specular = _ContainerValue(light, HdLightTokens->specular, 1.0f);
     const GfMatrix4d world = _WorldTransform(scene, path);
     std::array<double, 16> matrix{};
     for (int row = 0; row < 4; ++row)

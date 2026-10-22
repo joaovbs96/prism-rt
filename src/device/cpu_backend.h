@@ -39,6 +39,8 @@ struct CpuBackend {
     Rng rng = {0u};
     // Every material of the scene always blocks shadow rays (no cutouts).
     bool opaqueScene = false;
+    // LightTable::lobes
+    bool lobes = false;
 
     static prism::PathRay ToQuery(::PathRay const& ray)
     {
@@ -127,7 +129,7 @@ struct CpuBackend {
     BsdfEvaluation evaluate(CpuShading const& shading, float3 wi)
     {
         const BRDFEvaluation e = shading.material->evaluatePrepared(*shading.hit, ToFloat3(wi), shading.prepared);
-        const BsdfEvaluation result = {FromFloat3(e.value), e.pdf, e.valid};
+        const BsdfEvaluation result = {FromFloat3(e.value), e.pdf, e.valid, FromFloat3(e.diffuse)};
         return result;
     }
 
@@ -141,6 +143,10 @@ struct CpuBackend {
         result.light = evaluatesLight(query, result.sample) ? evaluate(shading, query.lightWi)
                                                              : invalidBsdfEvaluation();
         result.medium = entersMedium(result.sample, shading.hit->front_face) ? medium(shading) : noMedium();
+        // The diffuse part of the BSDF towards the sample (light lobes).
+        result.sampleDiffuse = float3(0.0f);
+        if (query.lobes && result.sample.scattered && !result.sample.delta && !result.sample.null_event)
+            result.sampleDiffuse = diffuseFraction(evaluate(shading, result.sample.wi));
         return result;
     }
 
@@ -169,6 +175,16 @@ struct CpuBackend {
     }
 
     float environmentPdf(float3 direction) { return scene->environment->directionPdf(ToFloat3(direction)); }
+
+    bool lightLobes() { return lobes; }
+    EnvironmentLobes environmentLobes(float3 direction, float angular)
+    {
+        Color3 diffuse, specular;
+        EnvironmentRadianceLobes(scene->environment, ToFloat3(direction),
+                                 prism::DirectionFootprint{angular, scene->textureFiltering}, &diffuse, &specular);
+        const EnvironmentLobes result = {FromFloat3(diffuse), FromFloat3(specular)};
+        return result;
+    }
 
     uint lightCount() { return lights ? uint(lights->records.size()) : 0u; }
     uint analyticLightCount() { return lights ? lights->analyticCount : 0u; }
