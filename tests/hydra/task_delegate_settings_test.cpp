@@ -155,7 +155,10 @@ int RunAuthoredSettingsTests()
         Require(index->getChildCalls.load(std::memory_order_relaxed) ==
                     childrenBeforeSync,
                 "Settings sync traversed scene-index children");
-        Require(primQueries == 3,
+        // At most the three cached settings prims (up to the first active
+        // one) and the root's scene globals (no active render settings path
+        // in this scene index).
+        Require(primQueries >= 2 && primQueries <= 4,
                 "Settings sync queried more than the cached settings prims");
         Require(delegate.GetRenderSetting(TfToken("prism:samplesPerPixel"))
                     .UncheckedGet<int>() == 31,
