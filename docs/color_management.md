@@ -188,10 +188,14 @@ like the CLI's 8-bit outputs. That needs PrismRT's OpenUSD patch (below).
   as `openusd-<new version>-hdx-ocio-lut-sampler.patch` (the build fails if it
   no longer applies). With an unpatched OpenUSD (an older prefix), set
   `PRISM_USDVIEW_OCIO_VIEW=Un-tone-mapped`.
-- On the CPU device the usdview viewport matches the CLI's PNG of the same
-  view (the default ACES 2.0 SDR one, and `--view Un-tone-mapped` with that
-  view) to within one 8-bit level outside the HUD
-  (`tests/hydra/fixtures/color_management.usda` and the Cornell box).
+- On the CPU device the usdview viewport (camera gate) matches the CLI's PNG
+  of the same view, the default ACES 2.0 SDR one as well as
+  `Un-tone-mapped`: `tests/hydra/fixtures/color_management.usda` to within
+  one 8-bit level (98% of the pixels; the rest are usdview's gate and axis
+  lines), the Cornell box to 0.3 levels on average over 16x16-pixel blocks
+  (per-pixel differences are sampling noise). usdrecord's image of the
+  fixture equals the CLI's where it is opaque (it writes the dome with
+  alpha 0).
 - usdview fills its *OCIO Config* menu (displays, views, input colour spaces)
   with `PyOpenColorIO`, which is not installed: vcpkg's port has no Python
   bindings, and the pip wheel brings its own OpenColorIO library. usdview then
