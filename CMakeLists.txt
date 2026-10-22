@@ -852,7 +852,8 @@ if(TARGET prism_hydra_render AND TARGET prism_compare_images)
     # loaders render the fixture, prism_scene_features_test checks each render.
     # <feature>:<fixture>
     set(_prism_scene_features
-        camera_visibility:light_camera_visibility)
+        camera_visibility:light_camera_visibility
+        dome_temperature:dome_color_temperature)
     foreach(_entry IN LISTS _prism_scene_features)
         string(REPLACE ":" ";" _parts "${_entry}")
         list(GET _parts 0 _feature)

@@ -3170,8 +3170,12 @@ void _SetDomeEnvironment(HdSceneIndexBaseRefPtr const &scene,
         snapshot->warnedFeatures.insert("domeTextureFormat").second)
         TF_WARN("PrismRT: dome texture format '%s' is not supported; reading it as lat-long",
                 format.GetText());
-    const GfVec3f color = _ContainerValue(
+    GfVec3f color = _ContainerValue(
         light, HdLightTokens->color, GfVec3f(1.0f));
+    // As for the other lights: the blackbody colour (linear Rec.709) tints it.
+    if (_ContainerValue(light, HdLightTokens->enableColorTemperature, false))
+        color = GfCompMult(color, UsdLuxBlackbodyTemperatureAsRgb(
+            _ContainerValue(light, HdLightTokens->colorTemperature, 6500.0f)));
     const float intensity = _ContainerValue(light, HdLightTokens->intensity, 1.0f);
     const float exposure = _ContainerValue(light, HdLightTokens->exposure, 0.0f);
     const float scale = intensity * std::exp2(exposure);

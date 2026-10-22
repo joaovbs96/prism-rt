@@ -8,6 +8,8 @@
 //   camera_visibility  light_camera_visibility.usda: the light with
 //                      cameraVisibility = 1 is seen by the camera (and
 //                      covers its pixels), the other is not; both light the floor.
+//   dome_temperature   dome_color_temperature.usda: the dome's colour
+//                      temperature tints it.
 
 #include <OpenImageIO/imagebuf.h>
 
@@ -96,12 +98,23 @@ void CameraVisibility(Image const& image)
     }
 }
 
+// dome_color_temperature.usda: a 3000 K dome is orange (red > green > blue)
+// in any working space; an untinted dome would be grey.
+void DomeTemperature(Image const& image)
+{
+    const float r = image.Mean(3, 3, 0), g = image.Mean(3, 3, 1), b = image.Mean(3, 3, 2);
+    Check(r > 0.1f, Describe("the dome is seen", r));
+    Check(r > 1.1f * g && g > 1.1f * b, Describe("the dome is orange (red / blue)", b > 0.0f ? r / b : r));
+    Check(r > 2.0f * b, Describe("the tint is strong, red / blue", b > 0.0f ? r / b : r));
+}
+
 } // namespace
 
 int main(int argc, char** argv)
 {
     std::map<std::string, std::function<void(Image const&)>> const checks = {
         {"camera_visibility", CameraVisibility},
+        {"dome_temperature", DomeTemperature},
     };
     if (argc != 3 || !checks.contains(argv[1])) {
         std::printf("usage: prism_scene_features_test FEATURE IMAGE.exr\nfeatures:");
