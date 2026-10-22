@@ -236,6 +236,10 @@ noise but no bias.
 | cornell_box | 1.4e-3 | 1% |
 | in_one_weekend | 6.2e-5 | 1% |
 | lights | 0.068 (mean 0.2%) | 10% (mean 1%) |
+| dome_color_temperature, pointinstancer_invisible_ids, display_color_interpolation | 0 | 1% |
+| light_camera_visibility | 2.0e-3 | 1% |
+| light_lobes (full, diffuse, specular) | 0.012, 0.005, 0.014 (mean below 1e-4) | 5% (mean 1%): lights in another order |
+| double_sided | 0.016 (mean 0.25%) | 3% (mean 1%): the mirrored card's far side (see the call) |
 
 The CLI does not load these fixtures like Hydra yet (phase 7):
 
