@@ -13,7 +13,8 @@
   small enough to cache. The tags and pip versions come from tools/deps.json;
   tools/build_deps_local.ps1 runs this same script on a development machine;
   -UsdOnly rebuilds OpenUSD alone against existing OpenSubdiv and MaterialX
-  prefixes.
+  prefixes. After cloning OpenUSD it applies tools/ci/patches/openusd-<version>-*.patch
+  (failing if one does not apply) and copies them to <UsdPrefix>\patches.
 #>
 param(
     [string] $Prefix = "",
@@ -56,7 +57,19 @@ function Run([string] $what, [scriptblock] $block) {
 }
 function Clone([string] $url, [string] $tag, [string] $dest) {
     if (Test-Path -LiteralPath $dest) { Remove-Item -LiteralPath $dest -Recurse -Force }
-    Run "clone $url $tag" { git clone --quiet --depth 1 --branch $tag $url $dest }
+    # core.autocrlf=false: the checkout matches the repository byte for byte, so
+    # the patches (LF, tools/ci/patches) apply on any Git configuration.
+    Run "clone $url $tag" { git clone --quiet --depth 1 --config core.autocrlf=false --branch $tag $url $dest }
+}
+# Applies tools/ci/patches/openusd-<version>-*.patch (Get-PrismUsdPatches) to
+# the OpenUSD clone, and fails if any of them no longer applies.
+function ApplyPatches([string] $dest) {
+    $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+    foreach ($patch in Get-PrismUsdPatches) {
+        $file = Join-Path $repoRoot $patch
+        Run "check $patch" { git -C $dest apply --check $file }
+        Run "apply $patch" { git -C $dest apply $file }
+    }
 }
 function Fwd([string] $path) { return $path.Replace('\', '/') }
 
@@ -100,6 +113,8 @@ $parallel = @(if ($Jobs -gt 0) { "--parallel", "$Jobs" } else { "--parallel" })
 Write-Host "OpenSubdiv $OpenSubdivTag -> $osdPrefix"
 Write-Host "MaterialX $MaterialXTag -> $mtlxPrefix"
 Write-Host "OpenUSD $UsdTag -> $usdPrefix"
+$usdPatches = @(Get-PrismUsdPatches)
+Write-Host ("OpenUSD patches: " + $(if ($usdPatches.Count) { $usdPatches -join ", " } else { "none" }))
 Write-Host "oneTBB $TbbRoot, Python $pyVersion $python"
 Write-Host "OpenColorIO $ocioVersion $OcioRoot"
 
@@ -145,6 +160,9 @@ Run "build MaterialX" { cmake --build "$mtlxSrc\build" --target install --config
 # usdrecord); OCIO_LOCATION makes OpenUSD's FindOpenColorIO module find vcpkg's.
 $usdSrc = Join-Path $SourceDir "OpenUSD"
 Clone "https://github.com/PixarAnimationStudios/OpenUSD" $UsdTag $usdSrc
+# Fixes for this OpenUSD version that upstream does not have yet: see each
+# patch's header for what it fixes and when to delete it.
+ApplyPatches $usdSrc
 Run "configure OpenUSD" {
     cmake -S $usdSrc -B "$usdSrc\build" @generator "-DCMAKE_INSTALL_PREFIX=$(Fwd $usdPrefix)" `
         "-DPython3_EXECUTABLE=$(Fwd $python)" "-DPython3_ROOT_DIR=$(Fwd $pythonRoot)" `
@@ -197,6 +215,14 @@ if (Get-ChildItem $usdPrefix -Recurse -Filter "OpenColorIO*.dll" -File) {
 Copy-Item (Join-Path $usdSrc "pxr\usdImaging\bin\usdview\usdview.py") (Join-Path $usdPrefix "lib\python\usdview.py")
 Copy-Item (Join-Path $usdSrc "LICENSE.txt") (Join-Path $usdPrefix "LICENSE.txt")
 Copy-Item (Join-Path $usdSrc "NOTICE.txt") (Join-Path $usdPrefix "NOTICE.txt") -ErrorAction SilentlyContinue
+# The changes made to OpenUSD's sources, shipped with the package's licences.
+$patchOut = Join-Path $usdPrefix "patches"
+if (Test-Path -LiteralPath $patchOut) { Remove-Item -LiteralPath $patchOut -Recurse -Force }
+if ($usdPatches.Count) {
+    New-Item -ItemType Directory -Force -Path $patchOut | Out-Null
+    $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+    foreach ($patch in $usdPatches) { Copy-Item (Join-Path $repoRoot $patch) $patchOut }
+}
 
 if (Test-Path -LiteralPath (Join-Path $usdPrefix "include\tbb")) {
     throw "The OpenUSD install contains legacy TBB headers; it was built against the wrong TBB."

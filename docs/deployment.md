@@ -88,8 +88,8 @@ and `MDL_SDK_ROOT`, replace `PATH` with the package directories plus
 `%LOCALAPPDATA%\PrismRT\cache` (set `PRISMRT_CACHE_DIR` to move them). The device
 is automatic; `PRISMRT_DEVICE=cpu` forces the CPU. `OCIO` is kept, and set to
 `ocio://studio-config-latest` when unset, so usdview shows PrismRT's ACEScg
-colour AOV through OpenColorIO (the `Un-tone-mapped` sRGB view, as OpenUSD
-26.08 renders the ACES 2.0 views black; see
+colour AOV through OpenColorIO (the config's default view, ACES 2.0 SDR on
+sRGB like `prism_render.bat`'s images; it needs the patched OpenUSD, see
 [color_management.md](color_management.md#usdview)). `usdview.bat` without a scene
 opens the Cornell box through its camera; with only options it adds the same
 scene; otherwise it passes its arguments to usdview. `README.txt` in the package
@@ -111,7 +111,10 @@ counter that forces CI to rebuild its cached stacks. Its consumers:
 
 - `tools/deps.psm1`: `Get-PrismDeps` and `Get-PrismCacheKey -Stack usd|mdl`
   (the versions, `stack_revision`, the runner image and a hash of the build
-  scripts), used by every script below.
+  scripts and, for `usd`, of the OpenUSD patches), used by every script below.
+  `Get-PrismUsdPatches` lists the patches for `deps.json`'s OpenUSD version
+  (`tools/ci/patches/openusd-<version>-*.patch`) and `Get-PrismUsdPatchHash`
+  hashes them.
 - `tools/ci/export_deps.ps1`: exports the versions and cache keys to each CI job
   (`GITHUB_ENV` and step outputs, including `setup-python`'s version).
   `windows.yml` has no version literals.
@@ -137,6 +140,11 @@ counter that forces CI to rebuild its cached stacks. Its consumers:
    version, and `vcpkg.openimageio` to that version.
 2. Run `python tools/check_deps.py --write`. It updates the vcpkg manifests
    and lists every doc line that still names the old version; fix those.
+   For OpenUSD, check each `tools/ci/patches/openusd-<old version>-*.patch`:
+   the new version no longer applies it. Delete the ones the new release
+   fixes (each patch's header names the upstream issue or PR); rebase the
+   others onto the new tag as `openusd-<new version>-*.patch` (`git diff`
+   against the tag). The build stops when a patch does not apply.
 3. Rebuild the local stack: `tools/build_deps_local.ps1` (OpenUSD, MaterialX,
    OpenSubdiv) builds into new versioned prefixes next to the old ones; point
    `cmake/PrismLocalDependencies.cmake` and `prism_local_env.ps1` at them.
@@ -156,7 +164,7 @@ same `tools/ci/build_usd_stack.ps1` as CI (oneTBB through
 `PXR_FIND_TBB_IN_CONFIG=ON`, no legacy TBB headers, Python from `deps.json`,
 imaging, usdview, MaterialX and OpenColorIO support, `RelWithDebInfo`) into
 `<Root>\opensubdiv-<version>`, `<Root>\materialx-<version>` and
-`<Root>\openusd-<version>-ocio<OpenColorIO version>`:
+`<Root>\openusd-<version>-ocio<OpenColorIO version>[-p<patch hash>]`:
 
 ```powershell
 .\tools\build_deps_local.ps1 -TbbRoot C:\deps\oneapi-tbb-2022.2.0 -WorkDir D:\prism-deps\src -VcpkgRoot D:\prism-deps\vcpkg
@@ -177,6 +185,17 @@ install, `build_usd_stack.ps1` replaces the import library's absolute path in
 `find_dependency(OpenColorIO ...)` to `pxrConfig.cmake`, so PrismRT links the
 OpenColorIO it found itself, and checks that `usd_hdx.dll` imports
 `OpenColorIO_2_6.dll`.
+
+OpenUSD is patched: after cloning, `build_usd_stack.ps1` applies every
+`tools/ci/patches/openusd-<version>-*.patch` for `deps.json`'s OpenUSD version
+(`git apply --check`, then `git apply`; the clone uses `core.autocrlf=false`
+so the LF patches apply on any Git setup) and fails if one does not apply. It
+copies them to `<prefix>\patches`, and the package ships them next to
+OpenUSD's licence. The local prefix carries their short hash
+(`Get-PrismUsdPatchHash`), so a patched build never replaces an unpatched one:
+OpenUSD 26.08 with the Hdx OpenColorIO LUT fix
+([color_management.md](color_management.md#usdview)) is
+`openusd-26.08-ocio2.6.0-p7e45c2c5`. A version without patches has no suffix.
 
 `-UsdOnly` rebuilds OpenUSD alone against the existing OpenSubdiv and
 MaterialX prefixes, for example after an OpenColorIO change:
@@ -209,7 +228,8 @@ vcpkg install --triplet x64-windows --x-manifest-root=. --x-install-root=build\v
 - `usd` job: builds OpenSubdiv, MaterialX and OpenUSD with
   `tools/ci/build_usd_stack.ps1`, like the development machine. The install,
   minus `.pdb` files, is cached under `Get-PrismCacheKey -Stack usd`, which
-  includes the OpenColorIO version and PrismRT's vcpkg baseline. On a hit
+  includes the OpenColorIO version, PrismRT's vcpkg baseline and the OpenUSD
+  patches (`usd-26.08-p<patch hash>-...`, and in the files hash). On a hit
   the job only does the cache lookup. Otherwise it restores the `build` job's
   vcpkg binary cache (read-only) and installs vcpkg's OpenColorIO with
   `tools/ci/install_ocio.ps1` for OpenUSD to link. It does not use

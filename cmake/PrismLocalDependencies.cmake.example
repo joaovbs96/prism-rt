@@ -6,7 +6,7 @@
 # The roots come from PRISM_* environment variables (CI sets them), or edit
 # them directly. tools/build_deps_local.ps1 builds OpenSubdiv, MaterialX and
 # OpenUSD into versioned prefixes, for example:
-#   PRISM_OPENUSD_ROOT     D:/prism-deps/openusd-26.08-ocio2.6.0
+#   PRISM_OPENUSD_ROOT     D:/prism-deps/openusd-26.08-ocio2.6.0-p7e45c2c5
 #   PRISM_MATERIALX_ROOT   D:/prism-deps/materialx-1.39.5
 #   PRISM_OPENSUBDIV_ROOT  D:/prism-deps/opensubdiv-3.6.1
 # The versions themselves live only in tools/deps.json; the configure checks

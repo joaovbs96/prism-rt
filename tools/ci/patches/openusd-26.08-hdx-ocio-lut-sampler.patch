@@ -1,0 +1,57 @@
+HdxColorCorrectionTask: fix OpenColorIO's 1D/2D LUT textures (OCIO v2 path)
+
+Applied by tools/ci/build_usd_stack.ps1 to OpenUSD v26.08; the code is
+unchanged on OpenUSD's dev branch (bc32a655a417, 2026-10-13). Without it every
+OCIO view that uses 1D/2D LUT textures, among them the studio config's ACES
+2.0 views, renders black in usdview and usdrecord on OpenGL and Vulkan:
+
+- only 3D LUTs got a sampler name, so _CreateOpenColorIOShaderCode failed
+  TF_VERIFY(!texName.empty() && !samplerName.empty()) and left the OCIO
+  shader's samplers unbound;
+- single-channel LUTs were created without data (the stored vector stayed
+  empty, so initialData was null);
+- RGB LUTs were counted as 4 floats per texel, reading past OCIO's 3-float
+  buffer.
+
+Upstream: PixarAnimationStudios/OpenUSD PR #3419 (open, fixes the first two)
+and issue #3274. Delete this file when the OpenUSD tag in tools/deps.json has
+the fix (docs/color_management.md, usdview).
+
+diff --git a/pxr/imaging/hdx/colorCorrectionTask.cpp b/pxr/imaging/hdx/colorCorrectionTask.cpp
+index 7503900..fd1b913 100644
+--- a/pxr/imaging/hdx/colorCorrectionTask.cpp
++++ b/pxr/imaging/hdx/colorCorrectionTask.cpp
+@@ -407,9 +407,11 @@ HdxColorCorrectionTask::_CreateOpenColorIOResourcesImpl(
+
+         shaderDesc->getTextureValues(i, lutValues);
+
++        // OCIO provides one float per texel for TEXTURE_RED_CHANNEL and
++        // three (RGB) otherwise.
+         int channelPerPix =
+             channel == OCIO::GpuShaderCreator::TextureType::TEXTURE_RED_CHANNEL
+-                ? 1 : 4;
++                ? 1 : 3;
+         int valueCount = channelPerPix*width*height;
+         HgiFormat fmt =
+             channelPerPix == 1 ? HgiFormatFloat32 : HgiFormatFloat32Vec3;
+@@ -421,6 +423,10 @@ HdxColorCorrectionTask::_CreateOpenColorIOResourcesImpl(
+             fmt = HgiFormatFloat32Vec4;
+             channelPerPix = 4;
+             lutValues = float4AdaptedLutValues.data();
++        } else if (lutValues) {
++            // The texture is created from the stored values below, so keep
++            // a copy of single-channel LUTs too.
++            float4AdaptedLutValues.assign(lutValues, lutValues + valueCount);
+         }
+
+         // Texture description
+@@ -444,6 +450,9 @@ HdxColorCorrectionTask::_CreateOpenColorIOResourcesImpl(
+
+         // Sampler description
+         HgiSamplerDesc sampDesc;
++        // The sampler name is substituted in the OCIO shader text on
++        // OpenGL and Vulkan (_CreateOpenColorIOShaderCode).
++        sampDesc.debugName = samplerName;
+         sampDesc.magFilter =
+             interpolation == OCIO::Interpolation::INTERP_NEAREST ?
+                 HgiSamplerFilterNearest : HgiSamplerFilterLinear;

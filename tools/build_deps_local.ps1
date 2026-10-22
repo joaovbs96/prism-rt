@@ -8,7 +8,11 @@
   prefix, so an upgrade never overwrites the stack in use:
 
     <Root>\opensubdiv-<version>   <Root>\materialx-<version>
-    <Root>\openusd-<version>-ocio<OpenColorIO version>
+    <Root>\openusd-<version>-ocio<OpenColorIO version>[-p<patch hash>]
+
+  -p<patch hash> is the short hash of the OpenUSD patches the build applies
+  (tools/ci/patches/openusd-<version>-*.patch, Get-PrismUsdPatchHash); a
+  version without patches has no suffix.
 
   Like CI: oneTBB (PXR_FIND_TBB_IN_CONFIG=ON, no legacy TBB headers), Python
   from deps.json, imaging, usdview, MaterialX and OpenColorIO support on,
@@ -93,11 +97,14 @@ if (-not $OcioRoot) {
     $OcioRoot = Join-Path $ocioInstall "x64-windows"
 }
 
-# The OpenUSD prefix names the OpenColorIO it was built against: hdx links it.
+# The OpenUSD prefix names the OpenColorIO it was built against (hdx links it)
+# and, as -p<hash>, the patches applied to it (Get-PrismUsdPatchHash).
+$usdPatchHash = Get-PrismUsdPatchHash
 $prefixes = @{
     Osd  = Join-Path $Root "opensubdiv-$($deps.opensubdiv.version)"
     Mtlx = Join-Path $Root "materialx-$($deps.materialx.version)"
-    Usd  = Join-Path $Root "openusd-$($deps.openusd.version)-ocio$ocioVersion"
+    Usd  = Join-Path $Root ("openusd-$($deps.openusd.version)-ocio$ocioVersion" +
+        $(if ($usdPatchHash) { "-p$usdPatchHash" } else { "" }))
 }
 $sw = [Diagnostics.Stopwatch]::StartNew()
 $arguments = @{

@@ -5,7 +5,7 @@
 .EXAMPLE
   Import-Module ./tools/deps.psm1
   (Get-PrismDeps).openusd.tag          # v26.08
-  Get-PrismCacheKey -Stack usd         # usd-26.08-osd-3.6.1-...-ocio-2.6.0-vcpkg-...-<script hash>
+  Get-PrismCacheKey -Stack usd         # usd-26.08-p<patch hash>-osd-3.6.1-...-ocio-2.6.0-vcpkg-...-<script hash>
 #>
 $script:DepsJson = Join-Path $PSScriptRoot "deps.json"
 $script:RepoRoot = Split-Path -Parent $PSScriptRoot
@@ -39,9 +39,31 @@ function Get-PrismFilesHash {
 }
 
 <#
+  The patches tools/ci/build_usd_stack.ps1 applies to OpenUSD: every
+  tools/ci/patches/openusd-<version>-*.patch for deps.json's OpenUSD version,
+  as repository-relative paths in the order they are applied. A version
+  upgrade therefore drops them; each patch says when to delete it.
+#>
+function Get-PrismUsdPatches {
+    $version = (Get-PrismDeps).openusd.version
+    $dir = Join-Path $script:RepoRoot "tools\ci\patches"
+    if (-not (Test-Path -LiteralPath $dir)) { return @() }
+    return @(Get-ChildItem -LiteralPath $dir -Filter "openusd-$version-*.patch" -File |
+        Sort-Object Name | ForEach-Object { "tools/ci/patches/$($_.Name)" })
+}
+
+# Short hash of the OpenUSD patches ("" without any): it names the local
+# OpenUSD prefix and goes into the usd cache key.
+function Get-PrismUsdPatchHash {
+    $patches = Get-PrismUsdPatches
+    if (-not $patches.Count) { return "" }
+    return (Get-PrismFilesHash $patches).Substring(0, 8)
+}
+
+<#
   Cache key of a CI-built dependency stack: the versions that go into it, the
   stack revision (bump it to force a rebuild), the runner image and a hash of
-  the scripts that build it.
+  the scripts that build it (and of the OpenUSD patches they apply).
 #>
 function Get-PrismCacheKey {
     param(
@@ -53,8 +75,10 @@ function Get-PrismCacheKey {
         "usd" {
             # OpenUSD links vcpkg's OpenColorIO (tools/ci/install_ocio.ps1).
             $files = @("tools/ci/build_usd_stack.ps1", "tools/ci/fetch_prebuilt.ps1",
-                "tools/ci/install_ocio.ps1")
-            $parts = @("usd-$($d.openusd.version)", "osd-$($d.opensubdiv.version)",
+                "tools/ci/install_ocio.ps1") + @(Get-PrismUsdPatches)
+            $patchHash = Get-PrismUsdPatchHash
+            $usd = "usd-$($d.openusd.version)" + $(if ($patchHash) { "-p$patchHash" } else { "" })
+            $parts = @($usd, "osd-$($d.opensubdiv.version)",
                 "mtlx-$($d.materialx.version)", "tbb-$($d.onetbb.version)",
                 "ocio-$($d.vcpkg.opencolorio)", "vcpkg-$($d.vcpkg.baseline.Substring(0, 10))",
                 "py$($d.python.version)", ("pip-" + ((Get-PrismPipRequirements) -join "_").Replace("==", "")))
@@ -69,4 +93,5 @@ function Get-PrismCacheKey {
     return ($parts -join "-")
 }
 
-Export-ModuleMember -Function Get-PrismDeps, Get-PrismPipRequirements, Get-PrismFilesHash, Get-PrismCacheKey
+Export-ModuleMember -Function Get-PrismDeps, Get-PrismPipRequirements, Get-PrismFilesHash, Get-PrismCacheKey,
+    Get-PrismUsdPatches, Get-PrismUsdPatchHash

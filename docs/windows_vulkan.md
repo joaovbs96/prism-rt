@@ -49,8 +49,10 @@ table.
 
 builds the three with `tools/ci/build_usd_stack.ps1`, exactly as CI does, into
 `D:\prism-deps\opensubdiv-3.6.1`, `materialx-1.39.5` and
-`openusd-26.08-ocio2.6.0` (about 100 minutes with `-Jobs 6`, almost all of it
-OpenUSD; the work directory, about 20 GB, can be deleted afterwards). First it
+`openusd-26.08-ocio2.6.0-p7e45c2c5` (about 100 minutes with `-Jobs 6`, almost
+all of it OpenUSD; the work directory, about 20 GB, can be deleted afterwards;
+`-p<hash>` names the OpenUSD patches from `tools/ci/patches` it applies, such
+as the fix that lets usdview show the ACES 2.0 views). First it
 installs vcpkg's OpenColorIO (`tools/ci/install_ocio.ps1`, from the vcpkg clone
 at `deps.json`'s baseline) into `D:\prism-deps\opencolorio-2.6.0-vcpkg` for
 OpenUSD to link. `-UsdOnly` rebuilds only OpenUSD against the existing

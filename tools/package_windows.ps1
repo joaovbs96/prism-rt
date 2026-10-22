@@ -269,6 +269,9 @@ Copy-IfExists (Join-Path $root "LICENSE") $lic "PrismRT-LICENSE.txt"
 $usdSource = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $UsdviewScript))))
 foreach ($c in @((Join-Path $usdSource "LICENSE.txt"), (Join-Path $UsdRoot "LICENSE.txt"))) { Copy-IfExists $c $lic "OpenUSD-LICENSE.txt" }
 Copy-IfExists (Join-Path $UsdRoot "NOTICE.txt") $lic "OpenUSD-NOTICE.txt"
+# The changes PrismRT's build made to OpenUSD (build_usd_stack.ps1).
+Get-ChildItem -LiteralPath (Join-Path $UsdRoot "patches") -Filter "*.patch" -File -ErrorAction SilentlyContinue |
+    ForEach-Object { Copy-IfExists $_.FullName (Join-Path $lic "OpenUSD-patches") $_.Name }
 Copy-IfExists (Join-Path $MaterialXRoot "LICENSE") $lic "MaterialX-LICENSE.txt"
 Copy-IfExists (Join-Path $MaterialXRoot "THIRD-PARTY.md") $lic "MaterialX-THIRD-PARTY.md"
 foreach ($n in @("LICENSE.md", "LICENSE_THIRDPARTY.md", "LICENSE.txt", "LICENSE")) { Copy-IfExists (Join-Path $MdlSdkRoot $n) $lic "MDL-SDK-$n" }

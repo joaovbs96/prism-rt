@@ -1,0 +1,2 @@
+# git apply needs the patches byte for byte (LF), whatever core.autocrlf says.
+*.patch -text
