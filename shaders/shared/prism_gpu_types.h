@@ -16,6 +16,13 @@ static const uint kInstancePlacement = 1u;   // has a placement transform (norma
 static const uint kInstanceFlip = 2u;        // orientation flip of the geometric and shading normals
 static const uint kInstanceMirrored = 4u;    // reflection: negates the bitangent sign
 static const uint kInstanceOpaque = 8u;      // every material always blocks shadow rays
+static const uint kInstanceCullBackFaces = 16u; // some primitive has kPrimitiveCullBackFace (non-opaque in the
+                                                // acceleration structure, so the trace can skip its back faces)
+
+// Per-primitive material table entries: the material index, and the
+// prism:honorDoubleSided cull bit of single-sided, non-transmissive triangles.
+static const uint kPrimitiveMaterialMask = 0x7fffffffu;
+static const uint kPrimitiveCullBackFace = 0x80000000u;
 
 // Instance masks of the acceleration structure: shadow rays first query the
 // opaque instances for any hit, then walk the others for cutouts.

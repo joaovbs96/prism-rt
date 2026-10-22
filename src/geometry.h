@@ -412,6 +412,12 @@ class Mesh : public Geometry {
             int offset = 0;
         };
         std::vector<Primvar> primvars;
+        // USD doubleSided false per triangle (empty: none), for the CLI's
+        // merged mesh (SceneManager::culledBackFace).
+        std::vector<uint8_t> single_sided;
+        // Every triangle is single-sided (the delegate's meshes: USD
+        // doubleSided false).
+        bool single_sided_all = false;
         int primvarStride = 0;
         std::vector<float> primvarValues;
 

@@ -2809,6 +2809,10 @@ bool VulkanDevice::Impl::buildAccelerationStructures(std::string* error)
         instance.mask = (d.instances[i].info.y & kInstanceOpaque) != 0u ? kMaskOpaque : kMaskNonOpaque;
         instance.instanceShaderBindingTableRecordOffset = 0;
         instance.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+        // prism:honorDoubleSided: the trace skips culled back faces itself
+        // (gpu_culled_triangle), so their triangles must reach it.
+        if ((d.instances[i].info.y & kInstanceCullBackFaces) != 0u)
+            instance.flags |= VK_GEOMETRY_INSTANCE_FORCE_NO_OPAQUE_BIT_KHR;
         instance.accelerationStructureReference = bottomLevel[structureOfPrototype[d.instances[i].info.x]].address;
     }
     Buffer instanceBuffer;

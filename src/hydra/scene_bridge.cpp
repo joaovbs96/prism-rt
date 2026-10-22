@@ -1835,6 +1835,11 @@ MeshConversion _ConvertMesh(HdContainerDataSourceHandle const &dataSource,
 
     std::unique_ptr<Mesh, ConvertedMeshDeleter> mesh(new Mesh());
     mesh->primvarStride = extraStride;
+    // USD doubleSided (default false), for prism:honorDoubleSided.
+    if (auto doubleSided = meshSchema.GetDoubleSided())
+        mesh->single_sided_all = !doubleSided->GetTypedValue(0.0f);
+    else
+        mesh->single_sided_all = true;
     for (size_t e = 0; e < extras.size(); ++e)
         mesh->primvars.push_back({extras[e].name, extras[e].components, extraOffsets[e]});
     mesh->vertices.reserve(3 * triangleEstimate);
@@ -2020,6 +2025,7 @@ MeshConversion _ConvertMesh(HdContainerDataSourceHandle const &dataSource,
     }
     for (float const value : mesh->tangents) hashCombine(geometryHash, value);
     for (auto const &primvar : mesh->primvars) hashCombine(geometryHash, primvar.name);
+    hashCombine(geometryHash, mesh->single_sided_all);
     for (float const value : mesh->primvarValues) hashCombine(geometryHash, value);
     for (unsigned int const index : mesh->indices) hashCombine(geometryHash, index);
     info.geometryHash = geometryHash;
@@ -2030,7 +2036,8 @@ MeshConversion _ConvertMesh(HdContainerDataSourceHandle const &dataSource,
 
 bool _EqualMeshGeometry(Mesh const &mesh, Mesh const *other)
 {
-    if (!other || mesh.vertices.size() != other->vertices.size() ||
+    if (!other || mesh.single_sided_all != other->single_sided_all ||
+        mesh.vertices.size() != other->vertices.size() ||
         mesh.normals.size() != other->normals.size() ||
         mesh.texcoords.size() != other->texcoords.size() ||
         mesh.tangents != other->tangents ||
@@ -3816,6 +3823,7 @@ std::shared_ptr<Snapshot> _BuildSnapshot(HdSceneIndexBaseRefPtr const &scene,
     result->scene->environmentSampling =
         settings.environmentSampling == RenderSettings::EnvironmentSampling::Mis;
     result->scene->textureFiltering = settings.textureFiltering;
+    result->scene->honorDoubleSided = settings.honorDoubleSided;
     result->scene->textureStreaming = settings.textureStreaming;
     result->sphereBatching = settings.sphereBatching;
     result->fallbackTexture = std::make_unique<ColorTexture>(Color3(0.5f));
@@ -5793,6 +5801,7 @@ void SceneBridge::SetSettings(RenderSettings const &requested)
             current.refinementDelayMs == settings.refinementDelayMs &&
             current.resourceRevision == settings.resourceRevision &&
             current.sphereBatching == settings.sphereBatching &&
+            current.honorDoubleSided == settings.honorDoubleSided &&
             current.hiddenGeometryBudgetMiB == settings.hiddenGeometryBudgetMiB &&
             current.textureFiltering == settings.textureFiltering &&
             current.textureStreaming == settings.textureStreaming &&
@@ -5819,6 +5828,7 @@ void SceneBridge::SetSettings(RenderSettings const &requested)
             current.spatialLights != settings.spatialLights ||
             current.resourceRevision != settings.resourceRevision ||
             current.sphereBatching != settings.sphereBatching ||
+            current.honorDoubleSided != settings.honorDoubleSided ||
             current.textureFiltering != settings.textureFiltering ||
             current.textureStreaming != settings.textureStreaming ||
             current.environmentSampling != settings.environmentSampling ||
@@ -5908,6 +5918,19 @@ void SceneBridge::SetSettings(RenderSettings const &requested)
         _impl->dirtyKinds |= static_cast<unsigned int>(SceneDirtyKind::Structure);
         ++_impl->conservativeRebuilds;
         _impl->lastRebuildReason = "sphere batching changed";
+    }
+    if (_impl->snapshot &&
+        _impl->settings.honorDoubleSided != settings.honorDoubleSided) {
+        _impl->sceneDirty = true;
+        if (_impl->buildCancel)
+            _impl->buildCancel->store(true, std::memory_order_relaxed);
+        ++_impl->requestedGeneration;
+        _impl->dirtyJournal.push_back({
+            _impl->requestedGeneration,
+            static_cast<unsigned int>(SceneDirtyKind::Structure), {}});
+        _impl->dirtyKinds |= static_cast<unsigned int>(SceneDirtyKind::Structure);
+        ++_impl->conservativeRebuilds;
+        _impl->lastRebuildReason = "honorDoubleSided changed";
     }
     _impl->settings = settings;
     _impl->prototypePool->hiddenGeometryBudgetBytes.store(
@@ -6849,6 +6872,8 @@ bool SceneBridge::Prepare(CameraState const &camera,
                                     RenderSettings::EnvironmentSampling::Mis;
                             result.snapshot->scene->textureFiltering =
                                 jobSettings.textureFiltering;
+                            result.snapshot->scene->honorDoubleSided =
+                                jobSettings.honorDoubleSided;
                             result.snapshot->scene->textureStreaming =
                                 jobSettings.textureStreaming;
                         }
@@ -6889,6 +6914,8 @@ bool SceneBridge::Prepare(CameraState const &camera,
                 RenderSettings::EnvironmentSampling::Mis;
         _impl->snapshot->scene->textureFiltering =
             _impl->settings.textureFiltering;
+        _impl->snapshot->scene->honorDoubleSided =
+            _impl->settings.honorDoubleSided;
         _impl->snapshot->scene->textureStreaming =
             _impl->settings.textureStreaming;
     }

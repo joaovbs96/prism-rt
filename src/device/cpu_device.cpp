@@ -112,6 +112,7 @@ SampleResult TraceSample(SceneManager& scene, CpuSceneState const& state, Camera
     tracer.backend.opaqueScene = state.opaque;
     tracer.backend.lights = state.lights.get();
     tracer.backend.lobes = state.lights && state.lights->lobes;
+    tracer.backend.culling = state.culling;
     tracer.backend.rng.state = seed;
     tracer.path.sampler = {sample, pixelSeed, 0u};
     const SampleResult result = tracer.renderSample(camera, x, y, width, height, settings);
@@ -137,7 +138,9 @@ std::shared_ptr<const CpuSceneState> CpuDevice::PreparedScene(SceneManager& scen
         // ray then takes the per-hit path.
         bool shadowLinks = false;
         for (auto const& light : scene.lights) shadowLinks |= light.shadowLinkBit != 0u;
-        state->opaque = !(scene.lightLinking && shadowLinks) && AllMaterialsBlock(scene);
+        state->culling = scene.cullsBackFaces();
+        // Culled back faces let shadow rays through: they take the per-hit path.
+        state->opaque = !(scene.lightLinking && shadowLinks) && !state->culling && AllMaterialsBlock(scene);
         state->lights = std::make_shared<LightTable>(BuildLightTable(scene));
         m_state = std::move(state);
         m_stateOf = &scene;
@@ -339,7 +342,7 @@ void CpuDevice::RenderPass(SceneManager& scene, PassRequest const& request)
                         for (unsigned y = tile.y; y < tile.y + tile.height; ++y) {
                             if (abandoned()) return;
                             for (unsigned x = tile.x; x < tile.x + tile.width; ++x) {
-                                const auto hit = scene.cast_ray(centers[(y-tile.y)*tile.width+x-tile.x]);
+                                const auto hit = scene.castRayCulled(centers[(y-tile.y)*tile.width+x-tile.x], state->culling);
                                 if (!request.traceColor) ++geometricWork.value;
                                 request.resolvePrimary(x, y, hit);
                             }
@@ -421,7 +424,7 @@ bool CpuDevice::RenderPreview(SceneManager& scene, PreviewRequest const& request
             }
             ++colorWork.value;
             if (request.tracePrimary) {
-                const RayHit primary = scene.cast_ray(center);
+                const RayHit primary = scene.castRayCulled(center, state->culling);
                 request.writePixel(px, py, color, coverage, &primary);
             } else {
                 request.writePixel(px, py, color, coverage, nullptr);

@@ -871,6 +871,20 @@ if(TARGET prism_hydra_render AND TARGET prism_compare_images)
             endforeach()
         endif()
     endforeach()
+    # prism:honorDoubleSided (the fixture's render settings turn it on). The
+    # loaders shade the far side of the mirrored (negative scale) card
+    # differently, culled or not (CLI mirroring: phase 7); it reaches the image
+    # only through indirect light: noise-level NRMSE (0.016), mean 0.3%.
+    prism_add_parity_fixture(NAME double_sided SCENE tests/hydra/fixtures/double_sided.usda
+        ARGS --render-settings /Render/Settings TOLERANCE 0.03 MEAN_TOLERANCE 0.01)
+    if(TARGET prism_scene_features_test)
+        foreach(_frontend cli hydra)
+            add_test(NAME prism_scene_features_double_sided_${_frontend}
+                COMMAND prism_scene_features_test double_sided "${prism_parity_double_sided_dir}/${_frontend}/image.exr")
+            set_tests_properties(prism_scene_features_double_sided_${_frontend} PROPERTIES
+                FIXTURES_REQUIRED prism_parity_double_sided)
+        endforeach()
+    endif()
     # Light inputs:diffuse / inputs:specular: the full image and its
     # diffuse-only and specular-only variants. As for "lights", the loaders
     # order the lights differently: noise, not bias (the mean agrees).

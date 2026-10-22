@@ -41,6 +41,8 @@ struct CpuBackend {
     bool opaqueScene = false;
     // LightTable::lobes
     bool lobes = false;
+    // CpuSceneState::culling
+    bool culling = false;
 
     static prism::PathRay ToQuery(::PathRay const& ray)
     {
@@ -82,7 +84,7 @@ struct CpuBackend {
         query.ray.tfar = ray.ray.tfar;
         query.ray.mask = -1;
         query.footprint = ToFootprint(ray.footprint);
-        const RayHit rh = scene->cast_ray(query);
+        const RayHit rh = scene->castRayCulled(query, culling);
         CpuHit hit;
         hit.surface = FromRayHit(rh);
         hit.primvarMesh = rh.primvarMesh;

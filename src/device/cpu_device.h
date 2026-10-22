@@ -13,6 +13,8 @@ struct LightTable;
 struct CpuSceneState {
     // Every material of the scene always blocks shadow rays.
     bool opaque = false;
+    // Back faces of single-sided geometry are culled (SceneManager::cullsBackFaces).
+    bool culling = false;
     std::shared_ptr<const LightTable> lights;
 };
 

@@ -277,6 +277,7 @@ void GpuRenderDevice::RenderPass(SceneManager& scene, PassRequest const& request
             request.rayNanoseconds->fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
                 primaryStart - rayStart).count()), std::memory_order_relaxed);
         if (tracePrimary) {
+            const bool culling = scene.cullsBackFaces();
             auto const* hits = gpuPrimary
                 ? static_cast<const float*>(RenderBuffer(kSlotAccumulation, pixels * 48)) : nullptr;
             for (size_t t = first; t < last; ++t) {
@@ -285,8 +286,8 @@ void GpuRenderDevice::RenderPass(SceneManager& scene, PassRequest const& request
                     for (unsigned x = tile.x; x < tile.x + tile.width; ++x) {
                         // Without a usable GPU scene, trace on the CPU scene.
                         const RayHit hit = hits ? PrimaryHit(hits, size_t(y) * width + x, pixels)
-                            : scene.cast_ray(prism::MakeCameraRayWithLens(request.camera,
-                                  float(x) + 0.5f, float(y) + 0.5f, width, height, nullptr));
+                            : scene.castRayCulled(prism::MakeCameraRayWithLens(request.camera,
+                                  float(x) + 0.5f, float(y) + 0.5f, width, height, nullptr), culling);
                         request.resolvePrimary(x, y, hit);
                     }
                 });

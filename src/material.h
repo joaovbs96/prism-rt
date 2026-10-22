@@ -82,6 +82,9 @@ class Material {
         virtual bool supportsNee(const RayHit&) const { return false; }
         virtual float cutoutOpacity(const RayHit&) { return 1.0f; }
         virtual bool provenOpaque() const { return false; }
+        // The BSDF may transmit (refract): back faces of single-sided geometry
+        // with such a material are never culled (prism:honorDoubleSided).
+        virtual bool transmissive() const { return false; }
         virtual std::optional<ConstantEmission> constantEmission() const { return std::nullopt; }
         // Displacement of the surface (applied to the geometry when it is built).
         virtual bool hasDisplacement() const { return false; }
@@ -267,6 +270,7 @@ class Emissive : public Material {
 class Glass : public Material {
     public:
         Glass (const float ior) : ior(ior) {}
+        bool transmissive() const override { return true; }
 
         Float3 sample_direction(const RayHit ray_hit, unsigned int &seed) override {
             float ior_ = ray_hit.front_face ? 1.0f / ior : ior;
@@ -423,6 +427,7 @@ class MetalGltf : public Material {
 class SpecularBTDFglTF : public Material {
     public:
         SpecularBTDFglTF (Texture<Float3>* base_color, const float ior) : base_color(base_color), ior(ior) {}
+        bool transmissive() const override { return true; }
 
         Float3 sample_direction(const RayHit ray_hit, unsigned int &seed) override {
             float ior_ = ray_hit.front_face ? 1.0f / ior : ior;
@@ -451,6 +456,7 @@ class SpecularBTDFglTF : public Material {
 class gltfPBR : public Material {
     public:
         gltfPBR(){}
+        bool transmissive() const override { return transmission != nullptr; }
 
         void setBaseColor(Texture<Float3>* base_color_){
             base_color = base_color_;

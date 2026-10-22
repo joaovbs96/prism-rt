@@ -17,6 +17,9 @@
 //   light_lobes        FULL DIFFUSE SPECULAR: light_lobes.usda and its
 //                      variants: inputs:diffuse / inputs:specular light
 //                      multipliers split the image by BSDF lobe.
+//   double_sided       double_sided.usda: with prism:honorDoubleSided,
+//                      back faces of single-sided, non-transmissive meshes
+//                      are not hit.
 //   lobes_consistency  MIS BSDF: a light_lobes variant rendered with MIS and
 //                      with BSDF sampling only agrees on every card.
 
@@ -208,6 +211,30 @@ void LightLobes(std::vector<Image> const& images)
           Describe("the camera sees the dome unscaled", full.Gray(32, 3)));
 }
 
+// double_sided.usda (prism:honorDoubleSided on): cards at columns 7, 19, 32,
+// 45, 57 (row 32) in front of a blue backdrop.
+void DoubleSided(Image const& image)
+{
+    const float backdropR = image.Mean(32, 6, 0), backdropB = image.Mean(32, 6, 2);
+    Check(backdropB > 0.4f && backdropR < 0.2f, Describe("the backdrop is blue", backdropB));
+    struct Card {
+        char const* name;
+        int x;
+        bool drawn;
+    };
+    const Card cards[] = {{"single-sided card facing away is culled", 7, false},
+                          {"doubleSided card facing away is drawn", 19, true},
+                          {"single-sided card facing the camera is drawn", 32, true},
+                          {"mirrored single-sided card is culled", 57, false}};
+    for (auto const& card : cards) {
+        const float r = image.Mean(card.x, 32, 0), b = image.Mean(card.x, 32, 2);
+        Check(card.drawn ? (r > 0.4f && b < 0.2f) : (b > 0.7f * backdropB && r < 0.2f),
+              Describe(card.name, card.drawn ? r : b));
+    }
+    const float glassB = image.Mean(45, 32, 2);
+    Check(glassB < 0.6f * backdropB, Describe("the transmissive card facing away is drawn (tints the backdrop)", glassB));
+}
+
 // A light_lobes variant rendered with MIS (next-event estimation splits the
 // BSDF evaluation by lobe) and with BSDF sampling only (light hits are scaled
 // by the sampled direction's diffuse fraction): the card means agree (the
@@ -244,6 +271,20 @@ int main(int argc, char** argv)
         {"invisible_ids", single(InvisibleIds)},
         {"display_color", single(DisplayColor)},
         {"light_lobes", {3, LightLobes}},
+        {"double_sided", single(DoubleSided)},
+        // Diagnostics: the pixels where two images differ most.
+        {"diff", {2, [](std::vector<Image> const& images) {
+            std::vector<std::pair<float, int>> d;
+            for (int y = 0; y < images[0].height; ++y)
+                for (int x = 0; x < images[0].width; ++x) {
+                    float e = 0.0f;
+                    for (int c = 0; c < 3; ++c) e += std::abs(images[0].At(x, y, c) - images[1].At(x, y, c));
+                    d.push_back({e, y * images[0].width + x});
+                }
+            std::sort(d.rbegin(), d.rend());
+            for (size_t i = 0; i < std::min<size_t>(12, d.size()); ++i)
+                std::printf("(%d, %d): %g\n", d[i].second % images[0].width, d[i].second / images[0].width, d[i].first);
+        }}},
         {"lobes_consistency", {2, LobesConsistency}},
     };
     if (argc < 3 || !checks.contains(argv[1]) || argc - 2 != checks.at(argv[1]).first) {

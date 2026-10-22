@@ -49,6 +49,7 @@ struct Options {
     Float3 cameraUp{0, 1, 0};
     float verticalFov = 40, focusDistance = 10, defocusAngle = 0;
     bool explicitLens = false, widthSet = false, heightSet = false;
+    bool honorDoubleSided = false; // prism:honorDoubleSided
     int width = 1280, height = 720, samples = 256, depth = 32, roulette = 4;
     unsigned seed = 0;
     float exposure = 0, clamp = 10;
@@ -88,6 +89,8 @@ void help() {
         "  --light-selection spatial|power (default spatial: analytic lights by their estimated\n"
         "                 irradiance at the shading point, mixed with power; power: by power only)\n"
         "  --texture-filtering filtered|bilinear (default filtered)\n"
+        "  --honor-double-sided true|false (default false: USD doubleSided is ignored; true: back faces of\n"
+        "                 single-sided meshes are not hit, unless their material transmits)\n"
         "  --device auto|cpu|cpu-reference|vulkan|metal (default auto: GPU if available, else CPU;\n"
         "                 cpu-reference runs the original CPU integrator)\n"
         "  --ocio-config FILE|URI (default $OCIO, else ocio://studio-config-latest)\n"
@@ -144,6 +147,11 @@ Options parse(int argc, char** argv) {
         else if (key == "--defocus-angle") { o.defocusAngle = number(value); o.explicitLens = true; }
         else if (key == "--environment-sampling") o.environmentSampling = value;
         else if (key == "--texture-filtering") o.textureFiltering = value;
+        else if (key == "--honor-double-sided") {
+            if (value != "true" && value != "false")
+                throw std::runtime_error("--honor-double-sided takes true or false");
+            o.honorDoubleSided = value == "true";
+        }
         else if (key == "--device") {
             if (!prism::device::ParseDevicePreference(value, &o.device))
                 throw std::runtime_error("--device must be auto, cpu, cpu-reference, vulkan or metal");
@@ -270,6 +278,9 @@ void applyRenderSettings(VtDictionary const& settings, Options& o) {
         o.environmentSampling = mode;
     if (auto mode = textSetting("textureFiltering", "--texture-filtering"); !mode.empty())
         o.textureFiltering = mode;
+    if (!o.given.count("--honor-double-sided"))
+        if (auto const* v = value("honorDoubleSided"); v && v->IsHolding<bool>())
+            o.honorDoubleSided = v->UncheckedGet<bool>();
     if (auto name = textSetting("device", "--device"); !name.empty() &&
         !prism::device::ParseDevicePreference(name, &o.device))
         throw std::runtime_error("prism:device must be auto, cpu, cpu-reference, vulkan or metal");
@@ -496,6 +507,7 @@ int runStandaloneCli(int argc, char** argv) {
         scene.rr_min_depth = o.roulette;
         scene.environmentSampling = o.environmentSampling == "mis";
         scene.textureFiltering = o.textureFiltering == "bilinear" ? prism::TextureFiltering::Bilinear : prism::TextureFiltering::Filtered;
+        scene.honorDoubleSided = o.honorDoubleSided;
         ColorTexture black(Color3(0));
         ConstantColorBackground background(&black);
         std::unique_ptr<ImageTexture<Color3>> envImage;
@@ -668,10 +680,11 @@ int runStandaloneCli(int argc, char** argv) {
                 for (AovKind kind : geometric)
                     planes.push_back({kind, prism::output::AovComponents(kind),
                         std::vector<float>(size_t(width) * height * prism::output::AovComponents(kind))});
+                const bool culling = scene.cullsBackFaces();
                 tbb::parallel_for(0u, height, [&](unsigned y) {
                     for (unsigned x = 0; x < width; ++x) {
-                        const RayHit hit = scene.cast_ray(prism::MakeCameraRayWithLens(rays.parameters,
-                            float(x) + 0.5f, float(y) + 0.5f, width, height, nullptr));
+                        const RayHit hit = scene.castRayCulled(prism::MakeCameraRayWithLens(rays.parameters,
+                            float(x) + 0.5f, float(y) + 0.5f, width, height, nullptr), culling);
                         for (auto& plane : planes)
                             prism::output::ResolveGeometricAov(plane.kind, hit, worldToView, projection,
                                 plane.pixels.data() + (size_t(y) * width + x) * plane.components);

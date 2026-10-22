@@ -458,6 +458,7 @@ GpuSceneData BuildGpuScene(SceneManager& scene)
     std::sort(placements.begin(), placements.end());
 
     std::vector<uint32_t> table;
+    const bool culling = scene.cullsBackFaces();
     for (int id : placements) {
         Geometry* geometry = scene.geometry.at(id);
         if (!geometry) continue;
@@ -518,6 +519,14 @@ GpuSceneData BuildGpuScene(SceneManager& scene)
             }
             table[prim] = builder.material(material);
         }
+        // prism:honorDoubleSided: single-sided, non-transmissive triangles.
+        if (culling && proto.info.x == kProtoTriangles) {
+            for (uint32_t prim = 0; prim < primitives; ++prim) {
+                if (!scene.culledBackFace(id, int(prim))) continue;
+                table[prim] |= kPrimitiveCullBackFace;
+                instance.info.y |= kInstanceCullBackFaces;
+            }
+        }
         instance.info.z = builder.primitiveMaterials(table);
         data.instances.push_back(instance);
         data.instanceTransforms.push_back(transform);
@@ -574,7 +583,7 @@ void ApplyMdlShaderCode(GpuSceneData& data, MdlShaderCode const& code)
         const uint32_t primitives = data.prototypes[instance.info.x].info.w;
         bool opaque = true;
         for (uint32_t p = 0; p < primitives && opaque; ++p)
-            opaque = blocks(data.materials[data.primitiveMaterials[instance.info.z + p]]);
+            opaque = blocks(data.materials[data.primitiveMaterials[instance.info.z + p] & kPrimitiveMaterialMask]);
         if (data.shadowLinks && instance.links.y != ~0u) opaque = false;
         if (opaque) instance.info.y |= kInstanceOpaque;
         else data.hasCutouts = true;

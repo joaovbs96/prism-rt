@@ -66,6 +66,7 @@ public:
     {
         evaluateUniformCutout();
         evaluateUniformEmission();
+        evaluateTransmission();
     }
     // Compiles a .mtlx file into a callable MDL material.
     //   mtlx_path:         path to the .mtlx file
@@ -184,6 +185,7 @@ public:
         m_valid = true;
         evaluateUniformCutout();
         evaluateUniformEmission();
+        evaluateTransmission();
         // NOTE: prints the *resolved* name (material_name may be empty)
         if (PrismMdlVerbose())
             std::cout << "[MDLMaterial] OK: " << m_target.program->target_code->get_callable_function_count()
@@ -195,6 +197,7 @@ public:
     }
 
     bool is_valid() const { return m_valid; }
+    bool transmissive() const override { return m_transmissive; }
 
     // Accessor for the target code (needed by MaterialXTest scene)
     const mdl::TargetCode& get_target_code() const { return m_target; }
@@ -733,6 +736,38 @@ private:
             m_uniformCutout = std::clamp(opacity, 0.0f, 1.0f);
     }
 
+    // Whether the BSDF transmits: a few samples from each side at two angles
+    // of incidence, at the centre of the texture space, see a transmission
+    // event (refraction, thin-walled translucency). Cutout holes do not count.
+    void evaluateTransmission() {
+        m_transmissive = false;
+        if (!m_valid || !m_target.program) return;
+        for (const bool front : {true, false}) {
+            for (const float cosine : {1.0f, 0.5f}) {
+                RTCRayHit miss{};
+                miss.hit.geomID = RTC_INVALID_GEOMETRY_ID;
+                RayHit hit(miss);
+                hit.n = hit.n_g = Float3(0.0f, 0.0f, 1.0f);
+                hit.tangent = Float3(1.0f, 0.0f, 0.0f);
+                hit.u = hit.v = 0.5f;
+                hit.front_face = front;
+                const float sine = std::sqrt(1.0f - cosine * cosine);
+                hit.d = Float3(sine, 0.0f, -cosine);
+                hit.o = hit.p - hit.d;
+                for (int i = 0; i < 16; ++i) {
+                    const float xi[4] = {(float(i % 4) + 0.5f) / 4.0f, (float(i / 4) + 0.5f) / 4.0f,
+                                         (float(i) + 0.5f) / 16.0f, (float(15 - i) + 0.5f) / 16.0f};
+                    unsigned seed = 1u + unsigned(i);
+                    const BRDFSample s = sampleWithState(hit, seed, nullptr, xi);
+                    if (s.scattered && s.transmitted && !s.null_event) {
+                        m_transmissive = true;
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
     // Uniform emission is evaluated once, toward the normal of the front face.
     void evaluateUniformEmission() {
         m_uniformEmission.reset();
@@ -772,6 +807,7 @@ private:
 
     std::optional<float> m_uniformCutout;
     std::optional<ConstantEmission> m_uniformEmission;
+    bool m_transmissive = false;
 
     // MDL pipeline objects — kept alive for the material's lifetime
     std::unique_ptr<mdl::MaterialCompiler> m_compiler;

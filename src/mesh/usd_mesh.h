@@ -717,6 +717,7 @@ struct MeshData {
     // displayColor (3) and displayOpacity (1) per vertex, when either varies
     // over the mesh; otherwise empty and displayConstant holds them.
     std::vector<float>         display;
+    bool                       singleSided = true;  // USD doubleSided false
     std::array<float, 4>       displayConstant{0.7f, 0.7f, 0.7f, 1.0f};
 };
 
@@ -877,6 +878,14 @@ public:
         }
 
         installDisplayPrimvars();
+        // USD doubleSided per triangle (SceneManager::culledBackFace): the
+        // common uniform cases need no table.
+        if (std::all_of(single_sided.begin(), single_sided.end(), [](uint8_t s) { return s != 0; })) {
+            single_sided_all = !single_sided.empty();
+            single_sided.clear();
+        } else if (std::none_of(single_sided.begin(), single_sided.end(), [](uint8_t s) { return s != 0; })) {
+            single_sided.clear();
+        }
 
         std::cout << "Finished processing USD file:\n"
                   << "    Total vertices:  " << vertices.size()  << "\n"
@@ -1023,6 +1032,7 @@ private:
         size_t triCount = data.indices.size() / 3;
         for (size_t t = 0; t < triCount; ++t) {
             material_mapping[globalTriangleCount++] = data.mat_id;
+            single_sided.push_back(data.singleSided ? 1 : 0);
         }
     }
 
@@ -1137,6 +1147,9 @@ private:
         display.opacity = readDisplayPrimvar(mesh.GetPrim(), "displayOpacity", 1, timeCode, points.size(),
                                              faceVertexCounts.size(), faceVertexIndices.size());
         out.mat_id = resolveMaterialId(mesh.GetPrim(), timeCode, &display);
+        bool doubleSided = false;
+        mesh.GetDoubleSidedAttr().Get(&doubleSided, timeCode);
+        out.singleSided = !doubleSided;
         if (display.color.authored())
             std::copy_n(display.color.values.begin(), 3, out.displayConstant.begin());
         if (display.opacity.authored()) out.displayConstant[3] = display.opacity.values.front();

@@ -214,7 +214,7 @@ GpuHit gpu_intersect(PathRay ray, uint mask)
     hit.p = hit.o + hit.t * hit.d;
     hit.instance = inst.info.w;
     hit.primitive = localPrimitive;
-    result.material = gpu_primitive_material(inst.info.z + localPrimitive);
+    result.material = gpu_primitive_material(inst.info.z + localPrimitive) & kPrimitiveMaterialMask;
     result.sphere = type == kProtoSpheres;
     result.instanceIndex = raw.instance;
 

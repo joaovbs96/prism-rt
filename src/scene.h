@@ -643,6 +643,75 @@ public:
     // GPU devices that stream textures (Vulkan) load the mip levels shading
     // asks for instead of whole textures (prism:textureStreaming).
     bool textureStreaming = true;
+    // USD doubleSided (prism:honorDoubleSided, off by default): with it, the
+    // back faces of single-sided geometry are not hit, unless their material
+    // transmits. Single-sided are the placements listed here (Hydra) and the
+    // triangles Mesh::single_sided marks (the CLI's merged mesh).
+    bool honorDoubleSided = false;
+    std::unordered_set<int> single_sided_placements;
+
+    // Whether some geometry is single-sided while doubleSided is honoured.
+    bool cullsBackFaces() const
+    {
+        if (!honorDoubleSided) return false;
+        if (!single_sided_placements.empty()) return true;
+        for (auto const& [id, g] : geometry)
+            if (auto const* mesh = dynamic_cast<Mesh const*>(g);
+                mesh && (mesh->single_sided_all || !mesh->single_sided.empty())) return true;
+        return false;
+    }
+
+    // Whether a back-face hit on this primitive of this placement is culled.
+    bool culledBackFace(int placement, int primitive)
+    {
+        if (!honorDoubleSided || primitive < 0) return false;
+        bool single = single_sided_placements.contains(placement);
+        auto found = geometry.find(placement);
+        if (found == geometry.end() || !found->second || found->second->type != RTC_GEOMETRY_TYPE_TRIANGLE)
+            return false;
+        if (!single) {
+            auto const* mesh = dynamic_cast<Mesh const*>(found->second);
+            single = mesh && (mesh->single_sided_all ||
+                (size_t(primitive) < mesh->single_sided.size() && mesh->single_sided[size_t(primitive)]));
+        }
+        if (!single) return false;
+        Material* material = nullptr;
+        auto binding = placement_materials.find(placement);
+        if (binding != placement_materials.end()) {
+            auto triangle = binding->second.triangles.find(primitive);
+            material = triangle != binding->second.triangles.end() ? triangle->second : binding->second.fallback;
+        }
+        if (!material) {
+            const unsigned instance = intersection_geometry.contains(placement) ? unsigned(placement)
+                                                                                 : RTC_INVALID_GEOMETRY_ID;
+            try { material = found->second->getMaterial(primitive, instance); }
+            catch (std::exception const&) { material = nullptr; }
+        }
+        return !(material && material->transmissive());
+    }
+
+    // cast_ray that passes through culled back faces (culledBackFace). The
+    // integrator devices and their primary hits use it; the cpu-reference
+    // integrator does not.
+    RayHit castRayCulled(prism::PathRay pathRay, bool culling)
+    {
+        RayHit hit = cast_ray(pathRay);
+        if (!culling) return hit;
+        for (int crossings = 0; crossings < 64; ++crossings) {
+            if (hit.geomid == int(RTC_INVALID_GEOMETRY_ID) || hit.front_face || !culledBackFace(hit.geomid, hit.primid))
+                return hit;
+            pathRay.ray.tnear = std::nextafter(hit.t, std::numeric_limits<float>::infinity());
+            if (!(pathRay.ray.tnear <= pathRay.ray.tfar)) break;
+            hit = cast_ray(pathRay);
+        }
+        RTCRayHit miss{};
+        miss.ray = pathRay.ray;
+        miss.hit.geomID = RTC_INVALID_GEOMETRY_ID;
+        RayHit result(miss);
+        result.ray_footprint = pathRay.footprint;
+        return result;
+    }
+    RayHit castRayCulled(RTCRay ray, bool culling) { return castRayCulled(prism::PathRay{ray, {}}, culling); }
 };
 
 

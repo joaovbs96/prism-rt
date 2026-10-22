@@ -447,6 +447,9 @@ bool MetalDevice::Impl::buildAccelerationStructures(bool keepPrimitives, std::st
         for (int c = 0; c < 4; ++c)
             instance.transformationMatrix.columns[c] = MTLPackedFloat3Make(m[c], m[4 + c], m[8 + c]);
         instance.options = MTLAccelerationStructureInstanceOptionDisableTriangleCulling;
+        // prism:honorDoubleSided: the trace skips culled back faces itself.
+        if ((d.instances[i].info.y & kInstanceCullBackFaces) != 0u)
+            instance.options |= MTLAccelerationStructureInstanceOptionNonOpaque;
         instance.mask = (d.instances[i].info.y & kInstanceOpaque) != 0u ? kMaskOpaque : kMaskNonOpaque;
         instance.accelerationStructureIndex = structureOfPrototype[d.instances[i].info.x];
     }

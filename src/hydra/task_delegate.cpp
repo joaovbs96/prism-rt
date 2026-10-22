@@ -43,6 +43,7 @@ TfToken const _neeFromDepth("prism:neeFromDepth");
 TfToken const _lightSelection("prism:lightSelection");
 TfToken const _domeCameraVisibility("domeLightCameraVisibility");
 TfToken const _sphereBatching("prism:sphereBatching");
+TfToken const _honorDoubleSided("prism:honorDoubleSided");
 TfToken const _hiddenGeometryBudget("prism:hiddenGeometryBudgetMiB");
 TfToken const _previewTargetMs("prism:previewTargetMs");
 TfToken const _previewMaxDimension("prism:previewMaxDimension");
@@ -207,6 +208,7 @@ HdRenderSettingDescriptorList PrismTaskDelegate::GetRenderSettingDescriptors() c
             {"Adaptive preview", _adaptivePreview, VtValue(true)},
             {"Dome light camera visibility", _domeCameraVisibility, VtValue(true)},
             {"Sphere batching (experimental)", _sphereBatching, VtValue(false)},
+            {"Honor doubleSided (cull back faces)", _honorDoubleSided, VtValue(false)},
             {"Hidden geometry budget (MiB, 0 unlimited)", _hiddenGeometryBudget, VtValue(0)},
             {"Preview target (ms)", _previewTargetMs, VtValue(33)},
             {"Preview maximum dimension (0 automatic)", _previewMaxDimension, VtValue(0)},
@@ -245,6 +247,7 @@ VtValue PrismTaskDelegate::GetRenderSetting(TfToken const &key) const
     if (key == _lightSelection) return VtValue(std::string(s.spatialLights ? "spatial" : "power"));
     if (key == _domeCameraVisibility) return VtValue(s.domeLightCameraVisibility);
     if (key == _sphereBatching) return VtValue(s.sphereBatching);
+    if (key == _honorDoubleSided) return VtValue(s.honorDoubleSided);
     if (key == _hiddenGeometryBudget) return VtValue(s.hiddenGeometryBudgetMiB);
     if (key == _previewTargetMs) return VtValue(s.previewTargetMs);
     if (key == _previewMaxDimension) return VtValue(s.previewMaxDimension);
@@ -354,6 +357,8 @@ void PrismTaskDelegate::SetRenderSetting(TfToken const &key, VtValue const &valu
         s.domeLightCameraVisibility = _Get(value, s.domeLightCameraVisibility);
     else if (key == _sphereBatching)
         s.sphereBatching = _Get(value, s.sphereBatching);
+    else if (key == _honorDoubleSided)
+        s.honorDoubleSided = _Get(value, s.honorDoubleSided);
     else if (key == _hiddenGeometryBudget) {
         if (!value.IsHolding<int>() || value.UncheckedGet<int>() < 0) {
             TF_WARN("PrismRT: prism:hiddenGeometryBudgetMiB requires a non-negative integer; retaining the previous value");

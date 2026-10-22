@@ -52,6 +52,9 @@ struct RenderSettings {
     int refinementDelayMs = 100;
     int resourceRevision = 0;
     bool sphereBatching = false;
+    // USD doubleSided (prism:honorDoubleSided): back faces of single-sided,
+    // non-transmissive meshes are not hit. Off by default.
+    bool honorDoubleSided = false;
     // Soft target for converted geometry retained only by hidden prototypes.
     // Zero preserves unlimited retention; source data and Embree are excluded.
     int hiddenGeometryBudgetMiB = 0;
