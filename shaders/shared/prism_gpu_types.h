@@ -35,11 +35,15 @@ static const uint kMaterialDiffuseGltf = 7u;
 static const uint kMaterialMetalGltf = 8u;
 static const uint kMaterialSpecularBtdfGltf = 9u;
 static const uint kMaterialGltfPbr = 10u;
-static const uint kMaterialFallback = 11u;   // hydra::FallbackMaterial (Diffuse with constant opacity)
+static const uint kMaterialFallback = 11u;   // hydra::FallbackMaterial (Diffuse with an opacity)
 
 // Material flags.
 static const uint kMaterialConstantCutout = 1u;
 static const uint kMaterialNormalTexture = 2u;
+// Fallback materials: the hit prototype's displayColor / displayOpacity
+// primvar (kPrimvarDisplay*) replaces the constant colour / opacity.
+static const uint kMaterialPrimvarColor = 4u;
+static const uint kMaterialPrimvarOpacity = 8u;
 
 // Legacy texture kinds (Texture<T> classes).
 static const uint kTextureValue = 0u;
@@ -129,8 +133,13 @@ struct GpuPrototype {
 };
 
 // One named primvar of a prototype: x: scene data id (string constant of the
-// MDL link unit, 0: unused), y: components, z: offset in a vertex's values,
-// w: values per vertex.
+// MDL link unit, 0: unused), y: components (kPrimvarComponents) and role
+// (kPrimvarDisplay*), z: offset in a vertex's values, w: values per vertex.
+static const uint kPrimvarComponents = 0xffu;
+static const uint kPrimvarDisplayColor = 0x100u;   // USD displayColor (fallback materials)
+static const uint kPrimvarDisplayOpacity = 0x200u; // USD displayOpacity
+static const uint kPrimvarRoles = 0xff00u;
+
 struct GpuPrimvar {
     uint4 info;
 };

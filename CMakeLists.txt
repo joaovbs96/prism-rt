@@ -854,7 +854,8 @@ if(TARGET prism_hydra_render AND TARGET prism_compare_images)
     set(_prism_scene_features
         camera_visibility:light_camera_visibility
         dome_temperature:dome_color_temperature
-        invisible_ids:pointinstancer_invisible_ids)
+        invisible_ids:pointinstancer_invisible_ids
+        display_color:display_color_interpolation)
     foreach(_entry IN LISTS _prism_scene_features)
         string(REPLACE ":" ";" _parts "${_entry}")
         list(GET _parts 0 _feature)

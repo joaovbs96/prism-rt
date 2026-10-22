@@ -539,7 +539,7 @@ bool prism_primvar(Shading_state_material state, int id, out float4 value)
             const uint base = prototype.info2.w + (state.primvar_vertex[k] - prototype.info.y) * primvar.info.w +
                 primvar.info.z;
             for (uint c = 0u; c < 4u; ++c)
-                if (c < primvar.info.y) result[c] += w[k] * gpu_primvar_value(base + c);
+                if (c < (primvar.info.y & kPrimvarComponents)) result[c] += w[k] * gpu_primvar_value(base + c);
         }
         value = float4(result[0], result[1], result[2], result[3]);
         return true;

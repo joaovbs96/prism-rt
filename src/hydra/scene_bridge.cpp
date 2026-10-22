@@ -2178,13 +2178,20 @@ bool _AppendMesh(HdSceneIndexBaseRefPtr const &sceneIndex,
                 path.GetText(), info.degenerateFaceCount);
     if (!prepared->storage) return false;
 
+    // displayColor / displayOpacity of any interpolation: constant values
+    // become the material's; others are mesh primvars (_ExtraPrimvars) the
+    // material reads at each hit, their first value standing in where the
+    // mesh could not keep them (an unexpected size).
     Material *material = snapshot->fallbackMaterial.get();
     PrimvarData opacityPv = _Primvar(primvars, TfToken("displayOpacity"));
     float opacity = 1.0f;
-    if (opacityPv.interpolation == HdPrimvarSchemaTokens->constant &&
-        opacityPv.value.IsHolding<VtFloatArray>()) {
+    bool primvarOpacity = false;
+    if (opacityPv.value.IsHolding<VtFloatArray>()) {
         auto const &values = opacityPv.value.UncheckedGet<VtFloatArray>();
-        if (!values.empty()) opacity = values.front();
+        if (!values.empty()) {
+            opacity = values.front();
+            primvarOpacity = opacityPv.interpolation != HdPrimvarSchemaTokens->constant;
+        }
     }
     PrimvarData displayColor = _Primvar(primvars, TfToken("displayColor"));
     if (displayColor.value.IsHolding<VtVec3fArray>()) {
@@ -2198,7 +2205,8 @@ bool _AppendMesh(HdSceneIndexBaseRefPtr const &sceneIndex,
                 GfVec3f const &value = colors.front();
                 auto texture = std::make_unique<ColorTexture>(
                     Color3(value[0], value[1], value[2]));
-                auto displayMaterial = std::make_unique<FallbackMaterial>(texture.get(), opacity);
+                auto displayMaterial = std::make_unique<FallbackMaterial>(texture.get(), opacity,
+                    displayColor.interpolation != HdPrimvarSchemaTokens->constant, primvarOpacity);
                 material = displayMaterial.get();
                 snapshot->displayColorTextures.push_back(std::move(texture));
                 snapshot->displayColorMaterials.push_back(std::move(displayMaterial));
@@ -2207,13 +2215,13 @@ bool _AppendMesh(HdSceneIndexBaseRefPtr const &sceneIndex,
         }
     }
     if (material == snapshot->fallbackMaterial.get() &&
-        NormalizeFallbackOpacity(opacity) < 1.0f) {
+        (primvarOpacity || NormalizeFallbackOpacity(opacity) < 1.0f)) {
         auto const existing = snapshot->displayMaterialsByPath.find(path);
         if (existing != snapshot->displayMaterialsByPath.end()) {
             material = existing->second;
         } else {
             auto displayMaterial = std::make_unique<FallbackMaterial>(
-                snapshot->fallbackTexture.get(), opacity);
+                snapshot->fallbackTexture.get(), opacity, false, primvarOpacity);
             material = displayMaterial.get();
             snapshot->displayColorMaterials.push_back(std::move(displayMaterial));
             snapshot->displayMaterialsByPath.emplace(path, material);

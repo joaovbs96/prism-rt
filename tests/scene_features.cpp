@@ -12,6 +12,8 @@
 //                      temperature tints it.
 //   invisible_ids      pointinstancer_invisible_ids.usda: invisibleIds hide
 //                      their instances.
+//   display_color      display_color_interpolation.usda: displayColor and
+//                      displayOpacity of every interpolation (and indexed).
 
 #include <OpenImageIO/imagebuf.h>
 
@@ -127,6 +129,44 @@ void InvisibleIds(Image const& image)
     }
 }
 
+// display_color_interpolation.usda: cards at columns 11, 32, 53 and rows 21
+// (top) and 43 (bottom); a two-face card's faces at its column -5 and +5.
+void DisplayColor(Image const& image)
+{
+    struct Expected {
+        char const* what;
+        int x, y;
+        float r, g, b;
+        float tolerance;
+    };
+    // The vertex gradients 8 pixels from the centre are 9% of the way from
+    // their end colour to the other.
+    const auto mix = [](float a, float b, float t) { return a + (b - a) * t; };
+    const float t = (0.35f - 8.0f / 28.0f) / 0.7f;
+    const Expected expected[] = {
+        {"constant", 11, 21, 0.8f, 0.1f, 0.1f, 0.06f},
+        {"uniform, first face", 27, 21, 0.1f, 0.8f, 0.1f, 0.06f},
+        {"uniform, second face", 37, 21, 0.1f, 0.1f, 0.8f, 0.06f},
+        {"vertex, left", 45, 21, mix(0.8f, 0.1f, t), mix(0.1f, 0.8f, t), 0.1f, 0.08f},
+        {"vertex, middle", 53, 21, 0.45f, 0.45f, 0.1f, 0.08f},
+        {"vertex, right", 61, 21, mix(0.1f, 0.8f, t), mix(0.8f, 0.1f, t), 0.1f, 0.08f},
+        {"faceVarying, first face", 6, 43, 0.8f, 0.1f, 0.1f, 0.06f},
+        {"faceVarying, second face", 16, 43, 0.1f, 0.1f, 0.8f, 0.06f},
+        {"indexed, left", 24, 43, mix(0.1f, 0.8f, t), mix(0.1f, 0.8f, t), mix(0.8f, 0.1f, t), 0.08f},
+        {"indexed, right", 40, 43, mix(0.8f, 0.1f, t), mix(0.8f, 0.1f, t), mix(0.1f, 0.8f, t), 0.08f},
+        {"opacity 1", 48, 43, 0.8f, 0.1f, 0.1f, 0.06f},
+        {"opacity 0 (the dome)", 58, 43, 1.0f, 1.0f, 1.0f, 0.06f},
+    };
+    for (auto const& e : expected) {
+        const float r = image.Mean(e.x, e.y, 0), g = image.Mean(e.x, e.y, 1), b = image.Mean(e.x, e.y, 2);
+        const float error = std::max({std::abs(r - e.r), std::abs(g - e.g), std::abs(b - e.b)});
+        char text[256];
+        std::snprintf(text, sizeof(text), "%s: (%.3f, %.3f, %.3f), expected (%.3f, %.3f, %.3f)", e.what, r, g, b,
+                      e.r, e.g, e.b);
+        Check(error <= e.tolerance, text);
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -135,6 +175,7 @@ int main(int argc, char** argv)
         {"camera_visibility", CameraVisibility},
         {"dome_temperature", DomeTemperature},
         {"invisible_ids", InvisibleIds},
+        {"display_color", DisplayColor},
     };
     if (argc != 3 || !checks.contains(argv[1])) {
         std::printf("usage: prism_scene_features_test FEATURE IMAGE.exr\nfeatures:");

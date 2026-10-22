@@ -1,0 +1,84 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    upAxis = "Y"
+    metersPerUnit = 1
+)
+
+# displayColor and displayOpacity of every interpolation, on cards facing the
+# camera under a white dome (a card's colour is its albedo):
+#   top:    constant red | uniform green, blue | vertex red to green
+#   bottom: faceVarying red, blue | indexed vertex blue to yellow | uniform opacity 1, 0 (red)
+def Xform "World"
+{
+    def Camera "Camera"
+    {
+        float focalLength = 35
+        float horizontalAperture = 20
+        float verticalAperture = 20
+        float2 clippingRange = (0.1, 100)
+        double3 xformOp:translate = (0, 0, 4)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+
+    def Mesh "Constant"
+    {
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 1, 2, 3]
+        point3f[] points = [(-1.1, 0.05, 0), (-0.4, 0.05, 0), (-0.4, 0.75, 0), (-1.1, 0.75, 0)]
+        color3f[] primvars:displayColor = [(0.8, 0.1, 0.1)] (interpolation = "constant")
+        uniform token subdivisionScheme = "none"
+    }
+
+    def Mesh "Uniform"
+    {
+        int[] faceVertexCounts = [4, 4]
+        int[] faceVertexIndices = [0, 1, 4, 5, 1, 2, 3, 4]
+        point3f[] points = [(-0.35, 0.05, 0), (0, 0.05, 0), (0.35, 0.05, 0), (0.35, 0.75, 0), (0, 0.75, 0), (-0.35, 0.75, 0)]
+        color3f[] primvars:displayColor = [(0.1, 0.8, 0.1), (0.1, 0.1, 0.8)] (interpolation = "uniform")
+        uniform token subdivisionScheme = "none"
+    }
+
+    def Mesh "Vertex"
+    {
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 1, 2, 3]
+        point3f[] points = [(0.4, 0.05, 0), (1.1, 0.05, 0), (1.1, 0.75, 0), (0.4, 0.75, 0)]
+        color3f[] primvars:displayColor = [(0.8, 0.1, 0.1), (0.1, 0.8, 0.1), (0.1, 0.8, 0.1), (0.8, 0.1, 0.1)] (interpolation = "vertex")
+        uniform token subdivisionScheme = "none"
+    }
+
+    def Mesh "FaceVarying"
+    {
+        int[] faceVertexCounts = [4, 4]
+        int[] faceVertexIndices = [0, 1, 4, 5, 1, 2, 3, 4]
+        point3f[] points = [(-1.1, -0.75, 0), (-0.75, -0.75, 0), (-0.4, -0.75, 0), (-0.4, -0.05, 0), (-0.75, -0.05, 0), (-1.1, -0.05, 0)]
+        color3f[] primvars:displayColor = [(0.8, 0.1, 0.1), (0.8, 0.1, 0.1), (0.8, 0.1, 0.1), (0.8, 0.1, 0.1), (0.1, 0.1, 0.8), (0.1, 0.1, 0.8), (0.1, 0.1, 0.8), (0.1, 0.1, 0.8)] (interpolation = "faceVarying")
+        uniform token subdivisionScheme = "none"
+    }
+
+    def Mesh "Indexed"
+    {
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 1, 2, 3]
+        point3f[] points = [(-0.35, -0.75, 0), (0.35, -0.75, 0), (0.35, -0.05, 0), (-0.35, -0.05, 0)]
+        color3f[] primvars:displayColor = [(0.1, 0.1, 0.8), (0.8, 0.8, 0.1)] (interpolation = "vertex")
+        int[] primvars:displayColor:indices = [0, 1, 1, 0]
+        uniform token subdivisionScheme = "none"
+    }
+
+    def Mesh "Opacity"
+    {
+        int[] faceVertexCounts = [4, 4]
+        int[] faceVertexIndices = [0, 1, 4, 5, 1, 2, 3, 4]
+        point3f[] points = [(0.4, -0.75, 0), (0.75, -0.75, 0), (1.1, -0.75, 0), (1.1, -0.05, 0), (0.75, -0.05, 0), (0.4, -0.05, 0)]
+        color3f[] primvars:displayColor = [(0.8, 0.1, 0.1)] (interpolation = "constant")
+        float[] primvars:displayOpacity = [1, 0] (interpolation = "uniform")
+        uniform token subdivisionScheme = "none"
+    }
+
+    def DomeLight "Dome"
+    {
+        float inputs:intensity = 1
+    }
+}

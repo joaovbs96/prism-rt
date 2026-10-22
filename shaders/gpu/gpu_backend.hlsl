@@ -363,6 +363,49 @@ float gpu_texture1(uint ref, SurfaceHit hit, bool useFootprint)
     return gpu_legacy_texture_sample(ref, hit.u, hit.v, useFootprint, hit.texture_footprint).x;
 }
 
+// A display primvar (role kPrimvarDisplayColor or kPrimvarDisplayOpacity) of
+// the hit triangle (Mesh::interpolatePrimvar); false where its prototype has
+// none.
+bool gpu_display_primvar(SurfaceHit hit, uint role, out float4 value)
+{
+    value = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    if (hit.prototype == 0xffffffffu) return false;
+    const GpuPrototype prototype = gpu_prototype(hit.prototype);
+    for (uint i = 0u; i < prototype.info2.z; ++i) {
+        const GpuPrimvar primvar = gpu_primvar(prototype.info2.y + i);
+        if ((primvar.info.y & kPrimvarRoles) != role) continue;
+        const uint components = primvar.info.y & kPrimvarComponents;
+        const float w[3] = {1.0f - hit.bary_u - hit.bary_v, hit.bary_u, hit.bary_v};
+        const uint vertices[3] = {hit.vertex0, hit.vertex1, hit.vertex2};
+        float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (uint k = 0u; k < 3u; ++k) {
+            const uint base = prototype.info2.w + (vertices[k] - prototype.info.y) * primvar.info.w + primvar.info.z;
+            for (uint c = 0u; c < 4u; ++c)
+                if (c < components) result[c] += w[k] * gpu_primvar_value(base + c);
+        }
+        value = float4(result[0], result[1], result[2], result[3]);
+        return true;
+    }
+    return false;
+}
+
+// FallbackMaterial: the opacity and the colour at the hit.
+float gpu_fallback_opacity(SurfaceHit hit, GpuMaterial material)
+{
+    float4 value;
+    if ((material.info.w & kMaterialPrimvarOpacity) != 0u && gpu_display_primvar(hit, kPrimvarDisplayOpacity, value))
+        return isfinite(value.x) ? clamp(value.x, 0.0f, 1.0f) : 1.0f;
+    return material.params.x;
+}
+
+float3 gpu_fallback_color(SurfaceHit hit, GpuMaterial material, float3 color)
+{
+    float4 value;
+    if ((material.info.w & kMaterialPrimvarColor) != 0u && gpu_display_primvar(hit, kPrimvarDisplayColor, value))
+        return gpu_xyz(value);
+    return color;
+}
+
 // ---------------------------------------------------------------------------
 // Legacy materials (material.h, hydra/fallback_material.h)
 // ---------------------------------------------------------------------------
@@ -468,10 +511,11 @@ BsdfSample gpu_legacy_sample(SurfaceHit hit, GpuMaterial material, inout Rng rng
     uint kind = material.info.x;
     if (kind == kMaterialDiffuse) return gpu_diffuse_sample(hit, material.textures.x, true, true, rng);
     if (kind == kMaterialFallback) {
-        float opacity = material.params.x;
-        if (opacity >= 1.0f) return gpu_diffuse_sample(hit, material.textures.x, true, true, rng);
-        if (opacity <= 0.0f || rng.next() >= opacity) return gpu_null_sample(hit);
-        return gpu_diffuse_sample(hit, material.textures.x, true, true, rng);
+        const float opacity = gpu_fallback_opacity(hit, material);
+        if (opacity < 1.0f && (opacity <= 0.0f || rng.next() >= opacity)) return gpu_null_sample(hit);
+        BsdfSample s = gpu_diffuse_sample(hit, material.textures.x, true, true, rng);
+        s.color = gpu_fallback_color(hit, material, s.color);
+        return s;
     }
     if (kind == kMaterialMetal) {
         float roughness = gpu_texture1(material.textures.y, hit, true);
@@ -1022,7 +1066,9 @@ struct GpuBackend {
         if (material.info.x == kMaterialDiffuse || material.info.x == kMaterialFallback) {
             // Diffuse::evaluate
             const float cosine = max(0.0f, dot(shading.surface.n, normalize(wi)));
-            e.value = gpu_texture3(material.textures.x, shading.surface, true) * (cosine / kPi);
+            float3 color = gpu_texture3(material.textures.x, shading.surface, true);
+            if (material.info.x == kMaterialFallback) color = gpu_fallback_color(shading.surface, material, color);
+            e.value = color * (cosine / kPi);
             e.pdf = cosine / kPi;
             e.valid = cosine > 0.0f;
         }
@@ -1078,7 +1124,8 @@ struct GpuBackend {
     bool provenOpaque(GpuHit hit)
     {
         const GpuMaterial material = gpu_material(hit.material);
-        if (material.info.x == kMaterialFallback) return material.params.x >= 1.0f;
+        if (material.info.x == kMaterialFallback)
+            return material.params.x >= 1.0f && (material.info.w & kMaterialPrimvarOpacity) == 0u;
         if (material.info.x == kMaterialMdl)
             return (material.info.w & kMaterialConstantCutout) != 0u && material.params.w >= 1.0f;
         return false;
@@ -1087,7 +1134,7 @@ struct GpuBackend {
     float cutoutOpacity(GpuHit hit)
     {
         const GpuMaterial material = gpu_material(hit.material);
-        if (material.info.x == kMaterialFallback) return material.params.x;
+        if (material.info.x == kMaterialFallback) return gpu_fallback_opacity(hit.surface, material);
         if (material.info.x != kMaterialMdl) return 1.0f;
         if ((material.info.w & kMaterialConstantCutout) != 0u) return material.params.w;
         // Only programs with a varying cutout get here.

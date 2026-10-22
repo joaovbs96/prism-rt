@@ -65,7 +65,7 @@ bool AlwaysBlocks(Material* material)
         return !mdl->is_valid() || (cutout && *cutout >= 1.0f);
     }
     if (auto* fallback = dynamic_cast<prism::hydra::FallbackMaterial*>(material))
-        return fallback->opacity() >= 1.0f;
+        return fallback->provenOpaque();
     return true; // Material::cutoutOpacity is 1
 }
 

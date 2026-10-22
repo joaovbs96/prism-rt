@@ -94,6 +94,8 @@ public:
                 record.info.x = kMaterialFallback;
                 record.textures.x = texture(fallback->diffuse_color);
                 record.params.x = fallback->opacity();
+                if (fallback->primvarColor()) record.info.w |= kMaterialPrimvarColor;
+                if (fallback->primvarOpacity()) record.info.w |= kMaterialPrimvarOpacity;
             } else if (auto const* dispersive = dynamic_cast<Dispersive const*>(material)) {
                 record.info.x = kMaterialDispersive;
                 record.params = {dispersive->iorD(), dispersive->iorF(), dispersive->iorC(), 1.0f};
@@ -209,7 +211,10 @@ public:
                                             mesh->primvarValues.end());
                 for (auto const& primvar : mesh->primvars) {
                     GpuPrimvar entry;
-                    entry.info = {0u, uint32_t(primvar.components), uint32_t(primvar.offset),
+                    // displayColor / displayOpacity also serve fallback materials.
+                    const uint32_t role = primvar.name == "displayColor" ? kPrimvarDisplayColor
+                        : primvar.name == "displayOpacity" ? kPrimvarDisplayOpacity : 0u;
+                    entry.info = {0u, uint32_t(primvar.components) | role, uint32_t(primvar.offset),
                                   uint32_t(mesh->primvarStride)};
                     m_data.primvars.push_back(entry);
                     m_data.primvarNames.push_back(primvar.name);
@@ -555,7 +560,8 @@ void ApplyMdlShaderCode(GpuSceneData& data, MdlShaderCode const& code)
     // Instances whose every material always blocks shadow rays.
     auto blocks = [](GpuMaterial const& m) {
         if (m.info.x == kMaterialMdl) return (m.info.w & kMaterialConstantCutout) != 0u && m.params.w >= 1.0f;
-        if (m.info.x == kMaterialFallback) return m.params.x >= 1.0f;
+        if (m.info.x == kMaterialFallback)
+            return m.params.x >= 1.0f && (m.info.w & kMaterialPrimvarOpacity) == 0u;
         return true; // legacy materials and invalid MDL materials are opaque
     };
     data.hasCutouts = false;

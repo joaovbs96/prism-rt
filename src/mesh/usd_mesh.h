@@ -11,6 +11,7 @@
 #include <unistd.h>
 #endif
 #include <filesystem>
+#include <array>
 #include <map>
 #include <set>
 #include <memory>
@@ -71,6 +72,7 @@ namespace mx = MaterialX;
 
 // internal deps
 #include "../geometry.h"
+#include "../hydra/fallback_material.h"
 #include "../mdl_material.h"
 #include "../materialx/usd_network.h"
 #include "../materialx/prepared_template.h"
@@ -665,12 +667,57 @@ CompileMtlxMaterial(const ResolvedMtlxMaterial& resolved,
 // built by buildMeshData() before anything is written into the global buffers.
 // ============================================================================
 
+// USD displayColor and displayOpacity of one mesh, for its fallback material:
+// constant, or one value per face (uniform), point (vertex, varying) or face
+// corner (faceVarying), indices already applied. A primvar whose size does
+// not fit its interpolation counts as constant (its first value), as in the
+// Hydra delegate.
+struct DisplayPrimvar {
+    std::vector<float> values;
+    int components = 0;
+    pxr::TfToken interpolation = pxr::UsdGeomTokens->constant;
+    bool authored() const { return !values.empty(); }
+    bool varying() const { return interpolation != pxr::UsdGeomTokens->constant; }
+    // The value at a corner (point index, corner index, face index).
+    float const* at(size_t point, size_t corner, size_t face) const {
+        size_t element = 0;
+        if (interpolation == pxr::UsdGeomTokens->uniform) element = face;
+        else if (interpolation == pxr::UsdGeomTokens->faceVarying) element = corner;
+        else if (interpolation != pxr::UsdGeomTokens->constant) element = point;
+        return values.data() + element * size_t(components);
+    }
+};
+
+struct DisplayPrimvars {
+    DisplayPrimvar color, opacity;
+    bool varying() const { return color.varying() || opacity.varying(); }
+    // Per-face or per-corner values need one vertex per face corner.
+    bool expands() const {
+        auto expanding = [](DisplayPrimvar const& p) {
+            return p.interpolation == pxr::UsdGeomTokens->uniform ||
+                p.interpolation == pxr::UsdGeomTokens->faceVarying;
+        };
+        return expanding(color) || expanding(opacity);
+    }
+    // RGB colour and opacity at a corner (grey and opaque where unauthored).
+    void append(std::vector<float>& out, size_t point, size_t corner, size_t face) const {
+        static const float grey[3] = {0.7f, 0.7f, 0.7f}, opaque = 1.0f;
+        float const* c = color.authored() ? color.at(point, corner, face) : grey;
+        float const* o = opacity.authored() ? opacity.at(point, corner, face) : &opaque;
+        out.insert(out.end(), {c[0], c[1], c[2], o[0]});
+    }
+};
+
 struct MeshData {
     std::vector<Float3>        positions;
     std::vector<Float3>        normals;
     std::vector<Float2>        texcoords;
     std::vector<unsigned int>  indices;   // into the above, base-0 for this mesh
     int                        mat_id = -1;
+    // displayColor (3) and displayOpacity (1) per vertex, when either varies
+    // over the mesh; otherwise empty and displayConstant holds them.
+    std::vector<float>         display;
+    std::array<float, 4>       displayConstant{0.7f, 0.7f, 0.7f, 1.0f};
 };
 
 // ============================================================================
@@ -829,6 +876,8 @@ public:
             }
         }
 
+        installDisplayPrimvars();
+
         std::cout << "Finished processing USD file:\n"
                   << "    Total vertices:  " << vertices.size()  << "\n"
                   << "    Total triangles: " << globalTriangleCount << "\n"
@@ -882,6 +931,65 @@ private:
     std::map<SdfPath, int>                    m_mdl_material_lookup;
     std::vector<pxr::TfToken>                 m_bindingPurposes;
 
+    // displayColor / displayOpacity of the appended meshes: constant spans,
+    // and per-vertex values of the meshes where they vary. They become the
+    // mesh primvars `displayColor` and `displayOpacity` (as in the Hydra
+    // delegate) only if some mesh varies.
+    struct DisplaySpan {
+        size_t first = 0, count = 0;
+        std::array<float, 4> constant{};
+        std::vector<float> values; // 4 per vertex, or empty: the constant
+    };
+    std::vector<DisplaySpan> m_displaySpans;
+    bool m_displayVaries = false;
+
+    void installDisplayPrimvars()
+    {
+        if (!m_displayVaries) {
+            m_displaySpans.clear();
+            return;
+        }
+        primvars = {{"displayColor", 3, 0}, {"displayOpacity", 1, 3}};
+        primvarStride = 4;
+        primvarValues.assign(vertices.size() * 4, 0.0f);
+        for (auto const& span : m_displaySpans) {
+            float* out = primvarValues.data() + span.first * 4;
+            if (!span.values.empty())
+                std::copy(span.values.begin(), span.values.end(), out);
+            else
+                for (size_t v = 0; v < span.count; ++v) std::copy(span.constant.begin(), span.constant.end(), out + 4 * v);
+        }
+        m_displaySpans.clear();
+    }
+
+    // displayColor (components 3) or displayOpacity (1) of a mesh prim with
+    // the given counts of points, faces and face corners.
+    static DisplayPrimvar readDisplayPrimvar(const pxr::UsdPrim& prim, const char* name, int components,
+                                             pxr::UsdTimeCode time, size_t points, size_t faces, size_t corners)
+    {
+        DisplayPrimvar result;
+        result.components = components;
+        const pxr::UsdGeomPrimvar primvar = pxr::UsdGeomPrimvarsAPI(prim).GetPrimvar(TfToken(name));
+        pxr::VtValue value;
+        if (!primvar || !primvar.ComputeFlattened(&value, time)) return result;
+        if (components == 3 && value.IsHolding<pxr::VtVec3fArray>()) {
+            for (auto const& c : value.UncheckedGet<pxr::VtVec3fArray>())
+                result.values.insert(result.values.end(), {c[0], c[1], c[2]});
+        } else if (components == 1 && value.IsHolding<pxr::VtFloatArray>()) {
+            for (float o : value.UncheckedGet<pxr::VtFloatArray>()) result.values.push_back(o);
+        }
+        if (result.values.empty()) return result;
+        const TfToken interpolation = primvar.GetInterpolation();
+        const size_t count = result.values.size() / size_t(components);
+        size_t expected = 0;
+        if (interpolation == pxr::UsdGeomTokens->uniform) expected = faces;
+        else if (interpolation == pxr::UsdGeomTokens->faceVarying) expected = corners;
+        else if (interpolation == pxr::UsdGeomTokens->vertex || interpolation == pxr::UsdGeomTokens->varying)
+            expected = points;
+        if (expected && count == expected) result.interpolation = interpolation;
+        return result;
+    }
+
     // -----------------------------------------------------------------------
     // appendMeshData — commit a fully-built MeshData into the global buffers
     // -----------------------------------------------------------------------
@@ -891,6 +999,15 @@ private:
         if (data.positions.empty()) return;
 
         const size_t vertexOffset = vertices.size();
+        DisplaySpan span;
+        span.first = vertexOffset;
+        span.count = data.positions.size();
+        span.constant = data.displayConstant;
+        if (data.display.size() == 4 * data.positions.size()) {
+            span.values = data.display;
+            m_displayVaries = true;
+        }
+        m_displaySpans.push_back(std::move(span));
 
         // Append geometry
         vertices.insert(vertices.end(),   data.positions.begin(),  data.positions.end());
@@ -914,7 +1031,8 @@ private:
     // -----------------------------------------------------------------------
 
     int resolveMaterialId(const pxr::UsdPrim& prim,
-                          pxr::UsdTimeCode timeCode)
+                          pxr::UsdTimeCode timeCode,
+                          DisplayPrimvars const* display = nullptr)
     {
         if (!m_mdl_material_lookup.empty()) {
             pxr::UsdShadeMaterial boundMat = ComputeBoundMaterialFor(prim, m_bindingPurposes);
@@ -943,9 +1061,33 @@ private:
             }
         }
 
+        // displayOpacity, and the mesh primvars where either varies (the
+        // Hydra delegate's FallbackMaterial).
+        float opacity = 1.0f;
+        if (display) {
+            if (display->color.authored())
+                mesh_color = Color3(display->color.values[0], display->color.values[1], display->color.values[2]);
+            if (display->opacity.authored()) opacity = display->opacity.values.front();
+        } else {
+            // Other prims (spheres): a constant displayOpacity only.
+            pxr::UsdGeomPrimvar opacityPrimvar = primvarsAPI.GetPrimvar(TfToken("displayOpacity"));
+            pxr::VtValue val;
+            if (opacityPrimvar && opacityPrimvar.GetInterpolation() == pxr::UsdGeomTokens->constant &&
+                opacityPrimvar.Get(&val, timeCode) && val.IsHolding<pxr::VtFloatArray>() &&
+                !val.UncheckedGet<pxr::VtFloatArray>().empty())
+                opacity = val.UncheckedGet<pxr::VtFloatArray>()[0];
+        }
+        const bool primvarColor = display && display->color.varying();
+        const bool primvarOpacity = display && display->opacity.varying();
+
         int mat_id = static_cast<int>(materials.size());
         auto texture = std::make_unique<ColorTexture>(mesh_color);
-        auto material = std::make_unique<Diffuse>(texture.get());
+        std::unique_ptr<Diffuse> material;
+        if (primvarColor || primvarOpacity || prism::hydra::NormalizeFallbackOpacity(opacity) < 1.0f)
+            material = std::make_unique<prism::hydra::FallbackMaterial>(texture.get(), opacity, primvarColor,
+                                                                        primvarOpacity);
+        else
+            material = std::make_unique<Diffuse>(texture.get());
         materials[mat_id] = material.get();
         m_owned_fallback_textures.push_back(std::move(texture));
         m_owned_fallback_materials.push_back(std::move(material));
@@ -973,9 +1115,6 @@ private:
     {
         MeshData out;
 
-        // ── Resolve material ───────────────────────────────────────────────
-        out.mat_id = resolveMaterialId(mesh.GetPrim(), timeCode);
-
         // ── Read raw mesh attributes ───────────────────────────────────────
         pxr::VtArray<pxr::GfVec3f> points;
         pxr::VtArray<int>          faceVertexIndices;
@@ -987,8 +1126,20 @@ private:
         {
             std::cerr << "[USDMesh] Missing required attributes on "
                       << mesh.GetPrim().GetPath() << "\n";
+            out.mat_id = resolveMaterialId(mesh.GetPrim(), timeCode);
             return out;
         }
+
+        // ── displayColor / displayOpacity, and the material ───────────────
+        DisplayPrimvars display;
+        display.color = readDisplayPrimvar(mesh.GetPrim(), "displayColor", 3, timeCode, points.size(),
+                                           faceVertexCounts.size(), faceVertexIndices.size());
+        display.opacity = readDisplayPrimvar(mesh.GetPrim(), "displayOpacity", 1, timeCode, points.size(),
+                                             faceVertexCounts.size(), faceVertexIndices.size());
+        out.mat_id = resolveMaterialId(mesh.GetPrim(), timeCode, &display);
+        if (display.color.authored())
+            std::copy_n(display.color.values.begin(), 3, out.displayConstant.begin());
+        if (display.opacity.authored()) out.displayConstant[3] = display.opacity.values.front();
 
         // ── Compute transform-derived values ───────────────────────────────
         pxr::GfMatrix4d normalMatrix = worldTransform.GetInverse().GetTranspose();
@@ -1043,18 +1194,18 @@ private:
         // If UVs (or normals) are faceVarying we must expand: one vertex
         // per face corner. Otherwise we keep the compact indexed layout.
         //
-        if (isFaceVarying || normalsAreFaceVarying) {
+        if (isFaceVarying || normalsAreFaceVarying || display.expands()) {
             buildFaceVaryingLayout(
                 out, points, faceVertexIndices, faceVertexCounts,
                 uvValues, uvIndices, hasUvIndices,
                 meshNormals, normalsAreFaceVarying, hasMeshNormals,
-                worldTransform, normalMatrix, flipNormals);
+                worldTransform, normalMatrix, flipNormals, display);
         } else {
             buildIndexedLayout(
                 out, points, faceVertexIndices, faceVertexCounts,
                 uvValues, uvInterpolation,
                 meshNormals, normalsInterpolation, hasMeshNormals,
-                worldTransform, normalMatrix, flipNormals);
+                worldTransform, normalMatrix, flipNormals, display);
         }
 
         return out;
@@ -1082,7 +1233,8 @@ private:
         bool                               hasMeshNormals,
         const pxr::GfMatrix4d&             worldTransform,
         const pxr::GfMatrix4d&             normalMatrix,
-        bool                               flipNormals)
+        bool                               flipNormals,
+        const DisplayPrimvars&             display)
     {
         // Pre-compute per-vertex geometric normals for fallback / fan normal
         std::vector<pxr::GfVec3f> geometricNormals =
@@ -1138,6 +1290,9 @@ private:
                 out.normals.push_back(
                     transformNormal(rawNormal, normalMatrix, flipNormals));
 
+                if (display.varying())
+                    display.append(out.display, size_t(posIdx), faceCorner + c, faceIdx);
+
                 cornerVerts.push_back(expandedIdx);
             }
 
@@ -1167,7 +1322,8 @@ private:
         bool                               hasMeshNormals,
         const pxr::GfMatrix4d&             worldTransform,
         const pxr::GfMatrix4d&             normalMatrix,
-        bool                               flipNormals)
+        bool                               flipNormals,
+        const DisplayPrimvars&             display)
     {
         // Positions
         out.positions.reserve(points.size());
@@ -1217,6 +1373,10 @@ private:
             out.normals.push_back(Float3(0.f, 1.f, 0.f));
         while (out.texcoords.size()  < out.positions.size())
             out.texcoords.push_back(Float2(0.f, 0.f));
+
+        // Display primvars per point (constant, vertex or varying here).
+        if (display.varying())
+            for (size_t p = 0; p < points.size(); ++p) display.append(out.display, p, 0, 0);
 
         // Indices — triangulate faces
         size_t faceCorner = 0;
