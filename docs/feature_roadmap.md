@@ -291,6 +291,11 @@ reference path. The parity tests ([hydra.md](hydra.md#cli-and-hydra-parity))
 compare the two on every fixture both can load; the fixtures the CLI cannot
 load yet are listed there.
 
+glTF loads only in the CLI ([gltf.md](gltf.md)): Hydra and usdview need a
+glTF file-format plugin (none in the OpenUSD build), which could reuse the
+MaterialX converter. Material variants, thin-walled transmission and the
+other gaps listed in gltf.md are open.
+
 ## Not worth porting from the OptiX path tracer
 
 The older OptiX tracer (`joaovbs96/OptiX-Path-Tracer`) has nothing Prism lacks
