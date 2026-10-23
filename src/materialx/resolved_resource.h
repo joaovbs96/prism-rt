@@ -159,6 +159,53 @@ inline std::string ImageExtensionFor(const std::string& authored, const char* by
     return authored;
 }
 
+// In-memory resource bytes (a glTF image embedded in a buffer or a data URI)
+// published like PrepareMaterialResource's artifacts: content-addressed
+// (<sha1><extension>) in cacheDir, written once through a temporary file and
+// a rename, and registered with the texture service as a trusted source.
+inline std::shared_ptr<const ResolvedMaterialResource> PublishMaterialResourceBytes(
+    const char* bytes, size_t size, const std::string& extension, const std::filesystem::path& cacheDir)
+{
+    if (!bytes || !size) throw std::runtime_error("empty material resource");
+    const auto textures = prism::TextureService::Acquire();
+    auto resource = std::make_shared<ResolvedMaterialResource>();
+    resource->fingerprint = OIIO::SHA1::digest(bytes, size);
+    resource->textureService = textures;
+    resource->sourceBytes = size;
+    std::filesystem::create_directories(cacheDir);
+    resource->path = cacheDir / (resource->fingerprint + ImageExtensionFor(extension, bytes, size));
+    resource_detail::PublicationLock publication(resource->path);
+    std::error_code error;
+    if (std::filesystem::exists(resource->path)) {
+        if (!resource_detail::Matches(resource->path, bytes, size))
+            throw std::runtime_error("corrupt material resource cache artifact: " + resource->path.string());
+    } else {
+        static std::atomic<uint64_t> serial{0};
+#ifdef _WIN32
+        const auto process = _getpid();
+#else
+        const auto process = getpid();
+#endif
+        const std::filesystem::path temporary = resource->path.string() + "." + std::to_string(process) + "." +
+            std::to_string(++serial) + ".tmp";
+        {
+            std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
+            if (!out || !out.write(bytes, static_cast<std::streamsize>(size)))
+                throw std::runtime_error("cannot materialize resource: " + temporary.string());
+            out.close();
+            if (!out) throw std::runtime_error("cannot close material resource: " + temporary.string());
+        }
+        std::filesystem::rename(temporary, resource->path, error);
+        if (error) {
+            std::filesystem::remove(temporary, error);
+            if (!std::filesystem::is_regular_file(resource->path))
+                throw std::runtime_error("cannot publish material resource: " + resource->path.string());
+        }
+    }
+    textures->registerTrustedSource(resource->path, {"sha1", "1", resource->fingerprint});
+    return resource;
+}
+
 // Owned resolver inputs only. The registry never calls Hydra or traverses a
 // stage. Waiters release the map mutex before waiting or opening an asset.
 inline MaterialResourceResult PrepareMaterialResource(

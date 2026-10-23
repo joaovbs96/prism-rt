@@ -1,12 +1,20 @@
 #pragma once
 
 // STD Lib deps
-#include <iostream>
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstring>
 #include <filesystem>
+#include <iostream>
+#include <map>
+#include <memory>
+#include <set>
 #include <stdexcept>
 
 // External Deps
 #include <tiny_gltf.h>
+#include <MaterialXFormat/XmlIo.h>
 
 // internal deps
 #include "../geometry.h"
@@ -14,28 +22,354 @@
 #include "../float2.h"
 #include "../transforms.h"
 #include "../material.h"
+#include "../mdl_material.h"
+#include "../resource_limits.h"
+#include "../color/color_management.h"
+#include "../materialx/gltf_material.h"
+#include "../materialx/cached_document.h"
+#include "../materialx/resolved_resource.h"
 
+// glTF 2.0 scenes (.gltf, .glb). Materials load as MaterialX gltf_pbr
+// documents compiled through MDL (docs/gltf.md), unless the legacy C++
+// materials are asked for (--gltf-materials legacy, PRISM_GLTF_MATERIALS) or
+// no MDL context is given. A material whose MaterialX conversion or
+// compilation fails falls back to its legacy material.
 class glTFMesh : public Mesh {
-    private:
-        std::vector<TransformMatrix> nodeTransforms;  // Store transforms for each node
+    public:
+        using MaterialMode = prism::gltf::MaterialMode;
 
-        void processSceneNodes(const tinygltf::Model& model) {
-            // Initialize transforms for all nodes
-            nodeTransforms.resize(model.nodes.size());
-            for (size_t i = 0; i < model.nodes.size(); ++i) {
-                nodeTransforms[i].identity();
+        // Legacy materials (no MDL context).
+        explicit glTFMesh(const std::filesystem::path &file_path)
+            : glTFMesh(file_path, nullptr, "", "", MaterialMode::Legacy) {}
+
+        glTFMesh(const std::filesystem::path &file_path, mdl::Context* mdl_context,
+                 const std::string& mx_libraries_path, const std::string& mx_mdl_path,
+                 MaterialMode mode = prism::gltf::MaterialModeFromEnvironment())
+            : m_path(file_path)
+        {
+            if (mode == MaterialMode::MaterialX && (!mdl_context || mx_libraries_path.empty())) {
+                std::cerr << "PrismRT glTF: no MDL context or MaterialX libraries; using the legacy materials\n";
+                mode = MaterialMode::Legacy;
+            }
+            m_mode = mode;
+
+            tinygltf::TinyGLTF loader;
+            // MaterialX materials read the encoded image files (materialized
+            // into the cache); only legacy materials need decoded pixels.
+            loader.SetImagesAsIs(m_mode == MaterialMode::MaterialX);
+            std::string err, warn;
+            const bool ret = file_path.extension() == ".glb"
+                ? loader.LoadBinaryFromFile(&m_model, &err, &warn, file_path.string())
+                : loader.LoadASCIIFromFile(&m_model, &err, &warn, file_path.string());
+            if (!warn.empty()) std::cout << "Warning: " << warn << std::endl;
+            if (!err.empty()) std::cout << "Error: " << err << std::endl;
+            if (!ret) throw std::runtime_error("Failed to parse glTF file: " + file_path.string());
+
+            if (m_mode == MaterialMode::MaterialX) {
+                for (auto const& extension : prism::gltf::UnsupportedExtensions(m_model))
+                    std::cerr << "PrismRT glTF: extension " << extension << " is not supported; ignored\n";
+            } else {
+                for (const auto& extension : m_model.extensionsUsed) {
+                    if (extension != "KHR_materials_emissive_strength" &&
+                        extension != "KHR_materials_transmission")
+                        std::cerr << "PrismRT: unsupported glTF extension " << extension
+                                  << "; using the existing core material/geometry behavior\n";
+                }
             }
 
-            std::cout << "Scene info: " << model.scenes.size() << " scenes, " << model.nodes.size() << " nodes" << std::endl;
+            // Process scene hierarchy and calculate node transforms
+            processSceneNodes(m_model);
 
-            // Process default scene (or first scene if no default)
-            int sceneIndex = model.defaultScene >= 0 ? model.defaultScene : 0;
-            if (sceneIndex < model.scenes.size()) {
-                const tinygltf::Scene& scene = model.scenes[sceneIndex];
-                std::cout << "Processing scene " << sceneIndex << " with " << scene.nodes.size() << " root nodes" << std::endl;
+            // Materials first: the geometry's texture coordinates follow
+            // the convention of the material drawn with them.
+            buildMaterials(mdl_context, mx_libraries_path, mx_mdl_path);
 
-                // Process root nodes
-                for (int nodeIndex : scene.nodes) {
+            int n_faces = 0;
+            for (size_t node_idx = 0; node_idx < m_model.nodes.size(); ++node_idx) {
+                const tinygltf::Node& node = m_model.nodes[node_idx];
+                if (node.mesh >= 0 && node.mesh < int(m_model.meshes.size())) {
+                    const tinygltf::Mesh& mesh = m_model.meshes[size_t(node.mesh)];
+                    processMeshPrimitives(m_model, mesh, nodeTransforms[node_idx], n_faces);
+                }
+            }
+            if (std::all_of(single_sided.begin(), single_sided.end(), [](uint8_t s) { return s != 0; })) {
+                single_sided_all = !single_sided.empty();
+                single_sided.clear();
+            } else if (std::none_of(single_sided.begin(), single_sided.end(), [](uint8_t s) { return s != 0; })) {
+                single_sided.clear();
+            }
+            std::cout << "glTF: " << vertices.size() << " vertices, " << indices.size() / 3 << " triangles, "
+                      << materials.size() << " material(s)\n";
+            // Encoded and decoded images are no longer needed.
+            m_model = tinygltf::Model();
+        }
+
+        MaterialMode materialMode() const { return m_mode; }
+        // Materials that compiled through MaterialX, and those that fell back
+        // to (or were asked to be) legacy materials.
+        size_t materialxMaterialCount() const { return m_materialxCount; }
+        size_t legacyMaterialCount() const { return m_legacyCount; }
+
+    private:
+        std::filesystem::path m_path;
+        tinygltf::Model m_model;
+        MaterialMode m_mode = MaterialMode::Legacy;
+        std::vector<TransformMatrix> nodeTransforms;
+        // Materials compiled through MaterialX (their primitives' UVs are
+        // V-flipped, gltf_material.h).
+        std::set<int> m_materialx;
+        std::vector<std::shared_ptr<MDLMaterial>> m_ownedMdl;
+        std::map<int, std::string> m_imageFiles;
+        size_t m_materialxCount = 0, m_legacyCount = 0;
+        // Primvar layout (Mesh::primvars), -1: absent.
+        int m_texcoord1Offset = -1, m_color0Offset = -1;
+
+        // ---------------------------------------------------------------
+        // Materials
+        // ---------------------------------------------------------------
+
+        void buildMaterials(mdl::Context* mdl_context, const std::string& libraries, const std::string& mdlLibraries)
+        {
+            // The materials primitives draw with (-1: the glTF default
+            // material), and whether one of them has vertex colours.
+            std::map<int, bool> used;
+            for (auto const& mesh : m_model.meshes)
+                for (auto const& primitive : mesh.primitives) {
+                    if (primitive.mode != TINYGLTF_MODE_TRIANGLES) continue;
+                    const int material = primitive.material < int(m_model.materials.size()) ? primitive.material : -1;
+                    used[material] = used[material] || primitive.attributes.contains("COLOR_0");
+                }
+            if (m_mode == MaterialMode::Legacy) {
+                for (auto const& [m, vertexColor] : used) {
+                    materials[m] = legacyMaterial(m);
+                    ++m_legacyCount;
+                }
+                return;
+            }
+
+            const auto start = std::chrono::steady_clock::now();
+            const std::filesystem::path cache = prism::PersistentCacheRoot() / "materials";
+            // Textures resolve beside the cached documents (as for USD).
+            mdl_context->add_resource_path(cache.string());
+            std::map<std::string, std::shared_ptr<MDLMaterial>> compiled; // by document
+            std::set<std::string> warned;
+            size_t reused = 0;
+            bool texcoord1 = false, color0 = false;
+            for (auto const& [m, vertexColor] : used) {
+                std::shared_ptr<MDLMaterial> material;
+                std::string failure;
+                try {
+                    prism::gltf::MaterialConversionOptions options;
+                    options.vertexColor = vertexColor;
+                    options.imageFile = [&](int image) { return imageFile(image, cache); };
+                    options.fromLinearRec709 = [](std::array<float, 3> c) {
+                        auto const colors = prism::color::Active();
+                        if (!colors) return c;
+                        const Float3 w = colors->FromRec709(Float3(c[0], c[1], c[2]));
+                        return std::array<float, 3>{w.x(), w.y(), w.z()};
+                    };
+                    auto conversion = prism::gltf::ConvertGltfMaterial(m_model, m, options);
+                    for (auto const& warning : conversion.warnings)
+                        if (warned.insert(warning).second) std::cerr << "PrismRT glTF: " << warning << "\n";
+                    const std::string xml = MaterialX::writeToXmlString(conversion.document);
+                    if (auto found = compiled.find(xml); found != compiled.end()) {
+                        material = found->second;
+                        ++reused;
+                    } else {
+                        const auto path = prism::materialx::PublishMaterialXDocument(xml, cache, "gltf_");
+                        material = std::make_shared<MDLMaterial>(path.string(), *mdl_context, libraries,
+                                                                 mdlLibraries, prism::gltf::kMaterialName);
+                        if (material->is_valid()) compiled.emplace(xml, material);
+                        else failure = "MDL compilation failed (" + path.string() + ")";
+                    }
+                    if (material && material->is_valid()) {
+                        texcoord1 = texcoord1 || conversion.usesTexcoord1;
+                        color0 = color0 || conversion.usesVertexColor;
+                    }
+                } catch (const std::exception& error) {
+                    failure = error.what();
+                }
+                if (material && material->is_valid()) {
+                    materials[m] = material.get();
+                    m_ownedMdl.push_back(std::move(material));
+                    m_materialx.insert(m);
+                    ++m_materialxCount;
+                } else {
+                    std::cerr << "PrismRT glTF: material " << materialLabel(m)
+                              << " has no MaterialX material (" << failure << "); using the legacy material\n";
+                    materials[m] = legacyMaterial(m);
+                    ++m_legacyCount;
+                }
+            }
+            if (texcoord1) addPrimvar(prism::gltf::kTexcoord1Primvar, 2, &m_texcoord1Offset);
+            if (color0) addPrimvar(prism::gltf::kColor0Primvar, 4, &m_color0Offset);
+            std::cout << "glTF: " << m_materialxCount << " MaterialX material(s) (" << compiled.size()
+                      << " compiled, " << reused << " reused), " << m_legacyCount << " legacy, in "
+                      << std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() << " s\n";
+        }
+
+        void addPrimvar(const char* name, int components, int* offset)
+        {
+            *offset = primvarStride;
+            primvars.push_back({name, components, primvarStride});
+            primvarStride += components;
+        }
+
+        std::string materialLabel(int m) const
+        {
+            return m >= 0 ? std::to_string(m) + " '" + m_model.materials[size_t(m)].name + "'" : "(default)";
+        }
+
+        // The cached copy of an image's encoded bytes (file name beside the
+        // cached documents), empty when it has none.
+        std::string imageFile(int index, const std::filesystem::path& cache)
+        {
+            if (auto found = m_imageFiles.find(index); found != m_imageFiles.end()) return found->second;
+            std::string name;
+            const tinygltf::Image& image = m_model.images[size_t(index)];
+            if (!image.image.empty()) {
+                std::string extension = image.mimeType == "image/jpeg" ? ".jpg"
+                    : image.mimeType == "image/png" ? ".png" : image.mimeType == "image/webp" ? ".webp" : "";
+                if (extension.empty() && !image.uri.empty() && image.uri.rfind("data:", 0) != 0)
+                    extension = std::filesystem::path(image.uri).extension().string();
+                auto resource = prism::materialx::PublishMaterialResourceBytes(
+                    reinterpret_cast<const char*>(image.image.data()), image.image.size(),
+                    extension.empty() ? ".bin" : extension, cache);
+                name = resource->path.filename().generic_string();
+            }
+            m_imageFiles.emplace(index, name);
+            return name;
+        }
+
+        // An image with decoded pixels for the legacy materials (decoded
+        // here when the loader kept the encoded bytes).
+        tinygltf::Image legacyImage(int index)
+        {
+            const tinygltf::Image& image = m_model.images[size_t(index)];
+            if (!image.as_is || !image.uri.empty() || image.image.empty()) return image;
+            tinygltf::Image decoded;
+            decoded.name = image.name;
+            std::string err, warn;
+            if (!tinygltf::LoadImageData(&decoded, index, &err, &warn, 0, 0, image.image.data(),
+                                         int(image.image.size()), nullptr))
+                std::cerr << "PrismRT glTF: cannot decode image " << index << ": " << err << "\n";
+            return decoded;
+        }
+
+        template <class T>
+        Texture<T>* legacyImageTexture(int textureIndex, const T& factor)
+        {
+            const int source = m_model.textures[size_t(textureIndex)].source;
+            tinygltf::Image image = legacyImage(source);
+            if (image.uri.length() > 0)
+                return new ImageMixTexture<T>(std::filesystem::path(m_path).parent_path().concat("/").concat(image.uri), factor);
+            return new ImageMixTexture<T>(&image.image, image.width, image.height, image.component, factor);
+        }
+
+        bool hasImage(int textureIndex) const
+        {
+            if (textureIndex < 0 || textureIndex >= int(m_model.textures.size())) return false;
+            const int source = m_model.textures[size_t(textureIndex)].source;
+            return source >= 0 && source < int(m_model.images.size());
+        }
+
+        static int extensionTexture(const tinygltf::Value& extension, const char* key)
+        {
+            if (!extension.IsObject() || !extension.Has(key)) return -1;
+            const tinygltf::Value& info = extension.Get(key);
+            if (!info.IsObject() || !info.Has("index") || !info.Get("index").IsInt()) return -1;
+            return info.Get("index").GetNumberAsInt();
+        }
+
+        static float getExtensionFactor(const tinygltf::Value& gltf_obj, const char* key, float default_value)
+        {
+            if (gltf_obj.IsObject() && gltf_obj.Has(key) && gltf_obj.Get(key).IsNumber())
+                return float(gltf_obj.Get(key).GetNumberAsDouble());
+            return default_value;
+        }
+
+        // The legacy C++ material (src/material.h) of a glTF material.
+        Material* legacyMaterial(int m)
+        {
+            static const tinygltf::Material defaultMaterial;
+            const tinygltf::Material& mp = m >= 0 ? m_model.materials[size_t(m)] : defaultMaterial;
+            if (mp.alphaMode != "OPAQUE" || mp.pbrMetallicRoughness.baseColorFactor[3] != 1.0)
+                std::cerr << "PrismRT: glTF material '" << mp.name
+                          << "' alpha/cutout settings are not supported by the legacy glTF shader\n";
+            if (mp.occlusionTexture.index >= 0)
+                std::cerr << "PrismRT: glTF material '" << mp.name
+                          << "' authored occlusion texture is ignored\n";
+            if (mp.pbrMetallicRoughness.baseColorTexture.texCoord > 0 ||
+                mp.pbrMetallicRoughness.metallicRoughnessTexture.texCoord > 0 ||
+                mp.normalTexture.texCoord > 0 || mp.emissiveTexture.texCoord > 0)
+                std::cerr << "PrismRT: glTF material '" << mp.name
+                          << "' requests additional UV sets; only TEXCOORD_0 is supported\n";
+            gltfPBR* gltf_material = new gltfPBR();
+
+            const tinygltf::PbrMetallicRoughness& pbr = mp.pbrMetallicRoughness;
+            Texture<Color3>* base_texture;
+            Color3 base_factor = Color3(pbr.baseColorFactor[0], pbr.baseColorFactor[1], pbr.baseColorFactor[2]);
+            if (hasImage(pbr.baseColorTexture.index)) {
+                base_texture = legacyImageTexture<Color3>(pbr.baseColorTexture.index, base_factor);
+                base_texture->gammaCorrect(1.0 / 2.2);
+            } else {
+                base_texture = new ColorTexture(base_factor);
+            }
+            // glTF colours are linear Rec.709 (after the decode above).
+            base_texture->convertToWorkingSpace(prism::color::kLightColorSpace);
+            gltf_material->setBaseColor(base_texture);
+
+            // TODO: occlusion is currently ignored
+            Texture<Float3>* orm_texture;
+            Float3 orm_factor = Float3(0.0f, pbr.roughnessFactor, pbr.metallicFactor);
+            if (hasImage(pbr.metallicRoughnessTexture.index))
+                orm_texture = legacyImageTexture<Float3>(pbr.metallicRoughnessTexture.index, orm_factor);
+            else
+                orm_texture = new ValueTexture<Float3>(orm_factor);
+            gltf_material->setORM(orm_texture);
+
+            if (hasImage(mp.normalTexture.index))
+                gltf_material->setNormalTexture(legacyImageTexture<Float3>(mp.normalTexture.index, orm_factor));
+
+            Texture<Color3>* emission_texture;
+            Color3 emission_factor = Color3(mp.emissiveFactor[0], mp.emissiveFactor[1], mp.emissiveFactor[2]);
+            float emission_strength = 1.0;
+            if (auto ext = mp.extensions.find("KHR_materials_emissive_strength"); ext != mp.extensions.end())
+                emission_strength = getExtensionFactor(ext->second, "emissiveStrength", 1.0);
+            if (hasImage(mp.emissiveTexture.index)) {
+                emission_texture = legacyImageTexture<Float3>(mp.emissiveTexture.index, emission_factor);
+                emission_texture->gammaCorrect(1.0 / 2.2);
+            } else {
+                emission_texture = new ValueTexture<Color3>(emission_factor);
+            }
+            emission_texture->convertToWorkingSpace(prism::color::kLightColorSpace);
+            gltf_material->setEmission(emission_texture, emission_strength);
+
+            if (auto ext = mp.extensions.find("KHR_materials_transmission"); ext != mp.extensions.end()) {
+                const tinygltf::Value& transmission = ext->second;
+                float transmission_factor = getExtensionFactor(transmission, "transmissionFactor", 0.0f);
+                const int texture = extensionTexture(transmission, "transmissionTexture");
+                Texture<float>* transmission_texture = hasImage(texture)
+                    ? legacyImageTexture<float>(texture, transmission_factor)
+                    : static_cast<Texture<float>*>(new ValueTexture<float>(transmission_factor));
+                gltf_material->setTransmission(transmission_texture);
+            }
+
+            gltf_material->createBRDFs();
+            return gltf_material;
+        }
+
+        // ---------------------------------------------------------------
+        // Geometry
+        // ---------------------------------------------------------------
+
+        void processSceneNodes(const tinygltf::Model& model) {
+            nodeTransforms.resize(model.nodes.size());
+            for (size_t i = 0; i < model.nodes.size(); ++i)
+                nodeTransforms[i].identity();
+            const int sceneIndex = model.defaultScene >= 0 ? model.defaultScene : 0;
+            if (sceneIndex < int(model.scenes.size())) {
+                for (int nodeIndex : model.scenes[size_t(sceneIndex)].nodes) {
                     TransformMatrix parentTransform;  // Identity for root nodes
                     processNode(model, nodeIndex, parentTransform);
                 }
@@ -45,518 +379,245 @@ class glTFMesh : public Mesh {
         }
 
         void processNode(const tinygltf::Model& model, int nodeIndex, const TransformMatrix& parentTransform) {
-            if (nodeIndex < 0 || nodeIndex >= model.nodes.size()) return;
-
-            const tinygltf::Node& node = model.nodes[nodeIndex];
-
-            // Calculate local transform for this node
+            if (nodeIndex < 0 || nodeIndex >= int(model.nodes.size())) return;
+            const tinygltf::Node& node = model.nodes[size_t(nodeIndex)];
             TransformMatrix localTransform;
             getNodeTransform(node, localTransform);
-
-            // Debug output for non-identity transforms
-            if (!localTransform.isIdentity()) {
-                std::cout << "Node " << nodeIndex << " has local transform:" << std::endl;
-                if (node.translation.size() == 3) {
-                    std::cout << "  Translation: (" << node.translation[0] << ", " << node.translation[1] << ", " << node.translation[2] << ")" << std::endl;
-                }
-                if (node.rotation.size() == 4) {
-                    std::cout << "  Rotation: (" << node.rotation[0] << ", " << node.rotation[1] << ", " << node.rotation[2] << ", " << node.rotation[3] << ")" << std::endl;
-                }
-                if (node.scale.size() == 3) {
-                    std::cout << "  Scale: (" << node.scale[0] << ", " << node.scale[1] << ", " << node.scale[2] << ")" << std::endl;
-                }
-                if (node.matrix.size() == 16) {
-                    std::cout << "  Has 4x4 matrix" << std::endl;
-                }
-            }
-
-            // Calculate world transform (parent * local)
-            nodeTransforms[nodeIndex] = parentTransform;
-            nodeTransforms[nodeIndex].multiply(localTransform);
-
-            // Process child nodes recursively
-            for (int childIndex : node.children) {
-                processNode(model, childIndex, nodeTransforms[nodeIndex]);
-            }
+            nodeTransforms[size_t(nodeIndex)] = parentTransform;
+            nodeTransforms[size_t(nodeIndex)].multiply(localTransform);
+            for (int childIndex : node.children)
+                processNode(model, childIndex, nodeTransforms[size_t(nodeIndex)]);
         }
 
         void getNodeTransform(const tinygltf::Node& node, TransformMatrix& transform) {
             transform.identity();
-
             if (node.matrix.size() == 16) {
-                // Node has a transformation matrix (glTF uses column-major, we need row-major)
+                // glTF uses column-major, we need row-major
                 float* m = transform.getMatrix();
-                for (int row = 0; row < 4; ++row) {
-                    for (int col = 0; col < 4; ++col) {
+                for (int row = 0; row < 4; ++row)
+                    for (int col = 0; col < 4; ++col)
                         m[row * 4 + col] = static_cast<float>(node.matrix[col * 4 + row]);
-                    }
-                }
             } else {
-                // Node has TRS (Translation, Rotation, Scale) components
-                // glTF specifies T * R * S order, so we apply in reverse: S, then R, then T
-
-                // Apply translation first
-                if (node.translation.size() == 3) {
-                    transform.translate(
-                        static_cast<float>(node.translation[0]),
-                        static_cast<float>(node.translation[1]),
-                        static_cast<float>(node.translation[2])
-                    );
-                }
-
-                // Apply rotation second (quaternion)
-                if (node.rotation.size() == 4) {
-                    applyQuaternionRotation(transform,
-                        static_cast<float>(node.rotation[0]), // x
-                        static_cast<float>(node.rotation[1]), // y
-                        static_cast<float>(node.rotation[2]), // z
-                        static_cast<float>(node.rotation[3])  // w
-                    );
-                }
-
-                // Apply scale last
-                if (node.scale.size() == 3) {
-                    transform.scale(
-                        static_cast<float>(node.scale[0]),
-                        static_cast<float>(node.scale[1]),
-                        static_cast<float>(node.scale[2])
-                    );
-                }
-
+                // glTF specifies T * R * S
+                if (node.translation.size() == 3)
+                    transform.translate(float(node.translation[0]), float(node.translation[1]), float(node.translation[2]));
+                if (node.rotation.size() == 4)
+                    applyQuaternionRotation(transform, float(node.rotation[0]), float(node.rotation[1]),
+                                            float(node.rotation[2]), float(node.rotation[3]));
+                if (node.scale.size() == 3)
+                    transform.scale(float(node.scale[0]), float(node.scale[1]), float(node.scale[2]));
             }
         }
 
         void applyQuaternionRotation(TransformMatrix& transform, float x, float y, float z, float w) {
-            // Convert quaternion to rotation matrix
             TransformMatrix rotMatrix;
             float* m = rotMatrix.getMatrix();
-
             float xx = x * x, yy = y * y, zz = z * z;
             float xy = x * y, xz = x * z, yz = y * z;
             float wx = w * x, wy = w * y, wz = w * z;
-
             m[0] = 1 - 2 * (yy + zz);   m[1] = 2 * (xy - wz);       m[2] = 2 * (xz + wy);       m[3] = 0;
             m[4] = 2 * (xy + wz);       m[5] = 1 - 2 * (xx + zz);   m[6] = 2 * (yz - wx);       m[7] = 0;
             m[8] = 2 * (xz - wy);       m[9] = 2 * (yz + wx);       m[10] = 1 - 2 * (xx + yy);  m[11] = 0;
             m[12] = 0;                  m[13] = 0;                  m[14] = 0;                  m[15] = 1;
-
             transform.multiply(rotMatrix);
         }
 
+        // An accessor as `components` floats per element: any component
+        // type (normalized integers mapped as the spec says), byteStride and
+        // sparse substitution honoured. Missing components are zero. False
+        // (with a warning) when the accessor is unusable.
+        static bool readAccessor(const tinygltf::Model& model, int index, int components, std::vector<float>* out)
+        {
+            if (index < 0 || index >= int(model.accessors.size())) return false;
+            const tinygltf::Accessor& accessor = model.accessors[size_t(index)];
+            const int available = tinygltf::GetNumComponentsInType(uint32_t(accessor.type));
+            const int componentSize = tinygltf::GetComponentSizeInBytes(uint32_t(accessor.componentType));
+            if (available <= 0 || componentSize <= 0) return false;
+            const size_t count = accessor.count;
+            out->assign(count * size_t(components), 0.0f);
+            auto decode = [&](const unsigned char* element, float* target) {
+                for (int c = 0; c < std::min(available, components); ++c) {
+                    const unsigned char* p = element + size_t(c) * size_t(componentSize);
+                    float value = 0.0f;
+                    switch (accessor.componentType) {
+                    case TINYGLTF_COMPONENT_TYPE_FLOAT: std::memcpy(&value, p, 4); break;
+                    case TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE:
+                        value = accessor.normalized ? *p / 255.0f : float(*p); break;
+                    case TINYGLTF_COMPONENT_TYPE_BYTE: {
+                        const float v = float(*reinterpret_cast<const int8_t*>(p));
+                        value = accessor.normalized ? std::max(v / 127.0f, -1.0f) : v; break;
+                    }
+                    case TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT: {
+                        uint16_t v; std::memcpy(&v, p, 2);
+                        value = accessor.normalized ? v / 65535.0f : float(v); break;
+                    }
+                    case TINYGLTF_COMPONENT_TYPE_SHORT: {
+                        int16_t v; std::memcpy(&v, p, 2);
+                        value = accessor.normalized ? std::max(v / 32767.0f, -1.0f) : float(v); break;
+                    }
+                    case TINYGLTF_COMPONENT_TYPE_UNSIGNED_INT: {
+                        uint32_t v; std::memcpy(&v, p, 4); value = float(v); break;
+                    }
+                    default: break;
+                    }
+                    target[c] = value;
+                }
+            };
+            const size_t elementSize = size_t(available) * size_t(componentSize);
+            auto view = [&](int bufferView, size_t byteOffset, size_t stride, size_t elements,
+                            const unsigned char** data) {
+                if (bufferView < 0 || bufferView >= int(model.bufferViews.size())) return false;
+                const tinygltf::BufferView& bv = model.bufferViews[size_t(bufferView)];
+                if (bv.buffer < 0 || bv.buffer >= int(model.buffers.size())) return false;
+                const tinygltf::Buffer& buffer = model.buffers[size_t(bv.buffer)];
+                const size_t begin = bv.byteOffset + byteOffset;
+                if (elements && begin + stride * (elements - 1) + elementSize > buffer.data.size()) return false;
+                *data = buffer.data.data() + begin;
+                return true;
+            };
+            if (accessor.bufferView >= 0) {
+                const tinygltf::BufferView& bv = model.bufferViews[size_t(accessor.bufferView)];
+                const size_t stride = bv.byteStride ? bv.byteStride : elementSize;
+                const unsigned char* data = nullptr;
+                if (!view(accessor.bufferView, accessor.byteOffset, stride, count, &data)) {
+                    std::cerr << "PrismRT glTF: accessor " << index << " is out of bounds; ignored\n";
+                    return false;
+                }
+                for (size_t i = 0; i < count; ++i)
+                    decode(data + i * stride, out->data() + i * size_t(components));
+            }
+            if (accessor.sparse.isSparse) {
+                const auto& sparse = accessor.sparse;
+                const int indexSize = tinygltf::GetComponentSizeInBytes(uint32_t(sparse.indices.componentType));
+                const unsigned char* indexData = nullptr;
+                const unsigned char* valueData = nullptr;
+                const size_t sparseCount = size_t(sparse.count);
+                if (indexSize <= 0 ||
+                    !view(sparse.indices.bufferView, sparse.indices.byteOffset, size_t(indexSize), 0, &indexData) ||
+                    !view(sparse.values.bufferView, sparse.values.byteOffset, elementSize, sparseCount, &valueData)) {
+                    std::cerr << "PrismRT glTF: sparse accessor " << index << " is invalid; ignored\n";
+                    return false;
+                }
+                for (size_t i = 0; i < sparseCount; ++i) {
+                    uint32_t target = 0;
+                    if (indexSize == 1) target = indexData[i];
+                    else if (indexSize == 2) { uint16_t v; std::memcpy(&v, indexData + 2 * i, 2); target = v; }
+                    else std::memcpy(&target, indexData + 4 * i, 4);
+                    if (target < count) decode(valueData + i * elementSize, out->data() + size_t(target) * size_t(components));
+                }
+            }
+            return true;
+        }
+
         void processMeshPrimitives(const tinygltf::Model& model, const tinygltf::Mesh& mesh,
-                                  TransformMatrix& nodeTransform, int& n_faces) {
+                                   TransformMatrix& nodeTransform, int& n_faces) {
             for (const auto& primitive : mesh.primitives) {
                 if (primitive.mode != TINYGLTF_MODE_TRIANGLES) {
                     std::cout << "Skipping non-triangle primitive" << std::endl;
                     continue;
                 }
-
-                // Extract vertex positions
-                auto posIt = primitive.attributes.find("POSITION");
-                if (posIt == primitive.attributes.end()) {
-                    std::cout << "No POSITION attribute found" << std::endl;
+                auto attribute = [&](const char* name) {
+                    auto found = primitive.attributes.find(name);
+                    return found == primitive.attributes.end() ? -1 : found->second;
+                };
+                std::vector<float> positions;
+                if (!readAccessor(model, attribute("POSITION"), 3, &positions)) {
+                    std::cout << "No usable POSITION attribute found" << std::endl;
                     continue;
                 }
+                const int material = primitive.material < int(model.materials.size()) ? primitive.material : -1;
+                const bool materialx = m_materialx.contains(material);
+                const size_t vertexOffset = vertices.size();
+                const size_t vertexCount = positions.size() / 3;
+                const bool identity = nodeTransform.isIdentity();
 
-                const tinygltf::Accessor& posAccessor = model.accessors[posIt->second];
-                const tinygltf::BufferView& posBufferView = model.bufferViews[posAccessor.bufferView];
-                const tinygltf::Buffer& posBuffer = model.buffers[posBufferView.buffer];
+                for (size_t i = 0; i < vertexCount; ++i)
+                    vertices.push_back(nodeTransform.transformPoint(
+                        Float3(positions[3 * i], positions[3 * i + 1], positions[3 * i + 2])));
 
-                if (posAccessor.componentType != TINYGLTF_COMPONENT_TYPE_FLOAT) {
-                    std::cout << "Position data is not float type" << std::endl;
-                    continue;
-                }
-
-                const float* positions = reinterpret_cast<const float*>(&posBuffer.data[posBufferView.byteOffset + posAccessor.byteOffset]);
-
-                size_t vertexOffset = vertices.size();
-                int vertexCount = posAccessor.count;
-
-                // Copy and transform vertices
-                std::cout << "  Processing " << vertexCount << " vertices..." << std::endl;
-                std::cout << "  Node transform isIdentity: " << (nodeTransform.isIdentity() ? "YES" : "NO") << std::endl;
-
-                for (int i = 0; i < vertexCount; ++i) {
-                    Float3 vertex(positions[i * 3 + 0], positions[i * 3 + 1], positions[i * 3 + 2]);
-
-                    // Apply node transformation
-                    if (true) {
-                    // if (!nodeTransform.isIdentity()) {
-                        Float3 originalVertex = vertex;
-                        vertex = nodeTransform.transformPoint(vertex);
-
-                        // Debug output for first few vertex transformations
-                        if (i < 3) {
-                            std::cout << "    Vertex " << i << ": (" << originalVertex.x() << ", " << originalVertex.y() << ", " << originalVertex.z()
-                                      << ") -> (" << vertex.x() << ", " << vertex.y() << ", " << vertex.z() << ")" << std::endl;
+                std::vector<float> data;
+                if (readAccessor(model, attribute("NORMAL"), 3, &data) && data.size() == 3 * vertexCount) {
+                    for (size_t i = 0; i < vertexCount; ++i) {
+                        Float3 normal(data[3 * i], data[3 * i + 1], data[3 * i + 2]);
+                        if (!identity) {
+                            Float4 transformed = nodeTransform.transformPoint(Float4(normal.x(), normal.y(), normal.z(), 0.0f));
+                            normal = Float3(transformed.x(), transformed.y(), transformed.z()).normalize();
                         }
-                    } else {
-                        // Double-check: if it's supposed to be identity, verify no transformation occurs
-                        if (i < 3) {
-                            Float3 testTransformed = nodeTransform.transformPoint(vertex);
-                            bool actuallyIdentity = (testTransformed.x() == vertex.x() &&
-                                                   testTransformed.y() == vertex.y() &&
-                                                   testTransformed.z() == vertex.z());
-
-                            std::cout << "    Vertex " << i << ": (" << vertex.x() << ", " << vertex.y() << ", " << vertex.z()
-                                      << ") (no transform applied)" << std::endl;
-
-                            if (!actuallyIdentity) {
-                                std::cout << "    ERROR: Identity transform actually transforms to ("
-                                          << testTransformed.x() << ", " << testTransformed.y() << ", " << testTransformed.z() << ")" << std::endl;
-                                std::cout << "    Matrix marked as identity but isn't:" << std::endl;
-                                nodeTransform.print();
-                            }
-                        }
-                    }
-
-                    vertices.push_back(vertex);
-                }
-
-                // Extract normals
-                auto normalIt = primitive.attributes.find("NORMAL");
-                if (normalIt != primitive.attributes.end()) {
-                    const tinygltf::Accessor& normalAccessor = model.accessors[normalIt->second];
-                    const tinygltf::BufferView& normalBufferView = model.bufferViews[normalAccessor.bufferView];
-                    const tinygltf::Buffer& normalBuffer = model.buffers[normalBufferView.buffer];
-
-                    if (normalAccessor.componentType == TINYGLTF_COMPONENT_TYPE_FLOAT) {
-                        const float* normals_data = reinterpret_cast<const float*>(
-                            &normalBuffer.data[normalBufferView.byteOffset + normalAccessor.byteOffset]);
-
-                        for (size_t i = 0; i < normalAccessor.count; ++i) {
-                            Float3 normal(normals_data[i * 3 + 0], normals_data[i * 3 + 1], normals_data[i * 3 + 2]);
-
-                            // Transform normal (using vector transformation)
-                            if (!nodeTransform.isIdentity()) {
-                                // Transform normal as a vector (w=0)
-                                Float4 normalH = Float4(normal.x(), normal.y(), normal.z(), 0.0f);
-                                Float4 transformedNormal = nodeTransform.transformPoint(normalH);
-                                normal = Float3(transformedNormal.x(), transformedNormal.y(), transformedNormal.z()).normalize();
-                            }
-
-                            normals.push_back(normal);
-                        }
+                        normals.push_back(normal);
                     }
                 } else {
-                    // If no normals, fill with dummy values to match vertex count
-                    size_t currentVertexCount = vertices.size() - normals.size();
-                    for (size_t i = 0; i < currentVertexCount; ++i) {
-                        normals.push_back(Float3(0.0f, 1.0f, 0.0f)); // Default up normal
-                    }
+                    normals.resize(vertices.size(), Float3(0.0f, 1.0f, 0.0f));
                 }
 
-                // Extract texture coordinates
-                auto texCoordIt = primitive.attributes.find("TEXCOORD_0");
-                if (texCoordIt != primitive.attributes.end()) {
-                    const tinygltf::Accessor& texAccessor = model.accessors[texCoordIt->second];
-                    const tinygltf::BufferView& texBufferView = model.bufferViews[texAccessor.bufferView];
-                    const tinygltf::Buffer& texBuffer = model.buffers[texBufferView.buffer];
+                // MaterialX materials take V up (gltf_material.h).
+                auto uv = [&](float u, float v) { return materialx ? Float2(u, 1.0f - v) : Float2(u, v); };
+                if (readAccessor(model, attribute("TEXCOORD_0"), 2, &data) && data.size() == 2 * vertexCount) {
+                    for (size_t i = 0; i < vertexCount; ++i) texcoords.push_back(uv(data[2 * i], data[2 * i + 1]));
+                } else {
+                    texcoords.resize(vertices.size(), Float2(0.0f, 0.0f));
+                }
 
-                    if (texAccessor.componentType == TINYGLTF_COMPONENT_TYPE_FLOAT) {
-                        const float* texcoords_data = reinterpret_cast<const float*>(
-                            &texBuffer.data[texBufferView.byteOffset + texAccessor.byteOffset]);
-
-                        for (size_t i = 0; i < texAccessor.count; ++i) {
-                            texcoords.push_back(Float2(
-                                texcoords_data[i * 2 + 0],
-                                texcoords_data[i * 2 + 1]
-                            ));
+                if (primvarStride > 0) {
+                    primvarValues.resize(vertices.size() * size_t(primvarStride), 0.0f);
+                    float* values = primvarValues.data() + vertexOffset * size_t(primvarStride);
+                    if (m_texcoord1Offset >= 0 && readAccessor(model, attribute("TEXCOORD_1"), 2, &data) &&
+                        data.size() == 2 * vertexCount) {
+                        for (size_t i = 0; i < vertexCount; ++i) {
+                            const Float2 t = uv(data[2 * i], data[2 * i + 1]);
+                            values[i * size_t(primvarStride) + size_t(m_texcoord1Offset)] = t.u();
+                            values[i * size_t(primvarStride) + size_t(m_texcoord1Offset) + 1] = t.v();
                         }
                     }
-                } else {
-                    // If no texture coordinates, fill with dummy values
-                    size_t currentVertexCount = vertices.size() - texcoords.size();
-                    for (size_t i = 0; i < currentVertexCount; ++i) {
-                        texcoords.push_back(Float2(0.0f, 0.0f)); // Default UV
+                    if (m_color0Offset >= 0) {
+                        const bool authored = readAccessor(model, attribute("COLOR_0"), 4, &data) &&
+                            data.size() == 4 * vertexCount;
+                        const auto accessor = attribute("COLOR_0");
+                        const bool rgb = accessor >= 0 && model.accessors[size_t(accessor)].type == TINYGLTF_TYPE_VEC3;
+                        auto const colors = prism::color::Active();
+                        for (size_t i = 0; i < vertexCount; ++i) {
+                            float* target = values + i * size_t(primvarStride) + size_t(m_color0Offset);
+                            if (!authored) { target[0] = target[1] = target[2] = target[3] = 1.0f; continue; }
+                            // Linear Rec.709 into the working space, once.
+                            const Float3 c = colors ? colors->FromRec709(Float3(data[4 * i], data[4 * i + 1], data[4 * i + 2]))
+                                                    : Float3(data[4 * i], data[4 * i + 1], data[4 * i + 2]);
+                            target[0] = c.x(); target[1] = c.y(); target[2] = c.z();
+                            target[3] = rgb ? 1.0f : data[4 * i + 3];
+                        }
                     }
                 }
 
-                // Extract indices
+                const bool singleSided = material >= 0 && !model.materials[size_t(material)].doubleSided;
+                auto addTriangle = [&](uint32_t a, uint32_t b, uint32_t c) {
+                    if (a >= vertexCount || b >= vertexCount || c >= vertexCount) return;
+                    material_mapping[n_faces++] = material;
+                    single_sided.push_back(singleSided ? 1 : 0);
+                    indices.push_back(uint32_t(vertexOffset) + a);
+                    indices.push_back(uint32_t(vertexOffset) + b);
+                    indices.push_back(uint32_t(vertexOffset) + c);
+                };
                 if (primitive.indices >= 0) {
-                    const tinygltf::Accessor& indexAccessor = model.accessors[primitive.indices];
-                    const tinygltf::BufferView& indexBufferView = model.bufferViews[indexAccessor.bufferView];
-                    const tinygltf::Buffer& indexBuffer = model.buffers[indexBufferView.buffer];
-
-                    const unsigned char* indexData = &indexBuffer.data[indexBufferView.byteOffset + indexAccessor.byteOffset];
-
-                    int triangleCount = indexAccessor.count / 3;
-
-                    for (int i = 0; i < triangleCount; i++) {
-                        material_mapping[n_faces] = primitive.material;
-                        n_faces++;
-
-                        // Handle different index component types
-                        for (int j = 0; j < 3; ++j) {
-                            unsigned int index = 0;
-                            int indexOffset = i * 3 + j;
-
-                            switch (indexAccessor.componentType) {
-                                case TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE:
-                                    index = static_cast<unsigned int>(indexData[indexOffset]);
-                                    break;
-                                case TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT:
-                                    index = static_cast<unsigned int>(reinterpret_cast<const unsigned short*>(indexData)[indexOffset]);
-                                    break;
-                                case TINYGLTF_COMPONENT_TYPE_UNSIGNED_INT:
-                                    index = reinterpret_cast<const unsigned int*>(indexData)[indexOffset];
-                                    break;
-                                default:
-                                    std::cout << "Unsupported index component type" << std::endl;
-                                    continue;
-                            }
-
-                            // Add vertex offset for this primitive
-                            indices.push_back(index + vertexOffset);
-                        }
+                    const tinygltf::Accessor& accessor = model.accessors[size_t(primitive.indices)];
+                    const int size = tinygltf::GetComponentSizeInBytes(uint32_t(accessor.componentType));
+                    if (accessor.bufferView < 0 || size <= 0) continue;
+                    const tinygltf::BufferView& bv = model.bufferViews[size_t(accessor.bufferView)];
+                    const tinygltf::Buffer& buffer = model.buffers[size_t(bv.buffer)];
+                    const size_t begin = bv.byteOffset + accessor.byteOffset;
+                    if (begin + accessor.count * size_t(size) > buffer.data.size()) {
+                        std::cerr << "PrismRT glTF: index accessor " << primitive.indices << " is out of bounds; skipped\n";
+                        continue;
                     }
+                    const unsigned char* bytes = buffer.data.data() + begin;
+                    auto index = [&](size_t i) -> uint32_t {
+                        if (size == 1) return bytes[i];
+                        if (size == 2) { uint16_t v; std::memcpy(&v, bytes + 2 * i, 2); return v; }
+                        uint32_t v; std::memcpy(&v, bytes + 4 * i, 4); return v;
+                    };
+                    for (size_t i = 0; i + 2 < accessor.count; i += 3)
+                        addTriangle(index(i), index(i + 1), index(i + 2));
                 } else {
-                  // Non-indexed geometry - create indices automatically
-                    size_t currentVertexCount = vertices.size() - vertexOffset;
-                    for (size_t i = 0; i < currentVertexCount; ++i) {
-                        indices.push_back(static_cast<unsigned int>(vertexOffset + i));
-                        // TODO: this might be wrong? What would be an example of non-indexed geom?
-                        if (i % 3 == 0){
-                            material_mapping[n_faces] = primitive.material;
-                            n_faces++;
-                        }
-                    }
+                    for (size_t i = 0; i + 2 < vertexCount; i += 3)
+                        addTriangle(uint32_t(i), uint32_t(i + 1), uint32_t(i + 2));
                 }
             }
-        }
-
-    public:
-        glTFMesh(const std::filesystem::path &file_path) {
-            tinygltf::TinyGLTF loader;
-            tinygltf::Model model;
-            std::string err;
-            std::string warn;
-
-            bool ret = false;
-            if (file_path.extension() == ".glb") {
-                ret = loader.LoadBinaryFromFile(&model, &err, &warn, file_path.string());
-            } else {
-                ret = loader.LoadASCIIFromFile(&model, &err, &warn, file_path.string());
-            }
-
-            if (!warn.empty()) {
-                std::cout << "Warning: " << warn << std::endl;
-            }
-
-            if (!err.empty()) {
-                std::cout << "Error: " << err << std::endl;
-            }
-
-            if (!ret) {
-                throw std::runtime_error("Failed to parse glTF file: " + file_path.string());
-            }
-
-            for (const auto& extension : model.extensionsUsed) {
-                if (extension != "KHR_materials_emissive_strength" &&
-                    extension != "KHR_materials_transmission")
-                    std::cerr << "PrismRT: unsupported glTF extension " << extension
-                              << "; using the existing core material/geometry behavior\n";
-            }
-
-            // Process scene hierarchy and calculate node transforms
-            processSceneNodes(model);
-
-            int n_faces = 0;
-
-            // Process meshes through their node references
-            for (size_t node_idx = 0; node_idx < model.nodes.size(); ++node_idx) {
-                const tinygltf::Node& node = model.nodes[node_idx];
-
-                if (node.mesh >= 0 && node.mesh < model.meshes.size()) {
-                    const tinygltf::Mesh& mesh = model.meshes[node.mesh];
-                    std::cout << "Processing mesh: " << mesh.name << " (Node: " << node_idx << ")" << std::endl;
-
-                    processMeshPrimitives(model, mesh, nodeTransforms[node_idx], n_faces);
-
-                    std::cout << "Mesh " << node.mesh << " at node " << node_idx << ": "
-                              << vertices.size() << " total vertices, " << indices.size() / 3 << " total triangles" << std::endl;
-                }
-            }
-
-            // Convert Materials from gltf/glb file
-            // for each material in the scene file
-            for (int m = 0; m < model.materials.size(); m++) {
-                tinygltf::Material mp = model.materials[m];
-                if (mp.alphaMode != "OPAQUE" || mp.pbrMetallicRoughness.baseColorFactor[3] != 1.0)
-                    std::cerr << "PrismRT: glTF material '" << mp.name
-                              << "' alpha/cutout settings are not supported by the legacy glTF shader\n";
-                if (mp.occlusionTexture.index >= 0)
-                    std::cerr << "PrismRT: glTF material '" << mp.name
-                              << "' authored occlusion texture is ignored\n";
-                if (mp.pbrMetallicRoughness.baseColorTexture.texCoord > 0 ||
-                    mp.pbrMetallicRoughness.metallicRoughnessTexture.texCoord > 0 ||
-                    mp.normalTexture.texCoord > 0 || mp.emissiveTexture.texCoord > 0)
-                    std::cerr << "PrismRT: glTF material '" << mp.name
-                              << "' requests additional UV sets; only TEXCOORD_0 is supported\n";
-                gltfPBR* gltf_material = new gltfPBR();
-
-                // Create Texture from image file or color value
-                tinygltf::PbrMetallicRoughness pbr = mp.pbrMetallicRoughness;
-                Texture<Color3>* base_texture;
-                Color3 base_factor = Color3(pbr.baseColorFactor[0], pbr.baseColorFactor[1], pbr.baseColorFactor[2]);
-                if (hasImage(model, pbr.baseColorTexture)) {
-                    tinygltf::Image image = getTextureImage(model, pbr.baseColorTexture);
-
-                    if (image.uri.length() > 0) {
-                        base_texture = new ImageMixTexture<Color3>(file_path.parent_path().concat("/").concat(image.uri), base_factor);
-                    } else {
-                        base_texture = new ImageMixTexture<Color3>(&image.image, image.width, image.height, image.component, base_factor);
-                    }
-                    base_texture->gammaCorrect(1.0 / 2.2);
-                } else {
-                    base_texture = new ColorTexture(base_factor);
-                }
-                // glTF colours are linear Rec.709 (after the decode above).
-                base_texture->convertToWorkingSpace(prism::color::kLightColorSpace);
-                gltf_material->setBaseColor(base_texture);
-
-                // TODO: occlusion is currently ignored
-                Texture<Float3>* orm_texture;
-                Float3 orm_factor = Float3(0.0f, pbr.roughnessFactor, pbr.metallicFactor);
-                if (hasImage(model, pbr.metallicRoughnessTexture)) {
-                    tinygltf::Image image = getTextureImage(model, pbr.metallicRoughnessTexture);
-
-                    if (image.uri.length() > 0) {
-                        orm_texture = new ImageMixTexture<Float3>(file_path.parent_path().concat("/").concat(image.uri), orm_factor);
-                    } else {
-                        orm_texture = new ImageMixTexture<Float3>(&image.image, image.width, image.height, image.component, orm_factor);
-                    }
-                } else {
-                    orm_texture = new ValueTexture<Float3>(orm_factor);
-                }
-                gltf_material->setORM(orm_texture);
-
-                Texture<Float3>* normal_texture;
-                if (hasImage(model, mp.normalTexture)) {
-                    tinygltf::Image image = getTextureImage(model, mp.normalTexture);
-
-                    if (image.uri.length() > 0) {
-                        normal_texture = new ImageMixTexture<Float3>(file_path.parent_path().concat("/").concat(image.uri), orm_factor);
-                    } else {
-                        normal_texture = new ImageMixTexture<Float3>(&image.image, image.width, image.height, image.component, orm_factor);
-                    }
-
-                    gltf_material->setNormalTexture(normal_texture);
-                }
-
-                Texture<Color3>* emission_texture;
-                Color3 emission_factor = Color3(mp.emissiveFactor[0], mp.emissiveFactor[1], mp.emissiveFactor[2]);
-                float emission_strength = 1.0;
-                if (mp.extensions.contains("KHR_materials_emissive_strength")) {
-                    tinygltf::Value::Object emission = mp.extensions["KHR_materials_emissive_strength"].Get<tinygltf::Value::Object>();
-                    emission_strength = getExtensionFactor(emission, "emissiveStrength", 1.0);
-                }
-                if (hasImage(model, mp.emissiveTexture)) {
-                    tinygltf::Image image = getTextureImage(model, mp.emissiveTexture);
-
-                    if (image.uri.length() > 0) {
-                        emission_texture = new ImageMixTexture<Float3>(file_path.parent_path().concat("/").concat(image.uri), emission_factor);
-                    } else {
-                        emission_texture = new ImageMixTexture<Float3>(&image.image, image.width, image.height, image.component, emission_factor);
-                    }
-                    emission_texture->gammaCorrect(1.0 / 2.2);
-                } else {
-                    emission_texture = new ValueTexture<Color3>(emission_factor);
-                }
-                emission_texture->convertToWorkingSpace(prism::color::kLightColorSpace);
-                gltf_material->setEmission(emission_texture, emission_strength);
-
-                if (mp.extensions.contains("KHR_materials_transmission")) {
-                    tinygltf::Value::Object transmission = mp.extensions["KHR_materials_transmission"].Get<tinygltf::Value::Object>();
-
-                    // Extract transmissionFactor (required parameter)
-                    float transmission_factor = getExtensionFactor(transmission, "transmissionFactor", 0.0f);
-                    Texture<float>* transmission_texture;
-                    if (hasImage(model, transmission, "transmissionTexture")) {
-                        tinygltf::Image image = getTextureImage(model, transmission, "transmissionTexture");
-
-                        if (image.uri.length() > 0) {
-                            transmission_texture = new ImageMixTexture<float>(file_path.parent_path().concat("/").concat(image.uri), transmission_factor);
-                        } else {
-                            transmission_texture = new ImageMixTexture<float>(&image.image, image.width, image.height, image.component, transmission_factor);
-                        }
-                    } else {
-                        transmission_texture = new ValueTexture<float>(transmission_factor);
-                    }
-                    gltf_material->setTransmission(transmission_texture);
-                }
-
-                gltf_material->createBRDFs();
-
-                // Assign material
-                materials[m] = gltf_material;
-            }
-        }
-
-        float getExtensionFactor(tinygltf::Value::Object gltf_obj, const char* key, float default_value) {
-            // Extract transmissionFactor (required parameter)
-            auto iterator_ = gltf_obj.find(key);
-            if (iterator_ != gltf_obj.end() && iterator_->second.IsNumber()) {
-                return float(iterator_->second.Get<double>());
-            } else {
-                return default_value;
-            }
-        }
-
-        bool hasImage(tinygltf::Model& model, tinygltf::NormalTextureInfo& texinfo) {
-            if (texinfo.index >= 0 && texinfo.index < model.textures.size()) {
-                tinygltf::Texture& normal_texture = model.textures[texinfo.index];
-                if (normal_texture.source >= 0 && normal_texture.source < model.images.size()) {
-                    return true;
-                }
-            }
-            return false;
-        }
-
-        bool hasImage(tinygltf::Model& model, tinygltf::TextureInfo& texinfo) {
-            if (texinfo.index >= 0 && texinfo.index < model.textures.size()){
-                tinygltf::Texture& texture = model.textures[texinfo.index];
-                if (texture.source >= 0 && texture.source < model.images.size()) {
-                    return true;
-                }
-            }
-            return false;
-        }
-
-        bool hasImage(tinygltf::Model& model, tinygltf::Value::Object ext_obj, const char* key) {
-            // Extract transmissionFactor (required parameter)
-            auto iterator_ = ext_obj.find(key);
-            if (iterator_ != ext_obj.end() && iterator_->second.IsObject()) {
-                const tinygltf::Value::Object& texinfo = iterator_->second.Get<tinygltf::Value::Object>();
-                // Get texture index
-                auto index_it_ = texinfo.find("index");
-                if (index_it_ != texinfo.end() && index_it_->second.IsInt()) {
-                    int tex_index = index_it_->second.Get<int>();
-                    tinygltf::Texture& texture = model.textures[tex_index];
-                    if (texture.source >= 0 && texture.source < model.images.size()) {
-                        return true;
-                    }
-                }
-            }
-            return false;
-        }
-
-        tinygltf::Image getTextureImage(tinygltf::Model& model, tinygltf::NormalTextureInfo& texinfo) {
-            tinygltf::Texture& texture = model.textures[texinfo.index];
-            return model.images[texture.source];
-        }
-
-        tinygltf::Image getTextureImage(tinygltf::Model& model, tinygltf::TextureInfo& texinfo) {
-            tinygltf::Texture& texture = model.textures[texinfo.index];
-            return model.images[texture.source];
-        }
-
-        tinygltf::Image getTextureImage(tinygltf::Model& model, tinygltf::Value::Object ext_obj, const char* key) {
-            auto iterator_ = ext_obj.find(key);
-            const tinygltf::Value::Object& texinfo = iterator_->second.Get<tinygltf::Value::Object>();
-            auto index_it_ = texinfo.find("index");
-            int tex_index = index_it_->second.Get<int>();
-            tinygltf::Texture& texture = model.textures[tex_index];
-            return model.images[texture.source];
         }
 };
