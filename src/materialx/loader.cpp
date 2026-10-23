@@ -6,6 +6,7 @@
 #include <cctype>
 #include <format>
 #include <iostream>
+#include <set>
 #include <vector>
 #include <cstdlib>
 #include <string_view>
@@ -427,6 +428,68 @@ void ExpandThinWalledOpenPbr(const MaterialX::DocumentPtr& doc)
     }
 }
 
+// MaterialX 1.39.5's gltf_pbr graph builds the KHR_materials_volume medium
+// (an anisotropic_vdf absorbing attenuation_coeff) but never connects it, so
+// attenuation is dropped and thick glTF glass renders clear. open_pbr_surface
+// layers its transmission over its VDF, which the MDL generator turns into
+// the material's volume. Expand gltf_pbr nodes with a finite attenuation
+// distance into their genmdl graph and add that layer.
+void LayerGltfPbrVolume(const MaterialX::DocumentPtr& doc)
+{
+    std::vector<MaterialX::NodePtr> nodes;
+    for (auto element : doc->traverseTree()) {
+        auto node = element->asA<MaterialX::Node>();
+        if (!node || node->getCategory() != "gltf_pbr") continue;
+        auto distance = node->getInput("attenuation_distance");
+        if (!distance) continue;
+        if (!IsBound(distance)) {
+            try {
+                const float value = std::stof(distance->getValueString());
+                if (!(value > 0.0f && value < 1e29f)) continue; // no attenuation
+            } catch (...) { continue; }
+        }
+        nodes.push_back(node);
+    }
+    const std::string target = "genmdl";
+    for (auto const& node : nodes) {
+        auto graph = node->getParent() ? node->getParent()->asA<MaterialX::GraphElement>() : nullptr;
+        auto implementation = node->getImplementation(target);
+        if (!graph || !implementation || !implementation->isA<MaterialX::NodeGraph>()) {
+            std::cerr << "[MaterialX] WARNING: no graph for " << node->getNamePath()
+                      << "; its volume attenuation is ignored\n";
+            continue;
+        }
+        std::set<std::string> before;
+        for (auto const& existing : graph->getNodes()) before.insert(existing->getName());
+        const std::string name = node->getName();
+        graph->flattenSubgraphs(target, [&](MaterialX::NodePtr candidate) { return candidate == node; });
+        if (graph->getNode(name) == node) continue; // not expanded
+
+        MaterialX::NodePtr transmission, volume;
+        for (auto const& added : graph->getNodes()) {
+            if (before.contains(added->getName())) continue;
+            if (added->getCategory() == "anisotropic_vdf") volume = added;
+            else if (added->getCategory() == "dielectric_bsdf") {
+                auto mode = added->getInput("scatter_mode");
+                if (mode && mode->getValueString() == "T") transmission = added;
+            }
+        }
+        if (!transmission || !volume) {
+            std::cerr << "[MaterialX] WARNING: " << name << " expanded without a transmission BSDF and"
+                      << " volume; its volume attenuation is ignored\n";
+            continue;
+        }
+        const std::vector<MaterialX::PortElementPtr> consumers = transmission->getDownstreamPorts();
+        auto layer = graph->addNode("layer", graph->createValidChildName(name + "_volume_transmission"), "BSDF");
+        layer->addInput("top", "BSDF")->setNodeName(transmission->getName());
+        layer->addInput("base", "VDF")->setNodeName(volume->getName());
+        for (auto const& port : consumers) port->setNodeName(layer->getName());
+        if (VerboseMdl())
+            std::cout << "[MaterialX] " << name << ": transmission layered over its volume ("
+                      << consumers.size() << " consumers)\n";
+    }
+}
+
 void NormalizeColorSpaces(const MaterialX::DocumentPtr& doc)
 {
     const std::string& attribute = MaterialX::Element::COLOR_SPACE_ATTRIBUTE;
@@ -584,6 +647,7 @@ MaterialX::DocumentPtr DocumentLoader::load(const std::string& filepath)
         // Both need the library (declared defaults, graph implementations).
         RouteUncoatedTransmissionIor(doc);
         ExpandThinWalledOpenPbr(doc);
+        LayerGltfPbrVolume(doc);
         std::string validation_errors;
         if (!doc->validate(&validation_errors)) {
             std::cerr << "[WARN] Document validation issues: " << validation_errors << "\n";

@@ -104,6 +104,17 @@ a varying `specular_ior`. Material templates keep `specular_ior`, `coat_ior`,
 `coat_weight` and `transmission_weight` structural on transmissive OpenPBR
 surfaces, so a bound variant never refracts with its seed's IOR.
 
+## gltf_pbr volume attenuation
+
+MaterialX 1.39.5's `gltf_pbr` graph builds the `KHR_materials_volume` medium
+(an `anisotropic_vdf` absorbing `ln(attenuation_color) / attenuation_distance`)
+but never connects it, so attenuation is dropped and thick glTF glass renders
+clear. `open_pbr_surface` layers its transmission over its VDF, which the MDL
+generator turns into the material's `volume`. The loader expands each
+`gltf_pbr` with a finite `attenuation_distance` into its genmdl graph and adds
+that layer (`LayerGltfPbrVolume`), so the integrator traces the absorbing
+medium as it does for OpenPBR glass.
+
 ## Deliberate non-repairs
 
 Two differences from the OpenPBR Shader Playground's Arnold reference render
