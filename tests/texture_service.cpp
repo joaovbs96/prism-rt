@@ -647,6 +647,13 @@ int main()
             auto serial = service->prepare(manyImages[i], manyOptions[i]);
             require(serial->preparedPath().parent_path() == root / "serial-many",
                     "serial reference preparation reused the concurrent cache");
+            // prepare() returns before a background writer publishes the
+            // .tx.exr; reading a pixel waits for it.
+            std::array<float, 4> firstPixel{};
+            require(service->readPixels(*serial, 0, 0, 1, 1, 0, serial->channels(), firstPixel.data()) &&
+                    service->readPixels(*manyResults[0][i], 0, 0, 1, 1, 0,
+                                        manyResults[0][i]->channels(), firstPixel.data()),
+                    "cannot wait for the prepared textures to be written");
             require(mipLevels(serial->preparedPath()) == mipLevels(manyResults[0][i]->preparedPath()),
                     "concurrently prepared texture differs from its serial preparation");
         }
