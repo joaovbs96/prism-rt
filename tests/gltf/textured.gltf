@@ -1,0 +1,339 @@
+{
+ "asset": {
+  "version": "2.0",
+  "generator": "PrismRT make_fixtures.py"
+ },
+ "scene": 0,
+ "scenes": [
+  {
+   "nodes": [
+    0,
+    1
+   ]
+  }
+ ],
+ "nodes": [
+  {
+   "mesh": 0,
+   "translation": [
+    -1.1,
+    0,
+    0
+   ]
+  },
+  {
+   "mesh": 1,
+   "translation": [
+    1.1,
+    0,
+    0
+   ]
+  }
+ ],
+ "meshes": [
+  {
+   "primitives": [
+    {
+     "attributes": {
+      "POSITION": 0,
+      "NORMAL": 1,
+      "TEXCOORD_0": 2,
+      "TEXCOORD_1": 4
+     },
+     "indices": 3,
+     "material": 0
+    }
+   ]
+  },
+  {
+   "primitives": [
+    {
+     "attributes": {
+      "POSITION": 5,
+      "NORMAL": 6,
+      "TEXCOORD_0": 7,
+      "COLOR_0": 9
+     },
+     "indices": 8,
+     "material": 1
+    }
+   ]
+  }
+ ],
+ "materials": [
+  {
+   "name": "textured",
+   "pbrMetallicRoughness": {
+    "baseColorTexture": {
+     "index": 0,
+     "extensions": {
+      "KHR_texture_transform": {
+       "offset": [
+        0.25,
+        0.5
+       ],
+       "rotation": 0.5,
+       "scale": [
+        2,
+        3
+       ]
+      }
+     }
+    },
+    "baseColorFactor": [
+     1,
+     0.9,
+     0.8,
+     1
+    ],
+    "metallicRoughnessTexture": {
+     "index": 2
+    },
+    "metallicFactor": 1,
+    "roughnessFactor": 1
+   },
+   "normalTexture": {
+    "index": 3,
+    "scale": 0.5
+   },
+   "occlusionTexture": {
+    "index": 2
+   },
+   "emissiveTexture": {
+    "index": 4,
+    "texCoord": 1
+   },
+   "emissiveFactor": [
+    0.5,
+    0.25,
+    0.1
+   ]
+  },
+  {
+   "name": "clamped_vertex_color",
+   "pbrMetallicRoughness": {
+    "baseColorTexture": {
+     "index": 1
+    },
+    "metallicFactor": 0,
+    "roughnessFactor": 0.5
+   }
+  }
+ ],
+ "accessors": [
+  {
+   "bufferView": 0,
+   "componentType": 5126,
+   "count": 4,
+   "type": "VEC3",
+   "min": [
+    -1.0,
+    -1.0,
+    0
+   ],
+   "max": [
+    1.0,
+    1.0,
+    0
+   ]
+  },
+  {
+   "bufferView": 1,
+   "componentType": 5126,
+   "count": 4,
+   "type": "VEC3",
+   "min": [
+    0,
+    0,
+    1
+   ],
+   "max": [
+    0,
+    0,
+    1
+   ]
+  },
+  {
+   "bufferView": 2,
+   "componentType": 5126,
+   "count": 4,
+   "type": "VEC2"
+  },
+  {
+   "bufferView": 3,
+   "componentType": 5123,
+   "count": 6,
+   "type": "SCALAR"
+  },
+  {
+   "bufferView": 4,
+   "componentType": 5126,
+   "count": 4,
+   "type": "VEC2"
+  },
+  {
+   "bufferView": 5,
+   "componentType": 5126,
+   "count": 4,
+   "type": "VEC3",
+   "min": [
+    -1.0,
+    -1.0,
+    0
+   ],
+   "max": [
+    1.0,
+    1.0,
+    0
+   ]
+  },
+  {
+   "bufferView": 6,
+   "componentType": 5126,
+   "count": 4,
+   "type": "VEC3",
+   "min": [
+    0,
+    0,
+    1
+   ],
+   "max": [
+    0,
+    0,
+    1
+   ]
+  },
+  {
+   "bufferView": 7,
+   "componentType": 5126,
+   "count": 4,
+   "type": "VEC2"
+  },
+  {
+   "bufferView": 8,
+   "componentType": 5123,
+   "count": 6,
+   "type": "SCALAR"
+  },
+  {
+   "bufferView": 9,
+   "componentType": 5121,
+   "count": 4,
+   "type": "VEC4",
+   "normalized": true
+  }
+ ],
+ "bufferViews": [
+  {
+   "buffer": 0,
+   "byteOffset": 0,
+   "byteLength": 48,
+   "target": 34962
+  },
+  {
+   "buffer": 0,
+   "byteOffset": 48,
+   "byteLength": 48,
+   "target": 34962
+  },
+  {
+   "buffer": 0,
+   "byteOffset": 96,
+   "byteLength": 32,
+   "target": 34962
+  },
+  {
+   "buffer": 0,
+   "byteOffset": 128,
+   "byteLength": 12,
+   "target": 34963
+  },
+  {
+   "buffer": 0,
+   "byteOffset": 140,
+   "byteLength": 32,
+   "target": 34962
+  },
+  {
+   "buffer": 0,
+   "byteOffset": 172,
+   "byteLength": 48,
+   "target": 34962
+  },
+  {
+   "buffer": 0,
+   "byteOffset": 220,
+   "byteLength": 48,
+   "target": 34962
+  },
+  {
+   "buffer": 0,
+   "byteOffset": 268,
+   "byteLength": 32,
+   "target": 34962
+  },
+  {
+   "buffer": 0,
+   "byteOffset": 300,
+   "byteLength": 12,
+   "target": 34963
+  },
+  {
+   "buffer": 0,
+   "byteOffset": 312,
+   "byteLength": 16,
+   "target": 34962
+  }
+ ],
+ "buffers": [
+  {
+   "byteLength": 328,
+   "uri": "data:application/octet-stream;base64,AACAvwAAgL8AAAAAAACAPwAAgL8AAAAAAACAPwAAgD8AAAAAAACAvwAAgD8AAAAAAAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAgD8AAIA/AACAPwAAgD8AAAAAAAAAAAAAAAAAAAEAAgAAAAIAAwAAAAAAAAAAQAAAAEAAAABAAAAAQAAAAAAAAAAAAAAAAAAAgL8AAIC/AAAAAAAAgD8AAIC/AAAAAAAAgD8AAIA/AAAAAAAAgL8AAIA/AAAAAAAAAAAAAAAAAACAPwAAAAAAAAAAAACAPwAAAAAAAAAAAACAPwAAAAAAAAAAAACAPwAAgL4AAKA/AACgPwAAoD8AAKA/AACAvgAAgL4AAIC+AAABAAIAAAACAAMA/wAA/wD/AP8AAP//////gA=="
+  }
+ ],
+ "samplers": [
+  {
+   "wrapS": 33071,
+   "wrapT": 33648,
+   "magFilter": 9728
+  }
+ ],
+ "images": [
+  {
+   "uri": "textured_base.png"
+  },
+  {
+   "uri": "textured_base.png"
+  },
+  {
+   "uri": "textured_orm.png"
+  },
+  {
+   "uri": "textured_normal.png"
+  },
+  {
+   "uri": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAH0lEQVR42mP4TwAwMDDgx6MGDAsDCCkgwoJRA4a+AQB8on2ffeydagAAAABJRU5ErkJggg=="
+  }
+ ],
+ "textures": [
+  {
+   "source": 0
+  },
+  {
+   "source": 1,
+   "sampler": 0
+  },
+  {
+   "source": 2
+  },
+  {
+   "source": 3
+  },
+  {
+   "source": 4
+  }
+ ],
+ "extensionsUsed": [
+  "KHR_texture_transform"
+ ]
+}
