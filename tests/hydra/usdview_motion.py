@@ -102,6 +102,7 @@ def testUsdviewInputFunction(appController):
     baseline_camera = model.viewSettings.freeCamera.clone()
     baseline_builds = view._renderer.GetRenderStats()["snapshotBuilds"]
     view.SetRendererSetting("prism:samplesPerPixel", 1000000)
+    view.SetRendererSetting("prism:adaptiveThreshold", 0.0)  # keep refining
     buttons = QtCore.Qt.MouseButton
     events = QtCore.QEvent.Type
     rows = []

@@ -43,6 +43,7 @@ def testUsdviewInputFunction(appController):
         time.sleep(.005)
     initial_refinement = int(dict(view._renderer.GetRenderStats()).get("refinementPublishes", 0))
     view.SetRendererSetting("prism:samplesPerPixel", 10000)
+    view.SetRendererSetting("prism:adaptiveThreshold", 0.0)  # keep refining
     view.switchToFreeCamera()
     model.viewSettings.freeCamera.Tumble(3, 0)
     view.updateView()

@@ -24,6 +24,9 @@
 //                      primvars reach MDL geompropvalue lookups.
 //   lobes_consistency  MIS BSDF: a light_lobes variant rendered with MIS and
 //                      with BSDF sampling only agrees on every card.
+//   sss_fallback       sss_fallback.usda: prism:sssFallback renders the
+//                      furnace's subsurface-only sphere by its (black)
+//                      diffuse lobe instead of tracing the walk.
 
 #include <OpenImageIO/imagebuf.h>
 
@@ -281,6 +284,15 @@ void LobesConsistency(std::vector<Image> const& images)
     }
 }
 
+// sss_fallback.usda, 64x64: the sphere of sss_furnace.usda covers the centre.
+// Traced, it looks like the white dome; with the fallback its base (weight 0)
+// leaves it black against the dome.
+void SssFallback(Image const& image)
+{
+    Check(image.Gray(32, 32, 2) < 0.05f, Describe("the sphere renders black", image.Gray(32, 32, 2)));
+    Check(image.Gray(2, 2, 1) > 0.5f, Describe("the dome is seen", image.Gray(2, 2, 1)));
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -299,6 +311,7 @@ int main(int argc, char** argv)
         {"light_lobes", {3, LightLobes}},
         {"double_sided", single(DoubleSided)},
         {"instance_primvars", single(InstancePrimvars)},
+        {"sss_fallback", single(SssFallback)},
         // Diagnostics: the pixels where two images differ most.
         {"diff", {2, [](std::vector<Image> const& images) {
             std::vector<std::pair<float, int>> d;

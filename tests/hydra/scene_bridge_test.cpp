@@ -1224,6 +1224,7 @@ int main()
 
         prism::hydra::RenderSettings renderSettings;
         renderSettings.samples = 1000000;
+        renderSettings.adaptiveThreshold = 0.0f; // fixed sample counts
         renderSettings.maxDepth = 1;
         renderSettings.previewMaxDimension = 16;
         renderSettings.refinementDelayMs = 0;

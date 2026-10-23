@@ -64,11 +64,11 @@ def main():
         for repetition in (1, 2):
             run(f"{name}-standalone-{repetition}", [standalone, "--scene", scene,
                 "--camera", "/World/Camera", "--width", 128, "--height", 128,
-                "--spp", samples, "--max-sample-radiance", 0, "--seed", 0,
+                "--spp", samples, "--adaptive-threshold", 0, "--max-sample-radiance", 0, "--seed", 0,
                 "--output", output / f"{name}-standalone-{repetition}.exr"])
             run(f"{name}-hydra-{repetition}", [hydra, scene, "/World/Camera",
                 output / f"{name}-hydra-{repetition}.exr", 128, 128, samples,
-                "--sample-clamp", 0])
+                "--sample-clamp", 0, "--adaptive-threshold", 0])
         for renderer in ("standalone", "hydra"):
             run(f"{name}-{renderer}-determinism", [compare,
                 output / f"{name}-{renderer}-1.exr", output / f"{name}-{renderer}-2.exr", "--exact"])

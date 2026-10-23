@@ -106,6 +106,8 @@ struct Fixture {
         auto settings=bridge->GetSettings(); settings.samples=64; settings.maxDepth=4;
         settings.rouletteDepth=32; settings.sampleClamp=0; settings.adaptivePreview=false;
         settings.previewMaxDimension=16; settings.refinementDelayMs=0;
+        // Fixed sample counts: no adaptive sampling (the default).
+        settings.adaptiveThreshold=0;
         bridge->SetSettings(settings);
     }
     ~Fixture() { thread.StopRender(); bridge.reset(); thread.StopThread(); }

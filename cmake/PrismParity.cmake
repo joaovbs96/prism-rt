@@ -11,7 +11,8 @@
 # Renders SCENE on the CPU device with the standalone CLI (PrismRT) and with
 # the Hydra delegate (prism_hydra_render), then compares the two with
 # prism_compare_images: normalized RMSE within TOLERANCE and relative mean
-# luminance within MEAN_TOLERANCE (default: TOLERANCE). Without PRODUCTS both
+# luminance within MEAN_TOLERANCE (default: TOLERANCE). Both render a fixed
+# number of samples (no adaptive sampling: _prism_fixed_sampling). Without PRODUCTS both
 # render one image from CAMERA; with PRODUCTS both write the RenderProducts of
 # the stage's render settings and each listed file is compared. EXACT_LAYERS
 # compares those layers (geometric AOVs) exactly. SCENE is relative to the
@@ -46,17 +47,17 @@ function(prism_add_parity_fixture)
     set(_prefix prism_parity_${P_NAME})
     if(P_PRODUCTS)
         add_test(NAME ${_prefix}_cli
-            COMMAND PrismRT --scene "${_scene}" --device cpu --output-dir "${_dir}/cli" ${P_ARGS} ${P_CLI_ARGS})
+            COMMAND PrismRT --scene "${_scene}" --device cpu --output-dir "${_dir}/cli" ${_prism_fixed_sampling} ${P_ARGS} ${P_CLI_ARGS})
         add_test(NAME ${_prefix}_hydra
-            COMMAND prism_hydra_render "${_scene}" --render-settings default "${_dir}/hydra" ${P_ARGS} ${P_HYDRA_ARGS})
+            COMMAND prism_hydra_render "${_scene}" --render-settings default "${_dir}/hydra" ${_prism_fixed_sampling} ${P_ARGS} ${P_HYDRA_ARGS})
         set(_outputs ${P_PRODUCTS})
     else()
         add_test(NAME ${_prefix}_cli
             COMMAND PrismRT --scene "${_scene}" --camera ${P_CAMERA} --width ${P_WIDTH} --height ${P_HEIGHT}
-                --spp ${P_SPP} --device cpu ${P_ARGS} ${P_CLI_ARGS} --output "${_dir}/cli/image.exr")
+                --spp ${P_SPP} --device cpu ${_prism_fixed_sampling} ${P_ARGS} ${P_CLI_ARGS} --output "${_dir}/cli/image.exr")
         add_test(NAME ${_prefix}_hydra
             COMMAND prism_hydra_render "${_scene}" ${P_CAMERA} "${_dir}/hydra/image.exr"
-                ${P_WIDTH} ${P_HEIGHT} ${P_SPP} ${P_ARGS} ${P_HYDRA_ARGS})
+                ${P_WIDTH} ${P_HEIGHT} ${P_SPP} ${_prism_fixed_sampling} ${P_ARGS} ${P_HYDRA_ARGS})
         set(_outputs image.exr)
     endif()
     # The CPU device in both frontends: these tests never open the GPU.

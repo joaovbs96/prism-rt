@@ -1,0 +1,23 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    renderSettingsPrimPath = "/Render/Settings"
+    subLayers = [
+        @./sss_furnace.usda@
+    ]
+    upAxis = "Y"
+)
+
+# prism:sssFallback from the render settings: the white furnace's
+# subsurface-only sphere renders by its diffuse lobe, whose weight is 0, so it
+# is black against the dome. Both loaders read the setting (parity fixture
+# sss_fallback; prism_scene_features_test sss_fallback).
+def Scope "Render"
+{
+    def RenderSettings "Settings"
+    {
+        rel camera = </World/Camera>
+        int2 resolution = (64, 64)
+        bool prism:sssFallback = 1
+    }
+}

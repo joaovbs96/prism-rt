@@ -104,6 +104,7 @@ def testUsdviewInputFunction(appController):
         original_view = view.copyViewState()
         view.switchToFreeCamera(computeAndSetClosestDistance=False)
         view.SetRendererSetting("prism:samplesPerPixel", 1000000)
+        view.SetRendererSetting("prism:adaptiveThreshold", 0.0)  # keep refining
         view.SetRendererSetting("prism:refinementDelayMs", 100)
         latencies = []
         navigation_stats = {key: [] for key in (

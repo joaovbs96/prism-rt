@@ -65,6 +65,7 @@ def testUsdviewInputFunction(appController):
     # shot; it is lowered afterwards so the image converges for the last one.
     final_samples = int(os.environ.get("PRISM_HUD_SAMPLES", "32"))
     view.SetRendererSetting("prism:samplesPerPixel", 1000000)
+    view.SetRendererSetting("prism:adaptiveThreshold", 0.0)  # keep refining
     view.updateView()
     lowered_at = None
 

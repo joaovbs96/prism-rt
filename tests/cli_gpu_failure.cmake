@@ -4,7 +4,7 @@
 file(REMOVE "${OUTPUT}")
 set(ENV{PRISM_GPU_FAIL_DISPATCH_AT} 0)
 execute_process(
-    COMMAND "${PRISMRT}" --scene "${SCENE}" --camera /World/Camera --width 32 --height 32 --spp 4
+    COMMAND "${PRISMRT}" --scene "${SCENE}" --camera /World/Camera --width 32 --height 32 --spp 4 --adaptive-threshold 0
             --device vulkan --output "${OUTPUT}"
     RESULT_VARIABLE result OUTPUT_VARIABLE out ERROR_VARIABLE err)
 if(result EQUAL 0)

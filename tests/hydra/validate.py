@@ -68,17 +68,18 @@ def main():
             "--camera", "/World/Camera", "--env", fixture.with_name("environment.ppm"),
             "--width", "128", "--height", "128", "--spp", args.spp,
             "--seed", "0", "--max-depth", "32", "--rr-min-depth", "4",
-            "--max-sample-radiance", "10", "--output", out / f"standalone-{rerun}.exr"])
+            "--max-sample-radiance", "10", "--adaptive-threshold", "0",
+            "--output", out / f"standalone-{rerun}.exr"])
         run(f"hydra-{rerun}", [hydra, fixture, "/World/Camera", out / f"hydra-{rerun}.exr",
-            "128", "128", args.spp] + (["--exercise"] if rerun == 1 else []))
+            "128", "128", args.spp, "--adaptive-threshold", "0"] + (["--exercise"] if rerun == 1 else []))
     for renderer in ("standalone", "hydra"):
         run(renderer + "-determinism", [compare, out / f"{renderer}-1.exr",
             out / f"{renderer}-2.exr", "--exact"])
     run("standalone-hydra-parity", [compare, out / "standalone-1.exr", out / "hydra-1.exr"])
     run("preview-surface", [hydra, preview, "/World/Camera", out / "preview.exr",
-        "128", "128", args.spp])
+        "128", "128", args.spp, "--adaptive-threshold", "0"])
     run("preview-materialx", [hydra, preview_mtlx, "/World/Camera",
-        out / "preview-mtlx.exr", "128", "128", args.spp])
+        out / "preview-mtlx.exr", "128", "128", args.spp, "--adaptive-threshold", "0"])
     run("preview-materialx-parity", [compare, out / "preview-mtlx.exr",
         out / "preview.exr"])
     print("Validation artifacts:", out)

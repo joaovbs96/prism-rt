@@ -308,6 +308,10 @@ if(PRISM_BUILD_HYDRA)
     add_test(NAME prism_deps_consistency_test
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/check_deps.py")
 
+    # Render tests pin their sampling: a fixed sample count without adaptive
+    # sampling (the default since adaptive sampling is on, render_defaults.h),
+    # so their images and run times do not follow the defaults.
+    set(_prism_fixed_sampling --adaptive-threshold 0)
     # Tests that compare renders exactly must not depend on whether the CPU
     # preview covered a slow GPU preparation.
     set(_prism_test_environment "PXR_PLUGINPATH_NAME=${PRISM_HYDRA_RESOURCES_DIR}"
@@ -342,14 +346,14 @@ if(PRISM_BUILD_HYDRA)
                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/parity.usda"
                     "/World/Camera"
                     "${CMAKE_BINARY_DIR}/hydra/parity_hydra.exr"
-                    128 128 16 --exercise)
+                    128 128 16 --exercise ${_prism_fixed_sampling})
             set_tests_properties(prism_hydra_render_exercise PROPERTIES ENVIRONMENT "${_prism_test_environment}")
             add_test(NAME prism_hydra_transparent_background_export
                 COMMAND prism_hydra_render
                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/parity.usda"
                     "/World/Camera"
                     "${CMAKE_BINARY_DIR}/hydra/parity_hydra_transparent.exr"
-                    128 128 16 --hide-dome-background)
+                    128 128 16 --hide-dome-background ${_prism_fixed_sampling})
             set_tests_properties(prism_hydra_transparent_background_export PROPERTIES
                 ENVIRONMENT "${_prism_test_environment}")
             # A changed integrator setting must reach the render device: a
@@ -358,12 +362,12 @@ if(PRISM_BUILD_HYDRA)
                 COMMAND prism_hydra_render
                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/parity.usda"
                     "/World/Camera" "${CMAKE_BINARY_DIR}/hydra/parity_depth1.exr"
-                    64 64 8 --max-depth 1)
+                    64 64 8 --max-depth 1 ${_prism_fixed_sampling})
             add_test(NAME prism_hydra_depth_change_render
                 COMMAND prism_hydra_render
                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/parity.usda"
                     "/World/Camera" "${CMAKE_BINARY_DIR}/hydra/parity_depth_changed.exr"
-                    64 64 8 --change-depth 1)
+                    64 64 8 --change-depth 1 ${_prism_fixed_sampling})
             add_test(NAME prism_hydra_setting_change_test
                 COMMAND prism_compare_images
                     "${CMAKE_BINARY_DIR}/hydra/parity_depth1.exr"
@@ -379,11 +383,11 @@ if(PRISM_BUILD_HYDRA)
             add_test(NAME prism_hydra_cutout_medium_render
                 COMMAND prism_hydra_render
                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/cutout_medium.usda"
-                    "/World/Camera" "${CMAKE_BINARY_DIR}/hydra/cutout_medium.exr" 64 64 16)
+                    "/World/Camera" "${CMAKE_BINARY_DIR}/hydra/cutout_medium.exr" 64 64 16 ${_prism_fixed_sampling})
             add_test(NAME prism_hydra_cutout_clear_render
                 COMMAND prism_hydra_render
                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/cutout_clear.usda"
-                    "/World/Camera" "${CMAKE_BINARY_DIR}/hydra/cutout_clear.exr" 64 64 16)
+                    "/World/Camera" "${CMAKE_BINARY_DIR}/hydra/cutout_clear.exr" 64 64 16 ${_prism_fixed_sampling})
             add_test(NAME prism_hydra_cutout_medium_test
                 COMMAND prism_compare_images
                     "${CMAKE_BINARY_DIR}/hydra/cutout_clear.exr" "${CMAKE_BINARY_DIR}/hydra/cutout_medium.exr")
@@ -398,7 +402,7 @@ if(PRISM_BUILD_HYDRA)
                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/animated.usda"
                     "/World/Camera"
                     "${CMAKE_BINARY_DIR}/hydra/animated_hydra.exr"
-                    64 64 16 --animation-exercise)
+                    64 64 16 --animation-exercise ${_prism_fixed_sampling})
             set_tests_properties(prism_hydra_animation_exercise PROPERTIES
                 ENVIRONMENT "${_prism_test_environment}")
         endif()
@@ -680,7 +684,7 @@ if(PRISM_BUILD_HYDRA)
     foreach(_device IN LISTS _prism_cli_exit_devices)
         add_test(NAME prism_cli_clean_exit_${_device}
             COMMAND PrismRT --scene "${CMAKE_CURRENT_SOURCE_DIR}/assets/scenes/CornellBox.usda"
-                --camera /World/Camera --width 32 --height 32 --spp 2 --device ${_device}
+                --camera /World/Camera --width 32 --height 32 --spp 2 ${_prism_fixed_sampling} --device ${_device}
                 --output "${CMAKE_BINARY_DIR}/cli_clean_exit_${_device}.png")
         set_tests_properties(prism_cli_clean_exit_${_device} PROPERTIES
             ENVIRONMENT "${_prism_test_environment}")
@@ -693,6 +697,23 @@ if(PRISM_BUILD_HYDRA)
                 -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli_gpu_failure.cmake)
         set_tests_properties(prism_cli_gpu_failure_vulkan PROPERTIES
             ENVIRONMENT "${_prism_test_environment}")
+    endif()
+    # --time-limit / prism:timeLimitSeconds: a sample count no render reaches
+    # stops at the limit, in both frontends (docs/hydra.md).
+    add_test(NAME prism_cli_time_limit
+        COMMAND PrismRT --scene "${CMAKE_CURRENT_SOURCE_DIR}/assets/scenes/CornellBox.usda"
+            --camera /World/Camera --width 32 --height 32 --spp 100000000 --adaptive-threshold 0
+            --time-limit 2 --device cpu --output "${CMAKE_BINARY_DIR}/cli_time_limit.exr")
+    set_tests_properties(prism_cli_time_limit PROPERTIES ENVIRONMENT "${_prism_test_environment}"
+        PASS_REGULAR_EXPRESSION "stopped by the time limit" TIMEOUT 120)
+    if(TARGET prism_hydra_render)
+        add_test(NAME prism_hydra_time_limit
+            COMMAND prism_hydra_render "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/parity.usda"
+                /World/Camera "${CMAKE_BINARY_DIR}/hydra/time_limit.exr" 32 32 100000000
+                --adaptive-threshold 0 --time-limit 2)
+        set_tests_properties(prism_hydra_time_limit PROPERTIES
+            ENVIRONMENT "${_prism_test_environment};PRISM_DEVICE=cpu"
+            PASS_REGULAR_EXPRESSION "Render stat timeLimitReached: (1|true)" TIMEOUT 120)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/material_loading_test.cpp")
         add_executable(prism_hydra_material_loading_test
@@ -730,13 +751,13 @@ if(TARGET prism_hydra_render AND TARGET prism_compare_images)
         "PRISM_GPU_STREAMING_THRESHOLD=0")
     add_test(NAME prism_hydra_streaming_cold
         COMMAND prism_hydra_render "${_prism_streaming}/streaming.usda" /World/Camera
-            "${_prism_streaming}/cold.exr" 160 120 16)
+            "${_prism_streaming}/cold.exr" 160 120 16 ${_prism_fixed_sampling})
     add_test(NAME prism_hydra_streaming_warm
         COMMAND prism_hydra_render "${_prism_streaming}/streaming.usda" /World/Camera
-            "${_prism_streaming}/warm.exr" 160 120 16)
+            "${_prism_streaming}/warm.exr" 160 120 16 ${_prism_fixed_sampling})
     add_test(NAME prism_hydra_streaming_whole
         COMMAND prism_hydra_render "${_prism_streaming}/streaming.usda" /World/Camera
-            "${_prism_streaming}/whole.exr" 160 120 16 --no-texture-streaming)
+            "${_prism_streaming}/whole.exr" 160 120 16 --no-texture-streaming ${_prism_fixed_sampling})
     set_tests_properties(prism_hydra_streaming_cold PROPERTIES
         ENVIRONMENT "${_prism_streaming_env}" FIXTURES_REQUIRED prism_streaming_fixture
         FIXTURES_SETUP prism_streaming_renders)
@@ -786,7 +807,7 @@ if(TARGET prism_hydra_render AND TARGET prism_compare_images AND TARGET prism_co
     endforeach()
     add_test(NAME prism_color_view_render
         COMMAND PrismRT --scene "${_prism_color_fixture}" --camera /World/Camera
-            --width 128 --height 64 --spp 4 --max-depth 1 --device cpu --output "${_prism_color}/cli_view.png")
+            --width 128 --height 64 --spp 4 --max-depth 1 ${_prism_fixed_sampling} --device cpu --output "${_prism_color}/cli_view.png")
     set_tests_properties(prism_color_view_render PROPERTIES
         ENVIRONMENT "${_prism_color_env}" FIXTURES_SETUP prism_color_view)
     add_test(NAME prism_color_view_once_test
@@ -802,7 +823,7 @@ if(TARGET prism_hydra_render AND TARGET prism_compare_images AND TARGET prism_co
         string(REPLACE "." "_" _name "${_output}")
         add_test(NAME prism_color_legacy_cli_${_name}_render
             COMMAND PrismRT --scene "${CMAKE_CURRENT_SOURCE_DIR}/assets/scenes/${_scene}.usda"
-                --camera /World/Camera --width 96 --height 64 --spp 16 --device cpu ${_prism_legacy_view}
+                --camera /World/Camera --width 96 --height 64 --spp 16 ${_prism_fixed_sampling} --device cpu ${_prism_legacy_view}
                 --output "${_prism_color}/legacy_cli_${_output}")
         add_test(NAME prism_color_legacy_cli_${_name}_test
             COMMAND prism_compare_images "${_prism_legacy}/cli_${_output}" "${_prism_color}/legacy_cli_${_output}")
@@ -814,7 +835,7 @@ if(TARGET prism_hydra_render AND TARGET prism_compare_images AND TARGET prism_co
     foreach(_fixture parity lights)
         add_test(NAME prism_color_legacy_hydra_${_fixture}_render
             COMMAND prism_hydra_render "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/${_fixture}.usda"
-                /World/Camera "${_prism_color}/legacy_hydra_${_fixture}.exr" 64 64 16 --working-space lin_rec709)
+                /World/Camera "${_prism_color}/legacy_hydra_${_fixture}.exr" 64 64 16 --working-space lin_rec709 ${_prism_fixed_sampling})
         add_test(NAME prism_color_legacy_hydra_${_fixture}_test
             COMMAND prism_compare_images "${_prism_legacy}/hydra_${_fixture}.exr"
                 "${_prism_color}/legacy_hydra_${_fixture}.exr")
@@ -894,12 +915,44 @@ if(TARGET prism_hydra_render AND TARGET prism_compare_images)
                 FIXTURES_REQUIRED prism_parity_double_sided)
         endforeach()
     endif()
-    # Per-instance primvars (PointInstancer and native instancing) for MDL
+    # prism:sssFallback (and --sss-fallback) from the render settings, on both
+    # loaders; the check shows the setting took effect.
+    prism_add_parity_fixture(NAME sss_fallback SCENE tests/hydra/fixtures/sss_fallback.usda
+        ARGS --render-settings /Render/Settings)
+    if(TARGET prism_scene_features_test)
+        foreach(_frontend cli hydra)
+            add_test(NAME prism_scene_features_sss_fallback_${_frontend}
+                COMMAND prism_scene_features_test sss_fallback "${prism_parity_sss_fallback_dir}/${_frontend}/image.exr")
+            set_tests_properties(prism_scene_features_sss_fallback_${_frontend} PROPERTIES
+                FIXTURES_REQUIRED prism_parity_sss_fallback)
+        endforeach()
+    endif()    # prism:subdivisionLevel from the render settings and prism_hydra_render's
+    # --subdivision-level (Hydra only: the CLI renders control hulls and warns).
+    set(_prism_subdivision "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/subdivision_level.usda")
+    foreach(_case "hull;/Render/Hull;12;" "default;/Render/Default;192;" "option;/Render/Hull;48;--subdivision-level;1")
+        list(GET _case 0 _name)
+        list(GET _case 1 _settings)
+        list(GET _case 2 _triangles)
+        list(SUBLIST _case 3 -1 _options)
+        add_test(NAME prism_hydra_subdivision_level_${_name}
+            COMMAND prism_hydra_render "${_prism_subdivision}" /World/Camera
+                "${CMAKE_BINARY_DIR}/hydra/subdivision_${_name}.exr" 32 32 4 ${_prism_fixed_sampling}
+                --render-settings ${_settings} ${_options})
+        set_tests_properties(prism_hydra_subdivision_level_${_name} PROPERTIES
+            ENVIRONMENT "${_prism_test_environment};PRISM_DEVICE=cpu"
+            PASS_REGULAR_EXPRESSION "Render stat triangleCount: ${_triangles}[^0-9]")
+    endforeach()
+    add_test(NAME prism_cli_subdivision_setting_warning
+        COMMAND PrismRT --scene "${_prism_subdivision}" --spp 1 --device cpu
+            --output "${CMAKE_BINARY_DIR}/cli_subdivision.exr")
+    set_tests_properties(prism_cli_subdivision_setting_warning PROPERTIES
+        ENVIRONMENT "${_prism_test_environment};PRISM_DEVICE=cpu"
+        PASS_REGULAR_EXPRESSION "prism:subdivisionLevel does not apply to the standalone loader")    # Per-instance primvars (PointInstancer and native instancing) for MDL
     # geompropvalue: the delegate only (the CLI has neither, phase 7).
     if(TARGET prism_scene_features_test)
         add_test(NAME prism_scene_features_instance_primvars_render
             COMMAND prism_hydra_render "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/instance_primvars.usda"
-                /World/Camera "${CMAKE_BINARY_DIR}/scene_features/instance_primvars.exr" 64 64 16)
+                /World/Camera "${CMAKE_BINARY_DIR}/scene_features/instance_primvars.exr" 64 64 16 ${_prism_fixed_sampling})
         set_tests_properties(prism_scene_features_instance_primvars_render PROPERTIES
             ENVIRONMENT "${_prism_test_environment};PRISM_DEVICE=cpu"
             FIXTURES_SETUP prism_scene_features_instance_primvars)
@@ -933,7 +986,7 @@ if(TARGET prism_hydra_render AND TARGET prism_compare_images)
             foreach(_sampling mis bsdf)
                 add_test(NAME prism_scene_features_${_variant}_${_sampling}_render
                     COMMAND PrismRT --scene "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/${_variant}.usda"
-                        --camera /World/Camera --width 32 --height 32 --spp 1024 --device cpu
+                        --camera /World/Camera --width 32 --height 32 --spp 1024 ${_prism_fixed_sampling} --device cpu
                         --max-sample-radiance 0 --environment-sampling ${_sampling}
                         --output "${CMAKE_BINARY_DIR}/scene_features/${_variant}_${_sampling}.exr")
                 set_tests_properties(prism_scene_features_${_variant}_${_sampling}_render PROPERTIES
@@ -1106,6 +1159,12 @@ set(_prism_gpu_test_regex
 string(JOIN "" _prism_gpu_test_regex ${_prism_gpu_test_regex})
 get_property(_prism_tests DIRECTORY PROPERTY TESTS)
 foreach(_test IN LISTS _prism_tests)
+    # Renders have no time limit of their own (prism_hydra_render waits for
+    # convergence): every test gets one.
+    get_test_property(${_test} TIMEOUT _prism_timeout)
+    if(NOT _prism_timeout)
+        set_tests_properties(${_test} PROPERTIES TIMEOUT 600)
+    endif()
     if(_test MATCHES "${_prism_gpu_test_regex}")
         set_tests_properties(${_test} PROPERTIES LABELS gpu RESOURCE_LOCK gpu)
     else()

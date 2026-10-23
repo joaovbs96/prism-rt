@@ -12,6 +12,7 @@
 #include "../../src/load_profile.h"
 #include "../../src/color/color_management.h"
 #include "../../src/output/render_products.h"
+#include "../../src/render_defaults.h"
 #include <pxr/usd/usd/editContext.h>
 #include <pxr/usd/usdGeom/tokens.h>
 #include <pxr/imaging/cameraUtil/framing.h>
@@ -78,11 +79,14 @@ void render(UsdImagingGLEngine& engine, const UsdStageRefPtr& stage,
             lastErrorCheck = std::chrono::steady_clock::now();
             checkPreparation();
         }
+        // No limit by default (prism:timeLimitSeconds bounds a render);
+        // PRISM_RENDER_TIMEOUT_MINUTES makes a render that never converges
+        // an error.
         static const int minutes = [] {
             const char* value = std::getenv("PRISM_RENDER_TIMEOUT_MINUTES");
-            return value && *value ? std::max(1, std::atoi(value)) : 5;
+            return value && *value ? std::max(1, std::atoi(value)) : 0;
         }();
-        if (std::chrono::steady_clock::now()-start > std::chrono::minutes(minutes))
+        if (minutes > 0 && std::chrono::steady_clock::now()-start > std::chrono::minutes(minutes))
             throw std::runtime_error("Hydra failed to converge within the time limit (PRISM_RENDER_TIMEOUT_MINUTES)");
         if (!engine.IsConverged()) std::this_thread::sleep_for(std::chrono::milliseconds(10));
     } while (!engine.IsConverged());
@@ -107,6 +111,7 @@ std::unique_ptr<UsdImagingGLEngine> makeAnimationEngine(
     engine->SetRendererSetting(TfToken("prism:maxDepth"), VtValue(8));
     engine->SetRendererSetting(TfToken("prism:rrMinDepth"), VtValue(2));
     engine->SetRendererSetting(TfToken("prism:seed"), VtValue(17));
+    engine->SetRendererSetting(TfToken("prism:adaptiveThreshold"), VtValue(0.0f));
     engine->SetRendererSetting(TfToken("prism:textureStreamingPrepass"), VtValue(true));
     engine->SetEnablePresentation(false);
     return engine;
@@ -352,13 +357,13 @@ int main(int argc, char** argv) {
         // renders the RenderProducts of a RenderSettings prim.
         const bool productMode = argc >= 3 && std::string(argv[2]) == "--render-settings";
         if (argc < 4 || (productMode && (argc < 5 || std::string(argv[4]).rfind("--", 0) == 0))) {
-            std::cerr << "usage: prism_hydra_render scene.usda /Camera output.exr [width height spp [--exercise] [--animation-exercise] [--hide-dome-background] [--environment-sampling mis|bsdf] [--light-selection spatial|power] [--sample-clamp N] [--seed N] [--sphere-batching] [--no-texture-streaming] [--progressive-textures] [--render-settings /Render/Settings]]\n"
+            std::cerr << "usage: prism_hydra_render scene.usda /Camera output.exr [width height spp [--exercise] [--animation-exercise] [--hide-dome-background] [--environment-sampling mis|bsdf] [--light-selection spatial|power] [--sample-clamp N] [--seed N] [--adaptive-threshold T] [--adaptive-min-samples N] [--time-limit SECONDS] [--gpu-texture-budget-mib N] [--sss-fallback true|false] [--subdivision-level N] [--displacement-level N] [--sphere-batching] [--no-texture-streaming] [--progressive-textures] [--render-settings /Render/Settings]]\n"
                          "       prism_hydra_render scene.usda --render-settings /Render/Settings|default OUTPUT_DIR [--spp N] [options]\n";
             return 2;
         }
         const int width = !productMode && argc > 4 ? std::stoi(argv[4]) : 128;
         const int height = !productMode && argc > 5 ? std::stoi(argv[5]) : 128;
-        int spp = !productMode && argc > 6 ? std::stoi(argv[6]) : 64;
+        int spp = !productMode && argc > 6 ? std::stoi(argv[6]) : prism::defaults::kSamplesPerPixel;
         bool exercise = false;
         bool animationExercise = false;
         bool sphereBatching = false;
@@ -371,7 +376,11 @@ int main(int argc, char** argv) {
         std::string sampling = "mis";
         std::string filtering = "filtered";
         float sampleClamp = 10.0f;
-        float adaptiveThreshold = 0.0f;
+        float adaptiveThreshold = prism::defaults::kAdaptiveThreshold;
+        int adaptiveMinSamples = prism::defaults::kAdaptiveMinSamples;
+        double timeLimit = prism::defaults::kTimeLimitSeconds;
+        // Settings the tool sets only when given (else authored or defaults).
+        std::vector<std::pair<std::string, VtValue>> optional;
         int maxDepth = 32;
         int changeDepth = 0;
         float neeProbabilityMin = 0.0f;
@@ -409,6 +418,22 @@ int main(int argc, char** argv) {
             else if (option == "--sample-clamp") sampleClamp = std::stof(argv[i]);
             else if (option == "--seed") seed = std::stoi(argv[i]);
             else if (option == "--adaptive-threshold") adaptiveThreshold = std::stof(argv[i]);
+            else if (option == "--adaptive-min-samples") adaptiveMinSamples = std::stoi(argv[i]);
+            else if (option == "--time-limit") timeLimit = std::stod(argv[i]);
+            else if (option == "--gpu-texture-budget-mib")
+                optional.emplace_back("gpuTextureBudgetMiB", VtValue(std::stoi(argv[i])));
+            else if (option == "--sss-fallback")
+                optional.emplace_back("sssFallback", VtValue(std::string(argv[i]) == "true"));
+            else if (option == "--subdivision-level")
+                optional.emplace_back("subdivisionLevel", VtValue(std::stoi(argv[i])));
+            else if (option == "--subdivision-max-faces")
+                optional.emplace_back("subdivisionMaxFaces", VtValue(std::stoi(argv[i])));
+            else if (option == "--subdivision-budget-faces")
+                optional.emplace_back("subdivisionBudgetFaces", VtValue(std::stoi(argv[i])));
+            else if (option == "--displacement-level")
+                optional.emplace_back("displacementLevel", VtValue(std::stoi(argv[i])));
+            else if (option == "--displacement-max-faces")
+                optional.emplace_back("displacementMaxFaces", VtValue(std::stoi(argv[i])));
             else if (option == "--max-depth") maxDepth = std::stoi(argv[i]);
             else if (option == "--time") renderTime = UsdTimeCode(std::stod(argv[i]));
             // Moves the camera this many times after the first render and
@@ -502,6 +527,9 @@ int main(int argc, char** argv) {
             add("--sample-clamp", "maxSampleRadiance", VtValue(sampleClamp));
             add("--seed", "seed", VtValue(seed));
             add("--adaptive-threshold", "adaptiveThreshold", VtValue(adaptiveThreshold));
+            add("--adaptive-min-samples", "adaptiveMinSamples", VtValue(adaptiveMinSamples));
+            add("--time-limit", "timeLimitSeconds", VtValue(timeLimit));
+            for (auto const& [name, value] : optional) overrides.emplace_back(name, value);
             add("--nee-probability-min", "neeProbabilityMin", VtValue(neeProbabilityMin));
             add("--environment-sampling", "environmentSampling", VtValue(sampling));
             add("--texture-filtering", "textureFiltering", VtValue(filtering));
@@ -535,6 +563,10 @@ int main(int argc, char** argv) {
         setting("--texture-filtering", "prism:textureFiltering", VtValue(TfToken(filtering)));
         setting("--seed", "prism:seed", VtValue(seed));
         setting("--adaptive-threshold", "prism:adaptiveThreshold", VtValue(adaptiveThreshold));
+        setting("--adaptive-min-samples", "prism:adaptiveMinSamples", VtValue(adaptiveMinSamples));
+        setting("--time-limit", "prism:timeLimitSeconds", VtValue(timeLimit));
+        for (auto const& [name, value] : optional)
+            engine.SetRendererSetting(TfToken("prism:" + name), value);
         setting("--nee-probability-min", "prism:neeProbabilityMin", VtValue(neeProbabilityMin));
         setting("--light-selection", "prism:lightSelection", VtValue(TfToken(lightSelection)));
         engine.SetRendererSetting(TfToken("prism:sphereBatching"), VtValue(sphereBatching));

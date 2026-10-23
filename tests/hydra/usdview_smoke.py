@@ -148,6 +148,7 @@ def testUsdviewInputFunction(appController):
     settle()
     camera_baseline = shot("02-camera-baseline.png")
     view.SetRendererSetting("prism:samplesPerPixel", 1000000)
+    view.SetRendererSetting("prism:adaptiveThreshold", 0.0)  # keep refining
     before_stats = view._renderer.GetRenderStats()
     previews_before = before_stats.get("previewPublishes", 0)
     camera_revision_before = before_stats["requestedCameraRevision"]

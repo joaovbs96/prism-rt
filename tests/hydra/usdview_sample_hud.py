@@ -54,6 +54,7 @@ def testUsdviewInputFunction(appController):
 
     # Refining: an unreachable target keeps the renderer busy.
     view.SetRendererSetting("prism:samplesPerPixel", 1000000)
+    view.SetRendererSetting("prism:adaptiveThreshold", 0.0)  # keep refining
     view.updateView()
     first_overlay = time.monotonic()
     assert pump(60, lambda: any("/ 1000000" in t for t in texts())), \
