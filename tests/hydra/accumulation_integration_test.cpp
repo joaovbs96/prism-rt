@@ -1,6 +1,7 @@
 #include "integration_fixture.h"
 
 #include <pxr/imaging/hd/light.h>
+#include <pxr/imaging/hd/overlayContainerDataSource.h>
 #include <algorithm>
 #include <cmath>
 #include <iostream>
@@ -237,6 +238,92 @@ int RunAccumulationIntegrationTests()
                     replacement.Capture().frame == continued.prim.Capture().frame,
                 "Replacement buffer was not published with its peer AOVs");
         continued.bindings.back() = oldBinding;
+
+        auto flag = [](VtDictionary const &stats, const char *name) {
+            auto const found = stats.find(name);
+            return found != stats.end() && found->second.IsHolding<bool>() &&
+                found->second.UncheckedGet<bool>();
+        };
+        auto percentDone = [](VtDictionary const &stats) {
+            auto const found = stats.find("percentDone");
+            return found != stats.end() && found->second.IsHolding<double>()
+                ? found->second.UncheckedGet<double>() : -1.0;
+        };
+        auto renderUntilConverged = [](Fixture &fixture) {
+            Prepare(fixture, kInitialSize, kInitialSize);
+            fixture.thread.StartRender();
+            Wait([&] { return fixture.bridge->IsConverged() && fixture.color.IsConverged(); },
+                 "Render did not converge");
+            fixture.thread.StopRender();
+        };
+
+        // prism:timeLimitSeconds: a sample budget no render reaches stops at
+        // the limit and reports convergence; raising the limit resumes the
+        // same accumulation for the time added.
+        Fixture timed;
+        AddScene(timed);
+        RenderSettings timedSettings = timed.bridge->GetSettings();
+        timedSettings.samples = 1000000;
+        timedSettings.timeLimitSeconds = 0.5;
+        timed.bridge->SetSettings(timedSettings);
+        renderUntilConverged(timed);
+        VtDictionary const timedStats = timed.bridge->GetStats();
+        const int64_t timedSamples = Stat(timedStats, "completedSamples");
+        Require(flag(timedStats, "timeLimitReached") && timedSamples >= 1 && timedSamples < 1000000 &&
+                    percentDone(timedStats) == 100.0,
+                "The time limit did not stop the render as converged");
+        RequireUsefulColor(Read<float>(timed.color));
+        timedSettings.timeLimitSeconds = 1.0;
+        timed.bridge->SetSettings(timedSettings);
+        Require(!timed.bridge->IsConverged(), "Raising the time limit did not resume the render");
+        renderUntilConverged(timed);
+        Require(Stat(timed.bridge->GetStats(), "completedSamples") > timedSamples &&
+                    flag(timed.bridge->GetStats(), "timeLimitReached"),
+                "Raising the time limit did not add samples to the accumulation");
+
+        // Adaptive sampling stops every pixel well before the maximum on this
+        // plain scene and reports done; without a time limit the limit flag
+        // stays off.
+        Fixture adaptive;
+        AddScene(adaptive);
+        RenderSettings adaptiveSettings = adaptive.bridge->GetSettings();
+        adaptiveSettings.samples = 100000;
+        adaptiveSettings.adaptiveThreshold = 0.05f;
+        adaptiveSettings.adaptiveMinSamples = 16;
+        adaptive.bridge->SetSettings(adaptiveSettings);
+        renderUntilConverged(adaptive);
+        VtDictionary const adaptiveStats = adaptive.bridge->GetStats();
+        Require(Stat(adaptiveStats, "completedSamples") >= 16 &&
+                    Stat(adaptiveStats, "completedSamples") < 100000 &&
+                    !flag(adaptiveStats, "timeLimitReached") && percentDone(adaptiveStats) == 100.0,
+                "Adaptive sampling did not converge before the sample maximum");
+        auto const activeFraction = adaptiveStats.find("activePixelFraction");
+        Require(activeFraction != adaptiveStats.end() && activeFraction->second.IsHolding<double>() &&
+                    activeFraction->second.UncheckedGet<double>() == 0.0,
+                "Adaptive convergence left pixels active");
+
+        // prism:subdivisionLevel in a running delegate: a Catmull-Clark quad
+        // converts again at the new level (one quad: 2 triangles at level 0,
+        // 4^level quads after).
+        Fixture subdivided;
+        AddScene(subdivided);
+        subdivided.scene->AddPrims({{SdfPath("/Smooth"), HdPrimTypeTokens->mesh,
+            HdOverlayContainerDataSource::New(
+                HdRetainedContainerDataSource::New(HdMeshSchemaTokens->mesh,
+                    HdMeshSchema::Builder().SetSubdivisionScheme(
+                        HdRetainedTypedSampledDataSource<TfToken>::New(TfToken("catmullClark"))).Build()),
+                Plane(0.3f))}});
+        RenderSettings subdivisionSettings = subdivided.bridge->GetSettings();
+        subdivisionSettings.subdivisionLevel = 0;
+        subdivided.bridge->SetSettings(subdivisionSettings);
+        renderUntilConverged(subdivided);
+        const int64_t hullTriangles = Stat(subdivided.bridge->GetStats(), "triangleCount");
+        subdivisionSettings.subdivisionLevel = 2;
+        subdivided.bridge->SetSettings(subdivisionSettings);
+        renderUntilConverged(subdivided);
+        const int64_t refinedTriangles = Stat(subdivided.bridge->GetStats(), "triangleCount");
+        Require(hullTriangles > 0 && refinedTriangles == hullTriangles + 30,
+                "Changing prism:subdivisionLevel did not refine the mesh again");
 
         std::cout << "Independent accumulation integration tests passed\n";
         return 0;

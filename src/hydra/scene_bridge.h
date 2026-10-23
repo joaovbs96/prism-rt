@@ -3,6 +3,7 @@
 #include "../device/device.h"
 #include "../color/color_management.h"
 #include "../progress.h"
+#include "../render_defaults.h"
 #include "../texture_service.h"
 #include "published_pick_scene.h"
 
@@ -30,15 +31,33 @@ PXR_NAMESPACE_CLOSE_SCOPE
 namespace prism::hydra {
 
 struct RenderSettings {
-    int samples = 256;
+    // Defaults shared with the CLI and prism_hydra_render (render_defaults.h).
+    int samples = prism::defaults::kSamplesPerPixel;
     int maxDepth = 32;
     int rouletteDepth = 4;
     int seed = 0;
     float sampleClamp = 10.0f;
     // Adaptive sampling error threshold (0 disables); `samples` is then the
     // per-pixel maximum.
-    float adaptiveThreshold = 0.0f;
-    int adaptiveMinSamples = 16;
+    float adaptiveThreshold = prism::defaults::kAdaptiveThreshold;
+    int adaptiveMinSamples = prism::defaults::kAdaptiveMinSamples;
+    // Wall-clock limit of an accumulation in seconds (0: none): refinement
+    // stops and reports convergence at the first pass boundary past it.
+    double timeLimitSeconds = prism::defaults::kTimeLimitSeconds;
+    // Mesh conversion (prism:subdivisionLevel and so on); their defaults
+    // come from the PRISM_* environment variables. Process-wide, like the
+    // colour management.
+    int subdivisionLevel = prism::defaults::FromEnvironment().subdivisionLevel;
+    int subdivisionMaxFaces = prism::defaults::FromEnvironment().subdivisionMaxFaces;
+    int subdivisionBudgetFaces = prism::defaults::FromEnvironment().subdivisionBudgetFaces;
+    int displacementLevel = prism::defaults::FromEnvironment().displacementLevel;
+    int displacementMaxFaces = prism::defaults::FromEnvironment().displacementMaxFaces;
+    // GPU texture budget in MiB, 0: 45% of device memory
+    // (prism:gpuTextureBudgetMiB, default PRISM_GPU_TEXTURE_BUDGET_MIB).
+    int gpuTextureBudgetMiB = prism::defaults::FromEnvironment().gpuTextureBudgetMiB;
+    // Subsurface scattering renders its diffuse lobe (prism:sssFallback,
+    // default PRISM_SSS_FALLBACK). Process-wide.
+    bool sssFallback = prism::defaults::FromEnvironment().sssFallback;
     // Probabilistic NEE (see prism::device::NeeSettings; 0 always samples).
     float neeProbabilityMin = 0.0f;
     int neeFromDepth = 2;

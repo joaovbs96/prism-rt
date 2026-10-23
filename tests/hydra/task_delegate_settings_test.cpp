@@ -1,4 +1,5 @@
 #include "../../src/hydra/task_delegate.h"
+#include "../../src/hydra/scene_bridge.h"
 
 #include <pxr/imaging/hd/renderSettingsSchema.h>
 #include <pxr/imaging/hd/materialBindingsSchema.h>
@@ -130,6 +131,30 @@ int RunAuthoredSettingsTests()
         const TfToken hiddenBudget("prism:hiddenGeometryBudgetMiB");
         Require(delegate.GetRenderSetting(hiddenBudget).UncheckedGet<int>() == 0,
                 "Hidden geometry budget must default to unlimited");
+        // Shared defaults (render_defaults.h) and numeric settings authored
+        // with another numeric type.
+        {
+            prism::hydra::RenderSettings const defaults;
+            Require(defaults.samples == 2048 && defaults.adaptiveThreshold == 0.01f &&
+                        defaults.adaptiveMinSamples == 64 && defaults.timeLimitSeconds == 0.0,
+                    "Sampling defaults are not 2048 samples, threshold 0.01, 64 minimum, no time limit");
+            const TfToken timeLimit("prism:timeLimitSeconds");
+            const TfToken threshold("prism:adaptiveThreshold");
+            const TfToken level("prism:subdivisionLevel");
+            const VtValue previousTime = delegate.GetRenderSetting(timeLimit);
+            const VtValue previousThreshold = delegate.GetRenderSetting(threshold);
+            const VtValue previousLevel = delegate.GetRenderSetting(level);
+            delegate.SetRenderSetting(timeLimit, VtValue(2.5f));
+            delegate.SetRenderSetting(threshold, VtValue(0.02));
+            delegate.SetRenderSetting(level, VtValue(9));
+            Require(delegate.GetRenderSetting(timeLimit).UncheckedGet<double>() == 2.5 &&
+                        delegate.GetRenderSetting(threshold).UncheckedGet<float>() == 0.02f &&
+                        delegate.GetRenderSetting(level).UncheckedGet<int>() == 6,
+                    "Time limit, threshold or subdivision level were not applied (or not clamped)");
+            delegate.SetRenderSetting(timeLimit, previousTime);
+            delegate.SetRenderSetting(threshold, previousThreshold);
+            delegate.SetRenderSetting(level, previousLevel);
+        }
         delegate.SetRenderSetting(hiddenBudget, VtValue(12));
         Require(delegate.GetRenderSetting(hiddenBudget).UncheckedGet<int>() == 12,
                 "Hidden geometry budget was not applied");

@@ -371,6 +371,17 @@ class UsdviewSampleHudTest(unittest.TestCase):
         self.assertEqual(prismUsdview.hud_lines({}, 7, 64, False),
                          [("Samples: 7 / 64", "normal"), ("  State: refining", "normal")])
 
+    def test_hud_lines_show_adaptive_progress(self):
+        # While adaptive sampling has stopped some pixels, the overall
+        # progress follows the sample count; not once converged.
+        adaptive = {"prismPhase": "rendering", "activePixelFraction": 0.25, "percentDone": 81.4}
+        self.assertEqual(prismUsdview.hud_lines(adaptive, 312, 2048, False),
+                         [("Samples: 312 / 2048 (81%)", "normal"), ("  State: refining", "normal")])
+        self.assertEqual(prismUsdview.hud_lines(dict(adaptive, percentDone=100.0), 312, 2048, True)[0],
+                         ("Samples: 312 / 2048", "normal"))
+        self.assertEqual(prismUsdview.hud_lines(dict(adaptive, activePixelFraction=1.0), 40, 2048, False)[0],
+                         ("Samples: 40 / 2048", "normal"))
+
     def test_texture_streaming_line(self):
         self.assertIsNone(prismUsdview.texture_line({}))
         self.assertIsNone(prismUsdview.texture_line({"prismTextureStreaming": False}))

@@ -361,6 +361,12 @@ def hud_lines(stats, completed, target, converged):
         lines.append(texture)
     samples, state = hud_text(completed, target, converged)
     if samples is not None:
+        # Adaptive sampling stops pixels early: the sample count alone would
+        # sit far below the target, so show the overall progress too.
+        active = stats.get("activePixelFraction")
+        done = stats.get("percentDone")
+        if not converged and active is not None and float(active) < 1.0 and done is not None:
+            samples += " (%d%%)" % int(float(done))
         lines.append(("Samples".rjust(7) + ": " + samples, "normal"))
     lines.append(("State".rjust(7) + ": " + state,
                   "converged" if converged else "normal"))

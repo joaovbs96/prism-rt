@@ -26,6 +26,8 @@
 #include "pxr/usd/sdf/assetPath.h"
 
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
 #include <limits>
 
 PXR_NAMESPACE_OPEN_SCOPE
@@ -37,6 +39,14 @@ TfToken const _seed("prism:seed");
 TfToken const _sampleClamp("prism:maxSampleRadiance");
 TfToken const _adaptiveThreshold("prism:adaptiveThreshold");
 TfToken const _adaptiveMinSamples("prism:adaptiveMinSamples");
+TfToken const _timeLimitSeconds("prism:timeLimitSeconds");
+TfToken const _subdivisionLevel("prism:subdivisionLevel");
+TfToken const _subdivisionMaxFaces("prism:subdivisionMaxFaces");
+TfToken const _subdivisionBudgetFaces("prism:subdivisionBudgetFaces");
+TfToken const _displacementLevel("prism:displacementLevel");
+TfToken const _displacementMaxFaces("prism:displacementMaxFaces");
+TfToken const _gpuTextureBudgetMiB("prism:gpuTextureBudgetMiB");
+TfToken const _sssFallback("prism:sssFallback");
 TfToken const _adaptivePreview("prism:adaptivePreview");
 TfToken const _neeProbabilityMin("prism:neeProbabilityMin");
 TfToken const _neeFromDepth("prism:neeFromDepth");
@@ -69,6 +79,14 @@ template<class T>
 T _Get(VtValue const &v, T fallback)
 {
     return v.IsHolding<T>() ? v.UncheckedGet<T>() : fallback;
+}
+
+// A number of any numeric type (authored attributes may be float, double or
+// int64).
+template<class T>
+T _Number(VtValue const &v, T fallback)
+{
+    return v.CanCast<T>() ? VtValue::Cast<T>(v).template UncheckedGet<T>() : fallback;
 }
 }
 
@@ -195,13 +213,17 @@ TfTokenVector PrismTaskDelegate::GetRenderSettingsNamespaces() const
 
 HdRenderSettingDescriptorList PrismTaskDelegate::GetRenderSettingDescriptors() const
 {
-    return {{"Samples", _samples, VtValue(256)},
+    // Defaults shared with the CLI (render_defaults.h); those with an
+    // environment variable take its value.
+    const prism::hydra::RenderSettings d;
+    return {{"Samples (maximum with adaptive sampling)", _samples, VtValue(d.samples)},
             {"Maximum depth", _maxDepth, VtValue(32)},
             {"Roulette depth", _rouletteDepth, VtValue(4)},
             {"Seed", _seed, VtValue(0)},
             {"Sample clamp", _sampleClamp, VtValue(10.0f)},
-            {"Adaptive sampling threshold (0 off)", _adaptiveThreshold, VtValue(0.0f)},
-            {"Adaptive sampling minimum samples", _adaptiveMinSamples, VtValue(16)},
+            {"Adaptive sampling threshold (0 off)", _adaptiveThreshold, VtValue(d.adaptiveThreshold)},
+            {"Adaptive sampling minimum samples", _adaptiveMinSamples, VtValue(d.adaptiveMinSamples)},
+            {"Time limit (seconds, 0 none)", _timeLimitSeconds, VtValue(d.timeLimitSeconds)},
             {"Minimum NEE probability (0 always samples)", _neeProbabilityMin, VtValue(0.0f)},
             {"Probabilistic NEE from depth", _neeFromDepth, VtValue(2)},
             {"Light selection (spatial, power)", _lightSelection, VtValue(std::string("spatial"))},
@@ -210,6 +232,13 @@ HdRenderSettingDescriptorList PrismTaskDelegate::GetRenderSettingDescriptors() c
             {"Sphere batching (experimental)", _sphereBatching, VtValue(false)},
             {"Honor doubleSided (cull back faces)", _honorDoubleSided, VtValue(false)},
             {"Hidden geometry budget (MiB, 0 unlimited)", _hiddenGeometryBudget, VtValue(0)},
+            {"Subdivision level", _subdivisionLevel, VtValue(d.subdivisionLevel)},
+            {"Subdivision faces per mesh", _subdivisionMaxFaces, VtValue(d.subdivisionMaxFaces)},
+            {"Subdivision faces per scene", _subdivisionBudgetFaces, VtValue(d.subdivisionBudgetFaces)},
+            {"Displacement subdivision level", _displacementLevel, VtValue(d.displacementLevel)},
+            {"Displacement faces per mesh", _displacementMaxFaces, VtValue(d.displacementMaxFaces)},
+            {"GPU texture budget (MiB, 0 automatic)", _gpuTextureBudgetMiB, VtValue(d.gpuTextureBudgetMiB)},
+            {"SSS renders as diffuse", _sssFallback, VtValue(d.sssFallback)},
             {"Preview target (ms)", _previewTargetMs, VtValue(33)},
             {"Preview maximum dimension (0 automatic)", _previewMaxDimension, VtValue(0)},
             {"Refinement delay (ms)", _refinementDelayMs, VtValue(100)},
@@ -241,6 +270,14 @@ VtValue PrismTaskDelegate::GetRenderSetting(TfToken const &key) const
     if (key == _sampleClamp) return VtValue(s.sampleClamp);
     if (key == _adaptiveThreshold) return VtValue(s.adaptiveThreshold);
     if (key == _adaptiveMinSamples) return VtValue(s.adaptiveMinSamples);
+    if (key == _timeLimitSeconds) return VtValue(s.timeLimitSeconds);
+    if (key == _subdivisionLevel) return VtValue(s.subdivisionLevel);
+    if (key == _subdivisionMaxFaces) return VtValue(s.subdivisionMaxFaces);
+    if (key == _subdivisionBudgetFaces) return VtValue(s.subdivisionBudgetFaces);
+    if (key == _displacementLevel) return VtValue(s.displacementLevel);
+    if (key == _displacementMaxFaces) return VtValue(s.displacementMaxFaces);
+    if (key == _gpuTextureBudgetMiB) return VtValue(s.gpuTextureBudgetMiB);
+    if (key == _sssFallback) return VtValue(s.sssFallback);
     if (key == _adaptivePreview) return VtValue(s.adaptivePreview);
     if (key == _neeProbabilityMin) return VtValue(s.neeProbabilityMin);
     if (key == _neeFromDepth) return VtValue(s.neeFromDepth);
@@ -344,9 +381,27 @@ void PrismTaskDelegate::SetRenderSetting(TfToken const &key, VtValue const &valu
     else if (key == _seed) s.seed = _Get(value, s.seed);
     else if (key == _sampleClamp) s.sampleClamp = std::max(0.0f, _Get(value, s.sampleClamp));
     else if (key == _adaptiveThreshold)
-        s.adaptiveThreshold = std::max(0.0f, _Get(value, s.adaptiveThreshold));
+        s.adaptiveThreshold = std::max(0.0f, _Number(value, s.adaptiveThreshold));
     else if (key == _adaptiveMinSamples)
         s.adaptiveMinSamples = std::max(1, _Get(value, s.adaptiveMinSamples));
+    else if (key == _timeLimitSeconds) {
+        const double seconds = _Number(value, s.timeLimitSeconds);
+        s.timeLimitSeconds = std::isfinite(seconds) ? std::max(0.0, seconds) : s.timeLimitSeconds;
+    }
+    else if (key == _subdivisionLevel)
+        s.subdivisionLevel = prism::defaults::ClampSubdivisionLevel(_Number(value, s.subdivisionLevel));
+    else if (key == _subdivisionMaxFaces)
+        s.subdivisionMaxFaces = prism::defaults::ClampFaces(_Number<int64_t>(value, s.subdivisionMaxFaces));
+    else if (key == _subdivisionBudgetFaces)
+        s.subdivisionBudgetFaces = prism::defaults::ClampFaces(_Number<int64_t>(value, s.subdivisionBudgetFaces));
+    else if (key == _displacementLevel)
+        s.displacementLevel = prism::defaults::ClampSubdivisionLevel(_Number(value, s.displacementLevel));
+    else if (key == _displacementMaxFaces)
+        s.displacementMaxFaces = prism::defaults::ClampFaces(_Number<int64_t>(value, s.displacementMaxFaces));
+    else if (key == _gpuTextureBudgetMiB)
+        s.gpuTextureBudgetMiB = prism::defaults::ClampGpuTextureBudgetMiB(_Number<int64_t>(value, s.gpuTextureBudgetMiB));
+    else if (key == _sssFallback)
+        s.sssFallback = _Get(value, s.sssFallback);
     else if (key == _neeProbabilityMin)
         s.neeProbabilityMin = std::clamp(_Get(value, s.neeProbabilityMin), 0.0f, 1.0f);
     else if (key == _neeFromDepth)

@@ -18,6 +18,7 @@
 #include "../device/light_table.h"
 #include "../geometry.h"
 #include "../material.h"
+#include "../materialx/loader.h"
 #include "../materialx/resolved_resource.h"
 #include "../mdl/context.h"
 #include "../progress.h"
@@ -560,6 +561,37 @@ struct PreparedMesh {
     bool builtStorage = false;
 };
 
+// Uniform subdivision of subdivision surfaces: the highest level, and the
+// faces one mesh may refine to (meshes denser than that use lower levels, and
+// their control hulls beyond it): prism:subdivisionLevel (0 renders control
+// hulls) and prism:subdivisionMaxFaces, which default to
+// PRISM_SUBDIVISION_LEVEL and PRISM_SUBDIVISION_MAX_FACES.
+struct _SubdivisionSettings {
+    int level = 2;
+    size_t maxFaces = size_t(1) << 16;
+    // Meshes whose material displaces them (prism:displacementLevel,
+    // prism:displacementMaxFaces).
+    int displacementLevel = 4;
+    size_t displacementMaxFaces = size_t(1) << 18;
+    // Faces all refined prototypes of one scene build may add up to
+    // (prism:subdivisionBudgetFaces). Beyond it the meshes that refine to
+    // the most faces drop levels first. Each face costs a few hundred bytes
+    // once triangulated, with normals, UVs, tangents and its Embree BVH.
+    size_t budgetFaces = size_t(24) << 20;
+
+    static _SubdivisionSettings From(RenderSettings const &settings)
+    {
+        _SubdivisionSettings result;
+        result.level = prism::defaults::ClampSubdivisionLevel(settings.subdivisionLevel);
+        result.maxFaces = size_t(prism::defaults::ClampFaces(settings.subdivisionMaxFaces));
+        result.displacementLevel = prism::defaults::ClampSubdivisionLevel(settings.displacementLevel);
+        result.displacementMaxFaces = size_t(prism::defaults::ClampFaces(settings.displacementMaxFaces));
+        result.budgetFaces = size_t(prism::defaults::ClampFaces(settings.subdivisionBudgetFaces));
+        return result;
+    }
+    bool operator==(_SubdivisionSettings const &) const = default;
+};
+
 struct Snapshot {
     struct PendingSphere {
         SdfPath path;
@@ -621,6 +653,8 @@ struct Snapshot {
     std::unordered_map<SdfPath, uint64_t, SdfPath::Hash> enabledPrototypePlacements;
     std::unordered_map<unsigned int, GfMatrix4d> placementMatrices;
     bool sphereBatching = false;
+    // Subdivision and displacement levels its meshes convert with.
+    _SubdivisionSettings subdivision;
     std::vector<PendingSphere> pendingSpheres;
     std::vector<SphereBatch> sphereBatches;
     std::unordered_map<SdfPath, SphereBatchLocation, SdfPath::Hash>
@@ -1338,43 +1372,6 @@ std::vector<_ExtraPrimvar> _ExtraPrimvars(HdPrimvarsSchema const &primvars, size
     return result;
 }
 
-// Uniform subdivision of subdivision surfaces: the highest level, and the
-// faces one mesh may refine to (meshes denser than that use lower levels, and
-// their control hulls beyond it). PRISM_SUBDIVISION_LEVEL (0 renders control
-// hulls) and PRISM_SUBDIVISION_MAX_FACES override them.
-struct _SubdivisionSettings {
-    int level = 2;
-    size_t maxFaces = size_t(1) << 16;
-    // Meshes whose material displaces them (PRISM_DISPLACEMENT_LEVEL,
-    // PRISM_DISPLACEMENT_MAX_FACES).
-    int displacementLevel = 4;
-    size_t displacementMaxFaces = size_t(1) << 18;
-    // Faces all refined prototypes of one scene build may add up to
-    // (PRISM_SUBDIVISION_BUDGET_FACES). Beyond it the meshes that refine to
-    // the most faces drop levels first. Each face costs a few hundred bytes
-    // once triangulated, with normals, UVs, tangents and its Embree BVH.
-    size_t budgetFaces = size_t(24) << 20;
-};
-
-_SubdivisionSettings const &_Subdivision()
-{
-    static const _SubdivisionSettings settings = [] {
-        _SubdivisionSettings result;
-        if (const char *value = std::getenv("PRISM_SUBDIVISION_LEVEL"); value && *value)
-            result.level = std::clamp(std::atoi(value), 0, 6);
-        if (const char *value = std::getenv("PRISM_SUBDIVISION_MAX_FACES"); value && *value)
-            result.maxFaces = size_t(std::max(1ll, std::atoll(value)));
-        if (const char *value = std::getenv("PRISM_DISPLACEMENT_LEVEL"); value && *value)
-            result.displacementLevel = std::clamp(std::atoi(value), 0, 6);
-        if (const char *value = std::getenv("PRISM_DISPLACEMENT_MAX_FACES"); value && *value)
-            result.displacementMaxFaces = size_t(std::max(1ll, std::atoll(value)));
-        if (const char *value = std::getenv("PRISM_SUBDIVISION_BUDGET_FACES"); value && *value)
-            result.budgetFaces = size_t(std::max(1ll, std::atoll(value)));
-        return result;
-    }();
-    return settings;
-}
-
 // Moves the vertices of a converted mesh by its material's displacement.
 // Vertices at one position (seams of normals or texture coordinates) move
 // together, so the surface stays closed; normals and tangents are rebuilt.
@@ -1458,7 +1455,7 @@ void _Displace(Mesh &mesh, Material const &material, bool flip)
 // conversion would use (index = level); a single entry, its own face count,
 // for meshes that do not refine. Reads only the topology.
 std::vector<size_t> _RefinementFaces(HdContainerDataSourceHandle const &dataSource,
-                                     bool displaced)
+                                     bool displaced, _SubdivisionSettings const &subdivision)
 {
     HdMeshSchema meshSchema = HdMeshSchema::GetFromParent(dataSource);
     HdMeshTopologySchema topology = meshSchema.GetTopology();
@@ -1473,7 +1470,6 @@ std::vector<size_t> _RefinementFaces(HdContainerDataSourceHandle const &dataSour
     }
     if (displaced && scheme == TfToken("none")) scheme = TfToken("bilinear");
     if (scheme == TfToken("none")) return faces;
-    _SubdivisionSettings const &subdivision = _Subdivision();
     const auto kind = scheme == TfToken("loop") ? prism::subdivision::Scheme::Loop
         : scheme == TfToken("bilinear") ? prism::subdivision::Scheme::Bilinear
                                         : prism::subdivision::Scheme::CatmullClark;
@@ -1524,6 +1520,7 @@ std::vector<int> _BudgetSubdivisionLevels(
 // caller emits the warnings recorded in MeshConversionInfo. levelCap, when
 // not negative, limits the subdivision level (see _BudgetSubdivisionLevels).
 MeshConversion _ConvertMesh(HdContainerDataSourceHandle const &dataSource,
+                            _SubdivisionSettings const &subdivision,
                             Material const *displacer = nullptr, int levelCap = -1)
 {
     MeshConversion result;
@@ -1607,7 +1604,6 @@ MeshConversion _ConvertMesh(HdContainerDataSourceHandle const &dataSource,
     const bool displaced = displacer && displacer->hasDisplacement();
     if (displaced && scheme == TfToken("none")) scheme = TfToken("bilinear");
     if (scheme != TfToken("none")) {
-        _SubdivisionSettings const &subdivision = _Subdivision();
         prism::subdivision::Input input;
         input.scheme = scheme == TfToken("loop") ? prism::subdivision::Scheme::Loop
             : scheme == TfToken("bilinear") ? prism::subdivision::Scheme::Bilinear
@@ -2134,7 +2130,7 @@ bool _AppendMesh(HdSceneIndexBaseRefPtr const &sceneIndex,
         // Prototype refreshes touch a few prims, so they convert inline.
         const auto conversionStart = std::chrono::steady_clock::now();
         MeshConversion conversion = _ConvertMesh(
-            prim.dataSource, _DisplacingMaterial(sceneIndex, prim.dataSource, materials, snapshot));
+            prim.dataSource, snapshot->subdivision, _DisplacingMaterial(sceneIndex, prim.dataSource, materials, snapshot));
         snapshot->meshConversionSeconds += std::chrono::duration<double>(
             std::chrono::steady_clock::now() - conversionStart).count();
         inlineMesh.info = conversion.info;
@@ -3498,7 +3494,7 @@ MeshPreparation _PrepareMeshes(HdSceneIndexBaseRefPtr const &scene,
     for (size_t i = 0; i < candidates.size(); ++i) if (deferred[i]) fixedLevel[i] = false;
     auto refine = [&](size_t i) {
         refinementFaces[i] = _RefinementFaces(candidates[i].second, deferred[i] && speculative
-            ? true : displacers[i] && displacers[i]->hasDisplacement());
+            ? true : displacers[i] && displacers[i]->hasDisplacement(), snapshot->subdivision);
         if (fixedLevel[i]) {
             auto const found = preparation.meshes.find(candidates[i].first);
             const size_t level = found != preparation.meshes.end()
@@ -3513,7 +3509,7 @@ MeshPreparation _PrepareMeshes(HdSceneIndexBaseRefPtr const &scene,
     if (cancelled && cancelled()) return preparation;
     size_t requestedFaces = 0, plannedFaces = 0;
     std::vector<int> levelCaps = _BudgetSubdivisionLevels(refinementFaces, fixedLevel,
-        _Subdivision().budgetFaces, &plannedFaces, &requestedFaces);
+        snapshot->subdivision.budgetFaces, &plannedFaces, &requestedFaces);
 
     std::vector<MeshConversion> conversions(misses.size());
     auto convert = [&](std::vector<size_t> const &indices, std::vector<MeshConversion> &out) {
@@ -3521,7 +3517,7 @@ MeshPreparation _PrepareMeshes(HdSceneIndexBaseRefPtr const &scene,
         const auto conversionStart = std::chrono::steady_clock::now();
         tbb::parallel_for(size_t(0), indices.size(), [&](size_t i) {
             if (cancelled && cancelled()) return;
-            out[i] = _ConvertMesh(candidates[indices[i]].second, displacers[indices[i]],
+            out[i] = _ConvertMesh(candidates[indices[i]].second, snapshot->subdivision, displacers[indices[i]],
                                   levelCaps[indices[i]]);
             prism::progress::Add(prism::Phase::Loading);
         });
@@ -3552,7 +3548,7 @@ MeshPreparation _PrepareMeshes(HdSceneIndexBaseRefPtr const &scene,
             for (size_t i = 0; i < candidates.size(); ++i) if (deferred[i]) refine(i);
             const std::vector<int> planned = levelCaps;
             levelCaps = _BudgetSubdivisionLevels(refinementFaces, fixedLevel,
-                _Subdivision().budgetFaces, &plannedFaces, &requestedFaces);
+                snapshot->subdivision.budgetFaces, &plannedFaces, &requestedFaces);
             for (size_t const i : misses) confirmed &= levelCaps[i] == planned[i];
         }
         if (!confirmed) {
@@ -3586,8 +3582,8 @@ MeshPreparation _PrepareMeshes(HdSceneIndexBaseRefPtr const &scene,
         static std::once_flag warned;
         std::call_once(warned, [&] {
             TF_WARN("PrismRT: subdivision refines to %zu faces, over the %zu-face budget "
-                    "(PRISM_SUBDIVISION_BUDGET_FACES); the densest meshes use lower levels (%zu faces)",
-                    requestedFaces, _Subdivision().budgetFaces, plannedFaces);
+                    "(prism:subdivisionBudgetFaces); the densest meshes use lower levels (%zu faces)",
+                    requestedFaces, snapshot->subdivision.budgetFaces, plannedFaces);
         });
     }
 
@@ -3869,7 +3865,9 @@ std::shared_ptr<Snapshot> _BuildSnapshot(HdSceneIndexBaseRefPtr const &scene,
     result->scene->textureFiltering = settings.textureFiltering;
     result->scene->honorDoubleSided = settings.honorDoubleSided;
     result->scene->textureStreaming = settings.textureStreaming;
+    result->scene->gpuTextureBudgetMiB = settings.gpuTextureBudgetMiB;
     result->sphereBatching = settings.sphereBatching;
+    result->subdivision = _SubdivisionSettings::From(settings);
     result->fallbackTexture = std::make_unique<ColorTexture>(Color3(0.5f));
     result->fallbackMaterial = std::make_unique<Diffuse>(result->fallbackTexture.get());
     auto blackEnvironment = std::make_unique<ColorTexture>(Color3(0.0f));
@@ -5526,7 +5524,7 @@ public:
     uint64_t renderDeviceGeneration = 0;
     // Integrator settings the render device last saw: GPU devices copy them
     // into their scene data, so a change must reach them like an edit.
-    std::tuple<int, int, bool, int, bool> renderDeviceSettings{};
+    std::tuple<int, int, bool, int, bool, int> renderDeviceSettings{};
     // Device creation and per-scene device preparation (GPU kernel
     // compilation, scene and texture upload) can take tens of seconds. They
     // run as jobs the render worker waits on while polling for a stop, so a
@@ -5578,6 +5576,15 @@ public:
     // still sampled.
     std::vector<float> adaptiveSums;
     prism::device::ActivePixels adaptiveActive;
+    // Progress of the accumulation (percentDone): the fraction of pixels
+    // adaptive sampling still traces, and the elapsed fraction of the time
+    // limit. Written by the render worker.
+    std::atomic<double> activePixelFraction{1.0};
+    std::atomic<double> timeLimitFraction{0.0};
+    std::atomic<bool> timeLimitReached{false};
+    // Time the render worker spent on the accumulation's full-resolution
+    // passes (prism:timeLimitSeconds); kept while it resumes.
+    double accumulationSeconds = 0.0;
     unsigned tileWidth = 0, tileHeight = 0;
     std::vector<RefinementTile> refinementTiles;
     TfTokenVector renderTags;
@@ -5722,6 +5729,8 @@ SceneBridge::SceneBridge(HdSceneIndexBaseRefPtr sceneIndex, HdRenderThread *thre
     } catch (std::exception const &error) {
         TF_WARN("PrismRT: %s", error.what());
     }
+    // Likewise the SSS fallback (prism:sssFallback).
+    DocumentLoader::SetSssFallback(_impl->settings.sssFallback);
 }
 SceneBridge::~SceneBridge()
 {
@@ -5884,6 +5893,8 @@ void SceneBridge::SetSettings(RenderSettings const &requested)
     bool budgetChanged = false;
     bool colorChanged = false;
     bool bindingsChanged = false;
+    bool geometryChanged = false;
+    bool sssChanged = false;
     {
         std::lock_guard lock(_impl->mutex);
         RenderSettings const &current = _impl->settings;
@@ -5894,6 +5905,14 @@ void SceneBridge::SetSettings(RenderSettings const &requested)
             current.sampleClamp == settings.sampleClamp &&
             current.adaptiveThreshold == settings.adaptiveThreshold &&
             current.adaptiveMinSamples == settings.adaptiveMinSamples &&
+            current.timeLimitSeconds == settings.timeLimitSeconds &&
+            current.subdivisionLevel == settings.subdivisionLevel &&
+            current.subdivisionMaxFaces == settings.subdivisionMaxFaces &&
+            current.subdivisionBudgetFaces == settings.subdivisionBudgetFaces &&
+            current.displacementLevel == settings.displacementLevel &&
+            current.displacementMaxFaces == settings.displacementMaxFaces &&
+            current.gpuTextureBudgetMiB == settings.gpuTextureBudgetMiB &&
+            current.sssFallback == settings.sssFallback &&
             current.neeProbabilityMin == settings.neeProbabilityMin &&
             current.neeFromDepth == settings.neeFromDepth &&
             current.spatialLights == settings.spatialLights &&
@@ -5916,6 +5935,8 @@ void SceneBridge::SetSettings(RenderSettings const &requested)
             current.materialBindingPurposes == settings.materialBindingPurposes)
             return;
         bindingsChanged = current.materialBindingPurposes != settings.materialBindingPurposes;
+        geometryChanged = _SubdivisionSettings::From(current) != _SubdivisionSettings::From(settings);
+        sssChanged = current.sssFallback != settings.sssFallback;
         // Display and view do not touch the linear colour AOV.
         colorChanged = current.color.config != settings.color.config ||
             current.color.workingSpace != settings.color.workingSpace;
@@ -5933,10 +5954,13 @@ void SceneBridge::SetSettings(RenderSettings const &requested)
             current.honorDoubleSided != settings.honorDoubleSided ||
             current.textureFiltering != settings.textureFiltering ||
             current.textureStreaming != settings.textureStreaming ||
+            current.gpuTextureBudgetMiB != settings.gpuTextureBudgetMiB ||
             current.environmentSampling != settings.environmentSampling ||
             current.domeLightCameraVisibility != settings.domeLightCameraVisibility ||
-            current.device != settings.device || colorChanged || bindingsChanged;
-        budgetChanged = current.samples != settings.samples;
+            current.device != settings.device || colorChanged || bindingsChanged ||
+            geometryChanged || sssChanged;
+        budgetChanged = current.samples != settings.samples ||
+            current.timeLimitSeconds != settings.timeLimitSeconds;
         if (budgetChanged && !imageChanged && _converged.load() &&
             _impl->samples.load() != 0 &&
             std::none_of(_impl->bindings.begin(), _impl->bindings.end(),
@@ -6020,6 +6044,44 @@ void SceneBridge::SetSettings(RenderSettings const &requested)
         _impl->dirtyKinds |= static_cast<unsigned int>(SceneDirtyKind::Structure);
         ++_impl->conservativeRebuilds;
         _impl->lastRebuildReason = "sphere batching changed";
+    }
+    // Subdivision and displacement: every mesh converts again (the
+    // conversion cache keeps meshes refined at the old levels).
+    if (geometryChanged) {
+        {
+            std::lock_guard poolLock(_impl->prototypePool->mutex);
+            _impl->prototypePool->conversions.clear();
+        }
+        if (_impl->snapshot) {
+            _impl->sceneDirty = true;
+            if (_impl->buildCancel)
+                _impl->buildCancel->store(true, std::memory_order_relaxed);
+            ++_impl->requestedGeneration;
+            _impl->dirtyJournal.push_back({
+                _impl->requestedGeneration,
+                static_cast<unsigned int>(SceneDirtyKind::Structure), {}});
+            _impl->dirtyKinds |= static_cast<unsigned int>(SceneDirtyKind::Structure);
+            ++_impl->conservativeRebuilds;
+            _impl->lastRebuildReason = "subdivision or displacement settings changed";
+        }
+    }
+    // The SSS fallback rewrites the MaterialX documents: every material
+    // generates again (as for a new resource revision).
+    if (sssChanged) {
+        DocumentLoader::SetSssFallback(settings.sssFallback);
+        if (_impl->snapshot) {
+            if (_impl->materialService) _impl->materialService->InvalidateAll();
+            _impl->sceneDirty = true;
+            if (_impl->buildCancel)
+                _impl->buildCancel->store(true, std::memory_order_relaxed);
+            ++_impl->requestedGeneration;
+            _impl->dirtyJournal.push_back({
+                _impl->requestedGeneration,
+                static_cast<unsigned int>(SceneDirtyKind::Material), {}});
+            _impl->dirtyKinds |= static_cast<unsigned int>(SceneDirtyKind::Material);
+            ++_impl->materialInvalidations;
+            _impl->lastRebuildReason = "SSS fallback changed";
+        }
     }
     if (_impl->snapshot &&
         _impl->settings.honorDoubleSided != settings.honorDoubleSided) {
@@ -6981,6 +7043,8 @@ bool SceneBridge::Prepare(CameraState const &camera,
                                 jobSettings.honorDoubleSided;
                             result.snapshot->scene->textureStreaming =
                                 jobSettings.textureStreaming;
+                            result.snapshot->scene->gpuTextureBudgetMiB =
+                                jobSettings.gpuTextureBudgetMiB;
                         }
                     } catch (std::bad_alloc const &) {
                         // Release the partial scene before reporting.
@@ -7023,6 +7087,8 @@ bool SceneBridge::Prepare(CameraState const &camera,
             _impl->settings.honorDoubleSided;
         _impl->snapshot->scene->textureStreaming =
             _impl->settings.textureStreaming;
+        _impl->snapshot->scene->gpuTextureBudgetMiB =
+            _impl->settings.gpuTextureBudgetMiB;
     }
     if (stateChanged || cameraChanged || bindingsChanged ||
         renderTagsChanged || published) {
@@ -7071,8 +7137,8 @@ void SceneBridge::Render()
         const auto deviceSettings = snapshot && snapshot->scene
             ? std::make_tuple(snapshot->scene->max_depth, snapshot->scene->rr_min_depth,
                   snapshot->scene->environmentSampling, int(snapshot->scene->textureFiltering),
-                  snapshot->scene->textureStreaming)
-            : std::tuple<int, int, bool, int, bool>{};
+                  snapshot->scene->textureStreaming, snapshot->scene->gpuTextureBudgetMiB)
+            : std::tuple<int, int, bool, int, bool, int>{};
         if (snapshot && snapshot->scene &&
             (_impl->renderDeviceScene != snapshot->scene.get() ||
              _impl->renderDeviceGeneration != _impl->activeGeneration ||
@@ -7266,6 +7332,9 @@ void SceneBridge::Render()
             std::vector<float>().swap(_impl->adaptiveSums);
             _impl->adaptiveActive = {};
         }
+        _impl->activePixelFraction.store(1.0);
+        _impl->timeLimitFraction.store(0.0);
+        _impl->timeLimitReached.store(false);
     }
     prism::CameraRayParameters const cameraParameters =
         _CameraParameters(camera);
@@ -7381,8 +7450,30 @@ void SceneBridge::Render()
     // Set once texture streaming restarted the accumulation: the geometric
     // outputs of the first pass are already published.
     bool restarted = false;
+    // prism:timeLimitSeconds: the wall-clock time the render worker spends
+    // on the accumulation's full-resolution passes (preview, refinement
+    // delay, texture settling and time between render calls excluded;
+    // pauses included). Checked at pass boundaries, so every pixel has at
+    // least one sample; a resumed accumulation keeps the time it spent.
+    if (firstSample == 0) _impl->accumulationSeconds = 0.0;
+    const double timeLimit = hasColor ? settings.timeLimitSeconds : 0.0;
+    auto timeMark = std::chrono::steady_clock::now();
+    auto elapsedFraction = [&] {
+        const auto now = std::chrono::steady_clock::now();
+        _impl->accumulationSeconds += std::chrono::duration<double>(now - timeMark).count();
+        timeMark = now;
+        return timeLimit > 0.0 ? _impl->accumulationSeconds / timeLimit : 0.0;
+    };
     for (int sample = firstSample; sample < sampleCount; ++sample) {
         if (adaptive.Enabled() && _impl->adaptiveActive.Count() == 0) break;
+        if (timeLimit > 0.0 && sample > 0) {
+            const double fraction = elapsedFraction();
+            _impl->timeLimitFraction.store(std::min(fraction, 1.0));
+            if (fraction >= 1.0) {
+                _impl->timeLimitReached.store(true);
+                break;
+            }
+        }
         if (_impl->renderThread->IsStopRequested()) return;
         while (_impl->renderThread->IsPauseRequested()) {
             if (_impl->renderThread->IsStopRequested()) return;
@@ -7694,9 +7785,11 @@ void SceneBridge::Render()
                     const float* p = sums + 7 * pixel;
                     return p[6] > 0.0f ? (p[0] + p[1] + p[2]) / p[6] : 0.0f;
                 });
-                _impl->adaptiveActive.Update(adaptive.threshold, [&](size_t pixel) {
+                const size_t active = _impl->adaptiveActive.Update(adaptive.threshold, [&](size_t pixel) {
                     return prism::device::AdaptiveError(sums + 7 * pixel, sums + 7 * pixel + 3, sample + 1, scale);
                 });
+                _impl->activePixelFraction.store(passColors.empty() ? 0.0 :
+                    static_cast<double>(active) / static_cast<double>(passColors.size()));
             }
         }
         _impl->committedRngStates.swap(rngStates);
@@ -7815,13 +7908,24 @@ VtDictionary SceneBridge::GetStats() const
     std::lock_guard lock(_impl->mutex);
     // Standard Hydra progress keys that hosts such as usdview read:
     // numCompletedSamples (int) and percentDone (double, 0-100). A converged
-    // pass reports 100 even below the target (adaptive early-out).
+    // pass reports 100 even below the target (adaptive early-out, time
+    // limit). With adaptive sampling, pixels that stopped count as done and
+    // the others by their samples, so the estimate keeps moving while the
+    // last pixels refine; with a time limit, at least the elapsed fraction.
     const int targetSamples = std::max(1, _impl->settings.samples);
     result["numCompletedSamples"] = VtValue(static_cast<int>(
         std::min<int64_t>(completed, std::numeric_limits<int>::max())));
     result["targetSamples"] = VtValue(targetSamples);
+    const double sampleFraction = std::clamp(
+        static_cast<double>(completed) / targetSamples, 0.0, 1.0);
+    const double active = completed > 0 ? _impl->activePixelFraction.load() : 1.0;
+    double progress = (1.0 - active) + active * sampleFraction;
+    if (completed > 0 && _impl->settings.timeLimitSeconds > 0.0)
+        progress = std::max(progress, _impl->timeLimitFraction.load());
     result["percentDone"] = VtValue(converged ? 100.0 :
-        std::clamp(100.0 * static_cast<double>(completed) / targetSamples, 0.0, 100.0));
+        std::clamp(100.0 * progress, 0.0, std::nextafter(100.0, 0.0)));
+    result["activePixelFraction"] = VtValue(active);
+    result["timeLimitReached"] = VtValue(_impl->timeLimitReached.load());
     result["refinementPublishes"] = VtValue(static_cast<int64_t>(_impl->refinementPublishes));
     result["devicePreparing"] = VtValue(_impl->devicePreparedEpoch != _impl->deviceSceneEpoch);
     result["devicePreparations"] = VtValue(static_cast<int64_t>(_impl->devicePreparations.load()));
