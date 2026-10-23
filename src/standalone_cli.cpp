@@ -1,5 +1,7 @@
 #include "standalone_cli.h"
 #include "scene.h"
+#include "render_defaults.h"
+#include "materialx/loader.h"
 #include "camera_rays.h"
 #include "camera_ray_diagnostics.h"
 #include "device/device.h"
@@ -38,6 +40,15 @@
 #include <set>
 #include <tuple>
 #include <type_traits>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+#include "progress.h"
+#ifdef _WIN32
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 
 namespace {
 // usdview's default dome light texture (Hdx's StinsonBeach.hdr), or empty.
@@ -62,11 +73,17 @@ struct Options {
     bool honorDoubleSided = false; // prism:honorDoubleSided
     bool defaultDome = true; // light scenes without lights like usdview's default dome
     prism::gltf::MaterialMode gltfMaterials = prism::gltf::MaterialModeFromEnvironment();
-    int width = 1280, height = 720, samples = 256, depth = 32, roulette = 4;
+    int width = 1280, height = 720, samples = prism::defaults::kSamplesPerPixel, depth = 32, roulette = 4;
     unsigned seed = 0;
     float exposure = 0, clamp = 10;
-    float adaptiveThreshold = 0;
-    int adaptiveMinSamples = 16;
+    float adaptiveThreshold = prism::defaults::kAdaptiveThreshold;
+    int adaptiveMinSamples = prism::defaults::kAdaptiveMinSamples;
+    double timeLimit = prism::defaults::kTimeLimitSeconds;
+    bool textureStreaming = true;
+    // Defaults from PRISM_GPU_TEXTURE_BUDGET_MIB and PRISM_SSS_FALLBACK.
+    int gpuTextureBudgetMiB = prism::defaults::FromEnvironment().gpuTextureBudgetMiB;
+    bool sssFallback = prism::defaults::FromEnvironment().sssFallback;
+    bool progress = true; // --no-progress
     unsigned contributions = 7;
     prism::device::NeeSettings nee;
     prism::color::Options color;
@@ -82,7 +99,7 @@ void help() {
         "  Supported scene formats: USD, glTF, GLB, OBJ\n"
         "  --camera-up 0,1,0 --vfov 40 --focus-distance 10 --defocus-angle 0\n"
         "  --env FILE --env-exposure STOPS (or --env-color r,g,b)\n"
-        "  --width 1280 --height 720 --spp 256\n"
+        "  --width 1280 --height 720 --spp 2048 (with adaptive sampling, the per-pixel maximum)\n"
         "  --max-depth 32 --rr-min-depth 4 --seed 0\n"
         "  --max-sample-radiance 10 --output output.exr\n"
         "  --render-settings /Render/Settings (default: the stage's renderSettingsPrimPath)\n"
@@ -91,8 +108,21 @@ void help() {
         "                 ratio, data window, material binding purposes and prism:* settings from\n"
         "                 it; without --output or a camera option, each RenderProduct is written\n"
         "                 with its RenderVars (see docs/hydra.md)\n"
-        "  --adaptive-threshold 0 (e.g. 0.01; 0 disables) --adaptive-min-samples 16\n"
-        "                 with adaptive sampling, --spp is the per-pixel maximum\n"
+        "  --adaptive-threshold 0.01 (0 disables: every pixel gets --spp samples)\n"
+        "  --adaptive-min-samples 64 (samples before a pixel may stop)\n"
+        "  --time-limit SECONDS (default 0: none; sampling stops at the first sample past it,\n"
+        "                 at least one sample per pixel; scene loading is not counted)\n"
+        "                 Rendering stops at whichever comes first: the threshold, --spp, the limit\n"
+        "  --texture-streaming true|false (default true: GPU devices that stream textures load\n"
+        "                 the mip levels shading asks for; false uploads whole textures)\n"
+        "  --gpu-texture-budget-mib N (default 0: 45% of device memory; textures beyond it upload at\n"
+        "                 reduced resolution; default $PRISM_GPU_TEXTURE_BUDGET_MIB)\n"
+        "  --no-progress (no progress line on stderr; on a terminal it updates in place, otherwise\n"
+        "                 a line per 10%)\n"
+        "  --sss-fallback true|false (default false: subsurface scattering is traced; true renders\n"
+        "                 its diffuse lobe instead; default $PRISM_SSS_FALLBACK)\n"
+        "  Options take precedence over the RenderSettings prim's prism:* settings, which take\n"
+        "  precedence over PRISM_* environment variables (docs/hydra.md)\n"
         "  --debug-contributions all|visible|direct|indirect (noise analysis: keep only light seen\n"
         "                 directly, reaching the first hit, or bounced more often; comma-separated)\n"
         "  --environment-sampling mis|bsdf (default mis)\n"
@@ -137,6 +167,11 @@ float number(const std::string& s) {
     return v;
 }
 
+bool boolean(const std::string& key, const std::string& s) {
+    if (s != "true" && s != "false") throw std::runtime_error(key + " takes true or false");
+    return s == "true";
+}
+
 Float3 triple(std::string s) {
     std::replace(s.begin(), s.end(), ',', ' ');
     std::istringstream input(s);
@@ -150,6 +185,7 @@ Options parse(int argc, char** argv) {
     Options o;
     for (int i = 1; i < argc; ++i) {
         const std::string key = argv[i];
+        if (key == "--no-progress") { o.progress = false; continue; }
         if (i + 1 == argc) throw std::runtime_error("Missing value for " + key);
         const std::string value = argv[++i];
         o.given.insert(key);
@@ -205,6 +241,10 @@ Options parse(int argc, char** argv) {
         else if (key == "--max-sample-radiance") o.clamp = number(value);
         else if (key == "--adaptive-threshold") o.adaptiveThreshold = number(value);
         else if (key == "--adaptive-min-samples") o.adaptiveMinSamples = integer(value);
+        else if (key == "--time-limit") o.timeLimit = number(value);
+        else if (key == "--texture-streaming") o.textureStreaming = boolean(key, value);
+        else if (key == "--gpu-texture-budget-mib") o.gpuTextureBudgetMiB = integer(value);
+        else if (key == "--sss-fallback") o.sssFallback = boolean(key, value);
         else if (key == "--nee-probability-min") o.nee.probabilityMin = number(value);
         else if (key == "--nee-from-depth") o.nee.fromDepth = integer(value);
         else if (key == "--light-selection") {
@@ -260,6 +300,10 @@ void validate(Options const& o) {
         throw std::runtime_error("--nee-probability-min must be in [0, 1] and --nee-from-depth nonnegative");
     if (o.adaptiveThreshold < 0 || o.adaptiveMinSamples < 1)
         throw std::runtime_error("--adaptive-threshold must be nonnegative and --adaptive-min-samples positive");
+    if (!(o.timeLimit >= 0) || !std::isfinite(o.timeLimit))
+        throw std::runtime_error("--time-limit must be a nonnegative number of seconds");
+    if (o.gpuTextureBudgetMiB < 0)
+        throw std::runtime_error("--gpu-texture-budget-mib must be nonnegative (0: automatic)");
     if (static_cast<uint64_t>(o.width) * o.height > std::numeric_limits<unsigned>::max() / 4)
         throw std::runtime_error("Image dimensions are too large");
 }
@@ -304,9 +348,24 @@ void applyRenderSettings(VtDictionary const& settings, Options& o) {
         o.environmentSampling = mode;
     if (auto mode = textSetting("textureFiltering", "--texture-filtering"); !mode.empty())
         o.textureFiltering = mode;
-    if (!o.given.count("--honor-double-sided"))
-        if (auto const* v = value("honorDoubleSided"); v && v->IsHolding<bool>())
-            o.honorDoubleSided = v->UncheckedGet<bool>();
+    auto booleanSetting = [&](const char* name, const char* flag, bool* field) {
+        if (o.given.count(flag)) return;
+        if (auto const* v = value(name); v && v->IsHolding<bool>()) *field = v->UncheckedGet<bool>();
+    };
+    booleanSetting("honorDoubleSided", "--honor-double-sided", &o.honorDoubleSided);
+    if (!o.given.count("--time-limit"))
+        if (auto const* v = value("timeLimitSeconds"); v && v->CanCast<double>())
+            o.timeLimit = VtValue::Cast<double>(*v).UncheckedGet<double>();
+    booleanSetting("textureStreaming", "--texture-streaming", &o.textureStreaming);
+    integerSetting("gpuTextureBudgetMiB", "--gpu-texture-budget-mib", &o.gpuTextureBudgetMiB);
+    booleanSetting("sssFallback", "--sss-fallback", &o.sssFallback);
+    // Settings of the delegate's mesh conversion: the standalone loader has
+    // no subdivision surfaces or displacement yet (docs/feature_roadmap.md).
+    for (const char* name : {"subdivisionLevel", "subdivisionMaxFaces", "subdivisionBudgetFaces",
+                             "displacementLevel", "displacementMaxFaces"})
+        if (value(name))
+            std::cerr << "PrismRT: prism:" << name << " does not apply to the standalone loader "
+                         "(no subdivision surfaces or displacement); ignored\n";
     if (auto name = textSetting("device", "--device"); !name.empty() &&
         !prism::device::ParseDevicePreference(name, &o.device))
         throw std::runtime_error("prism:device must be auto, cpu, cpu-reference, vulkan or metal");
@@ -358,6 +417,178 @@ struct UsdCameraRays {
     }
 };
 
+// The progress line on stderr: the loading stage, then a bar per colour
+// render. A monitor thread polls the device's ImageProgress (relaxed atomics)
+// and the process's prism::Progress model four times a second, so nothing in
+// the render path waits on it. On a terminal it rewrites one line with \r;
+// otherwise (logs, CTest) it prints a plain line per stage and per 10%.
+class ProgressPrinter {
+public:
+    explicit ProgressPrinter(bool enabled) : m_enabled(enabled)
+    {
+        if (!m_enabled) return;
+#ifdef _WIN32
+        m_terminal = _isatty(_fileno(stderr)) != 0;
+#else
+        m_terminal = isatty(fileno(stderr)) != 0;
+#endif
+        m_thread = std::thread([this] { Run(); });
+    }
+    ~ProgressPrinter() { Stop(); }
+
+    // An empty stage clears the line (before other output).
+    void Stage(std::string text)
+    {
+        if (!m_enabled) return;
+        std::lock_guard lock(m_mutex);
+        m_stage = std::move(text);
+        m_render = nullptr;
+        if (m_stage.empty() && m_terminal && m_width) {
+            std::cerr << '\r' << std::string(m_width, ' ') << '\r' << std::flush;
+            m_width = 0;
+        }
+    }
+    // With a time limit, the progress is at least its elapsed fraction.
+    void BeginRender(prism::device::ImageProgress* progress, bool adaptive, std::string label,
+                     double timeLimit)
+    {
+        if (!m_enabled) return;
+        std::lock_guard lock(m_mutex);
+        m_render = progress;
+        m_adaptive = adaptive;
+        m_timeLimit = timeLimit;
+        m_rate = m_rateSamples = m_rateTime = 0.0;
+        m_stage = std::move(label);
+        m_renderStart = std::chrono::steady_clock::now();
+        m_lastDecile = -1;
+    }
+    void EndRender()
+    {
+        if (!m_enabled) return;
+        std::lock_guard lock(m_mutex);
+        if (m_render) Print(Line(1.0), true);
+        m_render = nullptr;
+        m_stage.clear();
+    }
+    void Stop()
+    {
+        if (!m_thread.joinable()) return;
+        { std::lock_guard lock(m_mutex); m_stop = true; }
+        m_wake.notify_all();
+        m_thread.join();
+        // A render cut short (an error) keeps its last line; end it so the
+        // error starts on a line of its own.
+        if (m_terminal && m_width) std::cerr << '\n' << std::flush;
+        m_width = 0;
+    }
+
+private:
+    static std::string Duration(double seconds)
+    {
+        const long total = long(std::max(0.0, seconds) + 0.5);
+        return std::to_string(total / 60) + "m" + (total % 60 < 10 ? "0" : "") + std::to_string(total % 60) + "s";
+    }
+    // Called with m_mutex held.
+    double Fraction() const
+    {
+        double fraction = m_render->Fraction();
+        if (m_timeLimit > 0.0)
+            fraction = std::max(fraction, std::min(1.0, std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - m_renderStart).count() / m_timeLimit));
+        return fraction;
+    }
+    // Called with m_mutex held. `fraction` overrides the polled one (1 at the end).
+    std::string Line(double fraction = -1.0)
+    {
+        auto& p = *m_render;
+        const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - m_renderStart).count();
+        // GPU devices compile and upload before their first sample.
+        if (fraction < 0.0 && p.samples.load(std::memory_order_relaxed) == 0.0)
+            return "Preparing the render device... " + Duration(elapsed);
+        if (fraction < 0.0) fraction = Fraction();
+        const int width = 20, filled = int(fraction * width + 1e-9);
+        std::ostringstream line;
+        line << '[' << std::string(filled, '#') << std::string(width - filled, '-') << "] "
+             << int(fraction * 100.0) << "%  " << long(p.samples.load(std::memory_order_relaxed)) << '/'
+             << p.target.load(std::memory_order_relaxed) << " spp";
+        if (m_adaptive)
+            line << "  " << int(p.activeFraction.load(std::memory_order_relaxed) * 100.0 + 0.5) << "% px active";
+        line << "  " << Duration(elapsed) << " elapsed";
+        // ETA: the samples left at the current rate (adaptive sampling may
+        // stop the remaining pixels earlier), within the time limit.
+        const double samples = p.samples.load(std::memory_order_relaxed);
+        const double target = p.target.load(std::memory_order_relaxed);
+        if (samples > m_rateSamples && elapsed > m_rateTime + 0.5) {
+            const double rate = (samples - m_rateSamples) / (elapsed - m_rateTime);
+            m_rate = m_rate > 0.0 ? 0.7 * m_rate + 0.3 * rate : rate;
+            m_rateSamples = samples;
+            m_rateTime = elapsed;
+        }
+        if (fraction < 1.0 && m_rate > 0.0) {
+            double eta = (target - samples) / m_rate;
+            if (m_timeLimit > 0.0) eta = std::min(eta, std::max(0.0, m_timeLimit - elapsed));
+            line << ", ETA " << Duration(eta);
+        }
+        if (!m_stage.empty()) line << "  " << m_stage;
+        return line.str();
+    }
+    void Print(std::string const& text, bool final)
+    {
+        if (m_terminal) {
+            std::cerr << '\r' << text;
+            if (text.size() < m_width) std::cerr << std::string(m_width - text.size(), ' ');
+            m_width = final ? 0 : text.size();
+            if (final) std::cerr << '\n';
+            std::cerr << std::flush;
+        } else {
+            std::cerr << text << '\n' << std::flush;
+        }
+    }
+    void Run()
+    {
+        std::string lastStage;
+        std::unique_lock lock(m_mutex);
+        while (!m_stop) {
+            if (m_render) {
+                const double fraction = Fraction();
+                const int decile = int(fraction * 10.0);
+                if (m_terminal) Print(Line(), false);
+                else if (decile > m_lastDecile && decile < 10) { m_lastDecile = decile; Print(Line(), false); }
+            } else if (!m_stage.empty()) {
+                // Loading: the CLI's stage, with the material count while the
+                // materials compile (prism::Progress, reported by the loaders).
+                std::string text = m_stage;
+                if (auto* model = prism::Progress::Current()) {
+                    const auto snapshot = model->Read();
+                    auto const& materials = snapshot.phases[size_t(prism::Phase::Materials)];
+                    auto const& textures = snapshot.phases[size_t(prism::Phase::Textures)];
+                    if (materials.active && materials.total)
+                        text += " (materials " + std::to_string(materials.done) + "/" + std::to_string(materials.total) + ")";
+                    else if (textures.active && textures.total)
+                        text += " (textures " + std::to_string(textures.done) + "/" + std::to_string(textures.total) + ")";
+                }
+                if (m_terminal) Print(text + "...", false);
+                else if (m_stage != lastStage) Print(m_stage + "...", false);
+                lastStage = m_stage;
+            }
+            m_wake.wait_for(lock, std::chrono::milliseconds(250), [this] { return m_stop; });
+        }
+    }
+
+    bool m_enabled = false, m_terminal = false, m_stop = false, m_adaptive = false;
+    double m_timeLimit = 0.0;
+    // Sample rate for the ETA (samples per second, smoothed).
+    double m_rate = 0.0, m_rateSamples = 0.0, m_rateTime = 0.0;
+    std::mutex m_mutex;
+    std::condition_variable m_wake;
+    std::thread m_thread;
+    std::string m_stage;
+    prism::device::ImageProgress* m_render = nullptr;
+    std::chrono::steady_clock::time_point m_renderStart;
+    int m_lastDecile = -1;
+    size_t m_width = 0;
+};
+
 struct EmbreeDevice {
     RTCDevice value = rtcNewDevice(nullptr);
     ~EmbreeDevice() { if (value) rtcReleaseDevice(value); }
@@ -389,6 +620,9 @@ int runStandaloneCli(int argc, char** argv) {
             return 0;
         }
         Options o = parse(argc, argv);
+        // Loading phases (materials, textures) report to this model.
+        prism::Progress progressModel;
+        ProgressPrinter progress(o.progress && o.exportScene.empty());
         EmbreeDevice device;
         if (!device.value) throw std::runtime_error("Cannot create Embree device");
         if (!o.exportScene.empty()) {
@@ -504,8 +738,11 @@ int runStandaloneCli(int argc, char** argv) {
         prism::DumpCameraRayDiagnostics(
             viewRays.front().parameters, static_cast<unsigned int>(views.front().dataWidth),
             static_cast<unsigned int>(views.front().dataHeight), o.seed, "standalone");
+        progress.Stage("Loading scene");
         mdl::Context context;
         if (!context.is_valid()) throw std::runtime_error(context.get_error());
+        // Before any material loads.
+        DocumentLoader::SetSssFallback(o.sssFallback);
         SceneManager scene(device.value);
         const char* libraries = std::getenv("PRISM_MATERIALX_LIBRARY_PATH");
         const std::string libraryPath = libraries ? libraries : "";
@@ -537,6 +774,8 @@ int runStandaloneCli(int argc, char** argv) {
         scene.environmentSampling = o.environmentSampling == "mis";
         scene.textureFiltering = o.textureFiltering == "bilinear" ? prism::TextureFiltering::Bilinear : prism::TextureFiltering::Filtered;
         scene.honorDoubleSided = o.honorDoubleSided;
+        scene.textureStreaming = o.textureStreaming;
+        scene.gpuTextureBudgetMiB = prism::defaults::ClampGpuTextureBudgetMiB(o.gpuTextureBudgetMiB);
         ColorTexture black(Color3(0));
         ConstantColorBackground background(&black);
         std::unique_ptr<ImageTexture<Color3>> envImage;
@@ -649,7 +888,9 @@ int runStandaloneCli(int argc, char** argv) {
                 scene.environment = env.get();
             }
         }
+        progress.Stage("Building the scene");
         scene.commitScene();
+        progress.Stage("");
         // A scene with no lights, emissive geometry or environment would render
         // black. Light it with usdview's default dome, which the Hydra delegate
         // applies by the same rule (scene_bridge.cpp _ApplyDefaultDome).
@@ -671,8 +912,10 @@ int runStandaloneCli(int argc, char** argv) {
                              "--default-dome false override this\n";
             }
         }
+        progress.Stage("Creating the render device");
         std::string deviceNote;
         auto renderDevice = prism::device::CreateDevice(o.device, &deviceNote);
+        progress.Stage("");
         if (!deviceNote.empty()) std::cerr << "PrismRT: " << deviceNote << '\n';
         const auto deviceInfo = renderDevice->Info();
         std::cout << "Rendering on " << prism::device::ToString(deviceInfo.kind) << " device: "
@@ -680,7 +923,8 @@ int runStandaloneCli(int argc, char** argv) {
         renderDevice->SceneChanged(scene);
         const double loadSeconds = seconds();
         using prism::output::AovKind;
-        double renderSeconds = 0, meanSamples = o.samples;
+        double renderSeconds = 0, meanSamples = o.samples, fractionAtMaxSamples = 1.0;
+        bool timeLimitReached = false;
         std::vector<prism::output::RenderedAov> rendered;
         for (size_t index = 0; index < views.size(); ++index) {
             auto const& view = views[index];
@@ -716,7 +960,21 @@ int runStandaloneCli(int argc, char** argv) {
                     imageRequest.contributions = o.contributions;
                     imageRequest.nee = o.nee;
                     imageRequest.meanSamples = &meanSamples;
+                    imageRequest.fractionAtMaxSamples = &fractionAtMaxSamples;
+                    // The limit covers all of the views together.
+                    prism::device::ImageProgress imageProgress;
+                    imageRequest.progress = &imageProgress;
+                    bool stopped = false;
+                    if (o.timeLimit > 0) {
+                        imageRequest.timeLimitSeconds = std::max(1e-6, o.timeLimit - renderSeconds);
+                        imageRequest.timeLimitReached = &stopped;
+                    }
+                    progress.BeginRender(&imageProgress, o.adaptiveThreshold > 0,
+                        views.size() > 1 ? "view " + std::to_string(index + 1) + "/" + std::to_string(views.size()) : "",
+                        imageRequest.timeLimitSeconds);
                     rendered.push_back({AovKind::Color, 3, renderDevice->RenderImage(scene, imageRequest)});
+                    progress.EndRender();
+                    timeLimitReached |= stopped;
                 } else if (std::find(geometric.begin(), geometric.end(), var.kind) == geometric.end()) {
                     geometric.push_back(var.kind);
                 }
@@ -758,7 +1016,10 @@ int runStandaloneCli(int argc, char** argv) {
             if (!view.FullDataWindow())
                 std::cout << " (data window of " << view.width << "x" << view.height << ")";
             std::cout << " at " << o.samples << " spp";
-            if (o.adaptiveThreshold > 0) std::cout << " (adaptive, mean " << meanSamples << ")";
+            if (o.adaptiveThreshold > 0 || timeLimitReached)
+                std::cout << " (" << (o.adaptiveThreshold > 0 ? "adaptive, " : "") << "mean " << meanSamples
+                          << ", " << 100.0 * fractionAtMaxSamples << "% of pixels at the maximum"
+                          << (timeLimitReached ? ", stopped by the time limit" : "") << ")";
             std::cout << " to " << view.output << '\n';
         }
         const double outputSeconds = seconds() - loadSeconds - renderSeconds;
@@ -767,6 +1028,8 @@ int runStandaloneCli(int argc, char** argv) {
                   << ",\"loadSeconds\":" << loadSeconds
                   << ",\"renderSeconds\":" << renderSeconds
                   << ",\"meanSamples\":" << meanSamples
+                  << ",\"fractionAtMaxSamples\":" << fractionAtMaxSamples
+                  << ",\"timeLimitReached\":" << (timeLimitReached ? "true" : "false")
                   << ",\"outputSeconds\":" << outputSeconds
                   << ",\"textureFiltering\":\"" << o.textureFiltering << "\""
                   << ",\"texturePrepareCalls\":" << textureStats.prepareCalls
