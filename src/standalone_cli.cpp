@@ -622,6 +622,9 @@ int runStandaloneCli(int argc, char** argv) {
         Options o = parse(argc, argv);
         // Loading phases (materials, textures) report to this model.
         prism::Progress progressModel;
+        // Outlives the printer, whose thread reads it (also while an error
+        // unwinds).
+        prism::device::ImageProgress imageProgress;
         ProgressPrinter progress(o.progress && o.exportScene.empty());
         EmbreeDevice device;
         if (!device.value) throw std::runtime_error("Cannot create Embree device");
@@ -962,7 +965,6 @@ int runStandaloneCli(int argc, char** argv) {
                     imageRequest.meanSamples = &meanSamples;
                     imageRequest.fractionAtMaxSamples = &fractionAtMaxSamples;
                     // The limit covers all of the views together.
-                    prism::device::ImageProgress imageProgress;
                     imageRequest.progress = &imageProgress;
                     bool stopped = false;
                     if (o.timeLimit > 0) {
