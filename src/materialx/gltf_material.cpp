@@ -439,9 +439,12 @@ MaterialConversion ConvertGltfMaterial(const tinygltf::Model& model, int materia
         if (const tinygltf::Value* ext = Extension(material, "KHR_materials_volume")) {
             b.floatInput(shader, "thickness", Number(*ext, "thicknessFactor", 0), Ref(*ext, "thicknessTexture"), 1,
                          "thicknessTexture");
-            // +infinity (the glTF default) as a finite "no attenuation".
+            // +infinity (the glTF default) as a finite "no attenuation"
+            // (DocumentLoader layers a volume only below 1e29). Thickness 0
+            // means a thin-walled surface without a volume in glTF.
             const double distance = Number(*ext, "attenuationDistance", 0);
-            shader->setInputValue("attenuation_distance", float(distance > 0 ? distance : 1e30));
+            const bool thin = Number(*ext, "thicknessFactor", 0) <= 0;
+            shader->setInputValue("attenuation_distance", float(distance > 0 && !thin ? distance : 1e30));
             // A uniform input: generated colour transforms are varying, so
             // the value is converted here and left untagged.
             const auto color = Numbers(*ext, "attenuationColor", {1, 1, 1});
@@ -488,10 +491,33 @@ MaterialConversion ConvertGltfMaterial(const tinygltf::Model& model, int materia
             }
         }
         if (const tinygltf::Value* ext = Extension(material, "KHR_materials_anisotropy")) {
-            shader->setInputValue("anisotropy_strength", float(Number(*ext, "anisotropyStrength", 0)));
-            shader->setInputValue("anisotropy_rotation", float(Number(*ext, "anisotropyRotation", 0)));
-            if (Ref(*ext, "anisotropyTexture").valid())
-                b.warn("KHR_materials_anisotropy: anisotropyTexture is not supported; using the factors");
+            // strength = factor * B; rotation = factor + atan2(2G - 1, 2R - 1)
+            // (the direction in the tangent frame), as MaterialX's
+            // gltf_anisotropy_image computes it.
+            const double strength = Number(*ext, "anisotropyStrength", 0);
+            const double rotation = Number(*ext, "anisotropyRotation", 0);
+            b.floatInput(shader, "anisotropy_strength", strength, Ref(*ext, "anisotropyTexture"), 2,
+                         "anisotropyTexture");
+            if (mx::NodePtr lookup = b.image(Ref(*ext, "anisotropyTexture"), "vector3", false, "anisotropyTexture")) {
+                auto signedChannel = [&](int index) {
+                    mx::NodePtr scaled = b.node("multiply", "float", "anisotropy_direction");
+                    Builder::connect(scaled, "in1", "float", b.channel(lookup, index));
+                    scaled->setInputValue("in2", 2.0f);
+                    mx::NodePtr centred = b.node("subtract", "float", "anisotropy_direction");
+                    Builder::connect(centred, "in1", "float", scaled);
+                    centred->setInputValue("in2", 1.0f);
+                    return centred;
+                };
+                mx::NodePtr angle = b.node("atan2", "float", "anisotropy_angle");
+                Builder::connect(angle, "iny", "float", signedChannel(1));
+                Builder::connect(angle, "inx", "float", signedChannel(0));
+                mx::NodePtr total = b.node("add", "float", "anisotropy_rotation");
+                Builder::connect(total, "in1", "float", angle);
+                total->setInputValue("in2", float(rotation));
+                Builder::connect(shader, "anisotropy_rotation", "float", total);
+            } else {
+                shader->setInputValue("anisotropy_rotation", float(rotation));
+            }
         }
         if (const tinygltf::Value* ext = Extension(material, "KHR_materials_dispersion"))
             shader->setInputValue("dispersion", float(Number(*ext, "dispersion", 0)));

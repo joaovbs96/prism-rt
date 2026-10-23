@@ -9,13 +9,16 @@
 //   normal-mapped half shades like the quad rotated to its mapped normal.
 #include "../src/materialx/gltf_material.h"
 #include "../src/materialx/mdl_generator.h"
+#include "../src/materialx/loader.h"
 #include "../src/color/color_management.h"
 
 #include <MaterialXCore/Material.h>
 #include <MaterialXFormat/XmlIo.h>
 #include <OpenImageIO/imagebuf.h>
 
+#include <chrono>
 #include <cmath>
+#include <fstream>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
@@ -225,6 +228,17 @@ void TestFeatures(const std::filesystem::path& dir)
               Value(unlit.shader, "base_color", mx::Color3(0.0f)) && Value(unlit.shader, "specular", 0.0f) &&
               unlit.conversion.warnings.size() == 1,
           "unlit approximated as emission (with a warning)");
+    auto anisotropy = Convert(model, MaterialIndex(model, "anisotropy"));
+    auto strength = Upstream(anisotropy.shader, "anisotropy_strength");
+    auto rotation = Upstream(anisotropy.shader, "anisotropy_rotation");
+    Check(strength && strength->getCategory() == "multiply" && IsChannel(Upstream(strength, "in1"), 2) &&
+              Value(strength, "in2", 0.8f),
+          "anisotropy strength = factor * texture B");
+    auto angle = rotation ? Upstream(rotation, "in1") : nullptr;
+    Check(rotation && rotation->getCategory() == "add" && Value(rotation, "in2", 0.3f) && angle &&
+              angle->getCategory() == "atan2",
+          "anisotropy rotation = factor + atan2 of the texture direction");
+    Check(anisotropy.conversion.warnings.empty(), "anisotropy texture supported");
     auto unknown = Convert(model, MaterialIndex(model, "unknown_extension"));
     Check(unknown.conversion.warnings.size() == 1 &&
               unknown.conversion.warnings[0].find("EXT_prism_unknown") != std::string::npos,
@@ -275,6 +289,79 @@ void TestGeneration(const std::filesystem::path& dir, const std::string& librari
     }
 }
 
+// DocumentLoader's LayerGltfPbrVolume (src/materialx/loader.cpp): a gltf_pbr
+// with a finite attenuation_distance is expanded and its transmission layered
+// over its absorbing VDF; one without attenuation (the converter's 1e30) is
+// left alone; other lobes (clearcoat) and texture inputs survive.
+void TestVolumeLayer(const std::filesystem::path& dir, const std::string& libraries)
+{
+    auto generator = MDLGenerator::shared(libraries);
+    const auto path = std::filesystem::temp_directory_path() /
+        ("prism_gltf_volume_layer_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) +
+         ".mtlx");
+    {
+        std::ofstream out(path);
+        out << R"(<?xml version="1.0"?>
+<materialx version="1.39">
+  <image name="tint_image" type="color3"><input name="file" type="filename" value="tint.png" /></image>
+  <gltf_pbr name="absorbing" type="surfaceshader">
+    <input name="transmission" type="float" value="1" />
+    <input name="base_color" type="color3" nodename="tint_image" />
+    <input name="attenuation_distance" type="float" value="2" />
+    <input name="attenuation_color" type="color3" value="0.5, 0.8, 0.9" />
+    <input name="clearcoat" type="float" value="1" />
+  </gltf_pbr>
+  <surfacematerial name="Absorbing" type="material">
+    <input name="surfaceshader" type="surfaceshader" nodename="absorbing" />
+  </surfacematerial>
+  <gltf_pbr name="clear" type="surfaceshader">
+    <input name="transmission" type="float" value="1" />
+    <input name="attenuation_distance" type="float" value="1e+30" />
+  </gltf_pbr>
+  <surfacematerial name="Clear" type="material">
+    <input name="surfaceshader" type="surfaceshader" nodename="clear" />
+  </surfacematerial>
+</materialx>
+)";
+    }
+    DocumentLoader loader(generator->get_stdlib());
+    auto doc = loader.load(path.string());
+    std::error_code ignored;
+    std::filesystem::remove(path, ignored);
+    Check(bool(doc), "volume layer fixture loads");
+    if (!doc) return;
+    Check(!doc->getNode("absorbing"), "the attenuating gltf_pbr is expanded");
+    Check(doc->getNode("clear") && doc->getNode("clear")->getCategory() == "gltf_pbr",
+          "a gltf_pbr without attenuation is left alone");
+    int layers = 0;
+    bool clearcoat = false;
+    for (auto const& node : doc->getNodes()) {
+        if (node->getCategory() == "layer" && node->getType() == "BSDF") {
+            auto top = Upstream(node, "top"), base = Upstream(node, "base");
+            if (top && base && top->getCategory() == "dielectric_bsdf" &&
+                top->getInput("scatter_mode") && top->getInput("scatter_mode")->getValueString() == "T" &&
+                base->getCategory() == "anisotropic_vdf") {
+                ++layers;
+                Check(!node->getDownstreamPorts().empty(), "the volume layer replaces the transmission downstream");
+            }
+        }
+        if (node->getCategory() == "dielectric_bsdf" && !node->getInput("scatter_mode"))
+            clearcoat = true;
+    }
+    Check(layers == 1, "exactly one transmission is layered over its volume");
+    Check(clearcoat, "the clearcoat lobe survives the expansion");
+    bool tint = false;
+    for (auto const& node : doc->getNodes())
+        for (auto const& input : node->getInputs())
+            if (input->getNodeName() == "tint_image") tint = true;
+    Check(tint, "texture inputs stay connected");
+    for (auto const* material : {"Absorbing", "Clear"}) {
+        auto generated = generator->generate(doc, material);
+        Check(generated.success, std::string("volume layer fixture ") + material + " generates MDL: " +
+                                     generated.error_message);
+    }
+}
+
 // Mean luminance of the image around a point of the z = 0 plane.
 double Region(const OIIO::ImageBuf& image, double x, double y, double radius = 0.15)
 {
@@ -293,6 +380,39 @@ double Region(const OIIO::ImageBuf& image, double x, double y, double radius = 0
             ++count;
         }
     return count ? sum / count : 0.0;
+}
+
+// volume_sphere.gltf (camera at 0,0,6, a white background, linear Rec.709
+// working space): through the sphere's centre light travels 2 units, one
+// attenuationDistance, so Beer-Lambert leaves attenuationColor (0.5, 0.8,
+// 0.9) of the background, within 5%; outside it is the untinted background.
+int CheckVolume(const std::string& path)
+{
+    OIIO::ImageBuf image(path);
+    if (!image.read(0, 0, true, OIIO::TypeDesc::FLOAT)) {
+        std::cerr << "cannot read " << path << "\n";
+        return 2;
+    }
+    const auto& spec = image.spec();
+    const int cx = spec.width / 2, cy = spec.height / 2, r = std::max(1, spec.width / 32);
+    double sum[3]{};
+    int count = 0;
+    float pixel[4]{};
+    for (int y = cy - r; y < cy + r; ++y)
+        for (int x = cx - r; x < cx + r; ++x) {
+            image.getpixel(x, y, pixel, 4);
+            for (int c = 0; c < 3; ++c) sum[c] += pixel[c];
+            ++count;
+        }
+    const double expected[3] = {0.5, 0.8, 0.9};
+    std::cout << "through the centre: " << sum[0] / count << ", " << sum[1] / count << ", " << sum[2] / count
+              << " (expected 0.5, 0.8, 0.9)\n";
+    for (int c = 0; c < 3; ++c)
+        Check(std::abs(sum[c] / count - expected[c]) <= 0.05 * expected[c],
+              "channel " + std::to_string(c) + " is tinted by Beer-Lambert absorption (5%)");
+    image.getpixel(1, 1, pixel, 4);
+    Check(std::abs(pixel[0] - 1.0f) < 0.02f && std::abs(pixel[2] - 1.0f) < 0.02f, "the background is white");
+    return failures ? 1 : 0;
 }
 
 int CheckNormalMap(const std::string& path)
@@ -325,6 +445,7 @@ int main(int argc, char** argv)
 {
     try {
         if (argc == 3 && std::string(argv[1]) == "--check-normal-map") return CheckNormalMap(argv[2]);
+        if (argc == 3 && std::string(argv[1]) == "--check-volume") return CheckVolume(argv[2]);
         if (argc != 2) {
             std::cerr << "usage: prism_gltf_material_test <tests/gltf directory>\n";
             return 2;
@@ -335,7 +456,10 @@ int main(int argc, char** argv)
         TestFeatures(dir);
         TestEmbedded(dir);
         if (const char* libraries = std::getenv("PRISM_MATERIALX_LIBRARY_PATH"); libraries && *libraries)
+        {
             TestGeneration(dir, libraries);
+            TestVolumeLayer(dir, libraries);
+        }
         else
             std::cout << "PRISM_MATERIALX_LIBRARY_PATH not set: MDL generation not tested\n";
     } catch (const std::exception& error) {

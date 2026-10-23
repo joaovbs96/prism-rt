@@ -1033,6 +1033,25 @@ if(PRISM_BUILD_HYDRA)
     add_test(NAME prism_gltf_normal_map_test
         COMMAND prism_gltf_material_test --check-normal-map "${_prism_gltf}/normal_map_cpu.exr")
     set_tests_properties(prism_gltf_normal_map_test PROPERTIES FIXTURES_REQUIRED prism_gltf_normal_map)
+    # KHR_materials_volume: Beer-Lambert absorption through a closed sphere
+    # (the layer DocumentLoader adds under gltf_pbr's transmission).
+    set(_prism_gltf_volume --scene "${_prism_gltf_fixtures}/volume_sphere.gltf" --camera-position 0,0,6
+        --camera-target 0,0,0 --vfov 30 --width 64 --height 64 --spp 64 --max-sample-radiance 0
+        --env-color 1,1,1 --working-space lin_rec709)
+    set(_prism_gltf_volume_devices cpu)
+    if(PRISM_ENABLE_VULKAN)
+        list(APPEND _prism_gltf_volume_devices vulkan)
+    endif()
+    foreach(_device IN LISTS _prism_gltf_volume_devices)
+        add_test(NAME prism_gltf_volume_${_device}_render
+            COMMAND PrismRT ${_prism_gltf_volume} --device ${_device} --output "${_prism_gltf}/volume_${_device}.exr")
+        set_tests_properties(prism_gltf_volume_${_device}_render PROPERTIES ENVIRONMENT "${_prism_gltf_env}"
+            FIXTURES_SETUP prism_gltf_volume_${_device}
+            FAIL_REGULAR_EXPRESSION "${_prism_gltf_no_legacy};cannot render the scene on the GPU")
+        add_test(NAME prism_gltf_volume_${_device}_test
+            COMMAND prism_gltf_material_test --check-volume "${_prism_gltf}/volume_${_device}.exr")
+        set_tests_properties(prism_gltf_volume_${_device}_test PROPERTIES FIXTURES_REQUIRED prism_gltf_volume_${_device})
+    endforeach()
     if(TARGET prism_compare_images)
         add_test(NAME prism_gltf_materialx_vs_legacy
             COMMAND prism_compare_images "${_prism_gltf}/spheres_legacy_cpu.exr"
@@ -1074,7 +1093,7 @@ endif()
 set(_prism_gpu_test_regex
     "^prism_hydra_(render_exercise|transparent_background_export|depth1_render|depth_change_render|setting_change_test|cutout_(medium|clear)_render|cutout_medium_test|animation_exercise|pass_camera_test|scene_bridge_test|streaming_(cold|warm|whole)|streaming_.*_matches_.*)$"
     "|^prism_(gpu_shader_compile_test|device_selection_test|cli_clean_exit_vulkan)$"
-    "|^prism_gltf_.*_vulkan_(render|parity)$")
+    "|^prism_gltf_.*_vulkan_(render|parity|test)$")
 string(JOIN "" _prism_gpu_test_regex ${_prism_gpu_test_regex})
 get_property(_prism_tests DIRECTORY PROPERTY TESTS)
 foreach(_test IN LISTS _prism_tests)

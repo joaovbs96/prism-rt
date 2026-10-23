@@ -255,6 +255,12 @@ def features(out):
                       "extensions": {"KHR_materials_emissive_strength": {"emissiveStrength": 4}}}, "sphere"),
         ("unlit", {"pbrMetallicRoughness": {"baseColorFactor": [0.2, 0.7, 0.9, 1]},
                    "extensions": {"KHR_materials_unlit": {}}}, "sphere"),
+        ("anisotropy", {"pbrMetallicRoughness": {"baseColorFactor": [0.9, 0.9, 0.9, 1], "metallicFactor": 1,
+                                                 "roughnessFactor": 0.4},
+                        "extensions": {"KHR_materials_anisotropy": {
+                            "anisotropyStrength": 0.8, "anisotropyRotation": 0.3,
+                            "anisotropyTexture": {"index": g.image(png(4, 4, lambda x, y: (255, 128, 255, 255)),
+                                                                   embed="data")}}}}, "sphere"),
         ("unknown_extension", {"pbrMetallicRoughness": {"baseColorFactor": [0.7, 0.7, 0.7, 1], "metallicFactor": 0},
                                "extensions": {"EXT_prism_unknown": {"value": 1}}}, "sphere"),
     ]
@@ -262,7 +268,7 @@ def features(out):
         material["name"] = name
         index = g.material(material)
         mesh = g.mesh(*(s if shape == "sphere" else (p, n, uv, idx)), index)
-        g.node(mesh, (2.2 * (i % 5) - 4.4, 1.1 - 2.2 * (i // 5), 0), (0.9, 0.9, 0.9))
+        g.node(mesh, (2.2 * (i % 6) - 5.5, 1.1 - 2.2 * (i // 6), 0), (0.9, 0.9, 0.9))
     g.write_gltf(out / "features.gltf")
 
 
@@ -322,6 +328,22 @@ def normal_map(out):
     g.write_gltf(out / "normal_map.gltf")
 
 
+def volume_sphere(out):
+    """A closed glass sphere (IOR 1: no refraction or reflection) absorbing
+    through KHR_materials_volume. Through its centre (path length 2) the
+    background is tinted by attenuationColor^(2 / attenuationDistance), here
+    attenuationColor itself (prism_gltf_material_test --check-volume)."""
+    g = Gltf()
+    material = g.material({"name": "absorbing", "pbrMetallicRoughness": {
+        "baseColorFactor": [1, 1, 1, 1], "metallicFactor": 0, "roughnessFactor": 0},
+        "extensions": {"KHR_materials_transmission": {"transmissionFactor": 1},
+                       "KHR_materials_ior": {"ior": 1.0},
+                       "KHR_materials_volume": {"thicknessFactor": 2, "attenuationDistance": 2,
+                                                "attenuationColor": [0.5, 0.8, 0.9]}}})
+    g.node(g.mesh(*sphere(48, 24), material))
+    g.write_gltf(out / "volume_sphere.gltf")
+
+
 def environment(out, width=64, height=32):
     """A small studio-like equirect environment in Radiance HDR."""
     def rgbe(r, g, b):
@@ -359,6 +381,7 @@ def main():
     features(out)
     embedded(out)
     normal_map(out)
+    volume_sphere(out)
     environment(out)
 
 
