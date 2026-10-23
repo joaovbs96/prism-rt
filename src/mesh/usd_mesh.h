@@ -76,6 +76,7 @@ namespace mx = MaterialX;
 #include "../mdl_material.h"
 #include "../materialx/usd_network.h"
 #include "../materialx/prepared_template.h"
+#include "../materialx/cached_document.h"
 
 // ============================================================================
 // MaterialX material recovery from USD stages
@@ -597,35 +598,9 @@ CompileMtlxMaterial(const ResolvedMtlxMaterial& resolved,
             }
         }
     }
-    const std::filesystem::path tempMtlx = cache /
-        ("standalone_" + OIIO::SHA1::digest(xml.data(), xml.size()) + ".mtlx");
+    std::filesystem::path tempMtlx;
     try {
-        std::filesystem::create_directories(cache);
-        if (!std::filesystem::exists(tempMtlx)) {
-            static std::atomic<unsigned long long> serial{0};
-#ifdef _WIN32
-            const auto process = _getpid();
-#else
-            const auto process = getpid();
-#endif
-            const auto staging = std::filesystem::path(tempMtlx.string() + ".tmp-" +
-                std::to_string(process) + "-" + std::to_string(serial++));
-            struct Cleanup {
-                std::filesystem::path path;
-                ~Cleanup() { std::error_code ec; std::filesystem::remove(path, ec); }
-            } cleanup{staging};
-            {
-                std::ofstream output(staging, std::ios::binary | std::ios::trunc);
-                output << xml;
-                output.close();
-                if (!output) throw std::runtime_error("Cannot write recovered MaterialX document");
-            }
-            std::error_code error;
-            std::filesystem::rename(staging, tempMtlx, error);
-            // A concurrent process may have published identical content first.
-            if (error && !std::filesystem::exists(tempMtlx))
-                throw std::filesystem::filesystem_error("Publish recovered MaterialX", staging, tempMtlx, error);
-        }
+        tempMtlx = prism::materialx::PublishMaterialXDocument(xml, cache);
     } catch (const std::exception& e) {
         std::cerr << "[CompileMtlx] Failed to cache .mtlx: " << e.what() << "\n";
         return nullptr;
