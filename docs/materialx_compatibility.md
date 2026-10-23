@@ -11,8 +11,9 @@ switches.
 Subsurface scattering is traced as a random walk through the MDL volume
 coefficients (`volume.absorption_coefficient`, `volume.scattering_coefficient`;
 see `shaders/integrator/path_tracer.h`), so the loader no longer removes it by
-default. Setting `PRISM_SSS_FALLBACK=1` (or passing
-`fallback_sss_to_diffuse=true`) restores the old substitution, for comparison
+default. The `prism:sssFallback` render setting (CLI `--sss-fallback true`;
+its default comes from `PRISM_SSS_FALLBACK=1`), or passing
+`fallback_sss_to_diffuse=true`, restores the old substitution, for comparison
 or for scenes where the walk is too expensive:
 
 | MaterialX node category | Input replaced with constant zero |

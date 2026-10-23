@@ -125,7 +125,7 @@ Scenes: **Eggs** (MaterialEggs), **OpenPBR** (OpenPBRShaderPlayground),
 - **Adaptive subdivision and dicing.** Subdivision is uniform per mesh under a
   face budget; dense subdivision meshes render as their control hulls, and
   displacement dicing is limited the same way. A scene-wide budget
-  (`PRISM_SUBDIVISION_BUDGET_FACES`, default 24 Mi faces) lowers the levels of
+  (`prism:subdivisionBudgetFaces`, default 24 Mi faces) lowers the levels of
   the meshes refining to the most faces first: ALab asks for 48 M faces at
   level 2 and renders with 25 M (40 M triangles, 25 GB peak).
 - **Multiple UV sets.** Texture coordinates come from `st` (or `uv`);
@@ -220,7 +220,7 @@ than from the renderer.
 | Displacement | yes | no | yes | ? | ? | yes |
 | Motion blur | no | ? | no | ? | ? | yes |
 | IES / shaping | no | no | yes | ? | ? | yes |
-| Adaptive sampling | no | ? | yes | ? | ? | yes |
+| Adaptive sampling | yes | ? | yes | ? | ? | yes |
 | Denoiser | no | ? | ? | planned | OIDN | yes |
 | LPEs / light groups | no | ? | no | ? | ? | yes |
 | Status | active | active | branch on hold (refactor) | in progress | archived 2025-08 | production |
@@ -234,8 +234,9 @@ GPUs from every vendor. To close the gaps, in order:
    and "yes" for most of the others.
    - **Denoising** with Open Image Denoise, fed by albedo and normal AOVs. It
      runs on the CPU and on NVIDIA, AMD and Intel GPUs.
-   - **Adaptive sampling** from per-pixel variance, the way Typhoon does it,
-     paired with the denoiser.
+   - **Adaptive sampling** is on by default (Cycles' error estimate, threshold
+     0.01, up to 2048 samples, with a render time limit; [hydra.md](hydra.md#adaptive-sampling-and-time-limit)).
+     Left: pairing it with the denoiser.
    - **Motion blur** (see [Geometry](#geometry)). Do it on the CPU first,
      because Embree has time-sampled geometry. Vulkan's motion-blur extension
      is NVIDIA-only, so the other GPUs need several time steps or the CPU.
@@ -289,7 +290,10 @@ or UsdPreviewSurface translation, and no Hydra id AOVs (`primId`,
 `instanceId`, `elementId`). Hydra (`prism_hydra_render`, usdview) is the
 reference path. The parity tests ([hydra.md](hydra.md#cli-and-hydra-parity))
 compare the two on every fixture both can load; the fixtures the CLI cannot
-load yet are listed there.
+load yet are listed there. Render settings are at parity: every `prism:*`
+setting that affects a one-shot render has a CLI flag and is read from the
+RenderSettings prim, except the subdivision and displacement settings, which
+wait for the CLI's subdivision ([hydra.md](hydra.md#rendering-and-selection-settings)).
 
 glTF loads only in the CLI ([gltf.md](gltf.md)): Hydra and usdview need a
 glTF file-format plugin (none in the OpenUSD build), which could reuse the

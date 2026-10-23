@@ -122,7 +122,7 @@ to fit the budget, as before):
 - **Planning** (deterministic): tails always; levels resident and requested
   in the current view are never demoted; missing requested levels one at a
   time by lookup weight per byte within the budget
-  (`PRISM_GPU_TEXTURE_BUDGET_MIB` less the whole images); then other
+  (`prism:gpuTextureBudgetMiB` less the whole images); then other
   resident levels while they fit, least recently requested evicted first.
   Requests the budget cannot hold are reported once per view:
   `N of M streamed textures below the requested resolution`.

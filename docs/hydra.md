@@ -31,37 +31,181 @@ python tests/hydra/validate.py
 
 ## Rendering and selection settings
 
-| Hydra setting | Default | Meaning |
-| --- | --- | --- |
-| `prism:samplesPerPixel` | 256 | Samples per pixel before convergence |
-| `prism:maxDepth` | 32 | Maximum path depth |
-| `prism:rrMinDepth` | 4 | Start of Russian roulette |
-| `prism:maxSampleRadiance` | 10 | Existing hue-preserving per-sample clamp; zero disables it |
-| `prism:neeProbabilityMin` | 0 | Probabilistic NEE: from `prism:neeFromDepth` on, lights are sampled with probability clamp(path weight, this, 1); 0 samples them at every vertex (lower noise, slightly more work per sample) |
-| `prism:neeFromDepth` | 2 | First depth of probabilistic NEE |
-| `prism:seed` | 0 | Per-pixel RNG seed |
-| `prism:previewMaxDimension` | 96 | Preview longest edge, clamped to 16-1024 pixels |
-| `prism:adaptivePreview` | true | Adapt preview resolution using measured render time |
-| `prism:previewTargetMs` | 33 | Preview render-time target, clamped to 1-1000 ms |
-| `prism:refinementDelayMs` | 100 | Quiet interval before refinement, clamped to 0-2000 ms |
-| `prism:gpuPreparationPreview` | true | While a GPU device (Vulkan, Metal) is still preparing the scene after one second, render progressively on the CPU and continue on the GPU from the same sample once it is ready; env `PRISM_GPU_PREPARATION_PREVIEW=0` sets the initial value, see [CPU preview while the GPU prepares](#cpu-preview-while-the-gpu-prepares) |
-| `prism:gpuPreparationPreviewMaxMiB` | 8192 | Skip that preview when the scene's Embree memory exceeds this many MiB (0 never skips); env `PRISM_GPU_PREPARATION_PREVIEW_MAX_MIB` |
-| `domeLightCameraVisibility` | true | Show dome light in primary camera rays; secondary lighting remains enabled |
-| `prism:environmentSampling` | `mis` | Environment next-event sampling with MIS, or `bsdf` |
-| `prism:lightSelection` | `spatial` | NEE picks among the analytic (UsdLux) lights by their estimated irradiance at the shading point (`spatial`, for 2 to 64 analytic lights), or by power only (`power`); see [Sampling](gpu_devices.md#sampling) |
-| `prism:textureFiltering` | `filtered` | Footprint-based anisotropic mip filtering, or highest-resolution `bilinear` reference mode |
-| `prism:textureStreaming` | true | GPU devices that stream textures (Vulkan) keep only the mip levels shading asks for, within the texture budget; false uploads whole textures reduced to the budget (env `PRISM_GPU_TEXTURE_STREAMING=0`); see [texture streaming](texture_service.md#gpu-texture-streaming) |
-| `prism:textureStreamingPrepass` | false | Settle streamed textures with feedback-only passes before an accumulation and hold them for all of its samples (deterministic final images; `prism_hydra_render` sets it). Otherwise an accumulation restarts at most once, early, and later loads sharpen it in place |
-| `prism:honorDoubleSided` | false | Honour USD `doubleSided`: back faces of single-sided meshes (`doubleSided` false, USD's default) are not hit, unless their material transmits. Off, every mesh is two-sided as before (most path tracers ignore `doubleSided`). Changing it rebuilds the scene. CLI: `--honor-double-sided true\|false`. See [Scene features](#scene-features) |
-| `prism:sphereBatching` | false | Experimental batches of at most 1,024 eligible analytic spheres; ordinary instancing remains the default |
-| `prism:hiddenGeometryBudgetMiB` | 0 | Soft budget for retained hidden converted geometry; zero keeps unlimited retention |
-| `prism:resourceRevision` | 0 | Increment to invalidate cached material and external texture fingerprints and reload dome resources without rebuilding geometry |
-| `prism:selectionOutline` | true | Draw selection as an outline; false uses filled highlighting |
-| `prism:selectionOutlineRadius` | 2 | Outline thickness in pixels |
-| `prism:selectionUseHostSettings` | false | Use the host's Hdx outline parameters instead of PrismRT's overrides |
-| `prism:colorManagement:ocioConfig` | empty | OpenColorIO config; empty uses `$OCIO`, else `ocio://studio-config-latest`. See [colour management](color_management.md) |
-| `prism:colorManagement:workingSpace` | empty | Working space; empty is ACEScg. `lin_rec709` renders as before colour management. Changing it (or the config) rebuilds the scene |
-| `prism:colorManagement:display`, `prism:colorManagement:view` | empty | Recorded only: the colour AOV stays linear in the working space and usdview applies its own colour correction (`OCIO=ocio://studio-config-latest` for its OCIO mode) |
+Every setting is a Hydra render setting (usdview's renderer settings, or
+`prism:*` attributes of the active RenderSettings prim, see [Render settings
+and products](#render-settings-and-products)). The standalone CLI reads the
+same `prism:*` attributes from the RenderSettings prim and has a flag for each
+setting that affects a one-shot render. **Precedence:** command-line flag
+(CLI, `prism_hydra_render`) > RenderSettings `prism:*` > environment variable
+(where one is listed) > built-in default. The defaults live in
+`src/render_defaults.h`, shared by the delegate, the CLI and
+`prism_hydra_render`. *Hydra change* says what changing the setting does in a
+running delegate.
+
+| Setting | Default | CLI flag | Hydra change | Meaning |
+| --- | --- | --- | --- | --- |
+| `prism:samplesPerPixel` | 2048 | `--spp` | more samples resume the accumulation; fewer stop it | Samples per pixel; with adaptive sampling the per-pixel maximum |
+| `prism:adaptiveThreshold` | 0.01 | `--adaptive-threshold` | restarts the accumulation | Adaptive sampling: a pixel stops once its error estimate is below this (0: every pixel gets `samplesPerPixel`). See [Adaptive sampling and time limit](#adaptive-sampling-and-time-limit) |
+| `prism:adaptiveMinSamples` | 64 | `--adaptive-min-samples` | restarts the accumulation | Samples before a pixel may stop |
+| `prism:timeLimitSeconds` | 0 | `--time-limit` | like `samplesPerPixel` | Render time limit in seconds (0: none); rendering stops at whichever comes first of the threshold, the samples and the limit |
+| `prism:maxDepth` | 32 | `--max-depth` | restarts the accumulation | Maximum path depth |
+| `prism:rrMinDepth` | 4 | `--rr-min-depth` | restarts the accumulation | Start of Russian roulette |
+| `prism:maxSampleRadiance` | 10 | `--max-sample-radiance` | restarts the accumulation | Existing hue-preserving per-sample clamp; zero disables it |
+| `prism:neeProbabilityMin` | 0 | `--nee-probability-min` | restarts the accumulation | Probabilistic NEE: from `prism:neeFromDepth` on, lights are sampled with probability clamp(path weight, this, 1); 0 samples them at every vertex (lower noise, slightly more work per sample) |
+| `prism:neeFromDepth` | 2 | `--nee-from-depth` | restarts the accumulation | First depth of probabilistic NEE |
+| `prism:seed` | 0 | `--seed` | restarts the accumulation | Per-pixel RNG seed |
+| `prism:lightSelection` | `spatial` | `--light-selection` | restarts the accumulation | NEE picks among the analytic (UsdLux) lights by their estimated irradiance at the shading point (`spatial`, for 2 to 64 analytic lights), or by power only (`power`); see [Sampling](gpu_devices.md#sampling) |
+| `prism:environmentSampling` | `mis` | `--environment-sampling` | restarts the accumulation | Environment next-event sampling with MIS, or `bsdf` |
+| `prism:textureFiltering` | `filtered` | `--texture-filtering` | restarts the accumulation | Footprint-based anisotropic mip filtering, or highest-resolution `bilinear` reference mode |
+| `prism:textureStreaming` | true | `--texture-streaming` | the device prepares the scene again (textures re-upload) | GPU devices that stream textures (Vulkan) keep only the mip levels shading asks for, within the texture budget; false uploads whole textures reduced to the budget (env `PRISM_GPU_TEXTURE_STREAMING=0` turns streaming off for the process); see [texture streaming](texture_service.md#gpu-texture-streaming) |
+| `prism:textureStreamingPrepass` | false | none: the CLI always settles streamed textures before its first sample (as `true`) | restarts the accumulation | Settle streamed textures with feedback-only passes before an accumulation and hold them for all of its samples (deterministic final images; `prism_hydra_render` sets it). Otherwise an accumulation restarts at most once, early, and later loads sharpen it in place |
+| `prism:gpuTextureBudgetMiB` | 0 (env `PRISM_GPU_TEXTURE_BUDGET_MIB`) | `--gpu-texture-budget-mib` | the device prepares the scene again (textures re-upload at the new sizes) | GPU memory for textures in MiB (at least 64); 0 is 45% of the device's memory. Textures beyond it upload, or stream, at reduced resolution |
+| `prism:subdivisionLevel` | 2 (env `PRISM_SUBDIVISION_LEVEL`) | none (*) | every mesh converts again | Uniform subdivision level of subdivision surfaces, 0-6 (0: control hulls) |
+| `prism:subdivisionMaxFaces` | 65536 (env `PRISM_SUBDIVISION_MAX_FACES`) | none (*) | every mesh converts again | Faces one mesh may refine to; denser meshes use lower levels |
+| `prism:subdivisionBudgetFaces` | 25165824 (env `PRISM_SUBDIVISION_BUDGET_FACES`) | none (*) | every mesh converts again | Faces all refined meshes of the scene may add up to; beyond it the meshes refining to the most faces drop levels first |
+| `prism:displacementLevel` | 4 (env `PRISM_DISPLACEMENT_LEVEL`) | none (*) | every mesh converts again | Subdivision level of meshes their material displaces, 0-6 |
+| `prism:displacementMaxFaces` | 262144 (env `PRISM_DISPLACEMENT_MAX_FACES`) | none (*) | every mesh converts again | Faces one displaced mesh may refine to |
+| `prism:sssFallback` | false (env `PRISM_SSS_FALLBACK`) | `--sss-fallback` | every material generates again | Render subsurface scattering as its diffuse lobe instead of tracing it ([MaterialX compatibility](materialx_compatibility.md)). Process-wide, like the colour management |
+| `prism:honorDoubleSided` | false | `--honor-double-sided` | rebuilds the scene | Honour USD `doubleSided`: back faces of single-sided meshes (`doubleSided` false, USD's default) are not hit, unless their material transmits. Off, every mesh is two-sided as before (most path tracers ignore `doubleSided`). See [Scene features](#scene-features) |
+| `prism:device` | `auto` | `--device` | switches the render device | `auto`, `cpu`, `cpu-reference`, `vulkan` or `metal`; env `PRISM_DEVICE` sets the initial value |
+| `prism:colorManagement:ocioConfig` | empty | `--ocio-config` | rebuilds the scene | OpenColorIO config; empty uses `$OCIO`, else `ocio://studio-config-latest`. See [colour management](color_management.md) |
+| `prism:colorManagement:workingSpace` | empty | `--working-space` | rebuilds the scene | Working space; empty is ACEScg. `lin_rec709` renders as before colour management |
+| `prism:colorManagement:display`, `prism:colorManagement:view` | empty | `--display`, `--view` | none | Recorded only in the delegate: the colour AOV stays linear in the working space and usdview applies its own colour correction (`OCIO=ocio://studio-config-latest` for its OCIO mode). The CLI encodes 8-bit outputs with them |
+| `domeLightCameraVisibility` | true | none: the CLI shows domes to the camera | restarts the accumulation | Host setting (usdview's dome visibility): show dome light in primary camera rays; secondary lighting remains enabled |
+| `prism:sphereBatching` | false | Hydra only (**) | rebuilds the scene | Experimental batches of at most 1,024 eligible analytic spheres; ordinary instancing remains the default |
+| `prism:hiddenGeometryBudgetMiB` | 0 | Hydra only (**) | none | Soft budget for retained hidden converted geometry; zero keeps unlimited retention |
+| `prism:previewMaxDimension` | 0 | Hydra only (interactive) | next preview | Preview longest edge, clamped to 16-1024 pixels; 0 is automatic (512 on GPU devices, 96 on the CPU) |
+| `prism:adaptivePreview` | true | Hydra only (interactive) | next preview | Adapt preview resolution using measured render time |
+| `prism:previewTargetMs` | 33 | Hydra only (interactive) | next preview | Preview render-time target, clamped to 1-1000 ms |
+| `prism:refinementDelayMs` | 100 | Hydra only (interactive) | next preview | Quiet interval before refinement, clamped to 0-2000 ms |
+| `prism:gpuPreparationPreview` | true | Hydra only (interactive) | next preparation | While a GPU device (Vulkan, Metal) is still preparing the scene after one second, render progressively on the CPU and continue on the GPU from the same sample once it is ready; env `PRISM_GPU_PREPARATION_PREVIEW=0` sets the initial value, see [CPU preview while the GPU prepares](#cpu-preview-while-the-gpu-prepares) |
+| `prism:gpuPreparationPreviewMaxMiB` | 8192 | Hydra only (interactive) | next preparation | Skip that preview when the scene's Embree memory exceeds this many MiB (0 never skips); env `PRISM_GPU_PREPARATION_PREVIEW_MAX_MIB` |
+| `prism:resourceRevision` | 0 | Hydra only (interactive) | materials and domes reload | Increment to invalidate cached material and external texture fingerprints and reload dome resources without rebuilding geometry (a CLI run always reads its files afresh) |
+| `prism:selectionOutline` | true | Hydra only (interactive) | presentation only | Draw selection as an outline; false uses filled highlighting |
+| `prism:selectionOutlineRadius` | 2 | Hydra only (interactive) | presentation only | Outline thickness in pixels |
+| `prism:selectionUseHostSettings` | false | Hydra only (interactive) | presentation only | Use the host's Hdx outline parameters instead of PrismRT's overrides |
+
+(*) The standalone loader has no subdivision surfaces or displacement yet
+([feature roadmap](feature_roadmap.md#standalone-cli)): it renders control
+hulls, so these settings cannot apply, and the CLI warns when the
+RenderSettings prim authors them. `prism_hydra_render` has
+`--subdivision-level`, `--subdivision-max-faces`, `--subdivision-budget-faces`,
+`--displacement-level` and `--displacement-max-faces`.
+The subdivision, displacement and texture budget settings replace the
+environment-variable-only configuration; the variables now give the defaults.
+
+(**) Not image settings: sphere batching changes how the delegate's retained
+scene stores spheres (the CLI loads its spheres its own way, and the image is
+the same), and the hidden geometry budget bounds the memory of hidden
+prototypes kept for later edits, which a one-shot render does not have.
+
+### Adaptive sampling and time limit
+
+Adaptive sampling is on by default: up to 2048 samples per pixel, threshold
+0.01, at least 64 samples. The error estimate (`src/device/adaptive_sampling.h`)
+is the Cycles one: |mean of all samples - mean of the even samples| summed over
+RGB, over the square root of the mean, relative to the image's mean brightness,
+so the threshold means the same at any exposure. Every 8 samples after the
+minimum, pixels below the threshold stop, unless a neighbour in their 3x3
+window has not converged.
+
+Threshold study (CPU device, 320x180, against a 16384-spp non-adaptive
+reference of another seed; NRMSE as `prism_compare_images` computes it):
+
+| Scene | Threshold | Mean spp | Pixels at 2048 | Time (s) | NRMSE | Fixed, same mean spp: NRMSE | Fixed, same time: spp / NRMSE |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Cornell box | 0.005 | 1104 | 52% | 24 | 0.0015 | 0.0021 | 1999 / 0.0015 |
+| Cornell box | 0.01 | 1102 | 52% | 24 | 0.0015 | 0.0021 | 1984 / 0.0015 |
+| Cornell box | 0.02 | 1079 | 49% | 26 | 0.0015 | 0.0021 | 2021 / 0.0015 |
+| Cornell box | 0.05 | 758 | 22% | 21 | 0.0019 | 0.0025 | 1376 / 0.0018 |
+| Cornell box | 0.1 | 372 | 4% | 10 | 0.0033 | 0.0038 | 639 / 0.0028 |
+| Chess | 0.005 | 1603 | 71% | 53 | 0.0187 | 0.0213 | 2139 / 0.0184 |
+| Chess | 0.01 | 1444 | 65% | 51 | 0.0187 | 0.0224 | 2010 / 0.0189 |
+| Chess | 0.02 | 1342 | 62% | 51 | 0.0187 | 0.0233 | 2014 / 0.0189 |
+| Chess | 0.05 | 1247 | 55% | 62 | 0.0188 | 0.0241 | 2077 / 0.0186 |
+| Chess | 0.1 | 980 | 32% | 51 | 0.0215 | 0.0272 | 1535 / 0.0217 |
+| Egg (jade) | 0.005 | 2048 | 100% | 58 | 0.0105 | 0.0105 | 2172 / 0.0103 |
+| Egg (jade) | 0.01 | 2048 | 100% | 58 | 0.0105 | 0.0105 | 2091 / 0.0105 |
+| Egg (jade) | 0.02 | 2037 | 98% | 57 | 0.0106 | 0.0106 | 2139 / 0.0104 |
+| Egg (jade) | 0.05 | 1478 | 36% | 60 | 0.0125 | 0.0120 | 1750 / 0.0113 |
+| Egg (jade) | 0.1 | 526 | 1% | 23 | 0.0214 | 0.0192 | 629 / 0.0176 |
+| OpenPBR | 0.005 | 2048 | 100% | 68 | 0.0351 | 0.0351 | 2089 / 0.0348 |
+| OpenPBR | 0.01 | 2048 | 100% | 68 | 0.0351 | 0.0351 | 2120 / 0.0345 |
+| OpenPBR | 0.02 | 2048 | 100% | 71 | 0.0351 | 0.0351 | 1618 / 0.0390 |
+| OpenPBR | 0.05 | 2018 | 94% | 82 | 0.0353 | 0.0353 | 1978 / 0.0357 |
+| OpenPBR | 0.1 | 1515 | 40% | 77 | 0.0403 | 0.0401 | 1907 / 0.0362 |
+
+| Scene | 0.01, min 64 | 0.01, min 16 | 0.05, min 64 | 0.05, min 16 |
+| --- | --- | --- | --- | --- |
+| Cornell box | 1102 spp, 0.0015 | 1079 spp, 0.0015 | 758 spp, 0.0019 | 735 spp, 0.0019 |
+| Chess | 1444 spp, 0.0187 | 1439 spp, 0.0187 | 1247 spp, 0.0188 | 1232 spp, 0.0188 |
+| Egg (jade) | 2048 spp, 0.0105 | 2048 spp, 0.0105 | 1478 spp, 0.0125 | 1478 spp, 0.0125 |
+| OpenPBR | 2048 spp, 0.0351 | 2048 spp, 0.0351 | 2018 spp, 0.0353 | 2018 spp, 0.0353 |
+
+Every render is 320x180 on the CPU device, at most 2048 samples and at least 64
+unless noted; *fixed* renders use no adaptive sampling. *Same time* is the
+fixed sample count the adaptive render's time would have bought (from the two
+measured times; the machine was in use, so single timings vary by up to 30%,
+for example OpenPBR's 0.02 row). Scenes: ssets/scenes/CornellBox.usda, the
+chess set, MaterialEggs' egg_jade.usda and the OpenPBR shader playground
+(/renderCams/renderCam_mainCU).
+
+- **Thresholds 0.005 to 0.02 lose nothing.** Their NRMSE equals that of 2048
+  fixed samples: the pixels they stop early (half of the Cornell box, a third
+  of the chess set) contribute no measurable error, and the 8x8 tile with the
+  largest error (caustics, small lights, edges) is the same as at 2048. At
+  equal mean samples they beat fixed sampling by 25-30% NRMSE (Cornell box) and
+  15-20% (chess).
+- **0.05 and above converge too early.** The egg's NRMSE rises from 0.0105 to
+  0.0125 at 0.05 (worse than fixed sampling with the same mean, 0.0120), and
+  0.1 is worse still in every scene but the chess set.
+- **On the CPU, adaptive sampling saves samples, not much time.** The pixels it
+  keeps sampling are the expensive ones (long indirect paths), so its time is
+  close to that of 2048 fixed samples, and fixed sampling for the same time
+  reaches the same NRMSE. Dome-lit, textured scenes (the egg, OpenPBR) do not
+  reach 0.01 within 2048 samples anywhere: they render like 2048 fixed samples.
+- **0.01 is the default**: as safe as 0.005, nearly as economical as 0.02
+  (2-7% more samples than 0.02 with the same error), and a factor of five from
+  the threshold where pixels stop too early.
+- **Minimum 64 samples.** At 0.01 and 0.05, 16 minimum samples change neither
+  the NRMSE nor the worst tile and save at most 2% of the samples; 64 keeps a
+  margin against a pixel whose first samples all miss a small light or a
+  caustic, for that small cost.
+
+**Time limit.** `prism:timeLimitSeconds` (`--time-limit`) bounds the sampling
+time; 0 (the default) means none. It counts wall-clock time from the first
+full-resolution sample: scene loading, material compilation and device
+preparation are not counted (in the delegate neither are the preview, the
+refinement delay, the texture-streaming prepass and the time between render
+calls; pauses are). It is
+checked between samples, so every pixel has at least one sample and the last
+sample in progress completes. In the delegate the limit applies per
+accumulation: a camera move or scene edit starts a new accumulation and a new
+limit, and the progressive passes then stop and report converged; raising the
+limit or the samples resumes the accumulation for the remaining time. In
+`prism_hydra_render` and usdview the render then reports converged, like a
+render that reached its samples; `GetRenderStats()` reports
+`timeLimitReached`. In the CLI the limit covers all render products together
+and the summary says when it stopped a render. The `cpu-reference` device
+ignores the limit.
+
+**Progress.** `percentDone` counts pixels that adaptive sampling stopped as
+done and the others by their samples out of `samplesPerPixel`, so it keeps
+moving while the last pixels refine; with a time limit it is at least the
+elapsed fraction of the limit. It is 100 only once the render converged.
+`activePixelFraction` is the fraction of pixels still sampled.
+
+The CLI prints the same measure as a progress line on stderr, for example
+`[###########---------] 57%  584/2048 spp  31% px active  1m12s elapsed, ETA 0m54s`:
+the samples of the pixels still sampled, the share of pixels adaptive sampling
+has not stopped, and an ETA from the elapsed time and the fraction done. On a
+terminal the line updates in place (at most four times a second); otherwise
+(logs, CTest) it is printed once per 10%. Before the render it names the
+loading stage (and, while a GPU device compiles and uploads, `Preparing the
+render device`). The device publishes its progress through relaxed atomics
+at row and sample boundaries (`prism::device::ImageProgress`) and a monitor
+thread reads them, so the render never waits on it. `--no-progress` turns it
+off.
 
 PrismRT follows usdview's dome-visibility and background controls. With dome
 camera visibility enabled, the environment remains visible to primary rays.
@@ -438,7 +582,7 @@ The `prismUsdview` extension turns usdview's Lights > "Enable Default Dome Light
 
 The standalone CLI follows the same rule: a scene (USD, glTF or OBJ) with no lights, no constant-emission geometry and no `--env`/`--env-color` is lit by the same Stinson Beach dome, as a USD dome at intensity 1 (without `--env`'s factor of two), and the CLI says so on stderr. `--default-dome false` keeps such a scene black. Textured emitters are not detected yet, so a scene lit only by them also gets the dome.
 
-The beach HDR contains a small, extremely bright sun. Environment MIS is now the default in both frontends: one importance-sampled environment direction competes with BSDF sampling at supported scattering vertices. The distribution uses exact texel solid angles and a small uniform mixture to cover filtered texture values. Diffuse and MDL materials supply matching BSDF evaluations/PDFs; legacy rough-metal and glTF samplers retain their BSDF-only behavior. The default sample clamp of 10 can still reduce brightness: use zero when measuring energy or variance. "Converged" means the requested sample count was reached, not that a noise threshold was met.
+The beach HDR contains a small, extremely bright sun. Environment MIS is now the default in both frontends: one importance-sampled environment direction competes with BSDF sampling at supported scattering vertices. The distribution uses exact texel solid angles and a small uniform mixture to cover filtered texture values. Diffuse and MDL materials supply matching BSDF evaluations/PDFs; legacy rough-metal and glTF samplers retain their BSDF-only behavior. The default sample clamp of 10 can still reduce brightness: use zero when measuring energy or variance. "Converged" means adaptive sampling stopped every pixel, the samples per pixel were reached, or the time limit passed, whichever came first.
 
 Scene inputs are captured on the owning thread in incremental slices, then prepared in background jobs. The previous fully shaded snapshot remains navigable while the next generation prepares. Publication briefly stops rendering and swaps complete snapshots; superseded jobs cannot publish. Statistics expose pending generations and whether the displayed scene predates edits. The scene-index chain resolves CPU Hydra ExtComputation primvars before the transport filter; this includes computed point arrays used by stock USD Skel skinning.
 

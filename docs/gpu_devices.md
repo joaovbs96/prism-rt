@@ -509,10 +509,11 @@ called done there.
   `PRISM_VULKAN_PIPELINE_CACHE=0` (ignore stored pipeline caches) and
   `PRISM_VULKAN_SHADER_SALT=<n>` (unique shaders on both paths, so DXC and
   the driver's own shader cache compile anew): cold-compile measurements.
-- `PRISM_GPU_TEXTURE_BUDGET_MIB=<n>`: GPU memory for textures (default 45%
-  of the device's). Images beyond it are uploaded at reduced resolution,
-  reported as `PrismRT Vulkan: N of M images uploaded at reduced resolution
-  to fit GPU memory (PRISM_GPU_TEXTURE_BUDGET_MIB)` (`PrismRT Metal:` on
+- `PRISM_GPU_TEXTURE_BUDGET_MIB=<n>`: the default of the
+  `prism:gpuTextureBudgetMiB` setting (CLI `--gpu-texture-budget-mib`), GPU
+  memory for textures (0: 45% of the device's). Images beyond it are uploaded
+  at reduced resolution, reported as `PrismRT Vulkan: N of M images uploaded
+  at reduced resolution to fit GPU memory (prism:gpuTextureBudgetMiB)` (`PrismRT Metal:` on
   Metal). Vulkan uploads from each texture's GPU-ready copy
   ([texture service](texture_service.md#preparation-pipeline)) and counts its
   real storage: 8-bit sources as UNORM8 (also when reduced), 16-bit integer

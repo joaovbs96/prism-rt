@@ -165,6 +165,7 @@ ctest --test-dir build -C RelWithDebInfo --output-on-failure
   in 45 s, 1.1 GB), but the NVIDIA 610.88 pipeline compile of that SPIR-V
   then needs more than 12 GB, and for OpenChessSet it took 41 s and lost the
   device at dispatch.
-- Textures beyond `PRISM_GPU_TEXTURE_BUDGET_MIB` (default 45% of device
-  memory) are uploaded at reduced resolution, reported as
-  `PrismRT Vulkan: N of M images uploaded at reduced resolution to fit GPU memory (PRISM_GPU_TEXTURE_BUDGET_MIB)`.
+- Textures beyond the texture budget (`prism:gpuTextureBudgetMiB` /
+  `--gpu-texture-budget-mib`, default `PRISM_GPU_TEXTURE_BUDGET_MIB`, else 45%
+  of device memory) are uploaded at reduced resolution, reported as
+  `PrismRT Vulkan: N of M images uploaded at reduced resolution to fit GPU memory (prism:gpuTextureBudgetMiB)`.
