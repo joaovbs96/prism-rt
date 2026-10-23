@@ -3,6 +3,7 @@
 #include <MaterialXFormat/Util.h>
 #include <MaterialXCore/Traversal.h>
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <format>
 #include <iostream>
@@ -509,10 +510,21 @@ void NormalizeColorSpaces(const MaterialX::DocumentPtr& doc)
 }
 }
 
+namespace {
+// -1: not set (the environment variable decides), else 0 or 1.
+std::atomic<int> sssFallbackSetting{-1};
+}
+
 bool DocumentLoader::DefaultSssFallback()
 {
+    if (const int set = sssFallbackSetting.load(); set >= 0) return set != 0;
     const char* value = std::getenv("PRISM_SSS_FALLBACK");
     return value && *value && std::string(value) != "0";
+}
+
+void DocumentLoader::SetSssFallback(bool enabled)
+{
+    sssFallbackSetting.store(enabled ? 1 : 0);
 }
 
 DocumentLoader::DocumentLoader(MaterialX::DocumentPtr stdlib, bool clamp,

@@ -667,6 +667,7 @@ struct VulkanDevice::Impl {
         bool reportedBelow = false;
     } streaming;
     bool streamScene = false; // the scene being prepared asks for streaming
+    int sceneTextureBudgetMiB = 0; // its prism:gpuTextureBudgetMiB (0: automatic)
     bool memoryBudget = false; // VK_EXT_memory_budget
     // Device-local memory this process uses (VK_EXT_memory_budget; 0 without it).
     uint64_t deviceLocalUsage() const;
@@ -1099,7 +1100,7 @@ bool VulkanDevice::Impl::initialize(std::string* reason)
         for (uint32_t h = 0; h < memoryProperties.memoryHeapCount; ++h)
             if (memoryProperties.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
                 deviceLocal = std::max<uint64_t>(deviceLocal, memoryProperties.memoryHeaps[h].size);
-        earlyBudget = gpu::TextureBudget(deviceLocal);
+        earlyBudget = gpu::TextureBudget(deviceLocal, prism::defaults::FromEnvironment().gpuTextureBudgetMiB);
         vkCreateCommandPool(device, &poolInfo, nullptr, &earlyPool);
         vkCreateFence(device, &fenceInfo, nullptr, &earlyFence);
         if (earlyPool && earlyFence)
@@ -1508,7 +1509,7 @@ void VulkanDevice::Impl::streamLoop()
                 const auto stats = s.planner.stats(s.lastPlan);
                 if (stats.belowRequested && !s.reportedBelow) {
                     std::cerr << std::format("PrismRT Vulkan: {} of {} streamed textures below the requested "
-                                             "resolution to fit GPU memory (PRISM_GPU_TEXTURE_BUDGET_MIB)\n",
+                                             "resolution to fit GPU memory (prism:gpuTextureBudgetMiB)\n",
                                              stats.belowRequested, stats.requested);
                     s.reportedBelow = true;
                 }
@@ -2347,7 +2348,7 @@ bool VulkanDevice::Impl::uploadImages(std::string* error)
             pinnedFootprints.push_back(footprints[i]);
         }
     }
-    const uint64_t textureBudget = gpu::TextureBudget(deviceLocal);
+    const uint64_t textureBudget = gpu::TextureBudget(deviceLocal, sceneTextureBudgetMiB);
     std::vector<int> shift(d.images.size(), 0);
     uint64_t pinnedBytes = 0;
     {
@@ -2362,7 +2363,7 @@ bool VulkanDevice::Impl::uploadImages(std::string* error)
     if (reduced && reduced != reportedReducedImages) {
         std::cerr << "PrismRT Vulkan: " << reduced << " of " << d.images.size()
                   << " images uploaded at reduced resolution to fit GPU memory "
-                     "(PRISM_GPU_TEXTURE_BUDGET_MIB)\n";
+                     "(prism:gpuTextureBudgetMiB)\n";
     }
     reportedReducedImages = reduced;
     // The streamed images' entries, and their tails (or what an earlier
@@ -2951,6 +2952,7 @@ bool VulkanDevice::Impl::ensureScene(SceneManager& scene, std::string* error)
     // scene that streams).
     pauseStreaming();
     streamScene = StreamingEnabled() && scene.textureStreaming;
+    sceneTextureBudgetMiB = scene.gpuTextureBudgetMiB;
     {
         std::lock_guard lock(queueMutex);
         vkDeviceWaitIdle(device);

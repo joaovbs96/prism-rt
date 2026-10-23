@@ -165,7 +165,14 @@ std::vector<float> CpuDevice::RenderImage(SceneManager& scene, ImageRequest cons
     const int height = static_cast<int>(request.height);
     std::vector<float> pixels(size_t(width)*height*3);
     if (request.meanSamples) *request.meanSamples = request.samples;
+    ImageProgress* const progress = request.progress;
+    if (progress) {
+        progress->target.store(std::max(1, request.samples), std::memory_order_relaxed);
+        progress->samples.store(0.0, std::memory_order_relaxed);
+        progress->activeFraction.store(1.0, std::memory_order_relaxed);
+    }
     if (m_reference) {
+        std::atomic<int> rowsDone{0};
         tbb::parallel_for(0, height, [&](int y) {
             for (int x = 0; x < width; ++x) {
                 unsigned seed = tea<64>(unsigned(y*width) ^ request.seed, unsigned(x));
@@ -186,6 +193,9 @@ std::vector<float> CpuDevice::RenderImage(SceneManager& scene, ImageRequest cons
                 const size_t offset = (size_t(y)*width+x)*3;
                 for (int c = 0; c < 3; ++c) pixels[offset+c] = sum[c];
             }
+            if (progress)
+                progress->samples.store(double(request.samples) * (rowsDone.fetch_add(1) + 1) / height,
+                                        std::memory_order_relaxed);
         });
         return pixels;
     }
@@ -202,16 +212,33 @@ std::vector<float> CpuDevice::RenderImage(SceneManager& scene, ImageRequest cons
     std::vector<int> samples(count, 0);
     ActivePixels active;
     active.Reset(unsigned(width), unsigned(height));
-    // Without adaptive sampling this is one round of all samples per pixel.
+    // Without adaptive sampling or a time limit this is one round of all
+    // samples per pixel. A time limit renders one sample per round, so it is
+    // checked at every sample boundary; the samples are the same.
+    const bool timed = request.timeLimitSeconds > 0.0;
+    const auto start = std::chrono::steady_clock::now();
+    if (request.timeLimitReached) *request.timeLimitReached = false;
     int done = 0;
     while (done < request.samples) {
-        const int next = adaptive.Enabled()
+        if (timed && done > 0 &&
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() >=
+                request.timeLimitSeconds) {
+            if (request.timeLimitReached) *request.timeLimitReached = true;
+            break;
+        }
+        const int next = timed ? done + 1
+            : adaptive.Enabled()
             ? std::min(request.samples, done < adaptive.minSamples ? adaptive.minSamples : done + adaptive.step)
             : request.samples;
+        // Progress: the round's traced pixel-samples, added once per row.
+        const uint64_t roundWork = uint64_t(active.Count()) * uint64_t(next - done);
+        std::atomic<uint64_t> roundDone{0};
         tbb::parallel_for(0, height, [&](int y) {
+            uint64_t rowWork = 0;
             for (int x = 0; x < width; ++x) {
                 const size_t pixel = size_t(y) * width + x;
                 if (!active.Active(pixel)) continue;
+                rowWork += uint64_t(next - done);
                 unsigned& seed = seeds[pixel];
                 if (done == 0) seed = tea<64>(unsigned(y*width) ^ request.seed, unsigned(x));
                 for (int sample = done; sample < next; ++sample) {
@@ -223,28 +250,38 @@ std::vector<float> CpuDevice::RenderImage(SceneManager& scene, ImageRequest cons
                 }
                 samples[pixel] = next;
             }
+            if (progress && rowWork && roundWork) {
+                const uint64_t finished = roundDone.fetch_add(rowWork, std::memory_order_relaxed) + rowWork;
+                progress->samples.store(done + double(next - done) * double(finished) / double(roundWork),
+                                        std::memory_order_relaxed);
+            }
         });
         done = next;
+        if (progress) progress->samples.store(double(done), std::memory_order_relaxed);
         if (done < request.samples && adaptive.CheckAfter(done)) {
             const float scale = ImageScale(count, [&](size_t pixel) {
                 return (sums[pixel].x() + sums[pixel].y() + sums[pixel].z()) / float(samples[pixel]);
             });
-            if (active.Update(adaptive.threshold, [&](size_t pixel) {
+            active.Update(adaptive.threshold, [&](size_t pixel) {
                     const float sum[3] = {sums[pixel].x(), sums[pixel].y(), sums[pixel].z()};
                     const float even[3] = {evenSums[pixel].x(), evenSums[pixel].y(), evenSums[pixel].z()};
                     return AdaptiveError(sum, even, done, scale);
-                }) == 0)
-                break;
+                });
+            if (progress) progress->activeFraction.store(double(active.Count()) / double(count), std::memory_order_relaxed);
+            if (active.Count() == 0) break;
         }
     }
     double total = 0.0;
+    size_t atMax = 0;
     for (size_t pixel = 0; pixel < count; ++pixel) {
         Color3 value = sums[pixel];
         value /= float(samples[pixel]);
         for (int c = 0; c < 3; ++c) pixels[3 * pixel + c] = value[c];
         total += samples[pixel];
+        atMax += samples[pixel] >= request.samples;
     }
     if (request.meanSamples) *request.meanSamples = total / double(count);
+    if (request.fractionAtMaxSamples) *request.fractionAtMaxSamples = count ? double(atMax) / double(count) : 0.0;
     return pixels;
 }
 

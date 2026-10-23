@@ -4,6 +4,8 @@
 // largest images are halved (repeatedly) until the estimate fits. Shared by
 // the GPU devices; environment images keep full resolution.
 
+#include "../../render_defaults.h"
+
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
@@ -26,11 +28,13 @@ inline uint64_t ImageBytes(ImageFootprint const& image, int shift)
     return w * h * uint64_t(image.storedChannels) * uint64_t(image.componentBytes) * 4 / 3; // with mips
 }
 
-// Budget in bytes: PRISM_GPU_TEXTURE_BUDGET_MIB, else `fraction` of `available`.
-inline uint64_t TextureBudget(uint64_t available, double fraction = 0.45)
+// Budget in bytes: `budgetMiB` (the scene's prism:gpuTextureBudgetMiB, which
+// defaults to PRISM_GPU_TEXTURE_BUDGET_MIB) when positive, else `fraction` of
+// `available`.
+inline uint64_t TextureBudget(uint64_t available, int budgetMiB, double fraction = 0.45)
 {
-    if (const char* value = std::getenv("PRISM_GPU_TEXTURE_BUDGET_MIB"); value && *value)
-        return uint64_t(std::max(64ll, std::atoll(value))) << 20;
+    if (budgetMiB > 0)
+        return uint64_t(std::max(budgetMiB, prism::defaults::kMinGpuTextureBudgetMiB)) << 20;
     return uint64_t(double(available) * fraction);
 }
 

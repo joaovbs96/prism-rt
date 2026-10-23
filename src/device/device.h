@@ -13,6 +13,7 @@
 #include "../float3.h"
 #include "../ray.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <functional>
@@ -70,6 +71,30 @@ struct SampleShading {
     NeeSettings nee;
 };
 
+// Progress of a whole-image render, written by the device at row and sample
+// boundaries (relaxed atomics, no locks) and polled by the frontend (the
+// CLI's progress bar).
+struct ImageProgress {
+    // Samples traced per still-active pixel; fractional within a round of
+    // samples (the share of its pixels done).
+    std::atomic<double> samples{0.0};
+    // Fraction of pixels adaptive sampling still traces (1 without it).
+    std::atomic<double> activeFraction{1.0};
+    std::atomic<int> target{1};
+
+    // Overall progress in [0, 1]: pixels adaptive sampling stopped count as
+    // done, the others by their samples out of the target (the same measure
+    // as the Hydra delegate's percentDone).
+    double Fraction() const
+    {
+        const double active = activeFraction.load(std::memory_order_relaxed);
+        const double done = samples.load(std::memory_order_relaxed) /
+            double(std::max(1, target.load(std::memory_order_relaxed)));
+        const double fraction = (1.0 - active) + active * std::min(1.0, done);
+        return fraction < 0.0 ? 0.0 : fraction > 1.0 ? 1.0 : fraction;
+    }
+};
+
 // Whole-image render with all samples of a pixel accumulated at once
 // (standalone frontend). Writes width*height RGB triples, top row first.
 struct ImageRequest {
@@ -82,6 +107,17 @@ struct ImageRequest {
     AdaptiveSettings adaptive;
     // Receives the mean number of samples per pixel (when non-null).
     double* meanSamples = nullptr;
+    // Receives the fraction of pixels that received `samples` samples
+    // (adaptive sampling did not stop them first).
+    double* fractionAtMaxSamples = nullptr;
+    // Wall-clock limit in seconds for the sampling, without scene preparation
+    // (0: none). Every pixel gets at least one sample; then sampling stops at
+    // the first sample boundary past the limit.
+    double timeLimitSeconds = 0.0;
+    // Set to whether the time limit stopped the render (when non-null).
+    bool* timeLimitReached = nullptr;
+    // Updated while the render runs (when non-null).
+    ImageProgress* progress = nullptr;
     // Light contributions to keep (kContribution* mask; noise analysis).
     unsigned contributions = 7;
     NeeSettings nee;

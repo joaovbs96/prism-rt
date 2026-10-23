@@ -293,13 +293,13 @@ void MetalDevice::Impl::uploadImages()
         footprints[i] = {d.images[i]->width(), d.images[i]->height(), channels == 3 ? 4 : channels,
                          floatPrecision[i] ? 4 : 1, floatPrecision[i]};
     }
-    const std::vector<int> shift = gpu::FitImages(footprints, gpu::TextureBudget(device.recommendedMaxWorkingSetSize));
+    const std::vector<int> shift = gpu::FitImages(footprints, gpu::TextureBudget(device.recommendedMaxWorkingSetSize, boundScene ? boundScene->gpuTextureBudgetMiB : 0));
     size_t reduced = 0;
     for (int s : shift) reduced += s > 0 ? 1 : 0;
     if (reduced && reduced != reportedReducedImages) {
         std::cerr << "PrismRT Metal: " << reduced << " of " << d.images.size()
                   << " images uploaded at reduced resolution to fit GPU memory "
-                     "(PRISM_GPU_TEXTURE_BUDGET_MIB)\n";
+                     "(prism:gpuTextureBudgetMiB)\n";
         reportedReducedImages = reduced;
     }
     std::vector<size_t> missing;

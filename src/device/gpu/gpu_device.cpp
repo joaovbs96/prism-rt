@@ -126,10 +126,26 @@ std::vector<float> GpuRenderDevice::RenderImage(SceneManager& scene, ImageReques
     }
     BeginWork(kModeImage, 0);
     double gpuSeconds = 0.0;
+    // The time limit counts from here: scene preparation and texture
+    // settling are excluded, as on the CPU device.
+    const auto start = std::chrono::steady_clock::now();
+    if (request.timeLimitReached) *request.timeLimitReached = false;
+    ImageProgress* const progress = request.progress;
+    if (progress) {
+        progress->target.store(std::max(1, request.samples), std::memory_order_relaxed);
+        progress->samples.store(0.0, std::memory_order_relaxed);
+        progress->activeFraction.store(1.0, std::memory_order_relaxed);
+    }
     // Pixels left active by adaptive sampling get several samples in
     // parallel, so the dispatch still fills the GPU.
     constexpr int maxReplicas = 16;
     for (int sample = 0; sample < request.samples && !list.empty();) {
+        if (request.timeLimitSeconds > 0.0 && sample > 0 &&
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() >=
+                request.timeLimitSeconds) {
+            if (request.timeLimitReached) *request.timeLimitReached = true;
+            break;
+        }
         int replicas = 1;
         if (adaptive.Enabled() && list.size() < count) {
             int stop = sample + 1;
@@ -164,6 +180,7 @@ std::vector<float> GpuRenderDevice::RenderImage(SceneManager& scene, ImageReques
         }
         sample += replicas;
         for (uint32_t p : list) samples[p] = sample;
+        if (progress) progress->samples.store(double(sample), std::memory_order_relaxed);
         if (sample < request.samples && adaptive.CheckAfter(sample)) {
             auto const* sums = static_cast<const float*>(RenderBuffer(kSlotAccumulation, size_t(count) * 32));
             const float scale = ImageScale(count, [&](size_t p) {
@@ -175,16 +192,22 @@ std::vector<float> GpuRenderDevice::RenderImage(SceneManager& scene, ImageReques
             list.clear();
             for (uint32_t p = 0; p < count; ++p)
                 if (active.Active(p)) list.push_back(p);
+            if (progress)
+                progress->activeFraction.store(double(list.size()) / double(count), std::memory_order_relaxed);
         }
     }
     auto const* sums = static_cast<const float*>(RenderBuffer(kSlotAccumulation, size_t(count) * 32));
     double total = 0.0;
+    size_t atMax = 0;
     for (size_t p = 0; p < count; ++p) {
         const float scale = samples[p] > 0 ? 1.0f / float(samples[p]) : 0.0f;
         for (int c = 0; c < 3; ++c) pixels[3 * p + c] = sums[8 * p + c] * scale;
         total += samples[p];
+        atMax += samples[p] >= request.samples;
     }
     if (request.meanSamples) *request.meanSamples = total / double(count);
+    if (request.fractionAtMaxSamples)
+        *request.fractionAtMaxSamples = count ? double(atMax) / double(count) : 0.0;
     if (GpuVerbose())
         std::cerr << LogPrefix() << std::format("{} samples, GPU {:.3f} s\n", request.samples, gpuSeconds);
     return pixels;

@@ -26,6 +26,7 @@
 #include "lights.h"
 #include "system_utils.h"
 #include "render_profile.h"
+#include "render_defaults.h"
 
 // TODO: for motion blur, we need to add a new copy of the vertexbuffer per timestep
 // so we need to have the vertexbuffer and apply some sort of transformation to the buffer
@@ -646,6 +647,9 @@ public:
     // GPU devices that stream textures (Vulkan) load the mip levels shading
     // asks for instead of whole textures (prism:textureStreaming).
     bool textureStreaming = true;
+    // GPU texture budget in MiB (prism:gpuTextureBudgetMiB); 0 is 45% of the
+    // device's memory. Textures beyond it upload at reduced resolution.
+    int gpuTextureBudgetMiB = prism::defaults::FromEnvironment().gpuTextureBudgetMiB;
     // USD doubleSided (prism:honorDoubleSided, off by default): with it, the
     // back faces of single-sided geometry are not hit, unless their material
     // transmits. Single-sided are the placements listed here (Hydra) and the
