@@ -253,7 +253,15 @@ const char* ResultText(VkResult result)
     case VK_ERROR_EXTENSION_NOT_PRESENT: return "extension not present";
     case VK_ERROR_FEATURE_NOT_PRESENT: return "feature not present";
     case VK_ERROR_INCOMPATIBLE_DRIVER: return "incompatible driver";
-    default: return "Vulkan error";
+    case VK_TIMEOUT: return "timeout";
+    case VK_ERROR_OUT_OF_POOL_MEMORY: return "out of pool memory";
+    case VK_ERROR_FRAGMENTED_POOL: return "fragmented pool";
+    case VK_ERROR_UNKNOWN: return "unknown error (VK_ERROR_UNKNOWN)";
+    default: {
+        thread_local std::string text;
+        text = "Vulkan error " + std::to_string(int(result));
+        return text.c_str();
+    }
     }
 }
 

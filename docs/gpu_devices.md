@@ -409,6 +409,13 @@ called done there.
     ... --working-space acescg` on Metal and `prism_color_management_test
     --check-patches <exr> acescg`; an egg and OpenPBR on Metal vs CPU with
     `prism_compare_images`.
+- **Failed image renders are errors** (`GpuRenderDevice::RenderImage`, shared
+  by Vulkan and Metal): a scene that cannot be prepared, or a failed dispatch,
+  throws with the sample, resolution and cause instead of returning the zeroed
+  image, so the CLI exits 1 and writes nothing. `PRISM_GPU_FAIL_DISPATCH_AT=N`
+  simulates a failure at sample N. Run: `PRISM_GPU_FAIL_DISPATCH_AT=0
+  PrismRT --device metal ...` exits 1 with "GPU render failed at sample 1"
+  and no output file (`prism_cli_gpu_failure_vulkan` is the Vulkan test).
 - **Render settings and products** ([hydra.md](hydra.md#render-settings-and-products)):
   - No shader or device change: `shaders/` and `src/device/` are untouched.
   - Shared host code: `src/hydra/plugin.cpp` (the

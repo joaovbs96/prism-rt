@@ -12,6 +12,7 @@
 #include <cstring>
 #include <format>
 #include <iostream>
+#include <stdexcept>
 #include <thread>
 
 namespace prism::device::gpu {
@@ -75,16 +76,35 @@ GpuFrame GpuRenderDevice::BaseFrame(prism::CameraRayParameters const& camera, un
     return frame;
 }
 
+namespace {
+// What a failed submission most likely means, for the error message.
+std::string FailureHint(std::string const& error)
+{
+    if (error.find("device lost") != std::string::npos)
+        return " The GPU stopped responding or its driver reset it (on Windows a TDR: look for nvlddmkm or "
+               "Display events in Event Viewer > Windows Logs > System). Another GPU-heavy program, an "
+               "overclock or a driver problem can cause this; try again with the GPU otherwise idle, or "
+               "render with --device cpu.";
+    if (error.find("out of device memory") != std::string::npos)
+        return " The GPU ran out of memory: close other GPU programs, lower the resolution or "
+               "PRISM_GPU_TEXTURE_BUDGET_MIB, or render with --device cpu.";
+    return " Rerun with PRISM_GPU_VERBOSE=1 for details, or render with --device cpu.";
+}
+} // namespace
+
 std::vector<float> GpuRenderDevice::RenderImage(SceneManager& scene, ImageRequest const& request)
 {
     std::lock_guard lock(m_renderMutex);
     std::vector<float> pixels(size_t(request.width) * request.height * 3, 0.0f);
     if (request.meanSamples) *request.meanSamples = request.samples;
     std::string error;
-    if (!PrepareScene(scene, &error)) {
-        std::cerr << LogPrefix() << error << '\n';
-        return pixels;
-    }
+    // A failed render throws: returning the zeroed image would save a black
+    // picture and report success.
+    if (!PrepareScene(scene, &error))
+        throw std::runtime_error(std::string(LogPrefix()) + "cannot prepare the scene for the GPU: " + error);
+    // Test hook: fail the dispatch of this sample index.
+    const char* failAt = std::getenv("PRISM_GPU_FAIL_DISPATCH_AT");
+    const int failSample = failAt && *failAt ? std::atoi(failAt) : -1;
     const AdaptiveSettings& adaptive = request.adaptive;
     const uint32_t count = request.width * request.height;
     RenderBuffer(kSlotRng, size_t(count) * 4);
@@ -123,10 +143,14 @@ std::vector<float> GpuRenderDevice::RenderImage(SceneManager& scene, ImageReques
         f.work = {threads, replicas > 1 ? uint32_t(list.size()) : 0u, kModeImage, 0};
         f.counts.z = uint32_t(sample);
         if (sample == 0) f.settings.z |= kFrameSeedRng;
-        if (!Dispatch(f, threads, &gpuSeconds, &error)) {
-            std::cerr << LogPrefix() << error << '\n';
-            break;
-        }
+        const bool dispatched = sample == failSample
+            ? (error = "simulated dispatch failure (PRISM_GPU_FAIL_DISPATCH_AT)", false)
+            : Dispatch(f, threads, &gpuSeconds, &error);
+        if (!dispatched)
+            throw std::runtime_error(std::string(LogPrefix()) + std::format(
+                "GPU render failed at sample {} of {} ({}x{}, {} threads, {:.1f} s of GPU time so far): {}.{}",
+                sample + 1, request.samples, request.width, request.height, threads, gpuSeconds, error,
+                FailureHint(error)));
         if (replicas > 1) {
             auto const* out = static_cast<const float*>(RenderBuffer(kSlotOutput, size_t(threads) * 32));
             auto* sums = static_cast<float*>(RenderBuffer(kSlotAccumulation, size_t(count) * 32));

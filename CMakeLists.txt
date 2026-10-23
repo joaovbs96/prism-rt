@@ -685,6 +685,15 @@ if(PRISM_BUILD_HYDRA)
         set_tests_properties(prism_cli_clean_exit_${_device} PROPERTIES
             ENVIRONMENT "${_prism_test_environment}")
     endforeach()
+    if(PRISM_ENABLE_VULKAN)
+        add_test(NAME prism_cli_gpu_failure_vulkan
+            COMMAND ${CMAKE_COMMAND} -DPRISMRT=$<TARGET_FILE:PrismRT>
+                -DSCENE=${CMAKE_CURRENT_SOURCE_DIR}/assets/scenes/CornellBox.usda
+                -DOUTPUT=${CMAKE_BINARY_DIR}/cli_gpu_failure.png
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli_gpu_failure.cmake)
+        set_tests_properties(prism_cli_gpu_failure_vulkan PROPERTIES
+            ENVIRONMENT "${_prism_test_environment}")
+    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/material_loading_test.cpp")
         add_executable(prism_hydra_material_loading_test
             tests/hydra/material_loading_test.cpp src/hydra/materials.cpp)
@@ -1092,7 +1101,7 @@ endif()
 # beside GPU work and a parallel run never puts two GPU tests on the device.
 set(_prism_gpu_test_regex
     "^prism_hydra_(render_exercise|transparent_background_export|depth1_render|depth_change_render|setting_change_test|cutout_(medium|clear)_render|cutout_medium_test|animation_exercise|pass_camera_test|scene_bridge_test|streaming_(cold|warm|whole)|streaming_.*_matches_.*)$"
-    "|^prism_(gpu_shader_compile_test|device_selection_test|cli_clean_exit_vulkan)$"
+    "|^prism_(gpu_shader_compile_test|device_selection_test|cli_clean_exit_vulkan|cli_gpu_failure_vulkan)$"
     "|^prism_gltf_.*_vulkan_(render|parity|test)$")
 string(JOIN "" _prism_gpu_test_regex ${_prism_gpu_test_regex})
 get_property(_prism_tests DIRECTORY PROPERTY TESTS)
