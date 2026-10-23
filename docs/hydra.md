@@ -182,7 +182,7 @@ taking the prim's resolution, camera, data window, pixel aspect ratio and
 
 ## Standalone comparisons
 
-The no-argument executable displays help. Rendering uses scene files and a camera: a USD camera path, an explicit camera position/target, or the USD stage's render settings ([Render settings and products](#render-settings-and-products)); glTF/GLB and OBJ use an explicit camera position/target:
+The no-argument executable displays help. Rendering uses scene files and a camera: a USD camera path, an explicit camera position/target, or the USD stage's render settings ([Render settings and products](#render-settings-and-products)); glTF/GLB and OBJ use an explicit camera position/target (glTF materials: [gltf.md](gltf.md)):
 
 ```powershell
 ./build/RelWithDebInfo/PrismRT.exe `

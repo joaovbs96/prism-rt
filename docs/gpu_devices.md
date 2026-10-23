@@ -460,6 +460,22 @@ called done there.
     `PRISM_DEVICE=metal prism_hydra_render`, checked with
     `prism_scene_features_test` and `prism_compare_images`; then chess and an
     egg (light lobes off: unchanged).
+- **glTF materials as MaterialX** ([gltf.md](gltf.md)):
+  - No shader or device change: glTF materials are now ordinary
+    `MDLMaterial`s (the legacy `gltfPBR` path stays for
+    `--gltf-materials legacy`). Shared host code: `src/mesh/gltf_mesh.h`
+    (V-flipped UVs, `TEXCOORD_1`/`COLOR_0` mesh primvars, `single_sided`),
+    `src/materialx/gltf_material.cpp`, `cached_document.h`,
+    `PublishMaterialResourceBytes` in `resolved_resource.h`, and
+    `LayerGltfPbrVolume` in `src/materialx/loader.cpp` (the absorbing medium
+    reaches the device as for OpenPBR glass).
+  - Runs: `ctest -R prism_gltf -LE gpu` (CPU); then with `--device metal`,
+    the arguments of the `prism_gltf_*_vulkan_render` tests (spheres,
+    textured) compared with their CPU renders by `prism_compare_images
+    --tolerance 0.1 --mean-tolerance 0.02` (Vulkan: NRMSE 0.0002 and 0.0095),
+    and `volume_sphere.gltf` checked with `prism_gltf_material_test
+    --check-volume`. The textured fixture exercises Metal's MDL scene data
+    lookups (`TEXCOORD_1`, `COLOR_0`) and sampler wrap modes.
 
 ## Diagnostics
 
