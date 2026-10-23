@@ -51,6 +51,10 @@ The OpenColorIO config is OCIO, ocio://studio-config-latest unless
 you set it. Set PRISMRT_USDVIEW_COLOR_CORRECTION=sRGB (or disabled, or
 saved: usdview's last mode) to start usdview in another mode, and
 PRISMRT_USDVIEW_OCIO_VIEW (and PRISMRT_USDVIEW_OCIO_DISPLAY) for another view.
+usdview also starts with "Enable Default Dome Light" on, so a scene without lights
+is not black (PrismRT ignores it when the scene has lights of its own). Set
+PRISMRT_USDVIEW_DEFAULT_DOME_LIGHT=off to start with it off, or saved to keep
+usdview's last setting.
 
 Cache
 -----

@@ -43,6 +43,10 @@ rem disabled or saved (usdview's last mode) chooses otherwise.
 if defined PRISMRT_USDVIEW_COLOR_CORRECTION set "PRISM_USDVIEW_COLOR_CORRECTION=%PRISMRT_USDVIEW_COLOR_CORRECTION%"
 if defined PRISMRT_USDVIEW_OCIO_DISPLAY set "PRISM_USDVIEW_OCIO_DISPLAY=%PRISMRT_USDVIEW_OCIO_DISPLAY%"
 if defined PRISMRT_USDVIEW_OCIO_VIEW set "PRISM_USDVIEW_OCIO_VIEW=%PRISMRT_USDVIEW_OCIO_VIEW%"
+rem usdview starts with its default dome light enabled (PrismRT uses it only
+rem for stages without lights of their own); PRISMRT_USDVIEW_DEFAULT_DOME_LIGHT=off
+rem starts with it disabled, saved keeps usdview's last setting.
+if defined PRISMRT_USDVIEW_DEFAULT_DOME_LIGHT set "PRISM_USDVIEW_DEFAULT_DOME_LIGHT=%PRISMRT_USDVIEW_DEFAULT_DOME_LIGHT%"
 rem The device is chosen automatically (Vulkan GPU, else CPU). Override it with
 rem PRISMRT_DEVICE=cpu or vulkan.
 if defined PRISMRT_DEVICE set "PRISM_DEVICE=%PRISMRT_DEVICE%"

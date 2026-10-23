@@ -27,6 +27,13 @@ openColorIO to choose another start-up mode, or to "saved" to keep usdview's
 saved one. The view is the config's default (for the studio config ACES 2.0
 SDR on sRGB, like the CLI's 8-bit images) unless PRISM_USDVIEW_OCIO_DISPLAY
 or PRISM_USDVIEW_OCIO_VIEW choose another (see startup_ocio_view).
+
+Default dome light: usdview's Lights > "Enable Default Dome Light" starts
+enabled, because a stage without lights is otherwise black. usdview saves the
+toggle in its state file, so this sets it at each start-up only (the menu entry
+still turns it off for the session). PrismRT uses the default dome light only
+while the stage has no lights of its own. Set PRISM_USDVIEW_DEFAULT_DOME_LIGHT
+to off to start with it disabled, or to "saved" to keep usdview's saved state.
 """
 
 import os
@@ -70,6 +77,26 @@ def startup_color_correction(saved, environ=os.environ):
     return mode
 
 
+DEFAULT_DOME_ENV = "PRISM_USDVIEW_DEFAULT_DOME_LIGHT"
+
+
+def startup_default_dome_light(saved, environ=os.environ):
+    """Whether usdview's default dome light starts enabled, given its saved state.
+
+    On, unless PRISM_USDVIEW_DEFAULT_DOME_LIGHT is off (0, false, no) or
+    "saved" (keep usdview's saved state); on (1, true, yes) is the default.
+    """
+    choice = environ.get(DEFAULT_DOME_ENV, "").strip().lower()
+    if choice == "saved":
+        return saved
+    if choice in ("off", "0", "false", "no"):
+        return False
+    if choice and choice not in ("on", "1", "true", "yes"):
+        Tf.Warn("prismUsdview: %s=%s is not on, off or saved" %
+                (DEFAULT_DOME_ENV, choice))
+    return True
+
+
 OCIO_DISPLAY_ENV = "PRISM_USDVIEW_OCIO_DISPLAY"
 OCIO_VIEW_ENV = "PRISM_USDVIEW_OCIO_VIEW"
 _STUDIO_DISPLAY = "sRGB - Display"
@@ -102,6 +129,13 @@ def _apply_color_correction(api):
         view = startup_ocio_view()
         if view and not settings.ocioSettings.view:
             settings.setOcioSettings(display=view[0], view=view[1])
+
+
+def _apply_default_dome_light(api):
+    settings = api.dataModel.viewSettings
+    enabled = startup_default_dome_light(settings.domeLightEnabled)
+    if enabled != settings.domeLightEnabled:
+        settings.domeLightEnabled = enabled
 
 
 def selection_records(selection):
@@ -511,6 +545,10 @@ class PrismContainer(PluginContainer):
             _apply_color_correction(usdviewApi)
         except Exception as error:  # Never stop usdview from starting.
             Tf.Warn("prismUsdview colour correction: %s" % error)
+        try:
+            _apply_default_dome_light(usdviewApi)
+        except Exception as error:
+            Tf.Warn("prismUsdview default dome light: %s" % error)
         self._bridge = _SelectionBridge(usdviewApi)
         self._hud = _SampleHud(usdviewApi)
 

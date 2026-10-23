@@ -90,6 +90,19 @@ class UsdviewSelectionPluginTest(unittest.TestCase):
         self.assertEqual(start("sRGB", {env: "openColorIO"}), "sRGB")
         self.assertEqual(start("sRGB", dict(ocio, **{env: "bogus"})), "openColorIO")
 
+    def test_startup_default_dome_light(self):
+        start = prismUsdview.startup_default_dome_light
+        env = prismUsdview.DEFAULT_DOME_ENV
+        # On whatever usdview saved, unless the variable says otherwise.
+        self.assertTrue(start(False, {}))
+        self.assertTrue(start(True, {}))
+        self.assertTrue(start(False, {env: "on"}))
+        self.assertTrue(start(False, {env: "bogus"}))
+        for off in ("off", "OFF", "0", "false", "no"):
+            self.assertFalse(start(True, {env: off}))
+        self.assertFalse(start(False, {env: "saved"}))
+        self.assertTrue(start(True, {env: "Saved"}))
+
     def test_startup_ocio_view(self):
         view = prismUsdview.startup_ocio_view
         studio = {"OCIO": "ocio://studio-config-latest"}
@@ -113,6 +126,7 @@ class UsdviewSelectionPluginTest(unittest.TestCase):
             showHUD = False
             ocioSettings = type("OCIOSettings", (), {"view": ""})()
             ocio = None
+            domeLightEnabled = False
 
             def setOcioSettings(self, colorSpace="", display="", view=""):
                 self.ocio = (display, view)
@@ -131,6 +145,11 @@ class UsdviewSelectionPluginTest(unittest.TestCase):
         container._hud._timer.stop()
         settings = api.dataModel.viewSettings
         self.assertEqual(settings.colorCorrectionMode, "openColorIO")
+        # usdview's default dome light starts enabled; the menu entry (the
+        # setting) is then the user's for the session.
+        self.assertTrue(settings.domeLightEnabled)
+        settings.domeLightEnabled = False
+        self.assertFalse(settings.domeLightEnabled)
         # The config's default display and view: nothing is set.
         self.assertIsNone(settings.ocio)
         window.close()

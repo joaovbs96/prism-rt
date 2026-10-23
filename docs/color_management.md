@@ -159,6 +159,9 @@ like the CLI's 8-bit outputs. That needs PrismRT's OpenUSD patch (below).
   another start-up mode (`saved` keeps usdview's; in the package,
   `PRISMRT_USDVIEW_COLOR_CORRECTION`). Without `$OCIO` a saved `openColorIO`
   becomes `sRGB`.
+- The extension also turns usdview's "Enable Default Dome Light" on at
+  start-up (`PRISM_USDVIEW_DEFAULT_DOME_LIGHT=off|saved` to change; in the
+  package `PRISMRT_USDVIEW_DEFAULT_DOME_LIGHT`); see [hydra.md](hydra.md).
 - The extension leaves the display and view to the config's defaults.
   `PRISM_USDVIEW_OCIO_VIEW` chooses another view (`default`: the config's), on
   `PRISM_USDVIEW_OCIO_DISPLAY` (default `sRGB - Display`; usdview ignores a
