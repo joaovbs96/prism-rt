@@ -646,6 +646,12 @@ struct Snapshot {
     double embreeSceneCommitSeconds = 0.0;
     double sceneTraversalSeconds = 0.0;
     size_t domeCount = 0;
+    // The application's default dome light (usdview's "Enable Default Dome
+    // Light"), held back until the scene's own lights are known.
+    SdfPath defaultDomePath;
+    // Lights of the scene itself (not the application's, such as usdview's
+    // camera light) that took effect, domes excluded (see domeCount).
+    size_t stageLightCount = 0;
     std::unordered_set<std::string> warnedFeatures;
     std::unordered_set<SdfPath, SdfPath::Hash> warnedMotionPaths;
     std::unordered_map<SdfPath, Prototype, SdfPath::Hash> prototypes;
@@ -3242,6 +3248,28 @@ void _SetDomeEnvironment(HdSceneIndexBaseRefPtr const &scene,
     }
 }
 
+// usdview's default dome light is a prim of the engine's task controller:
+// /<delegate>/_UsdImaging_<renderer>_<engine>/lights/light_<n>.
+bool _IsEngineLightPath(SdfPath const &path)
+{
+    if (path.GetPathElementCount() < 3) return false;
+    SdfPath const scope = path.GetParentPath();
+    return path.GetName().rfind("light_", 0) == 0 &&
+           scope.GetName() == "lights" &&
+           scope.GetParentPath().GetName().rfind("_UsdImaging_", 0) == 0;
+}
+
+// The default dome lights a scene without lights of its own. Otherwise it
+// would add to the scene's lights and double-light it.
+void _ApplyDefaultDome(HdSceneIndexBaseRefPtr const &scene, Snapshot *snapshot)
+{
+    SdfPath const path = std::move(snapshot->defaultDomePath);
+    snapshot->defaultDomePath = SdfPath();
+    if (path.IsEmpty() || snapshot->domeCount != 0 || snapshot->stageLightCount != 0)
+        return;
+    _SetDomeEnvironment(scene, path, scene->GetPrim(path), snapshot);
+}
+
 // UsdLux sphere, rect, disk, cylinder and distant lights.
 void _AddAnalyticLight(HdSceneIndexBaseRefPtr const &scene,
                        SdfPath const &path, HdSceneIndexPrim const &prim,
@@ -3323,6 +3351,16 @@ void _AddAnalyticLight(HdSceneIndexBaseRefPtr const &scene,
         }
     }
     snapshot->scene->lights.push_back(std::move(result));
+}
+
+// A light prim: the application's own (usdview's camera light) lights the
+// scene without making it a lit stage.
+void _AddLight(HdSceneIndexBaseRefPtr const &scene, SdfPath const &path,
+               HdSceneIndexPrim const &prim, Snapshot *snapshot)
+{
+    const size_t before = snapshot->scene->lights.size();
+    _AddAnalyticLight(scene, path, prim, snapshot);
+    if (!_IsEngineLightPath(path)) snapshot->stageLightCount += snapshot->scene->lights.size() - before;
 }
 
 // Mesh prototypes converted ahead of the serial walk, which consumes them in
@@ -3710,10 +3748,12 @@ void _Walk(HdSceneIndexBaseRefPtr const &scene, SdfPath const &path,
             }
         }
     }
-    if (prim.primType == HdPrimTypeTokens->domeLight)
+    if (prim.primType == HdPrimTypeTokens->domeLight && _IsEngineLightPath(path))
+        snapshot->defaultDomePath = path;
+    else if (prim.primType == HdPrimTypeTokens->domeLight)
         _SetDomeEnvironment(scene, path, prim, snapshot);
     else if (HdPrimTypeIsLight(prim.primType) && HdLightSchema::GetFromParent(prim.dataSource))
-        _AddAnalyticLight(scene, path, prim, snapshot);
+        _AddLight(scene, path, prim, snapshot);
     static const std::unordered_set<std::string> unsupportedPrimTypes{
         "basisCurves", "nurbsCurves", "points", "volume", "tetMesh"};
     std::string const type = prim.primType.GetString();
@@ -3888,6 +3928,7 @@ std::shared_ptr<Snapshot> _BuildSnapshot(HdSceneIndexBaseRefPtr const &scene,
           renderTags, cancelled, &preparation);
     walkProfile.reset();
     if (cancelled && cancelled()) return {};
+    _ApplyDefaultDome(scene, result.get());
     _FlushSphereBatches(result.get());
     _ApplyLinkMasks(scene, result.get());
     _ApplyInstancePrimvars(scene, result.get());
@@ -4637,10 +4678,12 @@ void _RefreshEnvironment(HdSceneIndexBaseRefPtr const &index,
                          SdfPath const &path, Snapshot *snapshot)
 {
     HdSceneIndexPrim const prim = index->GetPrim(path);
-    if (prim.primType == HdPrimTypeTokens->domeLight)
+    if (prim.primType == HdPrimTypeTokens->domeLight && _IsEngineLightPath(path))
+        snapshot->defaultDomePath = path;
+    else if (prim.primType == HdPrimTypeTokens->domeLight)
         _SetDomeEnvironment(index, path, prim, snapshot);
     else if (HdPrimTypeIsLight(prim.primType) && HdLightSchema::GetFromParent(prim.dataSource))
-        _AddAnalyticLight(index, path, prim, snapshot);
+        _AddLight(index, path, prim, snapshot);
     for (SdfPath const &child : index->GetChildPrimPaths(path))
         _RefreshEnvironment(index, child, snapshot);
 }
@@ -6798,6 +6841,7 @@ bool SceneBridge::Prepare(CameraState const &camera,
                             if (jobDirtyKinds & static_cast<unsigned int>(
                                     SceneDirtyKind::Environment)) {
                                 bank->domeCount = 0;
+                                bank->stageLightCount = 0;
                                 auto black = std::make_unique<ColorTexture>(
                                     Color3(0.0f));
                                 bank->environment =
@@ -6811,6 +6855,7 @@ bool SceneBridge::Prepare(CameraState const &camera,
                                 bank->shadowLinkBits.clear();
                                 _RefreshEnvironment(
                                     retained, SdfPath::AbsoluteRootPath(), bank.get());
+                                _ApplyDefaultDome(retained, bank.get());
                                 _ApplyLinkMasks(retained, bank.get());
                             }
                             _ApplyInstancePrimvars(retained, bank.get());

@@ -58,6 +58,41 @@ int RunCoverageIntegrationTests() {
             Require(cutout[center+3]>.2f && cutout[center+3]<.8f,
                     "Stochastic display-opacity cutout has opaque primary coverage");
         }
+        {
+            // usdview's default dome light is an engine prim; it lights a scene
+            // without lights and is ignored once the scene has its own.
+            const SdfPath engineDome("/_UsdImaging_Test_0/lights/light_1");
+            const SdfPath cameraLight("/_UsdImaging_Test_0/lights/light_0");
+            const size_t center=(Fixture::Size/2*Fixture::Size+Fixture::Size/2)*4;
+            enum Lights { EngineDome=1, StageDome=2, CameraLight=4, StageDistant=8 };
+            auto litCenter=[&](int lights) {
+                Fixture fixture;
+                HdRetainedSceneIndex::AddedPrimEntries prims{{SdfPath("/Mesh"),HdPrimTypeTokens->mesh,Plane()}};
+                if(lights&EngineDome) prims.push_back({engineDome,HdPrimTypeTokens->domeLight,Dome({},1)});
+                if(lights&StageDome) prims.push_back({SdfPath("/Dome"),HdPrimTypeTokens->domeLight,Dome({},3)});
+                if(lights&CameraLight) prims.push_back({cameraLight,HdPrimTypeTokens->distantLight,Dome({},3)});
+                if(lights&StageDistant) prims.push_back({SdfPath("/Sun"),HdPrimTypeTokens->distantLight,Dome({},3)});
+                fixture.scene->AddPrims(prims); fixture.Render();
+                auto rgba=Read<float>(fixture.color);
+                return std::vector<float>(rgba.begin()+center,rgba.begin()+center+4);
+            };
+            const auto none=litCenter(0), engineOnly=litCenter(EngineDome);
+            Require(none[0]==0,"A scene without lights is lit");
+            Require(engineOnly[0]>0,"The default dome does not light a scene without lights");
+            const auto stageDome=litCenter(StageDome), stageDomeAndEngine=litCenter(StageDome|EngineDome);
+            Require(stageDome[0]>engineOnly[0]*1.5f,"Test stage dome is not brighter than the default dome");
+            const auto sun=litCenter(StageDistant), sunAndEngine=litCenter(StageDistant|EngineDome);
+            Require(sun[0]>0,"The test scene's own light does not light it");
+            for(int channel=0;channel<3;++channel) {
+                Require(stageDomeAndEngine[channel]==stageDome[channel],
+                        "The default dome adds to the scene's own dome");
+                Require(sunAndEngine[channel]==sun[channel],
+                        "The default dome adds to the scene's own light");
+            }
+            // usdview's camera light is not the scene's light: the dome still applies.
+            const auto camera=litCenter(CameraLight), cameraAndEngine=litCenter(CameraLight|EngineDome);
+            Require(cameraAndEngine[0]>camera[0],"The camera light stops the default dome");
+        }
         std::cout << "Primary coverage integration tests passed\n";
         return 0;
     } catch(std::exception const& error) { std::cerr << error.what() << '\n'; return 1; }
