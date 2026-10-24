@@ -37,11 +37,10 @@ Every device runs the same path tracer, [`shaders/integrator/path_tracer.h`](sha
 | `metal` | macOS on Apple GPUs (M1 and newer; hardware ray tracing from M3) | Metal acceleration structures, inline ray queries | HLSL kernel: DXC to DXIL, Metal shader converter; MDL materials in HLSL |
 | `vulkan` | Windows and Linux with `VK_KHR_ray_query` (NVIDIA RTX, AMD RX 6000+, Intel Arc) | Vulkan acceleration structures, inline ray queries | The same HLSL kernel, compiled to SPIR-V by DXC. Builds and compiles on macOS; not yet run-tested |
 | `cpu` | All | Embree | The path tracer as C++, the CPU materials and native MDL code |
-| `cpu-reference` | All | Embree | The original CPU integrator, kept as a validation reference |
 
 The default `auto` picks Metal on macOS and Vulkan elsewhere, and falls back to `cpu` when no GPU device is usable. Choose a device with:
 
-* the standalone renderer: `--device auto|cpu|cpu-reference|vulkan|metal` (`PrismRT --list-devices` lists the available ones);
+* the standalone renderer: `--device auto|cpu|vulkan|metal` (`PrismRT --list-devices` lists the available ones);
 * Hydra/usdview: the `PRISM_DEVICE` environment variable or the `prism:device` render setting.
 
 The GPU devices compile a kernel per scene material set the first time it is seen (about 30 s for the OpenChessSet scene) and cache it; later runs start in a few seconds. Primary AOVs and picking are traced on the CPU scene in every device.
@@ -101,7 +100,7 @@ No arguments display CLI help. USD, glTF/GLB and OBJ scene files are supported; 
 ---------------------------------------
 
 * Curves, VDB volumes, motion blur, light shaping/IES and an ACEScg rendering space are not implemented; see [the feature roadmap](docs/feature_roadmap.md).
-* Legacy rough-metal samplers remain BSDF-only when no matching PDF is available. glTF materials load as MaterialX `gltf_pbr` ([docs/gltf.md](docs/gltf.md)) and OBJ/MTL materials as `open_pbr_surface` ([docs/obj.md](docs/obj.md)); Hydra/usdview cannot open glTF or OBJ files.
+* Every material is MaterialX through MDL, apart from the built-in fallback (`displayColor`) and the magenta error material. glTF materials load as MaterialX `gltf_pbr` ([docs/gltf.md](docs/gltf.md)) and OBJ/MTL materials as `open_pbr_surface` ([docs/obj.md](docs/obj.md)); Hydra/usdview cannot open glTF or OBJ files.
 * The setPosition method of AABBs doesn't set correctly the position, if it's not initially in zero.
 
 

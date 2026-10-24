@@ -8,11 +8,13 @@ PrismRT renders through a *device*. Every device runs the same path tracer,
 | `metal` | `--device metal`, `PRISM_DEVICE=metal`, `prism:device` | HLSL kernel: DXC to DXIL, Metal shader converter; inline ray queries | macOS on Apple GPUs; ray-tracing hardware from M3 (M1/M2 run the same API in software) |
 | `vulkan` | `--device vulkan`, ... | The same HLSL kernel, compiled to SPIR-V by DXC; `VK_KHR_ray_query` | Windows/Linux with NVIDIA RTX, AMD RX 6000+ or Intel Arc. Builds and compiles its kernel on macOS; not yet run-tested |
 | `cpu` | `--device cpu`, ... | The same integrator compiled as C++, on Embree and the CPU materials (native MDL) | All platforms |
-| `cpu-reference` | `--device cpu-reference`, ... | The original `SceneManager::trace` | Validation reference, bit-identical to the renderer before devices existed |
 
 `auto` (the default) picks Metal on macOS and Vulkan elsewhere, and falls
 back to the CPU device with a message when no GPU device is usable.
-`PrismRT --list-devices` lists what this machine offers.
+`PrismRT --list-devices` lists what this machine offers. (The former
+`cpu-reference` device, the original recursive `SceneManager::trace`, was
+removed; asking for it fails with "the cpu-reference device was removed; use
+cpu".)
 
 ## How it fits together
 
@@ -26,9 +28,8 @@ back to the CPU device with a message when no GPU device is usable.
   (`shaders/gpu/kernel.hlsl`) with `GpuBackend`
   (`shaders/gpu/gpu_backend.hlsl`). Random numbers are drawn in the original
   order, so devices agree sample for sample up to floating-point and
-  intersection differences. The CPU device matches `cpu-reference` far
-  below the noise floor; the remaining difference comes from its
-  single-precision camera rays.
+  intersection differences. (The CPU device matched the former recursive
+  integrator far below the noise floor.)
 - **Explicit path state.** What a path carries between bounces is one
   struct, `PathState` (ray, sampler, radiance, weights, the previous
   vertex's MIS data, medium, depth and flags), advanced by step functions:
@@ -49,7 +50,8 @@ back to the CPU device with a message when no GPU device is usable.
   shared records (`shaders/shared/prism_gpu_types.h`): one bottom-level
   acceleration structure per prototype (triangles; analytic spheres as
   procedural boxes), one instance per placement, per-primitive materials, the
-  legacy materials and textures, and the environment with its importance
+  built-in materials (the fallback `Diffuse`, `Emissive`) and their textures,
+  and the environment with its importance
   tables.
 - **MDL on the GPU.** `src/device/gpu/gpu_materials.*` compiles the scene's
   MDL classes again with the HLSL backend into one link unit, with a
@@ -121,7 +123,7 @@ ray tracing pipeline (`VK_KHR_ray_tracing_pipeline`,
 `src/device/vulkan/vulkan_material_calls.*`):
 
 - **Raygen shader.** `kernel.hlsl` compiled with `PRISM_CALL_MATERIALS`:
-  the same integrator and step functions, legacy materials, lights and
+  the same integrator and step functions, built-in materials, lights and
   environment, but no MDL code. `GpuBackend::shade` packs a `MaterialCall`
   (`shaders/gpu/material_call.hlsl`) and calls the hit's MDL program with
   `CallShader(program, call)`; `cutoutOpacity` of a varying cutout does the
@@ -532,6 +534,16 @@ called done there.
     `display_color_interpolation.usda` fixtures with the CLI (`--device
     metal`) against their CPU renders (`prism_compare_images`), and chess and
     an egg (unchanged: no shape or material they use was touched).
+- **`cpu-reference` device removed** (`SceneManager::trace` and its helpers):
+  - Shared shader code: comments only (`shaders/integrator/path_tracer.h`,
+    `types.h`, `gpu_backend.hlsl` no longer name the removed functions); no
+    code change. Shared host code: `src/hydra/scene_bridge.cpp` and
+    `task_delegate.cpp` reject `PRISM_DEVICE` / `prism:device`
+    `cpu-reference` with "the cpu-reference device was removed; use cpu"
+    (`RemovedDeviceMessage`, `src/device/device.cpp`).
+  - Runs: `prism_device_selection_test` on macOS (Metal is still preferred by
+    `auto`; `cpu-reference` is rejected), and `PRISM_DEVICE=cpu-reference`
+    in usdview warns once and keeps `auto`.
 
 ## Diagnostics
 

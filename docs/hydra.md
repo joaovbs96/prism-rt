@@ -67,7 +67,7 @@ running delegate.
 | `prism:displacementMaxFaces` | 262144 (env `PRISM_DISPLACEMENT_MAX_FACES`) | none (*) | every mesh converts again | Faces one displaced mesh may refine to |
 | `prism:sssFallback` | false (env `PRISM_SSS_FALLBACK`) | `--sss-fallback` | every material generates again | Render subsurface scattering as its diffuse lobe instead of tracing it ([MaterialX compatibility](materialx_compatibility.md)). Process-wide, like the colour management |
 | `prism:honorDoubleSided` | false | `--honor-double-sided` | rebuilds the scene | Honour USD `doubleSided`: back faces of single-sided meshes (`doubleSided` false, USD's default) are not hit, unless their material transmits. Off, every mesh is two-sided as before (most path tracers ignore `doubleSided`). See [Scene features](#scene-features) |
-| `prism:device` | `auto` | `--device` | switches the render device | `auto`, `cpu`, `cpu-reference`, `vulkan` or `metal`; env `PRISM_DEVICE` sets the initial value |
+| `prism:device` | `auto` | `--device` | switches the render device | `auto`, `cpu`, `vulkan` or `metal`; env `PRISM_DEVICE` sets the initial value (`cpu-reference` was removed: it warns and is ignored) |
 | `prism:colorManagement:ocioConfig` | empty | `--ocio-config` | rebuilds the scene | OpenColorIO config; empty uses `$OCIO`, else `ocio://studio-config-latest`. See [colour management](color_management.md) |
 | `prism:colorManagement:workingSpace` | empty | `--working-space` | rebuilds the scene | Working space; empty is ACEScg. `lin_rec709` renders as before colour management |
 | `prism:colorManagement:display`, `prism:colorManagement:view` | empty | `--display`, `--view` | none | Recorded only in the delegate: the colour AOV stays linear in the working space and usdview applies its own colour correction (`OCIO=ocio://studio-config-latest` for its OCIO mode). The CLI encodes 8-bit outputs with them |
@@ -187,8 +187,7 @@ limit or the samples resumes the accumulation for the remaining time. In
 `prism_hydra_render` and usdview the render then reports converged, like a
 render that reached its samples; `GetRenderStats()` reports
 `timeLimitReached`. In the CLI the limit covers all render products together
-and the summary says when it stopped a render. The `cpu-reference` device
-ignores the limit.
+and the summary says when it stopped a render.
 
 **Progress.** `percentDone` counts pixels that adaptive sampling stopped as
 done and the others by their samples out of `samplesPerPixel`, so it keeps
@@ -446,7 +445,7 @@ parity fixture each and a check in `prism_scene_features_test`:
   shows a transmission event when probed at load).
   Camera, BSDF and shadow rays and the geometric AOVs see the same surfaces.
   CPU: the device's ray casts continue past culled back faces
-  (`SceneManager::castRayCulled`; `cpu-reference` does not cull); GPU: a cull bit
+  (`SceneManager::castRayCulled`); GPU: a cull bit
   in each primitive's material-table entry and non-opaque instances, tested
   in the ray query (`gpu_culled_triangle`). Fixture `double_sided.usda`.
 - **Per-instance primvars** (the delegate only): instance-rate primvars of
@@ -548,7 +547,7 @@ While a scene cannot render yet (and while an edit is converted), the renderer r
 | `prismMaterialsDone` / `prismMaterialsTotal` (int) | Materials compiled; the total grows when template seeds or fallback compiles are added |
 | `prismTexturesDone` / `prismTexturesTotal` (int) | Textures prepared ahead of material compilation |
 | `prismUploadDone` / `prismUploadTotal` (int) | Images prepared for the GPU (zero total outside the image stage; the stage is in `prismPhaseDetail`) |
-| `prismDevice` (string) | `vulkan: <GPU name>`, `cpu`, `cpu-reference`, or `cpu (Vulkan fallback: <reason>)` when the GPU device was unavailable at creation or later could not prepare the scene (`kernel too large` only without ray tracing pipelines: otherwise large material sets compile as callable shaders, see [gpu_devices.md](gpu_devices.md#material-programs-as-callable-shaders-vulkan); `kernel compile failed`, ...); empty until the device exists |
+| `prismDevice` (string) | `vulkan: <GPU name>`, `cpu`, or `cpu (Vulkan fallback: <reason>)` when the GPU device was unavailable at creation or later could not prepare the scene (`kernel too large` only without ray tracing pipelines: otherwise large material sets compile as callable shaders, see [gpu_devices.md](gpu_devices.md#material-programs-as-callable-shaders-vulkan); `kernel compile failed`, ...); empty until the device exists |
 | `prismGpuPreview` (bool) | True while the CPU renders a preview for a GPU device that is preparing; `prismDevice` is then `cpu (preview while the GPU prepares)` and `prismPhase` keeps naming the GPU phase |
 | `prismError` (string) | Last scene-conversion failure; cleared by the next published snapshot |
 
@@ -583,7 +582,7 @@ The `prismUsdview` extension turns usdview's Lights > "Enable Default Dome Light
 
 The standalone CLI follows the same rule: a scene (USD, glTF or OBJ) with no lights, no constant-emission geometry and no `--env`/`--env-color` is lit by the same Stinson Beach dome, as a USD dome at intensity 1 (without `--env`'s factor of two), and the CLI says so on stderr. `--default-dome false` keeps such a scene black. Textured emitters are not detected yet, so a scene lit only by them also gets the dome.
 
-The beach HDR contains a small, extremely bright sun. Environment MIS is now the default in both frontends: one importance-sampled environment direction competes with BSDF sampling at supported scattering vertices. The distribution uses exact texel solid angles and a small uniform mixture to cover filtered texture values. Diffuse and MDL materials supply matching BSDF evaluations/PDFs; legacy rough-metal and glTF samplers retain their BSDF-only behavior. The default sample clamp of 10 can still reduce brightness: use zero when measuring energy or variance. "Converged" means adaptive sampling stopped every pixel, the samples per pixel were reached, or the time limit passed, whichever came first.
+The beach HDR contains a small, extremely bright sun. Environment MIS is now the default in both frontends: one importance-sampled environment direction competes with BSDF sampling at supported scattering vertices. The distribution uses exact texel solid angles and a small uniform mixture to cover filtered texture values. Diffuse and MDL materials supply matching BSDF evaluations/PDFs. The default sample clamp of 10 can still reduce brightness: use zero when measuring energy or variance. "Converged" means adaptive sampling stopped every pixel, the samples per pixel were reached, or the time limit passed, whichever came first.
 
 Scene inputs are captured on the owning thread in incremental slices, then prepared in background jobs. The previous fully shaded snapshot remains navigable while the next generation prepares. Publication briefly stops rendering and swaps complete snapshots; superseded jobs cannot publish. Statistics expose pending generations and whether the displayed scene predates edits. The scene-index chain resolves CPU Hydra ExtComputation primvars before the transport filter; this includes computed point arrays used by stock USD Skel skinning.
 

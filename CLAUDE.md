@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-PrismRT is a CPU-based physically-based path tracer written in C++20. It renders 3D scenes from USD, glTF, and OBJ formats using Intel Embree for BVH-accelerated ray tracing, oneTBB for parallelism, OpenImageIO for image I/O, and the NVIDIA MDL SDK for MaterialX-based material compilation.
+PrismRT is a physically-based path tracer written in C++20, rendering on the CPU or the GPU (Vulkan, Metal), with a Hydra render delegate (hdPrism) and a standalone CLI. It renders 3D scenes from USD, glTF, and OBJ formats using Intel Embree for BVH-accelerated ray tracing on the CPU, oneTBB for parallelism, OpenImageIO for image I/O, and the NVIDIA MDL SDK for MaterialX-based material compilation.
 
 ## Build System
 
@@ -43,7 +43,7 @@ build/RelWithDebInfo/PrismRT.exe
 
 ## Tests
 
-The renderer itself has no automated tests — verify by inspecting the rendered `output.png`. There is one standalone regression test project for the MaterialX loader that deliberately avoids the USD/MDL/Embree dependencies:
+The main build registers the renderer's tests with CTest (`ctest --test-dir build -C RelWithDebInfo`; tests that may open a GPU device carry the `gpu` label, so `-LE gpu` runs the CPU ones). There is also a standalone regression test project for the MaterialX loader that deliberately avoids the USD/MDL/Embree dependencies:
 
 ```
 cmake -S tests -B build/sss_tests -DMaterialX_DIR=<MaterialX install>/lib/cmake/MaterialX
@@ -59,20 +59,19 @@ Most of the renderer is header-only (`src/*.h`); only the MDL/MaterialX pipeline
 
 ### Rendering Pipeline
 
-`main.cpp` drives everything:
-1. Initialize the MDL SDK (`mdl::Context` — loads the DLL, loads plugins *before* `neuray->start()`, acquires interfaces)
-2. Instantiate a `SceneManager` subclass. Scenes are hardcoded C++ classes, **all defined in `src/scene.h`**; the active scene, `samples`, and `max_depth` are hardcoded in `main()`. To add a scene: subclass `SceneManager` in `scene.h`, populate geometry/camera/`environment` in the constructor, and swap the `new ...` line in `main.cpp`.
-3. `commitScene()` applies transforms and commits the Embree BVH
-4. Nested `tbb::parallel_for` over rows/columns; per pixel, `cam.get_ray()` + `SceneManager::trace()` per sample, with a TEA-hash RNG seed per pixel
-5. `FrameBuffer::applyGammaCorrection()` then save `output.png` via OpenImageIO
+Two front ends load scenes into a `SceneManager` and hand it to a render device (`src/device/device.h`):
+- the standalone CLI (`main.cpp` -> `runStandaloneCli` in `src/standalone_cli.cpp`): one USD (`USDMesh`), glTF (`glTFMesh`) or OBJ (`ObjMesh`) file, a USD camera or `--camera-position/--camera-target`, render settings and products, output through OpenImageIO;
+- the Hydra delegate (`src/hydra/`, `scene_bridge.cpp`): usdview and `prism_hydra_render`.
 
-`SceneManager::trace()` is the original recursive integrator, kept as the `cpu-reference` device. Every other device runs the shared integrator in `shaders/integrator/path_tracer.h`, compiled as C++ (CPU backend, `src/device/cpu_backend.h`) and as HLSL (`shaders/gpu/gpu_backend.hlsl`): NEE with power-heuristic MIS over a light table (`shaders/integrator/lights.h`, built by `src/device/light_table.h`) holding UsdLux sphere/rect/disk/cylinder/distant lights, constant-emission triangles and the domes (several domes combine as one `CompositeEnvironment` entry), light and shadow linking, and random-walk media (SSS and absorbing transmission) from MDL volume coefficients.
+There are no hard-coded C++ scenes; `assets/scenes` holds USD scenes (InOneWeekend, CornellBox, QuadTest).
+
+Every device (`cpu`, `vulkan`, `metal`; the former `cpu-reference` device and its recursive `SceneManager::trace` were removed) runs the shared integrator in `shaders/integrator/path_tracer.h`, compiled as C++ (CPU backend, `src/device/cpu_backend.h`, `cpu_device.cpp`) and as HLSL (`shaders/gpu/gpu_backend.hlsl`): NEE with power-heuristic MIS over a light table (`shaders/integrator/lights.h`, built by `src/device/light_table.h`) holding UsdLux sphere/rect/disk/cylinder/distant lights, constant-emission triangles and the domes (several domes combine as one `CompositeEnvironment` entry), light and shadow linking, and random-walk media (SSS and absorbing transmission) from MDL volume coefficients. Render parallelism on the CPU is `tbb::parallel_for` over pixels, with a TEA-hash RNG seed per pixel.
 
 ### Key Subsystems
 
-**Scene (`src/scene.h`)** — `SceneManager` owns geometry (`std::unordered_map<int, Geometry*>` keyed by Embree `geomID`), camera, and environment. `add_mesh()` dispatches on file extension to `ObjMesh` / `glTFMesh` / `USDMesh`; `add_sphere/quad/box` create analytic shapes. Each `Geometry` registers itself with Embree via `setupEmbree()`. Materials are looked up per hit with `getMaterial(primid, instid)`, so meshes can carry multiple materials; `material_override` replaces them all.
+**Scene (`src/scene.h`)** — `SceneManager` owns geometry (`std::unordered_map<int, Geometry*>` keyed by Embree `geomID`), placements (transforms, materials, primvars) and the environment; the front ends attach loaded meshes (`attachImportedMesh`) and analytic USD spheres (`Sphere`, `BatchedSpheres`). Each `Geometry` registers itself with Embree via `setupEmbree()`. Materials are looked up per hit with `getMaterial(primid, instid)`, so meshes can carry multiple materials.
 
-**Materials (`src/material.h`, `src/mdl_material.h`)** — `Material::sample()` is the entry point; the default implementation composes `sample_direction()`, `evaluate_color()`, `evaluate_emission()`. `MDLMaterial` overrides `sample()` wholesale and executes MDL-generated native code (init → BSDF sample → EDF evaluate). `RayHit` normals arrive already flipped toward the ray, with the side recorded in `front_face` — MDL code relies on this; don't re-flip. An invalid `MDLMaterial` renders as emissive magenta rather than failing.
+**Materials (`src/material.h`, `src/mdl_material.h`)** — every scene material is MaterialX compiled through MDL (`MDLMaterial`): USD MaterialX/UsdShade networks, glTF materials (`src/materialx/gltf_material.cpp`, `gltf_pbr`, docs/gltf.md) and OBJ/MTL materials (`src/materialx/obj_material.cpp`, `open_pbr_surface`, docs/obj.md). `src/material.h` keeps only the built-in materials: `Diffuse` (the fallback for geometry without a material, `src/hydra/fallback_material.h`: `displayColor`/`displayOpacity`), `Emissive`, and `ErrorMaterial` (magenta, for materials that fail to load). `MDLMaterial` executes MDL-generated native code (init → BSDF sample → EDF evaluate). `RayHit` normals arrive already flipped toward the ray, with the side recorded in `front_face` — MDL code relies on this; don't re-flip. An invalid `MDLMaterial` renders as emissive magenta rather than failing.
 
 **MaterialX → MDL pipeline (`src/materialx/`, `src/mdl/`)**, run inside the `MDLMaterial` constructor:
 1. `MDLGenerator` (owns the MaterialX stdlib; obtain it via `MDLGenerator::shared(path)` — constructing one reloads the whole library) + `DocumentLoader::load()` — loads the `.mtlx`, applies in-memory compatibility preprocessing, imports the stdlib, validates
@@ -88,13 +87,12 @@ Most of the renderer is header-only (`src/*.h`); only the MDL/MaterialX pipeline
 
 ### Asset Resolution
 
-Assets resolve relative to the executable: `{exe_dir}/assets/{models,textures,environment}` via `SceneManager::getAssetsPath()`. Exceptions still hardcoded in `scene.h`: the MaterialX `libraries` path (`mx_libraries_path` / `mx_mdl_path` globals) and the `.mtlx` path in the `MaterialXTest` scene.
+Scene files resolve their own assets (USD through Ar; glTF images and OBJ maps relative to their files, published into the material cache). The MaterialX libraries come from `PRISM_MATERIALX_LIBRARY_PATH` (see `prism_env.ps1`).
 
 ## Known Limitations
 
-- Little error handling for missing assets — `add_mesh()` throws on a missing file, most other loads crash
 - `setPosition()` on AABBs only works correctly when geometry starts at origin
-- Many paths are user-specific (`CMakeLists.txt`, `build_script.py`, `.vscode/`, `scene.h`)
+- Many paths are user-specific (`build_script.py`, `.vscode/`)
 - README build instructions are WIP and partly outdated (e.g. TBB location) — trust `CMakeLists.txt`
 
 ## Git
