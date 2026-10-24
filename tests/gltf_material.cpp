@@ -334,7 +334,9 @@ void TestVolumeLayer(const std::filesystem::path& dir, const std::string& librar
     if (!doc) return;
     Check(!doc->getNode("absorbing"), "the attenuating gltf_pbr is expanded");
     // The clear glass is expanded too, to couple its reflection and
-    // transmission (an RT dielectric), but gets no volume layer.
+    // transmission (an RT dielectric), but gets no volume layer. The
+    // absorbing one (textured base_color) is coupled through
+    // prism_dielectric_split, its RT lobe over the volume.
     Check(!doc->getNode("clear"), "the clear glass is coupled");
     int layers = 0, volumeLayers = 0;
     bool clearcoat = false;
@@ -343,7 +345,9 @@ void TestVolumeLayer(const std::filesystem::path& dir, const std::string& librar
             auto top = Upstream(node, "top"), base = Upstream(node, "base");
             if (base && base->getCategory() == "anisotropic_vdf") ++volumeLayers;
             if (top && base && top->getCategory() == "dielectric_bsdf" &&
-                top->getInput("scatter_mode") && top->getInput("scatter_mode")->getValueString() == "T" &&
+                top->getInput("scatter_mode") &&
+                (top->getInput("scatter_mode")->getValueString() == "T" ||
+                 top->getInput("scatter_mode")->getValueString() == "RT") &&
                 base->getCategory() == "anisotropic_vdf") {
                 ++layers;
                 Check(!node->getDownstreamPorts().empty(), "the volume layer replaces the transmission downstream");
