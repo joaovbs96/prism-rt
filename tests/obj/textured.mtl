@@ -1,0 +1,31 @@
+# PrismRT make_fixtures.py
+newmtl checker
+Ka 0 0 0
+Kd 1 1 1
+Ks 0.5 0.5 0.5
+Ns 200
+illum 2
+map_Kd -s 2 2 1 checker.png
+map_Ks specular.png
+map_Ns shininess.png
+
+newmtl cutout
+Kd 1 1 1
+Ks 0 0 0
+illum 2
+map_Kd leaf.png
+map_d leaf.png
+
+newmtl bumped
+Kd 0.8 0.8 0.8
+Ks 0.1 0.1 0.1
+Ns 20
+illum 2
+bump -bm 2 height.png
+
+newmtl normal
+Kd 0.8 0.8 0.8
+Ks 0.1 0.1 0.1
+Ns 20
+illum 2
+norm normal.png

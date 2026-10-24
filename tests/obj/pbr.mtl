@@ -1,0 +1,24 @@
+# PrismRT make_fixtures.py: the PBR extension (exocortex.com)
+newmtl gold
+Kd 1 0.766 0.336
+Pr 0.25
+Pm 1
+
+newmtl velvet
+Kd 0.6 0.05 0.1
+Pr 0.8
+Pm 0
+Ps 1
+
+newmtl lacquer
+Kd 0.05 0.1 0.6
+Pr 0.6
+Pc 1
+Pcr 0.05
+
+newmtl brushed
+Kd 0.9 0.9 0.9
+Pm 1
+Pr 1
+map_Pr roughness.png
+aniso 0.8

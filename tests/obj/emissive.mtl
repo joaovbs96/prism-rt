@@ -1,0 +1,18 @@
+# PrismRT make_fixtures.py
+newmtl floor
+Kd 0.5 0.5 0.5
+Ks 0 0 0
+illum 1
+
+newmtl light
+Kd 0 0 0
+Ks 0 0 0
+Ke 2 2 2
+illum 1
+
+newmtl glow
+Kd 0 0 0
+Ks 0 0 0
+Ke 1 1 1
+map_Ke glow.png
+illum 1
