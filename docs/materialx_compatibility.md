@@ -205,6 +205,11 @@ what else is layered on the dielectric:
   gains energy there (R + T 1.19 at 40 degrees inside, rough coat over smooth
   glass) or loses more than the curve (0.66, smooth coat over rough glass). The
   coat over the opaque part also becomes Fresnel's rather than Schlick's.
+  Coupled coated OpenPBR glass reflects at both interfaces with the material
+  IOR (R 0.078 at normal incidence with `coat_ior` equal to `specular_ior`,
+  where OpenPBR's index-matched glass under the coat reflects nothing, R 0.04):
+  the RT lobe can't take OpenPBR's IOR relative to the coat. The coupling did
+  this before the coat repair as well.
 - **Not repaired, logged**: coats of another IOR (R + T 0.946 at 60 degrees
   inside; 0.87 of the light entering a closed sphere at 85 degrees leaves it),
   thin films over tinted glass (0.55 of the expected
