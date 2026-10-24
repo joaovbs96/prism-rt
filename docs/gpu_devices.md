@@ -468,9 +468,8 @@ called done there.
     `prism_scene_features_test` and `prism_compare_images`; then chess and an
     egg (light lobes off: unchanged).
 - **glTF materials as MaterialX** ([gltf.md](gltf.md)):
-  - No shader or device change: glTF materials are now ordinary
-    `MDLMaterial`s (the legacy `gltfPBR` path stays for
-    `--gltf-materials legacy`). Shared host code: `src/mesh/gltf_mesh.h`
+  - No shader or device change: glTF materials are ordinary
+    `MDLMaterial`s. Shared host code: `src/mesh/gltf_mesh.h`
     (V-flipped UVs, `TEXCOORD_1`/`COLOR_0` mesh primvars, `single_sided`),
     `src/materialx/gltf_material.cpp`, `cached_document.h`,
     `PublishMaterialResourceBytes` in `resolved_resource.h`, and
@@ -483,6 +482,22 @@ called done there.
     and `volume_sphere.gltf` checked with `prism_gltf_material_test
     --check-volume`. The textured fixture exercises Metal's MDL scene data
     lookups (`TEXCOORD_1`, `COLOR_0`) and sampler wrap modes.
+- **Legacy glTF materials removed** (`gltfPBR`, `DiffuseGltf`, `MetalGltf`,
+  `SpecularBTDFglTF`; [gltf.md](gltf.md#materials-that-fail)):
+  - Shared shader code: `shaders/gpu/gpu_backend.hlsl` loses the
+    `kMaterialDiffuseGltf`, `kMaterialMetalGltf`, `kMaterialSpecularBtdfGltf`
+    and `kMaterialGltfPbr` branches of `gpu_legacy_sample`;
+    `shaders/shared/prism_gpu_types.h` drops those constants (7 to 10; the
+    other kinds keep their values, `kMaterialFallback` stays 11). Check that
+    the Metal shaders still compile (nothing Metal-specific referenced them).
+  - Shared host code: `src/device/gpu/gpu_scene.cpp` no longer translates
+    them; a glTF material that fails now uses `ErrorMaterial`
+    (`src/material.h`), an `Emissive` the GPU scene translates as
+    `kMaterialEmissive` (magenta, not a light).
+  - Runs: `ctest -R prism_gltf -LE gpu`; then on Metal the glTF runs above,
+    and `metal_rough_spheres.gltf` with `PRISM_MATERIALX_LIBRARY_PATH` unset
+    (the arguments of `prism_gltf_error_material_render`, `--device metal`)
+    checked with `prism_gltf_material_test --check-error-material`.
 
 ## Diagnostics
 

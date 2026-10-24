@@ -9,29 +9,33 @@ emission.
 
 The code: `src/materialx/gltf_material.{h,cpp}` (the converter: MaterialXCore
 and tinygltf only) and `src/mesh/gltf_mesh.h` (geometry, images, compilation,
-legacy fallback).
+error material).
 
 ## Where glTF can be loaded
 
 | Front end | glTF |
 | --- | --- |
 | CLI (`PrismRT --scene x.gltf`) | yes (`glTFMesh`) |
-| `SceneManager::add_mesh` (C++ scenes, `tests/legacy_scene_presets.h`) | yes, legacy materials (no MDL context is passed) |
+| `SceneManager::add_mesh` | yes, with the MDL context it is given (without one, every material renders with the error material) |
 | Hydra / usdview, or a USD stage referencing a `.gltf` | **no**: the OpenUSD build has no glTF file-format plugin (`usd`, `usda`, `usdc`, `usdz` and `mtlx` only). A follow-up would add one (for example Adobe's `usd-fileformat-plugins`, or a small Sdf file format over the same converter). |
 
-## The material switch
+## Materials that fail
 
-| Setting | Effect |
-| --- | --- |
-| `--gltf-materials materialx` (default) | MaterialX `gltf_pbr` through MDL |
-| `--gltf-materials legacy` | the C++ materials of `src/material.h` (`gltfPBR`), as before |
-| `PRISM_GLTF_MATERIALS=materialx\|legacy` | the default of the option |
+A material whose conversion or MDL compilation fails renders with the magenta
+error material (`ErrorMaterial` in `src/material.h`: magenta emission, no
+scattering, not a light), as a USD material that fails to compile does, after
+one line naming it and the reason:
+`PrismRT glTF: material 3 'Glass' failed to load (MDL compilation failed (...)); rendering it with the magenta error material`.
+The CLI reports the split:
+`glTF: 15 MaterialX material(s) (15 compiled, 0 reused), 0 failed, in 8.2 s`.
 
-A material whose conversion or MDL compilation fails falls back to its legacy
-material, with a one-line warning naming it; it does not render magenta.
-(The legacy materials need decoded pixels; embedded images are decoded only
-for such a fallback.) The CLI reports the split:
-`glTF: 15 MaterialX material(s) (15 compiled, 0 reused), 0 legacy, in 8.2 s`.
+History: until this converter replaced them, glTF materials could also load
+as hand-written C++ materials (`gltfPBR` and its lobes, `--gltf-materials
+legacy` / `PRISM_GLTF_MATERIALS`), which were also the fallback for a failed
+material. They sampled the BSDF only, lost energy on rough metals, never
+emitted, ignored alpha and most extensions, and normal-mapped incorrectly (on
+`normal_map.gltf` 2–3× too dark); on the metal/rough spheres they were within
+NRMSE 0.18 of this mapping. They were removed with the other legacy materials.
 
 ## Mapping
 
@@ -43,7 +47,7 @@ Core metallic-roughness:
 | `metallicFactor`, `roughnessFactor` × `metallicRoughnessTexture` | `metallic` (B), `roughness` (G) | one raw `gltf_image` vector3, two `extract`s |
 | `normalTexture` (+ `scale`) | `normal` | raw `gltf_image` vector3 → `normalmap` with `scale` (`gltf_normalmap` has no scale) |
 | `occlusionTexture` | — | not mapped: `gltf_pbr` ignores `occlusion`, and a path tracer computes occlusion |
-| `emissiveFactor` × `emissiveTexture` | `emissive` | texture sRGB, factor `lin_rec709`. Emits light (the legacy material did not) |
+| `emissiveFactor` × `emissiveTexture` | `emissive` | texture sRGB, factor `lin_rec709`. Emits light |
 | `alphaMode` OPAQUE / MASK / BLEND, `alphaCutoff` | `alpha_mode` 0/1/2, `alpha_cutoff` | MASK cuts out, BLEND is stochastic coverage |
 | `doubleSided` | — | per triangle in `Mesh::single_sided`; honoured only with `--honor-double-sided true`, as for USD |
 | no material on a primitive | the glTF default material | white, metallic 1, roughness 1 (previously this crashed) |
@@ -75,7 +79,7 @@ Textures and texture coordinates:
   NEAREST → `filtertype closest`, otherwise linear (mip filtering is the
   renderer's own).
 - **V flip**: glTF's texture origin is top-left, MaterialX's bottom-left. The
-  loader stores `v' = 1 − v` for the primitives of MaterialX materials (this
+  loader stores `v' = 1 − v` for every primitive (this
   is what `gltf_image`'s pivot (0, 1) and MaterialX's own glTF loader
   expect); tangents are then derived in that space, so glTF's +Y-up normal
   maps come out right. `prism_gltf_normal_map_test` checks normal-mapped
@@ -94,13 +98,12 @@ colour) are sRGB and tagged `srgb_texture`; data textures (metallic-roughness,
 normal, transmission, ...) are raw. Colour factors are linear Rec.709 and are
 tagged `lin_rec709`, so the generator converts each into the working space
 (ACEScg by default) exactly once ([color_management.md](color_management.md)).
-As for the legacy materials, texture and factor convert separately before they
-multiply, which is exact when either is grey.
+Texture and factor convert separately before they multiply, which is exact
+when either is grey.
 
 ## Images
 
-The loader keeps images encoded (`tinygltf` "as is": nothing is decoded for
-MaterialX materials). Each referenced image — an external file, a data URI or
+The loader keeps images encoded (`tinygltf` "as is": nothing is decoded). Each referenced image — an external file, a data URI or
 a GLB buffer view — is published content-addressed into the material cache
 (`PRISM_CACHE_DIR` or `%LOCALAPPDATA%\PrismRT\cache`, `materials\<sha1>.png`)
 by `PublishMaterialResourceBytes` (`src/materialx/resolved_resource.h`, the
@@ -120,29 +123,9 @@ caches). Materials with identical
 documents within a load compile once (`reused` in the report), and the
 existing caches apply across loads and processes: generated MDL (persistent),
 compiled templates, the GPU program cache (8 factor-only glTF materials share
-one GPU program). Loading also no longer decodes images that only MaterialX
-materials use: ABeautifulGame loaded in 8.8 s with MaterialX and 15.4 s with
-the legacy materials, which decode every image (one run each, not a
-benchmark).
-
-## MaterialX against the legacy materials
-
-`prism_gltf_materialx_vs_legacy` renders `tests/gltf/metal_rough_spheres.gltf`
-both ways without a sample clamp: NRMSE 0.18, mean luminance 4.5% apart.
-Differences, all in the legacy materials' disfavour:
-
-- The legacy material samples its BSDF only (no light sampling or MIS); with
-  the default sample clamp, its hits of a small bright light are clipped and
-  it renders darker (23% on the spheres with the clamp).
-- Rough metals: MDL's GGX keeps multiple-scattering energy; the legacy one
-  loses it (the roughness-1 white metal is about 20% darker in legacy).
-- Dielectric specular: legacy reflects less at rough dielectrics.
-- The legacy normal mapping is wrong: on `normal_map.gltf` normal-mapped
-  halves render 2–3× darker than the rotated reference quads, where MaterialX
-  matches them within 10%. Textured assets (Avocado, Duck) differ most for
-  this reason.
-- Legacy emission never emits; alpha, occlusion and the extensions other than
-  transmission and emissive strength are ignored.
+one GPU program). Images are never decoded at load: ABeautifulGame loaded in
+8.8 s, against 15.4 s for the former C++ materials, which decoded every image
+(one run each, not a benchmark).
 
 ## Tests
 
@@ -152,10 +135,10 @@ Differences, all in the legacy materials' disfavour:
 | Test | Checks |
 | --- | --- |
 | `prism_gltf_material_test` | the converted document for each feature, validation against the standard library, MDL generation (sRGB and `lin_rec709` transforms into ACEScg), the volume layer (`LayerGltfPbrVolume`) |
-| `prism_gltf_{spheres,textured,features,embedded}_render` | every fixture renders with MaterialX materials only (no legacy fallback) |
+| `prism_gltf_{spheres,textured,features,embedded}_render` | every fixture renders with every material compiled (none uses the error material) |
+| `prism_gltf_error_material_{render,test}` | without the MaterialX libraries each material warns and renders magenta |
 | `prism_gltf_normal_map_test` | normal-mapped halves shade like quads rotated to the mapped normals (U and V) |
 | `prism_gltf_volume_{cpu,vulkan}_test` | through a closed IOR-1 sphere the background is `attenuationColor^(2 / attenuationDistance)` (Beer-Lambert) within 5% |
-| `prism_gltf_materialx_vs_legacy` | MaterialX vs legacy materials: NRMSE < 0.25, mean < 8% |
 | `prism_gltf_{spheres,textured}_vulkan_parity` | Vulkan vs CPU: NRMSE < 0.1, mean < 2% (measured 0.0002 and 0.0095) |
 
 ## Known gaps
