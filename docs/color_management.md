@@ -60,7 +60,7 @@ images from the old renderer and compare (see Tests).
 | Dome and rect-light `inputs:texture:file` | linear Rec.709 | texels, when the texture is prepared |
 | CLI `--env FILE`, `--env-color` | linear Rec.709 | texels; matrix |
 | glTF materials (MaterialX `gltf_pbr`, [gltf.md](gltf.md)) | colour textures `srgb_texture`, factors `lin_rec709`, data textures raw | MaterialX's generated MDL code; `attenuation_color` (uniform) and `COLOR_0` on the CPU at load |
-| OBJ diffuse (legacy materials) | linear Rec.709 (after the existing glTF decode) | texels and factors separately (exact when either is grey) |
+| OBJ materials (MaterialX `open_pbr_surface`, [obj.md](obj.md)) | colour maps `srgb_texture`, MTL colours `lin_rec709`, data maps raw | MaterialX's generated MDL code |
 | `displayColor` and other untagged USD colours | - | none |
 
 ### MaterialX: the spike, and the generator's colour transforms

@@ -102,7 +102,7 @@ No arguments display CLI help. USD, glTF/GLB and OBJ scene files are supported; 
 ---------------------------------------
 
 * Curves, VDB volumes, motion blur, light shaping/IES and an ACEScg rendering space are not implemented; see [the feature roadmap](docs/feature_roadmap.md).
-* Legacy rough-metal samplers remain BSDF-only when no matching PDF is available. glTF materials load as MaterialX `gltf_pbr` ([docs/gltf.md](docs/gltf.md)); Hydra/usdview cannot open glTF files.
+* Legacy rough-metal samplers remain BSDF-only when no matching PDF is available. glTF materials load as MaterialX `gltf_pbr` ([docs/gltf.md](docs/gltf.md)) and OBJ/MTL materials as `open_pbr_surface` ([docs/obj.md](docs/obj.md)); Hydra/usdview cannot open glTF or OBJ files.
 * The setPosition method of AABBs doesn't set correctly the position, if it's not initially in zero.
 
 

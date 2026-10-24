@@ -298,7 +298,11 @@ wait for the CLI's subdivision ([hydra.md](hydra.md#rendering-and-selection-sett
 glTF loads only in the CLI ([gltf.md](gltf.md)): Hydra and usdview need a
 glTF file-format plugin (none in the OpenUSD build), which could reuse the
 MaterialX converter. Material variants, thin-walled transmission and the
-other gaps listed in gltf.md are open.
+other gaps listed in gltf.md are open. OBJ is in the same position
+([obj.md](obj.md)): CLI only, MTL through a MaterialX `open_pbr_surface`
+converter; `anisor`, `-mm`/`-t` map options, reflection maps and vertex
+colours are open, and `disp` maps are converted but wait for the CLI's
+displacement.
 
 ## Not worth porting from the OptiX path tracer
 

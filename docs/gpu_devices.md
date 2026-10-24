@@ -498,6 +498,19 @@ called done there.
     and `metal_rough_spheres.gltf` with `PRISM_MATERIALX_LIBRARY_PATH` unset
     (the arguments of `prism_gltf_error_material_render`, `--device metal`)
     checked with `prism_gltf_material_test --check-error-material`.
+- **OBJ/MTL materials as MaterialX** ([obj.md](obj.md)):
+  - No shader or device change: MTL materials are ordinary `MDLMaterial`s
+    (`open_pbr_surface`). Shared host code: `src/mesh/obj_mesh.h` (MTL
+    statement scan, map publishing and TGA/BMP transcoding),
+    `src/materialx/obj_material.cpp` (the converter; `bump` becomes four
+    texel-shifted `image` lookups and arithmetic nodes, a pattern the GPU
+    MDL backends had not compiled before).
+  - Runs: `ctest -R prism_obj -LE gpu` (CPU); then with `--device metal`, the
+    arguments of `prism_obj_textured_vulkan_render` compared with
+    `textured_cpu.exr` by `prism_compare_images --tolerance 0.1
+    --mean-tolerance 0.02` (Vulkan: NRMSE 0.0032), and the glass and
+    emissive fixtures checked with `prism_obj_material_test --check-glass` /
+    `--check-emissive` on Metal renders.
 
 ## Diagnostics
 
