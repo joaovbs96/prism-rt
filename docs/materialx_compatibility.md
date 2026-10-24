@@ -93,6 +93,16 @@ transmittance is `transmission_color` whatever the depth, while the graph uses
 depth is cleared on these nodes. A connected `geometry_thin_walled` is left as
 it is (MDL's `thin_walled` is uniform).
 
+`standard_surface`'s graph uses `thin_walled` only to pick translucency over
+subsurface scattering and has no `thin_walled` on its constructor, so
+thin-walled `standard_surface` glass refracted like a solid (and lost energy
+leaving it, R + T 0.64 at 41 degrees inside). Autodesk Standard Surface
+defines a thin wall as an infinitely thin shell that transmits without
+refraction (and scatters subsurface light as translucency), which is MDL's
+`thin_walled`: a constant `true` gets the same expansion when the node
+transmits or scatters (`transmission` or `subsurface` not zero; an opaque one
+renders the same either way). The graph has no transmission medium.
+
 ## Refraction IOR of uncoated open_pbr_surface transmission
 
 MaterialX's MDL `dielectric_bsdf` gives the material its own IOR, and the coat
@@ -156,29 +166,158 @@ rewrites it as
     mix(RT [over its VDF], layer(R, opaque), transmission)
 
 (`CoupleSurfaceTransmissionFresnel`; `LayerGltfPbrVolume` couples the glTF
-graphs it expands). That is the same BSDF where the RT lobe can stand for both
-R and T, so only surfaces whose two lobes agree are rewritten:
+graphs it expands). R and T share IOR and roughness in all three graphs
+(`standard_surface` only without `transmission_extra_roughness`, and with
+`specular` 1), so every closed transmissive surface is rewritten; how depends on
+what else is layered on the dielectric:
 
-- `open_pbr_surface`: closed (`geometry_thin_walled` false), untinted reflection
-  (`specular_color` white), no thin film, and an untinted transmission lobe
-  (`transmission_color` white, or a positive `transmission_depth`, which turns
-  the color into the medium's absorption).
-- `standard_surface`: closed, `specular` 1, white `specular_color` and
-  `transmission_color`, no `transmission_extra_roughness`, no thin film.
-- `gltf_pbr`: white `base_color` (glTF's transmission tint), `specular` 1,
-  white `specular_color`, no iridescence. Its reflection becomes Fresnel's
-  rather than glTF's Schlick.
+- **Thin films** (`open_pbr_surface` `thin_film_weight`, `standard_surface`
+  `thin_film_thickness`, `gltf_pbr` `iridescence`): the RT lobe gets the
+  reflection lobe's film (a mix of filmed and plain RT lobes by the film
+  weight). libbsdf applies a film around an RT lobe to its Fresnel term with
+  R + T = 1, so this is exact; the film's reflectance becomes the film over
+  Fresnel's term instead of over the Schlick curve.
+- **Tints**: one RT lobe has one tint, so differently tinted lobes
+  (`transmission_color` at depth 0, `standard_surface`'s `transmission_color`
+  — its graph has no medium —, glTF's `base_color`, a tinted `specular_color`)
+  go through an in-document helper BSDF, `prism_dielectric_split`, with
+  reflection tint s and transmission tint t:
 
-After the repair the furnace renders the dome (mean 1.0000, worst pixel
-0.004 at 16 spp). Tinted transmission without a depth (`transmission_color`
-with depth 0, glTF's `base_color`), tinted reflection, thin films and
-iridescence keep MaterialX's graph and its loss: the RT lobe has a single
-tint. Thin-walled surfaces don't refract and don't lose energy. Coated glass
-keeps a loss: the coat is another custom-curve layer over the refracting base
-(R + T 0.946 at 60 degrees inside with `coat_darkening` 0), on top of the coat
-darkening below. Material templates keep the weight and these inputs
-structural, so a variant never binds onto a prototype rewritten for its
-seed's values. A draft upstream report proposes the RT form for the graphs.
+      min(s, t) * RT + (s - min) * fresnel_layer(R) + (t - min) * fresnel_layer(base: T)
+
+  RT is untinted; `df::fresnel_layer` weights a bare reflection lobe by its
+  Fresnel term and a transmission base by 1 - F with the refracted half vector,
+  so smooth lobes are exact (R = s F, T = t (1 - F), total internal reflection
+  included). Rough tinted glass is approximate: R + T is 0.92 of the expected
+  at 85 degrees outside with a transmission tint, 0.87 at 40 degrees inside
+  with a tinted `specular_color` (before: 0.70 and 0.84), and is logged.
+- **Coats**: a smooth coat over smooth glass of the same IOR
+  (`coat_roughness` and `specular_roughness` 0, `coat_ior` equal to
+  `specular_ior`; `standard_surface` `coat_IOR` and `specular_IOR`, both 1.5 by
+  default; `gltf_pbr` `clearcoat_roughness` and `roughness` 0, `ior` 1.5)
+  becomes `prism_fresnel_layer`, `df::fresnel_layer` with the coat's IOR and
+  weight over the coat's base: light refracted with the same IOR keeps exactly
+  1 - F. MDL refracts with one material IOR, so a coat of another IOR
+  (OpenPBR's default `coat_ior` is 1.6) can't be a Fresnel layer: from inside,
+  its Fresnel term reflects totally at angles the glass transmits, which
+  trapped light in closed glass (a furnace sphere rendered 0.64 at its
+  center). Rough coats or glass keep the custom-curve coat too: a Fresnel layer
+  gains energy there (R + T 1.19 at 40 degrees inside, rough coat over smooth
+  glass) or loses more than the curve (0.66, smooth coat over rough glass). The
+  coat over the opaque part also becomes Fresnel's rather than Schlick's.
+- **Not repaired, logged**: coats of another IOR (R + T 0.946 at 60 degrees
+  inside; 0.87 of the light entering a closed sphere at 85 degrees leaves it),
+  thin films over tinted glass (0.55 of the expected
+  at 41 degrees inside), rough coats (0.74 at 85 degrees, mostly the rough
+  layering loss of opaque surfaces below), coat darkening, OpenPBR fuzz (0.75 at
+  41 degrees inside) and glTF sheen (0.63): libbsdf weights a sheen layer's
+  base by `1 - max(rho(k1), rho(k2))`, the same heuristic, and MDL has no other
+  sheen layer.
+
+Measured with `prism_dielectric_albedo_test -s` (IOR 1.5, 20000 samples,
+lowest R + T over 0 to 85 degrees, with its angle; tinted cases relative to
+R = s F + t (1 - F)):
+
+| configuration | outside before | after | inside before | after |
+|---|---|---|---|---|
+| smooth glass, `specular_color` 0.9999 (split) | 0.9999 | 0.9998 | 0.639 (41) | 0.9998 |
+| rough glass (0.3), `specular_color` 0.9999 | 0.737 (85) | 0.999 | 0.672 (85) | 0.999 |
+| tinted transmission, depth 0 (all three) | 0.992 | 0.995 | 0.574 (41) | 0.995 |
+| tinted `specular_color` (1, 0.5, 0.5) | 0.986 | 0.998 | 0.717 (41) | 0.996 |
+| tinted transmission, rough 0.3 | 0.700 (85) | 0.922 (85) | 0.580 (85) | 0.978 |
+| thin film / iridescence (all three) | 0.992 | 1.000 | 0.615 (41) | 1.000 |
+| thin film, rough 0.3 | 0.734 (85) | 0.999 | 0.671 (85) | 1.000 |
+| smooth coat of the glass's IOR, `coat_darkening` 0 | 1.000 | 1.000 | 0.946 (60) | 1.000 |
+| `standard_surface` coat / glTF clearcoat | 1.000 | 1.000 | 0.778 (41) | 1.000 |
+| `standard_surface` `thin_walled` | 1.000 | 1.000 | 0.639 (41) | 1.000 |
+| `UsdPreviewSurface` opacity 0, roughness 0 | 1.000 | 1.000 | 0.639 (41) | 1.000 |
+| `LamaDielectric`, smooth / rough 0.3 | 1.000 / 0.737 | 1.000 / 0.999 | 0.639 / 0.672 | 1.000 / 1.000 |
+| `LamaGeneralizedSchlick` (defaults) | 0.040 | 1.000 | 0.040 | 1.000 |
+
+Of the light entering a closed smooth sphere at 75 to 85 degrees, 0.74 to
+0.88 left it before (paths through a sphere keep their incidence angle) and
+1.000 after, for every repaired smooth case. After the repair the furnace
+renders the dome (mean 1.0000, worst pixel 0.004 at 16 spp). Thin-walled surfaces don't refract and don't lose energy.
+Material templates keep the weight and the inputs these decisions read
+structural, so a variant never binds onto a prototype rewritten for its seed's
+values. A draft upstream report proposes the RT form for the graphs.
+
+The two helper BSDFs are a node definition and an inline genmdl
+implementation (`sourcecode`, an MDL material expression) added to the
+document that uses them, `ND_prism_fresnel_layer` and
+`ND_prism_dielectric_split`; MaterialX has no node for an MDL Fresnel layer.
+
+### UsdPreviewSurface
+
+With `opacity` below one in transparent mode (`opacityMode` 0, no
+`opacityThreshold`, which makes opacity a cutout) MaterialX's
+`UsdPreviewSurface` graph (the one USD ships) refracts through a
+`dielectric_bsdf` T with `ior`:
+
+    layer(generalized_schlick R (F0 from ior), mix(diffuse, T, opacity))
+
+which MDL turns into a `color_custom_curve_layer` with the same exit loss. The
+graph's transmission is always smooth while the specular lobe has
+`roughness`, so only a smooth specular agrees with it: such surfaces
+(`roughness` 0, `metallic` 0, metalness workflow, no clearcoat) are rewritten
+as `mix(layer(R, diffuse), RT, opacity)`; the opaque part keeps its Schlick
+reflection. A rough specular has no exact form: an RT lobe of that roughness
+would conserve energy but blur the refraction, a large visual change (the
+input's default is 0.5), so rough transparent surfaces keep the graph and its
+loss (R + T 0.71 at 85 degrees outside, 0.64 at 41 inside) and are logged, as
+are the metallic and specular workflows' tinted reflections and the clearcoat.
+
+### Lama
+
+`LamaDielectric` layers its reflection over its transmission over the interior
+VDF, both `dielectric_bsdf` with the same IOR, roughness and frame; with equal
+`reflectionTint` and `transmissionTint` (MaterialX applies each to its lobe on
+both sides) it becomes `layer(RT, VDF)`, exact for rough lobes too. Differing
+tints are logged.
+
+`LamaGeneralizedSchlick`'s reflection is `multiply(R, reflectionTint)` on top
+of a layer, and MaterialX's MDL generator drops a layer's base under a
+`multiply` top, so MDL rendered the reflection only (R + T 0.04). When the
+curve is Fresnel's Schlick approximation (`reflectivity90` white,
+`reflectivityProfile` 0.2, a constant gray reflectivity or IOR) and the tints
+agree, the node becomes the RT dielectric of that IOR over the interior
+(exact; its reflection becomes Fresnel's). Otherwise the tint moves into the
+reflection lobe's `color0` and `color90` (a Schlick curve is linear in them)
+and the lobe becomes the layer's top, which restores the transmission; that
+keeps the exit loss and the graph's second Schlick weight on its transmission
+lobe (T 0.92 at normal incidence) and is logged.
+
+## Energy loss of opaque layered dielectrics (not repaired)
+
+The same libbsdf layering darkens opaque surfaces. A white Lambertian base
+under the specular layer (`open_pbr_surface` `base_color` 1,
+`standard_surface` `base_color` 1) returns R = 0.954 at normal incidence; in a
+white furnace a smooth white sphere renders 0.956 at its center (0.960 with
+`specular_roughness` 0.3) instead of the dome's 1. The OpenPBR specification
+requires 1 here (its glossy-diffuse slab is `E_spec + (1 - E_spec) C`, "which
+guarantees that a white C passes the furnace test"), and so does MaterialX's
+albedo-scaling `layer` in its GLSL and OSL code. Two mechanisms, both in the
+curve layer's base weight `1 - max(c(k1), c(k2))`:
+
+- **Smooth, all angles**: the `c(k2)` term attenuates the diffuse light leaving
+  through the interface but nothing returns the part reflected back into the
+  base (no interreflection, the price of a reciprocal weight). The loss is the
+  cosine-weighted mean of the curve over k2: R = 0.9543 at 0 degrees with
+  MaterialX's Schlick curve, computed and measured alike (0.948 with MDL's
+  `fresnel_layer` and the true IOR, whose mean Fresnel term is larger).
+- **Rough, at grazing angles**: the base is cut by the curve at the macro
+  normal, `c(n.k1)` (0.59 at 85 degrees, the grazing reflectivity being
+  1 - roughness), while the rough lobe reflects only
+  the curve averaged over its microfacets (0.33; the GGX lobe itself returns
+  1.00 with its multiscatter term): R = 0.738 at 85 degrees with
+  `specular_roughness` 0.3.
+
+MDL has no layer that weights a base by the top's directional albedo
+(`fresnel_layer`, `custom_curve_layer`, `measured_curve_layer` and sheen all use
+the same heuristic), so an exact repair needs libbsdf; see the upstream draft.
+Brightening the base (about 1.05 on the diffuse weight) would fix normal
+incidence only and gain about 1.7% at grazing angles, on nearly every opaque
+material, so it is not done.
 
 ## Deliberate non-repairs
 
@@ -235,13 +374,21 @@ clamped; authoring them above one can still reach the same failure.
 conductor clamp, `materialx_loader_types` the color space names, input type
 repairs and layer distribution, and `materialx_loader_transmission` the
 thin-walled expansion and the refraction IOR, `materialx_loader_fresnel` the
-coupled transmission graph. `prism_openpbr_transmission_test`
+coupled transmission graph, `materialx_loader_dielectric` (against MaterialX's
+own library graphs, from the MaterialX install) the split, thin-film, coat,
+thin-walled `standard_surface`, `UsdPreviewSurface` and Lama rewrites.
+`prism_openpbr_transmission_test`
 (main build) samples compiled OpenPBR glass: thin walls transmit undeflected and
 tinted, closed glass refracts with `specular_ior` and carries its medium.
 `prism_dielectric_albedo_test` (main build) samples compiled smooth glass (a
-plain RT `dielectric_bsdf`, `open_pbr_surface`, `standard_surface`, `gltf_pbr`)
-from both sides at six angles: R + T must be 1 and R Fresnel's; `-v [case]`
-prints the table, coated and rough glass included. The
+plain RT `dielectric_bsdf`, the three surfaces plain, tinted, filmed and
+coated, thin-walled `standard_surface`, `UsdPreviewSurface`, `LamaDielectric`,
+`LamaGeneralizedSchlick`) from both sides at six angles: R + T must be 1 (or
+s F + t (1 - F) when tinted) and, where Fresnel's applies, R Fresnel's, and
+light entering a closed sphere must leave it (paths trapped by a total
+internal reflection that disagrees with the refraction show only there);
+`-v [case]` prints the table, `-s [case]` surveys rough, partly repaired and
+opaque models as well, and `-f file.mtlx` surveys a document. The
 `prism_scene_features_glass_furnace_*` checks require the furnace to render the
 dome (mean within 0.001, worst pixel within 0.02). The small standalone test project avoids loading the renderer
 and its USD/MDL runtime dependencies:
