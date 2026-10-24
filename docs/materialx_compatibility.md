@@ -190,7 +190,13 @@ what else is layered on the dielectric:
   so smooth lobes are exact (R = s F, T = t (1 - F), total internal reflection
   included). Rough tinted glass is approximate: R + T is 0.92 of the expected
   at 85 degrees outside with a transmission tint, 0.87 at 40 degrees inside
-  with a tinted `specular_color` (before: 0.70 and 0.84), and is logged.
+  with a tinted `specular_color` (before: 0.70 and 0.84), and is logged: the
+  Fresnel layer weights a rough lobe's base by the heuristic above, and
+  libbsdf compensates multiple scattering only for reflecting GGX lobes, not
+  for a transmit-only one (`df::fresnel_layer` over rough transmission alone
+  loses more than MaterialX's curve layer), so only the RT lobe is exact when
+  rough. With a transmission tint (s = 1 >= t) the rough transmit-only term
+  vanishes.
 - **Coats**: a smooth coat over smooth glass of the same IOR
   (`coat_roughness` and `specular_roughness` 0, `coat_ior` equal to
   `specular_ior`; `standard_surface` `coat_IOR` and `specular_IOR`, both 1.5 by
