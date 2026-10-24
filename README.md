@@ -82,8 +82,7 @@ Mean luminance differs by at most 0.05 %. Details, images and diagnostics: [docs
 For standalone rendering, initialize the same environment with `. ./prism_env.ps1`, then run:
 
 ```powershell
-./build/RelWithDebInfo/PrismRT.exe --export-scene InOneWeekend --seed 0 --output scene.usda
-./build/RelWithDebInfo/PrismRT.exe --scene scene.usda --camera /World/Camera --spp 256 --output render.exr
+./build/RelWithDebInfo/PrismRT.exe --scene assets/scenes/InOneWeekend.usda --camera /World/Camera --spp 256 --output render.exr
 # or every RenderProduct of the scene's RenderSettings, with its RenderVars as EXR layers:
 ./build/RelWithDebInfo/PrismRT.exe --scene scene.usda --output-dir renders
 ```

@@ -62,10 +62,6 @@ void ForEachPlacementMaterial(SceneManager& scene, int id, Geometry* geometry, F
     if (auto* mesh = dynamic_cast<Mesh*>(geometry)) {
         if (mesh->material_override) visit(mesh->material_override);
         for (auto const& [index, material] : mesh->materials) visit(material);
-    } else if (auto* quad = dynamic_cast<Quad*>(geometry)) {
-        visit(quad->material);
-    } else if (auto* box = dynamic_cast<Box*>(geometry)) {
-        visit(box->material);
     }
 }
 
@@ -175,7 +171,7 @@ inline LightTable BuildLightTable(SceneManager& scene, size_t maxEmitterTriangle
     std::vector<int> placements;
     for (auto const& [id, geometry] : scene.geometry) {
         if (!geometry || scene.disabled_placements.contains(id)) continue;
-        if (geometry->type != RTC_GEOMETRY_TYPE_TRIANGLE && geometry->type != RTC_GEOMETRY_TYPE_QUAD) continue;
+        if (geometry->type != RTC_GEOMETRY_TYPE_TRIANGLE) continue;
         bool emits = false;
         ForEachPlacementMaterial(scene, id, geometry, [&](Material* material) {
             if (material && material->constantEmission()) emits = true;
@@ -233,15 +229,6 @@ inline LightTable BuildLightTable(SceneManager& scene, size_t maxEmitterTriangle
             for (size_t i = 0; i < count; ++i) {
                 const unsigned* idx = &mesh->indices[3 * i];
                 add(unsigned(i), vertices + 3 * idx[0], vertices + 3 * idx[1], vertices + 3 * idx[2]);
-            }
-        } else if (vertices) {
-            uint32_t const* quads = static_cast<uint32_t const*>(
-                rtcGetGeometryBufferData(geometry->geom, RTC_BUFFER_TYPE_INDEX, 0));
-            const uint32_t quadCount = dynamic_cast<Box*>(geometry) ? 6u : 1u;
-            for (uint32_t q = 0; quads && q < quadCount; ++q) {
-                uint32_t const* i = quads + 4 * q;
-                add(q, vertices + 3 * i[0], vertices + 3 * i[1], vertices + 3 * i[3]);
-                add(q, vertices + 3 * i[2], vertices + 3 * i[3], vertices + 3 * i[1]);
             }
         }
         if (triangles.size() > maxEmitterTriangles) break;

@@ -442,8 +442,8 @@ parity fixture each and a check in `prism_scene_features_test`:
 - **`doubleSided`** behind `prism:honorDoubleSided` (off by default). With it, a
   back-face hit (the integrator's `front_face`: the transformed winding, so a
   mirroring transform turns a mesh around) on a single-sided triangle is
-  skipped, unless the triangle's material transmits (legacy glass; MDL
-  materials whose BSDF shows a transmission event when probed at load).
+  skipped, unless the triangle's material transmits (MDL materials whose BSDF
+  shows a transmission event when probed at load).
   Camera, BSDF and shadow rays and the geometric AOVs see the same surfaces.
   CPU: the device's ray casts continue past culled back faces
   (`SceneManager::castRayCulled`; `cpu-reference` does not cull); GPU: a cull bit
@@ -610,18 +610,23 @@ Experimental sphere batching accepts uninstanced spheres with translation and po
 Curves, volumes/SSS transport, displacement, subdivision refinement, motion blur, analytic USD lights, arbitrary shader primvars, and multiple simultaneous UV sets are outside this implementation's initial scope. Environment sampling is shared with standalone rendering. Emissive surfaces retain BSDF-path emission; emissive-mesh and analytic-light sampling are deferred. See [material support](hydra_materials.md) for network conversion, asset resolution, opacity, caching, and diagnostics.
 
 
-## Procedural scene export
+## Procedural scenes
 
-The procedural constructors remain available for export and regression tests. Export operates on their instantiated data, preserving stored float RGB values and authored roughness without extra random draws:
+`assets/scenes` holds `InOneWeekend.usda`, `CornellBox.usda` and
+`QuadTest.usda`: the scenes the renderer once hard-coded as C++ classes,
+exported to USD (inline OpenPBR MaterialX networks, USD spheres, polygon
+quads and boxes, camera and lens settings, render resolution; gradient skies
+as a linear EXR companion beside the USDA). The C++ scenes, their materials
+and the `--export-scene` option were removed; the USD files are the scenes now
+(`tests/hydra/validate_exports.py` renders them with both loaders):
 
 ```powershell
-./build/RelWithDebInfo/PrismRT.exe --export-scene InOneWeekend --seed 0 --output scene.usda
-./build/RelWithDebInfo/PrismRT.exe --scene scene.usda --camera /World/Camera --spp 256 --output scene.exr
+./build/RelWithDebInfo/PrismRT.exe --scene assets/scenes/InOneWeekend.usda --camera /World/Camera --spp 256 --output scene.exr
 ```
 
-`CornellBox` and `QuadTest` are also available. Exports contain inline OpenPBR MaterialX networks, USD spheres, polygon quads/boxes, camera/lens settings and render resolution. Gradient skies use a relative linear EXR companion. Keep that companion beside its USDA. Both ingestion paths render USD spheres analytically using Embree sphere-point geometry. The old rough-metal sampler and OpenPBR metal differ even when their numeric roughness is identical; exported legacy scenes are not an assertion of identical BSDF appearance.
+Both ingestion paths render USD spheres analytically using Embree sphere-point geometry.
 
-Sphere prototypes retain local-space geometry and use affine instances for placement, including nonuniform and mirrored transforms. Their silhouettes and normals are independent of usdview's complexity setting. They support prim/instance picking; face IDs are `-1` because implicit spheres have no polygon faces. Export tests compare authored radii and bounds, stored colors, camera rays, and baked sky against the procedural source. Meshes without authored normals use smooth area-weighted per-point normals, matching the standalone USD importer; authored normals retain their interpolation.
+Sphere prototypes retain local-space geometry and use affine instances for placement, including nonuniform and mirrored transforms. Their silhouettes and normals are independent of usdview's complexity setting. They support prim/instance picking; face IDs are `-1` because implicit spheres have no polygon faces. Meshes without authored normals use smooth area-weighted per-point normals, matching the standalone USD importer; authored normals retain their interpolation.
 
 USD dome lighting is read when `--env` is absent. Explicit `--env` overrides it and retains the historical factor-of-two convention. For formats without cameras, supply `--camera-position x,y,z --camera-target x,y,z`, with optional `--camera-up`, `--vfov`, `--focus-distance`, and `--defocus-angle`. Asset-specific local launchers belong in ignored `local/`; tracked configuration templates contain no personal paths. See [deployment](deployment.md).
 

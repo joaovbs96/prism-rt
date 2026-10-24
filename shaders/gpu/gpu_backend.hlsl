@@ -24,7 +24,6 @@ float3 gpu_transform(float3 v, float4 c0, float4 c1, float4 c2)
 
 bool gpu_filtered() { return (gpu_frame().settings.z & kFrameFiltered) != 0u; }
 
-float3 gpu_reflect(float3 i, float3 n) { return i - 2.0f * dot(i, n) * n; }
 
 // ---------------------------------------------------------------------------
 // Hits
@@ -208,7 +207,7 @@ GpuHit gpu_intersect(PathRay ray, uint mask)
     bool placement = (inst.info.y & kInstancePlacement) != 0u;
     bool flip = (inst.info.y & kInstanceFlip) != 0u;
     uint type = proto.info.x;
-    uint localPrimitive = type == kProtoQuads ? raw.primitive / 2u : raw.primitive;
+    uint localPrimitive = raw.primitive;
 
     hit.valid = true;
     hit.t = raw.t;
@@ -278,12 +277,6 @@ GpuHit gpu_intersect(PathRay ray, uint mask)
         hit.v = phi / kPi;
         hit.tangent = float3(outward.z, 0.0f, -outward.x);
         hit.bitangent_sign = -1.0f;
-    } else {
-        // Quads: Embree's (u, v) over the quad, from the triangle pair.
-        if ((raw.primitive & 1u) != 0u) {
-            hit.u = 1.0f - raw.barycentrics.x;
-            hit.v = 1.0f - raw.barycentrics.y;
-        }
     }
 
     if (placement) {
@@ -425,21 +418,6 @@ bool gpu_is_near_zero(float3 v)
     return abs(v.x) < 1e-8f && abs(v.y) < 1e-8f && abs(v.z) < 1e-8f;
 }
 
-float3 gpu_refract(float3 wi, float3 n, float ior)
-{
-    float cosTheta = min(dot(-wi, n), 1.0f);
-    float3 r1 = ior * (wi + cosTheta * n);
-    float3 r2 = -sqrt(abs(1.0f - dot(r1, r1))) * n;
-    return r1 + r2;
-}
-
-float gpu_schlick(float cosine, float ior)
-{
-    float r0 = (1.0f - ior) / (1.0f + ior);
-    r0 = r0 * r0;
-    return r0 + (1.0f - r0) * pow(1.0f - cosine, 5.0f);
-}
-
 BsdfSample gpu_bsdf_sample_empty()
 {
     BsdfSample s;
@@ -486,28 +464,6 @@ BsdfSample gpu_diffuse_sample(SurfaceHit hit, uint colorTexture, bool footprintC
     return s;
 }
 
-// Metal / MetalGltf: perturbed mirror reflection.
-BsdfSample gpu_glossy_sample(SurfaceHit hit, float roughness, float3 color, inout Rng rng)
-{
-    BsdfSample s = gpu_bsdf_sample_empty();
-    s.wi = normalize(normalize(gpu_reflect(hit.d, hit.n)) + roughness * gpu_random_unit_vector(rng));
-    s.color = color;
-    s.scattered = !isZero(s.wi);
-    return s;
-}
-
-// Glass::sample_direction with the given relative IOR.
-float3 gpu_dielectric_direction(SurfaceHit hit, float ior, inout Rng rng)
-{
-    float relative = hit.front_face ? 1.0f / ior : ior;
-    float3 unitDirection = normalize(hit.d);
-    float cosTheta = min(dot(-unitDirection, hit.n), 1.0f);
-    float sinTheta = sqrt(1.0f - cosTheta * cosTheta);
-    if (relative * sinTheta > 1.0f || gpu_schlick(cosTheta, relative) > rng.next())
-        return gpu_reflect(unitDirection, hit.n);
-    return gpu_refract(unitDirection, hit.n, relative);
-}
-
 BsdfSample gpu_legacy_sample(SurfaceHit hit, GpuMaterial material, inout Rng rng)
 {
     uint kind = material.info.x;
@@ -519,35 +475,9 @@ BsdfSample gpu_legacy_sample(SurfaceHit hit, GpuMaterial material, inout Rng rng
         s.color = gpu_fallback_color(hit, material, s.color);
         return s;
     }
-    if (kind == kMaterialMetal) {
-        float roughness = gpu_texture1(material.textures.y, hit, true);
-        BsdfSample s = gpu_glossy_sample(hit, roughness, (float3)0.0f, rng);
-        s.color = gpu_texture3(material.textures.x, hit, true);
-        return s;
-    }
     if (kind == kMaterialEmissive) {
         BsdfSample s = gpu_bsdf_sample_empty();
         s.emission = gpu_texture3(material.textures.x, hit, true) * material.params.x;
-        return s;
-    }
-    if (kind == kMaterialGlass) {
-        BsdfSample s = gpu_bsdf_sample_empty();
-        s.wi = gpu_dielectric_direction(hit, material.params.x, rng);
-        s.color = (float3)1.0f;
-        s.scattered = !isZero(s.wi);
-        s.delta = true;
-        return s;
-    }
-    if (kind == kMaterialDispersive) {
-        BsdfSample s = gpu_bsdf_sample_empty();
-        float choice = rng.next();
-        float ior;
-        if (choice < 0.333f) { ior = material.params.z; s.color = float3(3.0f, 0.0f, 0.0f); }
-        else if (choice < 0.666f) { ior = material.params.x; s.color = float3(0.0f, 3.0f, 0.0f); }
-        else { ior = material.params.y; s.color = float3(0.0f, 0.0f, 3.0f); }
-        s.wi = gpu_dielectric_direction(hit, ior, rng);
-        s.scattered = true;
-        s.delta = true;
         return s;
     }
     return gpu_invalid_sample();
@@ -1003,17 +933,6 @@ struct GpuBackend {
         shading.surface = hit.surface;
         shading.material = hit.material;
         shading.surface.n_g = normalize(shading.surface.n);
-        if ((material.info.w & kMaterialNormalTexture) != 0u) {
-            const float3 sampled = gpu_texture3(material.textures2.x, shading.surface, true);
-            if (!isZero(sampled)) {
-                const float3 tangentNormal = sampled * 2.0f - 1.0f;
-                const float3 ng = shading.surface.n_g;
-                const float3 up = abs(ng.y) < 0.999f ? float3(0.0f, 1.0f, 0.0f) : float3(1.0f, 0.0f, 0.0f);
-                const float3 t = cross(up, ng);
-                const float3 b = cross(ng, t);
-                shading.surface.n = normalize(t * tangentNormal.x + b * tangentNormal.y + ng * tangentNormal.z);
-            }
-        }
 #ifndef PRISM_CALL_MATERIALS
         if (material.info.x == kMaterialMdl) gpu_mdl_init_shading(shading, material);
 #endif

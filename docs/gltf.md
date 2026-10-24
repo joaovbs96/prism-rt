@@ -16,7 +16,6 @@ error material).
 | Front end | glTF |
 | --- | --- |
 | CLI (`PrismRT --scene x.gltf`) | yes (`glTFMesh`) |
-| `SceneManager::add_mesh` | yes, with the MDL context it is given (without one, every material renders with the error material) |
 | Hydra / usdview, or a USD stage referencing a `.gltf` | **no**: the OpenUSD build has no glTF file-format plugin (`usd`, `usda`, `usdc`, `usdz` and `mtlx` only). A follow-up would add one (for example Adobe's `usd-fileformat-plugins`, or a small Sdf file format over the same converter). |
 
 ## Materials that fail

@@ -87,10 +87,6 @@ bool AllMaterialsBlock(SceneManager& scene)
                 if (!blocks(material)) return false;
         } else if (auto* sphere = dynamic_cast<Sphere*>(geometry)) {
             if (!blocks(sphere->material)) return false;
-        } else if (auto* quad = dynamic_cast<Quad*>(geometry)) {
-            if (!blocks(quad->material)) return false;
-        } else if (auto* box = dynamic_cast<Box*>(geometry)) {
-            if (!blocks(box->material)) return false;
         } else if (auto* batch = dynamic_cast<BatchedSpheres*>(geometry)) {
             for (auto const& entry : batch->entries)
                 if (!blocks(entry.material)) return false;

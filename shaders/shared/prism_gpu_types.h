@@ -8,7 +8,7 @@
 
 // Prototype (BLAS) types.
 static const uint kProtoTriangles = 0u;
-static const uint kProtoQuads = 1u;
+// 1 was quads (the former analytic Quad and Box shapes).
 static const uint kProtoSpheres = 2u;
 
 // Instance flags.
@@ -34,16 +34,13 @@ static const uint kMaskAll = 0xFFu;
 static const uint kMaterialInvalid = 0u;     // magenta emission, no scattering
 static const uint kMaterialMdl = 1u;
 static const uint kMaterialDiffuse = 2u;
-static const uint kMaterialMetal = 3u;
 static const uint kMaterialEmissive = 4u;
-static const uint kMaterialGlass = 5u;
-static const uint kMaterialDispersive = 6u;
-// 7 to 10 were the legacy glTF materials.
+// 3 and 5 to 10 were the former Metal, Glass, Dispersive and glTF materials.
 static const uint kMaterialFallback = 11u;   // hydra::FallbackMaterial (Diffuse with an opacity)
 
 // Material flags.
 static const uint kMaterialConstantCutout = 1u;
-static const uint kMaterialNormalTexture = 2u;
+// 2 was kMaterialNormalTexture (the former glTF normal textures).
 // Fallback materials: the hit prototype's displayColor / displayOpacity
 // primvar (kPrimvarDisplay*) replaces the constant colour / opacity.
 static const uint kMaterialPrimvarColor = 4u;
@@ -163,7 +160,7 @@ struct GpuMaterial {
     uint4 textures;  // legacy texture records (kind dependent); MDL programs translated alone
                      // (callables): x read-only data offset (bytes), y texture table, z string
                      // table (32-bit word indices into the read-only data)
-    uint4 textures2; // x: normal texture, y: gltfPBR emission
+    uint4 textures2; // unused (were the former normal texture and gltfPBR emission)
     float4 params;   // kind dependent scalars; params.w: constant cutout opacity
     float4 emitter;  // x: selection density per unit area of its emissive triangles (0: none),
                      // y: 1 if both faces emit

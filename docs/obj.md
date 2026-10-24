@@ -16,7 +16,7 @@ scan, maps, compilation, error material).
 | Front end | OBJ |
 | --- | --- |
 | CLI (`PrismRT --scene x.obj`) | yes (`ObjMesh`) |
-| `SceneManager::add_mesh` | yes, with the MDL context it is given (without one, every material renders with the error material) |
+| `ObjMesh` without an MDL context | every material renders with the error material |
 | Hydra / usdview, or a USD stage referencing an `.obj` | **no**: the OpenUSD build has no OBJ file-format plugin. Adobe's `usd-fileformat-plugins` (below) would add one. |
 
 ## Reference: Adobe's OBJ file-format plugin

@@ -2766,7 +2766,6 @@ bool VulkanDevice::Impl::buildAccelerationStructures(std::string* error)
             aabbs.stride = sizeof(VkAabbPositionsKHR);
             build.geometry.flags = 0; // procedural hits are resolved by the ray query
         } else {
-            if (proto.info.x == kProtoQuads) primitives *= 2;
             uint32_t maxVertex = 0;
             for (size_t i = size_t(proto.info.z) * 3; i < size_t(proto.info.z + primitives) * 3; ++i)
                 maxVertex = std::max(maxVertex, d.indices[i]);

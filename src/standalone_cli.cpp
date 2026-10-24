@@ -60,7 +60,7 @@ std::string DefaultDomeTexture()
 
 struct Options {
     std::string scene, camera, environment, output = "output.exr";
-    std::string exportScene, environmentSampling = "mis", textureFiltering = "filtered";
+    std::string environmentSampling = "mis", textureFiltering = "filtered";
     // UsdRender settings prim (empty: the stage's renderSettingsPrimPath) and
     // the directory its relative product names resolve against.
     std::string renderSettings, outputDirectory;
@@ -94,7 +94,6 @@ struct Options {
 void help() {
     std::cout << "PrismRT --scene FILE --camera /Camera [options]\n"
         "PrismRT --scene FILE --camera-position x,y,z --camera-target x,y,z [options]\n"
-        "PrismRT --export-scene InOneWeekend|CornellBox|QuadTest --seed 0 --output scene.usda\n"
         "  Supported scene formats: USD, glTF, GLB, OBJ\n"
         "  --camera-up 0,1,0 --vfov 40 --focus-distance 10 --defocus-angle 0\n"
         "  --env FILE --env-exposure STOPS (or --env-color r,g,b)\n"
@@ -187,7 +186,6 @@ Options parse(int argc, char** argv) {
         const std::string value = argv[++i];
         o.given.insert(key);
         if (key == "--scene") o.scene = value;
-        else if (key == "--export-scene") o.exportScene = value;
         else if (key == "--camera") o.camera = value;
         else if (key == "--camera-position") o.cameraPosition = triple(value);
         else if (key == "--camera-target") o.cameraTarget = triple(value);
@@ -257,11 +255,6 @@ Options parse(int argc, char** argv) {
             }
         }
         else throw std::runtime_error("Unknown option: " + key);
-    }
-    if (!o.exportScene.empty()) {
-        if (!o.scene.empty() || !o.camera.empty() || o.cameraPosition || o.cameraTarget)
-            throw std::runtime_error("--export-scene cannot be combined with scene or camera options");
-        return o;
     }
     // The camera may also come from the stage's render settings.
     if (o.scene.empty())
@@ -618,19 +611,9 @@ int runStandaloneCli(int argc, char** argv) {
         // Outlives the printer, whose thread reads it (also while an error
         // unwinds).
         prism::device::ImageProgress imageProgress;
-        ProgressPrinter progress(o.progress && o.exportScene.empty());
+        ProgressPrinter progress(o.progress);
         EmbreeDevice device;
         if (!device.value) throw std::runtime_error("Cannot create Embree device");
-        if (!o.exportScene.empty()) {
-            unsigned seed = o.seed;
-            auto exportScene = [&](auto& scene) { scene.exportToUSDA(o.output); };
-            if (o.exportScene == "InOneWeekend") { InOneWeekendFinal s(device.value, seed); exportScene(s); }
-            else if (o.exportScene == "CornellBox") { CornellBox s(device.value, seed); exportScene(s); }
-            else if (o.exportScene == "QuadTest") { QuadTest s(device.value, seed); exportScene(s); }
-            else throw std::runtime_error("Unknown procedural scene: " + o.exportScene);
-            std::cout << "Exported " << o.exportScene << " to " << o.output << '\n';
-            return 0;
-        }
         auto start = std::chrono::steady_clock::now();
         auto seconds =[&] { return std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count(); };
         const auto extension = std::filesystem::path(o.scene).extension().string();

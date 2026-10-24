@@ -511,6 +511,27 @@ called done there.
     --mean-tolerance 0.02` (Vulkan: NRMSE 0.0032), and the glass and
     emissive fixtures checked with `prism_obj_material_test --check-glass` /
     `--check-emissive` on Metal renders.
+- **Hard-coded scenes and their materials removed** (`Metal`, `Glass`,
+  `Dispersive`, the analytic `Quad` and `Box`, normal textures):
+  - Shared shader code: `shaders/gpu/gpu_backend.hlsl` loses the
+    `kMaterialMetal`, `kMaterialGlass` and `kMaterialDispersive` branches of
+    `gpu_legacy_sample` (and `gpu_glossy_sample`, `gpu_dielectric_direction`,
+    `gpu_refract`, `gpu_schlick`, `gpu_reflect`), the normal-texture block of
+    `prepare` (`kMaterialNormalTexture`), and the quad case of the hit
+    (`kProtoQuads`: primitive halving and the quad (u, v)).
+    `shaders/shared/prism_gpu_types.h` drops those constants; the remaining
+    ones keep their values, and `GpuMaterial.textures2` stays (unused) so the
+    buffer layout and stride are unchanged.
+  - Device code: `src/device/metal/metal_device.mm` builds triangle geometry
+    with `proto.info.w` triangles (no quad doubling); the Vulkan device
+    likewise. Shared host code: `src/device/gpu/gpu_scene.cpp` (no quad
+    prototypes, no Metal/Glass/Dispersive translation),
+    `src/device/light_table.h` (emissive triangles only).
+  - Runs: the Metal shaders compile; `ctest -R "prism_parity|prism_scene_features"`
+    on the CPU, then on Metal the `glass_furnace.usda` and
+    `display_color_interpolation.usda` fixtures with the CLI (`--device
+    metal`) against their CPU renders (`prism_compare_images`), and chess and
+    an egg (unchanged: no shape or material they use was touched).
 
 ## Diagnostics
 

@@ -1,5 +1,11 @@
 # InOneWeekend render-cost comparison
 
+> **Historical.** `prism_render_cost_benchmark` (and
+> `tests/benchmark_texture_access.py`, which drove it) compared the hard-coded
+> C++ InOneWeekend scene with its USD export on the original recursive
+> integrator. Both the C++ scenes and that integrator were removed, and the
+> benchmark with them; the measurements below are kept as a record.
+
 The original procedural gradient and the exported HDR sky take very different
 rendering paths. The first controlled comparison identifies environment
 evaluation, rather than geometry or MDL execution, as the dominant cost of the

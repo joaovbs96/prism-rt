@@ -80,10 +80,6 @@ public:
         record.textures2 = {kTextureNone, kTextureNone, 0, 0};
         record.params.w = 1.0f;
         if (material) {
-            if (material->normal_texture) {
-                record.info.w |= kMaterialNormalTexture;
-                record.textures2.x = texture(material->normal_texture);
-            }
             if (auto const* mdl = dynamic_cast<MDLMaterial const*>(material)) {
                 if (mdl->is_valid()) {
                     record.info.x = kMaterialMdl;
@@ -96,19 +92,9 @@ public:
                 record.params.x = fallback->opacity();
                 if (fallback->primvarColor()) record.info.w |= kMaterialPrimvarColor;
                 if (fallback->primvarOpacity()) record.info.w |= kMaterialPrimvarOpacity;
-            } else if (auto const* dispersive = dynamic_cast<Dispersive const*>(material)) {
-                record.info.x = kMaterialDispersive;
-                record.params = {dispersive->iorD(), dispersive->iorF(), dispersive->iorC(), 1.0f};
-            } else if (auto const* glass = dynamic_cast<Glass const*>(material)) {
-                record.info.x = kMaterialGlass;
-                record.params.x = glass->getIor();
             } else if (auto const* diffuse = dynamic_cast<Diffuse const*>(material)) {
                 record.info.x = kMaterialDiffuse;
                 record.textures.x = texture(diffuse->diffuse_color);
-            } else if (auto const* metal = dynamic_cast<Metal const*>(material)) {
-                record.info.x = kMaterialMetal;
-                record.textures.x = texture(metal->specular_color);
-                record.textures.y = texture(metal->specular_roughness);
             } else if (auto const* emissive = dynamic_cast<Emissive const*>(material)) {
                 record.info.x = kMaterialEmissive;
                 record.textures.x = texture(emissive->emissive_color);
@@ -202,29 +188,7 @@ public:
                     m_data.primvarNames.push_back(primvar.name);
                 }
             }
-        } else if (geometry->type == RTC_GEOMETRY_TYPE_QUAD) {
-            // Embree splits quad (v0, v1, v2, v3) into (v0, v1, v3) and
-            // (v2, v3, v1); the kernel restores the quad parameterization.
-            record.info.x = kProtoQuads;
-            record.info.z = uint32_t(m_data.indices.size() / 3);
-            const int vertexCount = geometry->vertex_count;
-            float const* vertices = static_cast<float const*>(
-                rtcGetGeometryBufferData(geometry->geom, RTC_BUFFER_TYPE_VERTEX, 0));
-            uint32_t const* quads = static_cast<uint32_t const*>(
-                rtcGetGeometryBufferData(geometry->geom, RTC_BUFFER_TYPE_INDEX, 0));
-            const uint32_t quadCount = dynamic_cast<Box*>(geometry) ? 6u : 1u;
-            for (int v = 0; v < vertexCount; ++v) {
-                pushVertex(vertices + 3 * v);
-                m_data.normals.insert(m_data.normals.end(), {0.0f, 0.0f, 0.0f});
-                m_data.texcoords.insert(m_data.texcoords.end(), {0.0f, 0.0f});
-                m_data.tangents.insert(m_data.tangents.end(), {0.0f, 0.0f, 0.0f, 1.0f});
-            }
-            for (uint32_t q = 0; q < quadCount; ++q) {
-                uint32_t const* i = quads + 4 * q;
-                m_data.indices.insert(m_data.indices.end(), {i[0], i[1], i[3], i[2], i[3], i[1]});
-            }
-            record.info.w = quadCount;
-        } else if (geometry->type == RTC_GEOMETRY_TYPE_SPHERE_POINT) {
+                } else if (geometry->type == RTC_GEOMETRY_TYPE_SPHERE_POINT) {
             record.info.x = kProtoSpheres;
             record.info.z = uint32_t(m_data.spheres.size());
             uint32_t count = 0;

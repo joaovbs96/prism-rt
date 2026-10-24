@@ -12,10 +12,8 @@
 #include <embree4/rtcore_common.h>
 
 // project libraries
-#include "frame_buffer.h"
 #include "float3.h"
 #include "ray.h"
-#include "camera.h"
 #include "sampling.h"
 #include "material.h"
 #include "geometry.h"
@@ -48,50 +46,10 @@ public:
         bool flipOrientation = false;
         bool mirrored = false;
     };
-    // Export the instantiated procedural scene without regenerating its RNG.
-    // Call before commitScene(), which bakes geometry transforms.
-    void exportToUSDA(const std::filesystem::path& path) const;
-
     SceneManager(RTCDevice &device_)
     {
         device = &device_;
         scene = rtcNewScene(*device);
-    }
-
-    std::filesystem::path getAssetsPath()
-    {
-        return getExecutableFolder() / "assets";
-    }
-
-    Geometry *add_mesh(
-        const std::filesystem::path &file_path,
-        Material *material_override = nullptr,
-        mdl::Context* mdl_context = nullptr,
-        const std::string& mx_libraries_path = "",
-        const std::string& mx_mdl_path = ""
-    )
-    {
-        if (!std::filesystem::exists(file_path))
-            throw std::runtime_error("File not found: " + file_path.string());
-
-        Mesh *mesh = nullptr;
-        if (file_path.extension() == ".obj")
-            mesh = new ObjMesh(file_path, mdl_context, mx_libraries_path, mx_mdl_path);
-        else if ((file_path.extension() == ".gltf") || (file_path.extension() == ".glb"))
-            mesh = new glTFMesh(file_path, mdl_context, mx_libraries_path, mx_mdl_path);
-        else if ((file_path.extension() == ".usd") || (file_path.extension() == ".usda") || (file_path.extension() == ".usdz") || (file_path.extension() == ".usdc"))
-            mesh = new USDMesh(file_path, mdl_context, mx_libraries_path, mx_mdl_path);
-        else
-            throw std::runtime_error("Unsupported scene format: " +
-                                     file_path.extension().string());
-
-        if (material_override != nullptr)
-        {
-            mesh->material_override = material_override;
-        }
-
-        attachImportedMesh(mesh);
-        return mesh;
     }
 
     // USD imports can contain triangle meshes and analytic sphere placements.
@@ -118,30 +76,6 @@ public:
                 placement_materials[sphere.id].fallback = sphere.material;
             }
         }
-    }
-
-    Geometry *add_sphere(const Float3 &pos, float r, Material *material)
-    {
-        Sphere *sphere = new Sphere(pos, r, material);
-        int geomID = sphere->setupEmbree(*device, scene);
-        geometry[geomID] = sphere;
-        return sphere;
-    }
-
-    Geometry *add_quad(const Float3 &q, const Float3 &u, const Float3 &v, Material *material_)
-    {
-        Quad *quad = new Quad(q, u, v, material_);
-        int geomID = quad->setupEmbree(*device, scene);
-        geometry[geomID] = quad;
-        return quad;
-    }
-
-    Geometry *add_box(const Float3 &a, const Float3 &b, Material *material_)
-    {
-        Box *box = new Box(a, b, material_);
-        int geomID = box->setupEmbree(*device, scene);
-        geometry[geomID] = box;
-        return box;
     }
 
     RTCRayHit intersectRaw(prism::PathRay const &pathRay)
@@ -636,9 +570,6 @@ public:
     // empty without linking. Placements missing here belong to none.
     std::unordered_map<int, std::pair<uint32_t, uint32_t>> placement_link_masks;
     bool lightLinking = false;
-    Camera cam;
-    int image_width = 1280;
-    int image_height = 720;
     int rr_min_depth = 4;
     int max_depth = 32;
     bool environmentSampling = true;
@@ -721,131 +652,4 @@ public:
         return result;
     }
     RayHit castRayCulled(RTCRay ray, bool culling) { return castRayCulled(prism::PathRay{ray, {}}, culling); }
-};
-
-
-
-class InOneWeekendFinal : public SceneManager
-{
-public:
-    InOneWeekendFinal(RTCDevice device_, unsigned int &seed) : SceneManager(device_)
-    {
-        std::cout << "Started scene initialization." << std::endl;
-        add_sphere(Float3(0, -1000, 0), 1000, new Diffuse(new ColorTexture(Color3(0.5f))));
-
-        for (int x = -11; x < 11; x++)
-        {
-            for (int y = -11; y < 11; y++)
-            {
-                float rnd_ = rnd(seed);
-                Float3 center = Float3(x + 0.9 * rnd(seed), 0.2, y + 0.9 * rnd(seed));
-
-                if ((center - Float3(4.0, 0.2, 0.0)).length() > 0.9f)
-                {
-                    if (rnd_ < 0.8f)
-                    {
-                        add_sphere(center, 0.2f, new Diffuse(new ColorTexture(Color3(rnd(seed), rnd(seed), rnd(seed)))));
-                    }
-                    else if (rnd_ < 0.95f)
-                    {
-                        add_sphere(center, 0.2f, new Metal(new ColorTexture(Color3(rnd(seed), rnd(seed), rnd(seed))), new ValueTexture<float>(rnd(seed))));
-                    }
-                    else
-                    {
-                        add_sphere(center, 0.2f, new Glass(1.5f));
-                    }
-                }
-            }
-        }
-
-        add_sphere(Float3(0, 1, 0), 1.0f, new Glass(1.5f));
-        add_sphere(Float3(-4, 1, 0), 1.0f, new Diffuse(new ColorTexture(Color3(0.4, 0.2, 0.1))));
-        add_sphere(Float3(4, 1, 0), 1.0f, new Metal(new ColorTexture(Color3(0.7, 0.6, 0.5)), new ValueTexture<float>(0.0)));
-
-        std::cout << "Finished geometry creation." << std::endl;
-
-        // camera initialization
-        Float3 position(13, 2, 3);
-        Float3 target(0.0f);
-        Float3 up(0.0f, 1.0f, 0.0f);
-        float vfov = 20;
-        cam = Camera(position, target, up, 1280, 720, 16.0f / 9.0f, vfov, 0.6f, 10.0f);
-
-        // environment map - for missed rays
-        environment = new GradientBackground(new ColorTexture(Color3(1.0, 1.0, 1.0)), new ColorTexture(Color3(0.5, 0.7, 1.0)));
-    }
-};
-
-
-
-
-
-class QuadTest : public SceneManager
-{
-public:
-    QuadTest(RTCDevice device_, unsigned int &seed) : SceneManager(device_)
-    {
-        std::cout << "Started scene initialization." << std::endl;
-        add_quad(Float3(-3, -2, 5), Float3(0, 0, -4), Float3(0, 4, 0), new Diffuse(new ColorTexture(Color3(0.2, 1.0, 0.2))));
-        add_quad(Float3(-2, -2, 0), Float3(4, 0, 0), Float3(0, 4, 0), new Diffuse(new ColorTexture(Color3(0.2, 1.0, 0.2))));
-        add_quad(Float3(3, -2, 1), Float3(0, 0, 4), Float3(0, 4, 0), new Diffuse(new ColorTexture(Color3(0.2, 1.0, 0.2))));
-        add_quad(Float3(-2, 3, 1), Float3(4, 0, 0), Float3(0, 0, 4), new Diffuse(new ColorTexture(Color3(0.2, 1.0, 0.2))));
-        add_quad(Float3(-2, -3, 5), Float3(4, 0, 0), Float3(0, 0, -4), new Diffuse(new ColorTexture(Color3(0.2, 1.0, 0.2))));
-
-        std::cout << "Finished geometry creation." << std::endl;
-
-        // camera initialization
-        image_width = 1280;
-        image_height = 1280;
-        Float3 position(0.0, 0.0, 9.0);
-        Float3 target(0.0f);
-        Float3 up(0.0f, 1.0f, 0.0f);
-        float vfov = 80;
-        cam = Camera(position, target, up, image_width, image_height, float(image_width) / image_height, vfov, 0.0f, 10.0f);
-
-        // environment map - for missed rays
-        environment = new GradientBackground(new ColorTexture(Color3(1.0, 1.0, 1.0)), new ColorTexture(Color3(0.5, 0.7, 1.0)));
-    }
-};
-
-class CornellBox : public SceneManager
-{
-public:
-    CornellBox(RTCDevice device_, unsigned int &seed) : SceneManager(device_)
-    {
-        std::cout << "Started scene initialization." << std::endl;
-        Material *red = new Diffuse(new ColorTexture(Color3(.65, .05, .05)));
-        Material *white = new Diffuse(new ColorTexture(Color3(.73, .73, .73)));
-        Material *green = new Diffuse(new ColorTexture(Color3(.12, .45, .15)));
-        Material *light = new Emissive(new ColorTexture(Color3(1.0f)), 15.f);
-
-        add_quad(Float3(555, 0, 0), Float3(0, 555, 0), Float3(0, 0, 555), green);
-        add_quad(Float3(0, 0, 0), Float3(0, 555, 0), Float3(0, 0, 555), red);
-        add_quad(Float3(343, 554, 332), Float3(-130, 0, 0), Float3(0, 0, -105), light);
-        add_quad(Float3(0, 0, 0), Float3(555, 0, 0), Float3(0, 0, 555), white);
-        add_quad(Float3(555, 555, 555), Float3(-555, 0, 0), Float3(0, 0, -555), white);
-        add_quad(Float3(0, 0, 555), Float3(555, 0, 0), Float3(0, 555, 0), white);
-
-        Geometry *box1 = add_box(Float3(0.f), Float3(165, 330, 165), white);
-        box1->transform->translate(265, 0, 295);
-        box1->transform->rotateY(15);
-
-        Geometry *box2 = add_box(Float3(0.0f), Float3(165, 165, 165), white);
-        box2->transform->rotateY(-18);
-        box2->transform->translate(130, 0, 65);
-
-        std::cout << "Finished geometry creation." << std::endl;
-
-        // camera initialization
-        image_width = 1280;
-        image_height = 1280;
-        Float3 position(278, 278, -800);
-        Float3 target(278, 278, 0);
-        Float3 up(0.0f, 1.0f, 0.0f);
-        float vfov = 40;
-        cam = Camera(position, target, up, image_width, image_height, float(image_width) / image_height, vfov, 0.0f, 10.0f);
-
-        // environment map - for missed rays
-        environment = new ConstantColorBackground(new ColorTexture(Color3(0.0f)));
-    }
 };

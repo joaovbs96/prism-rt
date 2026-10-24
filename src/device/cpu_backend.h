@@ -219,8 +219,7 @@ struct CpuBackend {
         if (!found->second.twoSided && !hit.surface.front_face) return 0.0f;
         auto geometry = scene->geometry.find(int(hit.surface.instance));
         if (geometry == scene->geometry.end() || !geometry->second ||
-            (geometry->second->type != RTC_GEOMETRY_TYPE_TRIANGLE &&
-             geometry->second->type != RTC_GEOMETRY_TYPE_QUAD))
+            geometry->second->type != RTC_GEOMETRY_TYPE_TRIANGLE)
             return 0.0f;
         return found->second.pdfArea;
     }

@@ -401,7 +401,7 @@ bool MetalDevice::Impl::buildAccelerationStructures(bool keepPrimitives, std::st
             triangles.indexBuffer = buffers[kSlotIndices];
             triangles.indexBufferOffset = NSUInteger(proto.info.z) * 12;
             triangles.indexType = MTLIndexTypeUInt32;
-            triangles.triangleCount = proto.info.x == kProtoQuads ? 2 * proto.info.w : proto.info.w;
+            triangles.triangleCount = proto.info.w;
             triangles.opaque = YES;
             geometry = triangles;
         }
