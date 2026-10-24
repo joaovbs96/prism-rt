@@ -294,25 +294,29 @@ void SssFallback(Image const& image)
 }
 
 // glass_furnace.usda, 64x64: the glass sphere and the transparent card look
-// like the white dome: no energy gained, and little lost (MDL's OpenPBR
-// dielectric is not exactly energy preserving: the sphere renders about 3.5%
-// darker, 1.3% of the image, the same with BSDF sampling only), and no pixel
-// far from it. That delta paths are not MIS weighted is checked by comparing
-// MIS with BSDF-only renders (prism_scene_features_glass_furnace_sampling).
+// like the white dome: no energy gained or lost, on average or in any pixel.
+// (Before DocumentLoader coupled OpenPBR's reflection and transmission, MDL's
+// custom-curve layer lost light leaving the sphere: mean 0.987, the sphere
+// 3% dark; docs/materialx_compatibility.md.) The only loss left is paths
+// still inside the sphere at the depth limit. That delta paths are not MIS
+// weighted is checked by comparing MIS with BSDF-only renders
+// (prism_scene_features_glass_furnace_sampling).
 void GlassFurnace(Image const& image)
 {
-    double sum = 0.0, squares = 0.0;
+    double sum = 0.0, squares = 0.0, worst = 0.0;
     for (int y = 0; y < image.height; ++y)
         for (int x = 0; x < image.width; ++x)
             for (int c = 0; c < 3; ++c) {
                 const double v = image.At(x, y, c);
                 sum += v;
                 squares += (v - 1.0) * (v - 1.0);
+                worst = std::max(worst, std::abs(v - 1.0));
             }
     const double count = 3.0 * image.width * image.height;
     const float mean = float(sum / count), rms = float(std::sqrt(squares / count));
-    Check(mean >= 0.98f && mean <= 1.002f, Describe("the image is the dome on average", mean));
-    Check(rms <= 0.05f, Describe("the RMS difference from the dome", rms));
+    Check(std::abs(mean - 1.0f) <= 0.001f, Describe("the image is the dome on average", mean));
+    Check(rms <= 0.002f, Describe("the RMS difference from the dome", rms));
+    Check(worst <= 0.02, Describe("the largest pixel difference from the dome", float(worst)));
 }
 
 } // namespace

@@ -654,6 +654,11 @@ if(PRISM_BUILD_HYDRA)
         add_test(NAME prism_openpbr_transmission_test COMMAND prism_openpbr_transmission_test)
         set_tests_properties(prism_openpbr_transmission_test PROPERTIES
             ENVIRONMENT "${_prism_test_environment}" SKIP_RETURN_CODE 77)
+        add_executable(prism_dielectric_albedo_test tests/dielectric_albedo.cpp)
+        target_link_libraries(prism_dielectric_albedo_test PRIVATE PrismRT::core)
+        add_test(NAME prism_dielectric_albedo_test COMMAND prism_dielectric_albedo_test)
+        set_tests_properties(prism_dielectric_albedo_test PROPERTIES
+            ENVIRONMENT "${_prism_test_environment}" SKIP_RETURN_CODE 77)
     endif()
     # The CLI must exit cleanly: process-wide caches holding MDL handles once outlived
     # libmdl_sdk and crashed in static destruction after the image was written.
