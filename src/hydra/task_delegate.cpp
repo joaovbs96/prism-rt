@@ -246,7 +246,7 @@ HdRenderSettingDescriptorList PrismTaskDelegate::GetRenderSettingDescriptors() c
             {"Texture filtering", _textureFiltering, VtValue(std::string("filtered"))},
             {"GPU texture streaming", _textureStreaming, VtValue(true)},
             {"Settle streamed textures before rendering", _textureStreamingPrepass, VtValue(false)},
-            {"Device (auto, cpu, cpu-reference, vulkan, metal)", _device, VtValue(std::string("auto"))},
+            {"Device (auto, cpu, vulkan, metal)", _device, VtValue(std::string("auto"))},
             {"CPU preview while the GPU prepares", _gpuPreparationPreview, VtValue(true)},
             {"CPU preview scene limit (MiB, 0 unlimited)", _gpuPreparationPreviewMaxMiB, VtValue(8192)},
             {"Resource revision", _resourceRevision, VtValue(0)},
@@ -475,7 +475,11 @@ void PrismTaskDelegate::SetRenderSetting(TfToken const &key, VtValue const &valu
             ? value.UncheckedGet<std::string>()
             : value.UncheckedGet<TfToken>().GetString();
         if (!prism::device::ParseDevicePreference(name, &s.device)) {
-            TF_WARN("PrismRT: prism:device must be auto, cpu, cpu-reference, vulkan or metal; retaining the previous device");
+            const std::string removed = prism::device::RemovedDeviceMessage(name);
+            if (!removed.empty())
+                TF_WARN("PrismRT: prism:device: %s; retaining the previous device", removed.c_str());
+            else
+                TF_WARN("PrismRT: prism:device must be auto, cpu, vulkan or metal; retaining the previous device");
             return;
         }
     }

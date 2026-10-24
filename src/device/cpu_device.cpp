@@ -1,6 +1,5 @@
-// CPU render device. The loops below are the former standalone and Hydra
-// render loops. The reference variant traces with SceneManager::trace exactly
-// as before; the default variant runs the shared integrator per sample.
+// CPU render device: the standalone and Hydra render loops, running the
+// shared integrator (shaders/integrator) per sample on the CPU backend.
 
 #include "cpu_device.h"
 #include "cpu_backend.h"
@@ -41,20 +40,6 @@ struct WorkCounter {
         if (total && value) total->fetch_add(value, std::memory_order_relaxed);
     }
 };
-
-Color3 ShadeSample(Color3 color, SceneManager::PrimaryOutcome outcome,
-                   SampleShading const& shading, float* coverage)
-{
-    *coverage = shading.transparentEscapes &&
-        outcome == SceneManager::PrimaryOutcome::Escaped ? 0.0f : 1.0f;
-    if (*coverage == 0.0f) color = Color3(0.0f);
-    if (shading.sampleClamp > 0.0f) {
-        const float peak = color.max_component();
-        if (peak > shading.sampleClamp) color *= shading.sampleClamp / peak;
-    }
-    color *= shading.exposureScale;
-    return color;
-}
 
 // A material whose cutout opacity is 1 everywhere: shadow rays stop at it.
 bool AlwaysBlocks(Material* material)
@@ -147,10 +132,9 @@ std::shared_ptr<const CpuSceneState> CpuDevice::PreparedScene(SceneManager& scen
 DeviceInfo CpuDevice::Info() const
 {
     DeviceInfo info;
-    info.kind = m_reference ? DeviceKind::CpuReference : DeviceKind::Cpu;
+    info.kind = DeviceKind::Cpu;
     const unsigned threads = std::max(1u, std::thread::hardware_concurrency());
-    info.name = std::string(m_reference ? "CPU reference integrator" : "CPU") +
-        " (Embree, " + std::to_string(threads) + " threads)";
+    info.name = "CPU (Embree, " + std::to_string(threads) + " threads)";
     info.hardwareRayTracing = false;
     return info;
 }
@@ -167,35 +151,6 @@ std::vector<float> CpuDevice::RenderImage(SceneManager& scene, ImageRequest cons
         progress->samples.store(0.0, std::memory_order_relaxed);
         progress->activeFraction.store(1.0, std::memory_order_relaxed);
     }
-    if (m_reference) {
-        std::atomic<int> rowsDone{0};
-        tbb::parallel_for(0, height, [&](int y) {
-            for (int x = 0; x < width; ++x) {
-                unsigned seed = tea<64>(unsigned(y*width) ^ request.seed, unsigned(x));
-                Color3 sum(0);
-                for (int sample = 0; sample < request.samples; ++sample) {
-                    const auto pair = prism::GenerateCameraRays(
-                        request.camera, static_cast<unsigned int>(x),
-                        static_cast<unsigned int>(y), static_cast<unsigned int>(width),
-                        static_cast<unsigned int>(height), seed);
-                    const prism::PathRay r{pair.sampled, pair.footprint};
-                    Color3 value = scene.trace(r, 0, Float3(1), seed);
-                    const float peak = value.max_component();
-                    if (request.sampleClamp > 0 && peak > request.sampleClamp)
-                        value *= request.sampleClamp / peak;
-                    sum += value;
-                }
-                sum /= float(request.samples);
-                const size_t offset = (size_t(y)*width+x)*3;
-                for (int c = 0; c < 3; ++c) pixels[offset+c] = sum[c];
-            }
-            if (progress)
-                progress->samples.store(double(request.samples) * (rowsDone.fetch_add(1) + 1) / height,
-                                        std::memory_order_relaxed);
-        });
-        return pixels;
-    }
-
     const CameraParams camera = ToCameraParams(request.camera);
     const auto state = PreparedScene(scene);
     const SampleSettings settings = {request.sampleClamp, 1.0f, false, request.contributions,
@@ -293,7 +248,7 @@ void CpuDevice::RenderPass(SceneManager& scene, PassRequest const& request)
     auto abandoned = [&] { return request.abandoned && request.abandoned(); };
     auto paused = [&] { return request.paused && request.paused(); };
     const CameraParams camera = ToCameraParams(request.camera);
-    const auto state = m_reference ? std::make_shared<const CpuSceneState>() : PreparedScene(scene);
+    const auto state = PreparedScene(scene);
     const SampleSettings settings = {request.shading.sampleClamp,
         request.shading.exposureScale, request.shading.transparentEscapes, kContributionAll,
         request.shading.nee.probabilityMin, request.shading.nee.fromDepth,
@@ -339,33 +294,17 @@ void CpuDevice::RenderPass(SceneManager& scene, PassRequest const& request)
                             }
                             unsigned int &seed = request.rngStates[pixel];
                             if (request.sample == 0) seed = tea<64>((y * width) ^ request.seed, x);
-                            if (!m_reference) {
-                                if (tracePrimary)
-                                    centers[(y-tile.y)*tile.width+x-tile.x] =
-                                        prism::MakeCameraRayWithLens(request.camera,
-                                            static_cast<float>(x) + 0.5f,
-                                            static_cast<float>(y) + 0.5f,
-                                            width, height, nullptr);
-                                const auto result = TraceSample(scene, *state, camera, settings, x, y, width,
-                                    height, seed, unsigned(request.sample), seedPass(x, y, width, request.seed));
-                                ++colorWork.value;
-                                request.colors[pixel] = ToFloat3(result.color);
-                                request.coverage[pixel] = result.coverage;
-                                continue;
-                            }
-                            prism::CameraRayPair rays = prism::GenerateCameraRays(
-                                request.camera, x, y, width, height, seed);
                             if (tracePrimary)
-                                centers[(y-tile.y)*tile.width+x-tile.x] = rays.center;
-                            SceneManager::PrimaryOutcome outcome = SceneManager::PrimaryOutcome::Unresolved;
-                            Color3 c = scene.trace(
-                                prism::PathRay{rays.sampled, rays.footprint},
-                                0, Color3(1.0f), seed, &outcome);
+                                centers[(y-tile.y)*tile.width+x-tile.x] =
+                                    prism::MakeCameraRayWithLens(request.camera,
+                                        static_cast<float>(x) + 0.5f,
+                                        static_cast<float>(y) + 0.5f,
+                                        width, height, nullptr);
+                            const auto result = TraceSample(scene, *state, camera, settings, x, y, width,
+                                height, seed, unsigned(request.sample), seedPass(x, y, width, request.seed));
                             ++colorWork.value;
-                            float coverage;
-                            c = ShadeSample(c, outcome, request.shading, &coverage);
-                            request.colors[pixel] = c;
-                            request.coverage[pixel] = coverage;
+                            request.colors[pixel] = ToFloat3(result.color);
+                            request.coverage[pixel] = result.coverage;
                         }
                     }
                     auto primaryStart = Clock::now();
@@ -406,7 +345,7 @@ bool CpuDevice::RenderPreview(SceneManager& scene, PreviewRequest const& request
     std::atomic<bool> cancelled{false};
     auto stopRequested = [&] { return request.stopRequested && request.stopRequested(); };
     const CameraParams camera = ToCameraParams(request.camera);
-    const auto state = m_reference ? std::make_shared<const CpuSceneState>() : PreparedScene(scene);
+    const auto state = PreparedScene(scene);
     const SampleSettings settings = {request.shading.sampleClamp,
         request.shading.exposureScale, request.shading.transparentEscapes, kContributionAll,
         request.shading.nee.probabilityMin, request.shading.nee.fromDepth,
@@ -434,27 +373,13 @@ bool CpuDevice::RenderPreview(SceneManager& scene, PreviewRequest const& request
             unsigned int seed = tea<64>(
                 ((py * previewWidth + px) ^ request.seed) ^ 0x9e3779b9u,
                 (px + 0x85ebca6bu) ^ (py * 0xc2b2ae35u));
-            Color3 color;
-            float coverage;
-            RTCRay center;
-            if (m_reference) {
-                prism::CameraRayPair rays = prism::GenerateCameraRays(
-                    request.camera, x, y, width, height, seed);
-                SceneManager::PrimaryOutcome outcome = SceneManager::PrimaryOutcome::Unresolved;
-                color = scene.trace(
-                    prism::PathRay{rays.sampled, rays.footprint},
-                    0, Color3(1.0f), seed, &outcome);
-                color = ShadeSample(color, outcome, request.shading, &coverage);
-                center = rays.center;
-            } else {
-                const auto result = TraceSample(scene, *state, camera, settings, x, y, width, height,
-                                                seed, 0u, seed);
-                color = ToFloat3(result.color);
-                coverage = result.coverage;
-                center = prism::MakeCameraRayWithLens(request.camera,
-                    static_cast<float>(x) + 0.5f, static_cast<float>(y) + 0.5f,
-                    width, height, nullptr);
-            }
+            const auto result = TraceSample(scene, *state, camera, settings, x, y, width, height,
+                                            seed, 0u, seed);
+            const Color3 color = ToFloat3(result.color);
+            const float coverage = result.coverage;
+            const RTCRay center = prism::MakeCameraRayWithLens(request.camera,
+                static_cast<float>(x) + 0.5f, static_cast<float>(y) + 0.5f,
+                width, height, nullptr);
             ++colorWork.value;
             if (request.tracePrimary) {
                 const RayHit primary = scene.castRayCulled(center, state->culling);

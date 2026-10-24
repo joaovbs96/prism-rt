@@ -537,7 +537,7 @@ void ApplyMdlShaderCode(GpuSceneData& data, MdlShaderCode const& code)
         if (m.info.x == kMaterialMdl) return (m.info.w & kMaterialConstantCutout) != 0u && m.params.w >= 1.0f;
         if (m.info.x == kMaterialFallback)
             return m.params.x >= 1.0f && (m.info.w & kMaterialPrimvarOpacity) == 0u;
-        return true; // legacy materials and invalid MDL materials are opaque
+        return true; // built-in materials and invalid MDL materials are opaque
     };
     data.hasCutouts = false;
     for (auto& instance : data.instances) {

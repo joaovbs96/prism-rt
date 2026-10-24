@@ -3,8 +3,7 @@
 // Render devices execute the per-pixel path tracing work for both frontends.
 // Every device runs the shared integrator (shaders/integrator) on its own
 // backend: the CPU device on Embree and the CPU materials, the GPU devices
-// (Vulkan, Metal) in shading languages. The CPU reference device runs the
-// original SceneManager::trace for validation.
+// (Vulkan, Metal) in shading languages.
 // Frontends keep ownership of scene ingestion, accumulation, tiling policy and
 // presentation, and describe each unit of work with a request struct.
 
@@ -27,11 +26,10 @@ class SceneManager;
 
 namespace prism::device {
 
-// CpuReference runs the original CPU integrator (validation reference).
-enum class DeviceKind { Cpu, CpuReference, Vulkan, Metal };
+enum class DeviceKind { Cpu, Vulkan, Metal };
 
 // Auto prefers the platform GPU device and falls back to the CPU device.
-enum class DevicePreference { Auto, Cpu, CpuReference, Vulkan, Metal };
+enum class DevicePreference { Auto, Cpu, Vulkan, Metal };
 
 struct DeviceInfo {
     DeviceKind kind = DeviceKind::Cpu;
@@ -42,6 +40,9 @@ struct DeviceInfo {
 const char* ToString(DeviceKind kind);
 const char* ToString(DevicePreference preference);
 bool ParseDevicePreference(std::string_view text, DevicePreference* preference);
+// Why a device name is not accepted ("the cpu-reference device was removed;
+// use cpu" for that former device, empty for an ordinary unknown name).
+std::string RemovedDeviceMessage(std::string_view text);
 
 // A screen-space block of pixels. Tiles are processed in the given order.
 struct PixelTile {

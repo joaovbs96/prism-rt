@@ -18,14 +18,11 @@ struct CpuSceneState {
     std::shared_ptr<const LightTable> lights;
 };
 
-// CPU rendering (Embree intersection, TBB parallelism, MDL native code).
-// By default it runs the shared integrator (shaders/integrator) on a CPU
-// backend; the reference variant runs the original SceneManager::trace and
-// stays bit-identical to the renderer before the device abstraction.
-// Stateless: every call renders the scene it is given.
+// CPU rendering (Embree intersection, TBB parallelism, MDL native code): the
+// shared integrator (shaders/integrator) on a CPU backend. Stateless: every
+// call renders the scene it is given.
 class CpuDevice final : public RenderDevice {
 public:
-    explicit CpuDevice(bool reference = false) : m_reference(reference) {}
     DeviceInfo Info() const override;
     std::vector<float> RenderImage(SceneManager& scene, ImageRequest const& request) override;
     void RenderPass(SceneManager& scene, PassRequest const& request) override;
@@ -38,7 +35,6 @@ private:
     // The scene's CpuSceneState, cached until it changes.
     std::shared_ptr<const CpuSceneState> PreparedScene(SceneManager& scene);
 
-    bool m_reference;
     std::mutex m_stateMutex;
     SceneManager const* m_stateOf = nullptr;
     std::shared_ptr<const CpuSceneState> m_state;

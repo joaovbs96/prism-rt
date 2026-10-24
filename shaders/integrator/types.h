@@ -8,7 +8,7 @@
 
 static const float kPi = 3.14159265358979323846f;
 
-// Outcome of a primary path (SceneManager::PrimaryOutcome).
+// Outcome of a primary path.
 static const uint kPrimaryUnresolved = 0u;
 static const uint kPrimaryEscaped = 1u;
 static const uint kPrimaryAccepted = 2u;

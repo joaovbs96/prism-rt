@@ -47,8 +47,8 @@
 //
 // The integrator's own dimensions (pixel, lens, BSDF, light and roulette
 // samples) come from the low-discrepancy `path.sampler`, set up per pixel and
-// sample by the device; the decisions are those of SceneManager::trace and
-// SceneManager::traceEnvironmentMis, which this replaces with one loop.
+// sample by the device; the decisions are those of the original recursive
+// CPU integrator (since removed), in one loop.
 //
 // The path is explicit state (PathState) advanced by step functions in the
 // order of the original single loop; see "The steps of a path" below.
@@ -90,7 +90,7 @@ inline PathRay spawnRay(SurfaceHit hit, float3 direction, bool nullEvent)
     return result;
 }
 
-// SceneManager::directionFootprint
+// The angular footprint of a direction (environment lookups).
 inline float angularRadius(RayFootprint footprint) { return max(0.0f, footprint.spread); }
 
 // ---------------------------------------------------------------------------
@@ -303,7 +303,7 @@ struct PathTracer {
     bool spatial;              // spatial light selection
     bool lobes;                // UsdLux diffuse / specular light multipliers (backend.lightLobes)
 
-    // SceneManager::environmentVisible: stochastic transmission through cutouts.
+    // Stochastic transmission through cutouts.
     // Opaque geometry anywhere on the ray blocks it whatever cutouts lie in
     // front, so a cheap any-hit query on opaque geometry comes first.
     // Shadow rays end at shadow.ray.tfar (lights at a finite distance).

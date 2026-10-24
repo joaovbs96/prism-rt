@@ -1,6 +1,6 @@
 // The GPU backend of the shared path tracer (shaders/integrator/path_tracer.h),
 // for the Metal and Vulkan devices. It mirrors the CPU classes:
-// SceneManager::prepareHit / prepareFootprint, the legacy Material classes,
+// SceneManager::prepareHit / prepareFootprint, the built-in Material classes,
 // MDLMaterial and the Environment classes.
 //
 // Requires the resource accessors (resources.hlsl), gpu_trace (geometry.hlsl)
@@ -402,7 +402,7 @@ float3 gpu_fallback_color(SurfaceHit hit, GpuMaterial material, float3 color)
 }
 
 // ---------------------------------------------------------------------------
-// Legacy materials (material.h, hydra/fallback_material.h)
+// Built-in materials (material.h: Diffuse, Emissive; hydra/fallback_material.h)
 // ---------------------------------------------------------------------------
 
 float3 gpu_random_unit_vector(inout Rng rng)

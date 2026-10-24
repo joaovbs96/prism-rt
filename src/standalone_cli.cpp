@@ -133,8 +133,7 @@ void help() {
         "                 single-sided meshes are not hit, unless their material transmits)\n"
         "  --default-dome true|false (default true: a scene with no lights, emissive geometry or\n"
         "                 environment is lit by USD's default dome, as in usdview)\n"
-        "  --device auto|cpu|cpu-reference|vulkan|metal (default auto: GPU if available, else CPU;\n"
-        "                 cpu-reference runs the original CPU integrator)\n"
+        "  --device auto|cpu|vulkan|metal (default auto: GPU if available, else CPU)\n"
         "  --ocio-config FILE|URI (default $OCIO, else ocio://studio-config-latest)\n"
         "  --working-space NAME (default ACEScg; lin_rec709 renders in linear Rec.709 as before)\n"
         "  --display NAME --view NAME (8-bit outputs; default the config's: sRGB - Display and\n"
@@ -206,8 +205,11 @@ Options parse(int argc, char** argv) {
             o.defaultDome = value == "true";
         }
         else if (key == "--device") {
-            if (!prism::device::ParseDevicePreference(value, &o.device))
-                throw std::runtime_error("--device must be auto, cpu, cpu-reference, vulkan or metal");
+            if (!prism::device::ParseDevicePreference(value, &o.device)) {
+                const std::string removed = prism::device::RemovedDeviceMessage(value);
+                throw std::runtime_error(removed.empty() ? "--device must be auto, cpu, vulkan or metal"
+                                                         : "--device: " + removed);
+            }
         }
         else if (key == "--env") o.environment = value;
         else if (key == "--env-color") o.environmentColor = triple(value);
@@ -353,8 +355,11 @@ void applyRenderSettings(VtDictionary const& settings, Options& o) {
             std::cerr << "PrismRT: prism:" << name << " does not apply to the standalone loader "
                          "(no subdivision surfaces or displacement); ignored\n";
     if (auto name = textSetting("device", "--device"); !name.empty() &&
-        !prism::device::ParseDevicePreference(name, &o.device))
-        throw std::runtime_error("prism:device must be auto, cpu, cpu-reference, vulkan or metal");
+        !prism::device::ParseDevicePreference(name, &o.device)) {
+        const std::string removed = prism::device::RemovedDeviceMessage(name);
+        throw std::runtime_error(removed.empty() ? "prism:device must be auto, cpu, vulkan or metal"
+                                                 : "prism:device: " + removed);
+    }
     for (auto [name, field, flag] : {std::tuple{"ocioConfig", &o.color.config, "--ocio-config"},
              std::tuple{"workingSpace", &o.color.workingSpace, "--working-space"},
              std::tuple{"display", &o.color.display, "--display"},

@@ -5166,8 +5166,13 @@ public:
         // PRISM_DEVICE selects the initial device; a prism:device render setting
         // overrides it.
         if (const char *value = std::getenv("PRISM_DEVICE"); value && *value) {
-            if (!prism::device::ParseDevicePreference(value, &settings.device))
-                TF_WARN("PrismRT: ignoring PRISM_DEVICE=%s (expected auto, cpu, cpu-reference, vulkan or metal)", value);
+            if (!prism::device::ParseDevicePreference(value, &settings.device)) {
+                const std::string removed = prism::device::RemovedDeviceMessage(value);
+                if (!removed.empty())
+                    TF_WARN("PrismRT: ignoring PRISM_DEVICE=%s: %s", value, removed.c_str());
+                else
+                    TF_WARN("PrismRT: ignoring PRISM_DEVICE=%s (expected auto, cpu, vulkan or metal)", value);
+            }
         }
         // PRISM_GPU_PREPARATION_PREVIEW=0/1 sets the initial value of
         // prism:gpuPreparationPreview, which a render setting overrides.
@@ -5227,7 +5232,6 @@ public:
             if (name.size() > suffix.size() &&
                 name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0)
                 name.resize(name.size() - suffix.size());
-        if (info.kind == prism::device::DeviceKind::CpuReference) return "cpu-reference";
         if (info.kind != prism::device::DeviceKind::Cpu)
             return std::string(prism::device::ToString(info.kind)) + ": " + name;
         if (note.empty()) return "cpu";

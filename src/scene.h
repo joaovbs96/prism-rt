@@ -37,9 +37,6 @@
 class SceneManager
 {
 public:
-    // A null cutout crossing is not an accepted surface. Truncated primary
-    // paths remain unresolved so callers can conservatively retain coverage.
-    enum class PrimaryOutcome { Unresolved, Escaped, AcceptedSurface };
     struct PlacementTransform {
         std::array<float, 9> normal{};
         std::array<float, 9> tangent{};
@@ -335,205 +332,6 @@ public:
             hit.hit.primID, instanceId);
     }
 
-    prism::PathRay spawnRay(RayHit const &hit, Float3 const &direction,
-                            bool nullEvent = false) const
-    {
-        prism::PathRay result;
-        result.ray = initialize_ray(hit.p, direction);
-        result.footprint.width = std::max(hit.dpdx.length(), hit.dpdy.length());
-        result.footprint.spread = hit.ray_footprint.spread;
-        if (nullEvent && hit.ray_footprint.exact) {
-            result.footprint = hit.ray_footprint;
-            result.footprint.dOdx = hit.dpdx;
-            result.footprint.dOdy = hit.dpdy;
-            result.footprint.width = std::max(
-                hit.dpdx.length(), hit.dpdy.length());
-        } else {
-            result.footprint.exact = false;
-        }
-        return result;
-    }
-
-    prism::DirectionFootprint directionFootprint(
-        prism::RayFootprint const &footprint) const
-    {
-        return {std::max(0.0f, footprint.spread), textureFiltering};
-    }
-
-    Color3 trace(prism::PathRay pathRay, int depth, Color3 throughput,
-                 unsigned int &seed, PrimaryOutcome* primaryOutcome = nullptr)
-    {
-        if (environmentSampling)
-            return traceEnvironmentMis(pathRay, depth, throughput, seed, 0.0f, false,
-                                       0, primaryOutcome);
-        // reached maximum recursion
-        if (depth >= max_depth)
-            return Float3();
-
-        // cast ray and get hit record
-        RayHit ray_hit = cast_ray(pathRay);
-
-        // ray hit
-        if (ray_hit.geomid != RTC_INVALID_GEOMETRY_ID)
-        {
-            // retrieve material by geomid and sample the surface
-            prism::profiling::Scope sampleTimer(prism::profiling::MaterialSample);
-            Material *material = getMaterial(ray_hit);
-            // sample normal map and perturbate normal
-            material->perturbNormal(ray_hit);
-
-            // BRDFSample: surface hit color + scattered light ray
-            Material::PreparedShadingContext shadingContext;
-            material->prepare(ray_hit,shadingContext);
-            BRDFSample s=material->samplePrepared(ray_hit,seed,shadingContext);
-            sampleTimer.stop();
-            if (!s.null_event && primaryOutcome) {
-                *primaryOutcome = PrimaryOutcome::AcceptedSurface;
-                primaryOutcome = nullptr;
-            }
-            // MDLMaterial* d = dynamic_cast<MDLMaterial*>(material);
-            // if (d != nullptr) {
-            //     std::cout << "Color:" << s.color << std::endl;
-            // }
-            if (!s.scattered)
-                return s.emission;
-
-            throughput *= s.color;
-
-            float rr_weight = 1.0f;
-            if (depth >= rr_min_depth)
-            {
-                float q = std::clamp<float>(throughput.max_component(), 0.05f, 0.95f);
-                
-                if (rnd(seed) >= q)
-                    return s.emission;
-
-                rr_weight = 1.0f / q;
-            }
-
-            prism::PathRay new_ray = spawnRay(ray_hit, s.wi, s.null_event);
-
-            throughput *= rr_weight;
-
-            return s.emission + s.color * rr_weight * trace(new_ray, depth + 1, throughput, seed,
-                                                          primaryOutcome);
-        }
-
-        // ray miss: sample environment
-        if (primaryOutcome) *primaryOutcome = PrimaryOutcome::Escaped;
-        prism::profiling::Scope environmentTimer(prism::profiling::Environment);
-        return environment->radiance(
-            ray_hit.d, directionFootprint(pathRay.footprint));
-    }
-
-    Color3 trace(RTCRay ray, int depth, Color3 throughput, unsigned int &seed,
-                 PrimaryOutcome* primaryOutcome = nullptr)
-    { return trace(prism::PathRay{ray, {}}, depth, throughput, seed, primaryOutcome); }
-
-    static float powerHeuristic(float a, float b) {
-        const float scale = std::max(a, b);
-        if (!(scale > 0) || !std::isfinite(scale)) return 0;
-        a /= scale; b /= scale;
-        const float aa = a*a, bb = b*b;
-        return aa + bb > 0.0f ? aa/(aa+bb) : 0.0f;
-    }
-
-    bool environmentVisible(prism::PathRay shadow, unsigned int& seed) {
-        prism::profiling::ShadowScope shadowScope;
-        const Float3 direction(shadow.ray.dir_x,shadow.ray.dir_y,shadow.ray.dir_z);
-        for (int crossings=0; crossings<64; ++crossings) {
-            RTCRayHit rawHit = intersectRaw(shadow);
-            if (rawHit.hit.geomID == RTC_INVALID_GEOMETRY_ID) return true;
-            Material* blocker = getMaterial(rawHit);
-            if (blocker->provenOpaque()) return false;
-            RayHit hit = prepareHit(rawHit, shadow);
-            prism::profiling::Scope cutoutTimer(prism::profiling::Cutout);
-            const float opacity = std::clamp(blocker->cutoutOpacity(hit), 0.0f, 1.0f);
-            cutoutTimer.stop();
-            if (opacity >= 1.0f || (opacity > 0.0f && rnd(seed) < opacity)) return false;
-            shadow = spawnRay(hit, direction, true);
-        }
-        return false;
-    }
-
-    bool environmentVisible(const Float3& origin, const Float3& direction,
-                            unsigned int& seed) {
-        return environmentVisible(
-            prism::PathRay{initialize_ray(origin,direction),{}},seed);
-    }
-
-    Color3 traceEnvironmentMis(prism::PathRay pathRay, int depth, Color3 throughput,
-                               unsigned int& seed, float previousPdf,
-                               bool previousNee, int nullCrossings = 0,
-                               PrimaryOutcome* primaryOutcome = nullptr) {
-        if (depth >= max_depth) return Color3(0.0f);
-        RayHit hit = cast_ray(pathRay);
-        if (hit.geomid == RTC_INVALID_GEOMETRY_ID) {
-            if (primaryOutcome) *primaryOutcome = PrimaryOutcome::Escaped;
-            prism::profiling::Scope environmentTimer(prism::profiling::Environment);
-            const Float3 direction = ray_hit_direction(pathRay.ray);
-            const Color3 li = environment->radiance(
-                direction, directionFootprint(pathRay.footprint));
-            const float lightPdf = environment->directionPdf(direction);
-            return li * (previousNee ? powerHeuristic(previousPdf, lightPdf) : 1.0f);
-        }
-        prism::profiling::Scope sampleTimer(prism::profiling::MaterialSample);
-        Material* material = getMaterial(hit);
-        material->perturbNormal(hit);
-        Material::PreparedShadingContext shadingContext;
-        material->prepare(hit,shadingContext);
-        BRDFSample bs = material->samplePrepared(hit, seed, shadingContext);
-        sampleTimer.stop();
-        Color3 result = bs.emission;
-        if (bs.null_event) {
-            if (!bs.scattered) primaryOutcome = nullptr;
-            if (nullCrossings >= 64) return result;
-            return result + bs.color * traceEnvironmentMis(spawnRay(hit,bs.wi,true),
-                depth, throughput * bs.color, seed, previousPdf, previousNee, nullCrossings+1,
-                primaryOutcome);
-        }
-        if (primaryOutcome) {
-            *primaryOutcome = PrimaryOutcome::AcceptedSurface;
-            primaryOutcome = nullptr;
-        }
-        // At the depth boundary the competing continuation is truncated too.
-        const bool canNee = depth+1 < max_depth && material->supportsNee(hit);
-        if (canNee) {
-            prism::profiling::Scope environmentTimer(prism::profiling::Environment);
-            const prism::DirectionFootprint lightFootprint =
-                directionFootprint(spawnRay(hit,hit.n).footprint);
-            EnvironmentSample light = environment->sampleDirection(
-                seed, lightFootprint);
-            environmentTimer.stop();
-            prism::PathRay lightRay = spawnRay(hit,light.wi);
-            if (light.pdf > 0.0f && std::isfinite(light.pdf) &&
-                environmentVisible(lightRay, seed)) {
-                prism::profiling::Scope evaluateTimer(prism::profiling::MaterialEvaluate);
-                BRDFEvaluation f = material->evaluatePrepared(
-                    hit, light.wi, shadingContext);
-                evaluateTimer.stop();
-                if (f.valid && f.pdf >= 0.0f && std::isfinite(f.pdf))
-                    result += f.value * light.radiance * (powerHeuristic(light.pdf, f.pdf) / light.pdf);
-            }
-        }
-        if (!bs.scattered) return result;
-        throughput *= bs.color;
-        float rrWeight=1.0f;
-        if (depth >= rr_min_depth) {
-            const float q=std::clamp<float>(throughput.max_component(), .05f, .95f);
-            if (rnd(seed)>=q) return result;
-            rrWeight=1.0f/q; throughput*=rrWeight;
-        }
-        prism::PathRay next=spawnRay(hit, bs.wi);
-        const bool weightMiss = canNee && !bs.delta && !bs.null_event && bs.pdf > 0.0f;
-        return result + bs.color * rrWeight * traceEnvironmentMis(next, depth+1, throughput,
-                                                                  seed, bs.pdf, weightMiss);
-    }
-
-    static Float3 ray_hit_direction(const RTCRay& ray) {
-        return Float3(ray.dir_x, ray.dir_y, ray.dir_z).normalize();
-    }
-
     void commitScene()
     {
         // FIXME: commented out, transforms don't seem to be working atm
@@ -630,9 +428,8 @@ public:
         return !(material && material->transmissive());
     }
 
-    // cast_ray that passes through culled back faces (culledBackFace). The
-    // integrator devices and their primary hits use it; the cpu-reference
-    // integrator does not.
+    // cast_ray that passes through culled back faces (culledBackFace), for
+    // the integrator's rays and the primary hits.
     RayHit castRayCulled(prism::PathRay pathRay, bool culling)
     {
         RayHit hit = cast_ray(pathRay);

@@ -15,7 +15,6 @@ const char* ToString(DeviceKind kind)
 {
     switch (kind) {
     case DeviceKind::Cpu: return "cpu";
-    case DeviceKind::CpuReference: return "cpu-reference";
     case DeviceKind::Vulkan: return "vulkan";
     case DeviceKind::Metal: return "metal";
     }
@@ -27,7 +26,6 @@ const char* ToString(DevicePreference preference)
     switch (preference) {
     case DevicePreference::Auto: return "auto";
     case DevicePreference::Cpu: return "cpu";
-    case DevicePreference::CpuReference: return "cpu-reference";
     case DevicePreference::Vulkan: return "vulkan";
     case DevicePreference::Metal: return "metal";
     }
@@ -40,11 +38,18 @@ bool ParseDevicePreference(std::string_view text, DevicePreference* preference)
     for (char& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     if (lower == "auto") *preference = DevicePreference::Auto;
     else if (lower == "cpu") *preference = DevicePreference::Cpu;
-    else if (lower == "cpu-reference") *preference = DevicePreference::CpuReference;
     else if (lower == "vulkan") *preference = DevicePreference::Vulkan;
     else if (lower == "metal") *preference = DevicePreference::Metal;
     else return false;
     return true;
+}
+
+std::string RemovedDeviceMessage(std::string_view text)
+{
+    std::string lower(text);
+    for (char& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (lower == "cpu-reference") return "the cpu-reference device was removed; use cpu";
+    return {};
 }
 
 namespace {
@@ -55,8 +60,6 @@ std::unique_ptr<RenderDevice> TryCreate(DeviceKind kind, std::string* reason)
     switch (kind) {
     case DeviceKind::Cpu:
         return std::make_unique<CpuDevice>();
-    case DeviceKind::CpuReference:
-        return std::make_unique<CpuDevice>(true);
     case DeviceKind::Vulkan:
 #ifdef PRISM_HAS_VULKAN
         return VulkanDevice::Create(reason);
@@ -93,7 +96,6 @@ std::vector<DeviceInfo> AvailableDevices()
     for (DeviceKind kind : {DeviceKind::Metal, DeviceKind::Vulkan}) {
         if (auto device = TryCreate(kind, nullptr)) devices.push_back(device->Info());
     }
-    devices.push_back(CpuDevice(true).Info());
     devices.push_back(CpuDevice().Info());
     return devices;
 }
@@ -104,9 +106,6 @@ std::unique_ptr<RenderDevice> CreateDevice(DevicePreference preference, std::str
     switch (preference) {
     case DevicePreference::Auto: order = AutoOrder(); break;
     case DevicePreference::Cpu: break;
-    case DevicePreference::CpuReference:
-        if (note) note->clear();
-        return std::make_unique<CpuDevice>(true);
     case DevicePreference::Vulkan: order = {DeviceKind::Vulkan}; break;
     case DevicePreference::Metal: order = {DeviceKind::Metal}; break;
     }
