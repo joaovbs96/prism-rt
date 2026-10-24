@@ -752,7 +752,8 @@ int runStandaloneCli(int argc, char** argv) {
         else if (extension == ".gltf" || extension == ".glb") {
             mesh = std::make_unique<glTFMesh>(o.scene, &context, libraryPath, libraryPath + "/mdl");
         }
-        else if (extension == ".obj") mesh = std::make_unique<ObjMesh>(o.scene);
+        else if (extension == ".obj")
+            mesh = std::make_unique<ObjMesh>(o.scene, &context, libraryPath, libraryPath + "/mdl");
         else throw std::runtime_error("Unsupported scene format: " + extension);
         const auto usdMesh = dynamic_cast<USDMesh*>(mesh.get());
         if ((mesh->vertices.empty() || mesh->indices.empty()) &&

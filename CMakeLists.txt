@@ -1148,6 +1148,69 @@ if(PRISM_BUILD_HYDRA)
     endif()
 endif()
 
+# OBJ/MTL materials as MaterialX open_pbr_surface (docs/obj.md), with the
+# synthetic fixtures of tests/obj (tests/obj/make_fixtures.py):
+# - the converter's document for each mapped statement, its validity and MDL
+#   generation (prism_obj_material_test);
+# - every fixture renders on the CPU with every material compiled, and the
+#   renders show what the statements ask for: textures, cut-outs, bump and
+#   normal maps (textured), Tf-tinted refraction (glass), Ke as radiance
+#   (emissive);
+# - Vulkan against the CPU device on the textured fixture.
+if(PRISM_BUILD_HYDRA)
+    set(_prism_obj_fixtures "${CMAKE_CURRENT_SOURCE_DIR}/tests/obj")
+    set(_prism_obj "${CMAKE_BINARY_DIR}/obj")
+    file(MAKE_DIRECTORY "${_prism_obj}")
+    set(_prism_obj_env ${_prism_test_environment} "PRISM_CACHE_DIR=${CMAKE_BINARY_DIR}/test-cache")
+    add_executable(prism_obj_material_test tests/obj_material.cpp)
+    target_link_libraries(prism_obj_material_test PRIVATE PrismRT::core)
+    add_test(NAME prism_obj_material_test COMMAND prism_obj_material_test "${_prism_obj_fixtures}")
+    set_tests_properties(prism_obj_material_test PROPERTIES ENVIRONMENT "${_prism_obj_env}")
+
+    set(_prism_obj_view --camera-position 0,0,6 --camera-target 0,0,0 --vfov 45 --width 96 --height 96
+        ${_prism_fixed_sampling})
+    set(_prism_obj_studio --env "${CMAKE_CURRENT_SOURCE_DIR}/tests/gltf/studio_env.hdr")
+    # <fixture>:<spp>:<check or ->:<lighting>
+    foreach(_case "textured:64:textured:studio" "pbr:16:-:studio" "glass:64:glass:white" "emissive:16:emissive:black")
+        string(REPLACE ":" ";" _parts "${_case}")
+        list(GET _parts 0 _name)
+        list(GET _parts 1 _spp)
+        list(GET _parts 2 _check)
+        list(GET _parts 3 _light)
+        if(_light STREQUAL "studio")
+            set(_lighting ${_prism_obj_studio})
+        elseif(_light STREQUAL "white")
+            set(_lighting --env-color 1,1,1 --working-space lin_rec709)
+        else()
+            set(_lighting --env-color 0,0,0 --working-space lin_rec709)
+        endif()
+        set(_prism_obj_${_name}_args --scene "${_prism_obj_fixtures}/${_name}.obj" ${_prism_obj_view}
+            --spp ${_spp} ${_lighting})
+        add_test(NAME prism_obj_${_name}_render
+            COMMAND PrismRT ${_prism_obj_${_name}_args} --device cpu --output "${_prism_obj}/${_name}_cpu.exr")
+        set_tests_properties(prism_obj_${_name}_render PROPERTIES ENVIRONMENT "${_prism_obj_env}"
+            FIXTURES_SETUP prism_obj_${_name}_cpu
+            FAIL_REGULAR_EXPRESSION "magenta error material;is not supported")
+        if(NOT _check STREQUAL "-")
+            add_test(NAME prism_obj_${_name}_test
+                COMMAND prism_obj_material_test --check-${_check} "${_prism_obj}/${_name}_cpu.exr")
+            set_tests_properties(prism_obj_${_name}_test PROPERTIES FIXTURES_REQUIRED prism_obj_${_name}_cpu)
+        endif()
+    endforeach()
+    if(PRISM_ENABLE_VULKAN AND TARGET prism_compare_images)
+        add_test(NAME prism_obj_textured_vulkan_render
+            COMMAND PrismRT ${_prism_obj_textured_args} --device vulkan --output "${_prism_obj}/textured_vulkan.exr")
+        set_tests_properties(prism_obj_textured_vulkan_render PROPERTIES ENVIRONMENT "${_prism_obj_env}"
+            FIXTURES_SETUP prism_obj_textured_vulkan
+            FAIL_REGULAR_EXPRESSION "magenta error material;cannot render the scene on the GPU")
+        add_test(NAME prism_obj_textured_vulkan_parity
+            COMMAND prism_compare_images "${_prism_obj}/textured_cpu.exr" "${_prism_obj}/textured_vulkan.exr"
+                --tolerance 0.1 --mean-tolerance 0.02)
+        set_tests_properties(prism_obj_textured_vulkan_parity PROPERTIES
+            FIXTURES_REQUIRED "prism_obj_textured_cpu;prism_obj_textured_vulkan")
+    endif()
+endif()
+
 # Every test is labelled cpu or gpu. GPU tests are those that may open a render
 # device (the Hydra delegate's default "auto" picks Vulkan or Metal when one
 # is available), plus the comparisons whose fixtures are GPU renders, since
@@ -1157,7 +1220,7 @@ endif()
 set(_prism_gpu_test_regex
     "^prism_hydra_(render_exercise|transparent_background_export|depth1_render|depth_change_render|setting_change_test|cutout_(medium|clear)_render|cutout_medium_test|animation_exercise|pass_camera_test|scene_bridge_test|streaming_(cold|warm|whole)|streaming_.*_matches_.*)$"
     "|^prism_(gpu_shader_compile_test|device_selection_test|cli_clean_exit_vulkan|cli_gpu_failure_vulkan)$"
-    "|^prism_gltf_.*_vulkan_(render|parity|test)$")
+    "|^prism_(gltf|obj)_.*_vulkan_(render|parity|test)$")
 string(JOIN "" _prism_gpu_test_regex ${_prism_gpu_test_regex})
 get_property(_prism_tests DIRECTORY PROPERTY TESTS)
 foreach(_test IN LISTS _prism_tests)
