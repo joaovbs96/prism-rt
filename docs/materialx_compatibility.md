@@ -116,6 +116,70 @@ generator turns into the material's `volume`. The loader expands each
 that layer (`LayerGltfPbrVolume`), so the integrator traces the absorbing
 medium as it does for OpenPBR glass.
 
+## Energy loss of layered dielectric transmission
+
+Upstream (MaterialX's MDL library and its surface graphs, 1.39.5 with MDL SDK
+2026.0.2). `open_pbr_surface`, `standard_surface` and `gltf_pbr` all build
+their dielectric as a reflection-only lobe layered over a mix of a
+transmission-only lobe and the opaque base:
+
+    layer(R, mix(T [over its VDF], opaque, transmission))
+
+MaterialX's MDL `mx_dielectric_bsdf` (pbrlib_1_9) turns the layer into
+`df::custom_curve_layer` with a Schlick curve (normal reflectivity
+`((ior-1)/(ior+1))^2`, grazing `1 - roughness`). libbsdf weights a custom-curve
+base by `1 - weight * max(curve(cos k1), curve(cos k2))`
+(`curve_layer_sample`/`_evaluate` in `libbsdf.cpp`), and since the curve has
+no IOR it takes `k2`'s cosine as is. For light leaving the medium `k2` is the
+refracted direction, more grazing than `k1`, so the transmitted light is cut by
+`curve(k2) - curve(k1)` that is never reflected either. Smooth IOR 1.5 glass,
+sampled from inside (`prism_dielectric_albedo_test -v`):
+
+| inside angle | 0 | 20 | 40 | 60 (TIR) |
+|---|---|---|---|---|
+| R + T before | 1.000 | 1.000 | 0.795 | 1.000 |
+| R + T after | 1.000 | 1.000 | 1.000 | 1.000 |
+
+From outside R + T is 1, with Schlick's R instead of Fresnel's (0.067 instead
+of 0.089 at 60 degrees). Rough glass loses more (`specular_roughness` 0.3:
+R + T 0.74 at 85 degrees outside, 0.67 at 85 degrees inside). The three shading models measured
+the same. In the white furnace (`tests/hydra/fixtures/glass_furnace.usda`) the
+closed glass sphere rendered 3% dark (image mean 0.987, worst pixel 0.79),
+with MIS and with BSDF-only environment sampling alike.
+
+MaterialX's own `dielectric_bsdf` with `scatter_mode` `RT` (a GGX
+`scatter_reflect_transmit` lobe) splits by its exact Fresnel term, including
+total internal reflection, and conserves energy. Layering distributes over the
+mix, so the loader expands each transmissive surface into its genmdl graph and
+rewrites it as
+
+    mix(RT [over its VDF], layer(R, opaque), transmission)
+
+(`CoupleSurfaceTransmissionFresnel`; `LayerGltfPbrVolume` couples the glTF
+graphs it expands). That is the same BSDF where the RT lobe can stand for both
+R and T, so only surfaces whose two lobes agree are rewritten:
+
+- `open_pbr_surface`: closed (`geometry_thin_walled` false), untinted reflection
+  (`specular_color` white), no thin film, and an untinted transmission lobe
+  (`transmission_color` white, or a positive `transmission_depth`, which turns
+  the color into the medium's absorption).
+- `standard_surface`: closed, `specular` 1, white `specular_color` and
+  `transmission_color`, no `transmission_extra_roughness`, no thin film.
+- `gltf_pbr`: white `base_color` (glTF's transmission tint), `specular` 1,
+  white `specular_color`, no iridescence. Its reflection becomes Fresnel's
+  rather than glTF's Schlick.
+
+After the repair the furnace renders the dome (mean 1.0000, worst pixel
+0.004 at 16 spp). Tinted transmission without a depth (`transmission_color`
+with depth 0, glTF's `base_color`), tinted reflection, thin films and
+iridescence keep MaterialX's graph and its loss: the RT lobe has a single
+tint. Thin-walled surfaces don't refract and don't lose energy. Coated glass
+keeps a loss: the coat is another custom-curve layer over the refracting base
+(R + T 0.946 at 60 degrees inside with `coat_darkening` 0), on top of the coat
+darkening below. Material templates keep the weight and these inputs
+structural, so a variant never binds onto a prototype rewritten for its
+seed's values. A draft upstream report proposes the RT form for the graphs.
+
 ## Deliberate non-repairs
 
 Two differences from the OpenPBR Shader Playground's Arnold reference render
@@ -132,7 +196,9 @@ are intentional; don't "fix" them in preprocessing.
 - **Coat darkening on transmission.** MaterialX's `open_pbr_surface` estimates
   the base albedo from `base_color` and `subsurface_color`, ignoring
   `transmission_weight`, and then darkens the whole base, transmitted light
-  included. Coated glass is therefore darkened and tinted by `base_color`. The
+  included. Coated glass is therefore darkened and tinted by `base_color`:
+  smooth coated glass with the default `base_color` 0.8 keeps R + T 0.76 at
+  normal incidence. The
   OpenPBR specification doesn't settle whether darkening applies to transmitted
   light. PrismRT follows MaterialX here rather than patching its internal graph;
   reporting it upstream is the right fix.
@@ -168,9 +234,16 @@ clamped; authoring them above one can still reach the same failure.
 `materialx_loader_sss` covers the SSS fallback, `materialx_loader_clamp` the
 conductor clamp, `materialx_loader_types` the color space names, input type
 repairs and layer distribution, and `materialx_loader_transmission` the
-thin-walled expansion and the refraction IOR. `prism_openpbr_transmission_test`
+thin-walled expansion and the refraction IOR, `materialx_loader_fresnel` the
+coupled transmission graph. `prism_openpbr_transmission_test`
 (main build) samples compiled OpenPBR glass: thin walls transmit undeflected and
-tinted, closed glass refracts with `specular_ior` and carries its medium. The small standalone test project avoids loading the renderer
+tinted, closed glass refracts with `specular_ior` and carries its medium.
+`prism_dielectric_albedo_test` (main build) samples compiled smooth glass (a
+plain RT `dielectric_bsdf`, `open_pbr_surface`, `standard_surface`, `gltf_pbr`)
+from both sides at six angles: R + T must be 1 and R Fresnel's; `-v [case]`
+prints the table, coated and rough glass included. The
+`prism_scene_features_glass_furnace_*` checks require the furnace to render the
+dome (mean within 0.001, worst pixel within 0.02). The small standalone test project avoids loading the renderer
 and its USD/MDL runtime dependencies:
 
 ```text
