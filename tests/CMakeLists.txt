@@ -26,6 +26,15 @@ add_executable(materialx_loader_fresnel materialx_loader_fresnel.cpp ../src/mate
 target_compile_features(materialx_loader_fresnel PRIVATE cxx_std_20)
 target_link_libraries(materialx_loader_fresnel PRIVATE MaterialXCore MaterialXFormat)
 add_test(NAME materialx_loader_fresnel COMMAND materialx_loader_fresnel)
+# Checks the repairs against MaterialX's own library graphs, from the
+# MaterialX install (skipped without them).
+add_executable(materialx_loader_dielectric materialx_loader_dielectric.cpp ../src/materialx/loader.cpp)
+target_compile_features(materialx_loader_dielectric PRIVATE cxx_std_20)
+target_link_libraries(materialx_loader_dielectric PRIVATE MaterialXCore MaterialXFormat)
+get_filename_component(_prism_materialx_root "${MaterialX_DIR}/../../.." ABSOLUTE)
+target_compile_definitions(materialx_loader_dielectric PRIVATE PRISM_TEST_MATERIALX_ROOT="${_prism_materialx_root}")
+add_test(NAME materialx_loader_dielectric COMMAND materialx_loader_dielectric)
+set_tests_properties(materialx_loader_dielectric PROPERTIES SKIP_RETURN_CODE 77)
 
 # CPU-only; see the labels in the top-level CMakeLists.txt.
 get_property(_prism_materialx_tests DIRECTORY PROPERTY TESTS)
