@@ -16,6 +16,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace {
 void require(bool condition, std::string const& message)
@@ -111,7 +112,10 @@ int main(int argc, char** argv)
     const char* mdlPath = std::getenv("PRISM_MATERIALX_MDL");
     if (!libraries || !*libraries || !mdlPath || !*mdlPath) return 77;
     // -v [case]: print every albedo (of one case).
-    const bool verbose = argc > 1 && std::strcmp(argv[1], "-v") == 0;
+    // -s [case]: survey other layered models (never fails; prints each angle
+    // and the worst R + T per side).
+    const bool survey = argc > 1 && std::strcmp(argv[1], "-s") == 0;
+    const bool verbose = survey || (argc > 1 && std::strcmp(argv[1], "-v") == 0);
     const char* only = verbose && argc > 2 ? argv[2] : nullptr;
     try {
         mdl::Context context;
@@ -160,16 +164,127 @@ int main(int argc, char** argv)
             {"open_pbr_coat_no_darkening",
              Shader("open_pbr_surface", glass + coat + Input("coat_darkening", "float", "0")), false, false},
         };
+        // Survey (-s): configurations outside the repair, and baselines that
+        // dodge it (a specular_color of 0.9999 is not white to the loader).
+        auto bsdf = [](std::string const& nodes) {
+            return nodes + "  <surface name=\"Surface\" type=\"surfaceshader\">\n"
+                           "    <input name=\"bsdf\" type=\"BSDF\" nodename=\"Top\" />\n  </surface>\n";
+        };
+        auto node = [](std::string const& category, std::string const& name, std::string const& inputs) {
+            return "  <" + category + " name=\"" + name + "\" type=\"BSDF\">\n" + inputs + "  </" + category + ">\n";
+        };
+        auto link = [](std::string const& name, std::string const& node) {
+            return "    <input name=\"" + name + "\" type=\"BSDF\" nodename=\"" + node + "\" />\n";
+        };
+        const std::string dodge = Input("specular_color", "color3", "0.9999, 0.9999, 0.9999");
+        const std::string tint = "0.5, 0.8, 0.9";
+        const std::string ssGlass = Input("base", "float", "0") + Input("specular_roughness", "float", "0") +
+                                    Input("specular_IOR", "float", "1.5") + Input("transmission", "float", "1");
+        const std::string gltfGlass = Input("metallic", "float", "0") + Input("roughness", "float", "0") +
+                                      Input("ior", "float", "1.5") + Input("transmission", "float", "1");
+        const std::string transmitT = Input("ior", "float", "1.5") + Input("roughness", "vector2", "0, 0") +
+                                      Input("scatter_mode", "string", "T");
+        const Case surveyCases[] = {
+            {"open_pbr_unrepaired", Shader("open_pbr_surface", glass + dodge), false, false},
+            {"open_pbr_rough_unrepaired", Shader("open_pbr_surface", rough + dodge), false, false},
+            {"open_pbr_tint_depth0",
+             Shader("open_pbr_surface", glass + Input("transmission_color", "color3", tint)), false, false},
+            {"open_pbr_thin_film",
+             Shader("open_pbr_surface", glass + Input("thin_film_weight", "float", "1") +
+                                            Input("thin_film_thickness", "float", "0.5")),
+             false, false},
+            {"open_pbr_thin_walled",
+             Shader("open_pbr_surface", glass + Input("geometry_thin_walled", "boolean", "true")), false, false},
+            {"open_pbr_fuzz", Shader("open_pbr_surface", glass + Input("fuzz_weight", "float", "1")), false, false},
+            {"open_pbr_opaque_white",
+             Shader("open_pbr_surface",
+                    Input("base_color", "color3", "1, 1, 1") + Input("specular_roughness", "float", "0")),
+             false, false},
+            {"open_pbr_opaque_white_rough",
+             Shader("open_pbr_surface",
+                    Input("base_color", "color3", "1, 1, 1") + Input("specular_roughness", "float", "0.3")),
+             false, false},
+            {"standard_surface_unrepaired",Shader("standard_surface", ssGlass + dodge), false, false},
+            {"standard_surface_tint_depth0",
+             Shader("standard_surface", ssGlass + Input("transmission_color", "color3", tint)), false, false},
+            {"standard_surface_thin_walled",
+             Shader("standard_surface", ssGlass + Input("thin_walled", "boolean", "true")), false, false},
+            {"standard_surface_coat",
+             Shader("standard_surface", ssGlass + Input("coat", "float", "1") + Input("coat_roughness", "float", "0")),
+             false, false},
+            {"standard_surface_thin_film",
+             Shader("standard_surface", ssGlass + Input("thin_film_thickness", "float", "500") +
+                                            Input("thin_film_IOR", "float", "1.4")),
+             false, false},
+            {"standard_surface_sheen", Shader("standard_surface", ssGlass + Input("sheen", "float", "1")), false, false},
+            {"standard_surface_opaque_white",
+             Shader("standard_surface", Input("base", "float", "1") + Input("base_color", "color3", "1, 1, 1") +
+                                            Input("specular_roughness", "float", "0")),
+             false, false},
+            {"gltf_pbr_tint", Shader("gltf_pbr", gltfGlass + Input("base_color", "color3", tint)), false, false},
+            {"gltf_pbr_clearcoat", Shader("gltf_pbr", gltfGlass + Input("clearcoat", "float", "1")), false, false},
+            {"gltf_pbr_iridescence",
+             Shader("gltf_pbr", gltfGlass + Input("iridescence", "float", "1") +
+                                    Input("iridescence_thickness", "float", "400")),
+             false, false},
+            {"gltf_pbr_sheen",
+             Shader("gltf_pbr", gltfGlass + Input("sheen_color", "color3", "1, 1, 1") +
+                                    Input("sheen_roughness", "float", "0.3")),
+             false, false},
+            {"usd_preview_glass",
+             Shader("UsdPreviewSurface", Input("opacity", "float", "0") + Input("roughness", "float", "0") +
+                                             Input("ior", "float", "1.5")),
+             false, false},
+            {"usd_preview_glass_rough",
+             Shader("UsdPreviewSurface", Input("opacity", "float", "0") + Input("roughness", "float", "0.3") +
+                                             Input("ior", "float", "1.5")),
+             false, false},
+            {"disney_glass",
+             Shader("disney_principled", Input("baseColor", "color3", "1, 1, 1") + Input("roughness", "float", "0") +
+                                             Input("specTrans", "float", "1") + Input("ior", "float", "1.5")),
+             false, false},
+            {"lama_dielectric",
+             bsdf(node("LamaDielectric", "Top", Input("fresnelMode", "integer", "1") + Input("IOR", "float", "1.5") +
+                                                    Input("roughness", "float", "0"))),
+             false, false},
+            {"lama_dielectric_rough",
+             bsdf(node("LamaDielectric", "Top", Input("fresnelMode", "integer", "1") + Input("IOR", "float", "1.5") +
+                                                    Input("roughness", "float", "0.3"))),
+             false, false},
+            {"lama_generalized_schlick", bsdf(node("LamaGeneralizedSchlick", "Top", Input("roughness", "float", "0"))),
+             false, false},
+            {"schlick_r_over_dielectric_t",
+             bsdf(node("dielectric_bsdf", "Trans", transmitT) +
+                  node("generalized_schlick_bsdf", "Refl",
+                       Input("color0", "color3", "0.04, 0.04, 0.04") + Input("roughness", "vector2", "0, 0")) +
+                  node("layer", "Top", link("top", "Refl") + link("base", "Trans"))),
+             false, false},
+            {"sheen_over_dielectric_rt",
+             bsdf(node("dielectric_bsdf", "Glass",
+                       Input("ior", "float", "1.5") + Input("roughness", "vector2", "0, 0") +
+                           Input("scatter_mode", "string", "RT")) +
+                  node("sheen_bsdf", "Sheen", Input("roughness", "float", "0.3")) +
+                  node("layer", "Top", link("top", "Sheen") + link("base", "Glass"))),
+             false, false},
+        };
         const int count = 20000;
-        const double angles[] = {0.0, 20.0, 40.0, 60.0, 75.0, 85.0};
+        const std::vector<double> angles =
+            survey ? std::vector<double>{0.0, 20.0, 30.0, 40.0, 41.0, 50.0, 60.0, 75.0, 85.0}
+                   : std::vector<double>{0.0, 20.0, 40.0, 60.0, 75.0, 85.0};
+        std::vector<Case const*> selected;
+        if (survey)
+            for (auto const& test : surveyCases) selected.push_back(&test);
+        for (auto const& test : cases) selected.push_back(&test);
         int failures = 0;
-        for (auto const& test : cases) {
+        for (Case const* entry : selected) {
+            auto const& test = *entry;
             if (only && std::strcmp(only, test.name) != 0) continue;
             const auto path = dir / (std::string(test.name) + ".mtlx");
             { std::ofstream out(path); out << Document(test.body); }
             MDLMaterial material(path.string(), context, libraries, mdlPath);
             require(material.is_valid(), std::string("compile failed: ") + test.name);
             for (bool front : {true, false}) {
+                double worst = 2.0, worstAngle = 0.0;
                 for (double degrees : angles) {
                     const double theta = degrees * 3.14159265358979 / 180.0;
                     const Float3 d(float(std::sin(theta)), 0.0f, float(front ? -std::cos(theta) : std::cos(theta)));
@@ -186,8 +301,12 @@ int main(int argc, char** argv)
                         std::printf("%-26s %s %2.0f deg: R %.4f T %.4f R+T %.4f (Fresnel R %.4f)%s\n", test.name,
                                     front ? "outside" : "inside ", degrees, a.r, a.t, a.r + a.t, fresnel,
                                     ok ? "" : "  FAIL");
-                    if (!ok) ++failures;
+                    if (!ok && !survey) ++failures;
+                    if (a.r + a.t < worst) worst = a.r + a.t, worstAngle = degrees;
                 }
+                if (survey)
+                    std::printf("SUMMARY %-28s %s worst R+T %.4f at %2.0f deg\n", test.name,
+                                front ? "outside" : "inside ", worst, worstAngle);
             }
         }
         std::filesystem::remove_all(dir);
