@@ -303,8 +303,7 @@ int RunAccumulationIntegrationTests()
                 "Adaptive convergence left pixels active");
 
         // prism:subdivisionLevel in a running delegate: a Catmull-Clark quad
-        // converts again at the new level (one quad: 2 triangles at level 0,
-        // 4^level quads after).
+        // converts again at the new level (4^level quads).
         Fixture subdivided;
         AddScene(subdivided);
         subdivided.scene->AddPrims({{SdfPath("/Smooth"), HdPrimTypeTokens->mesh,
@@ -322,8 +321,11 @@ int RunAccumulationIntegrationTests()
         subdivided.bridge->SetSettings(subdivisionSettings);
         renderUntilConverged(subdivided);
         const int64_t refinedTriangles = Stat(subdivided.bridge->GetStats(), "triangleCount");
-        Require(hullTriangles > 0 && refinedTriangles == hullTriangles + 30,
-                "Changing prism:subdivisionLevel did not refine the mesh again");
+        // The hull is the same quad as /Mesh and shares its geometry (2
+        // triangles in all); refined, /Smooth adds its 16 quads.
+        if (!(hullTriangles == 2 && refinedTriangles == 2 + 32))
+            throw std::runtime_error("Changing prism:subdivisionLevel did not refine the mesh again (triangles " +
+                std::to_string(hullTriangles) + " -> " + std::to_string(refinedTriangles) + ")");
 
         std::cout << "Independent accumulation integration tests passed\n";
         return 0;
