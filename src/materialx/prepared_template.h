@@ -80,6 +80,33 @@ inline bool IsCompatibleTemplateValue(const CapturedNode& node,
             !(found->data.value.IsHolding<float>() && found->data.value.UncheckedGet<float>()==0.0f));
         if (transmissive) return false;
     }
+    // DocumentLoader couples the reflection and transmission of transmissive
+    // surfaces whose lobes agree (CoupleTransmissionFresnel in loader.cpp);
+    // the weight and the inputs it checks stay structural, so a variant never
+    // binds onto a prototype coupled (or not) for its seed's values.
+    struct Coupling { const char* type; const char* weight; std::initializer_list<const char*> inputs; };
+    static const Coupling couplings[] = {
+        {"open_pbr_surface", "transmission_weight",
+         {"specular_color", "thin_film_weight", "transmission_color", "transmission_depth"}},
+        {"standard_surface", "transmission",
+         {"specular", "specular_color", "transmission_color", "transmission_extra_roughness", "thin_film_thickness"}},
+        {"gltf_pbr", "transmission", {"base_color", "specular", "specular_color", "iridescence"}},
+    };
+    for (auto const& coupling : couplings) {
+        if (type.find(coupling.type)==std::string::npos) continue;
+        if (name==coupling.weight) return false;
+        if (std::find_if(coupling.inputs.begin(),coupling.inputs.end(),
+                [&](const char* input) { return name==input; })==coupling.inputs.end()) break;
+        const PXR_NS::TfToken weight(coupling.weight);
+        const bool connected=std::any_of(node.connections.begin(),node.connections.end(),
+            [&](const CapturedConnection& c) { return c.input==weight && !c.connections.empty(); });
+        const auto found=std::find_if(node.parameters.begin(),node.parameters.end(),
+            [&](const CapturedParameter& p) { return p.name==weight; });
+        if (connected || (found!=node.parameters.end() &&
+            !(found->data.value.IsHolding<float>() && found->data.value.UncheckedGet<float>()==0.0f)))
+            return false;
+        break;
+    }
     return IsCompatibleTemplateValue(parameter);
 }
 
