@@ -84,14 +84,40 @@ inline bool IsCompatibleTemplateValue(const CapturedNode& node,
     // surfaces whose lobes agree (CoupleTransmissionFresnel in loader.cpp);
     // the weight and the inputs it checks stay structural, so a variant never
     // binds onto a prototype coupled (or not) for its seed's values.
+    // (Tints choose between a plain and a split coupling; roughness, IORs and
+    // the coat's weight and roughness whether a smooth coat becomes a Fresnel
+    // layer.)
     struct Coupling { const char* type; const char* weight; std::initializer_list<const char*> inputs; };
     static const Coupling couplings[] = {
         {"open_pbr_surface", "transmission_weight",
-         {"specular_color", "thin_film_weight", "transmission_color", "transmission_depth"}},
+         {"specular_color", "thin_film_weight", "transmission_color", "transmission_depth", "specular_roughness",
+          "coat_weight", "coat_roughness"}},
         {"standard_surface", "transmission",
-         {"specular", "specular_color", "transmission_color", "transmission_extra_roughness", "thin_film_thickness"}},
-        {"gltf_pbr", "transmission", {"base_color", "specular", "specular_color", "iridescence"}},
+         {"specular", "specular_color", "transmission_color", "transmission_extra_roughness", "thin_film_thickness",
+          "specular_roughness", "coat", "coat_roughness", "coat_IOR", "specular_IOR"}},
+        {"gltf_pbr", "transmission",
+         {"base_color", "specular", "specular_color", "iridescence", "roughness", "clearcoat", "clearcoat_roughness", "ior"}},
     };
+    // DocumentLoader rewrites a UsdPreviewSurface with opacity below one
+    // (CoupleUsdPreviewTransmission), and only when the inputs below allow
+    // it: opacity always decides, the others while it is below one.
+    // LamaDielectric is coupled when its two tints agree.
+    if (type.find("UsdPreviewSurface")!=std::string::npos) {
+        if (name=="opacity") return false;
+        if (name=="opacityThreshold" || name=="roughness" || name=="metallic" || name=="clearcoat") {
+            const PXR_NS::TfToken opacity("opacity");
+            const bool connected=std::any_of(node.connections.begin(),node.connections.end(),
+                [&](const CapturedConnection& c) { return c.input==opacity && !c.connections.empty(); });
+            const auto found=std::find_if(node.parameters.begin(),node.parameters.end(),
+                [&](const CapturedParameter& p) { return p.name==opacity; });
+            if (connected || (found!=node.parameters.end() &&
+                !(found->data.value.IsHolding<float>() && found->data.value.UncheckedGet<float>()>=1.0f)))
+                return false;
+        }
+    }
+    if (type.find("LamaDielectric")!=std::string::npos &&
+        (name=="reflectionTint" || name=="transmissionTint"))
+        return false;
     for (auto const& coupling : couplings) {
         if (type.find(coupling.type)==std::string::npos) continue;
         if (name==coupling.weight) return false;

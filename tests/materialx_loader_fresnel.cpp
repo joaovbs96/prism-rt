@@ -1,8 +1,9 @@
 // DocumentLoader rewrites the dielectric of transmissive surfaces,
 // layer(R, mix(T over its VDF, opaque, w)), as
 // mix(RT over its VDF, layer(R, opaque), w): MDL's custom-curve layer loses
-// the energy of light leaving the medium, the RT dielectric does not. Only
-// surfaces whose reflection and transmission agree (untinted) are rewritten.
+// the energy of light leaving the medium, the RT dielectric does not.
+// Untinted lobes share the RT lobe directly; tinted ones go through
+// prism_dielectric_split.
 
 #include "../src/materialx/loader.h"
 #include <MaterialXCore/Node.h>
@@ -41,10 +42,16 @@ int run() {
         <input name="transmission_weight" type="float" value="1" />
         <input name="transmission_color" type="color3" value="0.5, 0.8, 0.9" />
       </open_pbr_surface>
+      <surfacematerial name="tinted_material" type="material">
+        <input name="surfaceshader" type="surfaceshader" nodename="tinted" />
+      </surfacematerial>
       <open_pbr_surface name="reflection_tinted" type="surfaceshader">
         <input name="transmission_weight" type="float" value="1" />
         <input name="specular_color" type="color3" value="1, 0.5, 0.5" />
       </open_pbr_surface>
+      <surfacematerial name="reflection_tinted_material" type="material">
+        <input name="surfaceshader" type="surfaceshader" nodename="reflection_tinted" />
+      </surfacematerial>
       <open_pbr_surface name="opaque" type="surfaceshader" />
     </materialx>)";
     { std::ofstream out(path); out << xml; }
@@ -116,10 +123,15 @@ int run() {
                         !node->getDownstreamPorts().empty(),
                     "the replaced substrate mix was left behind");
     }
-    for (const char* name : {"tinted", "reflection_tinted", "opaque"}) {
-        auto node = doc->getNode(name);
-        require(node && node->getCategory() == "open_pbr_surface", "a surface whose lobes differ was rewritten");
-    }
+    // Differently tinted lobes are coupled through prism_dielectric_split
+    // (materialx_loader_dielectric checks its shape).
+    for (const char* name : {"tinted", "reflection_tinted"})
+        require(!doc->getNode(name), "a tinted transmissive surface was not expanded");
+    size_t splits = 0;
+    for (auto const& node : doc->getNodes()) splits += node->getCategory() == "prism_dielectric_split";
+    require(splits == 2, "tinted surfaces were not split by their tints");
+    auto opaqueNode = doc->getNode("opaque");
+    require(opaqueNode && opaqueNode->getCategory() == "open_pbr_surface", "an opaque surface was rewritten");
 
     std::filesystem::remove(path);
     std::cout << "materialx loader fresnel ok\n";

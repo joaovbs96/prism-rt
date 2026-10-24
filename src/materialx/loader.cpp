@@ -10,7 +10,9 @@
 #include <set>
 #include <tuple>
 #include <vector>
+#include <cmath>
 #include <cstdlib>
+#include <optional>
 #include <string_view>
 
 namespace {
@@ -374,13 +376,26 @@ void RouteUncoatedTransmissionIor(const MaterialX::DocumentPtr& doc)
 // graph uses transmission_color as the tint only when the depth is zero
 // (otherwise it becomes the volume's absorption, which a thin-walled MDL
 // material ignores), so the depth is cleared as well.
+//
+// standard_surface's graph only uses thin_walled to pick translucency over
+// subsurface scattering and has no thin_walled on its constructor, so its
+// thin-walled glass refracts like a solid (and loses energy leaving it, R + T
+// 0.64 at 41 degrees inside). Autodesk Standard Surface defines a thin wall
+// as an infinitely thin shell that transmits without refraction, so such
+// nodes get the same expansion when they transmit or scatter (an opaque one
+// renders the same either way); standard_surface has no transmission medium.
 void ExpandThinWalledOpenPbr(const MaterialX::DocumentPtr& doc)
 {
     std::vector<MaterialX::NodePtr> nodes;
-    for (auto element : doc->traverseTree())
-        if (auto node = element->asA<MaterialX::Node>();
-            node && node->getCategory() == "open_pbr_surface" && IsTrueConstant(node->getInput("geometry_thin_walled")))
+    for (auto element : doc->traverseTree()) {
+        auto node = element->asA<MaterialX::Node>();
+        if (!node) continue;
+        if (node->getCategory() == "open_pbr_surface" && IsTrueConstant(node->getInput("geometry_thin_walled")))
             nodes.push_back(node);
+        else if (node->getCategory() == "standard_surface" && IsTrueConstant(node->getInput("thin_walled")) &&
+                 (!IsZero(ConstantOrDefault(node, "transmission")) || !IsZero(ConstantOrDefault(node, "subsurface"))))
+            nodes.push_back(node);
+    }
     if (nodes.empty()) return;
 
     // The MDL generator's own choice of implementation (the library's genmdl
@@ -395,11 +410,13 @@ void ExpandThinWalledOpenPbr(const MaterialX::DocumentPtr& doc)
                       << "; it renders as a closed surface\n";
             continue;
         }
-        auto depth = node->getInput("transmission_depth");
-        if (!depth) depth = node->addInput("transmission_depth", "float");
-        for (const char* attribute : {"nodename", "nodegraph", "output", "interfacename"})
-            depth->removeAttribute(attribute);
-        depth->setValue(0.0f);
+        if (node->getCategory() == "open_pbr_surface") {
+            auto depth = node->getInput("transmission_depth");
+            if (!depth) depth = node->addInput("transmission_depth", "float");
+            for (const char* attribute : {"nodename", "nodegraph", "output", "interfacename"})
+                depth->removeAttribute(attribute);
+            depth->setValue(0.0f);
+        }
 
         const std::string name = node->getName();
         std::vector<MaterialX::PortElementPtr> downstream = node->getDownstreamPorts();
@@ -455,6 +472,126 @@ bool IsPositive(const std::string& value)
     try { return !value.empty() && std::stod(value) > 0.0; } catch (...) { return false; }
 }
 
+bool IsBlack(const std::string& value)
+{
+    if (value.empty()) return false;
+    size_t start = 0, count = 0;
+    try {
+        while (start <= value.size()) {
+            const size_t end = std::min(value.find(',', start), value.size());
+            if (std::stod(value.substr(start, end - start)) != 0.0) return false;
+            ++count;
+            start = end + 1;
+        }
+    } catch (...) { return false; }
+    return count == 3;
+}
+
+// Two helper BSDFs with inline genmdl implementations, added to a document
+// that uses them (MaterialX has no node for an MDL Fresnel layer):
+//
+// prism_fresnel_layer: df::fresnel_layer(ior, weight, layer: coat, base:
+//   substrate). libbsdf weights its base by 1 - weight * max(F(k1), F(k2'))
+//   where k2' is k2 reflected about the half vector of the refraction, so a
+//   base refracting with the same IOR keeps exactly 1 - F (no exit loss).
+//   The coat is a bare reflection lobe (generalized_schlick with color0 =
+//   color90 = 1). The material IOR follows the reflection-only
+//   dielectric_bsdf it replaces (pbrlib's preserve_volume_ior: the base's when
+//   above one, else the layer's): OpenPBR's coated glass refracts with
+//   coat_ior, its base carrying specular_ior relative to the coat.
+//
+// prism_dielectric_split: a dielectric whose reflection (tint s) and
+//   transmission (tint t) are tinted differently, as
+//     min(s, t) * RT + (s - min) * F R + (t - min) * (1 - F) T
+//   with RT the untinted reflect-and-transmit lobe, F R the reflection lobe
+//   weighted by its Fresnel term, (1 - F) T the transmission lobe under an
+//   empty Fresnel layer. Exact where s >= t (the last term vanishes); the
+//   last term is exact for smooth lobes.
+const std::string kFresnelLayer = "prism_fresnel_layer";
+const std::string kDielectricSplit = "prism_dielectric_split";
+
+void EnsureHelperBsdf(const MaterialX::DocumentPtr& doc, const std::string& category)
+{
+    const std::string name = "ND_" + category;
+    if (doc->getNodeDef(name)) return;
+    auto nodedef = doc->addNodeDef(name, "BSDF", category);
+    nodedef->setNodeGroup("pbr");
+    std::string code;
+    if (category == kFresnelLayer) {
+        nodedef->setInputValue("ior", 1.5f);
+        nodedef->setInputValue("weight", 1.0f);
+        nodedef->addInput("coat", "BSDF");
+        nodedef->addInput("substrate", "BSDF");
+        code = "material(surface: material_surface(scattering: df::fresnel_layer(ior: {{ior}}, weight: {{weight}}, "
+               "layer: {{coat}}.surface.scattering, base: {{substrate}}.surface.scattering, normal: {{normal}})), "
+               "ior: ({{weight}} <= 0.0 || math::max_value({{substrate}}.ior) > 1.0) ? {{substrate}}.ior : "
+               "color({{ior}}), volume: {{substrate}}.volume)";
+    } else {
+        nodedef->setInputValue("ior", 1.5f);
+        nodedef->setInputValue("reflection_tint", MaterialX::Color3(1.0f));
+        nodedef->setInputValue("transmission_tint", MaterialX::Color3(1.0f));
+        nodedef->addInput("rt", "BSDF");
+        nodedef->addInput("reflection", "BSDF");
+        nodedef->addInput("transmission", "BSDF");
+        const std::string common = "math::min({{reflection_tint}}, {{transmission_tint}})";
+        code = "material(surface: material_surface(scattering: df::color_unbounded_mix(components: "
+               "df::color_bsdf_component[]("
+               "df::color_bsdf_component(weight: " + common + ", component: {{rt}}.surface.scattering), "
+               "df::color_bsdf_component(weight: {{reflection_tint}} - " + common +
+               ", component: df::fresnel_layer(ior: {{ior}}, layer: {{reflection}}.surface.scattering, "
+               "normal: {{normal}})), "
+               "df::color_bsdf_component(weight: {{transmission_tint}} - " + common +
+               ", component: df::fresnel_layer(ior: {{ior}}, base: {{transmission}}.surface.scattering, "
+               "normal: {{normal}}))))), "
+               "ior: {{rt}}.ior, volume: {{rt}}.volume)";
+    }
+    auto normal = nodedef->addInput("normal", "vector3");
+    if (doc->getGeomPropDef("Nworld")) normal->setDefaultGeomPropString("Nworld");
+    auto implementation = doc->addImplementation("IM_" + category + "_genmdl");
+    implementation->setNodeDefString(name);
+    implementation->setTarget("genmdl");
+    implementation->setAttribute("sourcecode", code);
+}
+
+// Copy an input (value or connection) from one node to another.
+void CopyInput(const MaterialX::NodePtr& to, const MaterialX::NodePtr& from, const std::string& name,
+               const std::string& as = std::string())
+{
+    auto source = from ? from->getInput(name) : nullptr;
+    if (!source) return;
+    const std::string target = as.empty() ? name : as;
+    auto input = to->getInput(target);
+    if (!input) input = to->addInput(target, source->getType());
+    input->copyContentFrom(source);
+}
+
+// A reflection lobe without Fresnel weighting (a constant Schlick curve of 1),
+// with the roughness and frame of `lobe`.
+MaterialX::NodePtr BareReflection(const MaterialX::GraphElementPtr& graph, const MaterialX::NodePtr& lobe,
+                                  const std::string& name)
+{
+    auto bare = graph->addNode("generalized_schlick_bsdf", graph->createValidChildName(name), "BSDF");
+    bare->setInputValue("color0", MaterialX::Color3(1.0f));
+    bare->setInputValue("color90", MaterialX::Color3(1.0f));
+    for (const char* input : {"roughness", "normal", "tangent", "distribution"}) CopyInput(bare, lobe, input);
+    return bare;
+}
+
+// The node connected to an input.
+MaterialX::NodePtr Producer(const MaterialX::NodePtr& node, const char* input)
+{
+    auto port = node ? node->getInput(input) : nullptr;
+    return port ? port->getConnectedNode() : nullptr;
+}
+
+void RedirectConsumers(const std::vector<MaterialX::PortElementPtr>& consumers, const MaterialX::NodePtr& node)
+{
+    for (auto const& port : consumers) {
+        port->setNodeName(node->getName());
+        port->removeAttribute("output");
+    }
+}
+
 // The single node connected to a node's output: (consumer, input name).
 std::pair<MaterialX::NodePtr, std::string> SoleConsumer(const MaterialX::NodePtr& node)
 {
@@ -484,9 +621,22 @@ std::pair<MaterialX::NodePtr, std::string> SoleConsumer(const MaterialX::NodePtr
 //     mix(RT [over its VDF], layer(R, opaque), transmission)
 //
 // which is the same where R and T agree (callers check that the lobes have
-// the same IOR and roughness and untinted reflection and transmission).
-// `transmission` is the expanded graph's scatter_mode "T" dielectric_bsdf.
-bool CoupleTransmissionFresnel(const MaterialX::GraphElementPtr& graph, const MaterialX::NodePtr& transmission)
+// the same IOR and roughness). `transmission` is the expanded graph's
+// scatter_mode "T" dielectric_bsdf (`mix` its substrate's port: "fg" in
+// open_pbr_surface, standard_surface and gltf_pbr, "bg" in UsdPreviewSurface).
+//
+// Thin films: the reflection lobe (or, in open_pbr_surface and gltf_pbr, the
+// thin-film side of a mix of reflection lobes) carries the film, and libbsdf
+// applies a film around an RT lobe to its Fresnel term with R + T = 1, so the
+// RT lobe gets the same film (a mix of filmed and plain RT lobes by the
+// film's weight).
+//
+// Tints: with `split`, reflection and transmission are tinted differently
+// (OpenPBR's transmission_color at depth 0, glTF's base_color, a tinted
+// specular_color): RT stays untinted and prism_dielectric_split weights it by
+// both tints. Callers don't combine a split with a thin film.
+bool CoupleTransmissionFresnel(const MaterialX::GraphElementPtr& graph, const MaterialX::NodePtr& transmission,
+                               bool split = false)
 {
     auto mode = transmission->getInput("scatter_mode");
     if (!mode || IsBound(mode) || mode->getValueString() != "T") return false;
@@ -496,48 +646,245 @@ bool CoupleTransmissionFresnel(const MaterialX::GraphElementPtr& graph, const Ma
         carrier = consumer;
         std::tie(consumer, port) = SoleConsumer(carrier);
     }
-    if (!consumer || consumer->getCategory() != "mix" || port != "fg") return false;
+    if (!consumer || consumer->getCategory() != "mix" || (port != "fg" && port != "bg")) return false;
     const MaterialX::NodePtr substrate = consumer;
+    const std::string carrierSide = port, opaqueSide = port == "fg" ? "bg" : "fg";
     auto [layer, layerPort] = SoleConsumer(substrate);
-    auto opaque = substrate->getInput("bg");
+    auto opaque = substrate->getInput(opaqueSide);
     if (!layer || layer->getCategory() != "layer" || layerPort != "base" || !opaque || !opaque->hasNodeName())
         return false;
+    auto top = Producer(layer, "top");
+    if (!top) return false;
+    // The plain reflection lobe, and the thin-film one with its weight.
+    MaterialX::NodePtr plain = top, filmed;
+    MaterialX::InputPtr filmWeight;
+    if (top->getCategory() == "mix") {
+        filmed = Producer(top, "fg");
+        plain = Producer(top, "bg");
+        filmWeight = top->getInput("mix");
+        if (!plain || !filmed) return false;
+        if (!filmWeight || (!IsBound(filmWeight) && IsZero(filmWeight->getValueString()))) filmed = nullptr;
+    } else if (auto film = top->getInput("thinfilm_thickness");
+               film && (IsBound(film) || !IsZero(film->getValueString()))) {
+        filmed = top;
+    }
 
     const std::vector<MaterialX::PortElementPtr> consumers = layer->getDownstreamPorts();
     mode->setValueString("RT");
+    if (split) {
+        EnsureHelperBsdf(graph->getDocument(), kDielectricSplit);
+        auto node = graph->addNode(kDielectricSplit, graph->createValidChildName(transmission->getName() + "_split"),
+                                   "BSDF");
+        CopyInput(node, transmission, "ior");
+        CopyInput(node, transmission, "normal");
+        if (plain->getCategory() == "dielectric_bsdf") CopyInput(node, plain, "tint", "reflection_tint");
+        CopyInput(node, transmission, "tint", "transmission_tint");
+        auto bareT = graph->addNode("dielectric_bsdf", graph->createValidChildName(transmission->getName() + "_bare"),
+                                    "BSDF");
+        for (const char* input : {"ior", "roughness", "normal", "tangent", "distribution"})
+            CopyInput(bareT, transmission, input);
+        bareT->setInputValue("scatter_mode", std::string("T"));
+        auto tint = transmission->getInput("tint");
+        if (!tint) tint = transmission->addInput("tint", "color3");
+        for (const char* attribute : {"nodename", "nodegraph", "output", "interfacename"}) tint->removeAttribute(attribute);
+        tint->setValueString("1, 1, 1");
+        node->addInput("rt", "BSDF")->setNodeName(carrier->getName());
+        node->addInput("reflection", "BSDF")->setNodeName(BareReflection(graph, plain, plain->getName() + "_bare")->getName());
+        node->addInput("transmission", "BSDF")->setNodeName(bareT->getName());
+        carrier = node;
+    } else if (filmed == top) {
+        for (const char* input : {"thinfilm_thickness", "thinfilm_ior"}) CopyInput(transmission, filmed, input);
+    } else if (filmed) {
+        auto filmedT = graph->addNode("dielectric_bsdf", graph->createValidChildName(transmission->getName() + "_tf"),
+                                      "BSDF");
+        filmedT->copyContentFrom(transmission);
+        for (const char* input : {"thinfilm_thickness", "thinfilm_ior"}) CopyInput(filmedT, filmed, input);
+        MaterialX::NodePtr filmedCarrier = filmedT;
+        if (carrier != transmission) {
+            filmedCarrier = graph->addNode("layer", graph->createValidChildName(carrier->getName() + "_tf"), "BSDF");
+            filmedCarrier->copyContentFrom(carrier);
+            filmedCarrier->getInput("top")->setNodeName(filmedT->getName());
+        }
+        auto films = graph->addNode("mix", graph->createValidChildName(carrier->getName() + "_films"), "BSDF");
+        films->addInput("fg", "BSDF")->setNodeName(filmedCarrier->getName());
+        films->addInput("bg", "BSDF")->setNodeName(carrier->getName());
+        if (filmWeight) films->addInput("mix", "float")->copyContentFrom(filmWeight);
+        carrier = films;
+    }
     layer->getInput("base")->setNodeName(opaque->getNodeName());
     auto mix = graph->addNode("mix", graph->createValidChildName(layer->getName() + "_fresnel_coupled"), "BSDF");
-    mix->addInput("fg", "BSDF")->setNodeName(carrier->getName());
-    mix->addInput("bg", "BSDF")->setNodeName(layer->getName());
+    mix->addInput(carrierSide, "BSDF")->setNodeName(carrier->getName());
+    mix->addInput(opaqueSide, "BSDF")->setNodeName(layer->getName());
     if (auto weight = substrate->getInput("mix")) mix->addInput("mix", "float")->copyContentFrom(weight);
-    for (auto const& downstream : consumers) downstream->setNodeName(mix->getName());
+    RedirectConsumers(consumers, mix);
     graph->removeNode(substrate->getName());
     return true;
 }
 
-// Whether a surface node's dielectric reflection and transmission lobes agree
-// (CoupleTransmissionFresnel): constant, untinted, same roughness, no thin
-// film, transmissive and closed.
-bool CanCoupleTransmissionFresnel(const MaterialX::NodePtr& node)
+// The coat of an expanded surface graph whose glass was coupled: the first
+// layer under the surface constructor (below a sheen) with a reflection-only
+// dielectric_bsdf on top. A smooth coat over smooth glass becomes a Fresnel
+// layer (prism_fresnel_layer) with the coat's IOR and weight: MDL refracts
+// the glass with the material IOR, and a Fresnel layer of the same IOR keeps
+// exactly 1 - F for the refracted light (custom_curve_layer loses
+// curve(k2) - curve(k1) of it leaving the medium, R + T 0.78 at 41 degrees
+// inside). Rough coats or glass are left alone: the Fresnel layer's base
+// weighting gains or loses more there than the curve layer does.
+bool ReplaceSmoothCoat(const MaterialX::GraphElementPtr& graph, const MaterialX::NodePtr& surface)
 {
+    MaterialX::NodePtr node = Producer(surface, "bsdf");
+    for (int depth = 0; node && node->getCategory() == "layer" && depth < 4; ++depth) {
+        auto top = Producer(node, "top");
+        if (top && top->getCategory() == "sheen_bsdf") {
+            node = Producer(node, "base");
+            continue;
+        }
+        if (!top || top->getCategory() != "dielectric_bsdf") return false;
+        if (ConstantOrDefault(top, "scatter_mode") != "R") return false;
+        auto tint = top->getInput("tint");
+        if (tint && (IsBound(tint) || !IsWhite(tint->getValueString()))) return false;
+        auto base = node->getInput("base");
+        if (!base || !base->hasNodeName()) return false;
+        EnsureHelperBsdf(graph->getDocument(), kFresnelLayer);
+        const std::vector<MaterialX::PortElementPtr> consumers = node->getDownstreamPorts();
+        auto layer = graph->addNode(kFresnelLayer, graph->createValidChildName(node->getName() + "_fresnel"), "BSDF");
+        for (const char* input : {"ior", "weight", "normal"}) CopyInput(layer, top, input);
+        layer->addInput("coat", "BSDF")->setNodeName(BareReflection(graph, top, top->getName() + "_bare")->getName());
+        layer->addInput("substrate", "BSDF")->copyContentFrom(base);
+        RedirectConsumers(consumers, layer);
+        return true;
+    }
+    return false;
+}
+
+// What the repair does with a surface node's dielectric
+// (CoupleTransmissionFresnel): couple its reflection and transmission lobes
+// (they share IOR and roughness), through prism_dielectric_split when their
+// tints differ; replace a smooth coat over smooth glass (ReplaceSmoothCoat);
+// and the layers it leaves lossy (`partial`, logged once per material).
+// Inputs that are bound count as non-zero (and non-white).
+struct DielectricPlan {
+    bool transmissive = false, couple = false, split = false, coat = false;
+    std::vector<std::string> partial;
+};
+
+DielectricPlan PlanDielectric(const MaterialX::NodePtr& node)
+{
+    DielectricPlan plan;
     auto value = [&](const char* name) { return ConstantOrDefault(node, name); };
+    auto declared = [&](const char* name) {
+        auto nodedef = node->getNodeDef();
+        return node->getInput(name) || (nodedef && nodedef->getActiveInput(name));
+    };
+    // Inputs the definition doesn't declare are zero.
+    auto nonzero = [&](const char* name) { return declared(name) && !IsZero(value(name)); };
     auto transmissive = [&](const char* name) {
         auto input = node->getInput(name);
         return input && (IsBound(input) || !IsZero(input->getValueString()));
     };
+    // A thin film needs untinted lobes; a coat is replaced when it and the
+    // glass are smooth and share one IOR (MDL refracts with a single IOR; a
+    // Fresnel layer of another IOR reflects totally inside at angles the
+    // glass transmits, trapping light in closed glass).
+    // Tints the definition doesn't declare leave the surface alone (a graph
+    // other than MaterialX's).
+    auto decide = [&](bool film, bool tinted, const char* coatWeight, const char* coatRoughness,
+                      const char* roughness, const std::string& coatIor, const std::string& ior,
+                      std::initializer_list<const char*> tints) {
+        for (const char* tint : tints)
+            if (!declared(tint)) return;
+        if (film && tinted) {
+            plan.partial.push_back("thin film over tinted glass");
+            return;
+        }
+        bool sameIor = false;
+        try { sameIor = !coatIor.empty() && !ior.empty() && std::stod(coatIor) == std::stod(ior); } catch (...) {}
+        // The split's Fresnel layers take the glass's IOR, which a coat of
+        // another IOR makes other than the material's.
+        if (tinted && nonzero(coatWeight) && !sameIor) {
+            plan.partial.push_back("tinted glass under a coat of another IOR");
+            return;
+        }
+        plan.couple = true;
+        plan.split = tinted;
+        // The split's Fresnel layers weight rough lobes only approximately.
+        if (tinted && nonzero(roughness)) plan.partial.push_back("rough tinted glass (approximately)");
+        if (nonzero(coatWeight)) {
+            if (nonzero(coatRoughness) || nonzero(roughness)) plan.partial.push_back("rough coat");
+            else if (!sameIor) plan.partial.push_back("coat of another IOR");
+            else plan.coat = true;
+        }
+    };
     const std::string& category = node->getCategory();
-    if (category == "open_pbr_surface")
-        return transmissive("transmission_weight") && value("geometry_thin_walled") == "false" &&
-               IsWhite(value("specular_color")) && IsZero(value("thin_film_weight")) &&
-               (IsWhite(value("transmission_color")) || IsPositive(value("transmission_depth")));
-    if (category == "standard_surface")
-        return transmissive("transmission") && value("thin_walled") == "false" && IsOne(value("specular")) &&
-               IsWhite(value("specular_color")) && IsWhite(value("transmission_color")) &&
-               IsZero(value("transmission_extra_roughness")) && IsZero(value("thin_film_thickness"));
-    if (category == "gltf_pbr")
-        return transmissive("transmission") && IsWhite(value("base_color")) && IsOne(value("specular")) &&
-               IsWhite(value("specular_color")) && IsZero(value("iridescence"));
-    return false;
+    if (category == "open_pbr_surface") {
+        if (!transmissive("transmission_weight") || value("geometry_thin_walled") != "false") return plan;
+        plan.transmissive = true;
+        const bool tinted = !IsWhite(value("specular_color")) ||
+                            !(IsWhite(value("transmission_color")) || IsPositive(value("transmission_depth")));
+        decide(nonzero("thin_film_weight"), tinted, "coat_weight", "coat_roughness", "specular_roughness",
+               value("coat_ior"), value("specular_ior"), {"specular_color", "transmission_color"});
+        if (nonzero("coat_weight") && nonzero("coat_darkening")) plan.partial.push_back("coat darkening");
+        if (nonzero("fuzz_weight")) plan.partial.push_back("fuzz");
+    } else if (category == "standard_surface") {
+        if (!transmissive("transmission") || value("thin_walled") != "false") return plan;
+        plan.transmissive = true;
+        if (!IsOne(value("specular")) || nonzero("transmission_extra_roughness")) {
+            plan.partial.push_back("specular weight or transmission_extra_roughness");
+            return plan;
+        }
+        const bool tinted = !IsWhite(value("specular_color")) || !IsWhite(value("transmission_color"));
+        decide(nonzero("thin_film_thickness"), tinted, "coat", "coat_roughness", "specular_roughness", value("coat_IOR"),
+               value("specular_IOR"), {"specular_color", "transmission_color"});
+    } else if (category == "gltf_pbr") {
+        if (!transmissive("transmission")) return plan;
+        plan.transmissive = true;
+        if (!IsOne(value("specular")) || !IsWhite(value("specular_color"))) {
+            plan.partial.push_back("specular or specular_color");
+            return plan;
+        }
+        decide(nonzero("iridescence"), !IsWhite(value("base_color")), "clearcoat", "clearcoat_roughness", "roughness",
+               "1.5", value("ior"), {"base_color"}); // gltf_pbr's clearcoat has IOR 1.5
+        if (!IsBlack(value("sheen_color"))) plan.partial.push_back("sheen");
+    }
+    return plan;
+}
+
+void ReportPartialRepair(const std::string& name, const DielectricPlan& plan)
+{
+    if (plan.partial.empty()) return;
+    std::string reasons;
+    for (auto const& reason : plan.partial) reasons += (reasons.empty() ? "" : ", ") + reason;
+    std::cerr << "[MaterialX] WARNING: " << name << ": layered transmission only partly repaired (not: " << reasons
+              << "); its glass may lose energy\n";
+}
+
+// The surface constructors an expanded node's consumers now read.
+std::vector<MaterialX::NodePtr> ExpandedSurfaces(const MaterialX::GraphElementPtr& graph,
+                                                 const std::vector<MaterialX::PortElementPtr>& downstream)
+{
+    std::vector<MaterialX::NodePtr> surfaces;
+    for (auto const& port : downstream) {
+        auto surface = graph->getNode(port->getNodeName());
+        if (surface && surface->getCategory() == "surface" &&
+            std::find(surfaces.begin(), surfaces.end(), surface) == surfaces.end())
+            surfaces.push_back(surface);
+    }
+    return surfaces;
+}
+
+// Remove the nodes an expansion added that nothing reads (gltf_pbr's
+// unconnected volume divides by an absent attenuation_distance and fails
+// validation).
+void PruneExpansion(const MaterialX::GraphElementPtr& graph, const std::set<std::string>& before)
+{
+    for (bool pruned = true; pruned;) {
+        pruned = false;
+        for (auto const& added : graph->getNodes())
+            if (!before.contains(added->getName()) && added->getDownstreamPorts().empty()) {
+                graph->removeNode(added->getName());
+                pruned = true;
+            }
+    }
 }
 
 // The scatter_mode "T" dielectric_bsdf among the nodes a flattening added.
@@ -556,40 +903,53 @@ MaterialX::NodePtr AddedTransmission(const MaterialX::GraphElementPtr& graph, co
 
 // Expand the transmissive surfaces whose lobes agree into their genmdl graphs
 // and couple reflection and transmission (CoupleTransmissionFresnel).
+// Couple (and replace the smooth coat of) an expanded surface graph by its
+// plan; false when the graph didn't have the expected shape.
+bool RepairExpandedDielectric(const MaterialX::GraphElementPtr& graph, const MaterialX::NodePtr& transmission,
+                              const std::vector<MaterialX::NodePtr>& surfaces, DielectricPlan& plan)
+{
+    if (!transmission || !CoupleTransmissionFresnel(graph, transmission, plan.split)) return false;
+    if (plan.coat) {
+        bool replaced = !surfaces.empty();
+        for (auto const& surface : surfaces) replaced = ReplaceSmoothCoat(graph, surface) && replaced;
+        if (!replaced) plan.partial.push_back("coat");
+    }
+    return true;
+}
+
 void CoupleSurfaceTransmissionFresnel(const MaterialX::DocumentPtr& doc)
 {
-    std::vector<MaterialX::NodePtr> nodes;
+    std::vector<std::pair<MaterialX::NodePtr, DielectricPlan>> nodes;
     for (auto element : doc->traverseTree())
-        if (auto node = element->asA<MaterialX::Node>(); node && CanCoupleTransmissionFresnel(node))
-            nodes.push_back(node);
+        if (auto node = element->asA<MaterialX::Node>()) {
+            DielectricPlan plan = PlanDielectric(node);
+            if (plan.couple || !plan.partial.empty()) nodes.emplace_back(node, plan);
+        }
     const std::string target = "genmdl";
-    for (auto const& node : nodes) {
+    for (auto& [node, plan] : nodes) {
+        const std::string name = node->getName();
         auto graph = node->getParent() ? node->getParent()->asA<MaterialX::GraphElement>() : nullptr;
         auto implementation = node->getImplementation(target);
-        if (!graph || !implementation || !implementation->isA<MaterialX::NodeGraph>()) continue;
+        if (!plan.couple || !graph || !implementation || !implementation->isA<MaterialX::NodeGraph>()) {
+            ReportPartialRepair(name, plan);
+            continue;
+        }
         std::set<std::string> before;
         for (auto const& existing : graph->getNodes()) before.insert(existing->getName());
-        const std::string name = node->getName();
+        const std::vector<MaterialX::PortElementPtr> downstream = node->getDownstreamPorts();
         graph->flattenSubgraphs(target, [&](MaterialX::NodePtr candidate) { return candidate == node; });
         if (graph->getNode(name) == node) continue; // not expanded
-        auto transmission = AddedTransmission(graph, before);
-        const bool coupled = transmission && CoupleTransmissionFresnel(graph, transmission);
-        // Drop the expansion's dead branches (gltf_pbr's unconnected volume
-        // divides by an absent attenuation_distance and fails validation).
-        for (bool pruned = true; pruned;) {
-            pruned = false;
-            for (auto const& added : graph->getNodes())
-                if (!before.contains(added->getName()) && added->getDownstreamPorts().empty()) {
-                    graph->removeNode(added->getName());
-                    pruned = true;
-                }
-        }
+        const bool coupled = RepairExpandedDielectric(graph, AddedTransmission(graph, before),
+                                                      ExpandedSurfaces(graph, downstream), plan);
+        PruneExpansion(graph, before);
         if (!coupled)
             std::cerr << "[MaterialX] WARNING: " << name << " expanded without a layered transmission"
                       << " lobe; its glass may lose energy\n";
         else if (VerboseMdl())
             std::cout << "[MaterialX] " << name << ": reflection and transmission share one Fresnel"
-                      << " dielectric\n";
+                      << " dielectric" << (plan.split ? " (split by tint)" : "")
+                      << (plan.coat ? ", smooth coat as a Fresnel layer" : "") << "\n";
+        ReportPartialRepair(name, plan);
     }
 }
 
@@ -627,7 +987,8 @@ void LayerGltfPbrVolume(const MaterialX::DocumentPtr& doc)
         std::set<std::string> before;
         for (auto const& existing : graph->getNodes()) before.insert(existing->getName());
         const std::string name = node->getName();
-        const bool couple = CanCoupleTransmissionFresnel(node);
+        DielectricPlan plan = PlanDielectric(node);
+        const std::vector<MaterialX::PortElementPtr> downstream = node->getDownstreamPorts();
         graph->flattenSubgraphs(target, [&](MaterialX::NodePtr candidate) { return candidate == node; });
         if (graph->getNode(name) == node) continue; // not expanded
 
@@ -653,8 +1014,280 @@ void LayerGltfPbrVolume(const MaterialX::DocumentPtr& doc)
         if (VerboseMdl())
             std::cout << "[MaterialX] " << name << ": transmission layered over its volume ("
                       << consumers.size() << " consumers)\n";
-        if (couple && !CoupleTransmissionFresnel(graph, transmission))
+        if (plan.couple && !RepairExpandedDielectric(graph, transmission, ExpandedSurfaces(graph, downstream), plan))
             std::cerr << "[MaterialX] WARNING: " << name << ": no layered transmission lobe; its glass may lose energy\n";
+        ReportPartialRepair(name, plan);
+    }
+}
+
+// Expand one node into its genmdl graph; the names of the graph's nodes
+// before, or nullptr when it has no graph or wasn't expanded.
+MaterialX::GraphElementPtr ExpandNode(const MaterialX::NodePtr& node, std::set<std::string>& before)
+{
+    const std::string target = "genmdl";
+    auto graph = node->getParent() ? node->getParent()->asA<MaterialX::GraphElement>() : nullptr;
+    auto implementation = node->getImplementation(target);
+    if (!graph || !implementation || !implementation->isA<MaterialX::NodeGraph>()) return nullptr;
+    for (auto const& existing : graph->getNodes()) before.insert(existing->getName());
+    const std::string name = node->getName();
+    graph->flattenSubgraphs(target, [&](MaterialX::NodePtr candidate) { return candidate == node; });
+    return graph->getNode(name) == node ? nullptr : graph;
+}
+
+std::vector<MaterialX::NodePtr> AddedNodes(const MaterialX::GraphElementPtr& graph, const std::set<std::string>& before,
+                                           const std::string& category, const char* mode = nullptr)
+{
+    std::vector<MaterialX::NodePtr> found;
+    for (auto const& added : graph->getNodes()) {
+        if (before.contains(added->getName()) || added->getCategory() != category) continue;
+        if (mode) {
+            auto input = added->getInput("scatter_mode");
+            if (!input || input->getValueString() != mode) continue;
+        }
+        found.push_back(added);
+    }
+    return found;
+}
+
+std::vector<MaterialX::NodePtr> NodesOf(const MaterialX::DocumentPtr& doc, const std::string& category)
+{
+    std::vector<MaterialX::NodePtr> nodes;
+    for (auto element : doc->traverseTree())
+        if (auto node = element->asA<MaterialX::Node>(); node && node->getCategory() == category)
+            nodes.push_back(node);
+    return nodes;
+}
+
+bool SameColor(const std::string& a, const std::string& b)
+{
+    if (a.empty() || b.empty()) return false;
+    try {
+        MaterialX::Color3 x = MaterialX::fromValueString<MaterialX::Color3>(a);
+        MaterialX::Color3 y = MaterialX::fromValueString<MaterialX::Color3>(b);
+        return x == y;
+    } catch (...) { return false; }
+}
+
+// UsdPreviewSurface with opacity < 1 in "transparent" mode (opacityMode 0,
+// no opacityThreshold) refracts: MaterialX's graph (the one USD ships) is
+//
+//     layer(generalized_schlick R (F0 from ior), mix(diffuse, T (ior, smooth), opacity))
+//
+// and loses energy leaving the medium like the other surfaces (R + T 0.64 at
+// 41 degrees inside). Its transmission is always smooth, so only a smooth
+// specular lobe (roughness 0) agrees with it: such surfaces are rewritten as
+//
+//     mix(layer(R, diffuse), RT, opacity)
+//
+// (the opaque part keeps its Schlick reflection; the transparent part
+// reflects with Fresnel's). A rough specular over the smooth transmission has
+// no exact form (an RT lobe would blur the refraction), and neither do the
+// metallic and specular workflows' tinted reflections or the clearcoat.
+void CoupleUsdPreviewTransmission(const MaterialX::DocumentPtr& doc)
+{
+    for (auto const& node : NodesOf(doc, "UsdPreviewSurface")) {
+        auto opacity = node->getInput("opacity");
+        if (!opacity) continue;
+        if (!IsBound(opacity)) {
+            try { if (!(std::stod(opacity->getValueString()) < 1.0)) continue; } catch (...) { continue; }
+        }
+        auto value = [&](const char* name) { return ConstantOrDefault(node, name); };
+        // A threshold makes opacity a cutout; presence mode a coverage.
+        if (!IsZero(value("opacityThreshold")) || (!value("opacityMode").empty() && value("opacityMode") != "0"))
+            continue;
+        DielectricPlan plan;
+        plan.transmissive = true;
+        if (!IsZero(value("roughness"))) plan.partial.push_back("rough specular over smooth transmission");
+        if (!IsZero(value("metallic"))) plan.partial.push_back("metallic");
+        if (value("useSpecularWorkflow") != "0") plan.partial.push_back("specular workflow");
+        if (!IsZero(value("clearcoat"))) plan.partial.push_back("clearcoat");
+        const std::string name = node->getName();
+        if (!plan.partial.empty()) {
+            ReportPartialRepair(name, plan);
+            continue;
+        }
+        std::set<std::string> before;
+        auto graph = ExpandNode(node, before);
+        if (!graph) continue;
+        auto transmissions = AddedNodes(graph, before, "dielectric_bsdf", "T");
+        bool coupled = false;
+        if (transmissions.size() == 1) {
+            auto transmission = transmissions.front();
+            auto [mixture, port] = SoleConsumer(transmission);
+            auto diffuse = mixture ? mixture->getInput("fg") : nullptr;
+            if (mixture && mixture->getCategory() == "mix" && port == "bg" && diffuse && diffuse->hasNodeName()) {
+                transmission->setInputValue("scatter_mode", std::string("RT"));
+                for (auto const& use : mixture->getDownstreamPorts()) {
+                    auto layer = use->getParent() ? use->getParent()->asA<MaterialX::Node>() : nullptr;
+                    if (!layer || layer->getCategory() != "layer" || use->getName() != "base") continue;
+                    const std::vector<MaterialX::PortElementPtr> consumers = layer->getDownstreamPorts();
+                    auto opaque = graph->addNode("layer", graph->createValidChildName(layer->getName() + "_opaque"), "BSDF");
+                    opaque->addInput("top", "BSDF")->copyContentFrom(layer->getInput("top"));
+                    opaque->addInput("base", "BSDF")->setNodeName(diffuse->getNodeName());
+                    auto coupledMix =
+                        graph->addNode("mix", graph->createValidChildName(layer->getName() + "_fresnel_coupled"), "BSDF");
+                    coupledMix->addInput("fg", "BSDF")->setNodeName(opaque->getName());
+                    coupledMix->addInput("bg", "BSDF")->setNodeName(transmission->getName());
+                    if (auto weight = mixture->getInput("mix")) coupledMix->addInput("mix", "float")->copyContentFrom(weight);
+                    RedirectConsumers(consumers, coupledMix);
+                    coupled = true;
+                }
+            }
+        }
+        PruneExpansion(graph, before);
+        if (!coupled)
+            std::cerr << "[MaterialX] WARNING: " << name << " expanded without a layered transmission"
+                      << " lobe; its glass may lose energy\n";
+        else if (VerboseMdl())
+            std::cout << "[MaterialX] " << name << ": transparent UsdPreviewSurface as an RT dielectric\n";
+    }
+}
+
+// LamaDielectric layers its reflection over its transmission (over the
+// interior VDF), both dielectric_bsdf with the same IOR, roughness and frame:
+// layer(R, layer(T, VDF)) loses the energy of light leaving the medium. With
+// equal tints (Lama's reflectionTint and transmissionTint are meant for
+// external reflection and inward transmission; MaterialX applies each to its
+// lobe on both sides) it is layer(RT, VDF).
+void CoupleLamaDielectric(const MaterialX::DocumentPtr& doc)
+{
+    for (auto const& node : NodesOf(doc, "LamaDielectric")) {
+        const std::string name = node->getName();
+        if (!SameColor(ConstantOrDefault(node, "reflectionTint"), ConstantOrDefault(node, "transmissionTint"))) {
+            DielectricPlan plan;
+            plan.partial.push_back("reflectionTint other than transmissionTint");
+            ReportPartialRepair(name, plan);
+            continue;
+        }
+        std::set<std::string> before;
+        auto graph = ExpandNode(node, before);
+        if (!graph) continue;
+        auto transmissions = AddedNodes(graph, before, "dielectric_bsdf", "T");
+        auto reflections = AddedNodes(graph, before, "dielectric_bsdf", "R");
+        bool coupled = false;
+        if (transmissions.size() == 1 && reflections.size() == 1) {
+            auto [interior, port] = SoleConsumer(transmissions.front());
+            auto [layer, layerPort] = SoleConsumer(reflections.front());
+            if (interior && interior->getCategory() == "layer" && port == "top" && layer &&
+                layer->getCategory() == "layer" && layerPort == "top" && Producer(layer, "base") == interior) {
+                transmissions.front()->setInputValue("scatter_mode", std::string("RT"));
+                RedirectConsumers(layer->getDownstreamPorts(), interior);
+                coupled = true;
+            }
+        }
+        PruneExpansion(graph, before);
+        if (!coupled)
+            std::cerr << "[MaterialX] WARNING: " << name << " expanded without a layered transmission"
+                      << " lobe; its glass may lose energy\n";
+        else if (VerboseMdl())
+            std::cout << "[MaterialX] " << name << ": LamaDielectric as an RT dielectric\n";
+    }
+}
+
+// LamaGeneralizedSchlick layers multiply(R, reflectionTint) over its
+// transmission; MaterialX's MDL generator threads a layer's base only into a
+// top BSDF with a base input ("TODO handle mix, add, and multiply" in
+// ClosureLayerNodeMdl), so the transmission is dropped and the surface only
+// reflects. A Schlick curve is linear in its colors, so the tint moves into
+// the reflection lobe's color0 and color90 and the lobe becomes the top. The
+// Schlick layer over the refracting base keeps its exit loss (a Schlick curve
+// has no IOR), and its transmission lobe carries a Schlick weight of its own
+// on top of the layer's (T 0.92 at normal incidence), which is logged.
+//
+// When the curve is Fresnel's Schlick approximation (reflectivity90 white,
+// reflectivityProfile 0.2, a gray constant reflectivity or IOR) and both
+// tints agree, the node is instead the RT dielectric of that IOR over its
+// interior, which conserves energy (its reflection becomes Fresnel's).
+std::optional<float> LamaSchlickIor(const MaterialX::NodePtr& node)
+{
+    auto value = [&](const char* name) { return ConstantOrDefault(node, name); };
+    if (!IsWhite(value("reflectivity90")) || !SameColor(value("reflectionTint"), value("transmissionTint")))
+        return std::nullopt;
+    try {
+        if (std::abs(std::stod(value("reflectivityProfile")) - 0.2) > 1e-6) return std::nullopt;
+        const std::string mode = value("fresnelMode");
+        const MaterialX::Color3 c = MaterialX::fromValueString<MaterialX::Color3>(
+            value(mode == "1" ? "IOR" : "reflectivity"));
+        if (c[0] != c[1] || c[1] != c[2]) return std::nullopt;
+        if (mode == "1") return c[0] > 1.0f ? std::optional<float>(c[0]) : std::nullopt;
+        if (mode != "0" || !(c[0] > 0.0f && c[0] < 1.0f)) return std::nullopt;
+        const float root = std::sqrt(c[0]);
+        return (1.0f + root) / (1.0f - root);
+    } catch (...) { return std::nullopt; }
+}
+
+bool LamaSchlickAsRt(const MaterialX::GraphElementPtr& graph, const std::set<std::string>& before, float ior)
+{
+    auto transmissions = AddedNodes(graph, before, "generalized_schlick_bsdf", "T");
+    if (transmissions.size() != 1) return false;
+    auto transmission = transmissions.front();
+    auto [interior, port] = SoleConsumer(transmission);
+    if (!interior || interior->getCategory() != "layer" || port != "top") return false;
+    auto [tinted, tintPort] = SoleConsumer(interior);
+    if (!tinted || tinted->getCategory() != "multiply" || tintPort != "in1") return false;
+    auto [layer, layerPort] = SoleConsumer(tinted);
+    if (!layer || layer->getCategory() != "layer" || layerPort != "base") return false;
+    auto rt = graph->addNode("dielectric_bsdf", graph->createValidChildName(transmission->getName() + "_rt"), "BSDF");
+    rt->setInputValue("ior", ior);
+    CopyInput(rt, tinted, "in2", "tint");
+    for (const char* input : {"roughness", "normal", "tangent", "distribution"}) CopyInput(rt, transmission, input);
+    rt->setInputValue("scatter_mode", std::string("RT"));
+    auto volume = graph->addNode("layer", graph->createValidChildName(interior->getName() + "_rt"), "BSDF");
+    volume->addInput("top", "BSDF")->setNodeName(rt->getName());
+    volume->addInput("base", "VDF")->copyContentFrom(interior->getInput("base"));
+    RedirectConsumers(layer->getDownstreamPorts(), volume);
+    return true;
+}
+
+void RepairLamaGeneralizedSchlick(const MaterialX::DocumentPtr& doc)
+{
+    for (auto const& node : NodesOf(doc, "LamaGeneralizedSchlick")) {
+        const std::string name = node->getName();
+        const std::optional<float> ior = LamaSchlickIor(node);
+        std::set<std::string> before;
+        auto graph = ExpandNode(node, before);
+        if (!graph) continue;
+        if (ior && LamaSchlickAsRt(graph, before, *ior)) {
+            PruneExpansion(graph, before);
+            if (VerboseMdl())
+                std::cout << "[MaterialX] " << name << ": LamaGeneralizedSchlick as an RT dielectric of IOR " << *ior
+                          << "\n";
+            continue;
+        }
+        bool repaired = false;
+        for (auto const& multiply : AddedNodes(graph, before, "multiply")) {
+            if (multiply->getType() != "BSDF") continue;
+            auto lobe = Producer(multiply, "in1");
+            auto [layer, port] = SoleConsumer(multiply);
+            auto tint = multiply->getInput("in2");
+            if (!lobe || lobe->getCategory() != "generalized_schlick_bsdf" || !tint || !layer ||
+                layer->getCategory() != "layer" || port != "top")
+                continue;
+            for (const char* color : {"color0", "color90"}) {
+                auto tinted = graph->addNode("multiply", graph->createValidChildName(lobe->getName() + "_" + color),
+                                             "color3");
+                auto in1 = tinted->addInput("in1", "color3");
+                if (auto source = lobe->getInput(color)) in1->copyContentFrom(source);
+                else in1->setValueString("1, 1, 1");
+                tinted->addInput("in2", "color3")->copyContentFrom(tint);
+                auto input = lobe->getInput(color);
+                if (!input) input = lobe->addInput(color, "color3");
+                for (const char* attribute : {"value", "nodename", "nodegraph", "output", "interfacename"})
+                    input->removeAttribute(attribute);
+                input->setNodeName(tinted->getName());
+            }
+            layer->getInput("top")->setNodeName(lobe->getName());
+            repaired = true;
+        }
+        PruneExpansion(graph, before);
+        if (!repaired) {
+            std::cerr << "[MaterialX] WARNING: " << name << ": no tinted reflection over its transmission; "
+                      << "MDL renders its reflection only\n";
+            continue;
+        }
+        DielectricPlan plan;
+        plan.partial.push_back("Schlick reflection over refraction");
+        ReportPartialRepair(name, plan);
     }
 }
 
@@ -828,6 +1461,9 @@ MaterialX::DocumentPtr DocumentLoader::load(const std::string& filepath)
         ExpandThinWalledOpenPbr(doc);
         LayerGltfPbrVolume(doc);
         CoupleSurfaceTransmissionFresnel(doc);
+        CoupleUsdPreviewTransmission(doc);
+        CoupleLamaDielectric(doc);
+        RepairLamaGeneralizedSchlick(doc);
         std::string validation_errors;
         if (!doc->validate(&validation_errors)) {
             std::cerr << "[WARN] Document validation issues: " << validation_errors << "\n";
