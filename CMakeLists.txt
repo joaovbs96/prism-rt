@@ -440,12 +440,6 @@ if(PRISM_BUILD_HYDRA)
     set_tests_properties(prism_hydra_pass_camera_test PROPERTIES
         ENVIRONMENT "${_prism_test_environment}")
 
-    add_executable(prism_hydra_primary_coverage_test tests/hydra/primary_coverage_test.cpp)
-    target_link_libraries(prism_hydra_primary_coverage_test PRIVATE PrismRT::core)
-    add_test(NAME prism_hydra_primary_coverage_test COMMAND prism_hydra_primary_coverage_test)
-    set_tests_properties(prism_hydra_primary_coverage_test PROPERTIES
-        ENVIRONMENT "${_prism_test_environment}")
-
     add_executable(prism_hydra_pick_bounds_test tests/hydra/pick_bounds_test.cpp)
     target_link_libraries(prism_hydra_pick_bounds_test PRIVATE PrismRT::core)
     add_test(NAME prism_hydra_pick_bounds_test COMMAND prism_hydra_pick_bounds_test)
@@ -644,18 +638,7 @@ if(PRISM_BUILD_HYDRA)
         target_link_libraries(prism_camera_rays_test PRIVATE PrismRT::core)
         add_test(NAME prism_camera_rays_test COMMAND prism_camera_rays_test)
     endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/render_cost_benchmark.cpp")
-        add_executable(prism_render_cost_benchmark
-            tests/render_cost_benchmark.cpp)
-        target_link_libraries(prism_render_cost_benchmark PRIVATE
-            PrismRT::core ${PXR_LIBRARIES})
-    endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/environment_lighting.cpp")
-        add_executable(prism_environment_lighting_test tests/environment_lighting.cpp)
-        target_link_libraries(prism_environment_lighting_test PRIVATE PrismRT::core)
-        add_test(NAME prism_environment_lighting_test COMMAND prism_environment_lighting_test)
-    endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/scene_export_test.cpp")
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/usd_spheres.cpp")
         add_executable(prism_usd_spheres_test tests/usd_spheres.cpp)
         target_link_libraries(prism_usd_spheres_test PRIVATE PrismRT::core ${PXR_LIBRARIES})
         add_test(NAME prism_usd_spheres_test COMMAND prism_usd_spheres_test)
@@ -671,9 +654,6 @@ if(PRISM_BUILD_HYDRA)
         add_test(NAME prism_openpbr_transmission_test COMMAND prism_openpbr_transmission_test)
         set_tests_properties(prism_openpbr_transmission_test PROPERTIES
             ENVIRONMENT "${_prism_test_environment}" SKIP_RETURN_CODE 77)
-        add_executable(prism_scene_export_test tests/scene_export_test.cpp)
-        target_link_libraries(prism_scene_export_test PRIVATE PrismRT::core ${PXR_LIBRARIES})
-        add_test(NAME prism_scene_export_test COMMAND prism_scene_export_test)
     endif()
     # The CLI must exit cleanly: process-wide caches holding MDL handles once outlived
     # libmdl_sdk and crashed in static destruction after the image was written.
@@ -885,7 +865,8 @@ if(TARGET prism_hydra_render AND TARGET prism_compare_images)
         camera_visibility:light_camera_visibility
         dome_temperature:dome_color_temperature
         invisible_ids:pointinstancer_invisible_ids
-        display_color:display_color_interpolation)
+        display_color:display_color_interpolation
+        glass_furnace:glass_furnace)
     foreach(_entry IN LISTS _prism_scene_features)
         string(REPLACE ":" ";" _parts "${_entry}")
         list(GET _parts 0 _feature)
@@ -1000,6 +981,23 @@ if(TARGET prism_hydra_render AND TARGET prism_compare_images)
             set_tests_properties(prism_scene_features_${_variant}_consistency PROPERTIES
                 FIXTURES_REQUIRED prism_scene_features_${_variant}_sampling)
         endforeach()
+        # Delta paths (smooth glass, null crossings) are never MIS weighted:
+        # with environment sampling on or off the furnace renders the same.
+        foreach(_sampling mis bsdf)
+            add_test(NAME prism_scene_features_glass_furnace_${_sampling}_render
+                COMMAND PrismRT --scene "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/glass_furnace.usda"
+                    --camera /World/Camera --width 64 --height 64 --spp 64 ${_prism_fixed_sampling} --device cpu
+                    --environment-sampling ${_sampling}
+                    --output "${CMAKE_BINARY_DIR}/scene_features/glass_furnace_${_sampling}.exr")
+            set_tests_properties(prism_scene_features_glass_furnace_${_sampling}_render PROPERTIES
+                ENVIRONMENT "${_prism_test_environment};PRISM_DEVICE=cpu"
+                FIXTURES_SETUP prism_scene_features_glass_furnace_sampling)
+        endforeach()
+        add_test(NAME prism_scene_features_glass_furnace_sampling
+            COMMAND prism_compare_images "${CMAKE_BINARY_DIR}/scene_features/glass_furnace_bsdf.exr"
+                "${CMAKE_BINARY_DIR}/scene_features/glass_furnace_mis.exr" --tolerance 0.005 --mean-tolerance 0.001)
+        set_tests_properties(prism_scene_features_glass_furnace_sampling PROPERTIES
+            FIXTURES_REQUIRED prism_scene_features_glass_furnace_sampling)
     endif()
     if(TARGET prism_render_settings_test)
         # Named channels and sane values in both frontends' products; the

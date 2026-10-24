@@ -1,4 +1,6 @@
-"""Independent frontend parity for exported procedural USD scenes.
+"""Independent frontend parity for the procedural USD scenes (assets/scenes:
+InOneWeekend, CornellBox and QuadTest, once exported from the C++ scenes the
+renderer used to hard-code).
 
 Use the configured Prism runtime. Image comparisons use the same thresholds as
 validate.py; no sample clamp hides energy discrepancies. Loading is timed but
@@ -43,7 +45,7 @@ def main():
     results = []
 
     def run(name, command):
-        if command[0] in (standalone, hydra) and "--export-scene" not in command:
+        if command[0] in (standalone, hydra):
             command = [*command, "--texture-filtering", args.texture_filtering]
             if command[0] == standalone and args.device:
                 command = [*command, "--device", args.device]
@@ -59,8 +61,7 @@ def main():
 
     for name in args.scene or ["InOneWeekend", "CornellBox", "QuadTest"]:
         samples = args.inoneweekend_spp if name == "InOneWeekend" else args.spp
-        scene = output / f"{name}.usda"
-        run(f"{name}-export", [standalone, "--export-scene", name, "--seed", 0, "--output", scene])
+        scene = root / "assets" / "scenes" / f"{name}.usda"
         for repetition in (1, 2):
             run(f"{name}-standalone-{repetition}", [standalone, "--scene", scene,
                 "--camera", "/World/Camera", "--width", 128, "--height", 128,

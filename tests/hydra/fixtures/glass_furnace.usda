@@ -1,0 +1,78 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    renderSettingsPrimPath = "/Render/Settings"
+    upAxis = "Y"
+)
+
+# No Russian roulette (its 1 / q weights are noise) and depth for the paths
+# that reflect inside the sphere.
+def Scope "Render"
+{
+    def RenderSettings "Settings"
+    {
+        rel camera = </World/Camera>
+        int2 resolution = (64, 64)
+        int prism:maxDepth = 64
+        int prism:rrMinDepth = 64
+    }
+}
+
+# White furnace for delta transport: under a uniform white dome a smooth,
+# closed, non-absorbing glass sphere (reflection and refraction are delta
+# lobes, never weighted against light sampling) must look exactly like the
+# dome, and so must a fully transparent card (null crossings: displayOpacity
+# 0) in front of it.
+def Xform "World"
+{
+    def Sphere "Ball" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        double radius = 1
+        rel material:binding = </World/Looks/Glass>
+    }
+
+    def Mesh "Card"
+    {
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 1, 2, 3]
+        point3f[] points = [(-1.5, -1.5, 1.5), (0, -1.5, 1.5), (0, 1.5, 1.5), (-1.5, 1.5, 1.5)]
+        color3f[] primvars:displayColor = [(0.5, 0.5, 0.5)]
+        float[] primvars:displayOpacity = [0]
+        bool doubleSided = true
+    }
+
+    def Scope "Looks"
+    {
+        def Material "Glass"
+        {
+            token outputs:mtlx:surface.connect = </World/Looks/Glass/Surface.outputs:out>
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_open_pbr_surface_surfaceshader"
+                float inputs:base_weight = 0
+                float inputs:specular_roughness = 0
+                float inputs:specular_ior = 1.5
+                float inputs:transmission_weight = 1
+                token outputs:out
+            }
+        }
+    }
+
+    def DomeLight "Dome"
+    {
+        color3f inputs:color = (1, 1, 1)
+        float inputs:intensity = 1
+    }
+
+    def Camera "Camera"
+    {
+        float focalLength = 50
+        float horizontalAperture = 36
+        float verticalAperture = 36
+        double3 xformOp:translate = (0, 0, 4)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+}
