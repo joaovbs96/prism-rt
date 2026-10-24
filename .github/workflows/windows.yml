@@ -260,7 +260,7 @@ jobs:
           $env:PRISM_DISABLE_VULKAN = "1"
           # Several Hydra tests share fixed temporary file names: run serially.
           ctest --test-dir build -C RelWithDebInfo --output-on-failure --timeout 900 `
-            -E "prism_cli_clean_exit_vulkan"
+            -E "prism_cli_clean_exit_vulkan|prism_cli_gpu_failure_vulkan"
           if ($LASTEXITCODE) { throw "ctest failed" }
 
       - name: Package
