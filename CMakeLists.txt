@@ -686,6 +686,12 @@ if(PRISM_BUILD_HYDRA)
             --time-limit 2 --device cpu --output "${CMAKE_BINARY_DIR}/cli_time_limit.exr")
     set_tests_properties(prism_cli_time_limit PROPERTIES ENVIRONMENT "${_prism_test_environment}"
         PASS_REGULAR_EXPRESSION "stopped by the time limit" TIMEOUT 120)
+    # The former cpu-reference device is rejected with a plain message.
+    add_test(NAME prism_cli_cpu_reference_removed
+        COMMAND PrismRT --scene "${CMAKE_CURRENT_SOURCE_DIR}/assets/scenes/CornellBox.usda"
+            --camera /World/Camera --device cpu-reference --output "${CMAKE_BINARY_DIR}/cli_cpu_reference.exr")
+    set_tests_properties(prism_cli_cpu_reference_removed PROPERTIES ENVIRONMENT "${_prism_test_environment}"
+        PASS_REGULAR_EXPRESSION "the cpu-reference device was removed; use cpu")
     if(TARGET prism_hydra_render)
         add_test(NAME prism_hydra_time_limit
             COMMAND prism_hydra_render "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/parity.usda"

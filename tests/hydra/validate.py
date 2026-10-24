@@ -29,7 +29,7 @@ def main():
                         help="override the Hydra render helper (for installed-plugin validation)")
     parser.add_argument("--compare", type=Path,
                         help="override the image comparison helper")
-    parser.add_argument("--device", choices=["auto", "cpu", "cpu-reference", "vulkan", "metal"],
+    parser.add_argument("--device", choices=["auto", "cpu", "vulkan", "metal"],
                         help="render device of both frontends (default: their auto)")
     args = parser.parse_args()
     env = dict(os.environ)

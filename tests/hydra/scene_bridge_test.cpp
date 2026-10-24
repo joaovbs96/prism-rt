@@ -12,6 +12,7 @@
 #include "../../src/hydra/task_delegate.h"
 #include "../../src/hydra/triangulation.h"
 #include "../../src/scene.h"
+#include "../../src/device/cpu_device.h"
 
 #include <pxr/base/gf/frustum.h>
 #include <pxr/base/gf/rotation.h>
@@ -477,8 +478,19 @@ Color3 TraceTriangle(bool instanced, bool mirrored, bool *zeroTangent)
         std::isfinite(primaryHit.tangent.x()) &&
         std::isfinite(primaryHit.tangent.y()) &&
         std::isfinite(primaryHit.tangent.z());
-    unsigned int seed = 17;
-    const Color3 result = scene.trace(primary, 0, Color3(1.0f), seed);
+    // A few integrator samples along that ray (a 1x1 orthographic view
+    // 0.02 wide, at z = 1 looking down -z), the same sequence in every
+    // variant.
+    prism::device::CpuDevice cpu;
+    prism::device::ImageRequest request;
+    request.camera.orthographic = true;
+    request.camera.inverseProjection.SetScale(GfVec3d(0.01, 0.01, 1.0));
+    request.camera.cameraToWorld.SetTranslate(GfVec3d(0.0, 0.0, 1.0));
+    request.width = request.height = 1;
+    request.samples = 16;
+    request.seed = 17;
+    const std::vector<float> pixels = cpu.RenderImage(scene, request);
+    const Color3 result(pixels[0], pixels[1], pixels[2]);
     scene.geometry.clear();
     scene.intersection_geometry.clear();
     scene.placement_transforms.clear();

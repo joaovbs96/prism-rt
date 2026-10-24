@@ -26,6 +26,10 @@ int main()
     check(ParseDevicePreference("vulkan", &preference) && preference == DevicePreference::Vulkan,
           "parse vulkan");
     check(!ParseDevicePreference("cuda", &preference), "reject unknown devices");
+    check(RemovedDeviceMessage("cuda").empty(), "an unknown device was never removed");
+    check(!ParseDevicePreference("cpu-reference", &preference) &&
+          RemovedDeviceMessage("CPU-Reference") == "the cpu-reference device was removed; use cpu",
+          "the removed cpu-reference device is rejected with a plain message");
 
     const auto devices = AvailableDevices();
     check(!devices.empty() && devices.back().kind == DeviceKind::Cpu,
