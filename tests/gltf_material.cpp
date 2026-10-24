@@ -7,6 +7,8 @@
 // prism_gltf_material_test --check-normal-map <render of normal_map.gltf>
 //   (camera at 0,0,6 looking at the origin, vertical FOV 40 degrees): each
 //   normal-mapped half shades like the quad rotated to its mapped normal.
+// prism_gltf_material_test --check-error-material <render>: the geometry of a
+//   render whose materials failed shows the magenta error material.
 #include "../src/materialx/gltf_material.h"
 #include "../src/materialx/mdl_generator.h"
 #include "../src/materialx/loader.h"
@@ -439,11 +441,36 @@ int CheckNormalMap(const std::string& path)
     return failures ? 1 : 0;
 }
 
+// A render whose materials all failed to load: the geometry shows the magenta
+// error material (unlit emission, so exactly (1, 0, 1) in linear Rec.709)
+// over a good part of the image.
+int CheckErrorMaterial(const std::string& path)
+{
+    OIIO::ImageBuf image(path);
+    if (!image.read(0, 0, true, OIIO::TypeDesc::FLOAT)) {
+        std::cerr << "cannot read " << path << "\n";
+        return 2;
+    }
+    const auto& spec = image.spec();
+    int magenta = 0;
+    float pixel[4]{};
+    for (int y = 0; y < spec.height; ++y)
+        for (int x = 0; x < spec.width; ++x) {
+            image.getpixel(x, y, pixel, 4);
+            if (pixel[0] > 0.5f && pixel[2] > 0.5f && pixel[1] < 0.05f * pixel[0]) ++magenta;
+        }
+    const double share = double(magenta) / (double(spec.width) * spec.height);
+    std::cout << "magenta pixels: " << share * 100.0 << "%\n";
+    Check(share > 0.05, "the failed materials render magenta");
+    return failures ? 1 : 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv)
 {
     try {
+        if (argc == 3 && std::string(argv[1]) == "--check-error-material") return CheckErrorMaterial(argv[2]);
         if (argc == 3 && std::string(argv[1]) == "--check-normal-map") return CheckNormalMap(argv[2]);
         if (argc == 3 && std::string(argv[1]) == "--check-volume") return CheckVolume(argv[2]);
         if (argc != 2) {

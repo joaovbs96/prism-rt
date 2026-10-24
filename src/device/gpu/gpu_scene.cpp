@@ -113,24 +113,6 @@ public:
                 record.info.x = kMaterialEmissive;
                 record.textures.x = texture(emissive->emissive_color);
                 record.params.x = emissive->emissive_multiplier;
-            } else if (auto const* gltf = dynamic_cast<DiffuseGltf const*>(material)) {
-                record.info.x = kMaterialDiffuseGltf;
-                record.textures.x = texture(gltf->base_color);
-            } else if (auto const* gltf = dynamic_cast<MetalGltf const*>(material)) {
-                record.info.x = kMaterialMetalGltf;
-                record.textures.x = texture(gltf->base_color);
-                record.textures.y = texture(gltf->orm);
-            } else if (auto const* gltf = dynamic_cast<SpecularBTDFglTF const*>(material)) {
-                record.info.x = kMaterialSpecularBtdfGltf;
-                record.textures.x = texture(gltf->base_color);
-                record.params.x = gltf->ior;
-            } else if (auto const* pbr = dynamic_cast<gltfPBR const*>(material)) {
-                record.info.x = kMaterialGltfPbr;
-                record.textures.x = texture(pbr->base_color);
-                record.textures.y = texture(pbr->orm);
-                record.textures.z = texture(pbr->transmission);
-                // gltfPBR::sample returns its lobes' samples, which carry no
-                // emission; the emission texture is never sampled.
             } else {
                 m_data.warnings.push_back("unsupported material type rendered as invalid");
             }

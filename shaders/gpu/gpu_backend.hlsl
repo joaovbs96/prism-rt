@@ -550,38 +550,6 @@ BsdfSample gpu_legacy_sample(SurfaceHit hit, GpuMaterial material, inout Rng rng
         s.delta = true;
         return s;
     }
-    if (kind == kMaterialDiffuseGltf) return gpu_diffuse_sample(hit, material.textures.x, false, false, rng);
-    if (kind == kMaterialMetalGltf) {
-        float roughness = gpu_texture3(material.textures.y, hit, true).y;
-        BsdfSample s = gpu_glossy_sample(hit, roughness * roughness, (float3)0.0f, rng);
-        s.color = gpu_texture3(material.textures.x, hit, false);
-        return s;
-    }
-    if (kind == kMaterialSpecularBtdfGltf) {
-        BsdfSample s = gpu_bsdf_sample_empty();
-        s.wi = gpu_dielectric_direction(hit, material.params.x, rng);
-        s.color = gpu_texture3(material.textures.x, hit, false);
-        s.scattered = !isZero(s.wi);
-        return s;
-    }
-    if (kind == kMaterialGltfPbr) {
-        // Lobe selection; lobe emission is zero and gltfPBR adds none here.
-        float probability = rng.next();
-        if (probability <= gpu_texture3(material.textures.y, hit, true).z) {
-            float roughness = gpu_texture3(material.textures.y, hit, true).y;
-            BsdfSample s = gpu_glossy_sample(hit, roughness * roughness, (float3)0.0f, rng);
-            s.color = gpu_texture3(material.textures.x, hit, false);
-            return s;
-        }
-        if (probability <= gpu_texture1(material.textures.z, hit, true)) {
-            BsdfSample s = gpu_bsdf_sample_empty();
-            s.wi = gpu_dielectric_direction(hit, 1.5f, rng);
-            s.color = gpu_texture3(material.textures.x, hit, false);
-            s.scattered = !isZero(s.wi);
-            return s;
-        }
-        return gpu_diffuse_sample(hit, material.textures.x, true, true, rng);
-    }
     return gpu_invalid_sample();
 }
 

@@ -267,6 +267,20 @@ class Emissive : public Material {
         float emissive_multiplier;
 };
 
+// The material of a material that failed to load or compile: magenta
+// emission without scattering, as an invalid MDLMaterial renders. It is not a
+// light (no constant emission), so it never brightens its surroundings.
+class ErrorMaterial : public Emissive {
+    public:
+        ErrorMaterial() : Emissive(&m_magenta) {}
+        std::optional<ConstantEmission> constantEmission() const override { return std::nullopt; }
+        // One instance serves every failed material.
+        static ErrorMaterial* Shared() { static ErrorMaterial material; return &material; }
+
+    private:
+        ValueTexture<Color3> m_magenta{Color3(1.0f, 0.0f, 1.0f)};
+};
+
 class Glass : public Material {
     public:
         Glass (const float ior) : ior(ior) {}
@@ -374,159 +388,4 @@ private:
     float n_F;  // IOR at F-line (486nm, blue)
     float n_C;  // IOR at C-line (656nm, red)
     float V_d;  // Abbe number
-};
-
-////////////////////////////////////////////////////////////////////////////
-////////////////////////////// glTF PBR Lobes //////////////////////////////
-////////////////////////////////////////////////////////////////////////////
-
-class DiffuseGltf : public Material {
-    public:
-        DiffuseGltf(Texture<Color3>* base_color) : base_color(base_color) {}
-
-        Float3 sample_direction(const RayHit ray_hit, unsigned int &seed) override {
-            // note that the ray incoming from the light (wi) is the next/scattered ray
-            // don't forget that a ray tracer works "in reverse"
-            Float3 wi = ray_hit.n + random_unit_vector(seed);
-
-            // if the incoming ray is near zero, we take the normal instead
-            if (wi.is_near_zero())
-                wi = ray_hit.n;
-
-            return wi;
-        }
-
-        Color3 evaluate_color(const Float3& p, const Float3& n, const Float3& wo, Float3& wi, float u, float v, unsigned int &seed) override {
-            return base_color->sample(u, v, p);
-        }
-
-        Texture<Color3>* base_color;
-};
-
-class MetalGltf : public Material {
-    public:
-        MetalGltf(Texture<Float3>* base_color, Texture<Float3>* orm) : base_color(base_color), orm(orm) {}
-
-        Float3 sample_direction(const RayHit ray_hit, unsigned int &seed) override {
-            // note that the ray incoming from the light (wi) is the next/scattered ray
-            // don't forget that a ray tracer works "in reverse"
-            float roughness = orm->sample(ray_hit.u, ray_hit.v, ray_hit.p,
-                ray_hit.texture_footprint).y();
-            Float3 wi = reflect(ray_hit.d, ray_hit.n).normalize() + (roughness * roughness) * random_unit_vector(seed);
-            return wi.normalize();
-        }
-
-        Color3 evaluate_color(const Float3& p, const Float3& n, const Float3& wo, Float3& wi, float u, float v, unsigned int &seed) override {
-            return base_color->sample(u, v, p);
-        }
-
-        Texture<Float3>* base_color;
-        Texture<Float3>* orm;
-};
-
-class SpecularBTDFglTF : public Material {
-    public:
-        SpecularBTDFglTF (Texture<Float3>* base_color, const float ior) : base_color(base_color), ior(ior) {}
-        bool transmissive() const override { return true; }
-
-        Float3 sample_direction(const RayHit ray_hit, unsigned int &seed) override {
-            float ior_ = ray_hit.front_face ? 1.0f / ior : ior;
-
-            Float3 unit_direction = ray_hit.d.normalize();
-            float cos_theta = std::fminf(dot(-unit_direction, ray_hit.n), 1.0f);
-            float sin_theta = std::sqrtf(1.0f - cos_theta * cos_theta);
-
-            // ray is exiting the object
-            // std::cout << "Test - " << "Front:" << is_front << "IOR:" << ior_ << "Theta:" << sin_theta << std::endl;
-            if (ior_ * sin_theta > 1.0f || schlick(cos_theta, ior_) > rnd(seed)) {
-                return reflect(unit_direction, ray_hit.n);
-            } else { // ray is entering the object
-                return refract(unit_direction, ray_hit.n, ior_);
-            }
-        }
-
-        Color3 evaluate_color(const Float3& p, const Float3& n, const Float3& wo, Float3& wi, float u, float v, unsigned int &seed) override {
-            return base_color->sample(u, v, p);
-        }
-
-    Texture<Float3>* base_color;
-    float ior;
-};
-
-class gltfPBR : public Material {
-    public:
-        gltfPBR(){}
-        bool transmissive() const override { return transmission != nullptr; }
-
-        void setBaseColor(Texture<Float3>* base_color_){
-            base_color = base_color_;
-        }
-
-        void setORM(Texture<Float3>* orm_){
-            orm = orm_;
-        }
-
-        void setTransmission(Texture<float>* transmission_){
-            transmission = transmission_;
-        }
-
-        void setEmission(Texture<Float3>* emissive_color_, float emissive_multiplier_){
-            emissive_color = emissive_color_;
-            emissive_multiplier = emissive_multiplier_;
-        }
-
-        void createBRDFs() {
-            if (base_color == nullptr)
-                base_color = new ColorTexture(Color3(1.0f));
-            if (orm == nullptr)
-                orm = new ValueTexture<Float3>(1.0f);
-            if (transmission == nullptr)
-                transmission = new ValueTexture<float>(0.0f);
-
-            diffuse_brdf = new Diffuse(base_color);
-            specular_btdf = new SpecularBTDFglTF(base_color, 1.5f);
-            metal_brdf = new MetalGltf(base_color, orm);
-        }
-
-        BRDFSample sample(const RayHit ray_hit, unsigned int &seed) override {
-            float prob = rnd(seed);
-            if (prob <= orm->sample(ray_hit.u, ray_hit.v, ray_hit.p,
-                    ray_hit.texture_footprint).b()){
-                return metal_brdf->sample(ray_hit, seed);
-            } else {
-                if (prob <= transmission->sample(ray_hit.u, ray_hit.v, ray_hit.p,
-                        ray_hit.texture_footprint)){
-                    return specular_btdf->sample(ray_hit, seed);
-                } else {
-                    return diffuse_brdf->sample(ray_hit, seed);
-                }
-            }
-        }
-
-        Color3 evaluate_emission(const RayHit ray_hit) override {
-            return emissive_color->sample(ray_hit.u, ray_hit.v, ray_hit.p,
-                ray_hit.texture_footprint) * emissive_multiplier;
-        }
-
-        std::optional<ConstantEmission> constantEmission() const override {
-            auto const* value = dynamic_cast<ValueTexture<Color3> const*>(emissive_color);
-            if (!value) return std::nullopt;
-            return ConstantEmission{value->value * emissive_multiplier, true};
-        }
-
-        // we won't need these: we will sample directly fomr the brdfs
-        Float3 sample_direction(const RayHit ray_hit, unsigned int &seed) override { return Float3(); }
-        Color3 evaluate_color(const Float3& p, const Float3& n, const Float3& wo, Float3& wi, float u, float v, unsigned int &seed) override {  return Color3(); }
-
-    // Textures and factors
-    Texture<Color3>* base_color = nullptr;
-    Texture<Float3>* orm = nullptr;
-    Texture<float>* transmission = nullptr;
-    Texture<Color3>* emissive_color;
-    float emissive_multiplier;
-
-    // BRDF lobes
-    Diffuse* diffuse_brdf = nullptr;
-    MetalGltf* metal_brdf = nullptr;
-    SpecularBTDFglTF* specular_btdf = nullptr;
 };

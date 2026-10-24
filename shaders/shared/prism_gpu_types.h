@@ -38,10 +38,7 @@ static const uint kMaterialMetal = 3u;
 static const uint kMaterialEmissive = 4u;
 static const uint kMaterialGlass = 5u;
 static const uint kMaterialDispersive = 6u;
-static const uint kMaterialDiffuseGltf = 7u;
-static const uint kMaterialMetalGltf = 8u;
-static const uint kMaterialSpecularBtdfGltf = 9u;
-static const uint kMaterialGltfPbr = 10u;
+// 7 to 10 were the legacy glTF materials.
 static const uint kMaterialFallback = 11u;   // hydra::FallbackMaterial (Diffuse with an opacity)
 
 // Material flags.

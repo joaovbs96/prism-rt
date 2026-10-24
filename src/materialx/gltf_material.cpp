@@ -5,7 +5,6 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
-#include <cstdlib>
 #include <iostream>
 #include <map>
 #include <optional>
@@ -15,24 +14,6 @@
 namespace mx = MaterialX;
 
 namespace prism::gltf {
-
-bool ParseMaterialMode(const std::string& text, MaterialMode* mode)
-{
-    if (text == "materialx") { *mode = MaterialMode::MaterialX; return true; }
-    if (text == "legacy") { *mode = MaterialMode::Legacy; return true; }
-    return false;
-}
-
-MaterialMode MaterialModeFromEnvironment()
-{
-    MaterialMode mode = MaterialMode::MaterialX;
-    if (const char* value = std::getenv("PRISM_GLTF_MATERIALS"); value && *value &&
-        !ParseMaterialMode(value, &mode)) {
-        std::cerr << "PrismRT glTF: PRISM_GLTF_MATERIALS must be materialx or legacy; using materialx\n";
-        mode = MaterialMode::MaterialX;
-    }
-    return mode;
-}
 
 namespace {
 

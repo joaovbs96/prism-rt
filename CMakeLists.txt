@@ -1038,12 +1038,9 @@ endif()
 # fixtures of tests/gltf (tests/gltf/make_fixtures.py):
 # - the converter's document for each mapped feature, its validity and MDL
 #   generation (prism_gltf_material_test);
-# - every fixture renders on the CPU with MaterialX materials only (no legacy
-#   fallback), and normal maps shade like geometry rotated to their normals;
-# - MaterialX against the legacy C++ materials on metal/rough spheres: close,
-#   not equal (docs/gltf.md explains the differences). No sample clamp: the
-#   legacy materials sample the BSDF only, and clamping their hits of the
-#   small bright key light would darken them (bias, not a material difference);
+# - every fixture renders on the CPU with every material compiled (none falls
+#   back to the error material), and normal maps shade like geometry rotated
+#   to their normals;
 # - Vulkan against the CPU device on the spheres and the textured fixture
 #   (textures, texture transform, TEXCOORD_1 and COLOR_0 primvars).
 if(PRISM_BUILD_HYDRA)
@@ -1062,20 +1059,30 @@ if(PRISM_BUILD_HYDRA)
     set(_prism_gltf_textured --scene "${_prism_gltf_fixtures}/textured.gltf"
         --camera-position 0,0,5 --camera-target 0,0,0 --vfov 35 --width 96 --height 48
         --env "${_prism_gltf_fixtures}/studio_env.hdr")
-    set(_prism_gltf_no_legacy "has no MaterialX material;legacy materials retain")
-    foreach(_mode materialx legacy)
-        add_test(NAME prism_gltf_spheres_${_mode}_render
-            COMMAND PrismRT ${_prism_gltf_spheres} --device cpu --gltf-materials ${_mode}
-                --output "${_prism_gltf}/spheres_${_mode}_cpu.exr")
-        set_tests_properties(prism_gltf_spheres_${_mode}_render PROPERTIES
-            ENVIRONMENT "${_prism_gltf_env}" FIXTURES_SETUP prism_gltf_spheres_${_mode}_cpu)
-    endforeach()
-    set_tests_properties(prism_gltf_spheres_materialx_render PROPERTIES
-        FAIL_REGULAR_EXPRESSION "${_prism_gltf_no_legacy}")
+    set(_prism_gltf_no_error "magenta error material")
+    add_test(NAME prism_gltf_spheres_render
+        COMMAND PrismRT ${_prism_gltf_spheres} --device cpu --output "${_prism_gltf}/spheres_cpu.exr")
+    set_tests_properties(prism_gltf_spheres_render PROPERTIES
+        ENVIRONMENT "${_prism_gltf_env}" FIXTURES_SETUP prism_gltf_spheres_cpu
+        FAIL_REGULAR_EXPRESSION "${_prism_gltf_no_error}")
     add_test(NAME prism_gltf_textured_render
         COMMAND PrismRT ${_prism_gltf_textured} --spp 64 --device cpu --output "${_prism_gltf}/textured_cpu.exr")
     set_tests_properties(prism_gltf_textured_render PROPERTIES ENVIRONMENT "${_prism_gltf_env}"
-        FIXTURES_SETUP prism_gltf_textured_cpu FAIL_REGULAR_EXPRESSION "${_prism_gltf_no_legacy}")
+        FIXTURES_SETUP prism_gltf_textured_cpu FAIL_REGULAR_EXPRESSION "${_prism_gltf_no_error}")
+    # Without the MaterialX libraries no material compiles: each one warns and
+    # renders with the magenta error material.
+    add_test(NAME prism_gltf_error_material_render
+        COMMAND PrismRT --scene "${_prism_gltf_fixtures}/metal_rough_spheres.gltf"
+            --camera-position 0,0,12 --camera-target 0,0,0 --vfov 30 --width 48 --height 24 --spp 4
+            ${_prism_fixed_sampling} --device cpu --working-space lin_rec709 --env-color 0,0,0
+            --output "${_prism_gltf}/error_material_cpu.exr")
+    set_tests_properties(prism_gltf_error_material_render PROPERTIES
+        ENVIRONMENT "${_prism_gltf_env};PRISM_MATERIALX_LIBRARY_PATH="
+        FIXTURES_SETUP prism_gltf_error_material
+        PASS_REGULAR_EXPRESSION "material 0 '[^']*' failed to load \\(no MDL context or MaterialX libraries\\); rendering it with the magenta error material")
+    add_test(NAME prism_gltf_error_material_test
+        COMMAND prism_gltf_material_test --check-error-material "${_prism_gltf}/error_material_cpu.exr")
+    set_tests_properties(prism_gltf_error_material_test PROPERTIES FIXTURES_REQUIRED prism_gltf_error_material)
     foreach(_scene features.gltf embedded.glb)
         string(REGEX REPLACE "\\..*$" "" _name "${_scene}")
         add_test(NAME prism_gltf_${_name}_render
@@ -1083,7 +1090,7 @@ if(PRISM_BUILD_HYDRA)
                 --camera-target 0,0,0 --vfov 30 --width 64 --height 32 --spp 4 --device cpu
                 --env "${_prism_gltf_fixtures}/studio_env.hdr" --output "${_prism_gltf}/${_name}_cpu.exr")
         set_tests_properties(prism_gltf_${_name}_render PROPERTIES ENVIRONMENT "${_prism_gltf_env}"
-            FAIL_REGULAR_EXPRESSION "${_prism_gltf_no_legacy}")
+            FAIL_REGULAR_EXPRESSION "${_prism_gltf_no_error}")
     endforeach()
     # Normal maps: the V flip and tangent frame against rotated geometry.
     add_test(NAME prism_gltf_normal_map_render
@@ -1091,7 +1098,7 @@ if(PRISM_BUILD_HYDRA)
             --camera-target 0,0,0 --vfov 40 --width 120 --height 80 --spp 128 --max-sample-radiance 0
             --device cpu --env "${_prism_gltf_fixtures}/studio_env.hdr" --output "${_prism_gltf}/normal_map_cpu.exr")
     set_tests_properties(prism_gltf_normal_map_render PROPERTIES ENVIRONMENT "${_prism_gltf_env}"
-        FIXTURES_SETUP prism_gltf_normal_map FAIL_REGULAR_EXPRESSION "${_prism_gltf_no_legacy}")
+        FIXTURES_SETUP prism_gltf_normal_map FAIL_REGULAR_EXPRESSION "${_prism_gltf_no_error}")
     add_test(NAME prism_gltf_normal_map_test
         COMMAND prism_gltf_material_test --check-normal-map "${_prism_gltf}/normal_map_cpu.exr")
     set_tests_properties(prism_gltf_normal_map_test PROPERTIES FIXTURES_REQUIRED prism_gltf_normal_map)
@@ -1109,34 +1116,29 @@ if(PRISM_BUILD_HYDRA)
             COMMAND PrismRT ${_prism_gltf_volume} --device ${_device} --output "${_prism_gltf}/volume_${_device}.exr")
         set_tests_properties(prism_gltf_volume_${_device}_render PROPERTIES ENVIRONMENT "${_prism_gltf_env}"
             FIXTURES_SETUP prism_gltf_volume_${_device}
-            FAIL_REGULAR_EXPRESSION "${_prism_gltf_no_legacy};cannot render the scene on the GPU")
+            FAIL_REGULAR_EXPRESSION "${_prism_gltf_no_error};cannot render the scene on the GPU")
         add_test(NAME prism_gltf_volume_${_device}_test
             COMMAND prism_gltf_material_test --check-volume "${_prism_gltf}/volume_${_device}.exr")
         set_tests_properties(prism_gltf_volume_${_device}_test PROPERTIES FIXTURES_REQUIRED prism_gltf_volume_${_device})
     endforeach()
     if(TARGET prism_compare_images)
-        add_test(NAME prism_gltf_materialx_vs_legacy
-            COMMAND prism_compare_images "${_prism_gltf}/spheres_legacy_cpu.exr"
-                "${_prism_gltf}/spheres_materialx_cpu.exr" --tolerance 0.25 --mean-tolerance 0.08)
-        set_tests_properties(prism_gltf_materialx_vs_legacy PROPERTIES
-            FIXTURES_REQUIRED "prism_gltf_spheres_materialx_cpu;prism_gltf_spheres_legacy_cpu")
         if(PRISM_ENABLE_VULKAN)
             add_test(NAME prism_gltf_spheres_vulkan_render
                 COMMAND PrismRT ${_prism_gltf_spheres} --device vulkan
-                    --output "${_prism_gltf}/spheres_materialx_vulkan.exr")
+                    --output "${_prism_gltf}/spheres_vulkan.exr")
             add_test(NAME prism_gltf_textured_vulkan_render
                 COMMAND PrismRT ${_prism_gltf_textured} --spp 64 --device vulkan
                     --output "${_prism_gltf}/textured_vulkan.exr")
             foreach(_scene spheres textured)
                 set_tests_properties(prism_gltf_${_scene}_vulkan_render PROPERTIES ENVIRONMENT "${_prism_gltf_env}"
                     FIXTURES_SETUP prism_gltf_${_scene}_vulkan
-                    FAIL_REGULAR_EXPRESSION "${_prism_gltf_no_legacy};cannot render the scene on the GPU")
+                    FAIL_REGULAR_EXPRESSION "${_prism_gltf_no_error};cannot render the scene on the GPU")
             endforeach()
             add_test(NAME prism_gltf_spheres_vulkan_parity
-                COMMAND prism_compare_images "${_prism_gltf}/spheres_materialx_cpu.exr"
-                    "${_prism_gltf}/spheres_materialx_vulkan.exr" --tolerance 0.1 --mean-tolerance 0.02)
+                COMMAND prism_compare_images "${_prism_gltf}/spheres_cpu.exr"
+                    "${_prism_gltf}/spheres_vulkan.exr" --tolerance 0.1 --mean-tolerance 0.02)
             set_tests_properties(prism_gltf_spheres_vulkan_parity PROPERTIES
-                FIXTURES_REQUIRED "prism_gltf_spheres_materialx_cpu;prism_gltf_spheres_vulkan")
+                FIXTURES_REQUIRED "prism_gltf_spheres_cpu;prism_gltf_spheres_vulkan")
             add_test(NAME prism_gltf_textured_vulkan_parity
                 COMMAND prism_compare_images "${_prism_gltf}/textured_cpu.exr"
                     "${_prism_gltf}/textured_vulkan.exr" --tolerance 0.1 --mean-tolerance 0.02)

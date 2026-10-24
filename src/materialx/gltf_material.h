@@ -35,15 +35,6 @@ inline constexpr const char* kTexcoord1Primvar = "TEXCOORD_1";
 inline constexpr const char* kColor0Primvar = "COLOR_0";
 inline constexpr const char* kMaterialName = "GltfMaterial";
 
-// How glTF materials load: through MaterialX (default) or as the legacy C++
-// materials (src/material.h).
-enum class MaterialMode { MaterialX, Legacy };
-// "materialx" or "legacy"; false for anything else.
-bool ParseMaterialMode(const std::string& text, MaterialMode* mode);
-// PRISM_GLTF_MATERIALS, else MaterialX. An invalid value warns and uses
-// MaterialX.
-MaterialMode MaterialModeFromEnvironment();
-
 struct MaterialConversionOptions {
     // The file name written into the document for a glTF image index (for
     // example the name of a materialized copy beside the cached .mtlx).

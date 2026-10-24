@@ -72,7 +72,6 @@ struct Options {
     bool explicitLens = false, widthSet = false, heightSet = false;
     bool honorDoubleSided = false; // prism:honorDoubleSided
     bool defaultDome = true; // light scenes without lights like usdview's default dome
-    prism::gltf::MaterialMode gltfMaterials = prism::gltf::MaterialModeFromEnvironment();
     int width = 1280, height = 720, samples = prism::defaults::kSamplesPerPixel, depth = 32, roulette = 4;
     unsigned seed = 0;
     float exposure = 0, clamp = 10;
@@ -131,8 +130,6 @@ void help() {
         "  --light-selection spatial|power (default spatial: analytic lights by their estimated\n"
         "                 irradiance at the shading point, mixed with power; power: by power only)\n"
         "  --texture-filtering filtered|bilinear (default filtered)\n"
-        "  --gltf-materials materialx|legacy (default materialx, or $PRISM_GLTF_MATERIALS: glTF materials\n"
-        "                 as MaterialX gltf_pbr through MDL, or the legacy C++ materials; docs/gltf.md)\n"
         "  --honor-double-sided true|false (default false: USD doubleSided is ignored; true: back faces of\n"
         "                 single-sided meshes are not hit, unless their material transmits)\n"
         "  --default-dome true|false (default true: a scene with no lights, emissive geometry or\n"
@@ -200,10 +197,6 @@ Options parse(int argc, char** argv) {
         else if (key == "--defocus-angle") { o.defocusAngle = number(value); o.explicitLens = true; }
         else if (key == "--environment-sampling") o.environmentSampling = value;
         else if (key == "--texture-filtering") o.textureFiltering = value;
-        else if (key == "--gltf-materials") {
-            if (!prism::gltf::ParseMaterialMode(value, &o.gltfMaterials))
-                throw std::runtime_error("--gltf-materials takes materialx or legacy");
-        }
         else if (key == "--honor-double-sided") {
             if (value != "true" && value != "false")
                 throw std::runtime_error("--honor-double-sided takes true or false");
@@ -757,11 +750,7 @@ int runStandaloneCli(int argc, char** argv) {
                                              std::move(bindingPurposes));
         }
         else if (extension == ".gltf" || extension == ".glb") {
-            auto gltf = std::make_unique<glTFMesh>(o.scene, &context, libraryPath, libraryPath + "/mdl",
-                                                   o.gltfMaterials);
-            if (gltf->legacyMaterialCount())
-                std::cerr << "PrismRT glTF: legacy materials retain BSDF-only sampling where no matching PDF is available\n";
-            mesh = std::move(gltf);
+            mesh = std::make_unique<glTFMesh>(o.scene, &context, libraryPath, libraryPath + "/mdl");
         }
         else if (extension == ".obj") mesh = std::make_unique<ObjMesh>(o.scene);
         else throw std::runtime_error("Unsupported scene format: " + extension);

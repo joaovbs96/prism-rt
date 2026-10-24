@@ -78,7 +78,7 @@ public:
         if (file_path.extension() == ".obj")
             mesh = new ObjMesh(file_path);
         else if ((file_path.extension() == ".gltf") || (file_path.extension() == ".glb"))
-            mesh = new glTFMesh(file_path);
+            mesh = new glTFMesh(file_path, mdl_context, mx_libraries_path, mx_mdl_path);
         else if ((file_path.extension() == ".usd") || (file_path.extension() == ".usda") || (file_path.extension() == ".usdz") || (file_path.extension() == ".usdc"))
             mesh = new USDMesh(file_path, mdl_context, mx_libraries_path, mx_mdl_path);
         else

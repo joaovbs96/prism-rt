@@ -30,33 +30,19 @@
 #include "../materialx/resolved_resource.h"
 
 // glTF 2.0 scenes (.gltf, .glb). Materials load as MaterialX gltf_pbr
-// documents compiled through MDL (docs/gltf.md), unless the legacy C++
-// materials are asked for (--gltf-materials legacy, PRISM_GLTF_MATERIALS) or
-// no MDL context is given. A material whose MaterialX conversion or
-// compilation fails falls back to its legacy material.
+// documents compiled through MDL (docs/gltf.md). A material whose conversion
+// or compilation fails (or that has no MDL context to compile with) renders
+// with the magenta error material, after a one-line warning.
 class glTFMesh : public Mesh {
     public:
-        using MaterialMode = prism::gltf::MaterialMode;
-
-        // Legacy materials (no MDL context).
-        explicit glTFMesh(const std::filesystem::path &file_path)
-            : glTFMesh(file_path, nullptr, "", "", MaterialMode::Legacy) {}
-
         glTFMesh(const std::filesystem::path &file_path, mdl::Context* mdl_context,
-                 const std::string& mx_libraries_path, const std::string& mx_mdl_path,
-                 MaterialMode mode = prism::gltf::MaterialModeFromEnvironment())
+                 const std::string& mx_libraries_path, const std::string& mx_mdl_path)
             : m_path(file_path)
         {
-            if (mode == MaterialMode::MaterialX && (!mdl_context || mx_libraries_path.empty())) {
-                std::cerr << "PrismRT glTF: no MDL context or MaterialX libraries; using the legacy materials\n";
-                mode = MaterialMode::Legacy;
-            }
-            m_mode = mode;
-
             tinygltf::TinyGLTF loader;
-            // MaterialX materials read the encoded image files (materialized
-            // into the cache); only legacy materials need decoded pixels.
-            loader.SetImagesAsIs(m_mode == MaterialMode::MaterialX);
+            // Materials read the encoded image files (materialized into the
+            // cache); pixels are never decoded here.
+            loader.SetImagesAsIs(true);
             std::string err, warn;
             const bool ret = file_path.extension() == ".glb"
                 ? loader.LoadBinaryFromFile(&m_model, &err, &warn, file_path.string())
@@ -65,17 +51,8 @@ class glTFMesh : public Mesh {
             if (!err.empty()) std::cout << "Error: " << err << std::endl;
             if (!ret) throw std::runtime_error("Failed to parse glTF file: " + file_path.string());
 
-            if (m_mode == MaterialMode::MaterialX) {
-                for (auto const& extension : prism::gltf::UnsupportedExtensions(m_model))
-                    std::cerr << "PrismRT glTF: extension " << extension << " is not supported; ignored\n";
-            } else {
-                for (const auto& extension : m_model.extensionsUsed) {
-                    if (extension != "KHR_materials_emissive_strength" &&
-                        extension != "KHR_materials_transmission")
-                        std::cerr << "PrismRT: unsupported glTF extension " << extension
-                                  << "; using the existing core material/geometry behavior\n";
-                }
-            }
+            for (auto const& extension : prism::gltf::UnsupportedExtensions(m_model))
+                std::cerr << "PrismRT glTF: extension " << extension << " is not supported; ignored\n";
 
             // Process scene hierarchy and calculate node transforms
             processSceneNodes(m_model);
@@ -104,23 +81,18 @@ class glTFMesh : public Mesh {
             m_model = tinygltf::Model();
         }
 
-        MaterialMode materialMode() const { return m_mode; }
-        // Materials that compiled through MaterialX, and those that fell back
-        // to (or were asked to be) legacy materials.
+        // Materials that compiled through MaterialX, and those rendered with
+        // the error material.
         size_t materialxMaterialCount() const { return m_materialxCount; }
-        size_t legacyMaterialCount() const { return m_legacyCount; }
+        size_t errorMaterialCount() const { return m_errorCount; }
 
     private:
         std::filesystem::path m_path;
         tinygltf::Model m_model;
-        MaterialMode m_mode = MaterialMode::Legacy;
         std::vector<TransformMatrix> nodeTransforms;
-        // Materials compiled through MaterialX (their primitives' UVs are
-        // V-flipped, gltf_material.h).
-        std::set<int> m_materialx;
         std::vector<std::shared_ptr<MDLMaterial>> m_ownedMdl;
         std::map<int, std::string> m_imageFiles;
-        size_t m_materialxCount = 0, m_legacyCount = 0;
+        size_t m_materialxCount = 0, m_errorCount = 0;
         // Primvar layout (Mesh::primvars), -1: absent.
         int m_texcoord1Offset = -1, m_color0Offset = -1;
 
@@ -139,11 +111,8 @@ class glTFMesh : public Mesh {
                     const int material = primitive.material < int(m_model.materials.size()) ? primitive.material : -1;
                     used[material] = used[material] || primitive.attributes.contains("COLOR_0");
                 }
-            if (m_mode == MaterialMode::Legacy) {
-                for (auto const& [m, vertexColor] : used) {
-                    materials[m] = legacyMaterial(m);
-                    ++m_legacyCount;
-                }
+            if (!mdl_context || libraries.empty()) {
+                for (auto const& [m, vertexColor] : used) useErrorMaterial(m, "no MDL context or MaterialX libraries");
                 return;
             }
 
@@ -192,20 +161,27 @@ class glTFMesh : public Mesh {
                 if (material && material->is_valid()) {
                     materials[m] = material.get();
                     m_ownedMdl.push_back(std::move(material));
-                    m_materialx.insert(m);
                     ++m_materialxCount;
                 } else {
-                    std::cerr << "PrismRT glTF: material " << materialLabel(m)
-                              << " has no MaterialX material (" << failure << "); using the legacy material\n";
-                    materials[m] = legacyMaterial(m);
-                    ++m_legacyCount;
+                    useErrorMaterial(m, failure);
                 }
             }
             if (texcoord1) addPrimvar(prism::gltf::kTexcoord1Primvar, 2, &m_texcoord1Offset);
             if (color0) addPrimvar(prism::gltf::kColor0Primvar, 4, &m_color0Offset);
             std::cout << "glTF: " << m_materialxCount << " MaterialX material(s) (" << compiled.size()
-                      << " compiled, " << reused << " reused), " << m_legacyCount << " legacy, in "
+                      << " compiled, " << reused << " reused), " << m_errorCount << " failed, in "
                       << std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() << " s\n";
+        }
+
+        // A material that cannot load renders magenta (as a failed USD
+        // material does), with a one-line warning naming it and the reason.
+        void useErrorMaterial(int m, const std::string& reason)
+        {
+            std::cerr << "PrismRT glTF: material " << materialLabel(m) << " failed to load ("
+                      << (reason.empty() ? std::string("unknown error") : reason)
+                      << "); rendering it with the magenta error material\n";
+            materials[m] = ErrorMaterial::Shared();
+            ++m_errorCount;
         }
 
         void addPrimvar(const char* name, int components, int* offset)
@@ -239,124 +215,6 @@ class glTFMesh : public Mesh {
             }
             m_imageFiles.emplace(index, name);
             return name;
-        }
-
-        // An image with decoded pixels for the legacy materials (decoded
-        // here when the loader kept the encoded bytes).
-        tinygltf::Image legacyImage(int index)
-        {
-            const tinygltf::Image& image = m_model.images[size_t(index)];
-            if (!image.as_is || !image.uri.empty() || image.image.empty()) return image;
-            tinygltf::Image decoded;
-            decoded.name = image.name;
-            std::string err, warn;
-            if (!tinygltf::LoadImageData(&decoded, index, &err, &warn, 0, 0, image.image.data(),
-                                         int(image.image.size()), nullptr))
-                std::cerr << "PrismRT glTF: cannot decode image " << index << ": " << err << "\n";
-            return decoded;
-        }
-
-        template <class T>
-        Texture<T>* legacyImageTexture(int textureIndex, const T& factor)
-        {
-            const int source = m_model.textures[size_t(textureIndex)].source;
-            tinygltf::Image image = legacyImage(source);
-            if (image.uri.length() > 0)
-                return new ImageMixTexture<T>(std::filesystem::path(m_path).parent_path().concat("/").concat(image.uri), factor);
-            return new ImageMixTexture<T>(&image.image, image.width, image.height, image.component, factor);
-        }
-
-        bool hasImage(int textureIndex) const
-        {
-            if (textureIndex < 0 || textureIndex >= int(m_model.textures.size())) return false;
-            const int source = m_model.textures[size_t(textureIndex)].source;
-            return source >= 0 && source < int(m_model.images.size());
-        }
-
-        static int extensionTexture(const tinygltf::Value& extension, const char* key)
-        {
-            if (!extension.IsObject() || !extension.Has(key)) return -1;
-            const tinygltf::Value& info = extension.Get(key);
-            if (!info.IsObject() || !info.Has("index") || !info.Get("index").IsInt()) return -1;
-            return info.Get("index").GetNumberAsInt();
-        }
-
-        static float getExtensionFactor(const tinygltf::Value& gltf_obj, const char* key, float default_value)
-        {
-            if (gltf_obj.IsObject() && gltf_obj.Has(key) && gltf_obj.Get(key).IsNumber())
-                return float(gltf_obj.Get(key).GetNumberAsDouble());
-            return default_value;
-        }
-
-        // The legacy C++ material (src/material.h) of a glTF material.
-        Material* legacyMaterial(int m)
-        {
-            static const tinygltf::Material defaultMaterial;
-            const tinygltf::Material& mp = m >= 0 ? m_model.materials[size_t(m)] : defaultMaterial;
-            if (mp.alphaMode != "OPAQUE" || mp.pbrMetallicRoughness.baseColorFactor[3] != 1.0)
-                std::cerr << "PrismRT: glTF material '" << mp.name
-                          << "' alpha/cutout settings are not supported by the legacy glTF shader\n";
-            if (mp.occlusionTexture.index >= 0)
-                std::cerr << "PrismRT: glTF material '" << mp.name
-                          << "' authored occlusion texture is ignored\n";
-            if (mp.pbrMetallicRoughness.baseColorTexture.texCoord > 0 ||
-                mp.pbrMetallicRoughness.metallicRoughnessTexture.texCoord > 0 ||
-                mp.normalTexture.texCoord > 0 || mp.emissiveTexture.texCoord > 0)
-                std::cerr << "PrismRT: glTF material '" << mp.name
-                          << "' requests additional UV sets; only TEXCOORD_0 is supported\n";
-            gltfPBR* gltf_material = new gltfPBR();
-
-            const tinygltf::PbrMetallicRoughness& pbr = mp.pbrMetallicRoughness;
-            Texture<Color3>* base_texture;
-            Color3 base_factor = Color3(pbr.baseColorFactor[0], pbr.baseColorFactor[1], pbr.baseColorFactor[2]);
-            if (hasImage(pbr.baseColorTexture.index)) {
-                base_texture = legacyImageTexture<Color3>(pbr.baseColorTexture.index, base_factor);
-                base_texture->gammaCorrect(1.0 / 2.2);
-            } else {
-                base_texture = new ColorTexture(base_factor);
-            }
-            // glTF colours are linear Rec.709 (after the decode above).
-            base_texture->convertToWorkingSpace(prism::color::kLightColorSpace);
-            gltf_material->setBaseColor(base_texture);
-
-            // TODO: occlusion is currently ignored
-            Texture<Float3>* orm_texture;
-            Float3 orm_factor = Float3(0.0f, pbr.roughnessFactor, pbr.metallicFactor);
-            if (hasImage(pbr.metallicRoughnessTexture.index))
-                orm_texture = legacyImageTexture<Float3>(pbr.metallicRoughnessTexture.index, orm_factor);
-            else
-                orm_texture = new ValueTexture<Float3>(orm_factor);
-            gltf_material->setORM(orm_texture);
-
-            if (hasImage(mp.normalTexture.index))
-                gltf_material->setNormalTexture(legacyImageTexture<Float3>(mp.normalTexture.index, orm_factor));
-
-            Texture<Color3>* emission_texture;
-            Color3 emission_factor = Color3(mp.emissiveFactor[0], mp.emissiveFactor[1], mp.emissiveFactor[2]);
-            float emission_strength = 1.0;
-            if (auto ext = mp.extensions.find("KHR_materials_emissive_strength"); ext != mp.extensions.end())
-                emission_strength = getExtensionFactor(ext->second, "emissiveStrength", 1.0);
-            if (hasImage(mp.emissiveTexture.index)) {
-                emission_texture = legacyImageTexture<Float3>(mp.emissiveTexture.index, emission_factor);
-                emission_texture->gammaCorrect(1.0 / 2.2);
-            } else {
-                emission_texture = new ValueTexture<Color3>(emission_factor);
-            }
-            emission_texture->convertToWorkingSpace(prism::color::kLightColorSpace);
-            gltf_material->setEmission(emission_texture, emission_strength);
-
-            if (auto ext = mp.extensions.find("KHR_materials_transmission"); ext != mp.extensions.end()) {
-                const tinygltf::Value& transmission = ext->second;
-                float transmission_factor = getExtensionFactor(transmission, "transmissionFactor", 0.0f);
-                const int texture = extensionTexture(transmission, "transmissionTexture");
-                Texture<float>* transmission_texture = hasImage(texture)
-                    ? legacyImageTexture<float>(texture, transmission_factor)
-                    : static_cast<Texture<float>*>(new ValueTexture<float>(transmission_factor));
-                gltf_material->setTransmission(transmission_texture);
-            }
-
-            gltf_material->createBRDFs();
-            return gltf_material;
         }
 
         // ---------------------------------------------------------------
@@ -526,7 +384,6 @@ class glTFMesh : public Mesh {
                     continue;
                 }
                 const int material = primitive.material < int(model.materials.size()) ? primitive.material : -1;
-                const bool materialx = m_materialx.contains(material);
                 const size_t vertexOffset = vertices.size();
                 const size_t vertexCount = positions.size() / 3;
                 const bool identity = nodeTransform.isIdentity();
@@ -550,7 +407,7 @@ class glTFMesh : public Mesh {
                 }
 
                 // MaterialX materials take V up (gltf_material.h).
-                auto uv = [&](float u, float v) { return materialx ? Float2(u, 1.0f - v) : Float2(u, v); };
+                auto uv = [](float u, float v) { return Float2(u, 1.0f - v); };
                 if (readAccessor(model, attribute("TEXCOORD_0"), 2, &data) && data.size() == 2 * vertexCount) {
                     for (size_t i = 0; i < vertexCount; ++i) texcoords.push_back(uv(data[2 * i], data[2 * i + 1]));
                 } else {
