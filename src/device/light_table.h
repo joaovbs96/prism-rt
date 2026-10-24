@@ -86,6 +86,23 @@ inline Material* PrimitiveMaterial(SceneManager& scene, int id, Geometry* geomet
 
 } // namespace light_table_detail
 
+// Whether some placement's material emits a constant radiance, so its own
+// geometry lights the scene (textured emitters are not detected).
+inline bool SceneHasEmitters(SceneManager& scene)
+{
+    for (auto const& [id, geometry] : scene.geometry) {
+        if (!geometry || scene.disabled_placements.contains(id)) continue;
+        bool emits = false;
+        light_table_detail::ForEachPlacementMaterial(scene, id, geometry, [&](Material* material) {
+            if (!material || emits) return;
+            const auto emission = material->constantEmission();
+            emits = emission && light_table_detail::Luminance(emission->radiance) > 0.0f;
+        });
+        if (emits) return true;
+    }
+    return false;
+}
+
 inline LightTable BuildLightTable(SceneManager& scene, size_t maxEmitterTriangles = kMaxEmitterTriangles)
 {
     using namespace light_table_detail;

@@ -15,6 +15,7 @@
 #include "../batched_spheres.h"
 #include "../camera_rays.h"
 #include "../camera_ray_diagnostics.h"
+#include "../device/light_table.h"
 #include "../geometry.h"
 #include "../material.h"
 #include "../materialx/resolved_resource.h"
@@ -3259,13 +3260,15 @@ bool _IsEngineLightPath(SdfPath const &path)
            scope.GetParentPath().GetName().rfind("_UsdImaging_", 0) == 0;
 }
 
-// The default dome lights a scene without lights of its own. Otherwise it
-// would add to the scene's lights and double-light it.
+// The default dome lights a scene without lights of its own (UsdLux lights or
+// emissive geometry). Otherwise it would add to the scene's lights and
+// double-light it. The CLI applies the same rule (standalone_cli.cpp).
 void _ApplyDefaultDome(HdSceneIndexBaseRefPtr const &scene, Snapshot *snapshot)
 {
     SdfPath const path = std::move(snapshot->defaultDomePath);
     snapshot->defaultDomePath = SdfPath();
-    if (path.IsEmpty() || snapshot->domeCount != 0 || snapshot->stageLightCount != 0)
+    if (path.IsEmpty() || snapshot->domeCount != 0 || snapshot->stageLightCount != 0 ||
+        prism::device::SceneHasEmitters(*snapshot->scene))
         return;
     _SetDomeEnvironment(scene, path, scene->GetPrim(path), snapshot);
 }

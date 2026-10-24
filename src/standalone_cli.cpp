@@ -3,6 +3,7 @@
 #include "camera_rays.h"
 #include "camera_ray_diagnostics.h"
 #include "device/device.h"
+#include "device/light_table.h"
 #include "color/color_management.h"
 #include "output/image_writer.h"
 #include "output/render_products.h"
@@ -19,6 +20,8 @@
 #include <pxr/usd/usdLux/tokens.h>
 #include <pxr/usd/usdGeom/xformCache.h>
 #include <pxr/usd/usdRender/settings.h>
+#include <pxr/base/plug/plugin.h>
+#include <pxr/base/plug/registry.h>
 #include <pxr/base/gf/camera.h>
 #include <pxr/base/gf/frustum.h>
 #include <pxr/imaging/cameraUtil/conformWindow.h>
@@ -37,6 +40,13 @@
 #include <type_traits>
 
 namespace {
+// usdview's default dome light texture (Hdx's StinsonBeach.hdr), or empty.
+std::string DefaultDomeTexture()
+{
+    const PXR_NS::PlugPluginPtr hdx = PXR_NS::PlugRegistry::GetInstance().GetPluginWithName("hdx");
+    return hdx ? hdx->FindPluginResource("textures/StinsonBeach.hdr", true) : std::string();
+}
+
 struct Options {
     std::string scene, camera, environment, output = "output.exr";
     std::string exportScene, environmentSampling = "mis", textureFiltering = "filtered";
@@ -50,6 +60,7 @@ struct Options {
     float verticalFov = 40, focusDistance = 10, defocusAngle = 0;
     bool explicitLens = false, widthSet = false, heightSet = false;
     bool honorDoubleSided = false; // prism:honorDoubleSided
+    bool defaultDome = true; // light scenes without lights like usdview's default dome
     prism::gltf::MaterialMode gltfMaterials = prism::gltf::MaterialModeFromEnvironment();
     int width = 1280, height = 720, samples = 256, depth = 32, roulette = 4;
     unsigned seed = 0;
@@ -94,6 +105,8 @@ void help() {
         "                 as MaterialX gltf_pbr through MDL, or the legacy C++ materials; docs/gltf.md)\n"
         "  --honor-double-sided true|false (default false: USD doubleSided is ignored; true: back faces of\n"
         "                 single-sided meshes are not hit, unless their material transmits)\n"
+        "  --default-dome true|false (default true: a scene with no lights, emissive geometry or\n"
+        "                 environment is lit by USD's default dome, as in usdview)\n"
         "  --device auto|cpu|cpu-reference|vulkan|metal (default auto: GPU if available, else CPU;\n"
         "                 cpu-reference runs the original CPU integrator)\n"
         "  --ocio-config FILE|URI (default $OCIO, else ocio://studio-config-latest)\n"
@@ -105,7 +118,8 @@ void help() {
         "EXR output is linear in the working space after the sample clamp; other formats go\n"
         "through the display and view. Light colors are linear Rec.709.\n"
         "The environment option follows the original EnvironmentMap radiance convention.\n"
-        "Without --env, USD scenes use their authored dome lighting.\n";
+        "Without --env, USD scenes use their authored dome lighting, and a scene with no lights,\n"
+        "emissive geometry or environment gets USD's default dome (--default-dome false: black).\n";
 }
 
 int integer(const std::string& s) {
@@ -158,6 +172,11 @@ Options parse(int argc, char** argv) {
             if (value != "true" && value != "false")
                 throw std::runtime_error("--honor-double-sided takes true or false");
             o.honorDoubleSided = value == "true";
+        }
+        else if (key == "--default-dome") {
+            if (value != "true" && value != "false")
+                throw std::runtime_error("--default-dome takes true or false");
+            o.defaultDome = value == "true";
         }
         else if (key == "--device") {
             if (!prism::device::ParseDevicePreference(value, &o.device))
@@ -631,6 +650,27 @@ int runStandaloneCli(int argc, char** argv) {
             }
         }
         scene.commitScene();
+        // A scene with no lights, emissive geometry or environment would render
+        // black. Light it with usdview's default dome, which the Hydra delegate
+        // applies by the same rule (scene_bridge.cpp _ApplyDefaultDome).
+        if (o.defaultDome && scene.environment == &background && scene.lights.empty() &&
+            !prism::device::SceneHasEmitters(scene)) {
+            if (const std::string texture = DefaultDomeTexture(); texture.empty()) {
+                std::cerr << "PrismRT: the scene has no lights, emissive geometry or environment, and USD's "
+                             "default dome texture was not found; the image will be black (pass --env or "
+                             "--env-color)\n";
+            } else {
+                // As a USD dome (intensity 1, exposure 0, untransformed), like
+                // usdview's, not --env's EnvironmentMap with its factor of two.
+                envImage = std::make_unique<ImageTexture<Color3>>(texture, prism::color::kLightColorSpace);
+                env = std::make_unique<TransformedEnvironmentMap>(envImage.get(), Color3(1.0f),
+                                                                  std::array<float, 9>{1, 0, 0, 0, 1, 0, 0, 0, 1});
+                scene.environment = env.get();
+                std::cerr << "PrismRT: the scene has no lights, emissive geometry or environment; lighting it "
+                             "with USD's default dome (" << texture << "). --env, --env-color or "
+                             "--default-dome false override this\n";
+            }
+        }
         std::string deviceNote;
         auto renderDevice = prism::device::CreateDevice(o.device, &deviceNote);
         if (!deviceNote.empty()) std::cerr << "PrismRT: " << deviceNote << '\n';
