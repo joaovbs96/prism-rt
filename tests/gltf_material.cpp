@@ -293,8 +293,8 @@ void TestGeneration(const std::filesystem::path& dir, const std::string& librari
 
 // DocumentLoader's LayerGltfPbrVolume (src/materialx/loader.cpp): a gltf_pbr
 // with a finite attenuation_distance is expanded and its transmission layered
-// over its absorbing VDF; one without attenuation (the converter's 1e30) is
-// left alone; other lobes (clearcoat) and texture inputs survive.
+// over its absorbing VDF; one without attenuation (the converter's 1e30) gets
+// no volume; other lobes (clearcoat) and texture inputs survive.
 void TestVolumeLayer(const std::filesystem::path& dir, const std::string& libraries)
 {
     auto generator = MDLGenerator::shared(libraries);
@@ -333,13 +333,15 @@ void TestVolumeLayer(const std::filesystem::path& dir, const std::string& librar
     Check(bool(doc), "volume layer fixture loads");
     if (!doc) return;
     Check(!doc->getNode("absorbing"), "the attenuating gltf_pbr is expanded");
-    Check(doc->getNode("clear") && doc->getNode("clear")->getCategory() == "gltf_pbr",
-          "a gltf_pbr without attenuation is left alone");
-    int layers = 0;
+    // The clear glass is expanded too, to couple its reflection and
+    // transmission (an RT dielectric), but gets no volume layer.
+    Check(!doc->getNode("clear"), "the clear glass is coupled");
+    int layers = 0, volumeLayers = 0;
     bool clearcoat = false;
     for (auto const& node : doc->getNodes()) {
         if (node->getCategory() == "layer" && node->getType() == "BSDF") {
             auto top = Upstream(node, "top"), base = Upstream(node, "base");
+            if (base && base->getCategory() == "anisotropic_vdf") ++volumeLayers;
             if (top && base && top->getCategory() == "dielectric_bsdf" &&
                 top->getInput("scatter_mode") && top->getInput("scatter_mode")->getValueString() == "T" &&
                 base->getCategory() == "anisotropic_vdf") {
@@ -350,7 +352,7 @@ void TestVolumeLayer(const std::filesystem::path& dir, const std::string& librar
         if (node->getCategory() == "dielectric_bsdf" && !node->getInput("scatter_mode"))
             clearcoat = true;
     }
-    Check(layers == 1, "exactly one transmission is layered over its volume");
+    Check(layers == 1 && volumeLayers == 1, "exactly one transmission is layered over its volume");
     Check(clearcoat, "the clearcoat lobe survives the expansion");
     bool tint = false;
     for (auto const& node : doc->getNodes())
