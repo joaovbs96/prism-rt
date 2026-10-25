@@ -72,9 +72,18 @@
 // Light AOVs (albedo, diffuse, specular, emission; LightAovSample):
 // compiled in with PRISM_LIGHT_AOVS 1 (the CPU backend always, the GPU
 // kernels in a variant built when a render asks for them) and gathered when
-// PathTracer::aovs is set. Without them the path tracer is unchanged.
+// PathTracer::aovs is set. Without them the path tracer is the code it was
+// before (the GPU kernels compile at -O0: the same source structure keeps
+// their SPIR-V, and so the driver's code, unchanged).
 #ifndef PRISM_LIGHT_AOVS
 #define PRISM_LIGHT_AOVS 0
+#endif
+
+// Light reaching the camera (PathTracer::gather).
+#if PRISM_LIGHT_AOVS
+#define PRISM_GATHER(c) gather(c)
+#else
+#define PRISM_GATHER(c) path.radiance += c
 #endif
 
 inline float powerHeuristic(float a, float b)
@@ -212,6 +221,7 @@ struct AnalyticLightSums {
     float probability; // of the lights' table (power) selection probabilities
 };
 
+#if PRISM_LIGHT_AOVS
 // The light AOVs of one sample (docs/hydra.md, "Light AOVs"), scaled as its
 // colour (coverage, sample clamp, exposure) except the albedo:
 //   albedo    the BSDF sample weight (an estimate of the directional albedo)
@@ -237,6 +247,7 @@ struct LightAovSample {
     float3 specular;
     float3 emission;
 };
+#endif
 
 struct SampleResult {
     float3 color;
@@ -533,13 +544,13 @@ struct PathTracer {
     // rest ks (with light lobes).
     float3 lobeScale(float kd, float ks) { return (float3)ks + (kd - ks) * path.previousDiffuse; }
 
-    // Light reaching the camera along the path (weighted): the colour, and
-    // with light AOVs the emission before the first scattering vertex, after
-    // it diffuse and specular by that vertex's lobes.
+#if PRISM_LIGHT_AOVS
+    // Light reaching the camera along the path (weighted; PRISM_GATHER): the
+    // colour, and with light AOVs the emission before the first scattering
+    // vertex, after it diffuse and specular by that vertex's lobes.
     void gather(float3 c)
     {
         path.radiance += c;
-#if PRISM_LIGHT_AOVS
         if (aovs) {
             if (path.aovPrimary) {
                 path.aov.emission += c;
@@ -549,10 +560,20 @@ struct PathTracer {
                 path.aov.specular += c - d;
             }
         }
-#endif
     }
 
-#if PRISM_LIGHT_AOVS
+    // Next-event estimation's contribution c at a vertex; at the first one
+    // diffuse is the BSDF's own diffuse part (as diffuse lobes see the light,
+    // with light lobes).
+    void gatherDirect(float3 c, float3 firstVertexDiffuse)
+    {
+        path.radiance += c;
+        if (!aovs) return;
+        const float3 d = path.aovPrimary ? min(firstVertexDiffuse, c) : c * path.firstDiffuse;
+        path.aov.diffuse += d;
+        path.aov.specular += c - d;
+    }
+
     // The albedo AOV at a surface vertex (LightAovSample): sharp bounces and
     // cutout crossings hand it on to the next vertex.
     void resolveAlbedo(BsdfSample bs)
@@ -707,7 +728,7 @@ struct PathTracer {
                                                  !hit.surface.valid, path.depth == 0, weighted, path.previousPdf,
                                                  path.previousNeeProbability, path.receiver, path.previousPosition,
                                                  spatial);
-            gather(path.weight * crossed * contributionWeight(settings.contributions, path.depth));
+            PRISM_GATHER(path.weight * crossed * contributionWeight(settings.contributions, path.depth));
             sawLight = path.depth == 0 && maxComponent(crossed) > 0.0f;
         }
         if (!hit.surface.valid) {
@@ -724,7 +745,7 @@ struct PathTracer {
             if (weighted)
                 misWeight = powerHeuristic(path.previousPdf, path.previousNeeProbability * domeSelectionProbability() *
                                                                  backend.environmentPdf(direction));
-            gather(path.weight * li * (misWeight * contributionWeight(settings.contributions, path.depth)));
+            PRISM_GATHER(path.weight * li * (misWeight * contributionWeight(settings.contributions, path.depth)));
             path.active = false;
         }
         return hit;
@@ -833,7 +854,8 @@ struct PathTracer {
                 emissionWeight = powerHeuristic(path.previousPdf, path.previousNeeProbability * pdfArea *
                                                                       distance * distance / cosLight);
         }
-        gather(path.weight * bs.emission * (emissionWeight * contributionWeight(settings.contributions, path.depth)));
+        PRISM_GATHER(path.weight * bs.emission *
+                     (emissionWeight * contributionWeight(settings.contributions, path.depth)));
         // A cutout hole crossed from the inside leaves the object, and with it
         // the medium entered by refraction; staying in it absorbed the rest of
         // the path and lost every path that then escaped to the environment.
@@ -876,23 +898,14 @@ struct PathTracer {
             contribution = path.weight * f.value * vertex.light.radiance * (misWeight / lightPdf);
         PathRay shadow = spawnRay(hit.surface, vertex.light.wi, false);
         if (isfinite(vertex.light.distance)) shadow.ray.tfar = vertex.light.distance * (1.0f - 1e-4f);
-        if (!(maxComponent(contribution) > 0.0f && visible(shadow, vertex.light.shadowBit))) return;
+        if (maxComponent(contribution) > 0.0f && visible(shadow, vertex.light.shadowBit))
 #if PRISM_LIGHT_AOVS
-        if (aovs) {
-            const float3 c = contribution * contributionWeight(settings.contributions, path.depth + 1);
-            path.radiance += c;
-            // At the first vertex the BSDF's own diffuse part (as diffuse
-            // lobes see the light, with light lobes), else that vertex's.
-            const float3 d = path.aovPrimary
-                ? min(path.weight * f.diffuse * vertex.light.radiance * (misWeight / lightPdf) *
-                          contributionWeight(settings.contributions, path.depth + 1), c)
-                : c * path.firstDiffuse;
-            path.aov.diffuse += d;
-            path.aov.specular += c - d;
-            return;
-        }
+            gatherDirect(contribution * contributionWeight(settings.contributions, path.depth + 1),
+                         path.weight * f.diffuse * vertex.light.radiance * (misWeight / lightPdf) *
+                             contributionWeight(settings.contributions, path.depth + 1));
+#else
+            path.radiance += contribution * contributionWeight(settings.contributions, path.depth + 1);
 #endif
-        path.radiance += contribution * contributionWeight(settings.contributions, path.depth + 1);
     }
 
     // Absorption, media, Russian roulette and the next segment.

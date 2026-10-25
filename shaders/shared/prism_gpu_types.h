@@ -78,8 +78,12 @@ static const uint kFrameSpatialLights = 512u; // spatial light selection (Sample
 static const uint kFrameTextureFeedback = 1024u; // record requested texture levels (Vulkan texture streaming)
 static const uint kFrameLightLobes = 2048u;   // UsdLux diffuse/specular light multipliers (LightTable::lobes)
 // The kernel's light AOV variant (PRISM_LIGHT_AOVS) renders this frame: the
-// output and accumulation buffers also hold the AOVs (kernel.hlsl).
+// output and accumulation buffers also hold the AOVs (kernel.hlsl). Host
+// only (the devices pick the variant by it): an unused constant would still
+// change the -O0 SPIR-V of every kernel.
+#ifndef __HLSL_VERSION
 static const uint kFrameLightAovs = 4096u;
+#endif
 
 // Work modes.
 static const uint kModePass = 0u;      // one sample per listed pixel
