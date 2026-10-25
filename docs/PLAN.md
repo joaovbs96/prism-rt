@@ -20,12 +20,13 @@ The handover for the main (orchestrating) session. Subagents don't read this fil
 
 - `main` is the development branch (fast-forwarded from `device-abstraction`; GitHub's `main` = fb2b235).
 - 11 local commits on top of it are not pushed: the layered-dielectric energy repairs and the albedo survey tool.
-- CI is paused: GitHub Actions stopped on billing. Revisit when the repository goes public (step 1).
+- CI is off: GitHub Actions stopped on billing and João disabled the workflow. Revisit when the repository goes public (step 1). Until then, the local full serial `ctest -j 1` is the only gate.
 - Completed so far: see `docs/PROGRESS.md`. Decisions: `docs/DECISIONS.md`. Longer-term feature list: `docs/feature_roadmap.md`.
 
 ## Steps
 
 ### 1. CI (deferred until the repository goes public)
+- João disabled the Actions workflow (2026-10-25); re-enable it first.
 - Public repositories get free Actions minutes; the billing stop (spending limit / payment) goes away or needs fixing then.
 - Then: confirm the workflow runs on `main`, that the USD/MDL/vcpkg caches saved on `main` are reused, and delete the `device-abstraction` branch on GitHub (João's OK).
 - Owner: João (billing), then the main session.
