@@ -6,7 +6,8 @@
 #     [TOLERANCE 0.01] [MEAN_TOLERANCE <tolerance>]
 #     [ARGS <options of both frontends>...]
 #     [CLI_ARGS <PrismRT options>...] [HYDRA_ARGS <prism_hydra_render options>...]
-#     [EXACT_LAYERS <file>:<layer>...])
+#     [EXACT_LAYERS <file>:<layer>...] [RELABEL_LAYERS <file>:<layer>...]
+#     [CLI_DEVICE cpu|vulkan|metal])
 #
 # Renders SCENE on the CPU device with the standalone CLI (PrismRT) and with
 # the Hydra delegate (prism_hydra_render), then compares the two with
@@ -15,8 +16,11 @@
 # number of samples (no adaptive sampling: _prism_fixed_sampling). Without PRODUCTS both
 # render one image from CAMERA; with PRODUCTS both write the RenderProducts of
 # the stage's render settings and each listed file is compared. EXACT_LAYERS
-# compares those layers (geometric AOVs) exactly. SCENE is relative to the
-# source directory unless absolute.
+# compares those layers (geometric AOVs) exactly; RELABEL_LAYERS compares id
+# layers exactly up to a renumbering (prim ids: each loader numbers its prims).
+# CLI_DEVICE renders the CLI's side on another device (a GPU: name the
+# fixture *_vulkan or *_metal so its tests get the gpu label and lock). SCENE
+# is relative to the source directory unless absolute.
 #
 # Tests: prism_parity_<name>_cli, prism_parity_<name>_hydra (the CTest
 # fixture prism_parity_<name>), and prism_parity_<name>_match (one image) or
@@ -24,12 +28,12 @@
 # ${CMAKE_BINARY_DIR}/parity/<name>/{cli,hydra}, which is returned in
 # prism_parity_<name>_dir.
 function(prism_add_parity_fixture)
-    cmake_parse_arguments(P "" "NAME;SCENE;CAMERA;WIDTH;HEIGHT;SPP;TOLERANCE;MEAN_TOLERANCE"
-        "ARGS;CLI_ARGS;HYDRA_ARGS;PRODUCTS;EXACT_LAYERS" ${ARGN})
+    cmake_parse_arguments(P "" "NAME;SCENE;CAMERA;WIDTH;HEIGHT;SPP;TOLERANCE;MEAN_TOLERANCE;CLI_DEVICE"
+        "ARGS;CLI_ARGS;HYDRA_ARGS;PRODUCTS;EXACT_LAYERS;RELABEL_LAYERS" ${ARGN})
     if(NOT P_NAME OR NOT P_SCENE)
         message(FATAL_ERROR "prism_add_parity_fixture needs NAME and SCENE")
     endif()
-    foreach(_default IN ITEMS "CAMERA;/World/Camera" "WIDTH;64" "HEIGHT;64" "SPP;16" "TOLERANCE;0.01")
+    foreach(_default IN ITEMS "CAMERA;/World/Camera" "WIDTH;64" "HEIGHT;64" "SPP;16" "TOLERANCE;0.01" "CLI_DEVICE;cpu")
         list(GET _default 0 _key)
         list(GET _default 1 _value)
         if(NOT DEFINED P_${_key})
@@ -47,22 +51,25 @@ function(prism_add_parity_fixture)
     set(_prefix prism_parity_${P_NAME})
     if(P_PRODUCTS)
         add_test(NAME ${_prefix}_cli
-            COMMAND PrismRT --scene "${_scene}" --device cpu --output-dir "${_dir}/cli" ${_prism_fixed_sampling} ${P_ARGS} ${P_CLI_ARGS})
+            COMMAND PrismRT --scene "${_scene}" --device ${P_CLI_DEVICE} --output-dir "${_dir}/cli" ${_prism_fixed_sampling} ${P_ARGS} ${P_CLI_ARGS})
         add_test(NAME ${_prefix}_hydra
             COMMAND prism_hydra_render "${_scene}" --render-settings default "${_dir}/hydra" ${_prism_fixed_sampling} ${P_ARGS} ${P_HYDRA_ARGS})
         set(_outputs ${P_PRODUCTS})
     else()
         add_test(NAME ${_prefix}_cli
             COMMAND PrismRT --scene "${_scene}" --camera ${P_CAMERA} --width ${P_WIDTH} --height ${P_HEIGHT}
-                --spp ${P_SPP} --device cpu ${_prism_fixed_sampling} ${P_ARGS} ${P_CLI_ARGS} --output "${_dir}/cli/image.exr")
+                --spp ${P_SPP} --device ${P_CLI_DEVICE} ${_prism_fixed_sampling} ${P_ARGS} ${P_CLI_ARGS} --output "${_dir}/cli/image.exr")
         add_test(NAME ${_prefix}_hydra
             COMMAND prism_hydra_render "${_scene}" ${P_CAMERA} "${_dir}/hydra/image.exr"
                 ${P_WIDTH} ${P_HEIGHT} ${P_SPP} ${_prism_fixed_sampling} ${P_ARGS} ${P_HYDRA_ARGS})
         set(_outputs image.exr)
     endif()
-    # The CPU device in both frontends: these tests never open the GPU.
-    set_tests_properties(${_prefix}_cli ${_prefix}_hydra PROPERTIES
+    # The CPU device in both frontends unless CLI_DEVICE says otherwise.
+    set_tests_properties(${_prefix}_hydra PROPERTIES
         ENVIRONMENT "${_prism_test_environment};PRISM_DEVICE=cpu"
+        FIXTURES_SETUP ${_prefix})
+    set_tests_properties(${_prefix}_cli PROPERTIES
+        ENVIRONMENT "${_prism_test_environment};PRISM_DEVICE=${P_CLI_DEVICE}"
         FIXTURES_SETUP ${_prefix})
     list(LENGTH _outputs _count)
     foreach(_output IN LISTS _outputs)
@@ -88,6 +95,17 @@ function(prism_add_parity_fixture)
         add_test(NAME ${_test}
             COMMAND prism_compare_images "${_dir}/cli/${_output}" "${_dir}/hydra/${_output}"
                 --exact --layer ${_layer})
+        set_tests_properties(${_test} PROPERTIES FIXTURES_REQUIRED ${_prefix})
+    endforeach()
+    foreach(_relabel IN LISTS P_RELABEL_LAYERS)
+        string(REPLACE ":" ";" _parts "${_relabel}")
+        list(GET _parts 0 _output)
+        list(GET _parts 1 _layer)
+        get_filename_component(_stem "${_output}" NAME_WE)
+        set(_test ${_prefix}_${_stem}_${_layer}_relabel)
+        add_test(NAME ${_test}
+            COMMAND prism_compare_images "${_dir}/cli/${_output}" "${_dir}/hydra/${_output}"
+                --layer ${_layer} --relabel)
         set_tests_properties(${_test} PROPERTIES FIXTURES_REQUIRED ${_prefix})
     endforeach()
     set(prism_parity_${P_NAME}_dir "${_dir}" PARENT_SCOPE)

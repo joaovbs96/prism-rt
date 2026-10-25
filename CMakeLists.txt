@@ -840,10 +840,6 @@ endif()
 # CLI-vs-Hydra parity (cmake/PrismParity.cmake, docs/hydra.md): every scene
 # feature both loaders support has a fixture here, rendered by both on the CPU
 # device and compared. Add one prism_add_parity_fixture call per fixture.
-# Not here yet, because the standalone loader lacks the feature (phase 7):
-# emissive.usda (a MaterialX graph the CLI cannot generate), instances.usda
-# (native instancing), linking.usda (light linking) and
-# native_instance_bindings.usda.
 if(TARGET prism_hydra_render AND TARGET prism_compare_images)
     prism_add_parity_fixture(NAME parity SCENE tests/hydra/fixtures/parity.usda)
     # Lights are sampled in another order: noise, not bias (the mean agrees).
@@ -893,12 +889,10 @@ if(TARGET prism_hydra_render AND TARGET prism_compare_images)
             endforeach()
         endif()
     endforeach()
-    # prism:honorDoubleSided (the fixture's render settings turn it on). The
-    # loaders shade the far side of the mirrored (negative scale) card
-    # differently, culled or not (CLI mirroring: phase 7); it reaches the image
-    # only through indirect light: noise-level NRMSE (0.016), mean 0.3%.
+    # prism:honorDoubleSided (the fixture's render settings turn it on),
+    # with a mirrored (negative scale) card.
     prism_add_parity_fixture(NAME double_sided SCENE tests/hydra/fixtures/double_sided.usda
-        ARGS --render-settings /Render/Settings TOLERANCE 0.03 MEAN_TOLERANCE 0.01)
+        ARGS --render-settings /Render/Settings)
     if(TARGET prism_scene_features_test)
         foreach(_frontend cli hydra)
             add_test(NAME prism_scene_features_double_sided_${_frontend}
@@ -918,8 +912,9 @@ if(TARGET prism_hydra_render AND TARGET prism_compare_images)
             set_tests_properties(prism_scene_features_sss_fallback_${_frontend} PROPERTIES
                 FIXTURES_REQUIRED prism_parity_sss_fallback)
         endforeach()
-    endif()    # prism:subdivisionLevel from the render settings and prism_hydra_render's
-    # --subdivision-level (Hydra only: the CLI renders control hulls and warns).
+    endif()
+    # prism:subdivisionLevel from the render settings and prism_hydra_render's
+    # --subdivision-level; the CLI against the delegate below.
     set(_prism_subdivision "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/subdivision_level.usda")
     foreach(_case "hull;/Render/Hull;12;" "default;/Render/Default;192;" "option;/Render/Hull;48;--subdivision-level;1")
         list(GET _case 0 _name)
@@ -934,24 +929,71 @@ if(TARGET prism_hydra_render AND TARGET prism_compare_images)
             ENVIRONMENT "${_prism_test_environment};PRISM_DEVICE=cpu"
             PASS_REGULAR_EXPRESSION "Render stat triangleCount: ${_triangles}[^0-9]")
     endforeach()
-    add_test(NAME prism_cli_subdivision_setting_warning
-        COMMAND PrismRT --scene "${_prism_subdivision}" --spp 1 --device cpu
-            --output "${CMAKE_BINARY_DIR}/cli_subdivision.exr")
-    set_tests_properties(prism_cli_subdivision_setting_warning PROPERTIES
-        ENVIRONMENT "${_prism_test_environment};PRISM_DEVICE=cpu"
-        PASS_REGULAR_EXPRESSION "prism:subdivisionLevel does not apply to the standalone loader")    # Per-instance primvars (PointInstancer and native instancing) for MDL
-    # geompropvalue: the delegate only (the CLI has neither, phase 7).
+    # The standalone loader's scene features at the delegate's level (phase 7,
+    # docs/hydra.md "Scene features"): subdivision at the render settings'
+    # level and the option's, ...
+    foreach(_case "hull;/Render/Hull;" "default;/Render/Default;" "option;/Render/Hull;--subdivision-level;1")
+        list(GET _case 0 _name)
+        list(GET _case 1 _settings)
+        list(SUBLIST _case 2 -1 _options)
+        prism_add_parity_fixture(NAME subdivision_${_name} SCENE tests/hydra/fixtures/subdivision_level.usda
+            WIDTH 32 HEIGHT 32 SPP 4 ARGS --render-settings ${_settings} ${_options})
+    endforeach()
+    # ... load-time displacement and implicit surfaces (refined), a UsdPreviewSurface
+    # emitter on refined meshes, mesh holes, leftHanded and mirrored meshes,
+    # GeomSubset bindings, uniform and constant normals, purposes (both
+    # includedPurposes) and visibility, ...
+    prism_add_parity_fixture(NAME displacement SCENE tests/hydra/fixtures/displacement.usda)
+    prism_add_parity_fixture(NAME implicit_surfaces SCENE tests/hydra/fixtures/implicit_surfaces.usda)
+    prism_add_parity_fixture(NAME emissive SCENE tests/hydra/fixtures/emissive.usda)
+    foreach(_settings Default Proxy)
+        string(TOLOWER "${_settings}" _name)
+        prism_add_parity_fixture(NAME mesh_features_${_name} SCENE tests/hydra/fixtures/mesh_features.usda
+            WIDTH 96 HEIGHT 64 ARGS --render-settings /Render/${_settings})
+    endforeach()
+    # ... PointInstancers (nested, invisibleIds) of implicit cubes, native
+    # instances with their own bindings, per-instance primvars for MDL scene
+    # data lookups (geompropvalue), ...
+    prism_add_parity_fixture(NAME instances SCENE tests/hydra/fixtures/instances.usda)
+    prism_add_parity_fixture(NAME instance_primvars SCENE tests/hydra/fixtures/instance_primvars.usda)
+    # The prototype panel and its two instances overlap in one plane: which
+    # surface wins there depends on each loader's geometry (the CLI keeps
+    # uninstanced meshes in world space), so they differ at those pixels only.
+    prism_add_parity_fixture(NAME native_instance_bindings SCENE tests/hydra/fixtures/native_instance_bindings.usda
+        TOLERANCE 0.03 MEAN_TOLERANCE 0.002)
     if(TARGET prism_scene_features_test)
-        add_test(NAME prism_scene_features_instance_primvars_render
-            COMMAND prism_hydra_render "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/instance_primvars.usda"
-                /World/Camera "${CMAKE_BINARY_DIR}/scene_features/instance_primvars.exr" 64 64 16 ${_prism_fixed_sampling})
-        set_tests_properties(prism_scene_features_instance_primvars_render PROPERTIES
-            ENVIRONMENT "${_prism_test_environment};PRISM_DEVICE=cpu"
-            FIXTURES_SETUP prism_scene_features_instance_primvars)
-        add_test(NAME prism_scene_features_instance_primvars_hydra
-            COMMAND prism_scene_features_test instance_primvars "${CMAKE_BINARY_DIR}/scene_features/instance_primvars.exr")
-        set_tests_properties(prism_scene_features_instance_primvars_hydra PROPERTIES
-            FIXTURES_REQUIRED prism_scene_features_instance_primvars)
+        foreach(_frontend cli hydra)
+            add_test(NAME prism_scene_features_instance_primvars_${_frontend}
+                COMMAND prism_scene_features_test instance_primvars
+                    "${prism_parity_instance_primvars_dir}/${_frontend}/image.exr")
+            set_tests_properties(prism_scene_features_instance_primvars_${_frontend} PROPERTIES
+                FIXTURES_REQUIRED prism_parity_instance_primvars)
+        endforeach()
+    endif()
+    # ... light and shadow linking (spatial light selection weighs the lights
+    # at each shading point, so the loaders' slightly different geometry
+    # picks lights differently: noise, the mean agrees), ...
+    prism_add_parity_fixture(NAME linking SCENE tests/hydra/fixtures/linking.usda
+        TOLERANCE 0.02 MEAN_TOLERANCE 0.002)
+    # ... animated attributes, transforms and skinning at a time (--time).
+    # animated: the CLI keeps vertex-interpolated texture coordinates per
+    # point, so its tangent frames are smoothed where the delegate's are per
+    # triangle; the sampled directions differ (noise, the mean agrees).
+    prism_add_parity_fixture(NAME animated_time SCENE tests/hydra/fixtures/animated.usda ARGS --time 2
+        TOLERANCE 0.03 MEAN_TOLERANCE 0.002)
+    prism_add_parity_fixture(NAME animated_xform_time SCENE tests/hydra/fixtures/animated_xform.usda ARGS --time 2)
+    foreach(_time 1 2)
+        prism_add_parity_fixture(NAME skinned_${_time} SCENE tests/hydra/fixtures/skinned.usda ARGS --time ${_time})
+    endforeach()
+    # Camera exposure, and prim, element and instance ids.
+    prism_add_parity_fixture(NAME camera_exposure SCENE tests/hydra/fixtures/camera_exposure.usda)
+    prism_add_parity_fixture(NAME id_aovs SCENE tests/hydra/fixtures/id_aovs.usda PRODUCTS id_aovs.exr
+        EXACT_LAYERS id_aovs.exr:ElementId id_aovs.exr:InstanceId RELABEL_LAYERS id_aovs.exr:PrimId)
+    # The CLI on Vulkan against the delegate on the CPU: instanced prototypes,
+    # placement transforms and instance primvars in the GPU scene.
+    if(PRISM_ENABLE_VULKAN)
+        prism_add_parity_fixture(NAME instance_primvars_vulkan SCENE tests/hydra/fixtures/instance_primvars.usda
+            CLI_DEVICE vulkan)
     endif()
     # Light inputs:diffuse / inputs:specular: the full image and its
     # diffuse-only and specular-only variants. As for "lights", the loaders
@@ -1180,7 +1222,8 @@ if(PRISM_BUILD_HYDRA)
         ${_prism_fixed_sampling})
     set(_prism_obj_studio --env "${CMAKE_CURRENT_SOURCE_DIR}/tests/gltf/studio_env.hdr")
     # <fixture>:<spp>:<check or ->:<lighting>
-    foreach(_case "textured:64:textured:studio" "pbr:16:-:studio" "glass:64:glass:white" "emissive:16:emissive:black")
+    foreach(_case "textured:64:textured:studio" "pbr:16:-:studio" "glass:64:glass:white" "emissive:16:emissive:black"
+                  "displaced:16:-:studio")
         string(REPLACE ":" ";" _parts "${_case}")
         list(GET _parts 0 _name)
         list(GET _parts 1 _spp)
@@ -1200,6 +1243,11 @@ if(PRISM_BUILD_HYDRA)
         set_tests_properties(prism_obj_${_name}_render PROPERTIES ENVIRONMENT "${_prism_obj_env}"
             FIXTURES_SETUP prism_obj_${_name}_cpu
             FAIL_REGULAR_EXPRESSION "magenta error material;is not supported")
+        if(_name STREQUAL "displaced")
+            # MTL disp: the ridged quad is diced and displaced at load time.
+            set_tests_properties(prism_obj_${_name}_render PROPERTIES
+                PASS_REGULAR_EXPRESSION "displaced the faces of 1 material\\(s\\) into [0-9]+ triangles")
+        endif()
         if(NOT _check STREQUAL "-")
             add_test(NAME prism_obj_${_name}_test
                 COMMAND prism_obj_material_test --check-${_check} "${_prism_obj}/${_name}_cpu.exr")
@@ -1229,7 +1277,8 @@ endif()
 set(_prism_gpu_test_regex
     "^prism_hydra_(render_exercise|transparent_background_export|depth1_render|depth_change_render|setting_change_test|cutout_(medium|clear)_render|cutout_medium_test|animation_exercise|pass_camera_test|scene_bridge_test|streaming_(cold|warm|whole)|streaming_.*_matches_.*)$"
     "|^prism_(gpu_shader_compile_test|device_selection_test|cli_clean_exit_vulkan|cli_gpu_failure_vulkan)$"
-    "|^prism_(gltf|obj)_.*_vulkan_(render|parity|test)$")
+    "|^prism_(gltf|obj)_.*_vulkan_(render|parity|test)$"
+    "|^prism_parity_.*_(vulkan|metal)_(cli|hydra|match)$")
 string(JOIN "" _prism_gpu_test_regex ${_prism_gpu_test_regex})
 get_property(_prism_tests DIRECTORY PROPERTY TESTS)
 foreach(_test IN LISTS _prism_tests)
