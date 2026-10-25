@@ -1,0 +1,95 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    upAxis = "Y"
+    metersPerUnit = 1
+)
+
+# A scene lit only by a textured emitter (docs/feature_roadmap.md, "Textured
+# emission as lights"): a 4 x 4 grid over a diffuse floor, tilted toward the
+# camera, its emission a texture whose left half is black and right half a
+# checker. Its triangles are next-event lights with per-triangle densities
+# (the black ones none); the emission is evaluated at each light sample.
+# Without lights of its own the scene must not get the default dome.
+def Xform "World"
+{
+    def Mesh "Floor" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 1, 2, 3]
+        point3f[] points = [(-3, 0, 3), (3, 0, 3), (3, 0, -3), (-3, 0, -3)]
+        uniform token subdivisionScheme = "none"
+        rel material:binding = </World/Looks/Floor>
+    }
+
+    def Mesh "Emitter" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        int[] faceVertexCounts = [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4]
+        int[] faceVertexIndices = [0, 1, 6, 5, 1, 2, 7, 6, 2, 3, 8, 7, 3, 4, 9, 8, 5, 6, 11, 10, 6, 7, 12, 11, 7, 8, 13, 12, 8, 9, 14, 13, 10, 11, 16, 15, 11, 12, 17, 16, 12, 13, 18, 17, 13, 14, 19, 18, 15, 16, 21, 20, 16, 17, 22, 21, 17, 18, 23, 22, 18, 19, 24, 23]
+        point3f[] points = [(-0.75, 0, -0.75), (-0.375, 0, -0.75), (0, 0, -0.75), (0.375, 0, -0.75), (0.75, 0, -0.75), (-0.75, 0, -0.375), (-0.375, 0, -0.375), (0, 0, -0.375), (0.375, 0, -0.375), (0.75, 0, -0.375), (-0.75, 0, 0), (-0.375, 0, 0), (0, 0, 0), (0.375, 0, 0), (0.75, 0, 0), (-0.75, 0, 0.375), (-0.375, 0, 0.375), (0, 0, 0.375), (0.375, 0, 0.375), (0.75, 0, 0.375), (-0.75, 0, 0.75), (-0.375, 0, 0.75), (0, 0, 0.75), (0.375, 0, 0.75), (0.75, 0, 0.75)]
+        texCoord2f[] primvars:st = [(0, 0), (0.25, 0), (0.5, 0), (0.75, 0), (1, 0), (0, 0.25), (0.25, 0.25), (0.5, 0.25), (0.75, 0.25), (1, 0.25), (0, 0.5), (0.25, 0.5), (0.5, 0.5), (0.75, 0.5), (1, 0.5), (0, 0.75), (0.25, 0.75), (0.5, 0.75), (0.75, 0.75), (1, 0.75), (0, 1), (0.25, 1), (0.5, 1), (0.75, 1), (1, 1)] (
+            interpolation = "vertex"
+        )
+        uniform token subdivisionScheme = "none"
+        double3 xformOp:translate = (0, 1.5, -0.3)
+        float3 xformOp:rotateXYZ = (-35, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
+        rel material:binding = </World/Looks/Checker>
+    }
+
+    def Scope "Looks"
+    {
+        def Material "Floor"
+        {
+            token outputs:mtlx:surface.connect = </World/Looks/Floor/Surface.outputs:out>
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_standard_surface_surfaceshader"
+                float inputs:base = 1
+                color3f inputs:base_color = (0.8, 0.8, 0.8)
+                float inputs:specular = 0
+                token outputs:out
+            }
+        }
+
+        def Material "Checker"
+        {
+            token outputs:mtlx:surface.connect = </World/Looks/Checker/Surface.outputs:out>
+
+            def Shader "Image"
+            {
+                uniform token info:id = "ND_image_color3"
+                asset inputs:file = @./textured_emitter_checker.ppm@ (
+                    colorSpace = "lin_rec709"
+                )
+                color3f outputs:out
+            }
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_standard_surface_surfaceshader"
+                float inputs:base = 0
+                float inputs:specular = 0
+                float inputs:emission = 6
+                color3f inputs:emission_color.connect = </World/Looks/Checker/Image.outputs:out>
+                token outputs:out
+            }
+        }
+    }
+
+    def Camera "Camera"
+    {
+        float focalLength = 24
+        float horizontalAperture = 36
+        float verticalAperture = 36
+        float2 clippingRange = (0.1, 100)
+        double3 xformOp:translate = (0, 1.1, 4.2)
+        float3 xformOp:rotateXYZ = (-12, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
+    }
+}

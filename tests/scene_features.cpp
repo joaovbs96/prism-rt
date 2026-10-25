@@ -24,6 +24,10 @@
 //                      primvars reach MDL geompropvalue lookups.
 //   lobes_consistency  MIS BSDF: a light_lobes variant rendered with MIS and
 //                      with BSDF sampling only agrees on every card.
+//   textured_emitter   textured_emitter.usda: a scene lit only by a textured
+//                      emitter gets no default dome and is lit by it.
+//   textured_emitter_consistency  MIS BSDF: the fixture with next-event
+//                      estimation and with BSDF sampling only agrees on the floor.
 //   sss_fallback       sss_fallback.usda: prism:sssFallback renders the
 //                      furnace's subsurface-only sphere by its (black)
 //                      diffuse lobe instead of tracing the walk.
@@ -284,6 +288,45 @@ void LobesConsistency(std::vector<Image> const& images)
     }
 }
 
+// textured_emitter.usda, 64x64: the floor is lit by the textured emitter
+// only. The sky stays black (no default dome: the scene's emitter counts as
+// a light), the emitter's checker is seen above the floor.
+void TexturedEmitter(Image const& image)
+{
+    float sky = 0.0f;
+    for (int y = 0; y < 6; ++y)
+        for (int x = 0; x < image.width; ++x)
+            for (int c = 0; c < 3; ++c) sky = std::max(sky, image.At(x, y, c));
+    Check(sky == 0.0f, Describe("the sky is black (no default dome)", sky));
+    float emitter = 0.0f;
+    for (int y = 6; y < image.height / 2; ++y)
+        for (int x = 0; x < image.width; ++x) emitter = std::max(emitter, image.At(x, y, 1));
+    Check(emitter > 1.0f, Describe("the emitter is seen", emitter));
+    Check(image.Gray(32, 44, 3) > 0.01f, Describe("the emitter lights the floor", image.Gray(32, 44, 3)));
+}
+
+// Horizontal bands of the floor (rows 30 to 57 of 64) with next-event
+// estimation and with BSDF sampling only (a high sample count): the light
+// sample's emission and densities are unbiased when they agree.
+void TexturedEmitterConsistency(std::vector<Image> const& images)
+{
+    Image const& mis = images[0];
+    Image const& bsdf = images[1];
+    for (int band = 0; band < 3; ++band) {
+        const int y0 = mis.height * (30 + 9 * band) / 64, y1 = mis.height * (39 + 9 * band) / 64;
+        double a = 0.0, b = 0.0;
+        for (int y = y0; y < y1; ++y)
+            for (int x = 0; x < mis.width; ++x)
+                for (int c = 0; c < 3; ++c) {
+                    a += mis.At(x, y, c);
+                    b += bsdf.At(x, y, c);
+                }
+        char text[256];
+        std::snprintf(text, sizeof(text), "floor rows %d-%d: MIS %.6f, BSDF sampling %.6f", y0, y1, a, b);
+        Check(std::abs(a - b) <= 0.02 * std::max(a, b) + 1e-6, text);
+    }
+}
+
 // sss_fallback.usda, 64x64: the sphere of sss_furnace.usda covers the centre.
 // Traced, it looks like the white dome; with the fallback its base (weight 0)
 // leaves it black against the dome.
@@ -339,6 +382,8 @@ int main(int argc, char** argv)
         {"instance_primvars", single(InstancePrimvars)},
         {"sss_fallback", single(SssFallback)},
         {"glass_furnace", single(GlassFurnace)},
+        {"textured_emitter", single(TexturedEmitter)},
+        {"textured_emitter_consistency", {2, TexturedEmitterConsistency}},
         // Diagnostics: the pixels where two images differ most.
         {"diff", {2, [](std::vector<Image> const& images) {
             std::vector<std::pair<float, int>> d;

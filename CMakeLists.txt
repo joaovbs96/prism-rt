@@ -873,7 +873,8 @@ if(TARGET prism_hydra_render AND TARGET prism_compare_images)
         dome_temperature:dome_color_temperature
         invisible_ids:pointinstancer_invisible_ids
         display_color:display_color_interpolation
-        glass_furnace:glass_furnace)
+        glass_furnace:glass_furnace
+        textured_emitter:textured_emitter)
     foreach(_entry IN LISTS _prism_scene_features)
         string(REPLACE ":" ";" _parts "${_entry}")
         list(GET _parts 0 _feature)
@@ -1051,6 +1052,48 @@ if(TARGET prism_hydra_render AND TARGET prism_compare_images)
                 "${CMAKE_BINARY_DIR}/scene_features/glass_furnace_mis.exr" --tolerance 0.005 --mean-tolerance 0.001)
         set_tests_properties(prism_scene_features_glass_furnace_sampling PROPERTIES
             FIXTURES_REQUIRED prism_scene_features_glass_furnace_sampling)
+        # Textured emitters are lights: next-event estimation (the emission
+        # evaluated at each light sample, per-triangle densities) agrees with
+        # BSDF sampling only on the floor they light. The MIS render is also
+        # the CPU side of the Vulkan parity test below.
+        set(_prism_textured_emitter "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/textured_emitter.usda")
+        foreach(_case "mis;256" "bsdf;16384")
+            list(GET _case 0 _sampling)
+            list(GET _case 1 _spp)
+            add_test(NAME prism_scene_features_textured_emitter_${_sampling}_render
+                COMMAND PrismRT --scene "${_prism_textured_emitter}" --camera /World/Camera --width 64 --height 64
+                    --spp ${_spp} ${_prism_fixed_sampling} --device cpu --environment-sampling ${_sampling}
+                    --max-sample-radiance 0
+                    --output "${CMAKE_BINARY_DIR}/scene_features/textured_emitter_${_sampling}.exr")
+            set_tests_properties(prism_scene_features_textured_emitter_${_sampling}_render PROPERTIES
+                ENVIRONMENT "${_prism_test_environment};PRISM_DEVICE=cpu"
+                FIXTURES_SETUP prism_scene_features_textured_emitter_${_sampling})
+        endforeach()
+        add_test(NAME prism_scene_features_textured_emitter_consistency
+            COMMAND prism_scene_features_test textured_emitter_consistency
+                "${CMAKE_BINARY_DIR}/scene_features/textured_emitter_mis.exr"
+                "${CMAKE_BINARY_DIR}/scene_features/textured_emitter_bsdf.exr")
+        set_tests_properties(prism_scene_features_textured_emitter_consistency PROPERTIES
+            FIXTURES_REQUIRED "prism_scene_features_textured_emitter_mis;prism_scene_features_textured_emitter_bsdf")
+        if(PRISM_ENABLE_VULKAN)
+            add_test(NAME prism_textured_emitter_vulkan_render
+                COMMAND PrismRT --scene "${_prism_textured_emitter}" --camera /World/Camera --width 64 --height 64
+                    --spp 256 ${_prism_fixed_sampling} --device vulkan --max-sample-radiance 0
+                    --output "${CMAKE_BINARY_DIR}/scene_features/textured_emitter_vulkan.exr")
+            set_tests_properties(prism_textured_emitter_vulkan_render PROPERTIES
+                ENVIRONMENT "${_prism_test_environment}"
+                FIXTURES_SETUP prism_textured_emitter_vulkan
+                FAIL_REGULAR_EXPRESSION "magenta error material;cannot render the scene on the GPU")
+            # The directly seen checker's filtered texels differ between the
+            # devices (NRMSE 0.067 before textured emitters were lights too);
+            # the floor agrees within 0.4% per band, the mean within 0.1%.
+            add_test(NAME prism_textured_emitter_vulkan_parity
+                COMMAND prism_compare_images "${CMAKE_BINARY_DIR}/scene_features/textured_emitter_mis.exr"
+                    "${CMAKE_BINARY_DIR}/scene_features/textured_emitter_vulkan.exr"
+                    --tolerance 0.1 --mean-tolerance 0.005)
+            set_tests_properties(prism_textured_emitter_vulkan_parity PROPERTIES
+                FIXTURES_REQUIRED "prism_scene_features_textured_emitter_mis;prism_textured_emitter_vulkan")
+        endif()
     endif()
     if(TARGET prism_render_settings_test)
         # Named channels and sane values in both frontends' products; the
@@ -1278,7 +1321,8 @@ set(_prism_gpu_test_regex
     "^prism_hydra_(render_exercise|transparent_background_export|depth1_render|depth_change_render|setting_change_test|cutout_(medium|clear)_render|cutout_medium_test|animation_exercise|pass_camera_test|scene_bridge_test|streaming_(cold|warm|whole)|streaming_.*_matches_.*)$"
     "|^prism_(gpu_shader_compile_test|device_selection_test|cli_clean_exit_vulkan|cli_gpu_failure_vulkan)$"
     "|^prism_(gltf|obj)_.*_vulkan_(render|parity|test)$"
-    "|^prism_parity_.*_(vulkan|metal)_(cli|hydra|match)$")
+    "|^prism_parity_.*_(vulkan|metal)_(cli|hydra|match)$"
+    "|^prism_textured_emitter_vulkan_(render|parity)$")
 string(JOIN "" _prism_gpu_test_regex ${_prism_gpu_test_regex})
 get_property(_prism_tests DIRECTORY PROPERTY TESTS)
 foreach(_test IN LISTS _prism_tests)
