@@ -46,9 +46,8 @@ Scenes: **Eggs** (MaterialEggs), **OpenPBR** (OpenPBRShaderPlayground),
   157k-triangle emissive MEET MAT: 9 points on each of both faces) reruns at
   each scene change, and in Hydra on a GPU twice (the CPU preview builds its
   own light table). `PRISM_VERBOSE_LIGHTS=1` lists the emitting groups.
-  The CLI does not load MEET MAT's emission texture yet (MDL "strict
-  relative file paths ... not supported in string-based modules"), so there
-  it does not emit.
+  Loaded by the CLI, MEET MAT's emission is zero at every probe point (it
+  emits through Hydra); not investigated.
 - **Material edits of displacing materials** rebuild bindings but not the
   displaced geometry until the next full snapshot.
 

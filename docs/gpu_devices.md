@@ -608,8 +608,13 @@ called done there.
     structural keys `v4`), `src/mdl/backend_compiler.cpp`
     (`emission_zero`, `backface_emission`), `src/mdl_material.h`,
     `src/material.h`.
-  - Runs: the Metal kernel compiles (the emitter dispatch is in every
-    kernel, empty without such materials); `ctest -R textured_emitter` on
+    `shaders/integrator/path_tracer.h` also picks lights of tables over 4096
+    entries with the white noise (`pickLight`, `kPreciseLightPickEntries`).
+    Kernels of material sets with varying emission are compiled with
+    `PRISM_VARYING_EMITTERS` (from the generated MDL code; the Vulkan raygen
+    shader gets it from `RaygenSource`), the others leave the light-sample
+    emission out, so their code and images are unchanged.
+  - Runs: the Metal kernel compiles with and without varying emitters; `ctest -R textured_emitter` on
     the CPU, then `tests/hydra/fixtures/textured_emitter.usda` with `--device
     metal` against `--device cpu` (`prism_compare_images`, as
     `prism_textured_emitter_vulkan_parity` does), and chess and an egg
