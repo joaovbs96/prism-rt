@@ -80,7 +80,13 @@ void Unit(std::filesystem::path const &fixtures, std::filesystem::path const &sc
           RenderVarAov("st", TfToken("primvar")) == AovKind::St &&
           RenderVarAov("primId", TfToken("raw")) == AovKind::PrimId &&
           RenderVarAov("C<RD>.*L", TfToken("lpe")) == AovKind::Unknown &&
-          RenderVarAov("albedo", TfToken("raw")) == AovKind::Unknown,
+          RenderVarAov("albedo", TfToken("raw")) == AovKind::Albedo &&
+          RenderVarAov("diffuse", TfToken()) == AovKind::Diffuse &&
+          RenderVarAov("specular", TfToken("raw")) == AovKind::Specular &&
+          RenderVarAov("emission", TfToken("raw")) == AovKind::Emission &&
+          RenderVarAov("Pworld", TfToken("raw")) == AovKind::Pworld &&
+          RenderVarAov("P", TfToken("raw")) == AovKind::Pworld &&
+          RenderVarAov("transmission", TfToken("raw")) == AovKind::Unknown,
           "render var sources");
 
     // The two-product fixture.
@@ -140,7 +146,10 @@ void Unit(std::filesystem::path const &fixtures, std::filesystem::path const &sc
           LayerChannels("st", AovKind::St, 2, false) == std::vector<std::string>{"st.U", "st.V"} &&
           LayerChannels("id", AovKind::PrimId, 1, false) == std::vector<std::string>{"id.id"} &&
           LayerChannels("beauty2", AovKind::Color, 3, false) ==
-              std::vector<std::string>{"beauty2.R", "beauty2.G", "beauty2.B"},
+              std::vector<std::string>{"beauty2.R", "beauty2.G", "beauty2.B"} &&
+          LayerChannels("Diffuse", AovKind::Diffuse, 3, false) ==
+              std::vector<std::string>{"Diffuse.R", "Diffuse.G", "Diffuse.B"} &&
+          LayerChannels("P", AovKind::Pworld, 3, false) == std::vector<std::string>{"P.X", "P.Y", "P.Z"},
           "layer channel names");
 
     // The writer: every layer in EXR, with its data window; colour only in

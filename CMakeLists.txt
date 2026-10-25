@@ -1010,8 +1010,12 @@ if(TARGET prism_hydra_render AND TARGET prism_compare_images)
     endif()
     foreach(_device IN LISTS _prism_light_aov_devices)
         set(_tag "")
+        set(_albedo_tolerance)
         if(_device STREQUAL "vulkan")
             set(_tag _vulkan)
+            # The closed room's long paths diverge between the devices: noise
+            # in the colour (NRMSE 0.013), the mean agrees within 0.03%.
+            set(_albedo_tolerance TOLERANCE 0.03 MEAN_TOLERANCE 0.002)
         endif()
         set(_fixture light_aovs${_tag})
         set(_albedo light_aovs_albedo${_tag})
@@ -1019,7 +1023,8 @@ if(TARGET prism_hydra_render AND TARGET prism_compare_images)
             PRODUCTS light_aovs.exr light_aovs_parts.exr LAYERS ${_prism_light_aov_layers}
             EXACT_LAYERS light_aovs.exr:Position)
         prism_add_parity_fixture(NAME ${_albedo} SCENE tests/hydra/fixtures/light_aovs_albedo.usda
-            CLI_DEVICE ${_device} PRODUCTS light_aovs_albedo.exr LAYERS light_aovs_albedo.exr:Albedo)
+            CLI_DEVICE ${_device} PRODUCTS light_aovs_albedo.exr LAYERS light_aovs_albedo.exr:Albedo
+            ${_albedo_tolerance})
         if(TARGET prism_scene_features_test)
             set(_frontends cli hydra)
             if(_device STREQUAL "vulkan")
