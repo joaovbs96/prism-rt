@@ -1,10 +1,12 @@
 """Focused tests for the stock-usdview Prism instance-selection shim."""
 
+import os
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from pxr import Plug, Sdf, Tf, Vt
+from pxr import Gf, Plug, Sdf, Tf, Usd, UsdGeom, UsdLux, Vt
 from pxr.Usdviewq.qt import QtWidgets
 
 import prismUsdview
@@ -22,6 +24,31 @@ class _Selection:
 class _Signal:
     def connect(self, callback):
         self.callback = callback
+
+
+class _Registry:
+    def __init__(self):
+        self.commands = []
+
+    def registerCommandPlugin(self, name, display, callback, description=""):
+        self.commands.append((name, display, callback))
+        return name
+
+
+class _Menu:
+    def __init__(self, items):
+        self.items = items
+
+    def addItem(self, command):
+        self.items.append(command)
+
+
+class _Builder:
+    def __init__(self):
+        self.menus = {}
+
+    def findOrCreateMenu(self, name):
+        return _Menu(self.menus.setdefault(name, []))
 
 
 class _Api:
@@ -140,7 +167,7 @@ class UsdviewSelectionPluginTest(unittest.TestCase):
             for name in (prismUsdview.COLOR_CORRECTION_ENV, prismUsdview.OCIO_VIEW_ENV,
                          prismUsdview.OCIO_DISPLAY_ENV):
                 prismUsdview.os.environ.pop(name, None)
-            container.registerPlugins(None, api)
+            container.registerPlugins(_Registry(), api)
         container._bridge._timer.stop()
         container._hud._timer.stop()
         settings = api.dataModel.viewSettings
@@ -156,7 +183,8 @@ class UsdviewSelectionPluginTest(unittest.TestCase):
 
     def test_container_supports_usdview_ui_configuration(self):
         # PluginContainer's default implementation raises NotImplementedError.
-        prismUsdview.PrismContainer().configureView(None, None)
+        prismUsdview.PrismContainer().configureView(
+            _Registry(), _Builder())
 
     def test_plug_registry_discovers_and_loads_container(self):
         plugin_dir = Path(__file__).resolve().parents[2] / "tools" / "usdview_plugins" / "prismUsdview"
@@ -493,6 +521,137 @@ class UsdviewSampleHudTest(unittest.TestCase):
         hud.eventFilter(view, QtCore_event("Resize"))
         self.assertEqual(label.geometry().x(), 640 - 160)
         window.close()
+
+
+class UsdviewEnvironmentTest(unittest.TestCase):
+    """Prism > Environment...: the dome lives only in the session layer."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.hdr = os.path.join(self.dir.name, "sky.hdr").replace("\\", "/")
+        open(self.hdr, "wb").close()
+
+    def _stage(self, up="Y", dome=False):
+        path = os.path.join(self.dir.name, "asset_%s_%d.usda" % (up, dome))
+        layer = Sdf.Layer.CreateNew(path)
+        stage = Usd.Stage.Open(layer)
+        UsdGeom.SetStageUpAxis(stage, up)
+        UsdGeom.Sphere.Define(stage, "/World/Ball")
+        if dome:
+            UsdLux.DomeLight.Define(stage, "/World/StageDome")
+        layer.Save()
+        self.before = layer.ExportToString()
+        # usdview opens the stage with a session layer.
+        return Usd.Stage.Open(path)
+
+    def test_authors_dome_in_session_layer_only(self):
+        stage = self._stage("Y")
+        environment = prismUsdview.environment
+        environment.set_environment(stage, self.hdr, 2.0, 0.5, 30.0)
+        light = UsdLux.DomeLight(stage.GetPrimAtPath("/__PrismEnvironment"))
+        self.assertTrue(light)
+        self.assertEqual(light.GetTextureFileAttr().Get().path, self.hdr)
+        self.assertEqual(light.GetTextureFormatAttr().Get(), UsdLux.Tokens.latlong)
+        self.assertAlmostEqual(light.GetIntensityAttr().Get(), 2.0)
+        self.assertAlmostEqual(light.GetExposureAttr().Get(), 0.5)
+        ops = UsdGeom.Xformable(light.GetPrim()).GetOrderedXformOps()
+        self.assertEqual([op.GetOpType() for op in ops], [UsdGeom.XformOp.TypeRotateY])
+        self.assertAlmostEqual(ops[0].Get(), 30.0)
+        self.assertIsNotNone(
+            stage.GetSessionLayer().GetPrimAtPath("/__PrismEnvironment"))
+        # The asset layer is untouched, in memory and on disk.
+        root = stage.GetRootLayer()
+        self.assertFalse(root.dirty)
+        self.assertIsNone(root.GetPrimAtPath("/__PrismEnvironment"))
+        self.assertEqual(root.ExportToString(), self.before)
+        with open(root.realPath, newline="") as f:
+            self.assertEqual(f.read(), self.before)
+
+    def test_rotation_uses_the_stage_up_axis(self):
+        stage = self._stage("Z")
+        prismUsdview.environment.set_environment(stage, self.hdr, rotation=90.0)
+        ops = UsdGeom.Xformable(
+            stage.GetPrimAtPath("/__PrismEnvironment")).GetOrderedXformOps()
+        self.assertEqual([op.GetOpType() for op in ops], [UsdGeom.XformOp.TypeRotateZ])
+        self.assertAlmostEqual(ops[0].Get(), 90.0)
+
+    def test_update_reuses_prim_and_single_rotate_op(self):
+        stage = self._stage("Y")
+        environment = prismUsdview.environment
+        environment.set_environment(stage, self.hdr, 1.0, 0.0, 10.0)
+        environment.set_environment(stage, self.hdr, 3.0, -1.0, 45.0)
+        self.assertEqual(environment.current_settings(stage),
+                         (self.hdr, 3.0, -1.0, 45.0))
+        ops = UsdGeom.Xformable(
+            stage.GetPrimAtPath("/__PrismEnvironment")).GetOrderedXformOps()
+        self.assertEqual(len(ops), 1)
+
+    def test_remove_restores_the_stage(self):
+        stage = self._stage("Y")
+        environment = prismUsdview.environment
+        self.assertFalse(environment.remove_environment(stage))
+        environment.set_environment(stage, self.hdr)
+        self.assertTrue(environment.remove_environment(stage))
+        self.assertFalse(stage.GetPrimAtPath("/__PrismEnvironment").IsValid())
+        self.assertIsNone(environment.current_settings(stage))
+        self.assertEqual(stage.GetSessionLayer().ExportToString().count("def "), 0)
+        self.assertEqual(stage.GetRootLayer().ExportToString(), self.before)
+
+    def test_stage_domes_are_deactivated_and_restored(self):
+        stage = self._stage("Y", dome=True)
+        environment = prismUsdview.environment
+        deactivated = environment.set_environment(stage, self.hdr)
+        self.assertEqual([str(p) for p in deactivated], ["/World/StageDome"])
+        self.assertFalse(stage.GetPrimAtPath("/World/StageDome").IsActive())
+        self.assertEqual(environment.stage_dome_lights(stage), [])
+        # Updating keeps the record, so removing still restores the dome.
+        environment.set_environment(stage, self.hdr, 2.0)
+        environment.remove_environment(stage)
+        self.assertTrue(stage.GetPrimAtPath("/World/StageDome").IsActive())
+        self.assertEqual(stage.GetSessionLayer().ExportToString().count("over "), 0)
+        self.assertEqual(stage.GetRootLayer().ExportToString(), self.before)
+
+    def test_keeping_stage_domes(self):
+        stage = self._stage("Y", dome=True)
+        environment = prismUsdview.environment
+        environment.set_environment(stage, self.hdr, replace_stage_domes=False)
+        self.assertTrue(stage.GetPrimAtPath("/World/StageDome").IsActive())
+        # Switching to replace and back restores the dome.
+        environment.set_environment(stage, self.hdr, replace_stage_domes=True)
+        self.assertFalse(stage.GetPrimAtPath("/World/StageDome").IsActive())
+        environment.set_environment(stage, self.hdr, replace_stage_domes=False)
+        self.assertTrue(stage.GetPrimAtPath("/World/StageDome").IsActive())
+
+    def test_choices_list_usd_default_and_asset_files(self):
+        env_dir = os.path.join(self.dir.name, "assets", "environment")
+        os.makedirs(env_dir)
+        for name in ("a.exr", "b.HDR", "notes.txt"):
+            open(os.path.join(env_dir, name), "wb").close()
+        start = os.path.join(self.dir.name, "tools", "x")
+        os.makedirs(start)
+        choices = prismUsdview.environment.environment_choices({}, start)
+        labels = [label for label, _ in choices]
+        self.assertEqual(labels[-2:], ["a.exr", "b.HDR"])
+        self.assertNotIn("notes.txt", labels)
+        beach = prismUsdview.environment.usd_default_environment()
+        if beach:
+            self.assertEqual(labels[0], "Stinson Beach (USD default)")
+            self.assertTrue(beach.endswith("StinsonBeach.hdr"))
+
+    def test_menu_entry_is_registered(self):
+        registry, builder = _Registry(), _Builder()
+        container = prismUsdview.PrismContainer()
+        window = QtWidgets.QWidget()
+        container.registerPlugins(registry, _Api(window, {}))
+        container.configureView(registry, builder)
+        self.assertEqual([(n, d) for n, d, _ in registry.commands],
+                         [("PrismContainer.environment", "Environment...")])
+        self.assertEqual(builder.menus, {"Prism": ["PrismContainer.environment"]})
 
 
 def QtCore_event(name):

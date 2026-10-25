@@ -34,6 +34,10 @@ toggle in its state file, so this sets it at each start-up only (the menu entry
 still turns it off for the session). PrismRT uses the default dome light only
 while the stage has no lights of its own. Set PRISM_USDVIEW_DEFAULT_DOME_LIGHT
 to off to start with it disabled, or to "saved" to keep usdview's saved state.
+
+Environment: the Prism menu's "Environment..." entry authors an HDR dome light
+in the session layer (see environment.py); it replaces the default dome and, by
+default, the stage's own dome lights while it is on.
 """
 
 import os
@@ -43,6 +47,8 @@ from pxr import Gf, Tf, Vt
 from pxr.Usdviewq.plugin import PluginContainer
 from pxr.Usdviewq.qt import QtCore, QtGui, QtWidgets
 from pxr.Usdviewq.stageView import StageView
+
+from . import environment
 
 
 SETTING = "prism:usdviewSelection"
@@ -557,9 +563,15 @@ class PrismContainer(PluginContainer):
             Tf.Warn("prismUsdview default dome light: %s" % error)
         self._bridge = _SelectionBridge(usdviewApi)
         self._hud = _SampleHud(usdviewApi)
+        self._environment = plugRegistry.registerCommandPlugin(
+            "PrismContainer.environment", "Environment...",
+            environment.show_dialog,
+            "Light the stage with an HDR/EXR dome light in the session layer")
 
     def configureView(self, plugRegistry, plugUIBuilder):
-        pass  # This extension needs no menu entry.
+        command = getattr(self, "_environment", None)
+        if command is not None:
+            plugUIBuilder.findOrCreateMenu("Prism").addItem(command)
 
 
 Tf.Type.Define(PrismContainer)
