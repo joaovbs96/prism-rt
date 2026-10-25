@@ -586,6 +586,14 @@ TargetCode BackendCompiler::generate_target_code(const CompiledMaterial& compile
     if (thin_walled_expr && thin_walled_expr->get_kind() == mi::neuraylib::IExpression::EK_CONSTANT)
         thinWalledNever = !binding->is_thin_walled;
     const bool backfaceEmission = !thinWalledNever && !EmissionIsZero(compiled.compiled_material.get(), "backface");
+    const auto* classMaterial = compiled.compiled_material.get();
+    const bool backfaceEmissionMatchesSurface =
+        classMaterial->get_slot_hash(mi::neuraylib::SLOT_BACKFACE_EMISSION_EDF_EMISSION) ==
+            classMaterial->get_slot_hash(mi::neuraylib::SLOT_SURFACE_EMISSION_EDF_EMISSION) &&
+        classMaterial->get_slot_hash(mi::neuraylib::SLOT_BACKFACE_EMISSION_INTENSITY) ==
+            classMaterial->get_slot_hash(mi::neuraylib::SLOT_SURFACE_EMISSION_INTENSITY) &&
+        classMaterial->get_slot_hash(mi::neuraylib::SLOT_BACKFACE_EMISSION_MODE) ==
+            classMaterial->get_slot_hash(mi::neuraylib::SLOT_SURFACE_EMISSION_MODE);
 
     const std::string classHash = ClassProgramHash(compiled.compiled_material.get(), m_ctx.get_factory(),
                                                    compiled.transaction.get());
@@ -998,6 +1006,7 @@ TargetCode BackendCompiler::generate_target_code(const CompiledMaterial& compile
     program->directional_emission = uniformEmission && directionalEmission;
     program->emission_zero = emissionZero;
     program->backface_emission = backfaceEmission;
+    program->backface_emission_matches_surface = backfaceEmissionMatchesSurface;
     program->has_displacement = hasDisplacement;
     program->builtin_resources = !binding->texture_runtime;
     program->identity = cacheKey;

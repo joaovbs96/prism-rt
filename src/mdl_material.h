@@ -800,14 +800,18 @@ private:
         if (!surfaceEmits && !backEmits) return;
         m_varyingEmission = true;
         if (!surfaceEmits || !program.uniform_emission) return;
-        // A varying cutout scales the emission per point.
+        // A varying cutout scales the emission per point, but cannot make
+        // zero emission positive: that is evaluated without it.
         const auto cutout = constant_cutout();
-        if (!cutout) return;
-        m_varyingEmission = false;
-        if (constantEmissionValue(*cutout)) return;
+        if (constantEmissionValue(cutout.value_or(1.0f))) {
+            if (cutout) m_varyingEmission = false;
+            else m_uniformEmission.reset();
+            return;
+        }
         // Uniform front emission that is zero or directional; a back face
-        // that may emit still varies.
-        m_varyingEmission = backEmits || m_directionalEmission;
+        // that may emit still varies, unless it is the front's own EDF.
+        m_varyingEmission = (backEmits && !program.backface_emission_matches_surface) ||
+                            m_directionalEmission;
     }
 
     // The constant front-face emission of a uniform EDF; false if it is zero,

@@ -124,6 +124,9 @@ struct CompiledProgram {
     // The back face may emit: thin_walled is not the constant false and
     // backface.emission is not provably zero.
     bool backface_emission = false;
+    // backface.emission is the surface.emission of the same class (the same
+    // EDF, intensity and mode): the back face emits when the front does.
+    bool backface_emission_matches_surface = false;
     // geometry.displacement is not the constant zero.
     bool has_displacement = false;
 };
