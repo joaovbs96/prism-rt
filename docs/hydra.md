@@ -60,11 +60,11 @@ running delegate.
 | `prism:textureStreaming` | true | `--texture-streaming` | the device prepares the scene again (textures re-upload) | GPU devices that stream textures (Vulkan) keep only the mip levels shading asks for, within the texture budget; false uploads whole textures reduced to the budget (env `PRISM_GPU_TEXTURE_STREAMING=0` turns streaming off for the process); see [texture streaming](texture_service.md#gpu-texture-streaming) |
 | `prism:textureStreamingPrepass` | false | none: the CLI always settles streamed textures before its first sample (as `true`) | restarts the accumulation | Settle streamed textures with feedback-only passes before an accumulation and hold them for all of its samples (deterministic final images; `prism_hydra_render` sets it). Otherwise an accumulation restarts at most once, early, and later loads sharpen it in place |
 | `prism:gpuTextureBudgetMiB` | 0 (env `PRISM_GPU_TEXTURE_BUDGET_MIB`) | `--gpu-texture-budget-mib` | the device prepares the scene again (textures re-upload at the new sizes) | GPU memory for textures in MiB (at least 64); 0 is 45% of the device's memory. Textures beyond it upload, or stream, at reduced resolution |
-| `prism:subdivisionLevel` | 2 (env `PRISM_SUBDIVISION_LEVEL`) | none (*) | every mesh converts again | Uniform subdivision level of subdivision surfaces, 0-6 (0: control hulls) |
-| `prism:subdivisionMaxFaces` | 65536 (env `PRISM_SUBDIVISION_MAX_FACES`) | none (*) | every mesh converts again | Faces one mesh may refine to; denser meshes use lower levels |
-| `prism:subdivisionBudgetFaces` | 25165824 (env `PRISM_SUBDIVISION_BUDGET_FACES`) | none (*) | every mesh converts again | Faces all refined meshes of the scene may add up to; beyond it the meshes refining to the most faces drop levels first |
-| `prism:displacementLevel` | 4 (env `PRISM_DISPLACEMENT_LEVEL`) | none (*) | every mesh converts again | Subdivision level of meshes their material displaces, 0-6 |
-| `prism:displacementMaxFaces` | 262144 (env `PRISM_DISPLACEMENT_MAX_FACES`) | none (*) | every mesh converts again | Faces one displaced mesh may refine to |
+| `prism:subdivisionLevel` | 2 (env `PRISM_SUBDIVISION_LEVEL`) | `--subdivision-level` | every mesh converts again | Uniform subdivision level of subdivision surfaces, 0-6 (0: control hulls) |
+| `prism:subdivisionMaxFaces` | 65536 (env `PRISM_SUBDIVISION_MAX_FACES`) | `--subdivision-max-faces` | every mesh converts again | Faces one mesh may refine to; denser meshes use lower levels |
+| `prism:subdivisionBudgetFaces` | 25165824 (env `PRISM_SUBDIVISION_BUDGET_FACES`) | `--subdivision-budget-faces` | every mesh converts again | Faces all refined meshes of the scene may add up to; beyond it the meshes refining to the most faces drop levels first |
+| `prism:displacementLevel` | 4 (env `PRISM_DISPLACEMENT_LEVEL`) | `--displacement-level` (*) | every mesh converts again | Subdivision level of meshes their material displaces, 0-6 |
+| `prism:displacementMaxFaces` | 262144 (env `PRISM_DISPLACEMENT_MAX_FACES`) | `--displacement-max-faces` (*) | every mesh converts again | Faces one displaced mesh may refine to |
 | `prism:sssFallback` | false (env `PRISM_SSS_FALLBACK`) | `--sss-fallback` | every material generates again | Render subsurface scattering as its diffuse lobe instead of tracing it ([MaterialX compatibility](materialx_compatibility.md)). Process-wide, like the colour management |
 | `prism:honorDoubleSided` | false | `--honor-double-sided` | rebuilds the scene | Honour USD `doubleSided`: back faces of single-sided meshes (`doubleSided` false, USD's default) are not hit, unless their material transmits. Off, every mesh is two-sided as before (most path tracers ignore `doubleSided`). See [Scene features](#scene-features) |
 | `prism:device` | `auto` | `--device` | switches the render device | `auto`, `cpu`, `vulkan` or `metal`; env `PRISM_DEVICE` sets the initial value (`cpu-reference` was removed: it warns and is ignored) |
@@ -86,14 +86,14 @@ running delegate.
 | `prism:selectionOutlineRadius` | 2 | Hydra only (interactive) | presentation only | Outline thickness in pixels |
 | `prism:selectionUseHostSettings` | false | Hydra only (interactive) | presentation only | Use the host's Hdx outline parameters instead of PrismRT's overrides |
 
-(*) The standalone loader has no subdivision surfaces or displacement yet
-([feature roadmap](feature_roadmap.md#standalone-cli)): it renders control
-hulls, so these settings cannot apply, and the CLI warns when the
-RenderSettings prim authors them. `prism_hydra_render` has
-`--subdivision-level`, `--subdivision-max-faces`, `--subdivision-budget-faces`,
-`--displacement-level` and `--displacement-max-faces`.
-The subdivision, displacement and texture budget settings replace the
-environment-variable-only configuration; the variables now give the defaults.
+(*) Both loaders refine and displace with the same conversion
+(`src/mesh/mesh_conversion.cpp`); the CLI's displacement settings also apply
+to OBJ faces their MTL `disp` displaces ([OBJ](obj.md)). `prism_hydra_render`
+has the same five options. The subdivision, displacement and texture budget
+settings replace the environment-variable-only configuration; the variables
+now give the defaults. The CLI's `--time` (the USD time code animated
+attributes, transforms, skinning and materials load at; default the default
+time) is `prism_hydra_render`'s `--time`; neither is a render setting.
 
 (**) Not image settings: sphere batching changes how the delegate's retained
 scene stores spheres (the CLI loads its spheres its own way, and the image is
@@ -362,13 +362,18 @@ prism_add_parity_fixture(NAME my_feature SCENE tests/hydra/fixtures/my_feature.u
     [CAMERA /World/Camera] [WIDTH 64] [HEIGHT 64] [SPP 16]
     [TOLERANCE 0.01] [MEAN_TOLERANCE 0.01]
     [ARGS <options of both>] [CLI_ARGS ...] [HYDRA_ARGS ...]
-    [PRODUCTS <product files>...] [EXACT_LAYERS <file>:<layer>...])
+    [PRODUCTS <product files>...] [EXACT_LAYERS <file>:<layer>...]
+    [RELABEL_LAYERS <file>:<layer>...] [CLI_DEVICE cpu|vulkan|metal])
 ```
 
 This creates `prism_parity_my_feature_{cli,hydra}` and the comparison
 `prism_parity_my_feature_match`. With `PRODUCTS`, both write the stage's
 RenderProducts and each file gets a `..._<file>_<ext>_match`;
-`EXACT_LAYERS` also compares geometric layers exactly. Outputs go to
+`EXACT_LAYERS` also compares geometric layers exactly and `RELABEL_LAYERS`
+id layers up to a renumbering (`prism_compare_images --relabel`: one
+bijection of values, misses equal; each loader numbers its prims).
+`CLI_DEVICE` renders the CLI's side on a GPU (name the fixture `*_vulkan` or
+`*_metal`: its tests then get the `gpu` label and lock). Outputs go to
 `build/parity/<name>/{cli,hydra}`. Both frontends seed pixels the same way,
 so most fixtures agree to about 1e-8. A tolerance above 1% needs a reason
 next to the call: `lights` samples its lights in another order, which adds
@@ -383,15 +388,19 @@ noise but no bias.
 | dome_color_temperature, pointinstancer_invisible_ids, display_color_interpolation | 0 | 1% |
 | light_camera_visibility | 2.0e-3 | 1% |
 | light_lobes (full, diffuse, specular) | 0.012, 0.005, 0.014 (mean below 1e-4) | 5% (mean 1%): lights in another order |
-| double_sided | 0.016 (mean 0.25%) | 3% (mean 1%): the mirrored card's far side (see the call) |
+| double_sided, emissive, mesh_features (default, proxy), subdivision_hull, id_aovs (colour) | below 1e-7 | 1% |
+| displacement, implicit_surfaces, instances, instance_primvars, subdivision (default, option), skinned (times 1 and 2), animated_xform_time, camera_exposure | 0 | 1% |
+| instance_primvars_vulkan (CLI on Vulkan, delegate on the CPU) | 2.3e-7 | 1% |
+| id_aovs ids | ElementId, InstanceId exact; PrimId exact up to a renumbering | exact |
+| linking | 0.0074 (mean 0.02%) | 2% (mean 0.2%): spatial light selection at slightly different points |
+| native_instance_bindings | 0.013 (mean 0.04%) | 3% (mean 0.2%): coplanar overlapping panels |
+| animated_time | 0.010 (mean 0.01%) | 3% (mean 0.2%): smoothed vs per-triangle tangent frames |
 
-The CLI does not load these fixtures like Hydra yet (phase 7):
-
-- `emissive.usda`: a MaterialX graph the CLI cannot generate;
-- `instances.usda`: native instancing;
-- `linking.usda`: light linking;
-- `native_instance_bindings.usda`;
-- `instance_primvars.usda`: per-instance primvars and MDL `geompropvalue`.
+Since phase 7 the CLI loads every fixture like the delegate (feature
+roadmap, "Standalone CLI"). The remaining differences are noise, never bias:
+the CLI keeps polygon meshes in world space and their vertex-interpolated
+attributes per point (smoothed tangent frames), where the delegate places
+prototypes and keeps per-triangle tangents.
 
 `tests/hydra/validate.py` and `validate_exports.py` also run under CTest, on
 the CPU device (`--device cpu`), as `prism_hydra_validate_script` and
@@ -448,13 +457,44 @@ parity fixture each and a check in `prism_scene_features_test`:
   (`SceneManager::castRayCulled`); GPU: a cull bit
   in each primitive's material-table entry and non-opaque instances, tested
   in the ray query (`gpu_culled_triangle`). Fixture `double_sided.usda`.
-- **Per-instance primvars** (the delegate only): instance-rate primvars of
+- **Per-instance primvars**: instance-rate (vertex/varying) primvars of
   PointInstancers and the inherited constant primvars of native instances
   answer MDL `geompropvalue` lookups, before the mesh's own primvars; nested
   instancers contribute outer to inner. CPU: `InstancePrimvars` per placement;
   GPU: `GpuInstance.links.z/w` index entries of the primvar directory.
-  Fixture `instance_primvars.usda` (not a parity fixture: the CLI has no
-  instancer primvars or general MDL primvars yet).
+  Fixture `instance_primvars.usda` (also on Vulkan in the CLI).
+- **Instancing**: PointInstancers (nested, masked by `invisibleIds`) and
+  native instances place shared prototypes by Embree instances. Native
+  instances resolve bindings, visibility and purpose through their instance
+  proxies (a binding on the instance root reaches the prototype's meshes).
+  Fixtures `instances.usda` (nested instancers of implicit cubes),
+  `native_instance_bindings.usda`.
+- **Subdivision and displacement** with the delegate's conversion
+  (`src/mesh/mesh_conversion.cpp`) and settings (the table above): fixtures
+  `subdivision_level.usda` (hull, default, option) and `displacement.usda`;
+  implicit cubes, cylinders, cones, capsules and planes are meshed with
+  GeomUtil as `HdsiImplicitSurfaceSceneIndex` does (`implicit_surfaces.usda`).
+- **Mesh details**: `holeIndices`, `leftHanded` orientation, negative scales
+  (a mirrored placement turns its winding, in both loaders), GeomSubset
+  material bindings, uniform and constant normals, `primvars:normals` over
+  `normals`, purpose (RenderSettings `includedPurposes`; default and render
+  without settings) and visibility. Fixture `mesh_features.usda` (render
+  settings `/Render/Default` and `/Render/Proxy`).
+- **Light and shadow linking**: a category bit per light or shadow link
+  collection that does not include everything (at most 32 of each), and on
+  each placement the bits of the collections including its prim
+  (`HdsiLightLinkingSceneIndex` in the delegate, `UsdCollectionAPI`
+  membership in the CLI). Fixture `linking.usda`.
+- **Time and skinning**: `--time` evaluates animated attributes, transforms,
+  materials and UsdSkel skinning (linear blend skinning; the CLI through
+  `UsdSkelCache`, without editing the stage). Fixtures `animated.usda`,
+  `animated_xform.usda`, `skinned.usda`.
+- **Camera exposure**: `exposure`, `exposure:fStop`, `:iso`, `:time` and
+  `:responsivity` (`UsdGeomCamera::ComputeLinearExposureScale`) scale the
+  colour. Fixture `camera_exposure.usda`.
+- **Prim, element and instance ids** in both loaders' render products
+  (`id_aovs.usda`): element and instance ids agree exactly; prim ids agree up
+  to a renumbering (each loader numbers its prims; `--relabel`).
 
 ## Scope and costs
 

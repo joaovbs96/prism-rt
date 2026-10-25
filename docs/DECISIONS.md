@@ -3,6 +3,11 @@
 Design decisions and deliberate deviations, newest first. Each entry: date, decision, why.
 
 ## 2026-10-25
+- **The CLI shares the delegate's mesh conversion and UsdPreviewSurface rewrite** (phase 7): `src/mesh/mesh_conversion.cpp` (subdivision, displacement, refinement budget, triangulation) and `src/materialx/preview_surface.h` were moved out of the delegate unchanged; each loader still reads the stage its own way (UsdGeom in the CLI, scene indices in the delegate). The CLI keeps its own polygon conversion for meshes that do not refine or displace, so its earlier images stay bit-identical; refined and displaced meshes use the shared one.
+- **The CLI places every gprim on its own** (phase 7), as the delegate does, instead of one merged mesh: needed for light-link masks, instance primvars, per-prim primvars and ids. Polygon meshes stay in world space (bit-identical to before), prototypes are Embree instances.
+- **The CLI reads USD materials from the composed UsdShade network first** (as the delegate), falling back to reading a referenced `.mtlx` file directly only when no network is composed: the direct read failed on the Teapot (material names) and the OpenPBR playground (relative texture paths in string MDL modules).
+- **CLI fallback grey is the delegate's 0.5** (was 0.7) for geometry without a material or `displayColor`.
+- **Prim ids are compared up to a renumbering** (`prism_compare_images --relabel`): each loader numbers its prims; element and instance ids compare exactly.
 - **CI paused until the repository goes public.** GitHub Actions stopped on billing; public repositories get free minutes.
 - **UsdPreviewSurface rough glass is left as MaterialX builds it** (rough specular over smooth transmission). The UsdPreviewSurface spec says "the transmissive lobe (if any) always assumes roughness 0.0", so the alternatives that conserve energy (one rough lobe: frosted; a smooth lobe: drops the specular roughness) contradict it. The remaining energy loss is MaterialX/MDL's to fix. Comparison: `local/comparisons/usdps_glass/`.
 - **The opaque layering loss (~4.6%) is not repaired.** No MDL construct reproduces OpenPBR's energy-conserving layering; a diffuse scale-up would be wrong at grazing angles and change nearly every material. Upstream only.

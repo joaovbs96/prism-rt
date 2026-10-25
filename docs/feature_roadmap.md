@@ -281,19 +281,40 @@ GPUs from every vendor. To close the gaps, in order:
 
 ## Standalone CLI
 
-The `PrismRT` CLI loads USD through its own path (`src/mesh/usd_mesh.h`): it
-reads analytic lights and combines domes, and follows the stage's render
-settings and products as `prism_hydra_render` does. It has no subdivision,
-displacement, named primvars (other than `displayColor`/`displayOpacity`),
-instance primvars, light linking, native instancing, mesh purpose
-or UsdPreviewSurface translation, and no Hydra id AOVs (`primId`,
-`instanceId`, `elementId`). Hydra (`prism_hydra_render`, usdview) is the
-reference path. The parity tests ([hydra.md](hydra.md#cli-and-hydra-parity))
-compare the two on every fixture both can load; the fixtures the CLI cannot
-load yet are listed there. Render settings are at parity: every `prism:*`
-setting that affects a one-shot render has a CLI flag and is read from the
-RenderSettings prim, except the subdivision and displacement settings, which
-wait for the CLI's subdivision ([hydra.md](hydra.md#rendering-and-selection-settings)).
+The `PrismRT` CLI loads USD through its own path (`src/mesh/usd_mesh.h`):
+it reads analytic lights and combines domes, and follows the stage's render
+settings and products as `prism_hydra_render` does. Hydra
+(`prism_hydra_render`, usdview) is the reference path; the parity tests
+([hydra.md](hydra.md#cli-and-hydra-parity)) compare the two on every
+fixture, and every `prism:*` setting that affects a one-shot render has a
+CLI flag and is read from the RenderSettings prim.
+
+Since phase 7 the CLI loads what the delegate loads (done): a placement per
+gprim (polygon meshes in world space; refined, displaced and instanced ones
+as prototypes behind Embree instances); subdivision surfaces and load-time
+displacement through the delegate's own conversion
+(`src/mesh/mesh_conversion.cpp`, with its refinement budget); implicit
+cubes, cylinders, cones, capsules and planes as Hydra meshes them;
+PointInstancers (nested, `invisibleIds`) and native instances, with
+per-instance primvars for MDL scene data lookups and bindings resolved
+through instance proxies; mesh holes, `leftHanded` orientation, negative
+scales (as the delegate orients mirrored placements), GeomSubset bindings,
+uniform and constant normals, `primvars:normals`, named mesh primvars and
+inherited constant primvars; purpose (`includedPurposes`) and visibility;
+`--time` for animated attributes, transforms, materials and UsdSkel
+skinning (linear blend skinning through `UsdSkelCache`); camera exposure;
+light and shadow linking; UsdPreviewSurface materials and displacement
+terminals (the delegate's network rewrite, `src/materialx/preview_surface.h`);
+materials read from the composed UsdShade network (referenced `.mtlx` files
+included); and the `primId`, `elementId` and `instanceId` AOVs.
+
+Left: UsdSkel blend shapes and skinned normals (authored normals of skinned
+meshes are not skinned), motion blur, and native instancing's numbering
+(prim and instance ids follow the CLI's traversal; the delegate numbers its
+propagated prototypes its own way, so the parity test compares prim ids up
+to a renumbering). The CLI keeps polygon meshes in world space, so
+coplanar overlaps and vertex-interpolated tangent frames differ from the
+delegate's at noise level (see the parity table).
 
 glTF loads only in the CLI ([gltf.md](gltf.md)): Hydra and usdview need a
 glTF file-format plugin (none in the OpenUSD build), which could reuse the
@@ -301,8 +322,7 @@ MaterialX converter. Material variants, thin-walled transmission and the
 other gaps listed in gltf.md are open. OBJ is in the same position
 ([obj.md](obj.md)): CLI only, MTL through a MaterialX `open_pbr_surface`
 converter; `anisor`, `-mm`/`-t` map options, reflection maps and vertex
-colours are open, and `disp` maps are converted but wait for the CLI's
-displacement.
+colours are open; `disp` maps displace their faces at load time.
 
 ## Not worth porting from the OptiX path tracer
 

@@ -125,11 +125,14 @@ the Hydra delegate merges a displacement terminal into the surface document
 `geometry.displacement` carries it. The height is the map's red channel (or
 `-imfchan`), raw, placed by `-o`/`-s`; `-mm base gain` gives
 `base + gain × texel` (a `multiply` and an `add`, as `displacement` has a
-scale but no offset; without a base the gain is its `scale`). The standalone
-loader does not displace meshes yet (the Hydra delegate displaces at load
-time; the CLI's displacement is planned with its subdivision), so a load with
-`disp` warns once:
-`PrismRT OBJ: disp is converted (material 'x'), but the standalone loader does not displace meshes yet (planned)`.
+scale but no offset; without a base the gain is its `scale`). The faces of
+a displacing material are displaced at load time with the USD loaders'
+conversion (`src/mesh/mesh_conversion.cpp`): corners at one position are
+welded so the surface stays closed, the faces refine bilinearly to
+`--displacement-level` (default 4, `PRISM_DISPLACEMENT_LEVEL`) within
+`--displacement-max-faces`, and their vertices move along the smooth normal;
+normals and tangents are then rebuilt. The load reports
+`OBJ: displaced the faces of N material(s) into M triangles`.
 
 ## Maps and the cache
 
@@ -180,7 +183,7 @@ into the working space once ([color_management.md](color_management.md)).
 | Test | Checks |
 | --- | --- |
 | `prism_obj_material_test` | the statement scan, the Phong roughness, the converted document for every fixture material and for inline MTL text (defaults, placeholders, channels, unsupported statements, missing maps, `disp` as a wired displacement shader with `-mm`), validation against the standard library and MDL generation |
-| `prism_obj_{textured,pbr,glass,emissive}_render` | every fixture renders on the CPU with every material compiled and no unsupported statement |
+| `prism_obj_{textured,pbr,glass,emissive,displaced}_render` | every fixture renders on the CPU with every material compiled and no unsupported statement; `displaced` reports its ridged quad displaced |
 | `prism_obj_textured_test` | `map_d` cuts the quad's corner out to the background, the opaque part is the leaf, bump and normal maps add shading detail (more than 3× the noise of a flat region) |
 | `prism_obj_glass_test` | through the refracting sphere the white background is tinted by `Tf` |
 | `prism_obj_emissive_test` | the `Ke 2 2 2` emitter shows radiance 2 (1%), the `map_Ke` one its texture |
@@ -189,8 +192,6 @@ into the working space once ([color_management.md](color_management.md)).
 ## Known gaps
 
 - No OBJ file-format plugin for Hydra / usdview.
-- `disp` is converted but only applied once the standalone loader displaces
-  meshes (Hydra cannot load OBJ).
 - `anisor`, `-mm` (except on `disp`), `-t`, `-boost`, `map_Ka`, `refl`, `decal`, Adobe's
   `adobe_*` statements and the MDL-material variant of Adobe's MTL files are
   not mapped (each warns once).

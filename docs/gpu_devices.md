@@ -544,6 +544,27 @@ called done there.
   - Runs: `prism_device_selection_test` on macOS (Metal is still preferred by
     `auto`; `cpu-reference` is rejected), and `PRISM_DEVICE=cpu-reference`
     in usdview warns once and keeps `auto`.
+- **The CLI's USD loader at the delegate's level** (phase 7,
+  [feature roadmap](feature_roadmap.md#standalone-cli)):
+  - No shader or device change: `shaders/` and `src/device/` are untouched.
+    The CLI's scenes now reach the GPU scene (`src/device/gpu/gpu_scene.cpp`)
+    as the delegate's do: a placement per gprim, prototypes behind Embree
+    instances with placement transforms (mirrored ones flip their
+    orientation), per-placement materials (GeomSubsets), instance primvars
+    (`GpuInstance.links.zw`) and light/shadow link masks.
+  - Shared host code: `src/hydra/scene_bridge.cpp` (mesh conversion,
+    displacement and the subdivision budget moved to
+    `src/mesh/mesh_conversion.{h,cpp}`, unchanged), `src/hydra/materials.cpp`
+    (the UsdPreviewSurface rewrite and `AddDisplacementShader` moved to
+    `src/materialx/preview_surface.h`, unchanged), `src/scene.h`
+    (`attachImportedMesh`), `src/output/aov.h` (id AOVs in both frontends).
+  - Runs: `ctest -R "prism_parity|prism_scene_features|prism_obj" -LE gpu`
+    (CPU); then on Metal the CLI (`--device metal`) on `instances.usda`,
+    `instance_primvars.usda`, `linking.usda`, `mesh_features.usda`
+    (`--render-settings /Render/Default`), `displacement.usda` and
+    `implicit_surfaces.usda` against `prism_hydra_render` on the CPU with
+    `prism_compare_images` (the `prism_parity_instance_primvars_vulkan_match`
+    tolerances), and chess and an egg on Metal against the CPU.
 
 ## Diagnostics
 
