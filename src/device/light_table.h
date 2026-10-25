@@ -68,8 +68,19 @@ struct LightTable {
 // Emissive triangles beyond this many are left to BSDF sampling.
 constexpr size_t kMaxEmitterTriangles = size_t(1) << 22;
 // Triangles of varying emission beyond this many are left to BSDF sampling
-// (a record is 112 bytes).
-constexpr size_t kMaxVaryingEmitterTriangles = size_t(1) << 20;
+// (a record is 112 bytes). PRISM_MAX_VARYING_EMITTER_TRIANGLES lowers the
+// limit for tests of what counts against it.
+inline size_t MaxVaryingEmitterTriangles()
+{
+    static const size_t limit = [] {
+        size_t value = size_t(1) << 20;
+        if (const char* text = std::getenv("PRISM_MAX_VARYING_EMITTER_TRIANGLES"); text && *text)
+            if (const unsigned long long parsed = std::strtoull(text, nullptr, 10); parsed > 0)
+                value = size_t(parsed);
+        return value;
+    }();
+    return limit;
+}
 // Emission evaluations of the estimate: k x k stratified points per triangle,
 // k from 4 down to 1 as the triangle count grows.
 constexpr size_t kEmissionEvaluationBudget = size_t(1) << 22;
@@ -362,7 +373,7 @@ inline bool SceneHasEmitters(SceneManager& scene)
     }
     if (!varying) return false;
     VaryingEmitters emitters;
-    if (!CollectVaryingEmitters(scene, kMaxVaryingEmitterTriangles, &emitters)) return true;
+    if (!CollectVaryingEmitters(scene, MaxVaryingEmitterTriangles(), &emitters)) return true;
     size_t evaluations = 0;
     for (size_t g = 0; g + 1 < emitters.groups.size(); ++g)
         if (GroupEmits(scene, emitters.triangles.data() + emitters.groups[g],
@@ -392,8 +403,10 @@ inline void AddVaryingEmitters(SceneManager& scene, LightTable& table, std::vect
     prism::load_profile::Scope profile("light table: varying emitters");
     const auto start = std::chrono::steady_clock::now();
     VaryingEmitters emitters;
-    if (!CollectVaryingEmitters(scene, kMaxVaryingEmitterTriangles, &emitters)) {
+    if (!CollectVaryingEmitters(scene, MaxVaryingEmitterTriangles(), &emitters)) {
         table.varyingEmittersOverBudget = true;
+        std::cerr << std::format("PrismRT: more than {} triangles have materials whose emission may vary; "
+                                 "they are not sampled as lights\n", MaxVaryingEmitterTriangles());
         return;
     }
     // Groups that emit at all.
