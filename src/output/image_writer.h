@@ -4,7 +4,8 @@
 // (docs/color_management.md, "Outputs"; docs/hydra.md, "Render products").
 // - EXR: every layer as named float channels, linear in the working space,
 //   tagged with oiio:ColorSpace and OpenEXR chromaticities; a cropped image
-//   keeps its data window inside the display window.
+//   keeps its data window inside the display window. One part holds every
+//   layer, or (Image::multiPart) each layer is a part named after it.
 // - Other formats (PNG, JPEG, ...): the colour layer only, through the
 //   display and view (ApplyView) exactly once; alpha stays linear.
 
@@ -31,11 +32,13 @@ struct Image {
     // (a data window crop). Zero full size: the image is the whole window.
     int x = 0, y = 0, fullWidth = 0, fullHeight = 0;
     std::vector<ImageLayer> layers;
+    // EXR: a part per layer (named after it, with the layer's channels).
+    bool multiPart = false;
 };
 
 // The channels of an AOV layer. The beauty layer is unprefixed R, G, B (and
 // A with four components); other layers are prefixed with their name:
-// colours <name>.R/G/B/A, vectors <name>.X/Y/Z, texture coordinates
+// colours and light AOVs <name>.R/G/B/A, vectors <name>.X/Y/Z, texture coordinates
 // <name>.U/V, depths <name>.Z and ids <name>.id.
 std::vector<std::string> LayerChannels(std::string const &layer, AovKind kind,
                                        int components, bool beauty);

@@ -113,6 +113,7 @@ Image BuildProductImage(RenderProductRequest const &product,
     Image image;
     image.width = product.dataWidth;
     image.height = product.dataHeight;
+    image.multiPart = product.multiPart;
     if (!product.FullDataWindow()) {
         image.x = product.dataX;
         image.y = product.dataY;
@@ -229,6 +230,12 @@ std::optional<RenderJob> ResolveRenderJob(UsdStageRefPtr const &stage,
         product.pixelAspectRatio = source.pixelAspectRatio;
         product.aspectRatioConformPolicy = source.aspectRatioConformPolicy;
         product.dataWindowNDC = source.dataWindowNDC;
+        if (auto found = source.namespacedSettings.find("prism:exr:multiPart");
+            found != source.namespacedSettings.end()) {
+            if (found->second.IsHolding<bool>()) product.multiPart = found->second.UncheckedGet<bool>();
+            else Warn(warnings, "Render product <" + product.path.GetString() +
+                      ">: prism:exr:multiPart is not a bool; ignored");
+        }
         Finish(product);
         if (product.width <= 0 || product.height <= 0 || product.dataWidth <= 0 || product.dataHeight <= 0) {
             Warn(warnings, "Render product <" + product.path.GetString() +

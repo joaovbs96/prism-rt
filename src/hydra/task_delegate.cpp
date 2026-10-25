@@ -6,6 +6,7 @@
 #include "selection_settings.h"
 #include "native_tasks.h"
 #include "transport_filter.h"
+#include "../output/aov.h"
 
 #include "pxr/imaging/hd/camera.h"
 #include "pxr/imaging/hd/instancer.h"
@@ -194,8 +195,12 @@ HdAovDescriptor PrismTaskDelegate::GetDefaultAovDescriptor(TfToken const &name) 
     if (name == HdAovTokens->cameraDepth)
         return {HdFormatFloat32, false,
                 VtValue(std::numeric_limits<float>::infinity())};
+    // World position (Pworld, also P) and the light AOVs (albedo, diffuse,
+    // specular, emission; src/output/aov.h).
+    const auto kind = prism::output::AovKindFromName(name.GetString());
     if (name == HdAovTokens->normal || name == HdAovTokens->Neye ||
-        name == HdAovTokens->Peye)
+        name == HdAovTokens->Peye || kind == prism::output::AovKind::Pworld ||
+        prism::output::LightAov(kind))
         return {HdFormatFloat32Vec3, false, VtValue(GfVec3f(0))};
     if (name == TfToken("primvars:st"))
         return {HdFormatFloat32Vec2, false, VtValue(GfVec2f(0))};

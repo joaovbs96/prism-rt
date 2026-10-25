@@ -4225,6 +4225,19 @@ AovKind _AovKind(TfToken const &name)
 
 bool _IntegerAov(AovKind kind) { return prism::output::IntegerAov(kind); }
 
+// The light AOVs (albedo, diffuse, specular, emission) accumulate with the
+// colour, over the same samples.
+bool _LightAov(AovKind kind) { return prism::output::LightAov(kind); }
+
+// Outputs of the path tracer: the colour and the light AOVs.
+bool _TracedAov(AovKind kind) { return kind == AovKind::Color || _LightAov(kind); }
+
+Color3 const &_LightAovValue(prism::device::LightAovPixel const &pixel, AovKind kind)
+{
+    return kind == AovKind::Albedo ? pixel.albedo : kind == AovKind::Diffuse ? pixel.diffuse
+        : kind == AovKind::Specular ? pixel.specular : pixel.emission;
+}
+
 size_t _AovComponents(AovKind kind)
 {
     return static_cast<size_t>(prism::output::AovComponents(kind));
@@ -4286,7 +4299,7 @@ PreviewResult _RenderPreview(std::shared_ptr<Snapshot> const &snapshot,
         std::vector<int> ints;
     };
     std::vector<Target> targets;
-    bool needPrimary = false;
+    bool needPrimary = false, needLight = false;
     const size_t pixels = static_cast<size_t>(result.width) * result.height;
     for (HdRenderPassAovBinding const &binding : bindings) {
         auto *buffer = dynamic_cast<PrismRenderBuffer *>(binding.renderBuffer);
@@ -4297,9 +4310,13 @@ PreviewResult _RenderPreview(std::shared_ptr<Snapshot> const &snapshot,
         target.kind = _AovKind(binding.aovName);
         if (binding.aovName == HdAovTokens->color) {
             target.components = 4; target.floats.resize(pixels * 4);
+        } else if (_LightAov(target.kind)) {
+            target.components = 3; target.floats.resize(pixels * 3);
+            needLight = true;
         } else if (binding.aovName == HdAovTokens->normal ||
                    binding.aovName == HdAovTokens->Neye ||
                    binding.aovName == HdAovTokens->Peye ||
+                   target.kind == AovKind::Pworld ||
                    binding.aovName == TfToken("primvars:st")) {
             target.components = binding.aovName == TfToken("primvars:st") ? 2 : 3;
             target.floats.resize(pixels * target.components);
@@ -4355,12 +4372,24 @@ PreviewResult _RenderPreview(std::shared_ptr<Snapshot> const &snapshot,
                 dst[2] = color.z(); dst[3] = coverage;
                 continue;
             }
-            if (!primary) continue;
+            if (!primary || _LightAov(target.kind)) continue;
             _ResolvePrimaryAov(target.kind, *primary, camera, snapshot.get(),
                 target.floats.empty() ? nullptr : target.floats.data() + pixel * target.components,
                 target.ints.empty() ? nullptr : target.ints.data() + pixel);
         }
     };
+    if (needLight)
+        request.writeLightAovs = [&](unsigned int px, unsigned int py,
+                                     prism::device::LightAovPixel const &aovs) {
+            const size_t pixel =
+                (static_cast<size_t>(result.height - 1 - py) * result.width + px);
+            for (Target &target : targets) {
+                if (!_LightAov(target.kind)) continue;
+                Color3 const &value = _LightAovValue(aovs, target.kind);
+                float *dst = target.floats.data() + pixel * 3;
+                dst[0] = value.x(); dst[1] = value.y(); dst[2] = value.z();
+            }
+        };
     if (!renderDevice.RenderPreview(*snapshot->scene, request)) return result;
     auto const publicationStart = std::chrono::steady_clock::now();
     for (Target const &target : targets) {
@@ -5247,7 +5276,7 @@ void SceneBridge::SetSettings(RenderSettings const &requested)
             _impl->samples.load() != 0 &&
             std::none_of(_impl->bindings.begin(), _impl->bindings.end(),
                 [](auto const &binding) {
-                    return binding.aovName == HdAovTokens->color &&
+                    return _TracedAov(_AovKind(binding.aovName)) &&
                         dynamic_cast<PrismRenderBuffer *>(binding.renderBuffer);
                 })) {
             // A completed deterministic output pass has no color sample budget.
@@ -6452,12 +6481,14 @@ void SceneBridge::Render()
         uniqueBindings.push_back(binding);
     }
     bindings = std::move(uniqueBindings);
-    bool hasColor = false, hasGeometric = false;
+    // hasColor: some bound output is path traced (the colour or a light AOV).
+    bool hasColor = false, hasGeometric = false, hasLight = false;
     for (auto const &binding : bindings) {
         if (!dynamic_cast<PrismRenderBuffer *>(binding.renderBuffer)) continue;
         const AovKind kind = _AovKind(binding.aovName);
-        hasColor |= kind == AovKind::Color;
-        hasGeometric |= kind != AovKind::Color && kind != AovKind::Unknown;
+        hasColor |= _TracedAov(kind);
+        hasLight |= _LightAov(kind);
+        hasGeometric |= !_TracedAov(kind) && kind != AovKind::Unknown;
     }
     const int sampleCount = hasColor ? std::max(1, settings.samples) : 1;
     if (!snapshot || !snapshot->scene || width == 0 || height == 0) {
@@ -6491,13 +6522,7 @@ void SceneBridge::Render()
     _impl->progress.Begin(prism::Phase::Rendering);
     for (HdRenderPassAovBinding const &binding : bindings) {
         TfToken const &name = binding.aovName;
-        const bool supported = name == HdAovTokens->color ||
-            name == HdAovTokens->normal || name == HdAovTokens->Neye ||
-            name == HdAovTokens->Peye || name == TfToken("primvars:st") ||
-            name == HdAovTokens->depth || name == HdAovTokens->cameraDepth ||
-            name == HdAovTokens->primId || name == HdAovTokens->elementId ||
-            name == HdAovTokens->instanceId;
-        if (!supported) _WarnUnsupportedAov(name);
+        if (_AovKind(name) == AovKind::Unknown) _WarnUnsupportedAov(name);
     }
     const int firstSample = static_cast<int>(_impl->samples.load());
     std::shared_ptr<const PublishedFrame> frame;
@@ -6656,7 +6681,7 @@ void SceneBridge::Render()
         auto *buffer = dynamic_cast<PrismRenderBuffer *>(binding.renderBuffer);
         const AovKind kind = _AovKind(binding.aovName);
         size_t plane = 0;
-        if (firstSample == 0 && buffer && kind != AovKind::Color && kind != AovKind::Unknown) {
+        if (firstSample == 0 && buffer && !_TracedAov(kind) && kind != AovKind::Unknown) {
             auto found = std::find_if(primaryPlanes.begin(), primaryPlanes.end(),
                 [kind](auto const &p) { return p.kind == kind; });
             plane = static_cast<size_t>(found - primaryPlanes.begin());
@@ -6671,6 +6696,7 @@ void SceneBridge::Render()
     }
     std::vector<Color3> passColors(hasColor ? scratchPixels : 0);
     std::vector<float> passCoverage(hasColor ? scratchPixels : 0);
+    std::vector<prism::device::LightAovPixel> passLightAovs(hasLight ? scratchPixels : 0);
     std::vector<unsigned int> rngStates(hasColor ? scratchPixels : 0);
     {
         std::lock_guard lock(_impl->mutex);
@@ -6679,7 +6705,8 @@ void SceneBridge::Render()
             _impl->firstPassPrimaryScratchBytes += plane.floats.capacity() * sizeof(float) +
                 plane.ints.capacity() * sizeof(int);
         _impl->colorPassScratchBytes = passColors.capacity() * sizeof(Color3) +
-            passCoverage.capacity() * sizeof(float);
+            passCoverage.capacity() * sizeof(float) +
+            passLightAovs.capacity() * sizeof(prism::device::LightAovPixel);
         _impl->colorRngStorageBytes = (rngStates.capacity() +
             _impl->committedRngStates.capacity()) * sizeof(unsigned int);
     }
@@ -6791,7 +6818,7 @@ void SceneBridge::Render()
         if (!previewingGpu && sample > 0 && hasColor &&
             activeDevice->AccumulationOutdated(*snapshot->scene)) {
             for (HdRenderPassAovBinding const &binding : bindings)
-                if (binding.aovName == HdAovTokens->color)
+                if (_TracedAov(_AovKind(binding.aovName)))
                     if (auto *buffer = dynamic_cast<PrismRenderBuffer *>(binding.renderBuffer))
                         buffer->BeginFrame(binding.clearValue, false);
             if (!_impl->adaptiveSums.empty()) {
@@ -6850,6 +6877,7 @@ void SceneBridge::Render()
         passRequest.rngStates = rngStates.data();
         passRequest.colors = passColors.data();
         passRequest.coverage = passCoverage.data();
+        passRequest.lightAovs = hasLight ? passLightAovs.data() : nullptr;
         passRequest.abandoned = [&] {
             return abandonPass.load(std::memory_order_relaxed) ||
                 _impl->renderThread->IsStopRequested();
@@ -6996,7 +7024,7 @@ void SceneBridge::Render()
                              bindingIndex < bindings.size(); ++bindingIndex) {
                             auto const &resolved = resolvedBindings[bindingIndex];
                             const AovKind kind = resolved.kind;
-                            if ((sample != 0 || restarted) && kind != AovKind::Color)
+                            if ((sample != 0 || restarted) && !_TracedAov(kind))
                                 continue;
                             auto *buffer = resolved.buffer;
                             if (!buffer) continue;
@@ -7008,6 +7036,11 @@ void SceneBridge::Render()
                                 Color3 const &c = passColors[pixel];
                                 float v[4] = {c.x(), c.y(), c.z(), passCoverage[pixel]};
                                 buffer->WriteFloat(x, bufferY, v, 4, true);
+                            } else if (_LightAov(kind)) {
+                                if (!traced(pixel)) continue;
+                                Color3 const &c = _LightAovValue(passLightAovs[pixel], kind);
+                                const float v[3] = {c.x(), c.y(), c.z()};
+                                buffer->WriteFloat(x, bufferY, v, 3, true);
                             } else if (kind != AovKind::Unknown && sample == 0) {
                                 auto const &plane = primaryPlanes[resolved.plane];
                                 if (_IntegerAov(kind))
@@ -7036,7 +7069,7 @@ void SceneBridge::Render()
         for (HdRenderPassAovBinding const &binding : bindings) {
             // Geometric AOVs are deterministic and only written on sample 0.
             // Color changes every pass as accumulation progresses.
-            if ((sample != 0 || restarted) && binding.aovName != HdAovTokens->color) continue;
+            if ((sample != 0 || restarted) && !_TracedAov(_AovKind(binding.aovName))) continue;
             if (auto *buffer = dynamic_cast<PrismRenderBuffer *>(binding.renderBuffer))
                 buffer->Publish(frame);
         }

@@ -1040,6 +1040,11 @@ int runStandaloneCli(int argc, char** argv) {
                 return std::any_of(rendered.begin(), rendered.end(),
                                    [&](auto const& aov) { return aov.kind == kind; });
             };
+            // The light AOVs render with the colour: ask for them if a
+            // product sharing this view has one.
+            bool lightAovs = false;
+            for (size_t other = index; other < views.size() && views[other].SameView(view); ++other)
+                for (auto const& var : views[other].vars) lightAovs |= prism::output::LightAov(var.kind);
             std::vector<AovKind> geometric;
             for (auto const& var : view.vars) {
                 auto const* info = prism::output::FindAov(var.kind);
@@ -1049,7 +1054,7 @@ int runStandaloneCli(int argc, char** argv) {
                               << "') is only available in the Hydra delegate; skipped\n";
                     continue;
                 }
-                if (var.kind == AovKind::Color) {
+                if (var.kind == AovKind::Color || prism::output::LightAov(var.kind)) {
                     prism::device::ImageRequest imageRequest;
                     imageRequest.camera = rays.parameters;
                     imageRequest.width = width;
@@ -1070,6 +1075,8 @@ int runStandaloneCli(int argc, char** argv) {
                         imageRequest.timeLimitSeconds = std::max(1e-6, o.timeLimit - renderSeconds);
                         imageRequest.timeLimitReached = &stopped;
                     }
+                    std::vector<prism::device::LightAovPixel> lightPixels;
+                    if (lightAovs) imageRequest.lightAovs = &lightPixels;
                     progress.BeginRender(&imageProgress, o.adaptiveThreshold > 0,
                         views.size() > 1 ? "view " + std::to_string(index + 1) + "/" + std::to_string(views.size()) : "",
                         imageRequest.timeLimitSeconds);
@@ -1077,8 +1084,24 @@ int runStandaloneCli(int argc, char** argv) {
                     // Applied after the sample clamp, as in every render loop;
                     // adaptive sampling measures its error relative to the
                     // image's brightness, so scaling afterwards is the same.
-                    if (const float scale = exposureScales[index]; scale != 1.0f)
+                    const float scale = exposureScales[index];
+                    if (scale != 1.0f)
                         for (float& value : rendered.back().pixels) value *= scale;
+                    if (lightAovs) {
+                        // Radiance AOVs take the colour's exposure; the albedo does not.
+                        for (AovKind kind : {AovKind::Albedo, AovKind::Diffuse, AovKind::Specular, AovKind::Emission}) {
+                            prism::output::RenderedAov plane{kind, 3, std::vector<float>(lightPixels.size() * 3)};
+                            const float planeScale = kind == AovKind::Albedo ? 1.0f : scale;
+                            for (size_t p = 0; p < lightPixels.size(); ++p) {
+                                auto const& a = lightPixels[p];
+                                const Color3& value = kind == AovKind::Albedo ? a.albedo
+                                    : kind == AovKind::Diffuse ? a.diffuse
+                                    : kind == AovKind::Specular ? a.specular : a.emission;
+                                for (int c = 0; c < 3; ++c) plane.pixels[3 * p + c] = value[c] * planeScale;
+                            }
+                            rendered.push_back(std::move(plane));
+                        }
+                    }
                     progress.EndRender();
                     timeLimitReached |= stopped;
                 } else if (std::find(geometric.begin(), geometric.end(), var.kind) == geometric.end()) {

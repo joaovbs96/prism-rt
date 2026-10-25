@@ -44,6 +44,9 @@ struct RenderProductRequest {
     // columns [dataX, dataX + dataWidth), rows [dataY, dataY + dataHeight).
     int dataX = 0, dataY = 0, dataWidth = 0, dataHeight = 0;
     std::vector<RenderVarRequest> vars;
+    // The product's bool prism:exr:multiPart: an EXR with a part per var
+    // (Image::multiPart) instead of one part with every layer.
+    bool multiPart = false;
 
     bool FullDataWindow() const
     {
