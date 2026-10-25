@@ -2,7 +2,8 @@
 // callable shaders of the ray tracing pipeline, see
 // src/device/vulkan/vulkan_material_calls.h). The caller packs the prepared
 // shading point and the material query; the program answers with
-// backend.shade's MaterialResult, or with the cutout opacity of a hit.
+// backend.shade's MaterialResult, the cutout opacity of a hit, or the
+// emission of a light sample's point (kMaterialCallEmitted).
 //
 // Only what the MDL state and the BSDF read travels: 48 words in, 24 out
 // (288 bytes). The payload goes through the callable's stack, so every word
@@ -19,6 +20,9 @@ static const uint kMaterialCallFrontFace = 2u;
 static const uint kMaterialCallFiltered = 4u;
 static const uint kMaterialCallEvaluateLight = 8u;
 static const uint kMaterialCallLobes = 2048u;   // MaterialQuery::lobes
+// Instead of shading: the emission toward the caller (`emission`), for light
+// samples on triangles of varying emission (GpuBackend::emitterRadiance).
+static const uint kMaterialCallEmitted = 1u << 24u;
 // The caller's texture feedback: on, and its path weight (9 bits from bit 12).
 static const uint kMaterialCallFeedback = 1024u;
 static const uint kMaterialCallFeedbackWeightShift = 12u;

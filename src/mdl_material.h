@@ -425,6 +425,20 @@ public:
     // The cutout opacity when it is the same everywhere on the material:
     // constant in the class, or depending only on the material's arguments.
     std::optional<ConstantEmission> constantEmission() const override { return m_uniformEmission; }
+    bool variesEmission() const override { return m_varyingEmission; }
+    bool mayEmitBackFace() const override { return m_varyingEmission && m_target.program->backface_emission; }
+    // Light samples evaluate the emitter between the shading point's prepare
+    // and its BSDF: that point's texture-runtime context is kept.
+    Color3 emittedRadiance(const RayHit& hit) override {
+        float origin[3];
+        std::copy(std::begin(mdl::NativeTextureRuntime::viewOrigin), std::end(mdl::NativeTextureRuntime::viewOrigin),
+                  origin);
+        const auto context = mdl::NativeTextureRuntime::primvarContext;
+        const Color3 radiance = m_valid ? evaluate_emission(hit) : Color3(0.0f);
+        std::copy(origin, origin + 3, mdl::NativeTextureRuntime::viewOrigin);
+        mdl::NativeTextureRuntime::primvarContext = context;
+        return radiance;
+    }
 
     // geometry.displacement: the offset of a surface point (in the space of
     // the hit, which is the geometry's own space when building it).
@@ -772,12 +786,34 @@ private:
     }
 
     // Uniform emission is evaluated once, toward the normal of the front face.
+    // Other emission that is not provably zero varies (m_varyingEmission):
+    // textures, a varying cutout, or a directional EDF.
     void evaluateUniformEmission() {
         m_uniformEmission.reset();
-        if (!m_valid || !m_target.program || !m_target.program->uniform_emission) return;
-        // A varying cutout scales the emission per point; leave those to BSDF sampling.
+        m_varyingEmission = false;
+        if (!m_valid || !m_target.program) return;
+        auto const& program = *m_target.program;
+        const bool surfaceEmits = !program.emission_zero &&
+            program.functions.surface_edf_function_index != ~mi::Size(0);
+        const bool backEmits = program.backface_emission &&
+            program.functions.backface_edf_function_index != ~mi::Size(0);
+        if (!surfaceEmits && !backEmits) return;
+        m_varyingEmission = true;
+        if (!surfaceEmits || !program.uniform_emission) return;
+        // A varying cutout scales the emission per point.
         const auto cutout = constant_cutout();
         if (!cutout) return;
+        m_varyingEmission = false;
+        if (constantEmissionValue(*cutout)) return;
+        // Uniform front emission that is zero or directional; a back face
+        // that may emit still varies.
+        m_varyingEmission = backEmits || m_directionalEmission;
+    }
+
+    // The constant front-face emission of a uniform EDF; false if it is zero,
+    // not finite, or directional (m_directionalEmission).
+    bool constantEmissionValue(float cutout) {
+        m_directionalEmission = false;
         RTCRayHit miss{};
         miss.hit.geomID = RTC_INVALID_GEOMETRY_ID;
         RayHit hit(miss);
@@ -788,10 +824,13 @@ private:
         ShadingStateData ss;
         build_shading_state(hit, ss);
         if (m_target.program->target_code->execute_init(m_target.program->functions.init_function_index,
-                ss.base(), m_target.texture_handler(), m_target.argument_data()) != 0) return;
-        const Color3 radiance = get_emission(ss.base(), mi::Float32_3(0.0f, 0.0f, 1.0f), false) * *cutout;
-        if (!(radiance.x() > 0.0f || radiance.y() > 0.0f || radiance.z() > 0.0f)) return;
-        if (!std::isfinite(radiance.x()) || !std::isfinite(radiance.y()) || !std::isfinite(radiance.z())) return;
+                ss.base(), m_target.texture_handler(), m_target.argument_data()) != 0) return false;
+        auto finite = [](Color3 const& c) {
+            return std::isfinite(c.x()) && std::isfinite(c.y()) && std::isfinite(c.z());
+        };
+        auto positive = [](Color3 const& c) { return c.x() > 0.0f || c.y() > 0.0f || c.z() > 0.0f; };
+        const Color3 radiance = get_emission(ss.base(), mi::Float32_3(0.0f, 0.0f, 1.0f), false) * cutout;
+        if (!finite(radiance)) return false;
         // A df::directional_factor (OpenPBR and standard_surface layer their
         // emission under the coat this way) is isotropic when its tints agree,
         // as when these arguments disable the coat: class compilation keeps
@@ -799,17 +838,23 @@ private:
         if (m_target.program->directional_emission) {
             for (const float angle : {0.5f, 1.0f, 1.3f, 1.5f}) {
                 const mi::Float32_3 wo(std::sin(angle), 0.0f, std::cos(angle));
-                const Color3 other = get_emission(ss.base(), wo, false) * *cutout;
+                const Color3 other = get_emission(ss.base(), wo, false) * cutout;
                 for (int c = 0; c < 3; ++c)
-                    if (!(std::abs(other[c] - radiance[c]) <= 1.0e-4f * std::max(radiance[c], 1.0e-6f)))
-                        return;
+                    if (!(std::abs(other[c] - radiance[c]) <= 1.0e-4f * std::max(radiance[c], 1.0e-6f))) {
+                        m_directionalEmission = true;
+                        return false;
+                    }
             }
         }
+        if (!positive(radiance)) return false;
         m_uniformEmission = ConstantEmission{radiance, false};
+        return true;
     }
 
     std::optional<float> m_uniformCutout;
     std::optional<ConstantEmission> m_uniformEmission;
+    bool m_varyingEmission = false;
+    bool m_directionalEmission = false;
     bool m_transmissive = false;
 
     // MDL pipeline objects — kept alive for the material's lifetime

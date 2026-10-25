@@ -303,6 +303,38 @@ bool IsUniformDiffuseEdf(const mi::neuraylib::IExpression* expression,
     }
 }
 
+// True if a sub-expression is a constant whose components are all zero
+// (colors), or a constant EDF (no EDF at all).
+bool IsConstantZero(const mi::neuraylib::IExpression* expression)
+{
+    if (!expression) return true;
+    if (expression->get_kind() != mi::neuraylib::IExpression::EK_CONSTANT) return false;
+    mi::base::Handle<const mi::neuraylib::IExpression_constant> constant(
+        expression->get_interface<mi::neuraylib::IExpression_constant>());
+    mi::base::Handle<const mi::neuraylib::IValue> value(constant->get_value());
+    mi::base::Handle<const mi::neuraylib::IValue_compound> compound(
+        value ? value->get_interface<mi::neuraylib::IValue_compound>() : nullptr);
+    if (!compound) return value && value->get_kind() == mi::neuraylib::IValue::VK_INVALID_DF;
+    for (mi::Size i = 0; i < compound->get_size(); ++i) {
+        mi::base::Handle<const mi::neuraylib::IValue_float> component(
+            compound->get_value<mi::neuraylib::IValue_float>(i));
+        if (!component || component->get_value() != 0.0f) return false;
+    }
+    return true;
+}
+
+// Whether the emission of one side is provably zero: no EDF, or a constant
+// black intensity.
+bool EmissionIsZero(const mi::neuraylib::ICompiled_material* material, const char* side)
+{
+    const std::string prefix = side;
+    mi::base::Handle<const mi::neuraylib::IExpression> intensity(
+        material->lookup_sub_expression((prefix + ".emission.intensity").c_str()));
+    mi::base::Handle<const mi::neuraylib::IExpression> edf(
+        material->lookup_sub_expression((prefix + ".emission.emission").c_str()));
+    return IsConstantZero(intensity.get()) || IsConstantZero(edf.get());
+}
+
 class KnownResourceCallback final : public mi::base::Interface_implement<
     mi::neuraylib::ITarget_resource_callback> {
 public:
@@ -549,6 +581,11 @@ TargetCode BackendCompiler::generate_target_code(const CompiledMaterial& compile
                             &directionalEmission) &&
         (!emissionMode || IsUniformExpression(emissionMode.get(), compiled.compiled_material.get(),
                                               compiled.transaction.get()));
+    const bool emissionZero = EmissionIsZero(compiled.compiled_material.get(), "surface");
+    bool thinWalledNever = false;
+    if (thin_walled_expr && thin_walled_expr->get_kind() == mi::neuraylib::IExpression::EK_CONSTANT)
+        thinWalledNever = !binding->is_thin_walled;
+    const bool backfaceEmission = !thinWalledNever && !EmissionIsZero(compiled.compiled_material.get(), "backface");
 
     const std::string classHash = ClassProgramHash(compiled.compiled_material.get(), m_ctx.get_factory(),
                                                    compiled.transaction.get());
@@ -959,6 +996,8 @@ TargetCode BackendCompiler::generate_target_code(const CompiledMaterial& compile
     program->uniform_cutout = uniformCutout;
     program->uniform_emission = uniformEmission;
     program->directional_emission = uniformEmission && directionalEmission;
+    program->emission_zero = emissionZero;
+    program->backface_emission = backfaceEmission;
     program->has_displacement = hasDisplacement;
     program->builtin_resources = !binding->texture_runtime;
     program->identity = cacheKey;

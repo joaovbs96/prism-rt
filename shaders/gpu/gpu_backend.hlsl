@@ -188,16 +188,15 @@ struct GpuHit {
     uint instanceIndex;
 };
 
-// SceneManager::cast_ray: intersection plus RayHit construction and the
-// placement handling of prepareHit.
-GpuHit gpu_intersect(PathRay ray, uint mask)
+// SceneManager::prepareHit: RayHit construction and the placement handling
+// of an intersection of `ray`.
+GpuHit gpu_hit_from_raw(GpuRawHit raw, PathRay ray)
 {
     GpuHit result;
     result.material = 0u;
     result.sphere = false;
     result.instanceIndex = 0u;
     SurfaceHit hit = gpu_empty_hit(ray);
-    GpuRawHit raw = gpu_trace(ray.ray, mask);
     if (!raw.hit) {
         result.surface = hit;
         return result;
@@ -293,6 +292,9 @@ GpuHit gpu_intersect(PathRay ray, uint mask)
     result.surface = hit;
     return result;
 }
+
+// SceneManager::cast_ray: intersection plus RayHit construction.
+GpuHit gpu_intersect(PathRay ray, uint mask) { return gpu_hit_from_raw(gpu_trace(ray.ray, mask), ray); }
 
 // ---------------------------------------------------------------------------
 // Images and legacy textures
@@ -677,6 +679,39 @@ void gpu_mdl_init_shading(inout GpuShading shading, GpuMaterial material)
 {
     gpu_build_mdl_state(shading.surface, material, shading.state);
     prism_mdl_init(material.info.y, shading.state);
+}
+
+// MDLMaterial::evaluate_emission of an initialized state: the opacity times
+// the emission toward the ray's origin. Through the dispatch of the programs
+// with varying emission only (prism_mdl_*_emitter), so light samples do not
+// inline every program's emission a second time.
+float3 gpu_mdl_emitter_emission(SurfaceHit hit, GpuMaterial material, inout Shading_state_material state)
+{
+    const bool backface = !hit.front_face;
+    float opacity = material.params.w;
+    if ((material.info.w & kMaterialConstantCutout) == 0u) {
+        const float value = prism_mdl_cutout_emitter(material.info.y, state);
+        opacity = isfinite(value) ? clamp(value, 0.0f, 1.0f) : 1.0f;
+    }
+    if (backface && !prism_mdl_thin_walled_emitter(material.info.y, state)) return (float3)0.0f;
+    const float3 intensity = prism_mdl_emission_intensity_emitter(material.info.y, backface, state);
+    if (intensity.x <= 0.0f && intensity.y <= 0.0f && intensity.z <= 0.0f) return (float3)0.0f;
+    Edf_evaluate_data data;
+    data.k1 = -normalize(hit.d);
+    data.cos = 0.0f;
+    data.edf = (float3)0.0f;
+    data.pdf = 0.0f;
+    if (!prism_mdl_edf_evaluate_emitter(material.info.y, backface, data, state)) return (float3)0.0f;
+    return opacity * (intensity * data.edf);
+}
+
+// The emission of a hit on a triangle of varying emission (light samples).
+float3 gpu_mdl_emitter_radiance(SurfaceHit hit, GpuMaterial material)
+{
+    Shading_state_material state;
+    gpu_build_mdl_state(hit, material, state);
+    prism_mdl_init_emitter(material.info.y, state);
+    return gpu_mdl_emitter_emission(hit, material, state);
 }
 
 #endif // PRISM_CALL_MATERIALS
@@ -1113,11 +1148,64 @@ struct GpuBackend {
 
     float emitterPdfArea(GpuHit hit)
     {
+        if (!hit.sphere) {
+            const uint densities = gpu_instance(hit.instanceIndex).emitters.x;
+            if (densities != kInstanceNoEmitters) {
+                const float density = asfloat(gpu_primitive_material(densities + hit.surface.primitive));
+                if (density != 0.0f) return density < 0.0f && !hit.surface.front_face ? 0.0f : abs(density);
+            }
+        }
         const GpuMaterial material = gpu_material(hit.material);
         if (!(material.emitter.x > 0.0f)) return 0.0f;
         if (material.emitter.y == 0.0f && !hit.surface.front_face) return 0.0f;
         return hit.sphere ? 0.0f : material.emitter.x;
     }
+    // Kernels of material sets with varying emission (some MDL program's
+    // emission is evaluated by light samples) are compiled with
+    // PRISM_VARYING_EMITTERS (the generated MDL code or the raygen shader
+    // defines it); the others leave that code out entirely.
+    bool varyingEmitters()
+    {
+#ifdef PRISM_VARYING_EMITTERS
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    // The emission of a varying-emission triangle at a light sample: the
+    // material at the hit `ray` makes there (CpuBackend).
+    float3 emitterRadiance(LightRecord light, float2 barycentrics, PathRay ray, float distance)
+    {
+        GpuRawHit raw;
+        raw.hit = true;
+        raw.instance = asuint(light.p0.w);
+        raw.primitive = light.info.z;
+        raw.t = distance;
+        raw.barycentrics = barycentrics;
+        raw.objectOrigin = (float3)0.0f;
+        raw.objectDirection = (float3)0.0f;
+        GpuHit hit = gpu_hit_from_raw(raw, ray);
+        hit.surface.n_g = normalize(hit.surface.n); // Material::perturbNormal, as in prepare
+        const GpuMaterial material = gpu_material(hit.material);
+        float3 radiance = (float3)0.0f;
+        if (material.info.x == kMaterialEmissive) {
+            radiance = gpu_texture3(material.textures.x, hit.surface, true) * material.params.x;
+        } else if (material.info.x == kMaterialMdl) {
+#ifdef PRISM_CALL_MATERIALS
+            MaterialCall call = materialCall(hit.surface, hit.material, kMaterialCallShade);
+            call.flags |= kMaterialCallEmitted;
+            prism_call_material(material.info.y, call);
+            radiance = call.emission;
+#else
+            radiance = gpu_mdl_emitter_radiance(hit.surface, material);
+#endif
+        }
+        return float3(isfinite(radiance.x) ? max(0.0f, radiance.x) : 0.0f,
+                      isfinite(radiance.y) ? max(0.0f, radiance.y) : 0.0f,
+                      isfinite(radiance.z) ? max(0.0f, radiance.z) : 0.0f);
+    }
+
     int maxDepth() { return int(gpu_frame().settings.x); }
     int rouletteDepth() { return int(gpu_frame().settings.y); }
     bool environmentMis() { return (gpu_frame().settings.z & kFrameEnvironmentMis) != 0u; }

@@ -416,6 +416,7 @@ GpuSceneData BuildGpuScene(SceneManager& scene)
         instance.info.x = prototype;
         instance.info.w = uint32_t(id);
         instance.links = {~0u, ~0u, 0u, 0u};
+        instance.emitters = {kInstanceNoEmitters, 0u, 0u, 0u};
         if (scene.lightLinking) {
             auto masks = scene.placement_link_masks.find(id);
             instance.links.x = masks != scene.placement_link_masks.end() ? masks->second.first : 0u;
@@ -510,6 +511,25 @@ GpuSceneData BuildGpuScene(SceneManager& scene)
     for (auto const& [material, emitter] : lights.emitters)
         if (auto index = builder.materialIndex(material))
             data.materials[*index].emitter = {emitter.pdfArea, emitter.twoSided ? 1.0f : 0.0f, 0.0f, 0.0f};
+    // Varying emitters: their records name the instance instead of the
+    // placement, and instances find their per-primitive densities after the
+    // primitive material tables.
+    if (!lights.varyingEmitters.empty()) {
+        std::unordered_map<uint32_t, uint32_t> instanceOf;
+        for (uint32_t i = 0; i < data.instances.size(); ++i) instanceOf.emplace(data.instances[i].info.w, i);
+        for (auto& record : data.lights) {
+            if (record.info.x != kLightTriangle || (record.info.y & kLightVaryingEmission) == 0u) continue;
+            auto found = instanceOf.find(asuint(record.p0.w));
+            if (found != instanceOf.end()) record.p0.w = asfloat(found->second);
+            else record.info.y &= ~kLightVaryingEmission; // no instance (cannot happen): emits nothing
+        }
+        for (auto const& [placement, densities] : lights.varyingEmitters) {
+            auto found = instanceOf.find(uint32_t(placement));
+            if (found == instanceOf.end() || densities.empty()) continue;
+            data.instances[found->second].emitters.x = uint32_t(data.primitiveMaterials.size());
+            for (float density : densities) data.primitiveMaterials.push_back(asuint(density));
+        }
+    }
     data.mdlTextures.resize(1);
     return data;
 }

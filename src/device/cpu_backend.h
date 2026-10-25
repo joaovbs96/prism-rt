@@ -213,7 +213,15 @@ struct CpuBackend {
 
     float emitterPdfArea(CpuHit const& hit)
     {
-        if (!lights || lights->emitters.empty() || !hit.material) return 0.0f;
+        if (!lights || !hit.material) return 0.0f;
+        if (!lights->varyingEmitters.empty()) {
+            auto found = lights->varyingEmitters.find(int(hit.surface.instance));
+            if (found != lights->varyingEmitters.end() && hit.surface.primitive < found->second.size()) {
+                const float density = found->second[hit.surface.primitive];
+                if (density != 0.0f) return density < 0.0f && !hit.surface.front_face ? 0.0f : std::abs(density);
+            }
+        }
+        if (lights->emitters.empty()) return 0.0f;
         auto found = lights->emitters.find(hit.material);
         if (found == lights->emitters.end()) return 0.0f;
         if (!found->second.twoSided && !hit.surface.front_face) return 0.0f;
@@ -223,6 +231,37 @@ struct CpuBackend {
             return 0.0f;
         return found->second.pdfArea;
     }
+    bool varyingEmitters() const { return lights && !lights->varyingEmitters.empty(); }
+
+    // The emission of a varying-emission triangle at the light sample: the
+    // material at the hit `ray` makes there.
+    float3 emitterRadiance(LightRecord const& light, float2 barycentrics, ::PathRay const& ray, float distance)
+    {
+        using namespace light_table_detail;
+        const int placement = int(asuint(light.p0.w));
+        auto found = scene->geometry.find(placement);
+        if (found == scene->geometry.end() || !found->second || !found->second->geom) return float3(0.0f);
+        auto* mesh = dynamic_cast<Mesh*>(found->second);
+        if (!mesh || size_t(light.info.z) * 3 + 2 >= mesh->indices.size()) return float3(0.0f);
+        float const* vertices = static_cast<float const*>(
+            rtcGetGeometryBufferData(found->second->geom, RTC_BUFFER_TYPE_VERTEX, 0));
+        if (!vertices) return float3(0.0f);
+        EmitterTriangle triangle;
+        triangle.placement = placement;
+        triangle.primitive = light.info.z;
+        triangle.instanced = scene->intersection_geometry.contains(placement);
+        const unsigned* idx = &mesh->indices[3 * size_t(light.info.z)];
+        const Float3 a(vertices[3 * idx[0]], vertices[3 * idx[0] + 1], vertices[3 * idx[0] + 2]);
+        const Float3 b(vertices[3 * idx[1]], vertices[3 * idx[1] + 1], vertices[3 * idx[1] + 2]);
+        const Float3 c(vertices[3 * idx[2]], vertices[3 * idx[2] + 1], vertices[3 * idx[2] + 2]);
+        triangle.objectNormal = cross(b - a, c - a);
+        triangle.material = PrimitiveMaterial(*scene, placement, found->second, light.info.z, triangle.instanced);
+        if (!triangle.material) return float3(0.0f);
+        RayHit hit = EmitterHit(*scene, triangle, barycentrics.x, barycentrics.y, ToFloat3(ray.ray.origin),
+                                ToFloat3(ray.ray.direction), distance, ToFootprint(ray.footprint));
+        return FromFloat3(NonNegative(triangle.material->emittedRadiance(hit)));
+    }
+
     int maxDepth() { return scene->max_depth; }
     int rouletteDepth() { return scene->rr_min_depth; }
     bool environmentMis() { return scene->environmentSampling; }

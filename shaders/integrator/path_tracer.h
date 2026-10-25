@@ -38,6 +38,15 @@
 //                                                 (both ~0u without linking)
 //   float    backend.emitterPdfArea(Hit)          selection density per unit area of a hit
 //                                                 emissive triangle (0: not a light)
+//   bool     backend.varyingEmitters()            the light table may hold kLightVaryingEmission
+//                                                 triangles (GPU: a compile-time constant, so
+//                                                 kernels without them keep their code)
+//   float3   backend.emitterRadiance(LightRecord, float2 barycentrics, PathRay ray, float distance)
+//                                                 a kLightVaryingEmission triangle's emission at
+//                                                 the point with these barycentrics, as `ray`
+//                                                 reaching it at `distance` sees it (its
+//                                                 footprint filters the textures), expected
+//                                                 over cutouts
 //   int      backend.maxDepth(), backend.rouletteDepth()
 //   bool     backend.environmentMis()
 //   bool     backend.lightLobes()             some light or dome has UsdLux diffuse or specular
@@ -665,6 +674,14 @@ struct PathTracer {
             light = sampled.sample;
             vertex.light.shadowBit = shadowLinkBit(record);
             if (record.info.w != 0u && (vertex.receiver & record.info.w) == 0u) light.valid = false;
+            // Varying emission: the material's emission at the sampled point,
+            // looked up as a BSDF ray along wi would (with its footprint): MIS
+            // needs both strategies to see the same filtered textures.
+            if (backend.varyingEmitters() && light.valid && (record.info.y & kLightVaryingEmission) != 0u) {
+                light.radiance = backend.emitterRadiance(record, primitiveBarycentrics(record, sampled.texcoord),
+                                                         spawnRay(hit.surface, light.wi, false), light.distance);
+                light.valid = maxComponent(light.radiance) > 0.0f;
+            }
             if (light.valid && (record.info.y & kLightTextured) != 0u)
                 light.radiance *= backend.lightTexture(record.info.z, sampled.texcoord);
             if (lobes) {

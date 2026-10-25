@@ -153,7 +153,12 @@ struct GpuInstance {
     uint4 info;   // x: prototype, y: flags, z: first primitive material, w: placement id
     uint4 links;  // x: light-link categories, y: shadow-link categories (~0u without linking),
                   // z: first per-instance primvar directory entry, w: their count
+    uint4 emitters; // x: first entry of the instance's per-primitive emitter densities in the primitive
+                    // material table (float bits; negative: front face only; 0: not sampled), or
+                    // kInstanceNoEmitters (LightTable::varyingEmitters)
 };
+
+static const uint kInstanceNoEmitters = 0xffffffffu;
 
 struct GpuMaterial {
     uint4 info;      // x: kind, y: MDL program, z: MDL argument block offset, w: flags

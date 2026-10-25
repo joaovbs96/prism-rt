@@ -9,8 +9,11 @@
 // more entry after the records. Analytic shapes are not in the acceleration
 // structure: camera and BSDF rays pass through them and collect their
 // emission (intersectLight), and shadow rays ignore them. Emissive triangles
-// are ordinary geometry; their selection density per unit area is a per
-// material constant, so a BSDF hit needs no light index for MIS.
+// are ordinary geometry; the selection density per unit area of those of
+// constant emission is a per-material constant, so a BSDF hit needs no light
+// index for MIS. Triangles of varying emission (kLightVaryingEmission) have
+// their own densities (backend.emitterPdfArea), and the light sample asks the
+// backend for the emission at the sampled point (backend.emitterRadiance).
 
 #include "types.h"
 
@@ -26,6 +29,13 @@ static const uint kLightTriangle = 7u;
 static const uint kLightCameraVisible = 1u;
 static const uint kLightTextured = 2u;
 static const uint kLightTwoSided = 4u;
+// Triangles: the emission varies over the surface. radiance is unused: the
+// backend evaluates the material at the sample (info.z: the primitive; p0.w:
+// the placement (CPU) or instance (GPU) as float bits).
+static const uint kLightVaryingEmission = 8u;
+// Triangles: u and v hold the primitive's third and second vertex (placements
+// that flip orientation).
+static const uint kLightSwappedVertices = 16u;
 
 static const uint kLightTextureNone = 0xffffffffu;
 
@@ -339,7 +349,9 @@ inline float lightImportance(LightRecord light, float3 p, float3 luminance)
 inline float2 rectTexcoord(float a, float b) { return float2(0.5f * (1.0f - a), 0.5f * (1.0f + b)); }
 
 // Samples light `light` from shading point p. The radiance of textured rect
-// lights still has to be multiplied by the texture at `texcoord`.
+// lights still has to be multiplied by the texture at `texcoord`; for
+// triangles, `texcoord` holds the weights of the record's second and third
+// vertex at the sampled point.
 struct LightSampleTextured {
     LightSample sample;
     float2 texcoord;
@@ -439,6 +451,7 @@ inline LightSampleTextured sampleLight(LightRecord light, float3 p, float2 u)
         const float b1 = u.y * su;
         const float3 q = xyz(light.p0) * b0 + xyz(light.u) * b1 + xyz(light.v) * (1.0f - b0 - b1);
         result.sample = areaSample(light, p, q, xyz(light.n), radiance);
+        result.texcoord = float2(b1, 1.0f - b0 - b1);
         return result;
     }
     if (type == kLightDistant) {
@@ -601,6 +614,13 @@ inline LightHit escapedDistantLight(LightRecord light, float3 direction)
 // Alias table over the light table's entries: x the probability of keeping
 // the column, y its alias (as float bits), z the entry's selection
 // probability. Picks an entry with one uniform number.
+// The barycentrics of a triangle's sampled point (sampleLight's texcoord) in
+// the primitive's vertex order: the weights of its second and third vertex.
+inline float2 primitiveBarycentrics(LightRecord light, float2 weights)
+{
+    return (light.info.y & kLightSwappedVertices) != 0u ? float2(weights.y, weights.x) : weights;
+}
+
 struct LightPick {
     uint index;
     float pmf;

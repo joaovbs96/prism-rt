@@ -2060,7 +2060,7 @@ bool VulkanDevice::Impl::buildCallablePipeline(std::shared_ptr<const gpu::MdlSha
     if (code.perProgram)
         for (auto const& program : code.programs) identity += "|" + program->digest;
     const std::string key = gpu::SourceDigest(identity) + (code.perProgram ? "|programs" : "") +
-        (reorder ? "|reorder" : "");
+        (reorder ? "|reorder" : "") + (code.varyingEmitters ? "|emitters" : "");
     std::cerr << std::format("PrismRT Vulkan: {} MDL programs as callable shaders ({}){}\n", code.programCount,
                              reason, reorder ? ", reordered by program" : "");
     auto found = callablePipelines.find(key);

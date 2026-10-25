@@ -119,6 +119,11 @@ struct CompiledProgram {
     // With uniform_emission: the EDF has a df::directional_factor, so it is
     // diffuse only for bindings whose tints agree (checked per binding).
     bool directional_emission = false;
+    // surface.emission is provably zero (no EDF, or a constant black intensity).
+    bool emission_zero = false;
+    // The back face may emit: thin_walled is not the constant false and
+    // backface.emission is not provably zero.
+    bool backface_emission = false;
     // geometry.displacement is not the constant zero.
     bool has_displacement = false;
 };

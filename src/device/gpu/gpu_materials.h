@@ -89,6 +89,10 @@ struct MdlShaderCode {
     // tables in roData; `code`, `targetCode` and `programDispatch` are empty.
     bool perProgram = false;
     std::vector<std::shared_ptr<const MdlProgramCode>> programs;
+    // Some material's emission varies (MDLMaterial::variesEmission): light
+    // samples evaluate it, so the kernel or raygen shader is compiled with
+    // PRISM_VARYING_EMITTERS (`code` starts with that define).
+    bool varyingEmitters = false;
     // Generated target code followed by the prism_mdl_* dispatch functions.
     std::string code;
     // The same code for one program at a time (callable shaders): the target

@@ -206,8 +206,17 @@ std::string GenerateSceneData(mi::neuraylib::ITarget_code const* code)
 // The prism_mdl_* dispatch functions. With `single`, of one program
 // translated alone: its functions are prism_p_*, and the dispatch reaches
 // them whatever the program index (the callable shader of that program).
+//
+// The prism_mdl_*_emitter functions (init, thin_walled, cutout,
+// emission_intensity, edf_evaluate) dispatch to the programs `emitters`
+// marks only: those of materials with varying emission, whose emission light
+// samples evaluate (gpu_mdl_emitter_emission). Their code is inlined there a
+// second time, the other programs' is not. With `single`, `emitters` is
+// ignored: the program is marked if it has an EDF (its callable answers
+// kMaterialCallEmitted whatever the scene).
 std::string GenerateDispatch(std::vector<std::array<bool, kEntryPointCount>> const& present,
-                             std::vector<ProgramTraits> const& traits, bool single = false)
+                             std::vector<ProgramTraits> const& traits, std::vector<bool> const& emitters,
+                             bool single = false)
 {
     const char* state = "Shading_state_material";
     const char* inoutState = "inout";
@@ -215,11 +224,18 @@ std::string GenerateDispatch(std::vector<std::array<bool, kEntryPointCount>> con
     auto ProgramFunction = [single](uint32_t program, EntryIndex entry) {
         return single ? SingleProgramFunction(entry) : prism::device::gpu::ProgramFunction(program, entry);
     };
+    // Programs of the function being generated (all, or the emitters).
+    bool emitterOnly = false;
+    auto included = [&](size_t p) {
+        if (!emitterOnly) return true;
+        if (single) return present[p][E_EDF] || present[p][E_BACK_EDF];
+        return p < emitters.size() && emitters[p];
+    };
     std::string s;
     auto cases = [&](EntryIndex entry, const char* call, const char* fallback) {
         std::string body = selector;
         for (size_t p = 0; p < present.size(); ++p) {
-            if (!present[p][entry]) continue;
+            if (!present[p][entry] || !included(p)) continue;
             const std::string function = ProgramFunction(uint32_t(p), entry);
             body += std::format("    case {}u: {}\n", p,
                 std::vformat(call, std::make_format_args(function)));
@@ -227,37 +243,34 @@ std::string GenerateDispatch(std::vector<std::array<bool, kEntryPointCount>> con
         body += std::format("    default: {}\n    }}\n", fallback);
         return body;
     };
-    s += std::format("void prism_mdl_init(uint program, {} {} state)\n{{\n", inoutState, state);
-    s += cases(E_INIT, "{}(state); break;", "break;");
-    s += "}\n\n";
-    // The cutout path's own init: only programs with a varying cutout.
-    s += std::format("void prism_mdl_init_cutout(uint program, {} {} state)\n{{\n", inoutState, state);
-    {
-        std::string body = selector;
-        for (size_t p = 0; p < present.size(); ++p)
-            if (present[p][E_CUTOUT])
-                body += std::format("    case {}u: {}(state); break;\n", p, ProgramFunction(uint32_t(p), E_INIT));
-        s += body + "    default: break;\n    }\n}\n\n";
-    }
-    s += std::format("bool prism_mdl_thin_walled(uint program, {} {} state)\n{{\n", inoutState, state);
-    {
+    auto init = [&](const char* name) {
+        s += std::format("void {}(uint program, {} {} state)\n{{\n", name, inoutState, state);
+        s += cases(E_INIT, "{}(state); break;", "break;");
+        s += "}\n\n";
+    };
+    auto thinWalled = [&](const char* name) {
+        s += std::format("bool {}(uint program, {} {} state)\n{{\n", name, inoutState, state);
         std::string body = selector;
         for (size_t p = 0; p < present.size(); ++p) {
+            if (!included(p)) continue;
             if (present[p][E_THIN_WALLED])
                 body += std::format("    case {}u: return {}(state);\n", p, ProgramFunction(uint32_t(p), E_THIN_WALLED));
             else if (traits[p].thinWalled == 1)
                 body += std::format("    case {}u: return true;\n", p);
         }
         s += body + "    default: return false;\n    }\n}\n\n";
-    }
-    s += std::format("float prism_mdl_cutout(uint program, {} {} state)\n{{\n", inoutState, state);
-    s += cases(E_CUTOUT, "return {}(state);", "return 1.0;");
-    s += "}\n\n";
-    s += std::format("float3 prism_mdl_emission_intensity(uint program, bool backface, {} {} state)\n{{\n",
-                     inoutState, state);
-    s += "    if (backface) {\n" + cases(E_BACK_INTENSITY, "return {}(state);", "break;") + "    }\n";
-    s += "    else {\n" + cases(E_INTENSITY, "return {}(state);", "break;") + "    }\n";
-    s += "    return float3(0.0, 0.0, 0.0);\n}\n\n";
+    };
+    auto cutout = [&](const char* name) {
+        s += std::format("float {}(uint program, {} {} state)\n{{\n", name, inoutState, state);
+        s += cases(E_CUTOUT, "return {}(state);", "return 1.0;");
+        s += "}\n\n";
+    };
+    auto intensity = [&](const char* name) {
+        s += std::format("float3 {}(uint program, bool backface, {} {} state)\n{{\n", name, inoutState, state);
+        s += "    if (backface) {\n" + cases(E_BACK_INTENSITY, "return {}(state);", "break;") + "    }\n";
+        s += "    else {\n" + cases(E_INTENSITY, "return {}(state);", "break;") + "    }\n";
+        s += "    return float3(0.0, 0.0, 0.0);\n}\n\n";
+    };
     // DF entry points report whether the selected side has a function.
     auto dfDispatch = [&](const char* name, const char* dataType, EntryIndex front,
                           EntryIndex back, const char* suffix) {
@@ -268,6 +281,19 @@ std::string GenerateDispatch(std::vector<std::array<bool, kEntryPointCount>> con
         s += "    else {\n" + cases(front, call.c_str(), "break;") + "    }\n";
         s += "    return false;\n}\n\n";
     };
+    init("prism_mdl_init");
+    // The cutout path's own init: only programs with a varying cutout.
+    s += std::format("void prism_mdl_init_cutout(uint program, {} {} state)\n{{\n", inoutState, state);
+    {
+        std::string body = selector;
+        for (size_t p = 0; p < present.size(); ++p)
+            if (present[p][E_CUTOUT])
+                body += std::format("    case {}u: {}(state); break;\n", p, ProgramFunction(uint32_t(p), E_INIT));
+        s += body + "    default: break;\n    }\n}\n\n";
+    }
+    thinWalled("prism_mdl_thin_walled");
+    cutout("prism_mdl_cutout");
+    intensity("prism_mdl_emission_intensity");
     s += std::format("float3 prism_mdl_volume_absorption(uint program, {} {} state)\n{{\n", inoutState, state);
     s += cases(E_VOLUME_ABSORPTION, "return {}(state);", "return float3(0.0, 0.0, 0.0);");
     s += "}\n\n";
@@ -280,6 +306,13 @@ std::string GenerateDispatch(std::vector<std::array<bool, kEntryPointCount>> con
     dfDispatch("prism_mdl_bsdf_sample", "Bsdf_sample_data", E_BSDF, E_BACK_BSDF, "_sample");
     dfDispatch("prism_mdl_bsdf_evaluate", "Bsdf_evaluate_data", E_BSDF, E_BACK_BSDF, "_evaluate");
     dfDispatch("prism_mdl_edf_evaluate", "Edf_evaluate_data", E_EDF, E_BACK_EDF, "_evaluate");
+    // Light samples on triangles of varying emission.
+    emitterOnly = true;
+    init("prism_mdl_init_emitter");
+    thinWalled("prism_mdl_thin_walled_emitter");
+    cutout("prism_mdl_cutout_emitter");
+    intensity("prism_mdl_emission_intensity_emitter");
+    dfDispatch("prism_mdl_edf_evaluate_emitter", "Edf_evaluate_data", E_EDF, E_BACK_EDF, "_evaluate");
     return s;
 }
 
@@ -344,7 +377,7 @@ std::filesystem::path StructuralKeyFile(std::string const& identity)
     const std::string stable = colon == std::string::npos ? identity : identity.substr(colon + 1);
     return prism::PersistentCacheRoot() / "gpu-structure" /
         (Digest(stable + "|hlsl" +
-                "|mdl-" MI_NEURAYLIB_PRODUCT_VERSION_STRING "|v3") + ".key");
+                "|mdl-" MI_NEURAYLIB_PRODUCT_VERSION_STRING "|v4") + ".key");
 }
 
 // Defined with the per-program layout below.
@@ -394,7 +427,7 @@ MdlShaderCode GenerateMdlShaderCode(std::vector<MDLMaterial const*> const& mater
     }
     result.programCount = uint32_t(programs.size());
     if (programs.empty()) {
-        result.code = GenerateDispatch({}, {}) + GenerateSceneData(nullptr);
+        result.code = GenerateDispatch({}, {}, {}) + GenerateSceneData(nullptr);
         result.success = true;
         return result;
     }
@@ -411,7 +444,7 @@ MdlShaderCode GenerateMdlShaderCode(std::vector<MDLMaterial const*> const& mater
         result.success = false;
         result.error = std::move(message);
         // Shaders still need the dispatch functions; every material is invalid.
-        result.code = GenerateDispatch({}, {}) + GenerateSceneData(nullptr);
+        result.code = GenerateDispatch({}, {}, {}) + GenerateSceneData(nullptr);
         transaction->abort();
         return result;
     };
@@ -479,6 +512,15 @@ MdlShaderCode GenerateMdlShaderCode(std::vector<MDLMaterial const*> const& mater
         programs = std::move(unique);
         result.programCount = uint32_t(programs.size());
     }
+
+    // Programs whose emission light samples evaluate (prism_mdl_*_emitter).
+    std::vector<bool> emitters(programs.size(), false);
+    for (size_t i = 0; i < materials.size(); ++i)
+        if (result.materials[i].valid && materials[i]->variesEmission() &&
+            result.materials[i].program < emitters.size()) {
+            emitters[result.materials[i].program] = true;
+            result.varyingEmitters = true;
+        }
 
     mi::base::Handle<mi::neuraylib::ILink_unit> linkUnit(
         backend->create_link_unit(transaction.get(), executionContext.get()));
@@ -628,14 +670,19 @@ MdlShaderCode GenerateMdlShaderCode(std::vector<MDLMaterial const*> const& mater
     for (mi::Size i = 1; i < code->get_string_constant_count(); ++i)
         if (const char* name = code->get_string_constant(i)) result.stringConstants[i] = name;
     result.sceneData = GenerateSceneData(code.get());
-    result.code = result.targetCode + "\n// ---- Prism material dispatch ----\n" + GenerateDispatch(present, traits) +
+    result.code = result.targetCode + "\n// ---- Prism material dispatch ----\n" + GenerateDispatch(present, traits, emitters) +
         result.sceneData;
+    if (result.varyingEmitters) result.code = "#define PRISM_VARYING_EMITTERS 1\n" + result.code;
     for (size_t p = 0; p < programs.size(); ++p) {
         std::vector<std::array<bool, kEntryPointCount>> only(programs.size());
         for (auto& row : only) row.fill(false);
         only[p] = present[p];
+        // A callable answers light samples whatever the material set (as a
+        // program translated alone): every program with an EDF.
+        std::vector<bool> emits(programs.size(), false);
+        emits[p] = present[p][E_EDF] || present[p][E_BACK_EDF];
         result.programDispatch.push_back(std::format("\n// ---- Prism material dispatch: program {} ----\n", p) +
-                                         GenerateDispatch(only, traits));
+                                         GenerateDispatch(only, traits, emits));
     }
     transaction->commit();
     result.success = true;
@@ -762,7 +809,7 @@ std::shared_ptr<MdlProgramCode> TranslateProgram(mdl::Context const& context,
     result->stringConstants.assign(code->get_string_constant_count(), std::string());
     for (mi::Size i = 1; i < code->get_string_constant_count(); ++i)
         if (const char* name = code->get_string_constant(i)) result->stringConstants[i] = name;
-    std::string dispatch = GenerateDispatch(present, std::vector<ProgramTraits>{traits}, true);
+    std::string dispatch = GenerateDispatch(present, std::vector<ProgramTraits>{traits}, {}, true);
     result->code = code->get_code();
     result->targetCodeBytes = result->code.size();
     result->code += "\n// ---- Prism material dispatch ----\n" + dispatch + GenerateSceneData(code.get());
@@ -803,7 +850,7 @@ std::filesystem::path ProgramFile(std::string const& classKey)
 {
     return prism::PersistentCacheRoot() / "gpu-programs" /
         (Digest(classKey + "|hlsl-alone|mdl-" MI_NEURAYLIB_PRODUCT_VERSION_STRING "|results-" +
-                std::to_string(kGpuTextureResults) + "|v1") + ".prog");
+                std::to_string(kGpuTextureResults) + "|v2") + ".prog");
 }
 
 constexpr char kProgramMagic[8] = {'P', 'R', 'S', 'M', 'P', 'R', 'G', '1'};
@@ -1217,6 +1264,7 @@ MdlShaderCode GenerateProgramShaderCode(std::vector<MDLMaterial const*> const& m
         record.program = found->second;
         record.valid = true;
         record.constantCutout = material->constant_cutout();
+        result.varyingEmitters = result.varyingEmitters || material->variesEmission();
     }
     result.programCount = uint32_t(result.programs.size());
     result.success = true;

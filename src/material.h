@@ -86,6 +86,16 @@ class Material {
         // with such a material are never culled (prism:honorDoubleSided).
         virtual bool transmissive() const { return false; }
         virtual std::optional<ConstantEmission> constantEmission() const { return std::nullopt; }
+        // Emission that may be nonzero but is not constant (textures,
+        // primvars, a cutout, a directional EDF): its triangles are sampled
+        // as lights by their estimated average radiance, and the light
+        // sample evaluates the emission at the sampled point (emittedRadiance).
+        virtual bool variesEmission() const { return false; }
+        // With variesEmission: the back face may emit too (thin-walled).
+        virtual bool mayEmitBackFace() const { return false; }
+        // The radiance leaving a surface point toward -hit.d, expected over
+        // cutouts (hit prepared as for shading, after perturbNormal).
+        virtual Color3 emittedRadiance(const RayHit& hit) { return evaluate_emission(hit); }
         // Displacement of the surface (applied to the geometry when it is built).
         virtual bool hasDisplacement() const { return false; }
         virtual Float3 displacement(const RayHit&) const { return Float3(0.0f); }
@@ -190,6 +200,8 @@ class Emissive : public Material {
             if (!value) return std::nullopt;
             return ConstantEmission{value->value * emissive_multiplier, true};
         }
+        // A textured Emissive is left to BSDF sampling (not variesEmission):
+        // GPU kernels evaluate the emission of MDL programs only.
 
         Texture<Color3>* emissive_color;
         float emissive_multiplier;

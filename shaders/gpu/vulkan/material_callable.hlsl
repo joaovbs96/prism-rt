@@ -5,7 +5,8 @@
 // PRISM_CALL_MATERIALS) calls it with the program index as the callable index.
 //
 // The program runs the megakernel's own material code: the MDL init of the
-// prepared shading point, then GpuBackend::shade, or the cutout opacity.
+// prepared shading point, then GpuBackend::shade, or the cutout opacity, or
+// the emission of a light sample's point (kMaterialCallEmitted).
 
 #include "../../shared/prism_gpu_types.h"
 #include "../../integrator/path_tracer.h"
@@ -34,6 +35,10 @@ void material(inout MaterialCall call)
     shading.surface = materialCallSurface(call);
     shading.material = call.material;
     gpu_mdl_init_shading(shading, material);
+    if ((call.flags & kMaterialCallEmitted) != 0u) {
+        call.emission = gpu_mdl_emitter_emission(shading.surface, material, shading.state);
+        return;
+    }
     GpuBackend backend;
     backend.rng.state = call.rng;
     MaterialQuery query;
