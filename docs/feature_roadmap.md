@@ -42,8 +42,13 @@ Scenes: **Eggs** (MaterialEggs), **OpenPBR** (OpenPBRShaderPlayground),
   both strategies see the same filtered textures, and BSDF hits weight these
   triangles by their own density. glTF emissive textures and OBJ `map_Ke`
   take this path. Limits: more than 2^20 such triangles are left to BSDF
-  sampling; the estimate (a few seconds for OpenPBR's 157k-triangle emissive
-  MEET MAT) reruns at each scene change.
+  sampling; the estimate (1.2 s, 25 s of CPU time, for OpenPBR's
+  157k-triangle emissive MEET MAT: 9 points on each of both faces) reruns at
+  each scene change, and in Hydra on a GPU twice (the CPU preview builds its
+  own light table). `PRISM_VERBOSE_LIGHTS=1` lists the emitting groups.
+  The CLI does not load MEET MAT's emission texture yet (MDL "strict
+  relative file paths ... not supported in string-based modules"), so there
+  it does not emit.
 - **Material edits of displacing materials** rebuild bindings but not the
   displaced geometry until the next full snapshot.
 

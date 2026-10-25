@@ -345,7 +345,13 @@ numbers in the same order and agree sample for sample.
   (`prism:neeProbabilityMin`) is off by default.
 - **Light selection.** An alias table over the light table picks by power
   (analytic lights, constant-emission triangles, triangles of varying
-  emission by their estimated power, the dome as one entry).
+  emission by their estimated power, the dome as one entry). Tables of more
+  than 4096 entries draw the column and the alias choice from the white
+  noise (uniform columns by rejection): the selection number's 24-bit grid
+  reached each column of a million-entry table only ~18 times, and the
+  realized probabilities strayed from the table's (the dome of a
+  million-triangle table came out 0.958 for 0.99; the OpenPBR playground's
+  desk was lit 8% too brightly; `prism_lights_test`).
   With `prism:lightSelection spatial` (default) and 2 to 64 analytic lights,
   an analytic pick is redone among the analytic lights in proportion to
   `lightImportance` at the shading point: radiance times the solid angle
