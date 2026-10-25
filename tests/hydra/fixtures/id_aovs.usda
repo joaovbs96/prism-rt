@@ -1,0 +1,123 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    upAxis = "Y"
+    metersPerUnit = 1
+    renderSettingsPrimPath = "/Render/Settings"
+)
+
+# Prim, element and instance ids (docs/hydra.md, "Render products"): two
+# meshes (one of two faces), a sphere and a PointInstancer of three cards,
+# one hidden by invisibleIds. Both loaders number the prims they place in
+# traversal order; instance ids are the compacted instance ordinals.
+def Xform "World"
+{
+    def Camera "Camera"
+    {
+        float focalLength = 35
+        float horizontalAperture = 36
+        float verticalAperture = 24
+        float2 clippingRange = (0.1, 100)
+        double3 xformOp:translate = (0, 0.6, 6)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+
+    def Mesh "Floor"
+    {
+        uniform token subdivisionScheme = "none"
+        int[] faceVertexCounts = [4, 4]
+        int[] faceVertexIndices = [0, 1, 2, 3, 3, 2, 4, 5]
+        point3f[] points = [(-3, -1, 2), (3, -1, 2), (3, -1, 0), (-3, -1, 0), (3, -1, -2), (-3, -1, -2)]
+        color3f[] primvars:displayColor = [(0.6, 0.6, 0.6)]
+    }
+
+    def Mesh "Wall"
+    {
+        uniform token subdivisionScheme = "none"
+        int[] faceVertexCounts = [3, 3]
+        int[] faceVertexIndices = [0, 1, 2, 0, 2, 3]
+        point3f[] points = [(-3, -1, -2), (3, -1, -2), (3, 2.5, -2), (-3, 2.5, -2)]
+        color3f[] primvars:displayColor = [(0.5, 0.6, 0.5)]
+    }
+
+    def Sphere "Ball"
+    {
+        double radius = 0.5
+        double3 xformOp:translate = (-1.6, -0.5, 0.5)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        color3f[] primvars:displayColor = [(0.8, 0.3, 0.2)]
+    }
+
+    def PointInstancer "Cards"
+    {
+        point3f[] positions = [(0, 0.6, 0), (0.8, 0.6, 0), (1.6, 0.6, 0)]
+        int[] protoIndices = [0, 0, 0]
+        int64[] invisibleIds = [1]
+        rel prototypes = </World/Cards/Prototypes/Card>
+
+        def Scope "Prototypes"
+        {
+            def Mesh "Card"
+            {
+                uniform token subdivisionScheme = "none"
+                int[] faceVertexCounts = [4]
+                int[] faceVertexIndices = [0, 1, 2, 3]
+                point3f[] points = [(-0.3, -0.4, 0), (0.3, -0.4, 0), (0.3, 0.4, 0), (-0.3, 0.4, 0)]
+                color3f[] primvars:displayColor = [(0.2, 0.3, 0.8)]
+            }
+        }
+    }
+
+    def DomeLight "Dome"
+    {
+        float inputs:intensity = 1
+    }
+}
+
+def Scope "Render"
+{
+    def RenderSettings "Settings"
+    {
+        rel camera = </World/Camera>
+        uniform int2 resolution = (64, 48)
+        rel products = </Render/Products/Ids>
+        int prism:samplesPerPixel = 4
+        int prism:maxDepth = 2
+    }
+
+    def Scope "Products"
+    {
+        def RenderProduct "Ids"
+        {
+            uniform token productName = "id_aovs.exr"
+            rel orderedVars = [</Render/Vars/Color>, </Render/Vars/PrimId>, </Render/Vars/ElementId>, </Render/Vars/InstanceId>]
+        }
+    }
+
+    def Scope "Vars"
+    {
+        def RenderVar "Color"
+        {
+            uniform token dataType = "color4f"
+            uniform string sourceName = "color"
+        }
+
+        def RenderVar "PrimId"
+        {
+            uniform token dataType = "int"
+            uniform string sourceName = "primId"
+        }
+
+        def RenderVar "ElementId"
+        {
+            uniform token dataType = "int"
+            uniform string sourceName = "elementId"
+        }
+
+        def RenderVar "InstanceId"
+        {
+            uniform token dataType = "int"
+            uniform string sourceName = "instanceId"
+        }
+    }
+}
