@@ -6,7 +6,7 @@ Phase reports, newest first. Detailed reports live in `local/reports/` (git-igno
 - Varying-emission materials get per-triangle records (stratified EDF estimate × area, with a floor); NEE evaluates the true EDF; BSDF hits use the per-triangle pdf; CPU and Vulkan (Metal shares the code, untested). `SceneHasEmitters` counts them (default-dome rule). glTF emissive textures and OBJ `map_Ke` become lights.
 - Unbiased against a 64k-spp BSDF-only reference (floor bands −0.11…+0.43%); ~24× lower variance. OpenPBR's 157k-triangle emitter costs 1.2 s per load (no cache yet).
 - Fixed a pre-existing bias: light tables over ~4096 entries picked lights with wrong probabilities (OpenPBR in Hydra was 7.8% too bright; now within 0.04% of a reference).
-- Open: OpenPBR's MEET MAT emits nothing in the CLI since Phase 7 (fine in Hydra).
+- Fixed after review: OpenPBR's MEET MAT was left out of the CLI's light table (its glow was there, only BSDF-sampled), not missing: see `local/reports/meetmat_cli_emission.md` and `docs/DECISIONS.md`.
 - 298/298 tests in the main checkout with Phases 5 and 7 merged. Report: `local/reports/phase5_textured_emitters.md`. Status: merged locally, not pushed.
 
 ## 2026-10-25 — Phase 7: CLI parity

@@ -619,6 +619,12 @@ called done there.
     metal` against `--device cpu` (`prism_compare_images`, as
     `prism_textured_emitter_vulkan_parity` does), and chess and an egg
     unchanged against the previous build (`--exact`).
+  - Also (MEET MAT fix): `MDLMaterial::evaluateUniformEmission` and
+    `backface_emission_matches_surface` (`src/mdl/backend_compiler.cpp`)
+    classify more materials as not varying, so kernels of scenes with
+    thin-walled materials may now compile without `PRISM_VARYING_EMITTERS`;
+    build the Metal kernel on the OpenPBR playground (or any scene with
+    thin-walled, non-emitting OpenPBR materials) and check it against the CPU.
 
 ## Diagnostics
 
