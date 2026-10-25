@@ -786,13 +786,19 @@ int runStandaloneCli(int argc, char** argv) {
             if (view.camera.IsEmpty() && !explicitCamera)
                 throw std::runtime_error("Render product <" + view.path.GetString() + "> has no camera");
         }
+        // The cameras' exposure (UsdGeomCamera exposure, exposure:iso,
+        // :time, :fStop and :responsivity), which scales the colour as the
+        // Hydra delegate's exposure compensation does.
+        std::vector<float> exposureScales;
         auto cameraFor = [&](prism::output::RenderProductRequest const& view) {
             GfCamera camera;
+            float exposureScale = 1.0f;
             if (!view.camera.IsEmpty()) {
                 if (!stage) throw std::runtime_error("--camera prim paths require a USD scene");
                 UsdGeomCamera authored(stage->GetPrimAtPath(view.camera));
                 if (!authored) throw std::runtime_error("Not a USD camera: " + view.camera.GetString());
                 camera = authored.GetCamera(time);
+                exposureScale = authored.ComputeLinearExposureScale(time);
             } else {
                 auto asGf = [](Float3 v) { return GfVec3d(v.x(),v.y(),v.z()); };
                 GfMatrix4d viewMatrix(1); viewMatrix.SetLookAt(asGf(*o.cameraPosition), asGf(*o.cameraTarget), asGf(o.cameraUp));
@@ -803,6 +809,7 @@ int runStandaloneCli(int argc, char** argv) {
                 camera.SetFStop(radius > 0 ? camera.GetFocalLength()*0.1f/(2*radius) : 0);
                 camera.SetClippingRange(GfRange1f(0.001f, 1e30f));
             }
+            exposureScales.push_back(std::isfinite(exposureScale) ? exposureScale : 1.0f);
             return UsdCameraRays(camera, view);
         };
         // Cameras are checked before the scene loads.
@@ -820,6 +827,14 @@ int runStandaloneCli(int argc, char** argv) {
         const char* libraries = std::getenv("PRISM_MATERIALX_LIBRARY_PATH");
         const std::string libraryPath = libraries ? libraries : "";
         std::unique_ptr<Mesh> mesh;
+        // Subdivision surfaces and load-time displacement (USD meshes; OBJ
+        // faces their MTL disp displaces).
+        prism::mesh::SubdivisionSettings subdivision;
+        subdivision.level = prism::defaults::ClampSubdivisionLevel(o.subdivisionLevel);
+        subdivision.maxFaces = size_t(prism::defaults::ClampFaces(o.subdivisionMaxFaces));
+        subdivision.budgetFaces = size_t(prism::defaults::ClampFaces(o.subdivisionBudgetFaces));
+        subdivision.displacementLevel = prism::defaults::ClampSubdivisionLevel(o.displacementLevel);
+        subdivision.displacementMaxFaces = size_t(prism::defaults::ClampFaces(o.displacementMaxFaces));
         if (isUsd) {
             USDMesh::LoadOptions load;
             if (job) {
@@ -830,18 +845,14 @@ int runStandaloneCli(int argc, char** argv) {
                 if (load.includedPurposes.empty()) load.includedPurposes.push_back(UsdGeomTokens->default_);
             }
             load.time = time;
-            load.subdivision.level = prism::defaults::ClampSubdivisionLevel(o.subdivisionLevel);
-            load.subdivision.maxFaces = size_t(prism::defaults::ClampFaces(o.subdivisionMaxFaces));
-            load.subdivision.budgetFaces = size_t(prism::defaults::ClampFaces(o.subdivisionBudgetFaces));
-            load.subdivision.displacementLevel = prism::defaults::ClampSubdivisionLevel(o.displacementLevel);
-            load.subdivision.displacementMaxFaces = size_t(prism::defaults::ClampFaces(o.displacementMaxFaces));
+            load.subdivision = subdivision;
             mesh = std::make_unique<USDMesh>(stage, &context, libraryPath, libraryPath + "/mdl", std::move(load));
         }
         else if (extension == ".gltf" || extension == ".glb") {
             mesh = std::make_unique<glTFMesh>(o.scene, &context, libraryPath, libraryPath + "/mdl");
         }
         else if (extension == ".obj")
-            mesh = std::make_unique<ObjMesh>(o.scene, &context, libraryPath, libraryPath + "/mdl");
+            mesh = std::make_unique<ObjMesh>(o.scene, &context, libraryPath, libraryPath + "/mdl", subdivision);
         else throw std::runtime_error("Unsupported scene format: " + extension);
         const auto usdMesh = dynamic_cast<USDMesh*>(mesh.get());
         if (usdMesh ? usdMesh->renderablePlacementCount() == 0
@@ -1063,6 +1074,11 @@ int runStandaloneCli(int argc, char** argv) {
                         views.size() > 1 ? "view " + std::to_string(index + 1) + "/" + std::to_string(views.size()) : "",
                         imageRequest.timeLimitSeconds);
                     rendered.push_back({AovKind::Color, 3, renderDevice->RenderImage(scene, imageRequest)});
+                    // Applied after the sample clamp, as in every render loop;
+                    // adaptive sampling measures its error relative to the
+                    // image's brightness, so scaling afterwards is the same.
+                    if (const float scale = exposureScales[index]; scale != 1.0f)
+                        for (float& value : rendered.back().pixels) value *= scale;
                     progress.EndRender();
                     timeLimitReached |= stopped;
                 } else if (std::find(geometric.begin(), geometric.end(), var.kind) == geometric.end()) {
