@@ -65,6 +65,11 @@ The handover for the main (orchestrating) session. Subagents don't read this fil
 - Extend the parity fixtures to every Hydra feature (one Vulkan variant under the GPU lock).
 - Mostly CPU-side loader work: may run in parallel with Phase 5 or 6 using `ctest -LE gpu`, with GPU checks serialized.
 
+### After the open phases: renderer SDK and Python API (idea, not started)
+- (a) Turn the renderer into a library/SDK that the CLI and Hydra both implement: a context object (`prism::Renderer`/`Session`) owning today's process-wide state (colour management, the shared `MDLGenerator`, the texture service, SSS fallback, binding purposes, the MDL SDK); public headers separated from internals (no Embree/MDL/TBB/USD types in the public API); scene building (meshes, instances, lights, cameras, MaterialX materials) with incremental edits (Hydra needs them), rendering (devices, settings, progressive passes, AOVs, cancellation, progress), and loaders (USD, glTF, OBJ) as optional modules so the core doesn't need USD. No ABI promise until a first release.
+- (b) A Python API with nanobind as a thin layer over that API: NumPy/DLPack zero-copy for mesh arrays and images, the GIL released during renders, cancellation through the progress callback, USD stages shared with `pxr` through `UsdUtils.StageCache` ids. Packaging (bundled DLLs, load order — cf. PySide6's old msvcp140) is its own task.
+- Order: a design-only investigation first (`docs/sdk_design.md`: API sketch, global-state inventory, header split, module boundaries); then the core API with the CLI ported onto it (its parity tests are the safety net); then Hydra; then the Python bindings. (b) only after (a).
+
 ### Later (from the original plan; see docs/feature_roadmap.md)
 - Phase 8a: ShapingAPI spotlights and IES profiles. Phase 8b: motion blur.
 - Curves; volumes (`docs/volumes.md`); tile texture streaming; the ALab GPU work (parked branch).
