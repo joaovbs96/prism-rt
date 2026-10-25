@@ -81,6 +81,30 @@ void gpu_accumulate(uint pixel, float3 value, bool even)
     if (even) b[2u * pixel + 1u] = b[2u * pixel + 1u] + float4(value, 0.0f);
 }
 
+#if PRISM_LIGHT_AOVS
+// Light AOVs (kFrameLightAovs): four entries per slot (albedo, diffuse,
+// specular, emission) after `base` entries, in the output buffer (one sample)
+// or added up in the accumulation buffer (image mode, after its 2 * pixels
+// colour sums).
+void gpu_store_aovs(uint base, uint slot, LightAovSample a)
+{
+    RWStructuredBuffer<float4> b = outputBuffer();
+    b[base + 4u * slot] = float4(a.albedo, 0.0f);
+    b[base + 4u * slot + 1u] = float4(a.diffuse, 0.0f);
+    b[base + 4u * slot + 2u] = float4(a.specular, 0.0f);
+    b[base + 4u * slot + 3u] = float4(a.emission, 0.0f);
+}
+void gpu_accumulate_aovs(uint base, uint pixel, LightAovSample a)
+{
+    RWStructuredBuffer<float4> b = accumulationBuffer();
+    const uint i = base + 4u * pixel;
+    b[i] = b[i] + float4(a.albedo, 0.0f);
+    b[i + 1u] = b[i + 1u] + float4(a.diffuse, 0.0f);
+    b[i + 2u] = b[i + 2u] + float4(a.specular, 0.0f);
+    b[i + 3u] = b[i + 3u] + float4(a.emission, 0.0f);
+}
+#endif
+
 #ifdef PRISM_TEXTURE_STREAMING
 // Texture feedback of this thread's lookups (kFrameTextureFeedback; a
 // subset of pixels): each lookup adds the path's weight to the histogram

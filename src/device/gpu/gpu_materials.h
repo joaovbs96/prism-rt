@@ -93,6 +93,10 @@ struct MdlShaderCode {
     // samples evaluate it, so the kernel or raygen shader is compiled with
     // PRISM_VARYING_EMITTERS (`code` starts with that define).
     bool varyingEmitters = false;
+    // The kernel or raygen shader also gathers the light AOVs
+    // (PRISM_LIGHT_AOVS, defined before the integrator): a device's variant
+    // of the scene's code, built when a render asks for them.
+    bool lightAovs = false;
     // Generated target code followed by the prism_mdl_* dispatch functions.
     std::string code;
     // The same code for one program at a time (callable shaders): the target

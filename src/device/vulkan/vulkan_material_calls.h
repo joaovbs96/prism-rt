@@ -84,7 +84,8 @@ bool PipelineCacheDataMatches(std::vector<char> const& data, VkPhysicalDevicePro
 // The HLSL of the raygen shader: the kernel without MDL code
 // (PRISM_CALL_MATERIALS). It depends on no scene, except with reordering
 // (the hint bits cover `programs`).
-bool RaygenSource(bool reorder, uint32_t programs, bool varyingEmitters, std::string* source, std::string* error);
+bool RaygenSource(bool reorder, uint32_t programs, bool varyingEmitters, std::string* source, std::string* error,
+                  bool lightAovs = false);
 // The HLSL of the callable pipeline: the raygen shader, then one callable per
 // program of `code` (that program's dispatch and, with `trim`, only the
 // functions of the link unit it reaches), each compiled alone with the

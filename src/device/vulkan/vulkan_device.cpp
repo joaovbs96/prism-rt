@@ -366,10 +366,11 @@ static std::string FallbackSummary(std::string const& error)
     return first.empty() ? "scene not supported" : first;
 }
 
-static bool AssembleVulkanKernel(std::string const& mdlCode, std::string* source, std::string* error)
+static bool AssembleVulkanKernel(std::string const& mdlCode, std::string* source, std::string* error,
+                                 bool lightAovs = false)
 {
     if (!gpu::AssembleShader("gpu/kernel.hlsl", {"gpu/vulkan"}, mdlCode, source, error)) return false;
-    *source = vulkan::ShaderSaltDefine() + *source;
+    *source = vulkan::ShaderSaltDefine() + (lightAovs ? "#define PRISM_LIGHT_AOVS 1\n" : "") + *source;
     return true;
 }
 
@@ -381,10 +382,10 @@ static std::filesystem::path TooLargeMarker(std::string const& source)
 }
 
 bool CompileVulkanKernel(std::string const& mdlCode, std::vector<uint32_t>* spirv, std::string* error,
-                         uint32_t programCount)
+                         uint32_t programCount, bool lightAovs)
 {
     std::string source;
-    if (!AssembleVulkanKernel(mdlCode, &source, error)) return false;
+    if (!AssembleVulkanKernel(mdlCode, &source, error, lightAovs)) return false;
     const auto cacheDirectory = gpu::ShaderCacheDirectory("vulkan");
     const auto cached = cacheDirectory / (gpu::SourceDigest(source) + ".spv");
     std::vector<char> bytes = vulkan::ReadCacheFile(cached);
@@ -413,8 +414,9 @@ bool CompileVulkanKernel(std::string const& mdlCode, std::vector<uint32_t>* spir
             failed[key] = error ? *error : reason;
             return false;
         }
-        std::cerr << std::format("PrismRT Vulkan: compiling the GPU kernel ({} MDL programs, {} KB of HLSL); this "
-                                 "happens once per material set\n", programCount, source.size() >> 10);
+        std::cerr << std::format("PrismRT Vulkan: compiling the GPU kernel{} ({} MDL programs, {} KB of HLSL); this "
+                                 "happens once per material set\n", lightAovs ? " with light AOVs" : "",
+                                 programCount, source.size() >> 10);
         progress::Detail(Phase::Kernel, std::format("DXC to SPIR-V, {} MDL programs, {} KB HLSL",
                                                     programCount, source.size() >> 10));
         std::string reason;
@@ -571,6 +573,11 @@ struct VulkanDevice::Impl {
     vulkan::MaterialCallPipeline const* callables = nullptr;
     // The generated MDL code `pipeline` was built from.
     std::shared_ptr<const gpu::MdlShaderCode> pipelineCode;
+    // The light AOV variant of `pipeline` (prepareLightAovs), built for
+    // `aovBase` (the pipelineCode it varies); frames with kFrameLightAovs run it.
+    VkPipeline aovPipeline = VK_NULL_HANDLE;
+    vulkan::MaterialCallPipeline const* aovCallables = nullptr;
+    std::shared_ptr<const gpu::MdlShaderCode> aovBase;
     // Why the scene's materials use the per-program layout (callables), for the log.
     std::string perProgramReason;
     VkQueryPool timestamps = VK_NULL_HANDLE;
@@ -706,6 +713,7 @@ struct VulkanDevice::Impl {
     bool prepareMaterials(std::shared_ptr<const gpu::MdlShaderCode>* code, bool* compile, std::string* error);
     // Builds the pipeline of `code`; runs while the scene uploads.
     bool compilePipeline(std::shared_ptr<const gpu::MdlShaderCode> const& shared, std::string* error);
+    bool prepareLightAovs(std::string* error);
     bool buildCallablePipeline(std::shared_ptr<const gpu::MdlShaderCode> const& code, std::string const& reason,
                                std::string* error);
     bool uploadImages(std::string* error);
@@ -1962,7 +1970,7 @@ bool VulkanDevice::Impl::compilePipeline(std::shared_ptr<const gpu::MdlShaderCod
         return buildCallablePipeline(shared, "PRISM_VULKAN_CALLABLES=1", error);
     if (callableMode == vulkan::CallableMode::Auto) {
         std::string source;
-        if (AssembleVulkanKernel(code.code, &source, nullptr)) {
+        if (AssembleVulkanKernel(code.code, &source, nullptr, code.lightAovs)) {
             const char* retry = std::getenv("PRISM_VULKAN_RETRY_LARGE");
             const bool retryLarge = retry && *retry && *retry != '0';
             if (source.size() > vulkan::CallableThresholdBytes())
@@ -1974,7 +1982,7 @@ bool VulkanDevice::Impl::compilePipeline(std::shared_ptr<const gpu::MdlShaderCod
     }
     std::vector<uint32_t> spirv;
     progress::Detail(Phase::Kernel, "SPIR-V kernel");
-    if (!CompileVulkanKernel(code.code, &spirv, error, code.programCount)) {
+    if (!CompileVulkanKernel(code.code, &spirv, error, code.programCount, code.lightAovs)) {
         if (callableMode == vulkan::CallableMode::Auto && error && gpu::HlslTooLarge(*error))
             return buildCallablePipeline(shared, "the kernel is too large for DXC", error);
         return false;
@@ -2060,9 +2068,10 @@ bool VulkanDevice::Impl::buildCallablePipeline(std::shared_ptr<const gpu::MdlSha
     if (code.perProgram)
         for (auto const& program : code.programs) identity += "|" + program->digest;
     const std::string key = gpu::SourceDigest(identity) + (code.perProgram ? "|programs" : "") +
-        (reorder ? "|reorder" : "") + (code.varyingEmitters ? "|emitters" : "");
-    std::cerr << std::format("PrismRT Vulkan: {} MDL programs as callable shaders ({}){}\n", code.programCount,
-                             reason, reorder ? ", reordered by program" : "");
+        (reorder ? "|reorder" : "") + (code.varyingEmitters ? "|emitters" : "") + (code.lightAovs ? "|aovs" : "");
+    std::cerr << std::format("PrismRT Vulkan: {} MDL programs as callable shaders ({}){}{}\n", code.programCount,
+                             reason, reorder ? ", reordered by program" : "",
+                             code.lightAovs ? ", with light AOVs" : "");
     auto found = callablePipelines.find(key);
     if (found == callablePipelines.end()) {
         auto built = std::make_unique<vulkan::MaterialCallPipeline>(device, physical, rayTracing, pipelineCacheTag);
@@ -3060,6 +3069,33 @@ bool VulkanDevice::Impl::ensureScene(SceneManager& scene, std::string* error)
     return true;
 }
 
+bool VulkanDevice::Impl::prepareLightAovs(std::string* error)
+{
+    if (!pipelineCode || !pipeline) {
+        if (error) *error = "no pipeline";
+        return false;
+    }
+    if (aovBase == pipelineCode && aovPipeline) return true;
+    // compilePipeline builds the variant as the scene's pipeline (cached by
+    // its SPIR-V or callable key): keep it aside and restore the scene's.
+    const VkPipeline base = pipeline;
+    vulkan::MaterialCallPipeline const* const baseCallables = callables;
+    const auto baseCode = pipelineCode;
+    auto variant = std::make_shared<gpu::MdlShaderCode>(*pipelineCode);
+    variant->lightAovs = true;
+    callables = nullptr;
+    const bool built = compilePipeline(variant, error);
+    if (built) {
+        aovPipeline = pipeline;
+        aovCallables = callables;
+        aovBase = baseCode;
+    }
+    pipeline = base;
+    callables = baseCallables;
+    pipelineCode = baseCode;
+    return built;
+}
+
 void* VulkanDevice::Impl::renderBuffer(int slot, size_t bytes)
 {
     if (buffers[slot].size < bytes) {
@@ -3143,12 +3179,15 @@ bool VulkanDevice::Impl::dispatch(GpuFrame const& work, uint32_t threads, double
     }
     vkCmdResetQueryPool(commands, timestamps, 0, 2);
     vkCmdWriteTimestamp(commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, timestamps, 0);
-    if (callables) {
+    // The light AOV variant (prepareLightAovs) for frames that ask for it.
+    const bool aovs = (frame.settings.z & kFrameLightAovs) != 0u && aovPipeline && aovBase == pipelineCode;
+    vulkan::MaterialCallPipeline const* const calls = aovs ? aovCallables : callables;
+    if (calls) {
         vkCmdBindDescriptorSets(commands, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, pipelineLayout, 0, 1,
                                 &descriptorSet, 0, nullptr);
-        callables->trace(commands, threads);
+        calls->trace(commands, threads);
     } else {
-        vkCmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+        vkCmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_COMPUTE, aovs ? aovPipeline : pipeline);
         vkCmdBindDescriptorSets(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &descriptorSet, 0,
                                 nullptr);
         vkCmdDispatch(commands, (threads + 63) / 64, 1, 1);
@@ -3301,6 +3340,7 @@ void VulkanDevice::HoldResidency()
 }
 
 bool VulkanDevice::PrepareScene(SceneManager& scene, std::string* error) { return m_impl->ensureScene(scene, error); }
+bool VulkanDevice::PrepareLightAovs(std::string* error) { return m_impl->prepareLightAovs(error); }
 GpuSceneData const& VulkanDevice::Data() const { return *m_impl->data; }
 uint32_t VulkanDevice::MdlTextureCount() const { return m_impl->mdlTextureCount; }
 void* VulkanDevice::RenderBuffer(int slot, size_t bytes) { return m_impl->renderBuffer(slot, bytes); }

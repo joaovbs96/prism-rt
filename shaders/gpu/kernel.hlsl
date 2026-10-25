@@ -79,6 +79,10 @@ void renderThread(uint thread)
     const uint height = frame.size.y;
     const uint mode = frame.work.z;
     GpuPathTracer tracer;
+#if PRISM_LIGHT_AOVS
+    // The light AOV variant of the kernel (PRISM_LIGHT_AOVS): every sample gathers them.
+    tracer.aovs = true;
+#endif
 
     // One call site of renderSample (and of the primary-hit intersection):
     // DXC inlines every call, so each extra site duplicates every material.
@@ -138,15 +142,27 @@ void renderThread(uint thread)
     if (!preview && frame.counts.y != 0u) {
         result.color = debugView(tracer, camera, x, y, width, height, frame.counts.y);
         result.coverage = 1.0f;
+#if PRISM_LIGHT_AOVS
+        result.aovs.albedo = (float3)0.0f;
+        result.aovs.diffuse = (float3)0.0f;
+        result.aovs.specular = (float3)0.0f;
+        result.aovs.emission = (float3)0.0f;
+#endif
     } else {
         result = tracer.renderSample(camera, x, y, width, height, settings);
     }
     if (replicated) {
         gpu_store_output(2u * thread, float4(result.color, 0.0f));
         gpu_store_output(2u * thread + 1u, (sampleIndex & 1u) == 0u ? float4(result.color, 0.0f) : (float4)0.0f);
+#if PRISM_LIGHT_AOVS
+        gpu_store_aovs(2u * frame.work.x, thread, result.aovs);
+#endif
         return;
     }
     if (preview) gpu_store_output(thread, float4(result.color, result.coverage));
+#if PRISM_LIGHT_AOVS
+    if (preview) gpu_store_aovs(frame.size.z * frame.size.w, thread, result.aovs);
+#endif
     if ((preview || mode == kModePass) && (flags & kFramePrimaryHits) != 0u)
         gpu_store_primary_hit(preview ? thread : pixel, preview ? frame.size.z * frame.size.w : width * height,
                               tracer.backend.intersect(pixelCenterRay(camera, x, y, width, height)).surface);
@@ -154,6 +170,10 @@ void renderThread(uint thread)
     gpu_store_rng(pixel, tracer.backend.rng.state);
     if (mode == kModeImage) gpu_accumulate(pixel, result.color, (frame.counts.z & 1u) == 0u);
     else gpu_store_output(pixel, float4(result.color, result.coverage));
+#if PRISM_LIGHT_AOVS
+    if (mode == kModeImage) gpu_accumulate_aovs(2u * width * height, pixel, result.aovs);
+    else gpu_store_aovs(width * height, pixel, result.aovs);
+#endif
 }
 
 #ifdef PRISM_CALL_MATERIALS

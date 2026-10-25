@@ -42,6 +42,7 @@ protected:
     gpu::GpuSceneData const& Data() const override;
     uint32_t MdlTextureCount() const override;
     void* RenderBuffer(int slot, size_t bytes) override;
+    bool PrepareLightAovs(std::string* error) override;
     bool Dispatch(GpuFrame const& frame, uint32_t threads, double* gpuSeconds,
                   std::string* error) override;
     const char* LogPrefix() const override { return "PrismRT Vulkan: "; }
@@ -58,7 +59,8 @@ private:
 };
 
 // The Vulkan kernel for the given MDL code, as SPIR-V (exposed for the shader compile test).
+// With lightAovs, the variant that also writes the light AOVs (PRISM_LIGHT_AOVS).
 bool CompileVulkanKernel(std::string const& mdlCode, std::vector<uint32_t>* spirv, std::string* error,
-                         uint32_t programCount = 0);
+                         uint32_t programCount = 0, bool lightAovs = false);
 
 } // namespace prism::device

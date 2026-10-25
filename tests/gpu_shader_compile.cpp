@@ -81,6 +81,23 @@ int main(int argc, char** argv)
         check(prism::device::CompileVulkanKernel(code.code, &spirv, &error) && spirv.size() > 1000 &&
                   spirv[0] == 0x07230203u,
               "Vulkan kernel compiles to SPIR-V: " + error);
+        // Its light AOV variant (PRISM_LIGHT_AOVS), and the raygen shader's.
+        std::vector<uint32_t> aovSpirv;
+        check(prism::device::CompileVulkanKernel(code.code, &aovSpirv, &error, 0, true) && aovSpirv.size() > 1000 &&
+                  aovSpirv != spirv,
+              "Vulkan light AOV kernel compiles to SPIR-V: " + error);
+        {
+            MdlShaderCode aovCode = code;
+            aovCode.lightAovs = true;
+            std::vector<std::string> aovSources;
+            std::vector<char> raygen;
+            check(prism::device::vulkan::MaterialCallSources(aovCode, true, &aovSources, &error) &&
+                      aovSources[0].find("#define PRISM_LIGHT_AOVS 1") != std::string::npos &&
+                      CompileHlsl(aovSources[0], HlslTarget::Spirv, ShaderCacheDirectory("test"), &raygen, &error,
+                                  HlslStage{prism::device::vulkan::kMaterialCallProfile, ""}) &&
+                      raygen.size() > 1000,
+                  "light AOV raygen shader compiles to SPIR-V: " + error);
+        }
         // The callable path: the raygen shader (with reordering) and each program's callable.
         std::vector<std::string> sources;
         check(prism::device::vulkan::MaterialCallSources(code, true, &sources, &error) &&
@@ -113,6 +130,11 @@ int main(int argc, char** argv)
                   CompileHlsl(source, HlslTarget::Dxil, ShaderCacheDirectory("test"), &dxil, &error) &&
                   dxil.size() > 1000,
               "Metal kernel compiles to DXIL: " + error);
+        // The Metal device's light AOV variant: the same source after the define.
+        std::vector<char> aovDxil;
+        check(CompileHlsl("#define PRISM_LIGHT_AOVS 1\n" + source, HlslTarget::Dxil, ShaderCacheDirectory("test"),
+                          &aovDxil, &error) && aovDxil.size() > 1000,
+              "Metal light AOV kernel compiles to DXIL: " + error);
     }
     rtcReleaseDevice(device);
     if (failures) return 1;

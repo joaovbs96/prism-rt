@@ -78,6 +78,17 @@ GpuFrame GpuRenderDevice::BaseFrame(prism::CameraRayParameters const& camera, un
 
 namespace {
 // What a failed submission most likely means, for the error message.
+// Light AOVs (kFrameLightAovs, kernel.hlsl): four float4 per slot.
+constexpr size_t kAovEntries = 4;
+
+LightAovPixel ReadLightAovs(float const* entries, float scale)
+{
+    auto read = [&](size_t k) {
+        return Color3(entries[4 * k] * scale, entries[4 * k + 1] * scale, entries[4 * k + 2] * scale);
+    };
+    return {read(0), read(1), read(2), read(3)};
+}
+
 std::string FailureHint(std::string const& error)
 {
     if (error.find("device lost") != std::string::npos)
@@ -102,13 +113,18 @@ std::vector<float> GpuRenderDevice::RenderImage(SceneManager& scene, ImageReques
     // picture and report success.
     if (!PrepareScene(scene, &error))
         throw std::runtime_error(std::string(LogPrefix()) + "cannot prepare the scene for the GPU: " + error);
+    const bool lightAovs = request.lightAovs != nullptr;
+    if (lightAovs && !PrepareLightAovs(&error))
+        throw std::runtime_error(std::string(LogPrefix()) + "cannot build the light AOV kernel: " + error);
     // Test hook: fail the dispatch of this sample index.
     const char* failAt = std::getenv("PRISM_GPU_FAIL_DISPATCH_AT");
     const int failSample = failAt && *failAt ? std::atoi(failAt) : -1;
     const AdaptiveSettings& adaptive = request.adaptive;
     const uint32_t count = request.width * request.height;
+    // Colour sums (two float4 per pixel), then the light AOV sums.
+    const size_t accumulationBytes = size_t(count) * (32 + (lightAovs ? 16 * kAovEntries : 0));
     RenderBuffer(kSlotRng, size_t(count) * 4);
-    std::memset(RenderBuffer(kSlotAccumulation, size_t(count) * 32), 0, size_t(count) * 32);
+    std::memset(RenderBuffer(kSlotAccumulation, accumulationBytes), 0, accumulationBytes);
     std::vector<uint32_t> list(count);
     for (uint32_t p = 0; p < count; ++p) list[p] = p;
     std::vector<int> samples(count, 0);
@@ -122,8 +138,9 @@ std::vector<float> GpuRenderDevice::RenderImage(SceneManager& scene, ImageReques
     // Streamed textures settle first, so every sample sees the same levels.
     if (StreamsTextures()) {
         SettleWithFrame(frame, kModeImage, count);
-        std::memset(RenderBuffer(kSlotAccumulation, size_t(count) * 32), 0, size_t(count) * 32);
+        std::memset(RenderBuffer(kSlotAccumulation, accumulationBytes), 0, accumulationBytes);
     }
+    if (lightAovs) frame.settings.z |= kFrameLightAovs;
     BeginWork(kModeImage, 0);
     double gpuSeconds = 0.0;
     // The time limit counts from here: scene preparation and texture
@@ -153,8 +170,9 @@ std::vector<float> GpuRenderDevice::RenderImage(SceneManager& scene, ImageReques
             replicas = std::clamp(int(count / list.size()), 1, std::min(maxReplicas, stop - sample));
         }
         const uint32_t threads = uint32_t(list.size()) * uint32_t(replicas);
+        const size_t outputBytes = size_t(threads) * (32 + (lightAovs ? 16 * kAovEntries : 0));
         std::memcpy(RenderBuffer(kSlotPixels, list.size() * 4), list.data(), list.size() * 4);
-        if (replicas > 1) RenderBuffer(kSlotOutput, size_t(threads) * 32);
+        if (replicas > 1) RenderBuffer(kSlotOutput, outputBytes);
         GpuFrame f = frame;
         f.work = {threads, replicas > 1 ? uint32_t(list.size()) : 0u, kModeImage, 0};
         f.counts.z = uint32_t(sample);
@@ -168,14 +186,19 @@ std::vector<float> GpuRenderDevice::RenderImage(SceneManager& scene, ImageReques
                 sample + 1, request.samples, request.width, request.height, threads, gpuSeconds, error,
                 FailureHint(error)));
         if (replicas > 1) {
-            auto const* out = static_cast<const float*>(RenderBuffer(kSlotOutput, size_t(threads) * 32));
-            auto* sums = static_cast<float*>(RenderBuffer(kSlotAccumulation, size_t(count) * 32));
+            auto const* out = static_cast<const float*>(RenderBuffer(kSlotOutput, outputBytes));
+            auto* sums = static_cast<float*>(RenderBuffer(kSlotAccumulation, accumulationBytes));
             for (uint32_t t = 0; t < threads; ++t) {
                 const uint32_t p = list[t % list.size()];
                 for (int c = 0; c < 3; ++c) {
                     sums[8 * p + c] += out[8 * t + c];
                     sums[8 * p + 4 + c] += out[8 * t + 4 + c];
                 }
+                // The light AOVs follow the 2 * threads colour entries.
+                if (lightAovs)
+                    for (size_t i = 0; i < 4 * kAovEntries; ++i)
+                        sums[8 * size_t(count) + 4 * kAovEntries * p + i] +=
+                            out[8 * size_t(threads) + 4 * kAovEntries * t + i];
             }
         }
         sample += replicas;
@@ -196,12 +219,14 @@ std::vector<float> GpuRenderDevice::RenderImage(SceneManager& scene, ImageReques
                 progress->activeFraction.store(double(list.size()) / double(count), std::memory_order_relaxed);
         }
     }
-    auto const* sums = static_cast<const float*>(RenderBuffer(kSlotAccumulation, size_t(count) * 32));
+    auto const* sums = static_cast<const float*>(RenderBuffer(kSlotAccumulation, accumulationBytes));
+    if (lightAovs) request.lightAovs->assign(count, LightAovPixel{});
     double total = 0.0;
     size_t atMax = 0;
     for (size_t p = 0; p < count; ++p) {
         const float scale = samples[p] > 0 ? 1.0f / float(samples[p]) : 0.0f;
         for (int c = 0; c < 3; ++c) pixels[3 * p + c] = sums[8 * p + c] * scale;
+        if (lightAovs) (*request.lightAovs)[p] = ReadLightAovs(sums + 8 * size_t(count) + 4 * kAovEntries * p, scale);
         total += samples[p];
         atMax += samples[p] >= request.samples;
     }
@@ -228,15 +253,22 @@ void GpuRenderDevice::RenderPass(SceneManager& scene, PassRequest const& request
     // Geometric outputs come from the kernel's pixel-center hits, with or
     // without color work, so they do not depend on the bound outputs.
     const bool gpuPrimary = tracePrimary && prepared;
+    bool lightAovs = traceColor && request.lightAovs;
+    if (lightAovs && !PrepareLightAovs(&error)) {
+        std::cerr << LogPrefix() << "cannot build the light AOV kernel: " << error << '\n';
+        lightAovs = false;
+    }
 
     const size_t pixels = size_t(width) * height;
+    // Colour and coverage per pixel, then the light AOVs.
+    const size_t outputBytes = pixels * (16 + (lightAovs ? 16 * kAovEntries : 0));
     uint32_t* rng = nullptr;
     float* output = nullptr;
     GpuFrame frame{};
     if (prepared) {
         if (traceColor) {
             rng = static_cast<uint32_t*>(RenderBuffer(kSlotRng, pixels * 4));
-            output = static_cast<float*>(RenderBuffer(kSlotOutput, pixels * 16));
+            output = static_cast<float*>(RenderBuffer(kSlotOutput, outputBytes));
             std::memcpy(rng, request.rngStates, pixels * 4);
         }
         frame = BaseFrame(request.camera, width, height);
@@ -245,6 +277,7 @@ void GpuRenderDevice::RenderPass(SceneManager& scene, PassRequest const& request
         if (request.shading.nee.spatialLights) frame.settings.z |= kFrameSpatialLights;
         if (request.shading.transparentEscapes) frame.settings.z |= kFrameTransparentEscapes;
         if (request.sample == 0) frame.settings.z |= kFrameSeedRng;
+        if (lightAovs) frame.settings.z |= kFrameLightAovs;
         frame.settings.w = request.seed;
         frame.counts.z = uint32_t(std::max(0, request.sample));
         if (gpuPrimary) {
@@ -305,7 +338,7 @@ void GpuRenderDevice::RenderPass(SceneManager& scene, PassRequest const& request
         if (traceColor && !list.empty()) {
             // Buffers may move when resized; fetch them again after the dispatch.
             rng = static_cast<uint32_t*>(RenderBuffer(kSlotRng, pixels * 4));
-            output = static_cast<float*>(RenderBuffer(kSlotOutput, pixels * 16));
+            output = static_cast<float*>(RenderBuffer(kSlotOutput, outputBytes));
             tbb::parallel_for(tbb::blocked_range<size_t>(0, list.size(), 4096),
                 [&](tbb::blocked_range<size_t> const& range) {
                     for (size_t i = range.begin(); i != range.end(); ++i) {
@@ -314,6 +347,9 @@ void GpuRenderDevice::RenderPass(SceneManager& scene, PassRequest const& request
                         request.colors[pixel] = Color3(output[4 * pixel], output[4 * pixel + 1],
                                                        output[4 * pixel + 2]);
                         request.coverage[pixel] = output[4 * pixel + 3];
+                        if (lightAovs)
+                            request.lightAovs[pixel] =
+                                ReadLightAovs(output + 4 * pixels + 4 * kAovEntries * pixel, 1.0f);
                     }
                 });
             if (request.colorPixels) request.colorPixels->fetch_add(list.size(), std::memory_order_relaxed);
@@ -361,9 +397,15 @@ bool GpuRenderDevice::RenderPreview(SceneManager& scene, PreviewRequest const& r
         std::cerr << LogPrefix() << error << '\n';
         return false;
     }
+    bool lightAovs = bool(request.writeLightAovs);
+    if (lightAovs && !PrepareLightAovs(&error)) {
+        std::cerr << LogPrefix() << "cannot build the light AOV kernel: " << error << '\n';
+        lightAovs = false;
+    }
     auto const traceStart = std::chrono::steady_clock::now();
     const uint32_t count = request.previewWidth * request.previewHeight;
-    RenderBuffer(kSlotOutput, size_t(count) * 16);
+    const size_t outputBytes = size_t(count) * (16 + (lightAovs ? 16 * kAovEntries : 0));
+    RenderBuffer(kSlotOutput, outputBytes);
     if (request.tracePrimary) RenderBuffer(kSlotAccumulation, size_t(count) * 48);
     GpuFrame frame = BaseFrame(request.camera, request.width, request.height);
     frame.size.z = request.previewWidth;
@@ -373,6 +415,7 @@ bool GpuRenderDevice::RenderPreview(SceneManager& scene, PreviewRequest const& r
     if (request.shading.nee.spatialLights) frame.settings.z |= kFrameSpatialLights;
     if (request.shading.transparentEscapes) frame.settings.z |= kFrameTransparentEscapes;
     if (request.tracePrimary) frame.settings.z |= kFramePrimaryHits;
+    if (lightAovs) frame.settings.z |= kFrameLightAovs;
     frame.settings.w = request.seed;
     frame.work = {count, 0, kModePreview, 0};
     BeginWork(kModePreview, 0);
@@ -385,7 +428,7 @@ bool GpuRenderDevice::RenderPreview(SceneManager& scene, PreviewRequest const& r
         std::cerr << std::format("PrismRT GPU preview: {}x{}, GPU {:.2f} ms\n", request.previewWidth,
                                  request.previewHeight, gpuSeconds * 1e3);
     if (request.colorPixels) request.colorPixels->fetch_add(count, std::memory_order_relaxed);
-    auto const* values = static_cast<const float*>(RenderBuffer(kSlotOutput, size_t(count) * 16));
+    auto const* values = static_cast<const float*>(RenderBuffer(kSlotOutput, outputBytes));
     auto const* hits = request.tracePrimary
         ? static_cast<const float*>(RenderBuffer(kSlotAccumulation, size_t(count) * 48)) : nullptr;
     const unsigned previewWidth = request.previewWidth, previewHeight = request.previewHeight;
@@ -395,10 +438,12 @@ bool GpuRenderDevice::RenderPreview(SceneManager& scene, PreviewRequest const& r
             const Color3 color(values[4 * i], values[4 * i + 1], values[4 * i + 2]);
             if (!hits) {
                 request.writePixel(px, py, color, values[4 * i + 3], nullptr);
-                continue;
+            } else {
+                const RayHit primary = PrimaryHit(hits, i, count);
+                request.writePixel(px, py, color, values[4 * i + 3], &primary);
             }
-            const RayHit primary = PrimaryHit(hits, i, count);
-            request.writePixel(px, py, color, values[4 * i + 3], &primary);
+            if (lightAovs)
+                request.writeLightAovs(px, py, ReadLightAovs(values + 4 * size_t(count) + 4 * kAovEntries * i, 1.0f));
         }
     });
     if (request.traceMilliseconds)

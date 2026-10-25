@@ -126,6 +126,10 @@ struct MetalDevice::Impl {
     std::unordered_map<std::string, std::string> failedPipelines; // source digest -> error
     // The generated MDL code `pipeline` was built from.
     std::shared_ptr<const gpu::MdlShaderCode> pipelineCode;
+    // The light AOV variant of `pipeline` (PRISM_LIGHT_AOVS), built for
+    // `aovBase` (the pipelineCode it varies); frames with kFrameLightAovs run it.
+    id<MTLComputePipelineState> aovPipeline = nil;
+    std::shared_ptr<const gpu::MdlShaderCode> aovBase;
     id<MTLBuffer> buffers[kSlotCount] = {};
     std::vector<id<MTLTexture>> images;
     // Uploaded images by prepared resource, reused across scene rebuilds.
@@ -150,6 +154,10 @@ struct MetalDevice::Impl {
 
     bool ensureScene(SceneManager& scene, std::string* error);
     bool buildPipeline(std::string* error);
+    // The kernel for `code` (with the light AOVs: its PRISM_LIGHT_AOVS variant).
+    bool compileKernel(gpu::MdlShaderCode const& code, bool lightAovs, id<MTLComputePipelineState>* result,
+                       std::string* error);
+    bool prepareLightAovs(std::string* error);
     void uploadBuffers(bool keepGeometry);
     void uploadImages();
     bool buildAccelerationStructures(bool keepPrimitives, std::string* error);
@@ -515,15 +523,38 @@ bool MetalDevice::Impl::buildPipeline(std::string* error)
     // The same generated code (an edit that kept the materials) keeps its pipeline.
     if (shared == pipelineCode && pipeline) return true;
     pipelineCode = nullptr;
+    pipeline = nil;
+    if (!compileKernel(code, false, &pipeline, error)) return false;
+    pipelineCode = shared;
+    if (Verbose()) std::cerr << std::format("PrismRT Metal: total shader setup {:.1f} s\n", SecondsSince(start));
+    return true;
+}
 
+bool MetalDevice::Impl::prepareLightAovs(std::string* error)
+{
+    if (!pipelineCode || !pipeline) {
+        if (error) *error = "no pipeline";
+        return false;
+    }
+    if (aovBase == pipelineCode && aovPipeline) return true;
+    id<MTLComputePipelineState> variant = nil;
+    if (!compileKernel(*pipelineCode, true, &variant, error)) return false;
+    aovPipeline = variant;
+    aovBase = pipelineCode;
+    return true;
+}
+
+bool MetalDevice::Impl::compileKernel(gpu::MdlShaderCode const& code, bool lightAovs,
+                                      id<MTLComputePipelineState>* result, std::string* error)
+{
     std::string mdlCode;
     if (!gpu::RewriteHlslToFp32(code.code, &mdlCode, error)) return false;
     std::string source;
     if (!gpu::AssembleShader("gpu/kernel.hlsl", {"gpu/metal"}, mdlCode, &source, error)) return false;
+    if (lightAovs) source = "#define PRISM_LIGHT_AOVS 1\n" + source;
     const std::string key = gpu::SourceDigest(source);
     if (auto found = pipelines.find(key); found != pipelines.end()) {
-        pipeline = found->second;
-        pipelineCode = shared;
+        *result = found->second;
         return true;
     }
     // A kernel that failed to compile fails again: do not retry it every frame.
@@ -539,8 +570,8 @@ bool MetalDevice::Impl::buildPipeline(std::string* error)
     const auto cached = cacheDirectory / (key + ".metallib");
     std::vector<char> metallib;
     if (!ReadFile(cached, &metallib)) {
-        std::cerr << "PrismRT Metal: compiling the GPU kernel (" << code.programCount
-                  << " MDL programs); this happens once per material set\n";
+        std::cerr << "PrismRT Metal: compiling the GPU kernel" << (lightAovs ? " with light AOVs" : "") << " ("
+                  << code.programCount << " MDL programs); this happens once per material set\n";
         auto const dxcStart = Clock::now();
         std::vector<char> dxil;
         if (!remember(gpu::CompileHlsl(source, gpu::HlslTarget::Dxil, cacheDirectory, &dxil, error)))
@@ -562,16 +593,15 @@ bool MetalDevice::Impl::buildPipeline(std::string* error)
     }
     auto const pipelineStart = Clock::now();
     id<MTLFunction> function = [library newFunctionWithName:library.functionNames.firstObject];
-    pipeline = [device newComputePipelineStateWithFunction:function error:&nsError];
-    if (!pipeline) {
+    id<MTLComputePipelineState> state = [device newComputePipelineStateWithFunction:function error:&nsError];
+    if (!state) {
         if (error) *error = std::string("Metal pipeline: ") + nsError.localizedDescription.UTF8String;
         return false;
     }
-    pipelines[key] = pipeline;
-    pipelineCode = shared;
+    pipelines[key] = state;
+    *result = state;
     if (Verbose() || SecondsSince(pipelineStart) > 1.0)
-        std::cerr << std::format("PrismRT Metal: pipeline {:.1f} s, total shader setup {:.1f} s\n",
-                                 SecondsSince(pipelineStart), SecondsSince(start));
+        std::cerr << std::format("PrismRT Metal: pipeline {:.1f} s\n", SecondsSince(pipelineStart));
     return true;
 }
 
@@ -618,7 +648,9 @@ bool MetalDevice::Impl::dispatch(GpuFrame const& frame, uint32_t threads, double
     @autoreleasepool {
         id<MTLCommandBuffer> commands = [queue commandBuffer];
         id<MTLComputeCommandEncoder> encoder = [commands computeCommandEncoder];
-        [encoder setComputePipelineState:pipeline];
+        // The light AOV variant (prepareLightAovs) for frames that ask for it.
+        const bool aovs = (frame.settings.z & kFrameLightAovs) != 0u && aovPipeline && aovBase == pipelineCode;
+        [encoder setComputePipelineState:aovs ? aovPipeline : pipeline];
         [encoder setBuffer:resourceHeap offset:0 atIndex:kIRDescriptorHeapBindPoint];
         [encoder setBuffer:samplerHeap offset:0 atIndex:kIRSamplerHeapBindPoint];
         // Everything is reached through the descriptor heaps, so it must be
@@ -703,6 +735,8 @@ bool MetalDevice::PrepareScene(SceneManager& scene, std::string* error)
 {
     return m_impl->ensureScene(scene, error);
 }
+
+bool MetalDevice::PrepareLightAovs(std::string* error) { return m_impl->prepareLightAovs(error); }
 
 GpuSceneData const& MetalDevice::Data() const { return *m_impl->data; }
 uint32_t MetalDevice::MdlTextureCount() const { return m_impl->mdlTextureCount; }

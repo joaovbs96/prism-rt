@@ -26,6 +26,7 @@ protected:
     gpu::GpuSceneData const& Data() const override;
     uint32_t MdlTextureCount() const override;
     void* RenderBuffer(int slot, size_t bytes) override;
+    bool PrepareLightAovs(std::string* error) override;
     bool Dispatch(GpuFrame const& frame, uint32_t threads, double* gpuSeconds,
                   std::string* error) override;
     const char* LogPrefix() const override { return "PrismRT Metal: "; }

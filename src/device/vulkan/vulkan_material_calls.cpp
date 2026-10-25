@@ -540,10 +540,12 @@ bool PipelineCacheDataMatches(std::vector<char> const& data, VkPhysicalDevicePro
         std::memcmp(header.pipelineCacheUUID, properties.pipelineCacheUUID, VK_UUID_SIZE) == 0;
 }
 
-bool RaygenSource(bool reorder, uint32_t programs, bool varyingEmitters, std::string* source, std::string* error)
+bool RaygenSource(bool reorder, uint32_t programs, bool varyingEmitters, std::string* source, std::string* error,
+                  bool lightAovs)
 {
     std::string defines = "#define PRISM_CALL_MATERIALS 1\n" + ShaderSaltDefine();
     if (varyingEmitters) defines += "#define PRISM_VARYING_EMITTERS 1\n";
+    if (lightAovs) defines += "#define PRISM_LIGHT_AOVS 1\n";
     if (reorder) {
         uint32_t bits = 1;
         while ((1u << bits) < programs && bits < 16) ++bits;
@@ -573,14 +575,16 @@ bool MaterialCallSources(gpu::MdlShaderCode const& code, bool reorder, std::vect
     if (code.perProgram) {
         const uint32_t programs = uint32_t(code.programs.size());
         sources->assign(programs + 1, std::string());
-        if (!RaygenSource(reorder, programs, code.varyingEmitters, &(*sources)[0], error)) return false;
+        if (!RaygenSource(reorder, programs, code.varyingEmitters, &(*sources)[0], error, code.lightAovs))
+            return false;
         for (uint32_t p = 0; p < programs; ++p)
             if (!ProgramCallableSource(*code.programs[p], &(*sources)[p + 1], error)) return false;
         return true;
     }
     const uint32_t programs = uint32_t(code.programDispatch.size());
     sources->assign(programs + 1, std::string());
-    if (!RaygenSource(reorder, programs, code.varyingEmitters, &(*sources)[0], error)) return false;
+    if (!RaygenSource(reorder, programs, code.varyingEmitters, &(*sources)[0], error, code.lightAovs))
+        return false;
     const std::string salt = ShaderSaltDefine();
     std::optional<LinkUnitTrimmer> trimmer;
     if (trim && TrimCallablesSetting()) trimmer.emplace(code.targetCode);

@@ -44,6 +44,10 @@ protected:
     // Host-visible storage for kSlotRng / Output / Accumulation / Pixels
     // of at least `bytes`, bound for the next dispatch.
     virtual void* RenderBuffer(int slot, size_t bytes) = 0;
+    // Builds (once per material set) the kernel variant that also writes the
+    // light AOVs (PRISM_LIGHT_AOVS); Dispatch runs it for frames with
+    // kFrameLightAovs. After PrepareScene.
+    virtual bool PrepareLightAovs(std::string* error) = 0;
     // Runs the kernel over `threads` threads and waits for completion.
     virtual bool Dispatch(GpuFrame const& frame, uint32_t threads, double* gpuSeconds,
                           std::string* error) = 0;
