@@ -34,6 +34,8 @@
 //   light_aovs         light_aovs.usda (light_aovs.exr): diffuse + specular +
 //                      emission is the colour in every pixel; each lobe shows
 //                      where it should; Position holds world positions.
+//   light_aovs_sum     any render with Diffuse, Specular and Emission layers:
+//                      their sum is the colour.
 //   light_aovs_albedo  light_aovs_albedo.usda: the albedo through the glass
 //                      and the mirror sphere is the walls' colour, that of
 //                      the diffuse sphere its own.
@@ -405,17 +407,11 @@ float LayerMean(Image const& image, int const* channels, int x, int y, int c, in
     return image.Mean(x, y, channels[c], r);
 }
 
-// light_aovs.usda, 96x64.
-void LightAovs(Image const& image)
+// diffuse + specular + emission against the colour (relative to it, or to a
+// hundredth of the mean where it is darker), and no negative AOV.
+void LightAovSum(Image const& image, int const* color, int const* albedo, int const* diffuse,
+                 int const* specular, int const* emission)
 {
-    int color[3], albedo[3], diffuse[3], specular[3], emission[3], position[3];
-    static char const* const xyz[] = {"X", "Y", "Z"};
-    if (!LayerChannels(image, "", color) || !LayerChannels(image, "Albedo", albedo) ||
-        !LayerChannels(image, "Diffuse", diffuse) || !LayerChannels(image, "Specular", specular) ||
-        !LayerChannels(image, "Emission", emission) || !LayerChannels(image, "Position", position, xyz))
-        return;
-    // The sum, against the colour (relative to it, or to a hundredth of the
-    // mean where it is darker).
     double mean = 0.0;
     for (int y = 0; y < image.height; ++y)
         for (int x = 0; x < image.width; ++x)
@@ -435,6 +431,28 @@ void LightAovs(Image const& image)
     Check(worst <= 1e-4, Describe("diffuse + specular + emission is the colour (largest relative difference)",
                                   float(worst)));
     Check(negative >= -1e-5, Describe("no AOV is negative (smallest value)", float(negative)));
+}
+
+void LightAovsSum(Image const& image)
+{
+    int color[3], albedo[3], diffuse[3], specular[3], emission[3];
+    if (!LayerChannels(image, "", color) || !LayerChannels(image, "Albedo", albedo) ||
+        !LayerChannels(image, "Diffuse", diffuse) || !LayerChannels(image, "Specular", specular) ||
+        !LayerChannels(image, "Emission", emission))
+        return;
+    LightAovSum(image, color, albedo, diffuse, specular, emission);
+}
+
+// light_aovs.usda, 96x64.
+void LightAovs(Image const& image)
+{
+    int color[3], albedo[3], diffuse[3], specular[3], emission[3], position[3];
+    static char const* const xyz[] = {"X", "Y", "Z"};
+    if (!LayerChannels(image, "", color) || !LayerChannels(image, "Albedo", albedo) ||
+        !LayerChannels(image, "Diffuse", diffuse) || !LayerChannels(image, "Specular", specular) ||
+        !LayerChannels(image, "Emission", emission) || !LayerChannels(image, "Position", position, xyz))
+        return;
+    LightAovSum(image, color, albedo, diffuse, specular, emission);
     auto gray = [&](int const* layer, int x, int y) {
         return (LayerMean(image, layer, x, y, 0, 1) + LayerMean(image, layer, x, y, 1, 1) +
                 LayerMean(image, layer, x, y, 2, 1)) / 3.0f;
@@ -598,6 +616,7 @@ int main(int argc, char** argv)
         }}},
         {"lobes_consistency", {2, LobesConsistency}},
         {"light_aovs", single(LightAovs)},
+        {"light_aovs_sum", single(LightAovsSum)},
         {"light_aovs_albedo", single(LightAovsAlbedo)},
         {"exr_parts", {2, ExrParts}},
     };
