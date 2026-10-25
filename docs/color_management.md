@@ -201,12 +201,22 @@ like the CLI's 8-bit outputs. That needs PrismRT's OpenUSD patch (below).
   fixture equals the CLI's where it is opaque (it writes the dome with
   alpha 0).
 - usdview fills its *OCIO Config* menu (displays, views, input colour spaces)
-  with `PyOpenColorIO`, which is not installed: vcpkg's port has no Python
-  bindings, and the pip wheel brings its own OpenColorIO library. usdview then
-  prints "Could not import PyOpenColorIO..." and the menu stays empty; the
-  view comes from the extension (above) or from OpenColorIO's
+  with `PyOpenColorIO`. vcpkg's port has no Python bindings, so the pip wheel
+  `opencolorio==2.6.0` (pinned in `tools/deps.json`, the same version as
+  vcpkg's) provides it. The wheel brings its own
+  `PyOpenColorIO\bin\OpenColorIO_2_6.dll`, but the module imports it by name:
+  usdview loads Hdx (and so vcpkg's `OpenColorIO_2_6.dll`) first, and Windows
+  reuses the loaded module, so one copy serves Hdx, PrismRT and the Python
+  module (checked in a running usdview: a single `OpenColorIO_2_6.dll`, from
+  vcpkg's `bin`). If a script imports `PyOpenColorIO` before `pxr`, the wheel's
+  DLL is the one loaded and Hdx then uses it. Both are 2.6.0, and the usdview
+  launchers import `pxr` first. The menu lists the config's displays, views
+  and colour spaces; it shows no checked view while the extension leaves the
+  config's default view in use (an empty display/view setting). The view
+  comes from the extension (above) or from OpenColorIO's
   `OCIO_ACTIVE_DISPLAYS`/`OCIO_ACTIVE_VIEWS` (these also change the CLI's
-  defaults, as they act on the config).
+  defaults, as they act on the config). The package ships the wheel without
+  its `bin` directory, so it holds exactly one OpenColorIO DLL.
 - `sRGB` only applies the sRGB curve: an ACEScg render then shows ACEScg
   values as Rec.709 (less saturated, not tone mapped). It matches the CLI's
   `Un-tone-mapped` sRGB view when rendering with

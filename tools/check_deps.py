@@ -37,6 +37,7 @@ def expected_versions(deps):
         "PySide6": packages["PySide6"],
         "PyOpenGL": packages["PyOpenGL"],
         "numpy": packages["numpy"],
+        "PyOpenColorIO": packages["opencolorio"],
         "Vulkan SDK": deps["vulkan_sdk"]["version"],
         "OpenImageIO": deps["vcpkg"]["openimageio"],
         "OpenColorIO": deps["vcpkg"]["opencolorio"],
@@ -88,6 +89,11 @@ def main():
     check_manifest("vcpkg.json", deps["vcpkg"]["baseline"], args.write, errors)
     check_manifest("tools/ci/mdl_vcpkg/vcpkg.json", deps["mdl_sdk"]["vcpkg_baseline"], args.write, errors)
     check_docs(expected_versions(deps), errors)
+    # The wheel's PyOpenColorIO and Hdx's vcpkg OpenColorIO share one process.
+    if deps["python"]["packages"]["opencolorio"] != deps["vcpkg"]["opencolorio"]:
+        errors.append("tools/deps.json: python.packages.opencolorio "
+                      f"{deps['python']['packages']['opencolorio']} differs from vcpkg.opencolorio "
+                      f"{deps['vcpkg']['opencolorio']}")
     for error in errors:
         print(error, file=sys.stderr)
     if errors:

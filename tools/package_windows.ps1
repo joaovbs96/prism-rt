@@ -38,7 +38,7 @@ $templates = Join-Path $PSScriptRoot "package"
 Import-Module (Join-Path $PSScriptRoot "deps.psm1") -Force
 $deps = Get-PrismDeps
 $PySideVersion = $deps.python.packages.PySide6
-$PipPackages = Get-PrismPipRequirements -Only numpy, PyOpenGL
+$PipPackages = Get-PrismPipRequirements -Only numpy, PyOpenGL, opencolorio
 # DLL names follow the ABI: oneTBB's binary interface 12, Embree's major version.
 $tbbDll = "tbb12.dll"
 $embreeDll = "embree$($deps.embree.version.Split('.')[0]).dll"
@@ -236,6 +236,11 @@ if (-not $SkipPip) {
     Get-ChildItem (Join-Path $site "PySide6") -Include "*.exe", "*.lib", "*.pyi" -File -Recurse -ErrorAction SilentlyContinue |
         Remove-Item -Force
     Get-ChildItem $site -Directory -Filter "bin" -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force
+    # PyOpenColorIO's wheel carries its own OpenColorIO_2_6.dll and command line
+    # tools in PyOpenColorIO\bin. Drop them: the module imports the DLL by name,
+    # and usdview has already loaded the package's vcpkg one (Hdx) by then.
+    $ocioBin = Join-Path $site "PyOpenColorIO\bin"
+    if (Test-Path -LiteralPath $ocioBin) { Remove-Item -LiteralPath $ocioBin -Recurse -Force }
     # The shiboken generator and its headers are build-time only.
     foreach ($dir in @("shiboken6_generator", "shiboken6\include")) {
         $p = Join-Path $site $dir
@@ -244,7 +249,8 @@ if (-not $SkipPip) {
 }
 
 # OpenUSD's Hdx (usdview's OpenColorIO colour correction) links the same
-# OpenColorIO as PrismRT and loads the vcpkg DLL in bin: exactly one copy ships.
+# OpenColorIO as PrismRT and loads the vcpkg DLL in bin: exactly one copy ships
+# (the PyOpenColorIO wheel's own copy was removed above).
 $ocioCopies = @(Get-ChildItem -LiteralPath $pkg -Recurse -Filter "OpenColorIO*.dll" -File)
 if ($ocioCopies.Count -ne 1) {
     throw "Expected one OpenColorIO DLL in the package, found: $($ocioCopies.FullName -join ', ')"

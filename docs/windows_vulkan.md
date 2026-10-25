@@ -13,7 +13,7 @@ This is the setup validated on Windows 11 x64 with an NVIDIA RTX 4070 Ti. See
 | Git / Git LFS | 2.46 / 3.5.1 |
 | Vulkan SDK | 1.4.321.0, which sets `VULKAN_SDK` and provides `Bin\dxc.exe` (1.8) |
 | NVIDIA driver | 610.88 (Vulkan 1.4.341) |
-| Python | 3.11.9 x64 with PySide6 6.7.2, PyOpenGL 3.1.7, numpy |
+| Python | 3.11.9 x64 with PySide6 6.7.2, PyOpenGL 3.1.7, numpy, PyOpenColorIO 2.6.0 (pip `opencolorio`, for usdview's OCIO menus) |
 | vcpkg | checked out at `tools/deps.json`'s baseline; OpenImageIO 3.1.14 from the manifest |
 
 The GPU must expose `VK_KHR_ray_query` and `VK_KHR_acceleration_structure`
@@ -39,7 +39,7 @@ table.
 | Embree | 4.4.0 | Intel binary release. |
 | NVIDIA MDL SDK | 2026.0.2 | Built from source without CUDA, see below. Do not use the binary release zip. |
 | OpenImageIO | 3.1.14 | vcpkg, installed into `build\vcpkg_installed\x64-windows`. |
-| OpenColorIO | 2.6.0 | vcpkg (also an OpenImageIO dependency). Colour management ([color_management.md](color_management.md)); its built-in configs ship inside `OpenColorIO_2_6.dll`. OpenUSD's Hdx (usdview's OpenColorIO colour correction) links the same version, so one `OpenColorIO_2_6.dll`, vcpkg's, serves both. |
+| OpenColorIO | 2.6.0 | vcpkg (also an OpenImageIO dependency). Colour management ([color_management.md](color_management.md)); its built-in configs ship inside `OpenColorIO_2_6.dll`. OpenUSD's Hdx (usdview's OpenColorIO colour correction) links the same version, so one `OpenColorIO_2_6.dll`, vcpkg's, serves both, and the pip `PyOpenColorIO` wheel binds to the loaded one by name (see [color_management.md](color_management.md)). |
 
 ### OpenUSD, MaterialX and OpenSubdiv
 

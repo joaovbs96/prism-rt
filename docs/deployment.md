@@ -77,8 +77,10 @@ The package contains `cmake --install` output (`PrismRT.exe`, the Hydra
 delegate, the usdview extension, the sample scenes), the runtime DLLs of
 OpenUSD, oneTBB, Embree, the MDL SDK (`mdl\bin`), vcpkg, the MSVC runtime and
 the Vulkan loader, the MaterialX libraries, DXC (compiles the GPU kernel at run
-time), and a private Python 3.11 with PySide6 (Essentials, 6.7.2), PyOpenGL and
-numpy installed with pip into `python\Lib\site-packages`. `.pdb`, `.lib` and
+time), and a private Python 3.11 with PySide6 (Essentials, 6.7.2), PyOpenGL,
+numpy and PyOpenColorIO installed with pip into `python\Lib\site-packages`
+(the PyOpenColorIO wheel without its own OpenColorIO DLL, see
+[color_management.md](color_management.md)). `.pdb`, `.lib` and
 headers are left out. The extracted size is about 730 MiB (zip about 280 MiB):
 the MDL SDK DLLs (about 230 MiB; built from source without CUDA, so none of
 them imports `nvcuda.dll`), Python with PySide6 (about 270 MiB) and the
@@ -109,7 +111,7 @@ vulkan device").
 
 `tools/deps.json` is the only list of dependency versions: OpenUSD, MaterialX
 and OpenSubdiv tags, oneTBB, Embree, the MDL SDK (tag, release build, clang
-and the SDK's vcpkg baseline), Python and the PySide6/PyOpenGL/numpy pins, the
+and the SDK's vcpkg baseline), Python and the PySide6/PyOpenGL/numpy/opencolorio pins, the
 Vulkan SDK, PrismRT's vcpkg baseline (OpenImageIO, OpenColorIO), and `stack_revision`, a
 counter that forces CI to rebuild its cached stacks. Its consumers:
 
