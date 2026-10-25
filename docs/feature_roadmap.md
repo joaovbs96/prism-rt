@@ -29,8 +29,21 @@ Scenes: **Eggs** (MaterialEggs), **OpenPBR** (OpenPBRShaderPlayground),
   one.
 - **NEE inside media and nested media.** The random walk samples no lights
   while inside a medium and tracks a single medium (no glass in liquid).
-- **Textured emission as lights.** Only constant-emission triangles are
-  sampled by NEE; textured emitters rely on BSDF sampling.
+- **Textured emission as lights (done).** Triangles whose emission varies
+  (textures, primvars, a varying cutout, a directional EDF such as a coated
+  OpenPBR emitter) are next-event lights too, on every device: at load time
+  `src/device/light_table.h` estimates each triangle's average radiance by
+  evaluating the material at stratified points (the CPU MDL code; up to 16
+  per triangle face, about 4M evaluations at most, in parallel) and selects
+  it by that times its area, with a floor of 10% of its material's mean so
+  dark-on-average triangles stay reachable; triangles whose estimate is zero
+  are left to BSDF sampling. The light sample evaluates the true emission at
+  the sampled point, with the footprint of the BSDF ray in that direction so
+  both strategies see the same filtered textures, and BSDF hits weight these
+  triangles by their own density. glTF emissive textures and OBJ `map_Ke`
+  take this path. Limits: more than 2^20 such triangles are left to BSDF
+  sampling; the estimate (a few seconds for OpenPBR's 157k-triangle emissive
+  MEET MAT) reruns at each scene change.
 - **Material edits of displacing materials** rebuild bindings but not the
   displaced geometry until the next full snapshot.
 
@@ -46,7 +59,7 @@ Scenes: **Eggs** (MaterialEggs), **OpenPBR** (OpenPBRShaderPlayground),
 - **Many-light sampling.** NEE picks lights by power from an alias table,
   then re-picks analytic lights by their estimated irradiance at the shading
   point (up to 64 of them; see [Sampling](gpu_devices.md#sampling)). Emissive
-  triangles are still picked by power alone, and BSDF rays test every
+  triangles are still picked by (estimated) power alone, and BSDF rays test every
   analytic light; scenes with hundreds of lights want a light BVH.
 - **Solid-angle sampling of emissive triangles and disk lights** (spherical
   triangles, Arvo 1995); both are area-sampled. On CornellBox direct light is
@@ -257,7 +270,7 @@ GPUs from every vendor. To close the gaps, in order:
      caustics through glass (see [Lights](#lights)).
    - Path guiding, for interiors lit through openings or by bounced light,
      where light sampling cannot aim (see [Lights](#lights)).
-   - Textured emissive meshes as NEE lights.
+   - Textured emissive meshes as NEE lights (done).
    - A light BVH for scenes with hundreds of lights.
 4. **Production output.**
    - `RenderSettings`, `RenderProduct` and `RenderVar` (done in

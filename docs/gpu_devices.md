@@ -344,7 +344,8 @@ numbers in the same order and agree sample for sample.
   MIS against BSDF sampling for every light type. Probabilistic NEE
   (`prism:neeProbabilityMin`) is off by default.
 - **Light selection.** An alias table over the light table picks by power
-  (analytic lights, constant-emission triangles, the dome as one entry).
+  (analytic lights, constant-emission triangles, triangles of varying
+  emission by their estimated power, the dome as one entry).
   With `prism:lightSelection spatial` (default) and 2 to 64 analytic lights,
   an analytic pick is redone among the analytic lights in proportion to
   `lightImportance` at the shading point: radiance times the solid angle
@@ -357,6 +358,19 @@ numbers in the same order and agree sample for sample.
   rectangles, Urena et al. 2013) above 1e-3 sr, area below. Cylinders: the
   arc visible from the shading point, equiangular along the axis. Disks and
   triangles: area. Distant lights: cone. Dome: texel alias table.
+- **Emissive triangles of varying emission** (`kLightVaryingEmission`;
+  [feature_roadmap.md](feature_roadmap.md), "Textured emission as lights"):
+  the light sample asks the backend for the emission at the sampled point
+  (`backend.emitterRadiance`): the CPU builds the hit Embree would report and
+  runs the material; the GPU builds it with `gpu_hit_from_raw` and runs the
+  emitter dispatch (`prism_mdl_*_emitter`, programs of such materials only)
+  in the compute kernel, or calls the program's callable with
+  `kMaterialCallEmitted`. The lookup uses the footprint of the BSDF ray in
+  that direction (`spawnRay`), so next-event estimation and BSDF hits see
+  the same filtered textures; with an empty footprint the far floor of the
+  checker fixture came out 6 to 10% bright. BSDF hits take each triangle's
+  own density from `GpuInstance.emitters` (per-primitive densities after the
+  primitive material tables) or `LightTable::varyingEmitters`.
 - **Russian roulette** from `prism:rrMinDepth` (4) with survival
   clamp(path weight, 0.05, 0.95).
 
@@ -565,6 +579,35 @@ called done there.
     `implicit_surfaces.usda` against `prism_hydra_render` on the CPU with
     `prism_compare_images` (the `prism_parity_instance_primvars_vulkan_match`
     tolerances), and chess and an egg on Metal against the CPU.
+- **Textured emitters as lights** ([Sampling](#sampling); Metal runs the
+  compute-kernel path):
+  - Shared shader code: `shaders/integrator/lights.h`
+    (`kLightVaryingEmission`, `kLightSwappedVertices`, sampleLight's triangle
+    `texcoord` = barycentrics, `primitiveBarycentrics`),
+    `shaders/integrator/path_tracer.h` (chooseLight calls
+    `backend.emitterRadiance` with `spawnRay(...)`'s footprint),
+    `shaders/shared/prism_gpu_types.h` (`GpuInstance.emitters`, one more
+    `uint4`: 144-byte instances; check the Metal instance buffer stride and
+    that `metal_device.mm` uploads `d.instances` whole),
+    `shaders/gpu/gpu_backend.hlsl` (`gpu_hit_from_raw` split out of
+    `gpu_intersect`; `gpu_mdl_emitter_emission`, `gpu_mdl_emitter_radiance`;
+    `GpuBackend::emitterRadiance`; `emitterPdfArea` reads the per-primitive
+    densities stored as float bits in the primitive material table),
+    `material_call.hlsl` / `vulkan/material_callable.hlsl` (Vulkan callables
+    only: `kMaterialCallEmitted`).
+  - Shared host code: `src/device/light_table.h` (estimate, records,
+    `SceneHasEmitters`), `src/device/gpu/gpu_scene.cpp` (record placement →
+    instance index, density tables), `src/device/gpu/gpu_materials.cpp`
+    (`prism_mdl_*_emitter` dispatch; persistent program cache `v2`,
+    structural keys `v4`), `src/mdl/backend_compiler.cpp`
+    (`emission_zero`, `backface_emission`), `src/mdl_material.h`,
+    `src/material.h`.
+  - Runs: the Metal kernel compiles (the emitter dispatch is in every
+    kernel, empty without such materials); `ctest -R textured_emitter` on
+    the CPU, then `tests/hydra/fixtures/textured_emitter.usda` with `--device
+    metal` against `--device cpu` (`prism_compare_images`, as
+    `prism_textured_emitter_vulkan_parity` does), and chess and an egg
+    unchanged against the previous build (`--exact`).
 
 ## Diagnostics
 
