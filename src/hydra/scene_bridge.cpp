@@ -7031,13 +7031,17 @@ void SceneBridge::Render()
                             const auto writeStart = _impl->profileBufferWrites
                                 ? std::chrono::steady_clock::now()
                                 : std::chrono::steady_clock::time_point{};
+                            // Converged pixels keep their accumulated value
+                            // in the storage this pass publishes.
+                            if (_TracedAov(kind) && !traced(pixel)) {
+                                buffer->KeepAccumulated(x, bufferY);
+                                continue;
+                            }
                             if (kind == AovKind::Color) {
-                                if (!traced(pixel)) continue;
                                 Color3 const &c = passColors[pixel];
                                 float v[4] = {c.x(), c.y(), c.z(), passCoverage[pixel]};
                                 buffer->WriteFloat(x, bufferY, v, 4, true);
                             } else if (_LightAov(kind)) {
-                                if (!traced(pixel)) continue;
                                 Color3 const &c = _LightAovValue(passLightAovs[pixel], kind);
                                 const float v[3] = {c.x(), c.y(), c.z()};
                                 buffer->WriteFloat(x, bufferY, v, 3, true);

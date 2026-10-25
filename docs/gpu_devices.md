@@ -652,6 +652,15 @@ called done there.
     (`prism_compare_images --layer Albedo|Diffuse|Specular|Emission`); usdview
     showing the `diffuse` AOV on Metal; chess and an egg with default outputs
     unchanged against the previous build (`--exact`).
+- **Converged pixels kept in published Hydra buffers** (adaptive sampling):
+  - Shared host code only: `src/hydra/scene_bridge.cpp` (the pass commit
+    writes `PrismRenderBuffer::KeepAccumulated` for colour and light-AOV
+    pixels adaptive sampling no longer traces) and `src/hydra/render_buffer.*`.
+    No shader or device change.
+  - Runs: `prism_hydra_scene_bridge_test adaptive-publication metal` (CTest
+    registers `cpu` and `vulkan` only); usdview on a dome-lit scene to a late
+    sample count: the dome background must stay visible once most pixels
+    have converged.
 
 ## Diagnostics
 

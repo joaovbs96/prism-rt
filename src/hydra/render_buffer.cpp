@@ -503,6 +503,20 @@ void PrismRenderBuffer::WriteFloat(unsigned int x, unsigned int y,
     _Write(x, y, value, n, accumulate);
 }
 
+void PrismRenderBuffer::KeepAccumulated(unsigned int x, unsigned int y)
+{
+    if (x >= _width || y >= _height || _format == HdFormatInvalid) return;
+    const size_t pixel = static_cast<size_t>(y) * _width + x;
+    const uint32_t count = _sampleCounts[pixel];
+    if (count == 0) return;
+    const size_t arity = HdGetComponentCount(_format);
+    uint8_t *dst = _workingPixels.data() + pixel * HdDataSizeOfFormat(_format);
+    // The same value _Write stored when the pixel was last traced.
+    for (size_t c = 0; c < arity; ++c)
+        _StoreComponent(_format, dst, c,
+                        _accumulation[pixel * arity + c] / static_cast<float>(count));
+}
+
 void PrismRenderBuffer::WriteInt(unsigned int x, unsigned int y,
                                  const int *value, size_t n)
 {

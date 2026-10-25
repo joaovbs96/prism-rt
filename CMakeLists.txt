@@ -495,6 +495,7 @@ if(PRISM_BUILD_HYDRA)
             tests/hydra/dependency_updates_test.cpp
             tests/hydra/structural_updates_test.cpp
             tests/hydra/accumulation_integration_test.cpp
+            tests/hydra/adaptive_publication_integration_test.cpp
         tests/hydra/progressive_integration_test.cpp
             tests/hydra/progress_status_test.cpp
             tests/hydra/gpu_preparation_preview_test.cpp
@@ -514,6 +515,14 @@ if(PRISM_BUILD_HYDRA)
             RUNTIME_OUTPUT_DIRECTORY "$<1:${CMAKE_BINARY_DIR}/hydra/plugin>")
         add_test(NAME prism_hydra_scene_bridge_test COMMAND prism_hydra_scene_bridge_test)
         set_tests_properties(prism_hydra_scene_bridge_test PROPERTIES ENVIRONMENT "${_prism_test_environment}")
+        # Converged pixels keep their values in every published buffer while a
+        # host maps the buffers (usdview), on the CPU and on Vulkan.
+        foreach(_device cpu vulkan)
+            add_test(NAME prism_hydra_adaptive_publication_${_device}
+                COMMAND prism_hydra_scene_bridge_test adaptive-publication ${_device})
+            set_tests_properties(prism_hydra_adaptive_publication_${_device} PROPERTIES
+                ENVIRONMENT "${_prism_test_environment}")
+        endforeach()
     endif()
 
     add_executable(prism_hydra_render_buffer_test
@@ -1378,7 +1387,7 @@ endif()
 # excluded. GPU tests share RESOURCE_LOCK gpu, so `ctest -LE gpu -j N` can run
 # beside GPU work and a parallel run never puts two GPU tests on the device.
 set(_prism_gpu_test_regex
-    "^prism_hydra_(render_exercise|transparent_background_export|depth1_render|depth_change_render|setting_change_test|cutout_(medium|clear)_render|cutout_medium_test|animation_exercise|pass_camera_test|scene_bridge_test|streaming_(cold|warm|whole)|streaming_.*_matches_.*)$"
+    "^prism_hydra_(adaptive_publication_vulkan|render_exercise|transparent_background_export|depth1_render|depth_change_render|setting_change_test|cutout_(medium|clear)_render|cutout_medium_test|animation_exercise|pass_camera_test|scene_bridge_test|streaming_(cold|warm|whole)|streaming_.*_matches_.*)$"
     "|^prism_(gpu_shader_compile_test|device_selection_test|cli_clean_exit_vulkan|cli_gpu_failure_vulkan)$"
     "|^prism_(gltf|obj)_.*_vulkan_(render|parity|test)$"
     "|^prism_parity_.*_(vulkan|metal)_(cli|hydra|match)$"

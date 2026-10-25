@@ -103,6 +103,11 @@ public:
                     size_t components, bool accumulate);
     void WriteInt(unsigned int x, unsigned int y, const int *value,
                   size_t components);
+    // Writes the accumulated mean of a pixel the pass did not trace (adaptive
+    // sampling converged it) into the working pixels. Publish recycles an
+    // older storage, or starts a zero-filled one while a host maps the
+    // published pixels, so an unwritten pixel would not keep its value.
+    void KeepAccumulated(unsigned int x, unsigned int y);
     void SetConverged(bool value) { _converged.store(value); }
     void ResetSamples();
     uint64_t GetAllocationRevision() const { return _allocationRevision.load(); }

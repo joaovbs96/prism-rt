@@ -56,6 +56,7 @@ int RunProgressiveIntegrationTests();
 int RunProgressStatusTests();
 int RunGpuPreparationPreviewTests();
 int RunAccumulationIntegrationTests();
+int RunAdaptivePublicationTests(std::string const &device);
 int RunB2DoublePrimvarIntegrationTests();
 int RunB3FallbackOpacityIntegrationTests();
 int RunC2GeometricAovIntegrationTests();
@@ -652,7 +653,7 @@ RayHit HitTransformedSphere(bool mirrored)
 
 } // namespace
 
-int main()
+int main(int argc, char **argv)
 {
     const std::string testCache =
         (std::filesystem::current_path() / "scene_bridge_test_cache").string();
@@ -669,6 +670,9 @@ int main()
 #else
     setenv("PRISM_GPU_PREPARATION_PREVIEW", "0", 1);
 #endif
+    // `adaptive-publication cpu|vulkan` runs only that check (one CTest each).
+    if (argc == 3 && std::string(argv[1]) == "adaptive-publication")
+        return RunAdaptivePublicationTests(argv[2]);
     if (RunAuthoredSettingsTests() != 0) return 1;
     if (RunB2DoublePrimvarIntegrationTests() != 0) return 1;
     if (RunB3FallbackOpacityIntegrationTests() != 0) return 1;
