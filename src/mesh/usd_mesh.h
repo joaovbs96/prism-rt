@@ -40,6 +40,11 @@
 #include <pxr/usd/usdGeom/plane.h>
 #include <pxr/usd/usdGeom/gprim.h>
 #include <pxr/usd/usdGeom/subset.h>
+#include <pxr/usd/usdSkel/binding.h>
+#include <pxr/usd/usdSkel/cache.h>
+#include <pxr/usd/usdSkel/root.h>
+#include <pxr/usd/usdSkel/skeletonQuery.h>
+#include <pxr/usd/usdSkel/skinningQuery.h>
 #include <pxr/imaging/geomUtil/capsuleMeshGenerator.h>
 #include <pxr/imaging/geomUtil/coneMeshGenerator.h>
 #include <pxr/imaging/geomUtil/cuboidMeshGenerator.h>
@@ -379,29 +384,16 @@ CollectMaterialXMaterials(const UsdStageRefPtr& stage,
         UsdShadeMaterial material(prim);
         if (!material) continue;
 
-        // --- Case 1: Direct .mtlx file reference ---
-        auto mtlxFile = FindReferencedMtlxFileInAncestors(prim);
-        if (mtlxFile.has_value()) {
-            ResolvedMtlxMaterial resolved;
-            resolved.materialPath = materialPath;
-            resolved.sourceKind   = MtlxSourceKind::ReferencedFile;
-            resolved.mtlxFilePath = mtlxFile.value();
-            resolved.materialName = materialPath.GetName();
-
-            if (UsdMaterialVerbose()) std::cout << "[MtlxCollect] Found referenced .mtlx: "
-                      << resolved.mtlxFilePath << " at " << materialPath << "\n";
-
-            result[materialPath] = std::move(resolved);
-            continue;
-        }
-
-        // --- Case 2: UsdShade-encoded MaterialX ---
-        if (HasMtlxSurfaceOutput(material)) {
+        // --- Case 1: UsdShade-encoded MaterialX ---
+        // The composed UsdShade network, as the Hydra delegate reads it; .mtlx
+        // files referenced into the stage arrive this way too (usdMtlx).
+        auto encoded = [&]() -> bool {
+            if (!HasMtlxSurfaceOutput(material)) return false;
             ResolvedMtlxMaterial resolved;
             const TfToken mtlxContext("mtlx");
             const TfTokenVector contexts{mtlxContext};
             const UsdShadeShader surface=material.ComputeSurfaceSource(contexts);
-            if (!surface) continue;
+            if (!surface) return false;
             HdMaterialNetworkMap networkMap;
             UsdImagingBuildHdMaterialNetworkFromTerminal(surface.GetPrim(),
                 HdMaterialTerminalTokens->surface,contexts,contexts,&networkMap,time);
@@ -415,7 +407,7 @@ CollectMaterialXMaterials(const UsdStageRefPtr& stage,
                 HdConvertToHdMaterialNetwork2(networkMap,&isVolume));
             const auto terminal=network->terminals.find(HdMaterialTerminalTokens->surface);
             if (terminal==network->terminals.end() ||
-                !network->nodes.contains(terminal->second.upstreamNode)) continue;
+                !network->nodes.contains(terminal->second.upstreamNode)) return false;
             HdMaterialNetwork2Interface networkInterface(materialPath,network.get());
             resolved.capturedGraph=prism::materialx::CaptureMaterialGraph(
                 networkInterface,mtlxContext,materialPath);
@@ -440,6 +432,24 @@ CollectMaterialXMaterials(const UsdStageRefPtr& stage,
                       << resolved.materialName << "')\n";
 
             result[materialPath] = std::move(resolved);
+            return true;
+        };
+        if (encoded()) continue;
+
+        // --- Case 2: a .mtlx file referenced into the stage, read directly ---
+        auto mtlxFile = FindReferencedMtlxFileInAncestors(prim);
+        if (mtlxFile.has_value()) {
+            ResolvedMtlxMaterial resolved;
+            resolved.materialPath = materialPath;
+            resolved.sourceKind   = MtlxSourceKind::ReferencedFile;
+            resolved.mtlxFilePath = mtlxFile.value();
+            resolved.materialName = materialPath.GetName();
+
+            if (UsdMaterialVerbose()) std::cout << "[MtlxCollect] Found referenced .mtlx: "
+                      << resolved.mtlxFilePath << " at " << materialPath << "\n";
+
+            result[materialPath] = std::move(resolved);
+            continue;
         }
     }
 
@@ -1633,7 +1643,8 @@ private:
     {
         auto existing = m_fallbackByPath.find(prim.GetPath());
         if (existing != m_fallbackByPath.end()) return materials.at(existing->second);
-        Color3 color(0.7f, 0.7f, 0.7f);
+        // Without displayColor: the delegate's fallback grey.
+        Color3 color(0.5f, 0.5f, 0.5f);
         float opacity = 1.0f;
         bool primvarColor = false, primvarOpacity = false;
         const bool meshLike = !prim.IsA<pxr::UsdGeomSphere>();
@@ -1722,7 +1733,52 @@ private:
 
     // Skinned points of a mesh bound to a skeleton (UsdSkel), at the load
     // time; null for other meshes.
-    pxr::VtVec3fArray const* skinnedPoints(pxr::UsdPrim const&) { return nullptr; }
+    pxr::VtVec3fArray const* skinnedPoints(pxr::UsdPrim const& prim)
+    {
+        auto found = m_skinnedPoints.find(prim.GetPath());
+        return found == m_skinnedPoints.end() ? nullptr : &found->second;
+    }
+
+    // UsdSkel linear blend skinning of the meshes under each SkelRoot at the
+    // load time (UsdSkelCache; the stage is not edited). Skinned points are
+    // computed in skeleton space and brought into each mesh's own space, so
+    // the mesh keeps its transform. Blend shapes are not applied.
+    void skinMeshes(pxr::UsdStageRefPtr const& stage)
+    {
+        pxr::UsdSkelCache cache;
+        bool warnedBlendShapes = false;
+        const auto predicate = pxr::UsdTraverseInstanceProxies();
+        for (pxr::UsdPrim const& prim : pxr::UsdPrimRange(stage->GetPseudoRoot(), predicate)) {
+            if (!prim.IsA<pxr::UsdSkelRoot>()) continue;
+            const pxr::UsdSkelRoot root(prim);
+            cache.Populate(root, predicate);
+            std::vector<pxr::UsdSkelBinding> bindings;
+            cache.ComputeSkelBindings(root, &bindings, predicate);
+            for (auto const& binding : bindings) {
+                const pxr::UsdSkelSkeletonQuery skeleton = cache.GetSkelQuery(binding.GetSkeleton());
+                pxr::VtMatrix4dArray transforms;
+                if (!skeleton || !skeleton.ComputeSkinningTransforms(&transforms, m_options.time)) continue;
+                const pxr::GfMatrix4d skeletonToWorld =
+                    m_xformCache->GetLocalToWorldTransform(binding.GetSkeleton().GetPrim());
+                for (pxr::UsdSkelSkinningQuery const& query : binding.GetSkinningTargets()) {
+                    const pxr::UsdPrim target = query.GetPrim();
+                    if (!target.IsA<pxr::UsdGeomMesh>() || !query.HasJointInfluences()) continue;
+                    if (query.HasBlendShapes() && !warnedBlendShapes) {
+                        std::cerr << "[USDMesh] UsdSkel blend shapes are not applied (first at "
+                                  << target.GetPath() << ")\n";
+                        warnedBlendShapes = true;
+                    }
+                    pxr::VtVec3fArray points;
+                    if (!pxr::UsdGeomMesh(target).GetPointsAttr().Get(&points, m_options.time) ||
+                        !query.ComputeSkinnedPoints(transforms, &points, m_options.time)) continue;
+                    const pxr::GfMatrix4d skeletonToMesh =
+                        skeletonToWorld * m_xformCache->GetLocalToWorldTransform(target).GetInverse();
+                    for (auto& point : points) point = pxr::GfVec3f(skeletonToMesh.Transform(pxr::GfVec3d(point)));
+                    m_skinnedPoints[target.GetPath()] = std::move(points);
+                }
+            }
+        }
+    }
 
     void addGprim(pxr::UsdPrim const& prim)
     {
@@ -1773,6 +1829,7 @@ private:
     void collectGeometry(pxr::UsdStageRefPtr const& stage)
     {
         m_xformCache = std::make_unique<pxr::UsdGeomXformCache>(m_options.time);
+        skinMeshes(stage);
         // PointInstancer prototype roots and the instancers listing them,
         // including instancers inside native prototypes.
         std::vector<pxr::UsdPrim> roots{stage->GetPseudoRoot()};
@@ -1908,4 +1965,5 @@ private:
     std::unordered_map<pxr::SdfPath, PointInstancerData, pxr::SdfPath::Hash> m_instancerData;
     std::unordered_map<pxr::SdfPath, std::pair<bool, std::vector<Instance>>, pxr::SdfPath::Hash> m_placementCache;
     std::map<std::pair<pxr::SdfPath, pxr::SdfPath>, int> m_primIds;
+    std::unordered_map<pxr::SdfPath, pxr::VtVec3fArray, pxr::SdfPath::Hash> m_skinnedPoints;
 };
