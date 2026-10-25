@@ -6,6 +6,7 @@
 #     [TOLERANCE 0.01] [MEAN_TOLERANCE <tolerance>]
 #     [ARGS <options of both frontends>...]
 #     [CLI_ARGS <PrismRT options>...] [HYDRA_ARGS <prism_hydra_render options>...]
+#     [ENV <NAME=value>...]   (environment of both renders)
 #     [EXACT_LAYERS <file>:<layer>...] [RELABEL_LAYERS <file>:<layer>...]
 #     [CLI_DEVICE cpu|vulkan|metal])
 #
@@ -29,7 +30,7 @@
 # prism_parity_<name>_dir.
 function(prism_add_parity_fixture)
     cmake_parse_arguments(P "" "NAME;SCENE;CAMERA;WIDTH;HEIGHT;SPP;TOLERANCE;MEAN_TOLERANCE;CLI_DEVICE"
-        "ARGS;CLI_ARGS;HYDRA_ARGS;PRODUCTS;EXACT_LAYERS;RELABEL_LAYERS" ${ARGN})
+        "ARGS;CLI_ARGS;HYDRA_ARGS;ENV;PRODUCTS;EXACT_LAYERS;RELABEL_LAYERS" ${ARGN})
     if(NOT P_NAME OR NOT P_SCENE)
         message(FATAL_ERROR "prism_add_parity_fixture needs NAME and SCENE")
     endif()
@@ -66,10 +67,10 @@ function(prism_add_parity_fixture)
     endif()
     # The CPU device in both frontends unless CLI_DEVICE says otherwise.
     set_tests_properties(${_prefix}_hydra PROPERTIES
-        ENVIRONMENT "${_prism_test_environment};PRISM_DEVICE=cpu"
+        ENVIRONMENT "${_prism_test_environment};PRISM_DEVICE=cpu;${P_ENV}"
         FIXTURES_SETUP ${_prefix})
     set_tests_properties(${_prefix}_cli PROPERTIES
-        ENVIRONMENT "${_prism_test_environment};PRISM_DEVICE=${P_CLI_DEVICE}"
+        ENVIRONMENT "${_prism_test_environment};PRISM_DEVICE=${P_CLI_DEVICE};${P_ENV}"
         FIXTURES_SETUP ${_prefix})
     list(LENGTH _outputs _count)
     foreach(_output IN LISTS _outputs)

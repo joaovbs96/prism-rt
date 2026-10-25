@@ -849,6 +849,12 @@ if(TARGET prism_hydra_render AND TARGET prism_compare_images)
     prism_add_parity_fixture(NAME cutout_medium SCENE tests/hydra/fixtures/cutout_medium.usda)
     prism_add_parity_fixture(NAME sss_furnace SCENE tests/hydra/fixtures/sss_furnace.usda)
     prism_add_parity_fixture(NAME preview_mtlx SCENE tests/hydra/fixtures/preview_mtlx_parity.usda)
+    # A referenced .mtlx whose emission is a texture behind a remap, and a
+    # thin-walled floor that does not emit: the floor's triangles must not
+    # count against the (lowered) budget of emitters of varying emission, or
+    # the CLI leaves the emitter out of its light table.
+    prism_add_parity_fixture(NAME mtlx_emission SCENE tests/hydra/fixtures/mtlx_emission.usda
+        ENV PRISM_MAX_VARYING_EMITTER_TRIANGLES=100)
     prism_add_parity_fixture(NAME cornell_box SCENE assets/scenes/CornellBox.usda)
     prism_add_parity_fixture(NAME quad_test SCENE assets/scenes/QuadTest.usda)
     prism_add_parity_fixture(NAME in_one_weekend SCENE assets/scenes/InOneWeekend.usda)

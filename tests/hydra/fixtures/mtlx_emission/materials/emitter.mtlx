@@ -1,0 +1,31 @@
+<?xml version="1.0"?>
+<materialx version="1.39" colorspace="lin_rec709">
+  <geompropvalue name="st" type="vector2">
+    <input name="geomprop" type="string" value="st" />
+  </geompropvalue>
+
+  <image name="Mask" type="color3">
+    <input name="file" type="filename" colorspace="Raw" value="../textures/mask.png" />
+    <input name="texcoord" type="vector2" nodename="st" />
+  </image>
+
+  <remap name="mtlxremap1" type="color3">
+    <input name="in" type="color3" nodename="Mask" />
+    <input name="inlow" type="color3" value="0.23, 0.4, 0.4" />
+    <input name="outhigh" type="color3" value="2, 2, 2" />
+  </remap>
+  <extract name="to_float" type="float">
+    <input name="in" type="color3" nodename="mtlxremap1" />
+  </extract>
+
+  <open_pbr_surface name="mtlxopen_pbr_surface" type="surfaceshader">
+    <input name="base_weight" type="float" value="0" />
+    <input name="emission_luminance" type="float" nodename="to_float" />
+    <input name="emission_color" type="color3" value="1, 0.6, 0.3" />
+    <input name="specular_weight" type="float" value="0" />
+  </open_pbr_surface>
+
+  <surfacematerial name="emitter" type="material">
+    <input name="surfaceshader" type="surfaceshader" nodename="mtlxopen_pbr_surface" />
+  </surfacematerial>
+</materialx>

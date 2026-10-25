@@ -1,0 +1,16 @@
+<?xml version="1.0"?>
+<materialx version="1.39" colorspace="lin_rec709">
+  <open_pbr_surface name="mtlxopen_pbr_surface" type="surfaceshader">
+    <input name="base_color" type="color3" value="0.8, 0.8, 0.8" />
+    <input name="specular_weight" type="float" value="0" />
+    <input name="emission_luminance" type="float" value="0" />
+    <input name="emission_color" type="color3" value="1, 0.5, 0.25" />
+    <input name="geometry_thin_walled" type="boolean" value="true" />
+    <input name="subsurface_weight" type="float" value="0.05" />
+    <input name="transmission_weight" type="float" value="0.05" />
+  </open_pbr_surface>
+
+  <surfacematerial name="floor" type="material">
+    <input name="surfaceshader" type="surfaceshader" nodename="mtlxopen_pbr_surface" />
+  </surfacematerial>
+</materialx>
