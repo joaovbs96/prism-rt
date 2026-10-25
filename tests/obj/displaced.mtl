@@ -1,0 +1,11 @@
+# PrismRT make_fixtures.py
+newmtl ridged
+Kd 0.8 0.8 0.8
+Ks 0 0 0
+illum 1
+disp -mm 0 0.3 height.png
+
+newmtl flat
+Kd 0.8 0.8 0.8
+Ks 0 0 0
+illum 1

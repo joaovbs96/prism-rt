@@ -142,6 +142,25 @@ illum 2
 norm normal.png
 """, newline="\n")
 
+    # disp: the left quad is diced and displaced at load time (sine ridges
+    # 0.3 high), the right one is flat.
+    displaced = Obj("displaced.mtl")
+    displaced.quad("ridged", (-1.1, 0, 0), 2)
+    displaced.quad("flat", (1.1, 0, 0), 2)
+    displaced.write(out / "displaced.obj")
+    (out / "displaced.mtl").write_text("""# PrismRT make_fixtures.py
+newmtl ridged
+Kd 0.8 0.8 0.8
+Ks 0 0 0
+illum 1
+disp -mm 0 0.3 height.png
+
+newmtl flat
+Kd 0.8 0.8 0.8
+Ks 0 0 0
+illum 1
+""", newline="\n")
+
     glass = Obj("glass.mtl")
     glass.sphere("refracting", (-1.2, 0, 0), 1)
     glass.sphere("dissolving", (1.2, 0, 0), 1)

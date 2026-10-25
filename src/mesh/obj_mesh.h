@@ -28,6 +28,11 @@
 #include "../materialx/obj_material.h"
 #include "../materialx/cached_document.h"
 #include "../materialx/resolved_resource.h"
+#include "../render_defaults.h"
+#include "mesh_conversion.h"
+#include <pxr/base/gf/vec2f.h>
+#include <pxr/base/gf/vec3f.h>
+#include <pxr/base/vt/types.h>
 
 // Wavefront OBJ scenes. MTL materials load as MaterialX open_pbr_surface
 // documents compiled through MDL (docs/obj.md). A material whose conversion
@@ -36,8 +41,12 @@
 // material are grey (Diffuse 0.5).
 class ObjMesh : public Mesh {
     public:
+        // Faces whose material displaces them (MTL disp) are diced and
+        // displaced at load time with `subdivision`'s displacement level and
+        // face limit, as USD meshes are.
         ObjMesh(const std::filesystem::path &file_path, mdl::Context* mdl_context,
-                const std::string& mx_libraries_path, const std::string& mx_mdl_path)
+                const std::string& mx_libraries_path, const std::string& mx_mdl_path,
+                prism::mesh::SubdivisionSettings subdivision = DefaultSubdivision())
             : m_path(file_path)
         {
             // based on: https://github.com/yumcyaWiz/embree-tinyobj-example
@@ -105,6 +114,7 @@ class ObjMesh : public Mesh {
             std::cout << "Finished creating mesh data. " << std::endl;
 
             buildMaterials(obj_materials, used, reader, mdl_context, mx_libraries_path, mx_mdl_path);
+            displace(subdivision);
             std::cout << "OBJ: " << vertices.size() << " vertices, " << indices.size() / 3 << " triangles, "
                       << materials.size() << " material(s)\n";
         }
@@ -114,7 +124,91 @@ class ObjMesh : public Mesh {
         size_t materialxMaterialCount() const { return m_materialxCount; }
         size_t errorMaterialCount() const { return m_errorCount; }
 
+        static prism::mesh::SubdivisionSettings DefaultSubdivision()
+        {
+            auto const& defaults = prism::defaults::FromEnvironment();
+            prism::mesh::SubdivisionSettings result;
+            result.displacementLevel = defaults.displacementLevel;
+            result.displacementMaxFaces = size_t(defaults.displacementMaxFaces);
+            return result;
+        }
+
     private:
+        // Faces of displacing materials, by the shared conversion: each
+        // material's faces become a mesh (corners at one position welded, so
+        // the surface stays closed), refined bilinearly to the displacement
+        // level within its face limit, and displaced.
+        void displace(prism::mesh::SubdivisionSettings const& subdivision)
+        {
+            std::map<int, std::vector<size_t>> displaced; // material -> triangles
+            const size_t triangles = indices.size() / 3;
+            for (size_t t = 0; t < triangles; ++t) {
+                auto material = materials.find(material_mapping.at(int(t)));
+                if (material != materials.end() && material->second && material->second->hasDisplacement())
+                    displaced[material->first].push_back(t);
+            }
+            if (displaced.empty()) return;
+            std::vector<Float3> keptVertices, keptNormals;
+            std::vector<Float2> keptTexcoords;
+            std::vector<unsigned> keptIndices;
+            std::unordered_map<int, int> keptMaterials;
+            int face = 0;
+            for (size_t t = 0; t < triangles; ++t) {
+                const int material = material_mapping.at(int(t));
+                if (displaced.contains(material)) continue;
+                for (int k = 0; k < 3; ++k) {
+                    const unsigned v = indices[3 * t + k];
+                    keptIndices.push_back(unsigned(keptVertices.size()));
+                    keptVertices.push_back(vertices[v]);
+                    keptNormals.push_back(normals[v]);
+                    keptTexcoords.push_back(texcoords[v]);
+                }
+                keptMaterials[face++] = material;
+            }
+            size_t refinedTriangles = 0;
+            for (auto const& [material, faces] : displaced) {
+                prism::mesh::MeshSource source;
+                pxr::VtVec3fArray points;
+                pxr::VtVec2fArray uvs;
+                std::map<std::array<float, 3>, int> welded;
+                for (size_t t : faces) {
+                    source.faceVertexCounts.push_back(3);
+                    for (int k = 0; k < 3; ++k) {
+                        const unsigned v = indices[3 * t + k];
+                        const std::array<float, 3> key{vertices[v].x(), vertices[v].y(), vertices[v].z()};
+                        auto [found, added] = welded.emplace(key, int(points.size()));
+                        if (added) points.push_back(pxr::GfVec3f(key[0], key[1], key[2]));
+                        source.faceVertexIndices.push_back(found->second);
+                        uvs.push_back(pxr::GfVec2f(texcoords[v].u(), texcoords[v].v()));
+                    }
+                }
+                source.points.value = pxr::VtValue(std::move(points));
+                source.points.interpolation = pxr::TfToken("vertex");
+                source.uvs.value = pxr::VtValue(std::move(uvs));
+                source.uvs.interpolation = pxr::TfToken("faceVarying");
+                source.doubleSided = true;
+                prism::mesh::MeshConversion conversion =
+                    prism::mesh::ConvertMesh(source, subdivision, materials.at(material));
+                if (!conversion.mesh) continue;
+                Mesh const& mesh = *conversion.mesh;
+                const unsigned base = unsigned(keptVertices.size());
+                keptVertices.insert(keptVertices.end(), mesh.vertices.begin(), mesh.vertices.end());
+                keptNormals.insert(keptNormals.end(), mesh.normals.begin(), mesh.normals.end());
+                keptTexcoords.insert(keptTexcoords.end(), mesh.texcoords.begin(), mesh.texcoords.end());
+                for (unsigned index : mesh.indices) keptIndices.push_back(base + index);
+                for (size_t t = 0; t < mesh.indices.size() / 3; ++t) keptMaterials[face++] = material;
+                refinedTriangles += mesh.indices.size() / 3;
+            }
+            vertices = std::move(keptVertices);
+            normals = std::move(keptNormals);
+            texcoords = std::move(keptTexcoords);
+            indices = std::move(keptIndices);
+            material_mapping = std::move(keptMaterials);
+            tangents.clear();
+            std::cout << "OBJ: displaced the faces of " << displaced.size() << " material(s) into "
+                      << refinedTriangles << " triangles\n";
+        }
+
         // tinyobjloader's file reader for mtllib, which also keeps each MTL
         // file's statements (tinyobjloader cannot tell its defaults from
         // authored values) and the directory its maps resolve against.
@@ -183,7 +277,6 @@ class ObjMesh : public Mesh {
             std::map<std::string, ImageHeader> headers;
             std::map<std::string, std::string> unsupported;               // -> first material
             std::set<std::string> warned;
-            bool displaced = false;
             size_t reused = 0;
             for (int m : used) {
                 if (m < 0) continue;
@@ -236,11 +329,6 @@ class ObjMesh : public Mesh {
                     for (auto const& warning : conversion.warnings)
                         if (warned.insert(warning).second) std::cerr << "PrismRT OBJ: " << warning << "\n";
                     for (auto const& statement : conversion.unsupported) unsupported.emplace(statement, material.name);
-                    if (conversion.displacement && !displaced) {
-                        std::cerr << "PrismRT OBJ: disp is converted (material '" << material.name
-                                  << "'), but the standalone loader does not displace meshes yet (planned)\n";
-                        displaced = true;
-                    }
                     const std::string xml = MaterialX::writeToXmlString(conversion.document);
                     if (auto found = compiled.find(xml); found != compiled.end()) {
                         compiledMaterial = found->second;
