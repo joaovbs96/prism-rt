@@ -22,6 +22,9 @@
 #include <pxr/usd/usdLux/tokens.h>
 #include <pxr/usd/usdGeom/xformCache.h>
 #include <pxr/usd/usdRender/settings.h>
+#include <pxr/usd/usd/collectionAPI.h>
+#include <pxr/usd/usd/collectionMembershipQuery.h>
+#include <pxr/usd/ar/resolver.h>
 #include <pxr/base/plug/plugin.h>
 #include <pxr/base/plug/registry.h>
 #include <pxr/base/gf/camera.h>
@@ -82,6 +85,15 @@ struct Options {
     // Defaults from PRISM_GPU_TEXTURE_BUDGET_MIB and PRISM_SSS_FALLBACK.
     int gpuTextureBudgetMiB = prism::defaults::FromEnvironment().gpuTextureBudgetMiB;
     bool sssFallback = prism::defaults::FromEnvironment().sssFallback;
+    // Subdivision surfaces and displacement (prism:subdivisionLevel etc.;
+    // defaults from PRISM_SUBDIVISION_LEVEL etc.).
+    int subdivisionLevel = prism::defaults::FromEnvironment().subdivisionLevel;
+    int subdivisionMaxFaces = prism::defaults::FromEnvironment().subdivisionMaxFaces;
+    int subdivisionBudgetFaces = prism::defaults::FromEnvironment().subdivisionBudgetFaces;
+    int displacementLevel = prism::defaults::FromEnvironment().displacementLevel;
+    int displacementMaxFaces = prism::defaults::FromEnvironment().displacementMaxFaces;
+    // The USD time code scenes load at (--time; default: the default time).
+    std::optional<double> time;
     bool progress = true; // --no-progress
     unsigned contributions = 7;
     prism::device::NeeSettings nee;
@@ -119,6 +131,13 @@ void help() {
         "                 a line per 10%)\n"
         "  --sss-fallback true|false (default false: subsurface scattering is traced; true renders\n"
         "                 its diffuse lobe instead; default $PRISM_SSS_FALLBACK)\n"
+        "  --time T (USD time code of animated attributes, transforms and skinning; default: the\n"
+        "                 default time)\n"
+        "  --subdivision-level 2 --subdivision-max-faces 65536 --subdivision-budget-faces 25165824\n"
+        "                 (subdivision surfaces refine uniformly to the level, each mesh within the\n"
+        "                 maximum faces and all of them within the budget; 0 renders control hulls)\n"
+        "  --displacement-level 4 --displacement-max-faces 262144 (meshes their material displaces)\n"
+        "                 Defaults: $PRISM_SUBDIVISION_LEVEL etc. (docs/hydra.md)\n"
         "  Options take precedence over the RenderSettings prim's prism:* settings, which take\n"
         "  precedence over PRISM_* environment variables (docs/hydra.md)\n"
         "  --debug-contributions all|visible|direct|indirect (noise analysis: keep only light seen\n"
@@ -238,6 +257,17 @@ Options parse(int argc, char** argv) {
         else if (key == "--texture-streaming") o.textureStreaming = boolean(key, value);
         else if (key == "--gpu-texture-budget-mib") o.gpuTextureBudgetMiB = integer(value);
         else if (key == "--sss-fallback") o.sssFallback = boolean(key, value);
+        else if (key == "--subdivision-level") o.subdivisionLevel = integer(value);
+        else if (key == "--subdivision-max-faces") o.subdivisionMaxFaces = integer(value);
+        else if (key == "--subdivision-budget-faces") o.subdivisionBudgetFaces = integer(value);
+        else if (key == "--displacement-level") o.displacementLevel = integer(value);
+        else if (key == "--displacement-max-faces") o.displacementMaxFaces = integer(value);
+        else if (key == "--time") {
+            size_t used = 0;
+            const double t = std::stod(value, &used);
+            if (used != value.size() || !std::isfinite(t)) throw std::runtime_error("Invalid time code: " + value);
+            o.time = t;
+        }
         else if (key == "--nee-probability-min") o.nee.probabilityMin = number(value);
         else if (key == "--nee-from-depth") o.nee.fromDepth = integer(value);
         else if (key == "--light-selection") {
@@ -292,6 +322,9 @@ void validate(Options const& o) {
         throw std::runtime_error("--time-limit must be a nonnegative number of seconds");
     if (o.gpuTextureBudgetMiB < 0)
         throw std::runtime_error("--gpu-texture-budget-mib must be nonnegative (0: automatic)");
+    if (o.subdivisionLevel < 0 || o.displacementLevel < 0 || o.subdivisionMaxFaces < 1 ||
+        o.subdivisionBudgetFaces < 1 || o.displacementMaxFaces < 1)
+        throw std::runtime_error("Subdivision and displacement levels must be nonnegative and their face limits positive");
     if (static_cast<uint64_t>(o.width) * o.height > std::numeric_limits<unsigned>::max() / 4)
         throw std::runtime_error("Image dimensions are too large");
 }
@@ -347,13 +380,12 @@ void applyRenderSettings(VtDictionary const& settings, Options& o) {
     booleanSetting("textureStreaming", "--texture-streaming", &o.textureStreaming);
     integerSetting("gpuTextureBudgetMiB", "--gpu-texture-budget-mib", &o.gpuTextureBudgetMiB);
     booleanSetting("sssFallback", "--sss-fallback", &o.sssFallback);
-    // Settings of the delegate's mesh conversion: the standalone loader has
-    // no subdivision surfaces or displacement yet (docs/feature_roadmap.md).
-    for (const char* name : {"subdivisionLevel", "subdivisionMaxFaces", "subdivisionBudgetFaces",
-                             "displacementLevel", "displacementMaxFaces"})
-        if (value(name))
-            std::cerr << "PrismRT: prism:" << name << " does not apply to the standalone loader "
-                         "(no subdivision surfaces or displacement); ignored\n";
+    // Mesh conversion, as the delegate's.
+    integerSetting("subdivisionLevel", "--subdivision-level", &o.subdivisionLevel);
+    integerSetting("subdivisionMaxFaces", "--subdivision-max-faces", &o.subdivisionMaxFaces);
+    integerSetting("subdivisionBudgetFaces", "--subdivision-budget-faces", &o.subdivisionBudgetFaces);
+    integerSetting("displacementLevel", "--displacement-level", &o.displacementLevel);
+    integerSetting("displacementMaxFaces", "--displacement-max-faces", &o.displacementMaxFaces);
     if (auto name = textSetting("device", "--device"); !name.empty() &&
         !prism::device::ParseDevicePreference(name, &o.device)) {
         const std::string removed = prism::device::RemovedDeviceMessage(name);
@@ -375,6 +407,71 @@ void applyRenderSettings(VtDictionary const& settings, Options& o) {
 std::string TextureColorSpace(UsdAttribute const&) {
     return prism::color::kLightColorSpace;
 }
+
+// A light's texture file, resolved as the Hydra delegate resolves it (the
+// asset's resolved path, else the resolver on its authored path); empty when
+// it does not exist.
+std::string ResolvedLightTexture(SdfAssetPath const& asset) {
+    std::string resolved = asset.GetResolvedPath();
+    if (resolved.empty() && !asset.GetAssetPath().empty())
+        resolved = ArGetResolver().Resolve(asset.GetAssetPath()).GetPathString();
+    if (!resolved.empty() && !std::filesystem::exists(resolved)) resolved.clear();
+    return resolved;
+}
+
+// Light and shadow linking as the Hydra delegate gets it from
+// HdsiLightLinkingSceneIndex: a category bit per distinct collection that
+// does not include everything (at most 32 of each kind), and on each
+// placement the bits of the collections that include its prim.
+class LightLinks {
+public:
+    // The category bit of a light's lightLink or shadowLink collection (0:
+    // it links everything).
+    uint32_t bit(UsdCollectionAPI const& collection, bool shadow)
+    {
+        if (!collection) return 0u;
+        UsdCollectionMembershipQuery query = collection.ComputeMembershipQuery();
+        std::string key;
+        if (query.UsesPathExpansionRuleMap()) {
+            auto const& rules = query.GetAsPathExpansionRuleMap();
+            if (rules.size() == 1 && rules.begin()->first == SdfPath::AbsoluteRootPath() &&
+                rules.begin()->second == UsdTokens->expandPrims) return 0u;
+            for (auto const& [path, rule] : rules) key += path.GetString() + "=" + rule.GetString() + ";";
+        } else {
+            const SdfPathExpression expression = collection.ResolveCompleteMembershipExpression();
+            if (expression == SdfPathExpression::Everything()) return 0u;
+            key = "expression:" + expression.GetText();
+        }
+        auto& kind = shadow ? m_shadow : m_light;
+        for (auto const& category : kind)
+            if (category.key == key) return category.bit;
+        if (kind.size() >= 32) {
+            if (!m_warned) std::cerr << "PrismRT: more than 32 light or shadow link collections; further ones are ignored\n";
+            m_warned = true;
+            return 0u;
+        }
+        kind.push_back({key, std::move(query), 1u << kind.size()});
+        return kind.back().bit;
+    }
+    bool active() const { return !m_light.empty() || !m_shadow.empty(); }
+    // The light and shadow link masks of a prim.
+    std::pair<uint32_t, uint32_t> masks(SdfPath const& path) const
+    {
+        std::pair<uint32_t, uint32_t> result{0u, 0u};
+        for (auto const& category : m_light) if (category.query.IsPathIncluded(path)) result.first |= category.bit;
+        for (auto const& category : m_shadow) if (category.query.IsPathIncluded(path)) result.second |= category.bit;
+        return result;
+    }
+
+private:
+    struct Category {
+        std::string key;
+        UsdCollectionMembershipQuery query;
+        uint32_t bit = 0;
+    };
+    std::vector<Category> m_light, m_shadow;
+    bool m_warned = false;
+};
 
 // Independent USD camera ingestion, deliberately separate from the Hydra adapter.
 struct UsdCameraRays {
@@ -675,15 +772,7 @@ int runStandaloneCli(int argc, char** argv) {
             view.vars.push_back(color);
             views.push_back(std::move(view));
         }
-        if (job && !job->includedPurposes.empty()) {
-            const auto& purposes = job->includedPurposes;
-            const bool onlyDefaults = std::all_of(purposes.begin(), purposes.end(), [](TfToken const& p) {
-                return p == UsdGeomTokens->default_ || p == UsdGeomTokens->render;
-            });
-            if (!onlyDefaults)
-                std::cerr << "PrismRT: includedPurposes other than default and render are not supported by the "
-                             "standalone loader yet; ignored\n";
-        }
+        const UsdTimeCode time = o.time ? UsdTimeCode(*o.time) : UsdTimeCode::Default();
         // Before anything loads: materials, lights and textures convert into
         // the working space as they are read.
         const auto colorManagement = prism::color::Activate(o.color);
@@ -703,7 +792,7 @@ int runStandaloneCli(int argc, char** argv) {
                 if (!stage) throw std::runtime_error("--camera prim paths require a USD scene");
                 UsdGeomCamera authored(stage->GetPrimAtPath(view.camera));
                 if (!authored) throw std::runtime_error("Not a USD camera: " + view.camera.GetString());
-                camera = authored.GetCamera(UsdTimeCode::Default());
+                camera = authored.GetCamera(time);
             } else {
                 auto asGf = [](Float3 v) { return GfVec3d(v.x(),v.y(),v.z()); };
                 GfMatrix4d viewMatrix(1); viewMatrix.SetLookAt(asGf(*o.cameraPosition), asGf(*o.cameraTarget), asGf(o.cameraUp));
@@ -732,10 +821,21 @@ int runStandaloneCli(int argc, char** argv) {
         const std::string libraryPath = libraries ? libraries : "";
         std::unique_ptr<Mesh> mesh;
         if (isUsd) {
-            std::vector<TfToken> bindingPurposes;
-            if (job) bindingPurposes.assign(job->materialBindingPurposes.begin(), job->materialBindingPurposes.end());
-            mesh = std::make_unique<USDMesh>(o.scene, &context, libraryPath, libraryPath + "/mdl",
-                                             std::move(bindingPurposes));
+            USDMesh::LoadOptions load;
+            if (job) {
+                load.bindingPurposes.assign(job->materialBindingPurposes.begin(), job->materialBindingPurposes.end());
+                // includedPurposes: default geometry always renders; without
+                // render settings, render-purpose geometry does too.
+                load.includedPurposes.assign(job->includedPurposes.begin(), job->includedPurposes.end());
+                if (load.includedPurposes.empty()) load.includedPurposes.push_back(UsdGeomTokens->default_);
+            }
+            load.time = time;
+            load.subdivision.level = prism::defaults::ClampSubdivisionLevel(o.subdivisionLevel);
+            load.subdivision.maxFaces = size_t(prism::defaults::ClampFaces(o.subdivisionMaxFaces));
+            load.subdivision.budgetFaces = size_t(prism::defaults::ClampFaces(o.subdivisionBudgetFaces));
+            load.subdivision.displacementLevel = prism::defaults::ClampSubdivisionLevel(o.displacementLevel);
+            load.subdivision.displacementMaxFaces = size_t(prism::defaults::ClampFaces(o.displacementMaxFaces));
+            mesh = std::make_unique<USDMesh>(stage, &context, libraryPath, libraryPath + "/mdl", std::move(load));
         }
         else if (extension == ".gltf" || extension == ".glb") {
             mesh = std::make_unique<glTFMesh>(o.scene, &context, libraryPath, libraryPath + "/mdl");
@@ -744,8 +844,8 @@ int runStandaloneCli(int argc, char** argv) {
             mesh = std::make_unique<ObjMesh>(o.scene, &context, libraryPath, libraryPath + "/mdl");
         else throw std::runtime_error("Unsupported scene format: " + extension);
         const auto usdMesh = dynamic_cast<USDMesh*>(mesh.get());
-        if ((mesh->vertices.empty() || mesh->indices.empty()) &&
-            (!usdMesh || usdMesh->sphereCount() == 0))
+        if (usdMesh ? usdMesh->renderablePlacementCount() == 0
+                    : (mesh->vertices.empty() || mesh->indices.empty()))
             throw std::runtime_error("Scene contains no renderable geometry");
         SceneRelease release{scene};
         release.mesh = mesh.get();
@@ -776,19 +876,20 @@ int runStandaloneCli(int argc, char** argv) {
         }
         std::vector<std::unique_ptr<Texture<Color3>>> domeTextures;
         std::vector<std::unique_ptr<Environment>> domes;
+        LightLinks links;
         if (stage) {
-            UsdGeomXformCache transforms;
+            UsdGeomXformCache transforms(time);
             const bool useDomes = !o.environmentColor && o.environment.empty();
             for (const auto& prim : stage->Traverse()) {
                 if (!prim.HasAPI<UsdLuxLightAPI>()) continue;
-                if (UsdGeomImageable(prim).ComputeVisibility() == UsdGeomTokens->invisible) continue;
+                if (UsdGeomImageable(prim).ComputeVisibility(time) == UsdGeomTokens->invisible) continue;
                 UsdLuxLightAPI light(prim);
                 GfVec3f color(1); float intensity = 1, exposure = 0;
-                light.GetColorAttr().Get(&color); light.GetIntensityAttr().Get(&intensity);
-                light.GetExposureAttr().Get(&exposure);
+                light.GetColorAttr().Get(&color, time); light.GetIntensityAttr().Get(&intensity, time);
+                light.GetExposureAttr().Get(&exposure, time);
                 bool enableTemperature = false; float temperature = 6500.0f;
-                light.GetEnableColorTemperatureAttr().Get(&enableTemperature);
-                light.GetColorTemperatureAttr().Get(&temperature);
+                light.GetEnableColorTemperatureAttr().Get(&enableTemperature, time);
+                light.GetColorTemperatureAttr().Get(&temperature, time);
                 if (enableTemperature) color = GfCompMult(color, UsdLuxBlackbodyTemperatureAsRgb(temperature));
                 const GfMatrix4d world = transforms.GetLocalToWorldTransform(prim);
                 const bool isDome = prim.IsA<UsdLuxDomeLight>() || prim.IsA<UsdLuxDomeLight_1>();
@@ -798,10 +899,12 @@ int runStandaloneCli(int argc, char** argv) {
                         (intensity*std::exp2(exposure));
                     SdfAssetPath asset;
                     const UsdAttribute file = prim.GetAttribute(UsdLuxTokens->inputsTextureFile);
-                    file.Get(&asset);
-                    const std::string texturePath = asset.GetResolvedPath();
+                    file.Get(&asset, time);
+                    const std::string texturePath = ResolvedLightTexture(asset);
+                    // As in the Hydra delegate: a white dome.
                     if (!asset.GetAssetPath().empty() && texturePath.empty())
-                        throw std::runtime_error("Cannot resolve dome texture: " + asset.GetAssetPath());
+                        std::cerr << "PrismRT: could not resolve dome texture '" << asset.GetAssetPath()
+                                  << "'; the dome is white\n";
                     if (!texturePath.empty())
                         domeTextures.push_back(std::make_unique<ImageTexture<Color3>>(texturePath, TextureColorSpace(file)));
                     else domeTextures.push_back(std::make_unique<ColorTexture>(Color3(1)));
@@ -809,29 +912,29 @@ int runStandaloneCli(int argc, char** argv) {
                     std::array<float,9> linear;
                     for (int row=0; row<3; ++row) for (int col=0; col<3; ++col) linear[row*3+col] = float(inverse[col][row]);
                     domes.push_back(std::make_unique<TransformedEnvironmentMap>(domeTextures.back().get(), multiplier, linear));
-                    light.GetDiffuseAttr().Get(&domes.back()->diffuseFactor);
-                    light.GetSpecularAttr().Get(&domes.back()->specularFactor);
+                    light.GetDiffuseAttr().Get(&domes.back()->diffuseFactor, time);
+                    light.GetSpecularAttr().Get(&domes.back()->specularFactor, time);
                     continue;
                 }
                 prism::LightParameters params;
                 if (prim.IsA<UsdLuxSphereLight>()) {
                     params.shape = prism::LightShape::Sphere;
-                    UsdLuxSphereLight(prim).GetRadiusAttr().Get(&params.radius);
-                    UsdLuxSphereLight(prim).GetTreatAsPointAttr().Get(&params.treatAsPoint);
+                    UsdLuxSphereLight(prim).GetRadiusAttr().Get(&params.radius, time);
+                    UsdLuxSphereLight(prim).GetTreatAsPointAttr().Get(&params.treatAsPoint, time);
                 } else if (prim.IsA<UsdLuxRectLight>()) {
                     params.shape = prism::LightShape::Rect;
-                    UsdLuxRectLight(prim).GetWidthAttr().Get(&params.width);
-                    UsdLuxRectLight(prim).GetHeightAttr().Get(&params.height);
+                    UsdLuxRectLight(prim).GetWidthAttr().Get(&params.width, time);
+                    UsdLuxRectLight(prim).GetHeightAttr().Get(&params.height, time);
                 } else if (prim.IsA<UsdLuxDiskLight>()) {
                     params.shape = prism::LightShape::Disk;
-                    UsdLuxDiskLight(prim).GetRadiusAttr().Get(&params.radius);
+                    UsdLuxDiskLight(prim).GetRadiusAttr().Get(&params.radius, time);
                 } else if (prim.IsA<UsdLuxCylinderLight>()) {
                     params.shape = prism::LightShape::Cylinder;
-                    UsdLuxCylinderLight(prim).GetRadiusAttr().Get(&params.radius);
-                    UsdLuxCylinderLight(prim).GetLengthAttr().Get(&params.length);
+                    UsdLuxCylinderLight(prim).GetRadiusAttr().Get(&params.radius, time);
+                    UsdLuxCylinderLight(prim).GetLengthAttr().Get(&params.length, time);
                 } else if (prim.IsA<UsdLuxDistantLight>()) {
                     params.shape = prism::LightShape::Distant;
-                    UsdLuxDistantLight(prim).GetAngleAttr().Get(&params.angle);
+                    UsdLuxDistantLight(prim).GetAngleAttr().Get(&params.angle, time);
                 } else {
                     std::cerr << "PrismRT: light type '" << prim.GetTypeName() << "' is not supported; skipped\n";
                     continue;
@@ -839,27 +942,34 @@ int runStandaloneCli(int argc, char** argv) {
                 params.color = Color3(color[0], color[1], color[2]);
                 params.intensity = intensity;
                 params.exposure = exposure;
-                light.GetNormalizeAttr().Get(&params.normalize);
-                light.GetDiffuseAttr().Get(&params.diffuse);
-                light.GetSpecularAttr().Get(&params.specular);
+                light.GetNormalizeAttr().Get(&params.normalize, time);
+                light.GetDiffuseAttr().Get(&params.diffuse, time);
+                light.GetSpecularAttr().Get(&params.specular, time);
                 // Hydra's light:cameraVisibility, which UsdImaging reads from
                 // the prim's `cameraVisibility` attribute.
                 if (const UsdAttribute visibility = prim.GetAttribute(TfToken("cameraVisibility")))
-                    visibility.Get(&params.cameraVisible);
+                    visibility.Get(&params.cameraVisible, time);
                 std::array<double, 16> matrix{};
                 for (int row = 0; row < 4; ++row)
                     for (int column = 0; column < 4; ++column) matrix[row * 4 + column] = world[row][column];
                 prism::SceneLight sceneLight = prism::MakeSceneLight(params, matrix);
+                sceneLight.lightLinkBit = links.bit(light.GetLightLinkCollectionAPI(), false);
+                sceneLight.shadowLinkBit = links.bit(light.GetShadowLinkCollectionAPI(), true);
                 if (params.shape == prism::LightShape::Rect) {
                     SdfAssetPath asset;
                     const UsdAttribute file = UsdLuxRectLight(prim).GetTextureFileAttr();
-                    file.Get(&asset);
-                    if (!asset.GetResolvedPath().empty())
+                    file.Get(&asset, time);
+                    if (const std::string texture = ResolvedLightTexture(asset); !texture.empty())
                         sceneLight.texture = std::make_shared<ImageTexture<Color3>>(
-                            asset.GetResolvedPath(), TextureColorSpace(file));
+                            texture, TextureColorSpace(file));
                 }
                 scene.lights.push_back(std::move(sceneLight));
             }
+            // Link masks of the placements, by the prims they place.
+            scene.lightLinking = links.active();
+            if (links.active() && usdMesh)
+                for (auto const& [id, ids] : usdMesh->attachedIds)
+                    scene.placement_link_masks[int(id)] = links.masks(ids.path);
             if (domes.size() == 1) {
                 scene.environment = domes.front().get();
             } else if (domes.size() > 1) {
@@ -969,13 +1079,30 @@ int runStandaloneCli(int argc, char** argv) {
                     planes.push_back({kind, prism::output::AovComponents(kind),
                         std::vector<float>(size_t(width) * height * prism::output::AovComponents(kind))});
                 const bool culling = scene.cullsBackFaces();
+                // Prim, element and instance ids (-1 on a miss): USD scenes
+                // number their placements as the Hydra delegate does; glTF
+                // and OBJ scenes are one prim of triangles.
+                auto resolveId = [&](AovKind kind, RayHit const& hit) -> float {
+                    if (hit.geomid == int(RTC_INVALID_GEOMETRY_ID)) return -1.0f;
+                    if (!usdMesh)
+                        return kind == AovKind::PrimId ? 0.0f : kind == AovKind::ElementId ? float(hit.primid) : -1.0f;
+                    auto found = usdMesh->attachedIds.find(unsigned(hit.geomid));
+                    if (found == usdMesh->attachedIds.end()) return -1.0f;
+                    auto const& ids = found->second;
+                    if (kind == AovKind::PrimId) return float(ids.primId);
+                    if (kind == AovKind::InstanceId) return float(ids.instanceId);
+                    return hit.primid >= 0 && size_t(hit.primid) < ids.coarseFaces.size()
+                        ? float(ids.coarseFaces[size_t(hit.primid)]) : -1.0f;
+                };
                 tbb::parallel_for(0u, height, [&](unsigned y) {
                     for (unsigned x = 0; x < width; ++x) {
                         const RayHit hit = scene.castRayCulled(prism::MakeCameraRayWithLens(rays.parameters,
                             float(x) + 0.5f, float(y) + 0.5f, width, height, nullptr), culling);
-                        for (auto& plane : planes)
-                            prism::output::ResolveGeometricAov(plane.kind, hit, worldToView, projection,
-                                plane.pixels.data() + (size_t(y) * width + x) * plane.components);
+                        for (auto& plane : planes) {
+                            float* values = plane.pixels.data() + (size_t(y) * width + x) * plane.components;
+                            if (prism::output::IntegerAov(plane.kind)) values[0] = resolveId(plane.kind, hit);
+                            else prism::output::ResolveGeometricAov(plane.kind, hit, worldToView, projection, values);
+                        }
                     }
                 });
                 for (auto& plane : planes) rendered.push_back(std::move(plane));

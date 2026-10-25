@@ -33,8 +33,9 @@ struct AovInfo {
     bool integer;
     // From the primary (pixel-centre) hit only; no path tracing.
     bool geometric;
-    // Resolvable from a hit and the camera alone (both frontends); prim,
-    // instance and element ids depend on the Hydra render index.
+    // Produced by both frontends. Prim, instance and element ids come from
+    // each frontend's own tables (the delegate's render index; the CLI's
+    // placements, numbered as the delegate numbers them).
     bool standalone;
 };
 
@@ -48,9 +49,9 @@ inline std::span<const AovInfo> Aovs()
         {AovKind::Neye, "Neye", 3, false, true, true},
         {AovKind::Peye, "Peye", 3, false, true, true},
         {AovKind::St, "primvars:st", 2, false, true, true},
-        {AovKind::PrimId, "primId", 1, true, true, false},
-        {AovKind::ElementId, "elementId", 1, true, true, false},
-        {AovKind::InstanceId, "instanceId", 1, true, true, false},
+        {AovKind::PrimId, "primId", 1, true, true, true},
+        {AovKind::ElementId, "elementId", 1, true, true, true},
+        {AovKind::InstanceId, "instanceId", 1, true, true, true},
     }};
     return table;
 }
