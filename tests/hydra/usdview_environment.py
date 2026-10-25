@@ -61,6 +61,10 @@ def testUsdviewInputFunction(appController):
     view.makeCurrent()
     view.grabFrameBuffer()
     assert view.SetRendererPlugin("HdPrismRendererPlugin"), "PrismRT plugin unavailable"
+    # Converging 2048 spp (the default) takes minutes on the CPU; the checks only
+    # need a coarse image. SetPhysicalWindowSize makes the render smaller than
+    # the window: use it only for screenshots, not for judging the framing.
+    view.SetRendererSetting("prism:samplesPerPixel", 32)
 
     def settle():
         end = time.monotonic() + 1.0  # let the edit reach the renderer
