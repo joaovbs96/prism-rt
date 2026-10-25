@@ -20,6 +20,11 @@
 #include <optional>
 #include <vector>
 #include <mutex>
+#include <span>
+#include <type_traits>
+#include <unordered_map>
+#include <unordered_set>
+#include <tbb/parallel_for.h>
 
 // Open USD Deps
 #include <pxr/pxr.h>
@@ -28,6 +33,18 @@
 #include <pxr/usd/usd/primRange.h>
 #include <pxr/usd/usdGeom/mesh.h>
 #include <pxr/usd/usdGeom/sphere.h>
+#include <pxr/usd/usdGeom/cube.h>
+#include <pxr/usd/usdGeom/cylinder.h>
+#include <pxr/usd/usdGeom/cone.h>
+#include <pxr/usd/usdGeom/capsule.h>
+#include <pxr/usd/usdGeom/plane.h>
+#include <pxr/usd/usdGeom/gprim.h>
+#include <pxr/usd/usdGeom/subset.h>
+#include <pxr/imaging/geomUtil/capsuleMeshGenerator.h>
+#include <pxr/imaging/geomUtil/coneMeshGenerator.h>
+#include <pxr/imaging/geomUtil/cuboidMeshGenerator.h>
+#include <pxr/imaging/geomUtil/cylinderMeshGenerator.h>
+#include <pxr/imaging/geomUtil/planeMeshGenerator.h>
 #include <pxr/imaging/pxOsd/meshTopology.h>
 #include <pxr/usd/usdGeom/primvarsAPI.h>
 #include <pxr/usd/usdGeom/xformCache.h>
@@ -77,6 +94,9 @@ namespace mx = MaterialX;
 #include "../materialx/usd_network.h"
 #include "../materialx/prepared_template.h"
 #include "../materialx/cached_document.h"
+#include "../materialx/preview_surface.h"
+#include "../render_defaults.h"
+#include "mesh_conversion.h"
 
 // ============================================================================
 // MaterialX material recovery from USD stages
@@ -335,7 +355,8 @@ RecoverMtlxDocumentFromUsdShade(const UsdPrim& materialPrim,
 static std::map<SdfPath, ResolvedMtlxMaterial>
 CollectMaterialXMaterials(const UsdStageRefPtr& stage,
                           const std::string& mx_libraries_path,
-                          std::vector<TfToken> const& bindingPurposes = {})
+                          std::vector<TfToken> const& bindingPurposes = {},
+                          UsdTimeCode time = UsdTimeCode::Default())
 {
     std::map<SdfPath, ResolvedMtlxMaterial> result;
 
@@ -347,13 +368,9 @@ CollectMaterialXMaterials(const UsdStageRefPtr& stage,
     // test is involved, so offscreen shadow/reflection materials stay live.
     std::set<SdfPath> required;
     for (const UsdPrim& geometry : UsdPrimRange(stage->GetPseudoRoot(), UsdTraverseInstanceProxies())) {
-        if (!geometry.IsA<UsdGeomMesh>() && !geometry.IsA<UsdGeomSphere>()) continue;
-        if (geometry.IsA<UsdGeomSphere>()) {
-            UsdGeomSphere sphere(geometry);
-            if (sphere.ComputeVisibility() == UsdGeomTokens->invisible) continue;
-            const TfToken purpose = sphere.ComputePurpose();
-            if (purpose == UsdGeomTokens->guide || purpose == UsdGeomTokens->proxy) continue;
-        }
+        if (!geometry.IsA<UsdGeomMesh>() && !geometry.IsA<UsdGeomSphere>() && !geometry.IsA<UsdGeomCube>() &&
+            !geometry.IsA<UsdGeomCylinder>() && !geometry.IsA<UsdGeomCone>() && !geometry.IsA<UsdGeomCapsule>() &&
+            !geometry.IsA<UsdGeomPlane>() && !geometry.IsA<UsdGeomSubset>()) continue;
         if (auto material = ComputeBoundMaterialFor(geometry, bindingPurposes))
             required.insert(material.GetPath());
     }
@@ -387,8 +404,12 @@ CollectMaterialXMaterials(const UsdStageRefPtr& stage,
             if (!surface) continue;
             HdMaterialNetworkMap networkMap;
             UsdImagingBuildHdMaterialNetworkFromTerminal(surface.GetPrim(),
-                HdMaterialTerminalTokens->surface,contexts,contexts,&networkMap,
-                UsdTimeCode::Default());
+                HdMaterialTerminalTokens->surface,contexts,contexts,&networkMap,time);
+            // Displacement, which the delegate merges into the material
+            // (AddDisplacementShader) and displaces geometry by at load time.
+            if (const UsdShadeShader displacement = material.ComputeDisplacementSource(contexts))
+                UsdImagingBuildHdMaterialNetworkFromTerminal(displacement.GetPrim(),
+                    HdMaterialTerminalTokens->displacement,contexts,contexts,&networkMap,time);
             bool isVolume=false;
             auto network=std::make_shared<HdMaterialNetwork2>(
                 HdConvertToHdMaterialNetwork2(networkMap,&isVolume));
@@ -550,6 +571,18 @@ CompileMtlxMaterial(const ResolvedMtlxMaterial& resolved,
             }
             HdMaterialNetwork2Interface networkInterface(
                 resolved.materialPath,conversionNetwork.get());
+            // As the Hydra delegate's material service converts: UsdPreviewSurface
+            // node types to their MaterialX definitions, connected inputs by
+            // their connection alone, and the displacement terminal merged in.
+            const bool previewSurface=prism::materialx::IsPreviewSurfaceNetwork(networkInterface);
+            if (previewSurface) {
+                prism::materialx::RewritePreviewSurfaceNetwork(networkInterface);
+                prism::materialx::RewritePreviewSurfaceWrapModes(networkInterface);
+            }
+            for (const TfToken& node : networkInterface.GetNodeNames())
+                for (const TfToken& input : networkInterface.GetNodeInputConnectionNames(node))
+                    if (!networkInterface.GetNodeInputConnection(node,input).empty())
+                        networkInterface.DeleteNodeParameter(node,input);
             document=prism::materialx::SimpleOpenPbrDocument(
                 networkInterface,resolved.terminalNodePath.GetToken(),resolved.libraries);
             if (!document) {
@@ -564,6 +597,10 @@ CompileMtlxMaterial(const ResolvedMtlxMaterial& resolved,
                         document,conversionNetwork->nodes);
                 }
             }
+            if (document && previewSurface)
+                prism::materialx::FixPreviewSurfaceNormalOutput(document);
+            else if (document)
+                prism::materialx::AddDisplacementShader(networkInterface,document,resolved.libraries);
             if (document) {
                 const auto materials=document->getMaterialNodes();
                 if (!materials.empty()) materials.front()->setName("PrismMaterial");
@@ -634,88 +671,459 @@ CompileMtlxMaterial(const ResolvedMtlxMaterial& resolved,
 }
 
 // ============================================================================
-// Per-face-corner vertex layout
-//
-// USD meshes with faceVarying UVs (the common case) require that geometry is
-// expanded so that each face corner becomes its own vertex entry. This struct
-// carries the fully-expanded, renderer-ready data for one mesh prim and is
-// built by buildMeshData() before anything is written into the global buffers.
+// Mesh sources: UsdGeomMesh and implicit surfaces as the shared conversion
+// (src/mesh/mesh_conversion.h) reads them, the way UsdImaging presents them
+// to the Hydra delegate.
 // ============================================================================
 
-// USD displayColor and displayOpacity of one mesh, for its fallback material:
-// constant, or one value per face (uniform), point (vertex, varying) or face
-// corner (faceVarying), indices already applied. A primvar whose size does
-// not fit its interpolation counts as constant (its first value), as in the
-// Hydra delegate.
-struct DisplayPrimvar {
-    std::vector<float> values;
-    int components = 0;
-    pxr::TfToken interpolation = pxr::UsdGeomTokens->constant;
-    bool authored() const { return !values.empty(); }
-    bool varying() const { return interpolation != pxr::UsdGeomTokens->constant; }
-    // The value at a corner (point index, corner index, face index).
-    float const* at(size_t point, size_t corner, size_t face) const {
-        size_t element = 0;
-        if (interpolation == pxr::UsdGeomTokens->uniform) element = face;
-        else if (interpolation == pxr::UsdGeomTokens->faceVarying) element = corner;
-        else if (interpolation != pxr::UsdGeomTokens->constant) element = point;
-        return values.data() + element * size_t(components);
-    }
-};
+namespace prism::usd_detail {
 
-struct DisplayPrimvars {
-    DisplayPrimvar color, opacity;
-    bool varying() const { return color.varying() || opacity.varying(); }
-    // Per-face or per-corner values need one vertex per face corner.
-    bool expands() const {
-        auto expanding = [](DisplayPrimvar const& p) {
-            return p.interpolation == pxr::UsdGeomTokens->uniform ||
-                p.interpolation == pxr::UsdGeomTokens->faceVarying;
-        };
-        return expanding(color) || expanding(opacity);
-    }
-    // RGB colour and opacity at a corner (grey and opaque where unauthored).
-    void append(std::vector<float>& out, size_t point, size_t corner, size_t face) const {
-        static const float grey[3] = {0.7f, 0.7f, 0.7f}, opaque = 1.0f;
-        float const* c = color.authored() ? color.at(point, corner, face) : grey;
-        float const* o = opacity.authored() ? opacity.at(point, corner, face) : &opaque;
-        out.insert(out.end(), {c[0], c[1], c[2], o[0]});
-    }
-};
+inline prism::mesh::PrimvarData ReadPrimvar(pxr::UsdGeomPrimvar const& primvar, pxr::UsdTimeCode time)
+{
+    prism::mesh::PrimvarData result;
+    if (!primvar) return result;
+    pxr::VtValue value;
+    if (!primvar.ComputeFlattened(&value, time)) return result;
+    result.value = std::move(value);
+    result.interpolation = primvar.GetInterpolation();
+    return result;
+}
 
-struct MeshData {
-    std::vector<Float3>        positions;
-    std::vector<Float3>        normals;
-    std::vector<Float2>        texcoords;
-    std::vector<unsigned int>  indices;   // into the above, base-0 for this mesh
-    int                        mat_id = -1;
-    // displayColor (3) and displayOpacity (1) per vertex, when either varies
-    // over the mesh; otherwise empty and displayConstant holds them.
-    std::vector<float>         display;
-    bool                       singleSided = true;  // USD doubleSided false
-    std::array<float, 4>       displayConstant{0.7f, 0.7f, 0.7f, 1.0f};
-};
+// The named primvars of a gprim with the constant primvars it inherits
+// (UsdImaging flattens inherited primvars into each prim); points, normals
+// and namespaced primvars are not among them.
+inline void ReadNamedPrimvars(pxr::UsdPrim const& prim, pxr::UsdTimeCode time, prism::mesh::MeshSource* source)
+{
+    static const std::unordered_set<std::string> geometry = {
+        "points", "normals", "widths", "velocities", "accelerations", "angularVelocities"};
+    for (pxr::UsdGeomPrimvar const& primvar : pxr::UsdGeomPrimvarsAPI(prim).FindPrimvarsWithInheritance()) {
+        const pxr::TfToken name = primvar.GetPrimvarName();
+        const std::string& text = name.GetString();
+        if (geometry.count(text) || text.find(':') != std::string::npos || !primvar.HasValue()) continue;
+        prism::mesh::PrimvarData data = ReadPrimvar(primvar, time);
+        if (!data.value.IsEmpty()) source->primvars.emplace_back(name, std::move(data));
+    }
+}
+
+inline void ReadSurfacePrimvars(pxr::UsdPrim const& prim, pxr::UsdTimeCode time, prism::mesh::MeshSource* source)
+{
+    pxr::UsdGeomPrimvarsAPI primvars(prim);
+    pxr::UsdGeomPrimvar st = primvars.GetPrimvar(pxr::TfToken("st"));
+    pxr::UsdGeomPrimvar uv = primvars.GetPrimvar(pxr::TfToken("uv"));
+    const bool hasSt = st && st.HasValue(), hasUv = uv && uv.HasValue();
+    source->multipleUvSets = hasSt && hasUv;
+    if (hasSt) source->uvs = ReadPrimvar(st, time);
+    else if (hasUv) source->uvs = ReadPrimvar(uv, time);
+    ReadNamedPrimvars(prim, time, source);
+}
+
+// A UsdGeomMesh at a time; skinnedPoints replace its points (UsdSkel).
+inline std::optional<prism::mesh::MeshSource> MeshSourceFromUsd(pxr::UsdGeomMesh const& mesh, pxr::UsdTimeCode time,
+                                                                 pxr::VtVec3fArray const* skinnedPoints = nullptr)
+{
+    prism::mesh::MeshSource source;
+    if (!mesh.GetFaceVertexCountsAttr().Get(&source.faceVertexCounts, time) ||
+        !mesh.GetFaceVertexIndicesAttr().Get(&source.faceVertexIndices, time))
+        return std::nullopt;
+    mesh.GetHoleIndicesAttr().Get(&source.holeIndices, time);
+    if (skinnedPoints) {
+        source.points.value = pxr::VtValue(*skinnedPoints);
+    } else {
+        pxr::VtValue points;
+        if (mesh.GetPointsAttr().Get(&points, time)) source.points.value = std::move(points);
+    }
+    source.points.interpolation = pxr::UsdGeomTokens->vertex;
+    // primvars:normals takes precedence over normals (UsdGeomPointBased).
+    pxr::UsdGeomPrimvar normals = pxr::UsdGeomPrimvarsAPI(mesh.GetPrim()).GetPrimvar(pxr::UsdGeomTokens->normals);
+    if (normals && normals.HasValue()) {
+        source.normals = ReadPrimvar(normals, time);
+    } else {
+        pxr::VtValue value;
+        if (mesh.GetNormalsAttr().Get(&value, time)) {
+            source.normals.value = std::move(value);
+            source.normals.interpolation = mesh.GetNormalsInterpolation();
+        }
+    }
+    ReadSurfacePrimvars(mesh.GetPrim(), time, &source);
+    mesh.GetSubdivisionSchemeAttr().Get(&source.subdivisionScheme, time);
+    mesh.GetOrientationAttr().Get(&source.orientation, time);
+    bool doubleSided = false;
+    mesh.GetDoubleSidedAttr().Get(&doubleSided, time);
+    source.doubleSided = doubleSided;
+    mesh.GetCreaseIndicesAttr().Get(&source.creaseIndices, time);
+    mesh.GetCreaseLengthsAttr().Get(&source.creaseLengths, time);
+    mesh.GetCreaseSharpnessesAttr().Get(&source.creaseSharpnesses, time);
+    mesh.GetCornerIndicesAttr().Get(&source.cornerIndices, time);
+    mesh.GetCornerSharpnessesAttr().Get(&source.cornerSharpnesses, time);
+    mesh.GetInterpolateBoundaryAttr().Get(&source.interpolateBoundary, time);
+    mesh.GetFaceVaryingLinearInterpolationAttr().Get(&source.faceVaryingLinearInterpolation, time);
+    mesh.GetTriangleSubdivisionRuleAttr().Get(&source.triangleSubdivisionRule, time);
+    source.motionBlur = mesh.GetPointsAttr().GetNumTimeSamples() > 1;
+    return source;
+}
+
+// The basis that turns the Z-aligned generated shapes to their axis
+// (HdsiImplicitSurfaceSceneIndex).
+inline pxr::GfMatrix4d ImplicitBasis(pxr::TfToken const& axis)
+{
+    pxr::GfVec4d u, v, spine;
+    if (axis == pxr::UsdGeomTokens->x) {
+        u = pxr::GfVec4d::YAxis(); v = pxr::GfVec4d::ZAxis(); spine = pxr::GfVec4d::XAxis();
+    } else if (axis == pxr::UsdGeomTokens->y) {
+        u = pxr::GfVec4d::ZAxis(); v = pxr::GfVec4d::XAxis(); spine = pxr::GfVec4d::YAxis();
+    } else {
+        u = pxr::GfVec4d::XAxis(); v = pxr::GfVec4d::YAxis(); spine = pxr::GfVec4d::ZAxis();
+    }
+    pxr::GfMatrix4d basis;
+    basis.SetRow(0, u); basis.SetRow(1, v); basis.SetRow(2, spine); basis.SetRow(3, pxr::GfVec4d::WAxis());
+    return basis;
+}
+
+inline bool IsImplicitSurface(pxr::UsdPrim const& prim)
+{
+    return prim.IsA<pxr::UsdGeomCube>() || prim.IsA<pxr::UsdGeomCylinder>() || prim.IsA<pxr::UsdGeomCone>() ||
+        prim.IsA<pxr::UsdGeomCapsule>() || prim.IsA<pxr::UsdGeomPlane>();
+}
+
+// Cubes, cylinders, cones, capsules and planes as the meshes Hydra makes of
+// them (HdsiImplicitSurfaceSceneIndex, GeomUtil generators).
+inline std::optional<prism::mesh::MeshSource> ImplicitMeshSource(pxr::UsdPrim const& prim, pxr::UsdTimeCode time)
+{
+    constexpr size_t kRadial = 10, kCapAxial = 4;
+    pxr::PxOsdMeshTopology topology;
+    pxr::VtVec3fArray points;
+    auto axisOf = [&](pxr::UsdAttribute const& attribute) {
+        pxr::TfToken axis = pxr::UsdGeomTokens->z;
+        attribute.Get(&axis, time);
+        return axis;
+    };
+    if (pxr::UsdGeomCube cube{prim}) {
+        double size = 2.0;
+        cube.GetSizeAttr().Get(&size, time);
+        topology = pxr::GeomUtilCuboidMeshGenerator::GenerateTopology();
+        points.resize(pxr::GeomUtilCuboidMeshGenerator::ComputeNumPoints());
+        pxr::GeomUtilCuboidMeshGenerator::GeneratePoints(points.begin(), float(size), float(size), float(size));
+    } else if (pxr::UsdGeomCylinder cylinder{prim}) {
+        double radius = 1.0, height = 2.0;
+        cylinder.GetRadiusAttr().Get(&radius, time);
+        cylinder.GetHeightAttr().Get(&height, time);
+        const pxr::GfMatrix4d basis = ImplicitBasis(axisOf(cylinder.GetAxisAttr()));
+        topology = pxr::GeomUtilCylinderMeshGenerator::GenerateTopology(kRadial);
+        points.resize(pxr::GeomUtilCylinderMeshGenerator::ComputeNumPoints(kRadial));
+        pxr::GeomUtilCylinderMeshGenerator::GeneratePoints(points.begin(), kRadial, float(radius), float(height), &basis);
+    } else if (pxr::UsdGeomCone cone{prim}) {
+        double radius = 1.0, height = 2.0;
+        cone.GetRadiusAttr().Get(&radius, time);
+        cone.GetHeightAttr().Get(&height, time);
+        const pxr::GfMatrix4d basis = ImplicitBasis(axisOf(cone.GetAxisAttr()));
+        topology = pxr::GeomUtilConeMeshGenerator::GenerateTopology(kRadial);
+        points.resize(pxr::GeomUtilConeMeshGenerator::ComputeNumPoints(kRadial));
+        pxr::GeomUtilConeMeshGenerator::GeneratePoints(points.begin(), kRadial, float(radius), float(height), &basis);
+    } else if (pxr::UsdGeomCapsule capsule{prim}) {
+        double radius = 0.5, height = 1.0;
+        capsule.GetRadiusAttr().Get(&radius, time);
+        capsule.GetHeightAttr().Get(&height, time);
+        const pxr::GfMatrix4d basis = ImplicitBasis(axisOf(capsule.GetAxisAttr()));
+        topology = pxr::GeomUtilCapsuleMeshGenerator::GenerateTopology(kRadial, kCapAxial);
+        points.resize(pxr::GeomUtilCapsuleMeshGenerator::ComputeNumPoints(kRadial, kCapAxial));
+        pxr::GeomUtilCapsuleMeshGenerator::GeneratePoints(points.begin(), kRadial, kCapAxial, float(radius),
+                                                          float(height), &basis);
+    } else if (pxr::UsdGeomPlane plane{prim}) {
+        double width = 2.0, length = 2.0;
+        plane.GetWidthAttr().Get(&width, time);
+        plane.GetLengthAttr().Get(&length, time);
+        const pxr::GfMatrix4d basis = ImplicitBasis(axisOf(plane.GetAxisAttr()));
+        topology = pxr::GeomUtilPlaneMeshGenerator::GenerateTopology();
+        points.resize(pxr::GeomUtilPlaneMeshGenerator::ComputeNumPoints());
+        pxr::GeomUtilPlaneMeshGenerator::GeneratePoints(points.begin(), float(width), float(length), &basis);
+    } else {
+        return std::nullopt;
+    }
+    prism::mesh::MeshSource source;
+    source.faceVertexCounts = topology.GetFaceVertexCounts();
+    source.faceVertexIndices = topology.GetFaceVertexIndices();
+    source.holeIndices = topology.GetHoleIndices();
+    source.subdivisionScheme = topology.GetScheme();
+    source.orientation = topology.GetOrientation();
+    source.points.value = pxr::VtValue(std::move(points));
+    source.points.interpolation = pxr::UsdGeomTokens->vertex;
+    ReadSurfacePrimvars(prim, time, &source);
+    bool doubleSided = false;
+    pxr::UsdGeomGprim(prim).GetDoubleSidedAttr().Get(&doubleSided, time);
+    source.doubleSided = doubleSided;
+    return source;
+}
+
+inline pxr::VtVec3fArray FloatPoints(pxr::VtValue const& value)
+{
+    if (value.IsHolding<pxr::VtVec3fArray>()) return value.UncheckedGet<pxr::VtVec3fArray>();
+    pxr::VtVec3fArray result;
+    if (value.IsHolding<pxr::VtVec3dArray>())
+        for (auto const& p : value.UncheckedGet<pxr::VtVec3dArray>()) result.push_back(pxr::GfVec3f(p));
+    return result;
+}
+
+template<class Vec>
+inline pxr::VtArray<Vec> FloatVectors(pxr::VtValue const& value)
+{
+    using Double = std::conditional_t<std::is_same_v<Vec, pxr::GfVec2f>, pxr::GfVec2d, pxr::GfVec3d>;
+    if (value.IsHolding<pxr::VtArray<Vec>>()) return value.UncheckedGet<pxr::VtArray<Vec>>();
+    pxr::VtArray<Vec> result;
+    if (value.IsHolding<pxr::VtArray<Double>>())
+        for (auto const& v : value.UncheckedGet<pxr::VtArray<Double>>()) result.push_back(Vec(v));
+    return result;
+}
+
+/// Transform and normalize a normal vector.
+inline Float3 TransformNormal(const pxr::GfVec3f& n, const pxr::GfMatrix4d& normalMatrix, bool flip)
+{
+    pxr::GfVec3d nd(n[0], n[1], n[2]);
+    pxr::GfVec3d tn = normalMatrix.TransformDir(nd);
+    if (flip) tn = -tn;
+    double len = tn.GetLength();
+    if (len > 0.0) tn /= len;
+    return Float3(static_cast<float>(tn[0]), static_cast<float>(tn[1]), static_cast<float>(tn[2]));
+}
+
+// Fan triangulation of a face given its corner vertex indices; leftHanded
+// faces swap the winding.
+inline void Triangulate(std::vector<unsigned int>& out, const std::vector<unsigned int>& corners, bool leftHanded)
+{
+    const int count = static_cast<int>(corners.size());
+    for (int i = 1; i + 1 < count; ++i) {
+        out.push_back(corners[0]);
+        out.push_back(corners[leftHanded ? i + 1 : i]);
+        out.push_back(corners[leftHanded ? i : i + 1]);
+    }
+}
+
+// The standalone loader's polygon conversion of a mesh that does not refine:
+// fan triangulation, a vertex per point unless a primvar varies per face or
+// face corner (then one per corner). Positions and normals are transformed by
+// `world` (identity: prototype space). Normals follow Hydra's conversion:
+// generated ones face along the authored winding (leftHanded flips them,
+// authored normals too), and a mirroring transform turns them with the
+// triangles (SceneManager flips placed prototypes the same way). Returns the
+// mesh's coarse face per triangle, or nothing when no triangle is left.
+inline bool BuildPolygonMesh(prism::mesh::MeshSource const& source, pxr::GfMatrix4d const& world,
+                             Mesh& out, std::vector<int>& coarseFaces)
+{
+    using pxr::UsdGeomTokens;
+    const pxr::VtVec3fArray points = FloatPoints(source.points.value);
+    pxr::VtIntArray const& counts = source.faceVertexCounts;
+    pxr::VtIntArray const& indices = source.faceVertexIndices;
+    if (points.empty() || counts.empty()) return false;
+    const bool leftHanded = source.orientation == pxr::TfToken("leftHanded");
+    const pxr::GfMatrix4d normalMatrix = world.GetInverse().GetTranspose();
+    const bool mirrored = world.GetDeterminant() < 0.0;
+    std::unordered_set<int> holes(source.holeIndices.begin(), source.holeIndices.end());
+    // Faces with a valid winding: three corners or more, inside the arrays.
+    std::vector<uint8_t> valid(counts.size(), 0);
+    {
+        size_t corner = 0;
+        for (size_t face = 0; face < counts.size(); ++face) {
+            const int count = counts[face];
+            bool ok = count >= 3 && corner + size_t(count) <= indices.size() && !holes.count(int(face));
+            for (int k = 0; ok && k < count; ++k)
+                ok = indices[corner + k] >= 0 && size_t(indices[corner + k]) < points.size();
+            valid[face] = ok;
+            corner += size_t(std::max(0, count));
+        }
+    }
+    const std::vector<prism::mesh::NamedPrimvar> extras =
+        prism::mesh::NamedPrimvars(source, points.size(), counts.size(), indices.size());
+    const pxr::VtVec2fArray uvs = FloatVectors<pxr::GfVec2f>(source.uvs.value);
+    const pxr::VtVec3fArray normals = FloatVectors<pxr::GfVec3f>(source.normals.value);
+    const pxr::TfToken& uvInterpolation = source.uvs.interpolation;
+    const pxr::TfToken& normalInterpolation = source.normals.interpolation;
+    auto perCorner = [](pxr::TfToken const& interpolation) {
+        return interpolation == UsdGeomTokens->faceVarying || interpolation == UsdGeomTokens->uniform;
+    };
+    bool expand = (!uvs.empty() && perCorner(uvInterpolation)) ||
+        (!normals.empty() && perCorner(normalInterpolation));
+    for (auto const& extra : extras) expand |= perCorner(extra.interpolation);
+
+    // Area-weighted per-point normals of the authored winding.
+    std::vector<pxr::GfVec3f> generated(points.size(), pxr::GfVec3f(0.f));
+    {
+        size_t corner = 0;
+        for (size_t face = 0; face < counts.size(); ++face) {
+            const int count = counts[face];
+            if (valid[face]) {
+                const int i0 = indices[corner], i1 = indices[corner + 1], i2 = indices[corner + 2];
+                pxr::GfVec3f fn = (points[i1] - points[i0]) ^ (points[i2] - points[i0]);
+                if (leftHanded) fn = -fn;
+                for (int k = 0; k < count; ++k) generated[indices[corner + k]] += fn;
+            }
+            corner += size_t(std::max(0, count));
+        }
+        for (auto& n : generated) {
+            const float length = n.GetLength();
+            n = length > 0.f ? n / length : pxr::GfVec3f(0.f, 1.f, 0.f);
+        }
+    }
+    // The shading normal at a corner: authored where it is usable (negated
+    // for leftHanded meshes), otherwise generated.
+    auto normalAt = [&](size_t point, size_t corner, size_t face) {
+        const size_t index = prism::mesh::PrimvarIndex(normalInterpolation, point, corner, face);
+        if (index < normals.size()) {
+            const pxr::GfVec3f& n = normals[index];
+            const float lengthSq = n.GetLengthSq();
+            if (lengthSq > 1e-20f && std::isfinite(lengthSq))
+                return TransformNormal(leftHanded ? -n : n, normalMatrix, mirrored);
+        }
+        return TransformNormal(generated[point], normalMatrix, mirrored);
+    };
+    auto uvAt = [&](size_t point, size_t corner, size_t face) {
+        const size_t index = prism::mesh::PrimvarIndex(uvInterpolation, point, corner, face);
+        return index < uvs.size() ? Float2(uvs[index][0], uvs[index][1]) : Float2(0.f, 0.f);
+    };
+    int stride = 0;
+    for (auto const& extra : extras) {
+        out.primvars.push_back({extra.name, extra.components, stride});
+        stride += extra.components;
+    }
+    out.primvarStride = stride;
+    auto appendExtras = [&](size_t point, size_t corner, size_t face) {
+        for (auto const& extra : extras) {
+            const size_t n = size_t(extra.components);
+            const size_t element = extra.interpolation == UsdGeomTokens->constant ? 0
+                : prism::mesh::PrimvarIndex(extra.interpolation, point, corner, face);
+            out.primvarValues.insert(out.primvarValues.end(), extra.values.begin() + element * n,
+                                     extra.values.begin() + (element + 1) * n);
+        }
+    };
+    auto position = [&](size_t point) {
+        const pxr::GfVec3d p = world.Transform(pxr::GfVec3d(points[point][0], points[point][1], points[point][2]));
+        return Float3(static_cast<float>(p[0]), static_cast<float>(p[1]), static_cast<float>(p[2]));
+    };
+
+    std::vector<unsigned int> corners;
+    size_t corner = 0;
+    if (expand) {
+        for (size_t face = 0; face < counts.size(); ++face) {
+            const int count = counts[face];
+            if (valid[face]) {
+                corners.clear();
+                for (int k = 0; k < count; ++k) {
+                    const size_t point = size_t(indices[corner + k]);
+                    corners.push_back(static_cast<unsigned int>(out.vertices.size()));
+                    out.vertices.push_back(position(point));
+                    out.texcoords.push_back(uvAt(point, corner + k, face));
+                    out.normals.push_back(normalAt(point, corner + k, face));
+                    if (stride) appendExtras(point, corner + k, face);
+                }
+                const size_t before = out.indices.size();
+                Triangulate(out.indices, corners, leftHanded);
+                coarseFaces.insert(coarseFaces.end(), (out.indices.size() - before) / 3, int(face));
+            }
+            corner += size_t(std::max(0, count));
+        }
+    } else {
+        out.vertices.reserve(points.size());
+        for (size_t point = 0; point < points.size(); ++point) {
+            out.vertices.push_back(position(point));
+            out.normals.push_back(normalAt(point, 0, 0));
+            out.texcoords.push_back(uvAt(point, 0, 0));
+            if (stride) appendExtras(point, 0, 0);
+        }
+        for (size_t face = 0; face < counts.size(); ++face) {
+            const int count = counts[face];
+            if (valid[face]) {
+                corners.assign(indices.begin() + corner, indices.begin() + corner + count);
+                const size_t before = out.indices.size();
+                Triangulate(out.indices, corners, leftHanded);
+                coarseFaces.insert(coarseFaces.end(), (out.indices.size() - before) / 3, int(face));
+            }
+            corner += size_t(std::max(0, count));
+        }
+    }
+    out.single_sided_all = source.doubleSided ? !*source.doubleSided : true;
+    return !out.indices.empty();
+}
+
+} // namespace prism::usd_detail
 
 // ============================================================================
 // USDMesh — loads geometry + detects and compiles MaterialX materials
+//
+// Every gprim becomes its own placement, as in the Hydra delegate: polygon
+// meshes in world space; refined, displaced and instanced meshes (native
+// instances and PointInstancers) as prototypes placed by Embree instances.
 // ============================================================================
 
 class USDMesh : public Mesh {
 public:
+    struct LoadOptions {
+        // Material bindings resolve for the first of these purposes that has
+        // one (UsdRenderSettings materialBindingPurposes; empty: full, then
+        // allPurpose).
+        std::vector<pxr::TfToken> bindingPurposes;
+        pxr::UsdTimeCode time = pxr::UsdTimeCode::Default();
+        // Purposes rendered besides default (UsdRenderSettings
+        // includedPurposes); empty: render.
+        std::vector<pxr::TfToken> includedPurposes;
+        prism::mesh::SubdivisionSettings subdivision = DefaultSubdivision();
+    };
+
+    static prism::mesh::SubdivisionSettings DefaultSubdivision()
+    {
+        auto const& defaults = prism::defaults::FromEnvironment();
+        prism::mesh::SubdivisionSettings result;
+        result.level = defaults.subdivisionLevel;
+        result.maxFaces = size_t(defaults.subdivisionMaxFaces);
+        result.displacementLevel = defaults.displacementLevel;
+        result.displacementMaxFaces = size_t(defaults.displacementMaxFaces);
+        result.budgetFaces = size_t(defaults.subdivisionBudgetFaces);
+        return result;
+    }
+
+    // What the render products and light linking need to know about an
+    // attached placement (by Embree geometry id).
+    struct PlacementIds {
+        int primId = -1;
+        int instanceId = -1;
+        prism::mesh::SharedFaceTable coarseFaces; // elementId per triangle (empty: the triangle)
+        pxr::SdfPath path;                        // the prim (an instance proxy for native instances)
+    };
+    std::unordered_map<unsigned, PlacementIds> attachedIds;
+
     struct AttachedSphere {
         unsigned int id;
         Sphere* geometry;
         pxr::GfMatrix4d world;
         Material* material;
+        PlacementIds ids;
+        std::shared_ptr<const InstancePrimvars> instancePrimvars;
+    };
+    struct AttachedMesh {
+        unsigned int id;
+        Mesh* mesh;
+        bool instanced;               // an Embree instance of the prototype mesh at `world`
+        pxr::GfMatrix4d world;
+        Material* material;
+        std::shared_ptr<const std::unordered_map<int, Material*>> triangleMaterials;
+        PlacementIds ids;
+        std::shared_ptr<const InstancePrimvars> instancePrimvars;
     };
 
     size_t sphereCount() const { return m_spherePlacements.size(); }
+    size_t meshPlacementCount() const { return m_meshPlacements.size(); }
+    // Placements that render (visible, of an included purpose).
+    size_t renderablePlacementCount() const
+    {
+        size_t count = 0;
+        for (auto const& p : m_meshPlacements) count += p.enabled;
+        for (auto const& p : m_spherePlacements) count += p.enabled;
+        return count;
+    }
 
     // Spheres retain their local analytic shape. Affine Embree instances also
     // represent nonuniformly scaled spheres without baking or tessellating them.
     std::vector<AttachedSphere> attachSphereInstances(RTCDevice device, RTCScene target) {
         std::vector<AttachedSphere> result;
         for (const auto& placement : m_spherePlacements) {
+            if (!placement.enabled) continue;
             auto& prototype = m_spherePrototypes[placement.radius];
             if (!prototype) prototype = std::make_unique<SpherePrototype>(device, placement.radius);
             RTCGeometry instance = rtcNewGeometry(device, RTC_GEOMETRY_TYPE_INSTANCE);
@@ -728,7 +1136,46 @@ public:
             const unsigned id = rtcAttachGeometry(target, instance);
             rtcReleaseGeometry(instance);
             result.push_back({id, &prototype->geometry, placement.world,
-                material_override ? material_override : materials.at(placement.materialId)});
+                material_override ? material_override : placement.material,
+                placement.ids, placement.instancePrimvars});
+        }
+        return result;
+    }
+
+    // Mesh placements: world-space meshes are attached directly, prototypes
+    // once each into a scene of their own that their placements instance.
+    std::vector<AttachedMesh> attachMeshPlacements(RTCDevice device, RTCScene target) {
+        std::vector<AttachedMesh> result;
+        for (const auto& placement : m_meshPlacements) {
+            if (!placement.enabled) continue;
+            Shape& shape = *m_shapes[placement.shape];
+            if (!shape.mesh) continue;
+            Material* material = material_override ? material_override : placement.material;
+            if (!shape.instanced) {
+                const unsigned id = shape.mesh->setupEmbree(device, target);
+                result.push_back({id, shape.mesh.get(), false, pxr::GfMatrix4d(1.0), material,
+                    material_override ? nullptr : placement.triangleMaterials, placement.ids,
+                    placement.instancePrimvars});
+                continue;
+            }
+            if (!shape.scene) {
+                shape.scene = rtcNewScene(device);
+                shape.mesh->setupEmbree(device, shape.scene);
+                rtcCommitScene(shape.scene);
+            }
+            RTCGeometry instance = rtcNewGeometry(device, RTC_GEOMETRY_TYPE_INSTANCE);
+            rtcSetGeometryInstancedScene(instance, shape.scene);
+            float matrix[16];
+            // GfMatrix uses row vectors; Embree's column-major affine convention.
+            for (int c = 0; c < 4; ++c) for (int r = 0; r < 4; ++r)
+                matrix[c * 4 + r] = float(placement.world[c][r]);
+            rtcSetGeometryTransform(instance, 0, RTC_FORMAT_FLOAT4X4_COLUMN_MAJOR, matrix);
+            rtcCommitGeometry(instance);
+            const unsigned id = rtcAttachGeometry(target, instance);
+            rtcReleaseGeometry(instance);
+            result.push_back({id, shape.mesh.get(), true, placement.world, material,
+                material_override ? nullptr : placement.triangleMaterials, placement.ids,
+                placement.instancePrimvars});
         }
         return result;
     }
@@ -738,15 +1185,22 @@ public:
         : USDMesh(file_path, nullptr, "", "")
     {}
 
-    // Full constructor with MDL/MaterialX material support. Material bindings
-    // resolve for the first of bindingPurposes that has one (UsdRenderSettings
-    // materialBindingPurposes; empty: full, then allPurpose).
+    // Full constructor with MDL/MaterialX material support.
     USDMesh(const std::filesystem::path& file_path,
             mdl::Context* mdl_context,
             const std::string& mx_libraries_path,
             const std::string& mx_mdl_path,
             std::vector<pxr::TfToken> bindingPurposes = {})
-        : m_bindingPurposes(std::move(bindingPurposes))
+        : USDMesh(file_path, mdl_context, mx_libraries_path, mx_mdl_path,
+                  LoadOptions{std::move(bindingPurposes)})
+    {}
+
+    USDMesh(const std::filesystem::path& file_path,
+            mdl::Context* mdl_context,
+            const std::string& mx_libraries_path,
+            const std::string& mx_mdl_path,
+            LoadOptions options)
+        : m_bindingPurposes(options.bindingPurposes), m_options(std::move(options))
     {
         pxr::UsdStageRefPtr stage = pxr::UsdStage::Open(file_path.string());
         if (!stage) {
@@ -754,7 +1208,31 @@ public:
             return;
         }
         std::cout << "Successfully opened USD stage: " << file_path << "\n";
+        load(stage, mdl_context, mx_libraries_path, mx_mdl_path);
+    }
 
+    USDMesh(pxr::UsdStageRefPtr const& stage,
+            mdl::Context* mdl_context,
+            const std::string& mx_libraries_path,
+            const std::string& mx_mdl_path,
+            LoadOptions options)
+        : m_bindingPurposes(options.bindingPurposes), m_options(std::move(options))
+    {
+        if (stage) load(stage, mdl_context, mx_libraries_path, mx_mdl_path);
+    }
+
+    ~USDMesh() override
+    {
+        for (auto& shape : m_shapes) {
+            if (shape->scene) rtcReleaseScene(shape->scene);
+            if (shape->mesh && shape->mesh->geom) rtcReleaseGeometry(shape->mesh->geom);
+        }
+    }
+
+private:
+    void load(pxr::UsdStageRefPtr const& stage, mdl::Context* mdl_context,
+              const std::string& mx_libraries_path, const std::string& mx_mdl_path)
+    {
         // ── Phase 1: Detect and compile MaterialX materials ────────────────
         if (mdl_context && !mx_libraries_path.empty()) {
             ArResolverContextBinder materialResolver(
@@ -767,7 +1245,8 @@ public:
                 (prism::PersistentCacheRoot() / "materials").string());
             std::cout << "[USDMesh] Scanning for MaterialX materials...\n";
 
-            auto mtlxMaterials = CollectMaterialXMaterials(stage, mx_libraries_path, m_bindingPurposes);
+            auto mtlxMaterials = CollectMaterialXMaterials(stage, mx_libraries_path, m_bindingPurposes,
+                                                           m_options.time);
 
             // Cache only within this mesh load: SDK context, libraries and loader
             // options are identical here. USD prim paths remain separate bindings.
@@ -820,60 +1299,569 @@ public:
         }
 
         // ── Phase 2: Process geometry ──────────────────────────────────────
-        pxr::UsdTimeCode timeCode = pxr::UsdTimeCode::Default();
-        pxr::UsdGeomXformCache xformCache(timeCode);
+        collectGeometry(stage);
+        convertShapes();
 
-        // We do a single traversal. PointInstancers are handled inline;
-        // their prototype subtrees are skipped by the traversal iterator
-        // so we won't double-process prototype meshes.
-        pxr::UsdPrimRange range(stage->GetPseudoRoot(), pxr::UsdTraverseInstanceProxies());
-        for (auto iter = range.begin(); iter != range.end(); ++iter) {
-            const pxr::UsdPrim& prim = *iter;
-
-            if (prim.IsA<pxr::UsdGeomPointInstancer>()) {
-                processPointInstancer(
-                    pxr::UsdGeomPointInstancer(prim),
-                    xformCache, timeCode);
-
-                // Skip into the instancer's subtree — prototypes live there
-                // and must not be processed as stand-alone meshes.
-                iter.PruneChildren();
-                continue;
-            }
-
-            if (prim.IsA<pxr::UsdGeomMesh>()) {
-                MeshData data = buildMeshData(
-                    pxr::UsdGeomMesh(prim), xformCache, timeCode,
-                    xformCache.GetLocalToWorldTransform(prim));
-                appendMeshData(data);
-            } else if (prim.IsA<pxr::UsdGeomSphere>()) {
-                captureSphere(pxr::UsdGeomSphere(prim), timeCode,
-                    xformCache.GetLocalToWorldTransform(prim));
-            }
+        size_t triangles = 0, instanced = 0;
+        for (auto const& placement : m_meshPlacements) {
+            if (!placement.enabled || !m_shapes[placement.shape]->mesh) continue;
+            triangles += m_shapes[placement.shape]->mesh->indices.size() / 3;
+            instanced += m_shapes[placement.shape]->instanced;
         }
-
-        installDisplayPrimvars();
-        // USD doubleSided per triangle (SceneManager::culledBackFace): the
-        // common uniform cases need no table.
-        if (std::all_of(single_sided.begin(), single_sided.end(), [](uint8_t s) { return s != 0; })) {
-            single_sided_all = !single_sided.empty();
-            single_sided.clear();
-        } else if (std::none_of(single_sided.begin(), single_sided.end(), [](uint8_t s) { return s != 0; })) {
-            single_sided.clear();
-        }
-
         std::cout << "Finished processing USD file:\n"
-                  << "    Total vertices:  " << vertices.size()  << "\n"
-                  << "    Total triangles: " << globalTriangleCount << "\n"
+                  << "    Mesh placements: " << m_meshPlacements.size() << " (" << instanced
+                  << " instanced), spheres: " << m_spherePlacements.size() << "\n"
+                  << "    Total triangles: " << triangles << "\n"
                   << "    Total materials: " << materials.size() << "\n";
     }
 
-private:
+    // ── Geometry ────────────────────────────────────────────────────────────
+
+    // One mesh conversion: a world-space polygon mesh, or a prototype shared
+    // by the placements of an instanced gprim (per displacing material).
+    struct Shape {
+        pxr::UsdPrim prim;
+        std::optional<prism::mesh::MeshSource> source;
+        bool worldSpace = false;            // a single placement baked in world space
+        pxr::GfMatrix4d world{1.0};         // for worldSpace
+        Material const* displacer = nullptr;
+        // Results.
+        bool instanced = false;             // placed by Embree instances
+        std::unique_ptr<Mesh, prism::mesh::ConvertedMeshDeleter> mesh;
+        prism::mesh::SharedFaceTable coarseFaces;
+        prism::mesh::MeshConversionInfo info;
+        RTCScene scene = nullptr;
+        std::vector<size_t> refinementFaces;
+        int level = 0;
+    };
+    struct MeshPlacement {
+        size_t shape = 0;
+        pxr::GfMatrix4d world{1.0};
+        Material* material = nullptr;
+        std::shared_ptr<const std::unordered_map<int, Material*>> triangleMaterials;
+        std::shared_ptr<const std::unordered_map<int, Material*>> faceMaterials; // by coarse face
+        bool enabled = true;
+        PlacementIds ids;
+        std::shared_ptr<const InstancePrimvars> instancePrimvars;
+    };
+    // An instance level of a placement: a PointInstancer (the instance's
+    // index into its arrays) or a native instance (its instance prim).
+    struct InstanceLevel {
+        pxr::UsdPrim instancer;
+        int sourceIndex = -1;
+        bool native = false;
+    };
+    // A placement of a prim's local space in the world.
+    struct Instance {
+        pxr::GfMatrix4d toWorld{1.0};
+        int instanceId = -1;
+        pxr::SdfPath instancerPath;
+        std::vector<InstanceLevel> chain;   // outer to inner
+        // Native instancing: the prototype root and its instance proxy path.
+        pxr::SdfPath prototypeRoot, proxyRoot;
+        pxr::SdfPath proxyOf(pxr::SdfPath const& path) const
+        {
+            return prototypeRoot.IsEmpty() ? path : path.ReplacePrefix(prototypeRoot, proxyRoot);
+        }
+    };
+    struct PointInstancerData {
+        pxr::VtVec3fArray positions, scales;
+        pxr::VtQuathArray orientations;
+        pxr::VtQuatfArray orientationsf;
+        pxr::VtIntArray protoIndices;
+        std::vector<bool> mask;
+        // Instance-rate primvars (vertex or varying interpolation).
+        struct Column { std::string name; int components = 0; std::vector<float> values; };
+        std::vector<Column> primvars;
+    };
+
+    pxr::GfMatrix4d localTransform(pxr::UsdPrim const& prim, bool* resets) const
+    {
+        *resets = false;
+        pxr::UsdGeomXformable xformable(prim);
+        if (!xformable) return pxr::GfMatrix4d(1.0);
+        pxr::GfMatrix4d local(1.0);
+        xformable.GetLocalTransformation(&local, resets, m_options.time);
+        return local;
+    }
+
+    PointInstancerData const& instancerData(pxr::UsdGeomPointInstancer const& instancer)
+    {
+        auto [it, added] = m_instancerData.try_emplace(instancer.GetPath());
+        if (!added) return it->second;
+        PointInstancerData& data = it->second;
+        const pxr::UsdTimeCode time = m_options.time;
+        instancer.GetPositionsAttr().Get(&data.positions, time);
+        instancer.GetScalesAttr().Get(&data.scales, time);
+        instancer.GetOrientationsAttr().Get(&data.orientations, time);
+        instancer.GetOrientationsfAttr().Get(&data.orientationsf, time);
+        instancer.GetProtoIndicesAttr().Get(&data.protoIndices, time);
+        // invisibleIds (and inactiveIds): the instances to skip, as Hydra's
+        // instancer topology mask does.
+        data.mask = instancer.ComputeMaskAtTime(time);
+        for (pxr::UsdGeomPrimvar const& primvar : pxr::UsdGeomPrimvarsAPI(instancer.GetPrim()).GetPrimvarsWithValues()) {
+            const pxr::TfToken interpolation = primvar.GetInterpolation();
+            const std::string name = primvar.GetPrimvarName().GetString();
+            if ((interpolation != pxr::UsdGeomTokens->vertex && interpolation != pxr::UsdGeomTokens->varying) ||
+                name.find(':') != std::string::npos) continue;
+            pxr::VtValue value;
+            if (!primvar.ComputeFlattened(&value, time)) continue;
+            PointInstancerData::Column column;
+            column.name = name;
+            if (!prism::mesh::PrimvarFloats(value, &column.values, &column.components) ||
+                column.components < 1 || column.components > 4) continue;
+            data.primvars.push_back(std::move(column));
+        }
+        return data;
+    }
+
+    // The instance transform of a PointInstancer's source index, composed as
+    // the Hydra delegate composes its instancer primvars (scale, rotation,
+    // then translation).
+    static pxr::GfMatrix4d instanceTransform(PointInstancerData const& data, int index)
+    {
+        pxr::GfMatrix4d transform(1.0);
+        const size_t i = size_t(index);
+        if (i < data.positions.size()) {
+            pxr::GfMatrix4d m(1.0); m.SetTranslate(pxr::GfVec3d(data.positions[i])); transform = m * transform;
+        }
+        bool hasRotation = false;
+        pxr::GfMatrix4d rotation(1.0);
+        if (i < data.orientationsf.size()) {
+            rotation.SetRotate(pxr::GfQuatd(data.orientationsf[i])); hasRotation = true;
+        } else if (i < data.orientations.size()) {
+            rotation.SetRotate(pxr::GfQuatd(data.orientations[i])); hasRotation = true;
+        }
+        if (hasRotation) transform = rotation * transform;
+        if (i < data.scales.size()) {
+            pxr::GfMatrix4d m(1.0); m.SetScale(pxr::GfVec3d(data.scales[i])); transform = m * transform;
+        }
+        return transform;
+    }
+
+    // The placements of a prim's local space: one per instance of the
+    // PointInstancer prototypes and native prototypes it lies in (nested
+    // levels multiply). *instanced is false for prims outside prototypes.
+    std::vector<Instance> const& placementsOf(pxr::UsdPrim const& prim, bool* instanced, int depth = 0)
+    {
+        static const std::vector<Instance> none;
+        auto cached = m_placementCache.find(prim.GetPath());
+        if (cached != m_placementCache.end()) {
+            *instanced = cached->second.first;
+            return cached->second.second;
+        }
+        auto& entry = m_placementCache[prim.GetPath()];
+        entry.first = false;
+        if (depth > 16) {
+            std::cerr << "[USDMesh] instancing depth exceeds 16 at " << prim.GetPath() << "\n";
+            return entry.second;
+        }
+        std::vector<Instance> result;
+        for (pxr::UsdPrim root = prim; root && !root.IsPseudoRoot(); root = root.GetParent()) {
+            auto roots = m_prototypeRoots.find(root.GetPath());
+            if (roots != m_prototypeRoots.end()) {
+                entry.first = true;
+                // Prototype hierarchy transforms up to (and with) the root.
+                pxr::GfMatrix4d toRoot(1.0);
+                for (pxr::UsdPrim p = prim; p; p = p.GetParent()) {
+                    bool resets = false;
+                    toRoot *= localTransform(p, &resets);
+                    if (resets || p == root) break;
+                }
+                for (auto const& [instancerPrim, prototypeIndex] : roots->second) {
+                    pxr::UsdGeomPointInstancer instancer(instancerPrim);
+                    PointInstancerData const& data = instancerData(instancer);
+                    std::vector<int> sources;
+                    for (size_t i = 0; i < data.protoIndices.size(); ++i)
+                        if (data.protoIndices[i] == prototypeIndex && (i >= data.mask.size() || data.mask[i]))
+                            sources.push_back(int(i));
+                    bool parentInstanced = false;
+                    std::vector<Instance> parents = placementsOf(instancerPrim, &parentInstanced, depth + 1);
+                    if (!parentInstanced) {
+                        Instance world;
+                        world.toWorld = m_xformCache->GetLocalToWorldTransform(instancerPrim);
+                        parents = {world};
+                    }
+                    for (Instance const& parent : parents) {
+                        for (size_t ordinal = 0; ordinal < sources.size(); ++ordinal) {
+                            Instance placement;
+                            placement.toWorld = (toRoot * instanceTransform(data, sources[ordinal])) * parent.toWorld;
+                            placement.instanceId = parentInstanced
+                                ? parent.instanceId * int(sources.size()) + int(ordinal) : int(ordinal);
+                            placement.instancerPath = instancerPrim.GetPath();
+                            placement.chain = parent.chain;
+                            placement.chain.push_back({instancerPrim, sources[ordinal], false});
+                            placement.prototypeRoot = parent.prototypeRoot;
+                            placement.proxyRoot = parent.proxyRoot;
+                            result.push_back(std::move(placement));
+                        }
+                    }
+                }
+                break;
+            }
+            if (root.IsPrototype()) {
+                entry.first = true;
+                pxr::GfMatrix4d toRoot(1.0);
+                for (pxr::UsdPrim p = prim; p && p != root; p = p.GetParent()) {
+                    bool resets = false;
+                    toRoot *= localTransform(p, &resets);
+                    if (resets) break;
+                }
+                std::vector<pxr::UsdPrim> instances = root.GetInstances();
+                std::sort(instances.begin(), instances.end(),
+                          [](auto const& a, auto const& b) { return a.GetPath() < b.GetPath(); });
+                for (size_t ordinal = 0; ordinal < instances.size(); ++ordinal) {
+                    pxr::UsdPrim const& instance = instances[ordinal];
+                    bool parentInstanced = false;
+                    std::vector<Instance> parents = placementsOf(instance, &parentInstanced, depth + 1);
+                    if (!parentInstanced) {
+                        Instance world;
+                        world.toWorld = m_xformCache->GetLocalToWorldTransform(instance);
+                        parents = {world};
+                    }
+                    for (Instance const& parent : parents) {
+                        Instance placement;
+                        placement.toWorld = toRoot * parent.toWorld;
+                        placement.instanceId = parentInstanced
+                            ? parent.instanceId * int(instances.size()) + int(ordinal) : int(ordinal);
+                        placement.instancerPath = root.GetPath();
+                        placement.chain = parent.chain;
+                        placement.prototypeRoot = root.GetPath();
+                        placement.proxyRoot = parent.proxyOf(instance.GetPath());
+                        // The native level's primvars are read from the proxy.
+                        placement.chain.push_back({instance.GetStage()->GetPrimAtPath(placement.proxyRoot), -1, true});
+                        result.push_back(std::move(placement));
+                    }
+                }
+                break;
+            }
+        }
+        entry.second = std::move(result);
+        *instanced = entry.first;
+        return entry.second;
+    }
+
+    // Instance-rate primvars of a placement for MDL scene data lookups:
+    // every level contributes, inner levels over outer ones. PointInstancer
+    // levels give their vertex/varying primvars at the instance's index;
+    // native instances the constant primvars the instance inherits (the
+    // primvars UsdImaging gives native instancers).
+    std::shared_ptr<const InstancePrimvars> instancePrimvars(std::vector<InstanceLevel> const& chain)
+    {
+        if (chain.empty()) return nullptr;
+        auto values = std::make_shared<InstancePrimvars>();
+        auto set = [&](InstancePrimvars::Value value) {
+            auto existing = std::find_if(values->values.begin(), values->values.end(),
+                                         [&](auto const& v) { return v.name == value.name; });
+            if (existing != values->values.end()) *existing = std::move(value);
+            else values->values.push_back(std::move(value));
+        };
+        for (auto const& level : chain) {
+            if (!level.instancer) continue;
+            if (!level.native) {
+                PointInstancerData const& data = instancerData(pxr::UsdGeomPointInstancer(level.instancer));
+                for (auto const& column : data.primvars) {
+                    const size_t n = column.values.size() / size_t(column.components);
+                    if (level.sourceIndex < 0 || size_t(level.sourceIndex) >= n) continue;
+                    InstancePrimvars::Value value;
+                    value.name = column.name;
+                    value.components = column.components;
+                    std::copy_n(column.values.begin() + size_t(level.sourceIndex) * size_t(column.components),
+                                column.components, value.value.begin());
+                    set(std::move(value));
+                }
+                continue;
+            }
+            for (pxr::UsdGeomPrimvar const& primvar :
+                 pxr::UsdGeomPrimvarsAPI(level.instancer).FindPrimvarsWithInheritance()) {
+                const std::string name = primvar.GetPrimvarName().GetString();
+                if (primvar.GetInterpolation() != pxr::UsdGeomTokens->constant ||
+                    name.find(':') != std::string::npos) continue;
+                pxr::VtValue value;
+                if (!primvar.ComputeFlattened(&value, m_options.time)) continue;
+                InstancePrimvars::Value entry;
+                entry.name = name;
+                std::vector<float> floats;
+                if (!prism::mesh::PrimvarFloats(value, &floats, &entry.components) ||
+                    entry.components < 1 || entry.components > 4) continue;
+                std::copy_n(floats.begin(), entry.components, entry.value.begin());
+                set(std::move(entry));
+            }
+        }
+        if (values->values.empty()) return nullptr;
+        return values;
+    }
+
+    // Whether a placement renders: visible (with every PointInstancer of its
+    // chain) and of an included purpose.
+    bool eligible(pxr::UsdPrim const& prim, std::vector<InstanceLevel> const& chain) const
+    {
+        pxr::UsdGeomImageable imageable(prim);
+        if (!imageable) return true;
+        if (imageable.ComputeVisibility(m_options.time) == pxr::UsdGeomTokens->invisible) return false;
+        for (auto const& level : chain)
+            if (!level.native && pxr::UsdGeomImageable(level.instancer).ComputeVisibility(m_options.time) ==
+                    pxr::UsdGeomTokens->invisible) return false;
+        const pxr::TfToken purpose = imageable.ComputePurpose();
+        if (purpose == pxr::UsdGeomTokens->default_) return true;
+        auto const& included = m_options.includedPurposes;
+        if (included.empty()) return purpose == pxr::UsdGeomTokens->render;
+        return std::find(included.begin(), included.end(), purpose) != included.end();
+    }
+
+    // The prim id of a (prim, instancer) pair: as the Hydra delegate numbers
+    // the prims it places, in traversal order.
+    int primId(pxr::SdfPath const& path, pxr::SdfPath const& instancer)
+    {
+        auto [it, added] = m_primIds.try_emplace({path, instancer}, int(m_primIds.size()));
+        return it->second;
+    }
+
+    // The bound MaterialX material of a prim, or null.
+    Material* boundMaterial(pxr::UsdPrim const& prim)
+    {
+        if (m_mdl_material_lookup.empty()) return nullptr;
+        pxr::UsdShadeMaterial bound = ComputeBoundMaterialFor(prim, m_bindingPurposes);
+        if (!bound) return nullptr;
+        auto it = m_mdl_material_lookup.find(bound.GetPrim().GetPath());
+        return it == m_mdl_material_lookup.end() ? nullptr : materials.at(it->second);
+    }
+
+    // The fallback material of a gprim without one: displayColor and
+    // displayOpacity (inherited constant ones too), one per prim.
+    Material* fallbackMaterial(pxr::UsdPrim const& prim)
+    {
+        auto existing = m_fallbackByPath.find(prim.GetPath());
+        if (existing != m_fallbackByPath.end()) return materials.at(existing->second);
+        Color3 color(0.7f, 0.7f, 0.7f);
+        float opacity = 1.0f;
+        bool primvarColor = false, primvarOpacity = false;
+        const bool meshLike = !prim.IsA<pxr::UsdGeomSphere>();
+        pxr::UsdGeomPrimvarsAPI primvars(prim);
+        if (pxr::UsdGeomPrimvar pv = primvars.FindPrimvarWithInheritance(pxr::TfToken("displayColor")); pv) {
+            pxr::VtValue value;
+            if (pv.ComputeFlattened(&value, m_options.time) && value.IsHolding<pxr::VtVec3fArray>() &&
+                !value.UncheckedGet<pxr::VtVec3fArray>().empty()) {
+                auto const& c = value.UncheckedGet<pxr::VtVec3fArray>().front();
+                color = Color3(c[0], c[1], c[2]);
+                primvarColor = pv.GetInterpolation() != pxr::UsdGeomTokens->constant && meshLike;
+            }
+        }
+        if (pxr::UsdGeomPrimvar pv = primvars.FindPrimvarWithInheritance(pxr::TfToken("displayOpacity")); pv) {
+            pxr::VtValue value;
+            if (pv.ComputeFlattened(&value, m_options.time) && value.IsHolding<pxr::VtFloatArray>() &&
+                !value.UncheckedGet<pxr::VtFloatArray>().empty()) {
+                const bool constant = pv.GetInterpolation() == pxr::UsdGeomTokens->constant;
+                // Spheres take a constant opacity only.
+                if (constant || meshLike) {
+                    opacity = value.UncheckedGet<pxr::VtFloatArray>().front();
+                    primvarOpacity = !constant;
+                }
+            }
+        }
+        int mat_id = static_cast<int>(materials.size());
+        auto texture = std::make_unique<ColorTexture>(color);
+        std::unique_ptr<Diffuse> material;
+        if (primvarColor || primvarOpacity || prism::hydra::NormalizeFallbackOpacity(opacity) < 1.0f)
+            material = std::make_unique<prism::hydra::FallbackMaterial>(texture.get(), opacity, primvarColor,
+                                                                        primvarOpacity);
+        else
+            material = std::make_unique<Diffuse>(texture.get());
+        materials[mat_id] = material.get();
+        m_owned_fallback_textures.push_back(std::move(texture));
+        m_owned_fallback_materials.push_back(std::move(material));
+        m_fallbackByPath.emplace(prim.GetPath(), mat_id);
+        return materials.at(mat_id);
+    }
+
+    // GeomSubset material bindings of a mesh, by coarse face (faces outside
+    // the subsets keep the mesh's material).
+    std::shared_ptr<const std::unordered_map<int, Material*>> subsetMaterials(pxr::UsdPrim const& prim)
+    {
+        if (!prim.IsA<pxr::UsdGeomMesh>()) return nullptr;
+        auto faces = std::make_shared<std::unordered_map<int, Material*>>();
+        for (pxr::UsdGeomSubset const& subset : pxr::UsdGeomSubset::GetAllGeomSubsets(pxr::UsdGeomImageable(prim))) {
+            pxr::TfToken elementType;
+            subset.GetElementTypeAttr().Get(&elementType);
+            if (elementType != pxr::UsdGeomTokens->face) continue;
+            Material* material = boundMaterial(subset.GetPrim());
+            if (!material) continue;
+            pxr::VtIntArray indices;
+            subset.GetIndicesAttr().Get(&indices, m_options.time);
+            for (int face : indices) if (face >= 0) (*faces)[face] = material;
+        }
+        if (faces->empty()) return nullptr;
+        return faces;
+    }
+
+    size_t shapeFor(pxr::UsdPrim const& prim, bool instanced, pxr::GfMatrix4d const& world,
+                    Material const* displacer)
+    {
+        if (instanced) {
+            auto key = std::make_pair(prim.GetPath(), displacer);
+            auto found = m_shapeIndex.find(key);
+            if (found != m_shapeIndex.end()) return found->second;
+            m_shapeIndex.emplace(key, m_shapes.size());
+        }
+        auto shape = std::make_unique<Shape>();
+        shape->prim = prim;
+        shape->worldSpace = !instanced;
+        shape->world = world;
+        shape->displacer = displacer;
+        if (prim.IsA<pxr::UsdGeomMesh>()) {
+            shape->source = prism::usd_detail::MeshSourceFromUsd(pxr::UsdGeomMesh(prim), m_options.time,
+                                                                 skinnedPoints(prim));
+            if (!shape->source)
+                std::cerr << "[USDMesh] Missing required attributes on " << prim.GetPath() << "\n";
+        } else {
+            shape->source = prism::usd_detail::ImplicitMeshSource(prim, m_options.time);
+        }
+        m_shapes.push_back(std::move(shape));
+        return m_shapes.size() - 1;
+    }
+
+    // Skinned points of a mesh bound to a skeleton (UsdSkel), at the load
+    // time; null for other meshes.
+    pxr::VtVec3fArray const* skinnedPoints(pxr::UsdPrim const&) { return nullptr; }
+
+    void addGprim(pxr::UsdPrim const& prim)
+    {
+        const bool isMesh = prim.IsA<pxr::UsdGeomMesh>();
+        const bool isSphere = prim.IsA<pxr::UsdGeomSphere>();
+        if (!isMesh && !isSphere && !prism::usd_detail::IsImplicitSurface(prim)) return;
+        bool instanced = false;
+        std::vector<Instance> placements = placementsOf(prim, &instanced);
+        if (!instanced) {
+            Instance world;
+            world.toWorld = m_xformCache->GetLocalToWorldTransform(prim);
+            placements = {world};
+        }
+        for (Instance const& placement : placements) {
+            // Native instances resolve bindings, visibility and purpose
+            // through the instance proxy of the prototype prim.
+            pxr::UsdPrim proxy = placement.prototypeRoot.IsEmpty() ? prim
+                : prim.GetStage()->GetPrimAtPath(placement.proxyOf(prim.GetPath()));
+            if (!proxy) proxy = prim;
+            PlacementIds ids;
+            ids.primId = primId(prim.GetPath(), placement.instancerPath);
+            ids.instanceId = placement.instanceId;
+            ids.path = proxy.GetPath();
+            // Hidden placements keep their prim id (the delegate numbers them
+            // too) but are not converted.
+            if (!eligible(proxy, placement.chain)) continue;
+            const bool enabled = true;
+            Material* material = boundMaterial(proxy);
+            if (!material) material = fallbackMaterial(prim);
+            if (isSphere) {
+                captureSphere(pxr::UsdGeomSphere(prim), placement.toWorld, material, enabled, ids,
+                              instancePrimvars(placement.chain));
+                continue;
+            }
+            Material const* displacer = material->hasDisplacement() ? material : nullptr;
+            MeshPlacement mesh;
+            mesh.shape = shapeFor(prim, instanced, placement.toWorld, displacer);
+            mesh.world = placement.toWorld;
+            mesh.material = material;
+            mesh.faceMaterials = subsetMaterials(proxy);
+            mesh.enabled = enabled;
+            mesh.ids = ids;
+            mesh.instancePrimvars = instancePrimvars(placement.chain);
+            m_meshPlacements.push_back(std::move(mesh));
+        }
+    }
+
+    void collectGeometry(pxr::UsdStageRefPtr const& stage)
+    {
+        m_xformCache = std::make_unique<pxr::UsdGeomXformCache>(m_options.time);
+        // PointInstancer prototype roots and the instancers listing them,
+        // including instancers inside native prototypes.
+        std::vector<pxr::UsdPrim> roots{stage->GetPseudoRoot()};
+        for (pxr::UsdPrim const& prototype : stage->GetPrototypes()) roots.push_back(prototype);
+        for (pxr::UsdPrim const& root : roots) {
+            for (pxr::UsdPrim const& prim : pxr::UsdPrimRange(root)) {
+                if (!prim.IsA<pxr::UsdGeomPointInstancer>()) continue;
+                pxr::SdfPathVector targets;
+                pxr::UsdGeomPointInstancer(prim).GetPrototypesRel().GetForwardedTargets(&targets);
+                for (size_t i = 0; i < targets.size(); ++i)
+                    m_prototypeRoots[targets[i]].emplace_back(prim, int(i));
+            }
+        }
+        // Gprims in traversal order (the delegate numbers prims so), then the
+        // prims of native prototypes.
+        for (pxr::UsdPrim const& root : roots)
+            for (pxr::UsdPrim const& prim : pxr::UsdPrimRange(root)) addGprim(prim);
+    }
+
+    // Refinement levels within the scene's budget, then the conversions:
+    // shapes that refine or displace by the shared conversion (as
+    // prototypes), the others by the polygon conversion.
+    void convertShapes()
+    {
+        std::vector<std::vector<size_t>> faces(m_shapes.size());
+        std::vector<bool> fixed(m_shapes.size(), false);
+        for (size_t i = 0; i < m_shapes.size(); ++i) {
+            Shape& shape = *m_shapes[i];
+            if (!shape.source) continue;
+            auto const& counts = shape.source->faceVertexCounts;
+            faces[i] = prism::mesh::RefinementFaces(std::span<const int>(counts.cdata(), counts.size()),
+                shape.source->subdivisionScheme, shape.displacer != nullptr, m_options.subdivision);
+        }
+        const std::vector<int> levels = prism::mesh::BudgetSubdivisionLevels(
+            faces, fixed, m_options.subdivision.budgetFaces, nullptr, nullptr);
+        std::atomic<bool> controlHulls{false};
+        tbb::parallel_for(size_t(0), m_shapes.size(), [&](size_t i) {
+            Shape& shape = *m_shapes[i];
+            if (!shape.source) return;
+            shape.level = levels[i];
+            const pxr::TfToken scheme = prism::mesh::RefinementScheme(shape.source->subdivisionScheme,
+                                                                      shape.displacer != nullptr);
+            if (shape.level > 0 || shape.displacer) {
+                prism::mesh::MeshConversion conversion = prism::mesh::ConvertMesh(
+                    *shape.source, m_options.subdivision, shape.displacer, shape.level);
+                shape.info = conversion.info;
+                shape.coarseFaces = conversion.info.coarseFaces;
+                shape.mesh = std::move(conversion.mesh);
+                shape.instanced = true;
+                if (conversion.info.subdivisionControlHull) controlHulls = true;
+            } else {
+                if (scheme != pxr::TfToken("none")) controlHulls = true;
+                std::unique_ptr<Mesh, prism::mesh::ConvertedMeshDeleter> mesh(new Mesh());
+                std::vector<int> coarse;
+                if (prism::usd_detail::BuildPolygonMesh(*shape.source,
+                        shape.worldSpace ? shape.world : pxr::GfMatrix4d(1.0), *mesh, coarse)) {
+                    shape.coarseFaces = prism::mesh::SharedFaceTable(std::move(coarse));
+                    shape.mesh = std::move(mesh);
+                }
+                shape.instanced = !shape.worldSpace;
+            }
+            shape.source.reset();
+        });
+        if (controlHulls)
+            std::cerr << "[USDMesh] some subdivision surfaces are rendered as control hulls (subdivision level "
+                         "0, over the maximum faces, or the refinement budget)\n";
+        // Materials of GeomSubsets per triangle, from the coarse faces.
+        for (auto& placement : m_meshPlacements) {
+            Shape const& shape = *m_shapes[placement.shape];
+            if (!shape.mesh) continue;
+            if (!placement.faceMaterials) continue;
+            auto triangles = std::make_shared<std::unordered_map<int, Material*>>();
+            for (size_t t = 0; t < shape.coarseFaces.size(); ++t) {
+                auto found = placement.faceMaterials->find(shape.coarseFaces[t]);
+                (*triangles)[int(t)] = found == placement.faceMaterials->end() ? placement.material : found->second;
+            }
+            placement.triangleMaterials = std::move(triangles);
+            placement.faceMaterials.reset();
+        }
+        for (auto& placement : m_meshPlacements) placement.ids.coarseFaces = m_shapes[placement.shape]->coarseFaces;
+    }
 
     struct SpherePlacement {
         float radius;
         pxr::GfMatrix4d world;
-        int materialId;
+        Material* material;
+        bool enabled = true;
+        PlacementIds ids;
+        std::shared_ptr<const InstancePrimvars> instancePrimvars;
     };
     struct SpherePrototype {
         Sphere geometry;
@@ -892,713 +1880,32 @@ private:
     std::vector<SpherePlacement> m_spherePlacements;
     std::map<float, std::unique_ptr<SpherePrototype>> m_spherePrototypes;
 
-    void captureSphere(const pxr::UsdGeomSphere& sphere,
-                       pxr::UsdTimeCode time, const pxr::GfMatrix4d& transform) {
-        if (sphere.ComputeVisibility(time) == pxr::UsdGeomTokens->invisible) return;
-        const TfToken purpose = sphere.ComputePurpose();
-        if (purpose == pxr::UsdGeomTokens->guide || purpose == pxr::UsdGeomTokens->proxy) return;
+    void captureSphere(const pxr::UsdGeomSphere& sphere, const pxr::GfMatrix4d& transform, Material* material,
+                       bool enabled, PlacementIds ids, std::shared_ptr<const InstancePrimvars> primvars) {
         double radius = 1;
-        sphere.GetRadiusAttr().Get(&radius, time);
+        sphere.GetRadiusAttr().Get(&radius, m_options.time);
         if (!(radius > 0) || !std::isfinite(radius) ||
             !std::isfinite(float(radius)) || std::abs(transform.GetDeterminant()) < 1e-15) {
             std::cerr << "[USDMesh] Invalid analytic sphere: " << sphere.GetPath() << '\n';
             return;
         }
-        m_spherePlacements.push_back({float(radius), transform, resolveMaterialId(sphere.GetPrim(), time)});
+        m_spherePlacements.push_back({float(radius), transform, material, enabled, std::move(ids),
+                                      std::move(primvars)});
     }
-
-    int globalTriangleCount = 0;
 
     std::vector<std::shared_ptr<MDLMaterial>> m_owned_mdl_materials;
     std::vector<std::unique_ptr<ColorTexture>> m_owned_fallback_textures;
     std::vector<std::unique_ptr<Diffuse>> m_owned_fallback_materials;
     std::map<SdfPath, int>                    m_mdl_material_lookup;
+    std::map<SdfPath, int>                    m_fallbackByPath;
     std::vector<pxr::TfToken>                 m_bindingPurposes;
-
-    // displayColor / displayOpacity of the appended meshes: constant spans,
-    // and per-vertex values of the meshes where they vary. They become the
-    // mesh primvars `displayColor` and `displayOpacity` (as in the Hydra
-    // delegate) only if some mesh varies.
-    struct DisplaySpan {
-        size_t first = 0, count = 0;
-        std::array<float, 4> constant{};
-        std::vector<float> values; // 4 per vertex, or empty: the constant
-    };
-    std::vector<DisplaySpan> m_displaySpans;
-    bool m_displayVaries = false;
-
-    void installDisplayPrimvars()
-    {
-        if (!m_displayVaries) {
-            m_displaySpans.clear();
-            return;
-        }
-        primvars = {{"displayColor", 3, 0}, {"displayOpacity", 1, 3}};
-        primvarStride = 4;
-        primvarValues.assign(vertices.size() * 4, 0.0f);
-        for (auto const& span : m_displaySpans) {
-            float* out = primvarValues.data() + span.first * 4;
-            if (!span.values.empty())
-                std::copy(span.values.begin(), span.values.end(), out);
-            else
-                for (size_t v = 0; v < span.count; ++v) std::copy(span.constant.begin(), span.constant.end(), out + 4 * v);
-        }
-        m_displaySpans.clear();
-    }
-
-    // displayColor (components 3) or displayOpacity (1) of a mesh prim with
-    // the given counts of points, faces and face corners.
-    static DisplayPrimvar readDisplayPrimvar(const pxr::UsdPrim& prim, const char* name, int components,
-                                             pxr::UsdTimeCode time, size_t points, size_t faces, size_t corners)
-    {
-        DisplayPrimvar result;
-        result.components = components;
-        const pxr::UsdGeomPrimvar primvar = pxr::UsdGeomPrimvarsAPI(prim).GetPrimvar(TfToken(name));
-        pxr::VtValue value;
-        if (!primvar || !primvar.ComputeFlattened(&value, time)) return result;
-        if (components == 3 && value.IsHolding<pxr::VtVec3fArray>()) {
-            for (auto const& c : value.UncheckedGet<pxr::VtVec3fArray>())
-                result.values.insert(result.values.end(), {c[0], c[1], c[2]});
-        } else if (components == 1 && value.IsHolding<pxr::VtFloatArray>()) {
-            for (float o : value.UncheckedGet<pxr::VtFloatArray>()) result.values.push_back(o);
-        }
-        if (result.values.empty()) return result;
-        const TfToken interpolation = primvar.GetInterpolation();
-        const size_t count = result.values.size() / size_t(components);
-        size_t expected = 0;
-        if (interpolation == pxr::UsdGeomTokens->uniform) expected = faces;
-        else if (interpolation == pxr::UsdGeomTokens->faceVarying) expected = corners;
-        else if (interpolation == pxr::UsdGeomTokens->vertex || interpolation == pxr::UsdGeomTokens->varying)
-            expected = points;
-        if (expected && count == expected) result.interpolation = interpolation;
-        return result;
-    }
-
-    // -----------------------------------------------------------------------
-    // appendMeshData — commit a fully-built MeshData into the global buffers
-    // -----------------------------------------------------------------------
-
-    void appendMeshData(const MeshData& data)
-    {
-        if (data.positions.empty()) return;
-
-        const size_t vertexOffset = vertices.size();
-        DisplaySpan span;
-        span.first = vertexOffset;
-        span.count = data.positions.size();
-        span.constant = data.displayConstant;
-        if (data.display.size() == 4 * data.positions.size()) {
-            span.values = data.display;
-            m_displayVaries = true;
-        }
-        m_displaySpans.push_back(std::move(span));
-
-        // Append geometry
-        vertices.insert(vertices.end(),   data.positions.begin(),  data.positions.end());
-        normals.insert(normals.end(),     data.normals.begin(),    data.normals.end());
-        texcoords.insert(texcoords.end(), data.texcoords.begin(),  data.texcoords.end());
-
-        // Append indices (rebased to global vertex buffer)
-        for (unsigned int idx : data.indices) {
-            indices.push_back(static_cast<unsigned int>(vertexOffset) + idx);
-        }
-
-        // Assign material to every triangle
-        size_t triCount = data.indices.size() / 3;
-        for (size_t t = 0; t < triCount; ++t) {
-            material_mapping[globalTriangleCount++] = data.mat_id;
-            single_sided.push_back(data.singleSided ? 1 : 0);
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // resolveMaterialId — look up or create a fallback material for a prim
-    // -----------------------------------------------------------------------
-
-    int resolveMaterialId(const pxr::UsdPrim& prim,
-                          pxr::UsdTimeCode timeCode,
-                          DisplayPrimvars const* display = nullptr)
-    {
-        if (!m_mdl_material_lookup.empty()) {
-            pxr::UsdShadeMaterial boundMat = ComputeBoundMaterialFor(prim, m_bindingPurposes);
-            if (boundMat) {
-                auto it = m_mdl_material_lookup.find(
-                    boundMat.GetPrim().GetPath());
-                if (it != m_mdl_material_lookup.end())
-                    return it->second;
-            }
-        }
-
-        // Fallback: Diffuse from displayColor
-        pxr::UsdGeomPrimvarsAPI primvarsAPI(prim);
-        pxr::UsdGeomPrimvar displayColorPrimvar =
-            primvarsAPI.GetPrimvar(TfToken("displayColor"));
-
-        Color3 mesh_color(0.7f, 0.7f, 0.7f);
-        if (displayColorPrimvar) {
-            pxr::VtValue val;
-            if (displayColorPrimvar.Get(&val, timeCode) &&
-                val.IsHolding<pxr::VtVec3fArray>())
-            {
-                auto arr = val.Get<pxr::VtVec3fArray>();
-                if (!arr.empty())
-                    mesh_color = Color3(arr[0][0], arr[0][1], arr[0][2]);
-            }
-        }
-
-        // displayOpacity, and the mesh primvars where either varies (the
-        // Hydra delegate's FallbackMaterial).
-        float opacity = 1.0f;
-        if (display) {
-            if (display->color.authored())
-                mesh_color = Color3(display->color.values[0], display->color.values[1], display->color.values[2]);
-            if (display->opacity.authored()) opacity = display->opacity.values.front();
-        } else {
-            // Other prims (spheres): a constant displayOpacity only.
-            pxr::UsdGeomPrimvar opacityPrimvar = primvarsAPI.GetPrimvar(TfToken("displayOpacity"));
-            pxr::VtValue val;
-            if (opacityPrimvar && opacityPrimvar.GetInterpolation() == pxr::UsdGeomTokens->constant &&
-                opacityPrimvar.Get(&val, timeCode) && val.IsHolding<pxr::VtFloatArray>() &&
-                !val.UncheckedGet<pxr::VtFloatArray>().empty())
-                opacity = val.UncheckedGet<pxr::VtFloatArray>()[0];
-        }
-        const bool primvarColor = display && display->color.varying();
-        const bool primvarOpacity = display && display->opacity.varying();
-
-        int mat_id = static_cast<int>(materials.size());
-        auto texture = std::make_unique<ColorTexture>(mesh_color);
-        std::unique_ptr<Diffuse> material;
-        if (primvarColor || primvarOpacity || prism::hydra::NormalizeFallbackOpacity(opacity) < 1.0f)
-            material = std::make_unique<prism::hydra::FallbackMaterial>(texture.get(), opacity, primvarColor,
-                                                                        primvarOpacity);
-        else
-            material = std::make_unique<Diffuse>(texture.get());
-        materials[mat_id] = material.get();
-        m_owned_fallback_textures.push_back(std::move(texture));
-        m_owned_fallback_materials.push_back(std::move(material));
-        return mat_id;
-    }
-
-    // -----------------------------------------------------------------------
-    // buildMeshData — two-pass builder
-    //
-    // Pass 1: read all primvars and decide on the vertex layout.
-    //         faceVarying UVs require one vertex per face corner.
-    //         vertex/varying UVs keep the original indexed layout.
-    //
-    // Pass 2: emit expanded geometry into MeshData.
-    //
-    // The transform is applied here so that the same function works for both
-    // regular meshes (world transform from xformCache) and instancer copies
-    // (prototype transform composed with the instance transform).
-    // -----------------------------------------------------------------------
-
-    MeshData buildMeshData(const pxr::UsdGeomMesh& mesh,
-                           pxr::UsdGeomXformCache& xformCache,
-                           pxr::UsdTimeCode timeCode,
-                           const pxr::GfMatrix4d& worldTransform)
-    {
-        MeshData out;
-
-        // ── Read raw mesh attributes ───────────────────────────────────────
-        pxr::VtArray<pxr::GfVec3f> points;
-        pxr::VtArray<int>          faceVertexIndices;
-        pxr::VtArray<int>          faceVertexCounts;
-
-        if (!mesh.GetPointsAttr().Get(&points, timeCode) ||
-            !mesh.GetFaceVertexIndicesAttr().Get(&faceVertexIndices, timeCode) ||
-            !mesh.GetFaceVertexCountsAttr().Get(&faceVertexCounts, timeCode))
-        {
-            std::cerr << "[USDMesh] Missing required attributes on "
-                      << mesh.GetPrim().GetPath() << "\n";
-            out.mat_id = resolveMaterialId(mesh.GetPrim(), timeCode);
-            return out;
-        }
-
-        // ── displayColor / displayOpacity, and the material ───────────────
-        DisplayPrimvars display;
-        display.color = readDisplayPrimvar(mesh.GetPrim(), "displayColor", 3, timeCode, points.size(),
-                                           faceVertexCounts.size(), faceVertexIndices.size());
-        display.opacity = readDisplayPrimvar(mesh.GetPrim(), "displayOpacity", 1, timeCode, points.size(),
-                                             faceVertexCounts.size(), faceVertexIndices.size());
-        out.mat_id = resolveMaterialId(mesh.GetPrim(), timeCode, &display);
-        bool doubleSided = false;
-        mesh.GetDoubleSidedAttr().Get(&doubleSided, timeCode);
-        out.singleSided = !doubleSided;
-        if (display.color.authored())
-            std::copy_n(display.color.values.begin(), 3, out.displayConstant.begin());
-        if (display.opacity.authored()) out.displayConstant[3] = display.opacity.values.front();
-
-        // ── Compute transform-derived values ───────────────────────────────
-        pxr::GfMatrix4d normalMatrix = worldTransform.GetInverse().GetTranspose();
-        bool flipNormals = worldTransform.GetDeterminant() < 0.0;
-
-        // ── Pass 1: UV primvar discovery ───────────────────────────────────
-        pxr::UsdGeomPrimvarsAPI primvarsAPI(mesh.GetPrim());
-        pxr::UsdGeomPrimvar uvPrimvar;
-        for (const pxr::UsdGeomPrimvar& pv : primvarsAPI.GetPrimvars()) {
-            TfToken name = pv.GetPrimvarName();
-            if (name == "st" || name == "uv" || name == "UV") {
-                uvPrimvar = pv;
-                break;
-            }
-        }
-
-        pxr::VtArray<pxr::GfVec2f> uvValues;
-        pxr::VtArray<int>          uvIndices;
-        pxr::TfToken               uvInterpolation;
-        bool                       hasUvIndices = false;
-        bool                       isFaceVarying = false;
-
-        if (uvPrimvar) {
-            uvPrimvar.Get(&uvValues, timeCode);
-            hasUvIndices   = uvPrimvar.GetIndices(&uvIndices, timeCode);
-            uvInterpolation = uvPrimvar.GetInterpolation();
-            isFaceVarying  = (uvInterpolation == pxr::UsdGeomTokens->faceVarying);
-        }
-
-        // ── Pass 1: normals discovery ──────────────────────────────────────
-        pxr::VtArray<pxr::GfVec3f> meshNormals;
-        pxr::TfToken               normalsInterpolation;
-        bool                       hasMeshNormals = false;
-        bool                       normalsAreFaceVarying = false;
-
-        pxr::UsdAttribute normalsAttr = mesh.GetNormalsAttr();
-        if (normalsAttr && normalsAttr.Get(&meshNormals, timeCode)) {
-            hasMeshNormals = true;
-            normalsInterpolation = mesh.GetNormalsInterpolation();
-            normalsAreFaceVarying = normalsInterpolation == pxr::UsdGeomTokens->faceVarying;
-            pxr::UsdGeomPrimvar normalsPrimvar =
-                primvarsAPI.GetPrimvar(pxr::UsdGeomTokens->normals);
-            if (normalsPrimvar) {
-                normalsInterpolation = normalsPrimvar.GetInterpolation();
-                normalsAreFaceVarying =
-                    (normalsInterpolation == pxr::UsdGeomTokens->faceVarying);
-            }
-        }
-
-        // ── Pass 2: emit geometry ──────────────────────────────────────────
-        //
-        // If UVs (or normals) are faceVarying we must expand: one vertex
-        // per face corner. Otherwise we keep the compact indexed layout.
-        //
-        if (isFaceVarying || normalsAreFaceVarying || display.expands()) {
-            buildFaceVaryingLayout(
-                out, points, faceVertexIndices, faceVertexCounts,
-                uvValues, uvIndices, hasUvIndices,
-                meshNormals, normalsAreFaceVarying, hasMeshNormals,
-                worldTransform, normalMatrix, flipNormals, display);
-        } else {
-            buildIndexedLayout(
-                out, points, faceVertexIndices, faceVertexCounts,
-                uvValues, uvInterpolation,
-                meshNormals, normalsInterpolation, hasMeshNormals,
-                worldTransform, normalMatrix, flipNormals, display);
-        }
-
-        return out;
-    }
-
-    // -----------------------------------------------------------------------
-    // buildFaceVaryingLayout
-    //
-    // Expands the mesh so every face corner is its own vertex. This is
-    // required when UVs (or normals) are authored with faceVarying
-    // interpolation, since the same position vertex may need different
-    // UV/normal values depending on which face it belongs to.
-    // -----------------------------------------------------------------------
-
-    void buildFaceVaryingLayout(
-        MeshData& out,
-        const pxr::VtArray<pxr::GfVec3f>& points,
-        const pxr::VtArray<int>&           faceVertexIndices,
-        const pxr::VtArray<int>&           faceVertexCounts,
-        const pxr::VtArray<pxr::GfVec2f>& uvValues,
-        const pxr::VtArray<int>&           uvIndices,
-        bool                               hasUvIndices,
-        const pxr::VtArray<pxr::GfVec3f>& meshNormals,
-        bool                               normalsAreFaceVarying,
-        bool                               hasMeshNormals,
-        const pxr::GfMatrix4d&             worldTransform,
-        const pxr::GfMatrix4d&             normalMatrix,
-        bool                               flipNormals,
-        const DisplayPrimvars&             display)
-    {
-        // Pre-compute per-vertex geometric normals for fallback / fan normal
-        std::vector<pxr::GfVec3f> geometricNormals =
-            computeGeometricNormals(points, faceVertexIndices, faceVertexCounts, flipNormals);
-
-        size_t faceCorner = 0;
-
-        for (size_t faceIdx = 0; faceIdx < faceVertexCounts.size(); ++faceIdx) {
-            int fvc = faceVertexCounts[faceIdx];
-
-            // Collect per-corner expanded vertex indices for triangulation
-            std::vector<unsigned int> cornerVerts;
-            cornerVerts.reserve(fvc);
-
-            for (int c = 0; c < fvc; ++c) {
-                int posIdx = faceVertexIndices[faceCorner + c];
-
-                unsigned int expandedIdx = static_cast<unsigned int>(out.positions.size());
-
-                // Position
-                pxr::GfVec3d p(points[posIdx][0], points[posIdx][1], points[posIdx][2]);
-                pxr::GfVec3d tp = worldTransform.Transform(p);
-                out.positions.push_back(Float3(
-                    static_cast<float>(tp[0]),
-                    static_cast<float>(tp[1]),
-                    static_cast<float>(tp[2])));
-
-                // UV
-                if (!uvValues.empty()) {
-                    int uvIdx = hasUvIndices
-                        ? uvIndices[faceCorner + c]
-                        : static_cast<int>(faceCorner + c);
-                    const pxr::GfVec2f& uv = uvValues[uvIdx];
-                    out.texcoords.push_back(Float2(uv[0], uv[1]));
-                } else {
-                    out.texcoords.push_back(Float2(0.f, 0.f));
-                }
-
-                // Normal
-                pxr::GfVec3f rawNormal(0.f, 1.f, 0.f);
-                if (hasMeshNormals && normalsAreFaceVarying &&
-                    (faceCorner + c) < meshNormals.size())
-                {
-                    rawNormal = meshNormals[faceCorner + c];
-                } else if (hasMeshNormals && !normalsAreFaceVarying &&
-                           posIdx < static_cast<int>(meshNormals.size()))
-                {
-                    rawNormal = meshNormals[posIdx];
-                } else if (posIdx < static_cast<int>(geometricNormals.size())) {
-                    rawNormal = geometricNormals[posIdx];
-                }
-
-                out.normals.push_back(
-                    transformNormal(rawNormal, normalMatrix, flipNormals));
-
-                if (display.varying())
-                    display.append(out.display, size_t(posIdx), faceCorner + c, faceIdx);
-
-                cornerVerts.push_back(expandedIdx);
-            }
-
-            // Fan triangulate
-            triangulate(out.indices, cornerVerts);
-
-            faceCorner += fvc;
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // buildIndexedLayout
-    //
-    // Keeps the original compact indexed layout for vertex/varying/uniform
-    // interpolated data. Normals and UVs are mapped 1:1 with points.
-    // -----------------------------------------------------------------------
-
-    void buildIndexedLayout(
-        MeshData& out,
-        const pxr::VtArray<pxr::GfVec3f>& points,
-        const pxr::VtArray<int>&           faceVertexIndices,
-        const pxr::VtArray<int>&           faceVertexCounts,
-        const pxr::VtArray<pxr::GfVec2f>& uvValues,
-        const pxr::TfToken&                uvInterpolation,
-        const pxr::VtArray<pxr::GfVec3f>& meshNormals,
-        const pxr::TfToken&                normalsInterpolation,
-        bool                               hasMeshNormals,
-        const pxr::GfMatrix4d&             worldTransform,
-        const pxr::GfMatrix4d&             normalMatrix,
-        bool                               flipNormals,
-        const DisplayPrimvars&             display)
-    {
-        // Positions
-        out.positions.reserve(points.size());
-        for (const pxr::GfVec3f& p : points) {
-            pxr::GfVec3d pd(p[0], p[1], p[2]);
-            pxr::GfVec3d tp = worldTransform.Transform(pd);
-            out.positions.push_back(Float3(
-                static_cast<float>(tp[0]),
-                static_cast<float>(tp[1]),
-                static_cast<float>(tp[2])));
-        }
-
-        // Normals (per-vertex)
-        if (hasMeshNormals &&
-            (normalsInterpolation == pxr::UsdGeomTokens->vertex ||
-             normalsInterpolation == pxr::UsdGeomTokens->varying))
-        {
-            out.normals.reserve(meshNormals.size());
-            for (const pxr::GfVec3f& n : meshNormals) {
-                out.normals.push_back(
-                    transformNormal(n, normalMatrix, flipNormals));
-            }
-        } else {
-            // Generate geometric normals
-            auto geom = computeGeometricNormals(
-                points, faceVertexIndices, faceVertexCounts, flipNormals);
-            out.normals.reserve(geom.size());
-            for (const pxr::GfVec3f& n : geom) {
-                out.normals.push_back(
-                    transformNormal(n, normalMatrix, flipNormals));
-            }
-        }
-
-        // UVs
-        if (!uvValues.empty() &&
-            (uvInterpolation == pxr::UsdGeomTokens->vertex ||
-             uvInterpolation == pxr::UsdGeomTokens->varying))
-        {
-            out.texcoords.reserve(uvValues.size());
-            for (const pxr::GfVec2f& uv : uvValues) {
-                out.texcoords.push_back(Float2(uv[0], uv[1]));
-            }
-        }
-
-        // Pad normals / texcoords to match positions
-        while (out.normals.size()    < out.positions.size())
-            out.normals.push_back(Float3(0.f, 1.f, 0.f));
-        while (out.texcoords.size()  < out.positions.size())
-            out.texcoords.push_back(Float2(0.f, 0.f));
-
-        // Display primvars per point (constant, vertex or varying here).
-        if (display.varying())
-            for (size_t p = 0; p < points.size(); ++p) display.append(out.display, p, 0, 0);
-
-        // Indices — triangulate faces
-        size_t faceCorner = 0;
-        for (size_t faceIdx = 0; faceIdx < faceVertexCounts.size(); ++faceIdx) {
-            int fvc = faceVertexCounts[faceIdx];
-            std::vector<unsigned int> cornerVerts(fvc);
-            for (int c = 0; c < fvc; ++c)
-                cornerVerts[c] = static_cast<unsigned int>(
-                    faceVertexIndices[faceCorner + c]);
-            triangulate(out.indices, cornerVerts);
-            faceCorner += fvc;
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Shared helpers
-    // -----------------------------------------------------------------------
-
-    /// Fan-triangulate a face given its corner vertex indices (into MeshData).
-    static void triangulate(std::vector<unsigned int>& outIndices,
-                            const std::vector<unsigned int>& cornerVerts)
-    {
-        int fvc = static_cast<int>(cornerVerts.size());
-        if (fvc < 3) return;
-
-        if (fvc == 3) {
-            outIndices.push_back(cornerVerts[0]);
-            outIndices.push_back(cornerVerts[1]);
-            outIndices.push_back(cornerVerts[2]);
-        } else if (fvc == 4) {
-            outIndices.push_back(cornerVerts[0]);
-            outIndices.push_back(cornerVerts[1]);
-            outIndices.push_back(cornerVerts[2]);
-            outIndices.push_back(cornerVerts[0]);
-            outIndices.push_back(cornerVerts[2]);
-            outIndices.push_back(cornerVerts[3]);
-        } else {
-            // Fan from vertex 0 for n-gons
-            for (int i = 1; i < fvc - 1; ++i) {
-                outIndices.push_back(cornerVerts[0]);
-                outIndices.push_back(cornerVerts[i]);
-                outIndices.push_back(cornerVerts[i + 1]);
-            }
-        }
-    }
-
-    /// Compute area-weighted per-vertex geometric normals.
-    static std::vector<pxr::GfVec3f>
-    computeGeometricNormals(const pxr::VtArray<pxr::GfVec3f>& points,
-                            const pxr::VtArray<int>&           faceVertexIndices,
-                            const pxr::VtArray<int>&           faceVertexCounts,
-                            bool                               flipNormals)
-    {
-        std::vector<pxr::GfVec3f> normals(points.size(), pxr::GfVec3f(0.f));
-
-        size_t faceCorner = 0;
-        for (size_t faceIdx = 0; faceIdx < faceVertexCounts.size(); ++faceIdx) {
-            int fvc = faceVertexCounts[faceIdx];
-            if (fvc >= 3) {
-                int i0 = faceVertexIndices[faceCorner + 0];
-                int i1 = faceVertexIndices[faceCorner + 1];
-                int i2 = faceVertexIndices[faceCorner + 2];
-
-                pxr::GfVec3f e1 = points[i1] - points[i0];
-                pxr::GfVec3f e2 = points[i2] - points[i0];
-                pxr::GfVec3f fn = e1 ^ e2; // cross product, area-weighted
-
-                if (flipNormals) fn = -fn;
-
-                for (int v = 0; v < fvc; ++v)
-                    normals[faceVertexIndices[faceCorner + v]] += fn;
-            }
-            faceCorner += fvc;
-        }
-
-        for (auto& n : normals) {
-            float len = n.GetLength();
-            n = (len > 0.f) ? (n / len) : pxr::GfVec3f(0.f, 1.f, 0.f);
-        }
-        return normals;
-    }
-
-    /// Transform and normalize a normal vector.
-    static Float3 transformNormal(const pxr::GfVec3f&    n,
-                                  const pxr::GfMatrix4d& normalMatrix,
-                                  bool                   flip)
-    {
-        pxr::GfVec3d nd(n[0], n[1], n[2]);
-        pxr::GfVec3d tn = normalMatrix.TransformDir(nd);
-        if (flip) tn = -tn;
-        double len = tn.GetLength();
-        if (len > 0.0) tn /= len;
-        return Float3(
-            static_cast<float>(tn[0]),
-            static_cast<float>(tn[1]),
-            static_cast<float>(tn[2]));
-    }
-
-    // -----------------------------------------------------------------------
-    // PointInstancer support
-    //
-    // For each instance, compose the instance transform (position + orientation
-    // + scale) with the prototype mesh's own local-to-world transform and call
-    // buildMeshData with the composed transform. This produces a correct,
-    // fully-transformed copy of the prototype geometry at each instance
-    // location. Actual GPU instancing can be added later.
-    // -----------------------------------------------------------------------
-
-    void processPointInstancer(const pxr::UsdGeomPointInstancer& instancer,
-                            pxr::UsdGeomXformCache&           xformCache,
-                            pxr::UsdTimeCode                  timeCode)
-    {
-        pxr::VtArray<pxr::GfVec3f> positions;
-        pxr::VtArray<pxr::GfQuath> orientations;
-        pxr::VtArray<pxr::GfVec3f> scales;
-        pxr::VtArray<int>          protoIndices;
-
-        instancer.GetPositionsAttr().Get(&positions,     timeCode);
-        instancer.GetOrientationsAttr().Get(&orientations, timeCode);
-        instancer.GetScalesAttr().Get(&scales,           timeCode);
-        instancer.GetProtoIndicesAttr().Get(&protoIndices, timeCode);
-
-        if (positions.empty() || protoIndices.empty()) {
-            std::cerr << "[PointInstancer] No instances on "
-                    << instancer.GetPrim().GetPath() << "\n";
-            return;
-        }
-
-        pxr::SdfPathVector protoPaths;
-        instancer.GetPrototypesRel().GetTargets(&protoPaths);
-        if (protoPaths.empty()) {
-            std::cerr << "[PointInstancer] No prototypes on "
-                    << instancer.GetPrim().GetPath() << "\n";
-            return;
-        }
-
-        pxr::UsdStageRefPtr stage = instancer.GetPrim().GetStage();
-        pxr::GfMatrix4d instancerWorld =
-            xformCache.GetLocalToWorldTransform(instancer.GetPrim());
-
-        std::cout << "[PointInstancer] Processing " << protoIndices.size()
-                << " instance(s) on " << instancer.GetPrim().GetPath() << "\n";
-
-        // invisibleIds (and inactiveIds): the instances to skip, as Hydra's
-        // instancer topology mask does.
-        const std::vector<bool> mask = instancer.ComputeMaskAtTime(timeCode);
-
-        for (size_t i = 0; i < protoIndices.size(); ++i) {
-            if (i < mask.size() && !mask[i]) continue;
-            int protoIdx = protoIndices[i];
-            if (protoIdx < 0 || protoIdx >= static_cast<int>(protoPaths.size())) {
-                std::cerr << "[PointInstancer] Invalid proto index " << protoIdx
-                        << " at instance " << i << "\n";
-                continue;
-            }
-
-            pxr::UsdPrim protoPrim = stage->GetPrimAtPath(protoPaths[protoIdx]);
-            if (!protoPrim.IsValid()) {
-                std::cerr << "[PointInstancer] Prototype prim not found: "
-                        << protoPaths[protoIdx] << "\n";
-                continue;
-            }
-
-            // Build per-instance local transform: T * R * S
-            pxr::GfVec3f pos = (i < positions.size())
-                ? positions[i] : pxr::GfVec3f(0.f);
-            pxr::GfQuath ori = (i < orientations.size())
-                ? orientations[i] : pxr::GfQuath(1.f, 0.f, 0.f, 0.f);
-            pxr::GfVec3f scl = (i < scales.size())
-                ? scales[i] : pxr::GfVec3f(1.f, 1.f, 1.f);
-
-            pxr::GfMatrix4d scaleMat(1.0);
-            scaleMat.SetScale(pxr::GfVec3d(scl[0], scl[1], scl[2]));
-
-            pxr::GfQuatf orif(
-                static_cast<float>(ori.GetReal()),
-                static_cast<float>(ori.GetImaginary()[0]),
-                static_cast<float>(ori.GetImaginary()[1]),
-                static_cast<float>(ori.GetImaginary()[2]));
-            pxr::GfQuatd orid(
-                orif.GetReal(),
-                pxr::GfVec3d(orif.GetImaginary()[0],
-                            orif.GetImaginary()[1],
-                            orif.GetImaginary()[2]));
-            pxr::GfMatrix4d rotMat(1.0);
-            rotMat.SetRotate(orid);
-
-            pxr::GfMatrix4d transMat(1.0);
-            transMat.SetTranslate(pxr::GfVec3d(pos[0], pos[1], pos[2]));
-
-            pxr::GfMatrix4d instanceLocal = scaleMat * rotMat * transMat;
-
-            // The prototype's world transform already has instancerWorld baked in
-            // (it's a child of the instancer). Strip it out to get only the
-            // proto's own local contribution relative to the instancer.
-            pxr::GfMatrix4d protoRelative =
-                xformCache.GetLocalToWorldTransform(protoPrim) *
-                instancerWorld.GetInverse();
-
-            // Final: instancerWorld brings us from instancer-local to world,
-            // instanceLocal places this specific instance, protoRelative applies
-            // any local transform the prototype prim itself has.
-            pxr::GfMatrix4d finalTransform =
-                protoRelative * instanceLocal * instancerWorld;
-
-            processPrimSubtreeWithTransform(
-                protoPrim, xformCache, timeCode, finalTransform);
-        }
-    }
-
-    /// Walk a prim subtree, applying a caller-supplied world transform to every
-    /// mesh found. Used to process instancer prototypes with their composed
-    /// instance transform rather than the prim's own world transform.
-    void processPrimSubtreeWithTransform(const pxr::UsdPrim&       root,
-                                         pxr::UsdGeomXformCache&   xformCache,
-                                         pxr::UsdTimeCode          timeCode,
-                                         const pxr::GfMatrix4d&    worldTransform)
-    {
-        if (root.IsA<pxr::UsdGeomMesh>()) {
-            MeshData data = buildMeshData(
-                pxr::UsdGeomMesh(root), xformCache, timeCode, worldTransform);
-            appendMeshData(data);
-        } else if (root.IsA<pxr::UsdGeomSphere>()) {
-            captureSphere(pxr::UsdGeomSphere(root), timeCode, worldTransform);
-        }
-
-        for (const pxr::UsdPrim& child : root.GetChildren()) {
-            // Compose child's local transform on top of the supplied world
-            pxr::GfMatrix4d childLocal =
-                xformCache.GetLocalToWorldTransform(child) *
-                xformCache.GetLocalToWorldTransform(root).GetInverse();
-            pxr::GfMatrix4d childWorld = childLocal * worldTransform;
-
-            processPrimSubtreeWithTransform(child, xformCache, timeCode, childWorld);
-        }
-    }
+    LoadOptions                               m_options;
+    std::unique_ptr<pxr::UsdGeomXformCache>   m_xformCache;
+    std::vector<std::unique_ptr<Shape>>       m_shapes;
+    std::map<std::pair<pxr::SdfPath, Material const*>, size_t> m_shapeIndex;
+    std::vector<MeshPlacement>                m_meshPlacements;
+    std::map<pxr::SdfPath, std::vector<std::pair<pxr::UsdPrim, int>>> m_prototypeRoots;
+    std::unordered_map<pxr::SdfPath, PointInstancerData, pxr::SdfPath::Hash> m_instancerData;
+    std::unordered_map<pxr::SdfPath, std::pair<bool, std::vector<Instance>>, pxr::SdfPath::Hash> m_placementCache;
+    std::map<std::pair<pxr::SdfPath, pxr::SdfPath>, int> m_primIds;
 };

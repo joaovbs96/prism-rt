@@ -121,6 +121,20 @@ struct MeshSource {
     bool motionBlur = false;
 };
 
+// A named primvar of a mesh for materials (geompropvalue), as floats.
+struct NamedPrimvar {
+    std::string name;
+    int components = 0;
+    pxr::TfToken interpolation;
+    std::vector<float> values;
+};
+
+// The primvars of a mesh other than its geometry (points, normals; texture
+// coordinates are included), sorted by name, whose size fits their
+// interpolation: the mesh's named primvars. Constant displayColor and
+// displayOpacity are left to the fallback material.
+std::vector<NamedPrimvar> NamedPrimvars(MeshSource const &source, size_t points, size_t faces, size_t corners);
+
 // Values of a primvar as floats (scalars, vectors; arrays or single values).
 bool PrimvarFloats(pxr::VtValue const &value, std::vector<float> *out, int *components);
 

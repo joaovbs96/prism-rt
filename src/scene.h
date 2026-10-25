@@ -57,6 +57,28 @@ public:
             geometry.emplace(id, mesh);
         }
         if (auto usd = dynamic_cast<USDMesh*>(mesh)) {
+            // A placement per gprim, as in the Hydra delegate: world-space
+            // meshes, and prototypes placed by Embree instances.
+            for (const auto& placed : usd->attachMeshPlacements(*device, scene)) {
+                geometry.emplace(placed.id, placed.mesh);
+                if (placed.instanced) {
+                    intersection_geometry.emplace(placed.id, placed.mesh->geom);
+                    PlacementTransform placement;
+                    const auto normal = placed.world.GetInverse().GetTranspose();
+                    for (int r = 0; r < 3; ++r) for (int c = 0; c < 3; ++c) {
+                        placement.normal[r * 3 + c] = float(normal[r][c]);
+                        placement.tangent[r * 3 + c] = float(placed.world[r][c]);
+                    }
+                    placement.mirrored = placed.world.GetDeterminant() < 0.0;
+                    placement.flipOrientation = placement.mirrored;
+                    placement_transforms.emplace(placed.id, placement);
+                }
+                auto& binding = placement_materials[placed.id];
+                binding.fallback = placed.material;
+                if (placed.triangleMaterials) binding.triangles = *placed.triangleMaterials;
+                if (placed.instancePrimvars) placement_primvars[int(placed.id)] = placed.instancePrimvars;
+                usd->attachedIds[placed.id] = placed.ids;
+            }
             for (const auto& sphere : usd->attachSphereInstances(*device, scene)) {
                 geometry.emplace(sphere.id, sphere.geometry);
                 intersection_geometry.emplace(sphere.id, sphere.geometry->geom);
@@ -71,6 +93,8 @@ public:
                 placement.flipOrientation = false;
                 placement_transforms.emplace(sphere.id, placement);
                 placement_materials[sphere.id].fallback = sphere.material;
+                if (sphere.instancePrimvars) placement_primvars[int(sphere.id)] = sphere.instancePrimvars;
+                usd->attachedIds[sphere.id] = sphere.ids;
             }
         }
     }

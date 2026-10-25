@@ -30,22 +30,23 @@ PXR_NAMESPACE_USING_DIRECTIVE
 namespace prism::mesh {
 namespace {
 
-// A named primvar of a mesh for materials (geompropvalue), as floats.
-struct ExtraPrimvar {
-    std::string name;
-    int components = 0;
-    TfToken interpolation;
-    std::vector<float> values;
-};
 
-// The primvars of a mesh other than its geometry (points, normals, texture
-// coordinates), whose size fits their interpolation.
-std::vector<ExtraPrimvar> ExtraPrimvars(MeshSource const &source, size_t points, size_t faces, size_t corners)
+
+prism::subdivision::Scheme SchemeKind(TfToken const &scheme)
+{
+    return scheme == TfToken("loop") ? prism::subdivision::Scheme::Loop
+        : scheme == TfToken("bilinear") ? prism::subdivision::Scheme::Bilinear
+                                        : prism::subdivision::Scheme::CatmullClark;
+}
+
+} // namespace
+
+std::vector<NamedPrimvar> NamedPrimvars(MeshSource const &source, size_t points, size_t faces, size_t corners)
 {
     static const std::unordered_set<std::string> skipped = {
         "points", "normals", "widths", "velocities", "accelerations", "angularVelocities"};
     constexpr int kMaxComponents = 64;
-    std::vector<ExtraPrimvar> result;
+    std::vector<NamedPrimvar> result;
     int total = 0;
     std::vector<std::pair<TfToken, PrimvarData> const *> sorted;
     sorted.reserve(source.primvars.size());
@@ -59,7 +60,7 @@ std::vector<ExtraPrimvar> ExtraPrimvars(MeshSource const &source, size_t points,
         // stay material edits.
         if ((text == "displayColor" || text == "displayOpacity") &&
             data.interpolation == HdPrimvarSchemaTokens->constant) continue;
-        ExtraPrimvar extra;
+        NamedPrimvar extra;
         extra.name = text;
         extra.interpolation = data.interpolation;
         if (!PrimvarFloats(data.value, &extra.values, &extra.components)) continue;
@@ -76,15 +77,6 @@ std::vector<ExtraPrimvar> ExtraPrimvars(MeshSource const &source, size_t points,
     }
     return result;
 }
-
-prism::subdivision::Scheme SchemeKind(TfToken const &scheme)
-{
-    return scheme == TfToken("loop") ? prism::subdivision::Scheme::Loop
-        : scheme == TfToken("bilinear") ? prism::subdivision::Scheme::Bilinear
-                                        : prism::subdivision::Scheme::CatmullClark;
-}
-
-} // namespace
 
 bool PrimvarFloats(VtValue const &value, std::vector<float> *out, int *components)
 {
@@ -292,7 +284,7 @@ MeshConversion ConvertMesh(MeshSource const &source, SubdivisionSettings const &
     PrimvarData normalPv = source.normals;
     PrimvarData uvPv = source.uvs;
     info.multipleUvSets = source.multipleUvSets;
-    std::vector<ExtraPrimvar> extras = ExtraPrimvars(source, pointCount, coarseCounts.size(),
+    std::vector<NamedPrimvar> extras = NamedPrimvars(source, pointCount, coarseCounts.size(),
                                                      coarseIndices.size());
     int extraStride = 0;
     int pointDataStride = 0;
