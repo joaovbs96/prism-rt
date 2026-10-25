@@ -1,0 +1,233 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    renderSettingsPrimPath = "/Render/Settings"
+    upAxis = "Y"
+)
+
+# Light AOVs (docs/hydra.md, "Light AOVs"): a diffuse floor, a glossy metal,
+# a glass and a plastic (diffuse under a glossy coat) sphere, a subsurface
+# sphere, an emissive panel and a visible dome. diffuse + specular + emission
+# must add up to the colour; both products come from one render, the second
+# as a multi-part EXR.
+def Scope "Render"
+{
+    def RenderSettings "Settings"
+    {
+        rel camera = </World/Camera>
+        uniform int2 resolution = (96, 64)
+        rel products = [</Render/Products/Layers>, </Render/Products/Parts>]
+        int prism:samplesPerPixel = 32
+        int prism:maxDepth = 8
+    }
+
+    def Scope "Products"
+    {
+        def RenderProduct "Layers"
+        {
+            uniform token productName = "light_aovs.exr"
+            rel orderedVars = [</Render/Vars/Color>, </Render/Vars/Albedo>, </Render/Vars/Diffuse>,
+                               </Render/Vars/Specular>, </Render/Vars/Emission>, </Render/Vars/Position>]
+        }
+
+        def RenderProduct "Parts"
+        {
+            uniform token productName = "light_aovs_parts.exr"
+            bool prism:exr:multiPart = true
+            rel orderedVars = [</Render/Vars/Color>, </Render/Vars/Albedo>, </Render/Vars/Diffuse>,
+                               </Render/Vars/Specular>, </Render/Vars/Emission>, </Render/Vars/Position>]
+        }
+    }
+
+    def Scope "Vars"
+    {
+        def RenderVar "Color"
+        {
+            uniform token dataType = "color4f"
+            uniform string sourceName = "color"
+        }
+
+        def RenderVar "Albedo"
+        {
+            uniform token dataType = "color3f"
+            uniform string sourceName = "albedo"
+        }
+
+        def RenderVar "Diffuse"
+        {
+            uniform token dataType = "color3f"
+            uniform string sourceName = "diffuse"
+        }
+
+        def RenderVar "Specular"
+        {
+            uniform token dataType = "color3f"
+            uniform string sourceName = "specular"
+        }
+
+        def RenderVar "Emission"
+        {
+            uniform token dataType = "color3f"
+            uniform string sourceName = "emission"
+        }
+
+        # World position under its other common name (Pworld).
+        def RenderVar "Position"
+        {
+            uniform token dataType = "point3f"
+            uniform string sourceName = "P"
+        }
+    }
+}
+
+def Xform "World"
+{
+    def Mesh "Floor"
+    {
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 1, 2, 3]
+        point3f[] points = [(-5, 0, 4), (5, 0, 4), (5, 0, -4), (-5, 0, -4)]
+        color3f[] primvars:displayColor = [(0.6, 0.45, 0.3)]
+    }
+
+    def Sphere "Metal" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        double radius = 0.6
+        double3 xformOp:translate = (-1.6, 0.6, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        rel material:binding = </World/Looks/Metal>
+    }
+
+    def Sphere "Glass" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        double radius = 0.6
+        double3 xformOp:translate = (0, 0.6, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        rel material:binding = </World/Looks/Glass>
+    }
+
+    def Sphere "Plastic" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        double radius = 0.6
+        double3 xformOp:translate = (1.6, 0.6, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        rel material:binding = </World/Looks/Plastic>
+    }
+
+    def Sphere "Skin" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        double radius = 0.3
+        double3 xformOp:translate = (0.8, 0.3, 1.3)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        rel material:binding = </World/Looks/Skin>
+    }
+
+    def Mesh "Panel" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 1, 2, 3]
+        point3f[] points = [(-0.6, 1.6, -2), (0.6, 1.6, -2), (0.6, 2.3, -2), (-0.6, 2.3, -2)]
+        rel material:binding = </World/Looks/Light>
+    }
+
+    def Scope "Looks"
+    {
+        def Material "Metal"
+        {
+            token outputs:mtlx:surface.connect = </World/Looks/Metal/Surface.outputs:out>
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_open_pbr_surface_surfaceshader"
+                float inputs:base_metalness = 1
+                color3f inputs:base_color = (0.9, 0.7, 0.4)
+                float inputs:specular_roughness = 0.25
+                token outputs:out
+            }
+        }
+
+        def Material "Glass"
+        {
+            token outputs:mtlx:surface.connect = </World/Looks/Glass/Surface.outputs:out>
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_open_pbr_surface_surfaceshader"
+                float inputs:base_weight = 0
+                float inputs:specular_roughness = 0
+                float inputs:specular_ior = 1.5
+                float inputs:transmission_weight = 1
+                token outputs:out
+            }
+        }
+
+        def Material "Plastic"
+        {
+            token outputs:mtlx:surface.connect = </World/Looks/Plastic/Surface.outputs:out>
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_open_pbr_surface_surfaceshader"
+                color3f inputs:base_color = (0.2, 0.4, 0.8)
+                float inputs:specular_roughness = 0.3
+                token outputs:out
+            }
+        }
+
+        def Material "Skin"
+        {
+            token outputs:mtlx:surface.connect = </World/Looks/Skin/Surface.outputs:out>
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_standard_surface_surfaceshader"
+                float inputs:base = 0
+                float inputs:subsurface = 1
+                color3f inputs:subsurface_color = (0.9, 0.5, 0.4)
+                color3f inputs:subsurface_radius = (1, 0.5, 0.25)
+                float inputs:subsurface_scale = 0.1
+                token outputs:out
+            }
+        }
+
+        def Material "Light"
+        {
+            token outputs:surface.connect = </World/Looks/Light/Surface.outputs:surface>
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "UsdPreviewSurface"
+                color3f inputs:diffuseColor = (0, 0, 0)
+                color3f inputs:emissiveColor = (4, 3, 2)
+                token outputs:surface
+            }
+        }
+    }
+
+    def DomeLight "Dome"
+    {
+        color3f inputs:color = (0.35, 0.45, 0.7)
+        float inputs:intensity = 1
+    }
+
+    def Camera "Camera"
+    {
+        float focalLength = 30
+        float horizontalAperture = 36
+        float verticalAperture = 24
+        float2 clippingRange = (0.1, 100)
+        double3 xformOp:translate = (0, 1.2, 5)
+        float3 xformOp:rotateXYZ = (-8, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
+    }
+}

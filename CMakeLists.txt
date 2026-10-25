@@ -996,6 +996,55 @@ if(TARGET prism_hydra_render AND TARGET prism_compare_images)
     prism_add_parity_fixture(NAME camera_exposure SCENE tests/hydra/fixtures/camera_exposure.usda)
     prism_add_parity_fixture(NAME id_aovs SCENE tests/hydra/fixtures/id_aovs.usda PRODUCTS id_aovs.exr
         EXACT_LAYERS id_aovs.exr:ElementId id_aovs.exr:InstanceId RELABEL_LAYERS id_aovs.exr:PrimId)
+    # Light AOVs and world positions (docs/hydra.md, "Light AOVs"): each layer
+    # of both loaders (and of the CLI on Vulkan) agrees; prism_scene_features_test
+    # checks the sum (diffuse + specular + emission = colour), the lobes, the
+    # albedo through delta bounces and the multi-part EXR of each render.
+    set(_prism_light_aov_layers)
+    foreach(_layer Albedo Diffuse Specular Emission)
+        list(APPEND _prism_light_aov_layers light_aovs.exr:${_layer})
+    endforeach()
+    set(_prism_light_aov_devices cpu)
+    if(PRISM_ENABLE_VULKAN)
+        list(APPEND _prism_light_aov_devices vulkan)
+    endif()
+    foreach(_device IN LISTS _prism_light_aov_devices)
+        set(_tag "")
+        if(_device STREQUAL "vulkan")
+            set(_tag _vulkan)
+        endif()
+        set(_fixture light_aovs${_tag})
+        set(_albedo light_aovs_albedo${_tag})
+        prism_add_parity_fixture(NAME ${_fixture} SCENE tests/hydra/fixtures/light_aovs.usda CLI_DEVICE ${_device}
+            PRODUCTS light_aovs.exr light_aovs_parts.exr LAYERS ${_prism_light_aov_layers}
+            EXACT_LAYERS light_aovs.exr:Position)
+        prism_add_parity_fixture(NAME ${_albedo} SCENE tests/hydra/fixtures/light_aovs_albedo.usda
+            CLI_DEVICE ${_device} PRODUCTS light_aovs_albedo.exr LAYERS light_aovs_albedo.exr:Albedo)
+        if(TARGET prism_scene_features_test)
+            set(_frontends cli hydra)
+            if(_device STREQUAL "vulkan")
+                set(_frontends cli)
+            endif()
+            foreach(_frontend IN LISTS _frontends)
+                set(_dir "${prism_parity_${_fixture}_dir}/${_frontend}")
+                set(_suffix ${_frontend})
+                if(_device STREQUAL "vulkan")
+                    set(_suffix vulkan)
+                endif()
+                add_test(NAME prism_scene_features_light_aovs_${_suffix}
+                    COMMAND prism_scene_features_test light_aovs "${_dir}/light_aovs.exr")
+                add_test(NAME prism_scene_features_exr_parts_${_suffix}
+                    COMMAND prism_scene_features_test exr_parts "${_dir}/light_aovs.exr" "${_dir}/light_aovs_parts.exr")
+                set_tests_properties(prism_scene_features_light_aovs_${_suffix} prism_scene_features_exr_parts_${_suffix}
+                    PROPERTIES FIXTURES_REQUIRED prism_parity_${_fixture})
+                add_test(NAME prism_scene_features_light_aovs_albedo_${_suffix}
+                    COMMAND prism_scene_features_test light_aovs_albedo
+                        "${prism_parity_${_albedo}_dir}/${_frontend}/light_aovs_albedo.exr")
+                set_tests_properties(prism_scene_features_light_aovs_albedo_${_suffix}
+                    PROPERTIES FIXTURES_REQUIRED prism_parity_${_albedo})
+            endforeach()
+        endif()
+    endforeach()
     # The CLI on Vulkan against the delegate on the CPU: instanced prototypes,
     # placement transforms and instance primvars in the GPU scene.
     if(PRISM_ENABLE_VULKAN)
@@ -1328,6 +1377,8 @@ set(_prism_gpu_test_regex
     "|^prism_(gpu_shader_compile_test|device_selection_test|cli_clean_exit_vulkan|cli_gpu_failure_vulkan)$"
     "|^prism_(gltf|obj)_.*_vulkan_(render|parity|test)$"
     "|^prism_parity_.*_(vulkan|metal)_(cli|hydra|match)$"
+    "|^prism_parity_.*_(vulkan|metal)_.*_(match|layer|exact)$"
+    "|^prism_scene_features_.*_vulkan$"
     "|^prism_textured_emitter_vulkan_(render|parity)$")
 string(JOIN "" _prism_gpu_test_regex ${_prism_gpu_test_regex})
 get_property(_prism_tests DIRECTORY PROPERTY TESTS)

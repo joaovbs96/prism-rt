@@ -31,8 +31,18 @@
 //   sss_fallback       sss_fallback.usda: prism:sssFallback renders the
 //                      furnace's subsurface-only sphere by its (black)
 //                      diffuse lobe instead of tracing the walk.
+//   light_aovs         light_aovs.usda (light_aovs.exr): diffuse + specular +
+//                      emission is the colour in every pixel; each lobe shows
+//                      where it should; Position holds world positions.
+//   light_aovs_albedo  light_aovs_albedo.usda: the albedo through the glass
+//                      and the mirror sphere is the walls' colour, that of
+//                      the diffuse sphere its own.
+//   exr_parts          LAYERS PARTS: the multi-part EXR PARTS holds a named
+//                      part per layer of the single-part LAYERS, with the
+//                      same channels and pixels.
 
 #include <OpenImageIO/imagebuf.h>
+#include <OpenImageIO/imageio.h>
 
 #include <algorithm>
 #include <cmath>
@@ -59,15 +69,19 @@ void Check(bool ok, std::string const& what)
 struct Image {
     int width = 0, height = 0, channels = 0;
     std::vector<float> pixels;
+    std::string path;
+    std::vector<std::string> names;
 
-    bool Load(std::string const& path)
+    bool Load(std::string const& file)
     {
+        path = file;
         OIIO::ImageBuf buffer(path);
         if (!buffer.read(0, 0, true, OIIO::TypeDesc::FLOAT)) return false;
         auto const& spec = buffer.spec();
         width = spec.width;
         height = spec.height;
         channels = spec.nchannels;
+        names = spec.channelnames;
         pixels.resize(size_t(width) * height * channels);
         return buffer.get_pixels(OIIO::ROI(spec.x, spec.x + width, spec.y, spec.y + height, 0, 1, 0, channels),
                                  OIIO::TypeDesc::FLOAT, pixels.data());
@@ -95,6 +109,13 @@ struct Image {
     }
 
     bool HasAlpha() const { return channels >= 4; }
+
+    // The index of the named channel, -1 when there is none.
+    int Channel(std::string const& name) const
+    {
+        auto found = std::find(names.begin(), names.end(), name);
+        return found == names.end() ? -1 : int(found - names.begin());
+    }
 };
 
 std::string Describe(char const* what, float value)
@@ -362,6 +383,184 @@ void GlassFurnace(Image const& image)
     Check(worst <= 0.02, Describe("the largest pixel difference from the dome", float(worst)));
 }
 
+// The three channels <layer>.R/G/B (R, G, B for an empty layer); false if
+// one is missing.
+bool LayerChannels(Image const& image, std::string const& layer, int* indices, char const* const* suffixes = nullptr)
+{
+    static char const* const rgb[] = {"R", "G", "B"};
+    if (!suffixes) suffixes = rgb;
+    for (int c = 0; c < 3; ++c) {
+        indices[c] = image.Channel(layer.empty() ? std::string(suffixes[c]) : layer + "." + suffixes[c]);
+        if (indices[c] < 0) {
+            Check(false, image.path + " has the channels of " + (layer.empty() ? std::string("the colour") : layer));
+            return false;
+        }
+    }
+    return true;
+}
+
+// Mean of a layer's channel c over the (2r+1)^2 box around (x, y).
+float LayerMean(Image const& image, int const* channels, int x, int y, int c, int r)
+{
+    return image.Mean(x, y, channels[c], r);
+}
+
+// light_aovs.usda, 96x64.
+void LightAovs(Image const& image)
+{
+    int color[3], albedo[3], diffuse[3], specular[3], emission[3], position[3];
+    static char const* const xyz[] = {"X", "Y", "Z"};
+    if (!LayerChannels(image, "", color) || !LayerChannels(image, "Albedo", albedo) ||
+        !LayerChannels(image, "Diffuse", diffuse) || !LayerChannels(image, "Specular", specular) ||
+        !LayerChannels(image, "Emission", emission) || !LayerChannels(image, "Position", position, xyz))
+        return;
+    // The sum, against the colour (relative to it, or to a hundredth of the
+    // mean where it is darker).
+    double mean = 0.0;
+    for (int y = 0; y < image.height; ++y)
+        for (int x = 0; x < image.width; ++x)
+            for (int c = 0; c < 3; ++c) mean += image.At(x, y, color[c]);
+    mean /= 3.0 * image.width * image.height;
+    double worst = 0.0, negative = 0.0;
+    for (int y = 0; y < image.height; ++y)
+        for (int x = 0; x < image.width; ++x)
+            for (int c = 0; c < 3; ++c) {
+                const double value = image.At(x, y, color[c]);
+                const double sum = double(image.At(x, y, diffuse[c])) + image.At(x, y, specular[c]) +
+                    image.At(x, y, emission[c]);
+                worst = std::max(worst, std::abs(sum - value) / std::max(std::abs(value), 0.01 * mean));
+                for (int const* layer : {diffuse, specular, emission, albedo})
+                    negative = std::min(negative, double(image.At(x, y, layer[c])));
+            }
+    Check(worst <= 1e-4, Describe("diffuse + specular + emission is the colour (largest relative difference)",
+                                  float(worst)));
+    Check(negative >= -1e-5, Describe("no AOV is negative (smallest value)", float(negative)));
+    auto gray = [&](int const* layer, int x, int y) {
+        return (LayerMean(image, layer, x, y, 0, 1) + LayerMean(image, layer, x, y, 1, 1) +
+                LayerMean(image, layer, x, y, 2, 1)) / 3.0f;
+    };
+    // The dome (top corner) and the panel are seen directly: emission only.
+    Check(gray(emission, 3, 3) > 0.3f && gray(diffuse, 3, 3) == 0.0f && gray(specular, 3, 3) == 0.0f,
+          Describe("the dome is emission", gray(emission, 3, 3)));
+    // Floor (bottom centre): mostly diffuse, no emission.
+    Check(gray(diffuse, 48, 60) > 0.05f && gray(emission, 48, 60) == 0.0f,
+          Describe("the floor is diffuse", gray(diffuse, 48, 60)));
+    Check(gray(specular, 48, 60) < 0.1f * gray(diffuse, 48, 60),
+          Describe("the floor has no glossy lobe (specular / diffuse)",
+                   gray(specular, 48, 60) / std::max(1e-6f, gray(diffuse, 48, 60))));
+    // A Lambertian sample weighs its colour exactly (in the working space).
+    float spread = 0.0f;
+    for (int c = 0; c < 3; ++c)
+        spread = std::max(spread, std::abs(image.At(47, 60, albedo[c]) - image.At(49, 59, albedo[c])));
+    Check(spread < 1e-5f && LayerMean(image, albedo, 48, 60, 0, 1) > LayerMean(image, albedo, 48, 60, 1, 1) &&
+              LayerMean(image, albedo, 48, 60, 1, 1) > LayerMean(image, albedo, 48, 60, 2, 1),
+          Describe("the floor's albedo is its (orange) colour, the same in every pixel (spread)", spread));
+    // Find the spheres' pixels from the world positions (centre rows).
+    auto nearest = [&](float px, float py, float pz, float radius) {
+        int best = -1;
+        float distance = 1e9f;
+        for (int y = 0; y < image.height; ++y)
+            for (int x = 0; x < image.width; ++x) {
+                const float dx = image.At(x, y, position[0]) - px, dy = image.At(x, y, position[1]) - py,
+                    dz = image.At(x, y, position[2]) - pz;
+                const float d = std::abs(std::sqrt(dx * dx + dy * dy + dz * dz) - radius);
+                // The point of the sphere closest to the camera, roughly.
+                if (d < 1e-3f && image.At(x, y, position[2]) > pz + 0.5f * radius) {
+                    const float off = std::abs(image.At(x, y, position[0]) - px) + std::abs(image.At(x, y, position[1]) - py);
+                    if (off < distance) { distance = off; best = y * image.width + x; }
+                }
+            }
+        return best;
+    };
+    const int metal = nearest(-1.6f, 0.6f, 0.0f, 0.6f);
+    const int glass = nearest(0.0f, 0.6f, 0.0f, 0.6f);
+    const int plastic = nearest(1.6f, 0.6f, 0.0f, 0.6f);
+    Check(metal >= 0 && glass >= 0 && plastic >= 0, "the world positions put the spheres where they are");
+    if (metal < 0 || glass < 0 || plastic < 0) return;
+    auto at = [&](int pixel, int const* layer) { return gray(layer, pixel % image.width, pixel / image.width); };
+    Check(at(metal, diffuse) < 0.02f * at(metal, specular), Describe("the metal is specular (diffuse / specular)",
+          at(metal, diffuse) / std::max(1e-6f, at(metal, specular))));
+    Check(at(glass, specular) > 0.05f && at(glass, diffuse) < 0.05f * at(glass, specular),
+          Describe("the glass is specular (diffuse / specular)", at(glass, diffuse) / std::max(1e-6f, at(glass, specular))));
+    Check(at(plastic, diffuse) > 0.02f && at(plastic, specular) > 0.002f,
+          Describe("the plastic is diffuse and specular (diffuse)", at(plastic, diffuse)));
+    // The metal's albedo is its colour: red above blue.
+    Check(LayerMean(image, albedo, metal % image.width, metal / image.width, 0, 1) >
+              1.5f * LayerMean(image, albedo, metal % image.width, metal / image.width, 2, 1),
+          Describe("the metal's albedo is gold (red)", LayerMean(image, albedo, metal % image.width, metal / image.width, 0, 1)));
+}
+
+// light_aovs_albedo.usda, 96x64: the spheres' centres project to (13, 32),
+// (48, 32) and (83, 32); a corner shows a wall.
+void LightAovsAlbedo(Image const& image)
+{
+    int albedo[3];
+    if (!LayerChannels(image, "Albedo", albedo)) return;
+    // The walls' colour in the working space, as a corner shows it.
+    float wall[3], sphere[3];
+    for (int c = 0; c < 3; ++c) {
+        wall[c] = LayerMean(image, albedo, 3, 3, c, 1);
+        sphere[c] = image.At(48, 32, albedo[c]);
+    }
+    Check(wall[0] > wall[1] && wall[1] > wall[2] && wall[2] > 0.0f, Describe("the walls are orange (red)", wall[0]));
+    Check(sphere[1] > 1.5f * sphere[0] && sphere[1] > 1.5f * sphere[2],
+          Describe("the diffuse sphere is green (green)", sphere[1]));
+    auto expect = [&](char const* what, int x, int y, float const* colour, float tolerance) {
+        float worst = 0.0f;
+        for (int c = 0; c < 3; ++c)
+            worst = std::max(worst, std::abs(LayerMean(image, albedo, x, y, c, 1) / colour[c] - 1.0f));
+        Check(worst <= tolerance, Describe(what, worst));
+        std::printf("  %s: albedo (%g, %g, %g)\n", what, LayerMean(image, albedo, x, y, 0, 1),
+                    LayerMean(image, albedo, x, y, 1, 1), LayerMean(image, albedo, x, y, 2, 1));
+    };
+    expect("another wall's albedo is the same (largest relative difference)", 92, 60, wall, 1e-4f);
+    expect("the diffuse sphere's albedo is its colour in every pixel", 48, 32, sphere, 1e-4f);
+    expect("the albedo through the glass is the walls' colour", 13, 32, wall, 0.03f);
+    expect("the albedo in the mirror is the walls' colour", 83, 32, wall, 0.03f);
+}
+
+// The parts of a multi-part EXR against the layers of a single-part one.
+void ExrParts(std::vector<Image> const& images)
+{
+    Image const& layers = images[0];
+    std::string path = images[1].path;
+    auto input = OIIO::ImageInput::open(path);
+    if (!input) {
+        Check(false, "cannot open " + path);
+        return;
+    }
+    int parts = 0;
+    size_t channels = 0;
+    bool same = true;
+    std::vector<std::string> partNames;
+    for (int part = 0; input->seek_subimage(part, 0); ++part) {
+        OIIO::ImageSpec const& spec = input->spec();
+        ++parts;
+        partNames.push_back(spec.get_string_attribute("oiio:subimagename"));
+        std::vector<float> pixels(size_t(spec.width) * spec.height * spec.nchannels);
+        if (spec.width != layers.width || spec.height != layers.height ||
+            !input->read_image(part, 0, 0, spec.nchannels, OIIO::TypeDesc::FLOAT, pixels.data())) {
+            same = false;
+            continue;
+        }
+        for (int c = 0; c < spec.nchannels; ++c) {
+            const int source = layers.Channel(spec.channelnames[c]);
+            if (source < 0) { same = false; continue; }
+            ++channels;
+            for (int y = 0; y < spec.height; ++y)
+                for (int x = 0; x < spec.width; ++x)
+                    same = same && pixels[(size_t(y) * spec.width + x) * spec.nchannels + c] == layers.At(x, y, source);
+        }
+    }
+    std::string names;
+    for (auto const& name : partNames) names += (names.empty() ? "" : ", ") + name;
+    std::printf("  parts: %s\n", names.c_str());
+    Check(parts == 6 && partNames.front() == "Color" && partNames.back() == "Position",
+          Describe("a named part per var", float(parts)));
+    Check(channels == size_t(layers.channels), Describe("the parts hold every channel", float(channels)));
+    Check(same, "the parts' pixels are the layers'");
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -398,6 +597,9 @@ int main(int argc, char** argv)
                 std::printf("(%d, %d): %g\n", d[i].second % images[0].width, d[i].second / images[0].width, d[i].first);
         }}},
         {"lobes_consistency", {2, LobesConsistency}},
+        {"light_aovs", single(LightAovs)},
+        {"light_aovs_albedo", single(LightAovsAlbedo)},
+        {"exr_parts", {2, ExrParts}},
     };
     if (argc < 3 || !checks.contains(argv[1]) || argc - 2 != checks.at(argv[1]).first) {
         std::printf("usage: prism_scene_features_test FEATURE IMAGE.exr...\nfeatures:");

@@ -7,6 +7,7 @@
 #     [ARGS <options of both frontends>...]
 #     [CLI_ARGS <PrismRT options>...] [HYDRA_ARGS <prism_hydra_render options>...]
 #     [ENV <NAME=value>...]   (environment of both renders)
+#     [LAYERS <file>:<layer>...]
 #     [EXACT_LAYERS <file>:<layer>...] [RELABEL_LAYERS <file>:<layer>...]
 #     [CLI_DEVICE cpu|vulkan|metal])
 #
@@ -16,7 +17,8 @@
 # luminance within MEAN_TOLERANCE (default: TOLERANCE). Both render a fixed
 # number of samples (no adaptive sampling: _prism_fixed_sampling). Without PRODUCTS both
 # render one image from CAMERA; with PRODUCTS both write the RenderProducts of
-# the stage's render settings and each listed file is compared. EXACT_LAYERS
+# the stage's render settings and each listed file is compared. LAYERS
+# compares those layers too, within the tolerances (light AOVs); EXACT_LAYERS
 # compares those layers (geometric AOVs) exactly; RELABEL_LAYERS compares id
 # layers exactly up to a renumbering (prim ids: each loader numbers its prims).
 # CLI_DEVICE renders the CLI's side on another device (a GPU: name the
@@ -25,12 +27,13 @@
 #
 # Tests: prism_parity_<name>_cli, prism_parity_<name>_hydra (the CTest
 # fixture prism_parity_<name>), and prism_parity_<name>_match (one image) or
-# prism_parity_<name>_<file stem>_match; outputs go to
+# prism_parity_<name>_<file stem>_match, prism_parity_<name>_<file
+# stem>_<layer>_{layer,exact,relabel} for the layers; outputs go to
 # ${CMAKE_BINARY_DIR}/parity/<name>/{cli,hydra}, which is returned in
 # prism_parity_<name>_dir.
 function(prism_add_parity_fixture)
     cmake_parse_arguments(P "" "NAME;SCENE;CAMERA;WIDTH;HEIGHT;SPP;TOLERANCE;MEAN_TOLERANCE;CLI_DEVICE"
-        "ARGS;CLI_ARGS;HYDRA_ARGS;ENV;PRODUCTS;EXACT_LAYERS;RELABEL_LAYERS" ${ARGN})
+        "ARGS;CLI_ARGS;HYDRA_ARGS;ENV;PRODUCTS;LAYERS;EXACT_LAYERS;RELABEL_LAYERS" ${ARGN})
     if(NOT P_NAME OR NOT P_SCENE)
         message(FATAL_ERROR "prism_add_parity_fixture needs NAME and SCENE")
     endif()
@@ -85,6 +88,17 @@ function(prism_add_parity_fixture)
         add_test(NAME ${_test}
             COMMAND prism_compare_images "${_dir}/cli/${_output}" "${_dir}/hydra/${_output}"
                 --tolerance ${P_TOLERANCE} --mean-tolerance ${P_MEAN_TOLERANCE})
+        set_tests_properties(${_test} PROPERTIES FIXTURES_REQUIRED ${_prefix})
+    endforeach()
+    foreach(_compared IN LISTS P_LAYERS)
+        string(REPLACE ":" ";" _parts "${_compared}")
+        list(GET _parts 0 _output)
+        list(GET _parts 1 _layer)
+        get_filename_component(_stem "${_output}" NAME_WE)
+        set(_test ${_prefix}_${_stem}_${_layer}_layer)
+        add_test(NAME ${_test}
+            COMMAND prism_compare_images "${_dir}/cli/${_output}" "${_dir}/hydra/${_output}"
+                --layer ${_layer} --tolerance ${P_TOLERANCE} --mean-tolerance ${P_MEAN_TOLERANCE})
         set_tests_properties(${_test} PROPERTIES FIXTURES_REQUIRED ${_prefix})
     endforeach()
     foreach(_exact IN LISTS P_EXACT_LAYERS)
