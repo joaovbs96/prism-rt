@@ -3,15 +3,18 @@
 // a point must agree between light sampling and uniform direction sampling
 // through intersectLight, and the density of a sampled direction must match
 // the density intersectLight reports for it. Also checks the light table's
-// alias distribution and the composite environment's density.
+// alias distribution (also over a million entries) and the composite
+// environment's density.
 
 #include "../src/device/light_table.h"
+#include "../shaders/integrator/path_tracer.h"
 #include "../src/environment.h"
 #include "../src/lights.h"
 
 #include <cmath>
 #include <cstdio>
 #include <random>
+#include <vector>
 
 namespace {
 
@@ -105,8 +108,51 @@ void CheckShape(char const* name, LightRecord const& light, float3 p)
 
 } // namespace
 
+// PathTracer::pickLight over a large table (a million emissive triangles and
+// a dome, as in the OpenPBR playground): the realized selection frequencies
+// must be the table's probabilities, which MIS assumes. Selection numbers
+// lie on the sampler's 24-bit grid.
+struct PickBackend {
+    std::vector<float4> const* alias = nullptr;
+    Rng rng = {12345u};
+    uint lightCount() { return uint(alias->size()) - 1u; }
+    float4 lightAlias(uint i) { return (*alias)[i]; }
+};
+struct PickHit {
+    SurfaceHit surface;
+};
+struct PickShading {};
+
+void CheckLargeTablePicks()
+{
+    const size_t n = 1000001;
+    const double dome = 0.99;
+    std::vector<double> pmf(n, (1.0 - dome) / double(n - 1));
+    pmf[n - 1] = dome;
+    const std::vector<float4> alias = prism::device::BuildAliasTable(pmf);
+    PathTracer<PickBackend, PickHit, PickShading> tracer;
+    tracer.backend.alias = &alias;
+    std::mt19937 generator(7);
+    const size_t draws = 4000000;
+    size_t domePicks = 0, lowHalf = 0;
+    for (size_t i = 0; i < draws; ++i) {
+        const float u = (float(generator() >> 8) + 0.5f) / 16777216.0f;
+        const LightPick pick = tracer.pickLight(u);
+        if (pick.index == n - 1) ++domePicks;
+        else if (pick.index < (n - 1) / 2) ++lowHalf;
+    }
+    const double domeFrequency = double(domePicks) / double(draws);
+    const double lowFrequency = double(lowHalf) / double(draws);
+    std::printf("large table: dome %.5f (table %.5f), first half of the triangles %.5f (table %.5f)\n",
+                domeFrequency, dome, lowFrequency, 0.5 * (1.0 - dome));
+    Check(std::abs(domeFrequency / dome - 1.0) < 1e-3, "large table: the dome is picked by its probability");
+    Check(std::abs(lowFrequency / (0.5 * (1.0 - dome)) - 1.0) < 0.03,
+          "large table: triangles are picked by their probability");
+}
+
 int main()
 {
+    CheckLargeTablePicks();
     prism::LightParameters params;
     params.intensity = 2.0f;
 

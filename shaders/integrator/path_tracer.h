@@ -191,6 +191,10 @@ struct SampleSettings {
     float3 luminance;
 };
 
+// Light tables with more entries pick between a column and its alias with
+// the white noise (PathTracer::pickLight).
+static const uint kPreciseLightPickEntries = 4096u;
+
 // Spatial light selection loops over the analytic lights: at most this many.
 static const uint kMaxSpatialLights = 64u;
 
@@ -342,14 +346,38 @@ struct PathTracer {
     }
 
     // The light table entry for the selection number u (lightCount() > 0).
+    // Small tables take the column and the choice between it and its alias
+    // from u alone. Sample numbers lie on a 24-bit grid, so above
+    // kPreciseLightPickEntries entries u reaches each column only a few
+    // times (18 at a million entries) and the fraction left in it is that
+    // coarse: entries came out with other probabilities than the table's,
+    // which MIS assumes (the OpenPBR playground's dome lit its desk 8% too
+    // brightly). Large tables draw the column (uniformly, by rejection) and
+    // the choice from the white noise instead. Another dimension of the same
+    // sample point is no good: at the column's scale it is nearly a function
+    // of u.
     LightPick pickLight(float u)
     {
         const uint entries = backend.lightCount() + 1u;
-        const float scaled = u * float(entries);
-        const uint column = min(uint(scaled), entries - 1u);
+        uint column;
+        float choice;
+        if (entries > kPreciseLightPickEntries) {
+            const uint limit = (16777216u / entries) * entries;
+            uint bits = 0u;
+            for (int attempt = 0; attempt < 8; ++attempt) {
+                bits = uint(backend.rng.next() * 16777216.0f);
+                if (bits < limit) break;
+            }
+            column = bits % entries;
+            choice = backend.rng.next();
+        } else {
+            const float scaled = u * float(entries);
+            column = min(uint(scaled), entries - 1u);
+            choice = scaled - float(column);
+        }
         const float4 entry = backend.lightAlias(column);
         LightPick pick;
-        pick.index = scaled - float(column) < entry.x ? column : asuint(entry.y);
+        pick.index = choice < entry.x ? column : asuint(entry.y);
         pick.pmf = backend.lightAlias(pick.index).z;
         return pick;
     }

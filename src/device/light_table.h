@@ -502,6 +502,36 @@ inline void AddVaryingEmitters(SceneManager& scene, LightTable& table, std::vect
 
 } // namespace light_table_detail
 
+// Vose's alias method over the selection probabilities `pmf`: x the
+// probability of keeping the column, y its alias (as float bits), z the
+// entry's probability (PathTracer::pickLight).
+inline std::vector<float4> BuildAliasTable(std::vector<double> const& pmf)
+{
+    const size_t n = pmf.size();
+    std::vector<float4> alias(n, float4(1.0f, 0.0f, 0.0f, 0.0f));
+    std::vector<double> scaled(n);
+    std::vector<uint32_t> smallBin, largeBin;
+    for (size_t i = 0; i < n; ++i) {
+        scaled[i] = pmf[i] * double(n);
+        (scaled[i] < 1.0 ? smallBin : largeBin).push_back(uint32_t(i));
+        alias[i].y = asfloat(uint32_t(i));
+        alias[i].z = float(pmf[i]);
+    }
+    while (!smallBin.empty() && !largeBin.empty()) {
+        const uint32_t s = smallBin.back();
+        smallBin.pop_back();
+        const uint32_t l = largeBin.back();
+        largeBin.pop_back();
+        alias[s].x = float(scaled[s]);
+        alias[s].y = asfloat(l);
+        scaled[l] -= 1.0 - scaled[s];
+        (scaled[l] < 1.0 ? smallBin : largeBin).push_back(l);
+    }
+    for (uint32_t i : largeBin) alias[i].x = 1.0f;
+    for (uint32_t i : smallBin) alias[i].x = 1.0f;
+    return alias;
+}
+
 inline LightTable BuildLightTable(SceneManager& scene, size_t maxEmitterTriangles = kMaxEmitterTriangles)
 {
     using namespace light_table_detail;
@@ -699,28 +729,7 @@ inline LightTable BuildLightTable(SceneManager& scene, size_t maxEmitterTriangle
         densities[record.info.z] = (record.info.y & kLightTwoSided) != 0u ? density : -density;
     }
 
-    // Vose's alias method.
-    table.alias.assign(n, float4(1.0f, 0.0f, 0.0f, 0.0f));
-    std::vector<double> scaled(n);
-    std::vector<uint32_t> smallBin, largeBin;
-    for (size_t i = 0; i < n; ++i) {
-        scaled[i] = pmf[i] * double(n);
-        (scaled[i] < 1.0 ? smallBin : largeBin).push_back(uint32_t(i));
-        table.alias[i].y = asfloat(uint32_t(i));
-        table.alias[i].z = float(pmf[i]);
-    }
-    while (!smallBin.empty() && !largeBin.empty()) {
-        const uint32_t s = smallBin.back();
-        smallBin.pop_back();
-        const uint32_t l = largeBin.back();
-        largeBin.pop_back();
-        table.alias[s].x = float(scaled[s]);
-        table.alias[s].y = asfloat(l);
-        scaled[l] -= 1.0 - scaled[s];
-        (scaled[l] < 1.0 ? smallBin : largeBin).push_back(l);
-    }
-    for (uint32_t i : largeBin) table.alias[i].x = 1.0f;
-    for (uint32_t i : smallBin) table.alias[i].x = 1.0f;
+    table.alias = BuildAliasTable(pmf);
     return table;
 }
 
