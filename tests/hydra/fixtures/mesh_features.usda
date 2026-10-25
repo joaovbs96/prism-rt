@@ -1,0 +1,258 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    upAxis = "Y"
+    metersPerUnit = 1
+    renderSettingsPrimPath = "/Render/Default"
+)
+
+# Mesh details both loaders read alike (docs/hydra.md, "Scene features"),
+# a card each, left to right, top row then bottom row:
+#   Holes: a 2x2 grid of quads with holeIndices [1, 2] (an L with two gaps)
+#   LeftHanded: a card with orientation leftHanded and no normals
+#   Mirrored: a card under a negative scale, with authored normals
+#   Subsets: two GeomSubsets binding red and blue UsdPreviewSurface materials
+#   UniformNormals: two faces with uniform (per-face) normals
+#   ConstantNormal: one face with a constant normal
+#   Purposes: guide (green), proxy (yellow) and render (magenta) cards stacked
+#             at one place; /Render/Default renders default and render
+#             purposes, /Render/Proxy default and proxy
+#   Hidden: an invisible card in front of everything
+def Xform "World"
+{
+    def Camera "Camera"
+    {
+        float focalLength = 35
+        float horizontalAperture = 36
+        float verticalAperture = 24
+        float2 clippingRange = (0.1, 100)
+        double3 xformOp:translate = (0, 0, 9)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+
+    def Mesh "Holes"
+    {
+        uniform token subdivisionScheme = "none"
+        int[] faceVertexCounts = [4, 4, 4, 4]
+        int[] faceVertexIndices = [0, 1, 4, 3, 1, 2, 5, 4, 3, 4, 7, 6, 4, 5, 8, 7]
+        int[] holeIndices = [1, 2]
+        point3f[] points = [(-1, -1, 0), (0, -1, 0), (1, -1, 0), (-1, 0, 0), (0, 0, 0), (1, 0, 0), (-1, 1, 0), (0, 1, 0), (1, 1, 0)]
+        color3f[] primvars:displayColor = [(0.8, 0.6, 0.2)]
+        double3 xformOp:translate = (-4.5, 1.6, 0)
+        float3 xformOp:rotateXYZ = (10, 25, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
+    }
+
+    def Mesh "LeftHanded" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        uniform token subdivisionScheme = "none"
+        uniform token orientation = "leftHanded"
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 3, 2, 1]
+        point3f[] points = [(-1, -1, 0), (1, -1, 0), (1, 1, 0), (-1, 1, 0)]
+        texCoord2f[] primvars:st = [(0, 0), (1, 0), (1, 1), (0, 1)] (interpolation = "vertex")
+        rel material:binding = </World/Looks/Glossy>
+        double3 xformOp:translate = (-1.5, 1.6, 0)
+        float3 xformOp:rotateXYZ = (-20, -30, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
+    }
+
+    def Mesh "Mirrored" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        uniform token subdivisionScheme = "none"
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 1, 2, 3]
+        point3f[] points = [(-1, -1, 0), (1, -1, 0), (1, 1, 0), (-1, 1, 0)]
+        normal3f[] normals = [(0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (interpolation = "vertex")
+        rel material:binding = </World/Looks/Glossy>
+        double3 xformOp:translate = (1.5, 1.6, 0)
+        float3 xformOp:rotateXYZ = (15, 30, 0)
+        float3 xformOp:scale = (-1, 1, 1)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
+    }
+
+    def Mesh "Subsets" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        uniform token subdivisionScheme = "none"
+        int[] faceVertexCounts = [4, 4, 4]
+        int[] faceVertexIndices = [0, 1, 5, 4, 1, 2, 6, 5, 2, 3, 7, 6]
+        point3f[] points = [(-1.2, -1, 0), (-0.4, -1, 0), (0.4, -1, 0), (1.2, -1, 0), (-1.2, 1, 0), (-0.4, 1, 0), (0.4, 1, 0), (1.2, 1, 0)]
+        rel material:binding = </World/Looks/Grey>
+        double3 xformOp:translate = (4.5, 1.6, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+
+        def GeomSubset "Red" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            uniform token elementType = "face"
+            uniform token familyName = "materialBind"
+            int[] indices = [0]
+            rel material:binding = </World/Looks/Red>
+        }
+
+        def GeomSubset "Blue" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            uniform token elementType = "face"
+            uniform token familyName = "materialBind"
+            int[] indices = [2]
+            rel material:binding = </World/Looks/Blue>
+        }
+    }
+
+    def Mesh "UniformNormals" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        uniform token subdivisionScheme = "none"
+        int[] faceVertexCounts = [4, 4]
+        int[] faceVertexIndices = [0, 1, 4, 3, 1, 2, 5, 4]
+        point3f[] points = [(-1, -1, 0.4), (0, -1, -0.2), (1, -1, 0.4), (-1, 1, 0.4), (0, 1, -0.2), (1, 1, 0.4)]
+        normal3f[] normals = [(-0.5, 0, 0.866), (0.5, 0, 0.866)] (interpolation = "uniform")
+        rel material:binding = </World/Looks/Glossy>
+        double3 xformOp:translate = (-4.5, -1.6, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+
+    def Mesh "ConstantNormal" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        uniform token subdivisionScheme = "none"
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 1, 2, 3]
+        point3f[] points = [(-1, -1, 0), (1, -1, 0), (1, 1, 0), (-1, 1, 0)]
+        normal3f[] normals = [(0.3, 0.3, 0.906)] (interpolation = "constant")
+        rel material:binding = </World/Looks/Glossy>
+        double3 xformOp:translate = (-1.5, -1.6, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+
+    def Xform "Purposes"
+    {
+        double3 xformOp:translate = (1.5, -1.6, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+
+        def Mesh "Guide"
+        {
+            uniform token purpose = "guide"
+            uniform token subdivisionScheme = "none"
+            int[] faceVertexCounts = [4]
+            int[] faceVertexIndices = [0, 1, 2, 3]
+            point3f[] points = [(-1, -1, 0.3), (1, -1, 0.3), (1, 1, 0.3), (-1, 1, 0.3)]
+            color3f[] primvars:displayColor = [(0.1, 0.8, 0.1)]
+        }
+
+        def Mesh "Proxy"
+        {
+            uniform token purpose = "proxy"
+            uniform token subdivisionScheme = "none"
+            int[] faceVertexCounts = [4]
+            int[] faceVertexIndices = [0, 1, 2, 3]
+            point3f[] points = [(-0.8, -0.8, 0.2), (0.8, -0.8, 0.2), (0.8, 0.8, 0.2), (-0.8, 0.8, 0.2)]
+            color3f[] primvars:displayColor = [(0.9, 0.8, 0.1)]
+        }
+
+        def Mesh "Render"
+        {
+            uniform token purpose = "render"
+            uniform token subdivisionScheme = "none"
+            int[] faceVertexCounts = [4]
+            int[] faceVertexIndices = [0, 1, 2, 3]
+            point3f[] points = [(-0.6, -0.6, 0.1), (0.6, -0.6, 0.1), (0.6, 0.6, 0.1), (-0.6, 0.6, 0.1)]
+            color3f[] primvars:displayColor = [(0.8, 0.1, 0.8)]
+        }
+    }
+
+    def Mesh "Hidden"
+    {
+        token visibility = "invisible"
+        uniform token subdivisionScheme = "none"
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 1, 2, 3]
+        point3f[] points = [(-6, -3, 2), (6, -3, 2), (6, 3, 2), (-6, 3, 2)]
+        color3f[] primvars:displayColor = [(0, 0, 0)]
+    }
+
+    def Scope "Looks"
+    {
+        def Material "Grey"
+        {
+            token outputs:surface.connect = </World/Looks/Grey/Surface.outputs:surface>
+            def Shader "Surface"
+            {
+                uniform token info:id = "UsdPreviewSurface"
+                color3f inputs:diffuseColor = (0.5, 0.5, 0.5)
+                float inputs:roughness = 0.6
+                token outputs:surface
+            }
+        }
+
+        def Material "Red"
+        {
+            token outputs:surface.connect = </World/Looks/Red/Surface.outputs:surface>
+            def Shader "Surface"
+            {
+                uniform token info:id = "UsdPreviewSurface"
+                color3f inputs:diffuseColor = (0.8, 0.05, 0.05)
+                float inputs:roughness = 0.6
+                token outputs:surface
+            }
+        }
+
+        def Material "Blue"
+        {
+            token outputs:surface.connect = </World/Looks/Blue/Surface.outputs:surface>
+            def Shader "Surface"
+            {
+                uniform token info:id = "UsdPreviewSurface"
+                color3f inputs:diffuseColor = (0.05, 0.1, 0.8)
+                float inputs:roughness = 0.6
+                token outputs:surface
+            }
+        }
+
+        def Material "Glossy"
+        {
+            token outputs:surface.connect = </World/Looks/Glossy/Surface.outputs:surface>
+            def Shader "Surface"
+            {
+                uniform token info:id = "UsdPreviewSurface"
+                color3f inputs:diffuseColor = (0.3, 0.5, 0.7)
+                float inputs:roughness = 0.25
+                float inputs:clearcoat = 1
+                token outputs:surface
+            }
+        }
+    }
+
+    def DomeLight "Dome"
+    {
+        asset inputs:texture:file = @environment.ppm@
+        float inputs:intensity = 1
+    }
+}
+
+def Scope "Render"
+{
+    def RenderSettings "Default"
+    {
+        rel camera = </World/Camera>
+        uniform int2 resolution = (96, 64)
+    }
+
+    def RenderSettings "Proxy"
+    {
+        rel camera = </World/Camera>
+        uniform int2 resolution = (96, 64)
+        uniform token[] includedPurposes = ["default", "proxy"]
+    }
+}

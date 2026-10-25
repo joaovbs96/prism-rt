@@ -1,0 +1,41 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    upAxis = "Y"
+    metersPerUnit = 1
+)
+
+# Camera exposure (UsdGeomCamera exposure and exposure:* attributes): the
+# linear scale 2^exposure * time * iso / 100 / fStop^2 * responsivity = 0.5
+# here, applied to the colour by both loaders.
+def Xform "World"
+{
+    def Camera "Camera"
+    {
+        float focalLength = 35
+        float horizontalAperture = 36
+        float verticalAperture = 24
+        float2 clippingRange = (0.1, 100)
+        float exposure = 1
+        float exposure:fStop = 2
+        float exposure:iso = 100
+        float exposure:time = 1
+        float exposure:responsivity = 1
+        double3 xformOp:translate = (0, 0.5, 4)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+
+    def Mesh "Card"
+    {
+        uniform token subdivisionScheme = "none"
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 1, 2, 3]
+        point3f[] points = [(-1, -0.5, 0), (1, -0.5, 0), (1, 1.5, 0), (-1, 1.5, 0)]
+        color3f[] primvars:displayColor = [(0.8, 0.5, 0.3)]
+    }
+
+    def DomeLight "Dome"
+    {
+        float inputs:intensity = 1
+    }
+}

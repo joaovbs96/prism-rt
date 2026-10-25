@@ -1,0 +1,76 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    upAxis = "Y"
+    metersPerUnit = 1
+)
+
+# Implicit surfaces as Hydra meshes them (HdsiImplicitSurfaceSceneIndex,
+# GeomUtil generators; refined bilinearly): a cube, a Y cylinder, an X cone,
+# a Z capsule and a Y plane under them. Spheres stay analytic in both loaders.
+def Xform "World"
+{
+    def Camera "Camera"
+    {
+        float focalLength = 35
+        float horizontalAperture = 36
+        float verticalAperture = 24
+        float2 clippingRange = (0.1, 100)
+        double3 xformOp:translate = (0, 1.5, 7)
+        float3 xformOp:rotateXYZ = (-12, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
+    }
+
+    def Cube "Cube"
+    {
+        double size = 0.9
+        color3f[] primvars:displayColor = [(0.8, 0.2, 0.1)]
+        double3 xformOp:translate = (-2.4, 0.6, 0)
+        float3 xformOp:rotateXYZ = (0, 30, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
+    }
+
+    def Cylinder "Cylinder"
+    {
+        double radius = 0.45
+        double height = 1.2
+        uniform token axis = "Y"
+        color3f[] primvars:displayColor = [(0.2, 0.7, 0.2)]
+        double3 xformOp:translate = (-0.8, 0.6, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+
+    def Cone "Cone"
+    {
+        double radius = 0.45
+        double height = 1.0
+        uniform token axis = "X"
+        color3f[] primvars:displayColor = [(0.2, 0.3, 0.9)]
+        double3 xformOp:translate = (0.8, 0.6, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+
+    def Capsule "Capsule"
+    {
+        double radius = 0.35
+        double height = 0.6
+        uniform token axis = "Z"
+        color3f[] primvars:displayColor = [(0.9, 0.8, 0.2)]
+        double3 xformOp:translate = (2.4, 0.6, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+
+    def Plane "Ground"
+    {
+        double width = 7
+        double length = 4
+        uniform token axis = "Y"
+        color3f[] primvars:displayColor = [(0.6, 0.6, 0.6)]
+    }
+
+    def DomeLight "Dome"
+    {
+        asset inputs:texture:file = @environment.ppm@
+        float inputs:intensity = 1
+    }
+}
