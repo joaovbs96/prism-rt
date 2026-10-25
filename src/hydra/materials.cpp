@@ -5,6 +5,7 @@
 #include "../materialx/captured_material.h"
 #include "../materialx/resolved_resource.h"
 #include "../materialx/prepared_template.h"
+#include "../materialx/preview_surface.h"
 #include "../mdl_material.h"
 #include "../resource_limits.h"
 #include "../load_profile.h"
@@ -73,6 +74,12 @@ namespace mx = MaterialX;
 
 namespace prism::hydra {
 namespace {
+
+using prism::materialx::AddDisplacementShader;
+using prism::materialx::FixPreviewSurfaceNormalOutput;
+using prism::materialx::IsPreviewSurfaceNetwork;
+using prism::materialx::RewritePreviewSurfaceNetwork;
+using prism::materialx::SurfaceTerminalName;
 bool TemplateDebug() {
     const char* value = std::getenv("PRISM_MATERIAL_TEMPLATE_DEBUG");
     return value && *value && std::string_view(value) != "0";
@@ -312,150 +319,6 @@ bool PublishImmutableText(const std::filesystem::path& cacheDir,
     return true;
 }
 
-TfToken SurfaceTerminalName(HdMaterialNetworkInterface& net)
-{
-    const TfTokenVector terminals = net.GetTerminalNames();
-    for (const TfToken& terminal : terminals) {
-        if (terminal == TfToken("surface") || terminal == TfToken("surfaceshader"))
-            return terminal;
-    }
-    for (const TfToken& terminal : terminals) {
-        const auto connection = net.GetTerminalConnection(terminal);
-        if (connection.first &&
-            HdMtlxGetMxTerminalName(&net, connection.second.upstreamNodeName) == "surfaceshader")
-            return terminal;
-    }
-    return {};
-}
-
-// hdMtlx converts one terminal; a displacement terminal is converted on its
-// own and merged into the surface document, its shader bound to the
-// material's displacementshader input.
-void AddDisplacementShader(HdMaterialNetworkInterface& net, const mx::DocumentPtr& doc,
-                           const mx::DocumentPtr& library)
-{
-    TfToken terminal;
-    for (const TfToken& name : net.GetTerminalNames())
-        if (name == TfToken("displacement")) terminal = name;
-    if (terminal.IsEmpty()) return;
-    const auto connection = net.GetTerminalConnection(terminal);
-    if (!connection.first) return;
-    HdMtlxTexturePrimvarData data;
-    mx::DocumentPtr displacement = HdMtlxCreateMtlxDocumentFromHdMaterialNetworkInterface(
-        &net, connection.second.upstreamNodeName,
-        net.GetNodeInputConnectionNames(connection.second.upstreamNodeName), library, &data);
-    if (!displacement) return;
-    auto sourceMaterials = displacement->getMaterialNodes();
-    auto materials = doc->getMaterialNodes();
-    if (sourceMaterials.empty() || materials.empty()) return;
-    auto shaderInput = sourceMaterials.front()->getInput("displacementshader");
-    if (!shaderInput || !shaderInput->hasNodeName()) return;
-    for (const auto& child : displacement->getChildren()) {
-        if (child == sourceMaterials.front()) continue;
-        auto existing = doc->getChild(child->getName());
-        if (!existing) {
-            doc->addChildOfCategory(child->getCategory(), child->getName())->copyContentFrom(child);
-        } else if (auto graph = child->asA<mx::NodeGraph>()) {
-            auto target = existing->asA<mx::NodeGraph>();
-            if (!target) continue;
-            for (const auto& node : graph->getChildren())
-                if (!target->getChild(node->getName()))
-                    target->addChildOfCategory(node->getCategory(), node->getName())->copyContentFrom(node);
-        }
-    }
-    auto input = materials.front()->getInput("displacementshader");
-    if (!input) input = materials.front()->addInput("displacementshader", "displacementshader");
-    input->setNodeName(shaderInput->getNodeName());
-}
-
-bool IsPreviewSurfaceNetwork(HdMaterialNetworkInterface& net)
-{
-    const TfToken terminalName = SurfaceTerminalName(net);
-    if (terminalName.IsEmpty()) return false;
-    const auto terminal = net.GetTerminalConnection(terminalName);
-    if (!terminal.first) return false;
-    const TfToken surfaceType = net.GetNodeType(terminal.second.upstreamNodeName);
-    // The universal USD context is supported when it is a Preview Surface
-    // graph. hdMtlx supplies the installed UsdPreviewSurface/UsdUVTexture
-    // definitions and performs graph conversion, including texture outputs.
-    if (surfaceType == TfToken("UsdPreviewSurface") ||
-        surfaceType == TfToken("ND_UsdPreviewSurface_surfaceshader"))
-        return true;
-    return false;
-}
-
-bool RewritePreviewSurfaceNetwork(HdMaterialNetworkInterface& net)
-{
-    const TfToken terminalName = SurfaceTerminalName(net);
-    if (terminalName.IsEmpty()) return false;
-    const auto terminal = net.GetTerminalConnection(terminalName);
-    if (!terminal.first ||
-        (net.GetNodeType(terminal.second.upstreamNodeName) != TfToken("UsdPreviewSurface") &&
-         net.GetNodeType(terminal.second.upstreamNodeName) != TfToken("ND_UsdPreviewSurface_surfaceshader")))
-        return false;
-
-    auto mappedType = [](const TfToken& type) -> TfToken {
-        const std::string value = type.GetString();
-        if (value == "UsdPreviewSurface") return TfToken("ND_UsdPreviewSurface_surfaceshader");
-        if (value == "UsdUVTexture") return TfToken("ND_UsdUVTexture_23");
-        if (value == "UsdTransform2d") return TfToken("ND_UsdTransform2d");
-        const std::string readerPrefix = "UsdPrimvarReader_";
-        if (value.rfind(readerPrefix, 0) == 0) {
-            std::string typeName = value.substr(readerPrefix.size());
-            if (typeName == "float2") typeName = "vector2";
-            else if (typeName == "float3") typeName = "vector3";
-            else if (typeName == "float4") typeName = "vector4";
-            return TfToken("ND_UsdPrimvarReader_" + typeName);
-        }
-        return {};
-    };
-    auto mappedOutput = [](const TfToken& type, const TfToken& output) {
-        if ((type == TfToken("UsdPreviewSurface") ||
-             type == TfToken("ND_UsdPreviewSurface_surfaceshader") ||
-             type == TfToken("UsdTransform2d") ||
-             type == TfToken("ND_UsdTransform2d") ||
-             type == TfToken("UsdPrimvarReader_float") ||
-             type == TfToken("UsdPrimvarReader_float2") ||
-             type == TfToken("UsdPrimvarReader_float3") ||
-             type == TfToken("UsdPrimvarReader_float4") ||
-             type == TfToken("ND_UsdPrimvarReader_float") ||
-             type == TfToken("ND_UsdPrimvarReader_vector2") ||
-             type == TfToken("ND_UsdPrimvarReader_vector3") ||
-             type == TfToken("ND_UsdPrimvarReader_vector4")) &&
-            (output == TfToken("surface") || output == TfToken("result")))
-            return TfToken("out");
-        return output;
-    };
-
-    for (const TfToken& node : net.GetNodeNames()) {
-        const TfToken sourceType = net.GetNodeType(node);
-        const TfToken translated = mappedType(sourceType);
-        if (!translated.IsEmpty()) net.SetNodeType(node, translated);
-        else if (sourceType.GetString().rfind("ND_", 0) != 0) {
-            TF_WARN("[Hydra Material] Unsupported node '%s' in UsdPreviewSurface graph",
-                    sourceType.GetText());
-            return false;
-        }
-
-        for (const TfToken& input : net.GetNodeInputConnectionNames(node)) {
-            auto connections = net.GetNodeInputConnection(node, input);
-            for (auto& connection : connections) {
-                const TfToken upstreamType = net.GetNodeType(connection.upstreamNodeName);
-                connection.upstreamOutputName =
-                    mappedOutput(upstreamType, connection.upstreamOutputName);
-            }
-            net.SetNodeInputConnection(node, input, connections);
-        }
-    }
-
-    HdMaterialNetworkInterface::InputConnection translatedTerminal = terminal.second;
-    translatedTerminal.upstreamOutputName = mappedOutput(
-        net.GetNodeType(translatedTerminal.upstreamNodeName),
-        translatedTerminal.upstreamOutputName);
-    net.SetTerminalConnection(terminalName, translatedTerminal);
-    return true;
-}
-
 // RenderMan's own texture format (.tex files starting 0xFACE) cannot be
 // read: an image of the same name in another format, next to it or in a
 // sibling directory, stands in for it. Empty when none is needed or found.
@@ -628,32 +491,6 @@ std::string ResolveTextureAssets(HdMaterialNetworkInterface& net,
         }
     }
     return dependencyFingerprint;
-}
-
-void FixPreviewSurfaceNormalOutput(const mx::DocumentPtr& doc)
-{
-    if (!doc) return;
-    for (const mx::NodePtr& node : doc->getNodes()) {
-        if (node->getCategory() == "UsdPreviewSurface") {
-            if (mx::InputPtr normalInput = node->getInput("normal"))
-                normalInput->setType("vector3");
-        }
-    }
-    for (const mx::NodeGraphPtr& graph : doc->getNodeGraphs()) {
-        mx::OutputPtr normal = graph->getOutput("normal_rgb");
-        if (!normal || normal->getType() != "color3" || !normal->hasNodeName())
-            continue;
-        const std::string upstreamName = normal->getNodeName();
-        const std::string upstreamOutput = normal->getOutputString();
-        mx::NodePtr convert = graph->addNode(
-            "convert", "normal_rgb_to_vector3", "vector3");
-        mx::InputPtr input = convert->addInput("in", "color3");
-        input->setNodeName(upstreamName);
-        input->setOutputString(upstreamOutput);
-        normal->setNodeName(convert->getName());
-        normal->removeAttribute("output");
-        normal->setType("vector3");
-    }
 }
 
 // PRISM_TEXTURE_PREPARE=serial leaves every texture to the compile of the
