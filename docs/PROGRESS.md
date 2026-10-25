@@ -2,6 +2,13 @@
 
 Phase reports, newest first. Detailed reports live in `local/reports/` (git-ignored).
 
+## 2026-10-25 — Phase 5: textured emitters as lights
+- Varying-emission materials get per-triangle records (stratified EDF estimate × area, with a floor); NEE evaluates the true EDF; BSDF hits use the per-triangle pdf; CPU and Vulkan (Metal shares the code, untested). `SceneHasEmitters` counts them (default-dome rule). glTF emissive textures and OBJ `map_Ke` become lights.
+- Unbiased against a 64k-spp BSDF-only reference (floor bands −0.11…+0.43%); ~24× lower variance. OpenPBR's 157k-triangle emitter costs 1.2 s per load (no cache yet).
+- Fixed a pre-existing bias: light tables over ~4096 entries picked lights with wrong probabilities (OpenPBR in Hydra was 7.8% too bright; now within 0.04% of a reference).
+- Open: OpenPBR's MEET MAT emits nothing in the CLI since Phase 7 (fine in Hydra).
+- 298/298 tests in the main checkout with Phases 5 and 7 merged. Report: `local/reports/phase5_textured_emitters.md`. Status: merged locally, not pushed.
+
 ## 2026-10-25 — Phase 7: CLI parity
 - The CLI's USD loader reaches the delegate's level: subdivision and displacement (OBJ `disp` too), instancing with per-instance primvars and invisibleIds, holes, leftHanded/negative scale, GeomSubsets, purpose, `--time`, UsdSkel, camera exposure, id AOVs; materials from the composed UsdShade network first (fixes `emissive.usda` and the OpenPBR materials that failed in the CLI). Mesh conversion moved from `scene_bridge.cpp` into `src/mesh/`.
 - 288 tests (agent's full run); main checkout 256/256 CPU tests, GPU tests pending. New parity fixtures ≤1e-7 NRMSE except linking 0.0074, native instance bindings 0.013, animation 0.010. CLI vs Hydra: egg 0.069→0.0005, chess 0.20→0.030, Teapot 0.48→0.0044, OpenPBR 1.43→0.30 (2.4% mean left, not investigated).
