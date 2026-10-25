@@ -625,6 +625,33 @@ called done there.
     thin-walled materials may now compile without `PRISM_VARYING_EMITTERS`;
     build the Metal kernel on the OpenPBR playground (or any scene with
     thin-walled, non-emitting OpenPBR materials) and check it against the CPU.
+- **Light AOVs and multi-part EXR** ([hydra.md](hydra.md#light-aovs)):
+  - Shared shader code: `shaders/integrator/path_tracer.h` (`PathTracer::gather`,
+    `gatherDirect`, `resolveAlbedo`, `LightAovSample`, all under `#if
+    PRISM_LIGHT_AOVS`; with the define off the source is token-identical to
+    before through `PRISM_GATHER`, and the Vulkan SPIR-V byte-identical),
+    `shaders/gpu/kernel.hlsl` and `accessors.hlsl` (`gpu_store_aovs`,
+    `gpu_accumulate_aovs`: four more `float4` per slot after the colour in the
+    output and accumulation buffers), `kFrameLightAovs` in
+    `shaders/shared/prism_gpu_types.h` (host only: `#ifndef __HLSL_VERSION`).
+  - Shared host code: `src/device/gpu/gpu_device.cpp` (buffer sizes and
+    readback of the AOVs in image, pass and preview modes, replicated image
+    threads included), `GpuRenderDevice::PrepareLightAovs` (pure virtual),
+    `MdlShaderCode::lightAovs`, `src/hydra/scene_bridge.cpp`,
+    `task_delegate.cpp`, `src/output/*`.
+  - Metal device (`metal_device.mm`, not compiled here): `compileKernel` split
+    out of `buildPipeline`; `prepareLightAovs` compiles the kernel source with
+    `#define PRISM_LIGHT_AOVS 1` in front (its own metallib cache entry);
+    `dispatch` binds `aovPipeline` for frames with `kFrameLightAovs`.
+    `prism_gpu_shader_compile_test` compiles that source to DXIL on Windows.
+  - Runs: build; `PrismRT --scene tests/hydra/fixtures/light_aovs.usda
+    --output-dir <dir> --device metal` then `prism_scene_features_test
+    light_aovs <dir>/light_aovs.exr`, `exr_parts <dir>/light_aovs.exr
+    <dir>/light_aovs_parts.exr` and `light_aovs_albedo` on
+    `light_aovs_albedo.usda`; each layer against the CPU render
+    (`prism_compare_images --layer Albedo|Diffuse|Specular|Emission`); usdview
+    showing the `diffuse` AOV on Metal; chess and an egg with default outputs
+    unchanged against the previous build (`--exact`).
 
 ## Diagnostics
 

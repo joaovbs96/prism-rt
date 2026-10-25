@@ -239,7 +239,7 @@ after a topology notice until the replacement picking table publishes.
 
 The launcher also loads PrismRT's Python usdview extension from `tools/usdview_plugins`. Stock usdview drops the selected instance index when forwarding selection to its scene index (`UsdImagingGLEngine::AddSelected` ignores it on the scene-index path in 26.05 and still in 26.08). Our extension forwards the selection model's original indices through the internal `prism:usdviewSelection` renderer setting, preserving individual-instance outlines without patching USD. It uses usdview's plugin registration and `StageView` renderer-setting methods; it does not replace usdview functions. Other hosts can supply complete Hydra selection data directly. Without the extension, stock usdview still renders and picks correctly, but individual-instance highlighting follows its upstream whole-prim selection limitation.
 
-The render buffers expose linear floating-point `color` (in the working space, ACEScg by default), projected `depth` in `[0,1]`, `cameraDepth`, world `normal`, eye-space `Neye` and `Peye`, `primvars:st`, and integer `primId`, `instanceId`, and `elementId`. IDs and geometric AOVs use a deterministic center ray independent of antialiasing and depth-of-field samples. `Peye` is the hit position transformed into eye space; `primvars:st` is the interpolated first UV set, with hit UVs used when that primvar is absent. `Pworld` is not currently exposed. `elementId` refers to the coarse polygon face. Prim, instance, and face picking use visible primary intersections; edge, vertex, and deep picking are deferred. Signed and unsigned 16-bit integer AOV buffers and signed 32-bit integer buffers are supported; Int32 IDs retain their exact values. Packed float32/uint8 buffers are rejected with a Hydra warning. Extra Hydra camera clip planes are not applied to ray intersections.
+The render buffers expose linear floating-point `color` (in the working space, ACEScg by default), projected `depth` in `[0,1]`, `cameraDepth`, world `normal`, eye-space `Neye` and `Peye`, `primvars:st`, and integer `primId`, `instanceId`, and `elementId`. IDs and geometric AOVs use a deterministic center ray independent of antialiasing and depth-of-field samples. `Peye` is the hit position transformed into eye space and `Pworld` (also bound as `P`) the world-space hit position (0 on a miss); `primvars:st` is the interpolated first UV set, with hit UVs used when that primvar is absent. The path tracer also fills the [light AOVs](#light-aovs) `albedo`, `diffuse`, `specular` and `emission` (`Float32Vec3`), accumulated with the colour. `elementId` refers to the coarse polygon face. Prim, instance, and face picking use visible primary intersections; edge, vertex, and deep picking are deferred. Signed and unsigned 16-bit integer AOV buffers and signed 32-bit integer buffers are supported; Int32 IDs retain their exact values. Packed float32/uint8 buffers are rejected with a Hydra warning. Extra Hydra camera clip planes are not applied to ray intersections.
 
 Color alpha accumulates primary coverage, including stochastic cutouts and silhouette samples. With no dome, or `domeLightCameraVisibility=false`, primary rays that escape the scene produce transparent black; unresolved early terminations retain coverage. A visible dome keeps opaque alpha. Changing dome camera visibility restarts preview and full accumulation.
 
@@ -293,23 +293,72 @@ render settings menu, `prism_hydra_render --render-settings` and
   | `color`, `Ci`, `C` (`raw`); `C.*`, `C.*[<L.>O]` (`lpe`) | colour | the first colour var: `R G B` (`A` for `color4f`), unprefixed; later ones `<var>.R` ... |
   | `depth`, `cameraDepth` (`raw`) | NDC depth, camera distance | `<var>.Z` |
   | `normal`, `Neye`, `Peye` (`raw`) | world/eye normal, eye position | `<var>.X/Y/Z` |
+  | `Pworld`, `P` (`raw`) | world position | `<var>.X/Y/Z` |
+  | `albedo`, `diffuse`, `specular`, `emission` (`raw`) | [light AOVs](#light-aovs) | `<var>.R/G/B` |
   | `primvars:st` (`raw`), `st` (`primvar`) | hit texture coordinates | `<var>.U/V` |
   | `primId`, `instanceId`, `elementId` (`raw`) | Hydra ids (not in the CLI) | `<var>.id` |
 
   `<var>` is the RenderVar prim's name. Geometric AOVs come from the
-  pixel-centre hit in both frontends, so the two give the same values. The
+  pixel-centre hit in both frontends, so the two give the same values. Light
+  path expressions other than the beauty's (such as `C<RD>.*L`) are not
+  supported; the light AOVs are their nearest equivalents. The
   CLI renders RGB only, so its alpha is 1, as the delegate's is with the dome
   visible to the camera. A var with another source is skipped with a warning,
   as is a product with no supported var. Products that differ only in their
   vars share one render.
 - **Outputs** (`src/output/image_writer.{h,cpp}`, shared by both frontends).
   An EXR holds every layer as float channels. It is linear in the working
-  space and tagged (`oiio:ColorSpace`, chromaticities). An 8-bit file (PNG,
-  JPEG, ...) holds the colour layer only, through the display and view once.
-  The layers it drops are reported.
+  space and tagged (`oiio:ColorSpace`, chromaticities). With the product's
+  `bool prism:exr:multiPart = true` it is a multi-part EXR instead: a part per
+  var, named after the RenderVar prim, holding that layer's channels (same
+  names and values; each part tagged). An 8-bit file (PNG, JPEG, ...) holds
+  the colour layer only, through the display and view once. The layers it
+  drops are reported. A file per AOV is a product with one var.
 - **The AOV table** (`src/output/aov.h`) lists the AOVs, their channels and
   how geometric ones resolve from a hit, for the delegate's render buffers and
-  both writers. Phase 6 adds AOVs there.
+  both writers.
+
+### Light AOVs
+
+The integrator (`shaders/integrator/path_tracer.h`, `LightAovSample`) splits
+the colour by the first scattering vertex of each path, as Cycles' and
+RenderMan's per-lobe passes (`C<RD>.*`, `C<RS>.*`) do, and records a
+denoising albedo as Open Image Denoise and Cycles define it. Every AOV
+accumulates over the same samples as the colour, so adaptive sampling,
+progressive passes, the CPU preview of a GPU render and texture-streaming
+restarts keep them consistent.
+
+| AOV | Value per sample |
+| --- | --- |
+| `emission` | Light reaching the camera before any scattering vertex: emissive surfaces, lights visible to the camera and the dome seen directly or through cutouts (null crossings are not vertices) |
+| `diffuse` | Light whose first scattering vertex is diffuse: that vertex's light sample weighted by the BSDF's diffuse part (MDL's `bsdf_diffuse`, which includes diffuse transmission), and everything after it weighted by the diffuse fraction of the sampled direction; all of a path that enters a scattering medium there (subsurface) |
+| `specular` | The rest: glossy and delta reflection and transmission (smooth or rough glass, metals, coats), and paths through absorbing-only media |
+| `albedo` | The BSDF sample weight (`f·cos/pdf`, an unbiased estimate of the directional albedo) at the first vertex that is neither a sharp bounce nor a cutout crossing, times the weights of the sharp bounces, crossings and Russian roulette before it. Sharp: a delta sample (`BsdfSample::delta`) or one whose density is at least 1000/sr (`kAlbedoSharpPdf`; MDL reports smooth OpenPBR glass and mirrors as glossy lobes; GGX reaches it below a roughness of about 0.1, close to Cycles' 0.075). 0 when the path escapes, is absorbed or ends first (background, emitters without a BSDF) |
+
+- `diffuse + specular + emission` is the colour in every pixel, after the
+  sample clamp and exposure (each AOV takes the colour's scale and coverage);
+  the albedo takes neither. The CLI applies the camera's exposure to the three
+  radiance AOVs as to the colour.
+- Through glass and mirrors the albedo is that of the first diffuse or rough
+  surface behind them (weighted by the Fresnel split of each sharp bounce);
+  a glossy surface's own albedo is its BSDF's. Lambertian surfaces give their
+  colour exactly; glossy ones converge with the samples.
+- The diffuse part of a sampled direction is the lobe split Phase 4 added
+  for UsdLux light lobes (`MaterialResult::sampleDiffuse`): the light AOVs ask
+  for it at the first vertex only (one more BSDF evaluation there). The GPU's
+  callable shaders return it as 16-bit fractions, so CPU and Vulkan split a
+  lobe within 2e-5 of each other.
+- Cost: the CPU path tracer always has the code and gathers the AOVs only when
+  asked (a runtime flag). The GPU kernels have a variant compiled with
+  `PRISM_LIGHT_AOVS` (`MdlShaderCode::lightAovs`, the Vulkan compute kernel or
+  raygen shader; the Metal kernel), built the first time a render asks for
+  light AOVs and cached like the scene's kernel: renders without them run the
+  unchanged kernel. Without the define the shared source is token for token
+  what it was (`PRISM_GATHER`), because the kernels compile at `-O0`: a
+  restructured but equivalent integrator gave other SPIR-V and a 10-28%
+  slower Vulkan kernel; now the raygen and callable SPIR-V are byte-identical
+  to the previous build's. With the AOVs the output buffers hold four more
+  `float4` per pixel (kernel.hlsl, `gpu_store_aovs` / `gpu_accumulate_aovs`).
 
 ```powershell
 # Every product of the stage's render settings, into build/products:
@@ -362,14 +411,16 @@ prism_add_parity_fixture(NAME my_feature SCENE tests/hydra/fixtures/my_feature.u
     [CAMERA /World/Camera] [WIDTH 64] [HEIGHT 64] [SPP 16]
     [TOLERANCE 0.01] [MEAN_TOLERANCE 0.01]
     [ARGS <options of both>] [CLI_ARGS ...] [HYDRA_ARGS ...]
-    [PRODUCTS <product files>...] [EXACT_LAYERS <file>:<layer>...]
-    [RELABEL_LAYERS <file>:<layer>...] [CLI_DEVICE cpu|vulkan|metal])
+    [PRODUCTS <product files>...] [LAYERS <file>:<layer>...]
+    [EXACT_LAYERS <file>:<layer>...] [RELABEL_LAYERS <file>:<layer>...]
+    [CLI_DEVICE cpu|vulkan|metal])
 ```
 
 This creates `prism_parity_my_feature_{cli,hydra}` and the comparison
 `prism_parity_my_feature_match`. With `PRODUCTS`, both write the stage's
-RenderProducts and each file gets a `..._<file>_<ext>_match`;
-`EXACT_LAYERS` also compares geometric layers exactly and `RELABEL_LAYERS`
+RenderProducts and each file gets a `..._<file>_<ext>_match`; `LAYERS`
+compares more layers (light AOVs) within the tolerances,
+`EXACT_LAYERS` geometric layers exactly and `RELABEL_LAYERS`
 id layers up to a renumbering (`prism_compare_images --relabel`: one
 bijection of values, misses equal; each loader numbers its prims).
 `CLI_DEVICE` renders the CLI's side on a GPU (name the fixture `*_vulkan` or
@@ -395,6 +446,8 @@ noise but no bias.
 | linking | 0.0074 (mean 0.02%) | 2% (mean 0.2%): spatial light selection at slightly different points |
 | native_instance_bindings | 0.013 (mean 0.04%) | 3% (mean 0.2%): coplanar overlapping panels |
 | animated_time | 0.010 (mean 0.01%) | 3% (mean 0.2%): smoothed vs per-triangle tangent frames |
+| light_aovs (colour, albedo, diffuse, specular, emission), light_aovs_albedo | below 2e-7; Position exact | 1% |
+| light_aovs_vulkan, light_aovs_albedo_vulkan (CLI on Vulkan, delegate on the CPU) | below 2e-3 per layer | 1% |
 
 Since phase 7 the CLI loads every fixture like the delegate (feature
 roadmap, "Standalone CLI"). The remaining differences are noise, never bias:

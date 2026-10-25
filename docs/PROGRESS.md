@@ -2,6 +2,12 @@
 
 Phase reports, newest first. Detailed reports live in `local/reports/` (git-ignored).
 
+## 2026-10-25 — Phase 6: light AOVs and multi-part EXR
+- New AOVs on CPU and Vulkan (Metal: same code, compile-checked only), in Hydra and the CLI: `albedo` (denoising albedo through sharp bounces), `diffuse`, `specular`, `emission` (split by the first scattering vertex; their sum is the colour to < 1.1e-6 relative), `Pworld` (also `P`). Multi-part EXR per product (`prism:exr:multiPart`).
+- Without light AOVs: images bit-identical to bd75e3e (chess, egg_gold, OpenPBR, Teapot on CPU; chess, egg_gold, Teapot on Vulkan) and the Vulkan raygen/callable SPIR-V byte-identical; CPU time unchanged (alternating pairs, +0.3%). With them: CPU +9%, Vulkan +28% GPU time on chess (one run each).
+- OpenPBR on Vulkan crashed in the NVIDIA driver's shader compiler (LLVM out of memory in nvoglv64.dll) for both bd75e3e and the new build: not compared.
+- Report: `local/reports/phase6_aovs.md`.
+
 ## 2026-10-25 — Phase 5: textured emitters as lights
 - Varying-emission materials get per-triangle records (stratified EDF estimate × area, with a floor); NEE evaluates the true EDF; BSDF hits use the per-triangle pdf; CPU and Vulkan (Metal shares the code, untested). `SceneHasEmitters` counts them (default-dome rule). glTF emissive textures and OBJ `map_Ke` become lights.
 - Unbiased against a 64k-spp BSDF-only reference (floor bands −0.11…+0.43%); ~24× lower variance. OpenPBR's 157k-triangle emitter costs 1.2 s per load (no cache yet).

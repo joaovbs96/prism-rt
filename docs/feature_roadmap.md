@@ -249,8 +249,10 @@ GPUs from every vendor. To close the gaps, in order:
 
 1. **Common features.** These are the items the table marks "no" for Prism
    and "yes" for most of the others.
-   - **Denoising** with Open Image Denoise, fed by albedo and normal AOVs. It
-     runs on the CPU and on NVIDIA, AMD and Intel GPUs.
+   - **Denoising** with Open Image Denoise, fed by albedo and normal AOVs
+     (both exist: the `albedo` light AOV follows delta bounces as OIDN asks,
+     [hydra.md](hydra.md#light-aovs)). It runs on the CPU and on NVIDIA, AMD
+     and Intel GPUs.
    - **Adaptive sampling** is on by default (Cycles' error estimate, threshold
      0.01, up to 2048 samples, with a render time limit; [hydra.md](hydra.md#adaptive-sampling-and-time-limit)).
      Left: pairing it with the denoiser.
@@ -283,8 +285,10 @@ GPUs from every vendor. To close the gaps, in order:
      channels; see [hydra.md](hydra.md#render-settings-and-products)).
      Remaining: batch rendering through `usdrender` and Houdini's husk, and
      `disableDepthOfField`.
-   - Light path expressions and light groups, a `Pworld` AOV, more AOVs
-     (albedo, diffuse, specular) and multi-part EXR output.
+   - Light path expressions and light groups. Done: the `albedo`, `diffuse`,
+     `specular` and `emission` light AOVs, `Pworld` and multi-part EXR output
+     ([hydra.md](hydra.md#light-aovs)). Possible next AOVs: direct/indirect
+     splits, transmission apart from reflection, a separate background.
    - A selectable working space such as ACEScg (see
      [Color management](#color-management)).
    - Adaptive subdivision by screen-space edge length, as Typhoon does it.
