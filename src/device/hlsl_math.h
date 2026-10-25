@@ -84,6 +84,7 @@ inline int min(int a, int b) { return std::min(a, b); }
 inline int max(int a, int b) { return std::max(a, b); }
 inline uint min(uint a, uint b) { return std::min(a, b); }
 inline uint max(uint a, uint b) { return std::max(a, b); }
+inline float3 min(float3 a, float3 b) { return {min(a.x, b.x), min(a.y, b.y), min(a.z, b.z)}; }
 inline float clamp(float v, float lo, float hi) { return std::min(std::max(v, lo), hi); }
 inline float saturate(float v) { return clamp(v, 0.0f, 1.0f); }
 inline float lerp(float a, float b, float t) { return a + (b - a) * t; }

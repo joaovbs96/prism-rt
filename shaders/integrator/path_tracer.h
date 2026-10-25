@@ -69,6 +69,14 @@
 #include "types.h"
 #include "lights.h"
 
+// Light AOVs (albedo, diffuse, specular, emission; LightAovSample):
+// compiled in with PRISM_LIGHT_AOVS 1 (the CPU backend always, the GPU
+// kernels in a variant built when a render asks for them) and gathered when
+// PathTracer::aovs is set. Without them the path tracer is unchanged.
+#ifndef PRISM_LIGHT_AOVS
+#define PRISM_LIGHT_AOVS 0
+#endif
+
 inline float powerHeuristic(float a, float b)
 {
     const float scale = max(a, b);
@@ -204,9 +212,38 @@ struct AnalyticLightSums {
     float probability; // of the lights' table (power) selection probabilities
 };
 
+// The light AOVs of one sample (docs/hydra.md, "Light AOVs"), scaled as its
+// colour (coverage, sample clamp, exposure) except the albedo:
+//   albedo    the BSDF sample weight (an estimate of the directional albedo)
+//             at the first vertex that is neither a cutout crossing nor a
+//             sharp bounce (kAlbedoSharpPdf), times the weights of the sharp
+//             bounces and crossings before it; 0 if the path ends first
+//   emission  light reaching the camera before any scattering vertex:
+//             emission, lights and the dome seen directly or through cutouts
+//   diffuse   light whose first scattering vertex scattered it by a diffuse
+//             lobe (MDL's bsdf_diffuse part, which includes diffuse
+//             transmission) or into a scattering medium (subsurface)
+//   specular  the rest: glossy and delta reflection and transmission
+// diffuse + specular + emission is the colour.
+// The albedo AOV passes through BSDF samples that are delta or whose density
+// is at least this (per steradian): MDL reports smooth glass and mirrors as
+// glossy lobes of near-zero roughness. GGX reflection reaches it below a
+// roughness of about 0.1 (Cycles' denoising albedo: 0.075).
+static const float kAlbedoSharpPdf = 1000.0f;
+
+struct LightAovSample {
+    float3 albedo;
+    float3 diffuse;
+    float3 specular;
+    float3 emission;
+};
+
 struct SampleResult {
     float3 color;
     float coverage;
+#if PRISM_LIGHT_AOVS
+    LightAovSample aovs;
+#endif
 };
 
 // Initial per-pixel random states of the render loops.
@@ -277,6 +314,14 @@ struct PathState {
     uint outcome;              // kPrimary*
     bool tracking;             // primary outcome still unresolved
     bool active;               // false: the path has ended
+#if PRISM_LIGHT_AOVS
+    // Light AOVs (PathTracer::aovs; LightAovSample).
+    LightAovSample aov;
+    bool aovPrimary;           // no scattering vertex yet (cutout crossings do not count)
+    float3 firstDiffuse;       // per channel: the diffuse part of the first vertex's continuation
+    bool albedoOpen;           // the albedo's vertex is still ahead
+    float3 albedoWeight;       // delta, crossing and roulette weights before it
+#endif
 };
 
 // Next-event estimation at one surface vertex: the light sample, drawn
@@ -315,6 +360,9 @@ struct PathTracer {
     int rouletteDepth;
     bool spatial;              // spatial light selection
     bool lobes;                // UsdLux diffuse / specular light multipliers (backend.lightLobes)
+#if PRISM_LIGHT_AOVS
+    bool aovs;                 // gather the light AOVs (set by the caller; beginPath keeps it)
+#endif
 
     // Stochastic transmission through cutouts.
     // Opaque geometry anywhere on the ray blocks it whatever cutouts lie in
@@ -485,6 +533,39 @@ struct PathTracer {
     // rest ks (with light lobes).
     float3 lobeScale(float kd, float ks) { return (float3)ks + (kd - ks) * path.previousDiffuse; }
 
+    // Light reaching the camera along the path (weighted): the colour, and
+    // with light AOVs the emission before the first scattering vertex, after
+    // it diffuse and specular by that vertex's lobes.
+    void gather(float3 c)
+    {
+        path.radiance += c;
+#if PRISM_LIGHT_AOVS
+        if (aovs) {
+            if (path.aovPrimary) {
+                path.aov.emission += c;
+            } else {
+                const float3 d = c * path.firstDiffuse;
+                path.aov.diffuse += d;
+                path.aov.specular += c - d;
+            }
+        }
+#endif
+    }
+
+#if PRISM_LIGHT_AOVS
+    // The albedo AOV at a surface vertex (LightAovSample): sharp bounces and
+    // cutout crossings hand it on to the next vertex.
+    void resolveAlbedo(BsdfSample bs)
+    {
+        if (bs.null_event || (bs.scattered && (bs.delta || bs.pdf >= kAlbedoSharpPdf))) {
+            path.albedoWeight *= bs.color;
+            return;
+        }
+        path.albedoOpen = false;
+        if (bs.scattered) path.aov.albedo = path.albedoWeight * bs.color;
+    }
+#endif
+
     // -----------------------------------------------------------------------
     // The steps of a path. A bounce is extend (trace the segment, media,
     // lights it crosses or the environment it escapes to), then at a surface
@@ -525,6 +606,16 @@ struct PathTracer {
         path.outcome = kPrimaryUnresolved;
         path.tracking = true;
         path.active = true;
+#if PRISM_LIGHT_AOVS
+        path.aov.albedo = (float3)0.0f;
+        path.aov.diffuse = (float3)0.0f;
+        path.aov.specular = (float3)0.0f;
+        path.aov.emission = (float3)0.0f;
+        path.aovPrimary = true;
+        path.firstDiffuse = (float3)0.0f;
+        path.albedoOpen = true;
+        path.albedoWeight = (float3)1.0f;
+#endif
     }
 
     // A scattering event inside the medium, scatterDistance along the ray.
@@ -616,7 +707,7 @@ struct PathTracer {
                                                  !hit.surface.valid, path.depth == 0, weighted, path.previousPdf,
                                                  path.previousNeeProbability, path.receiver, path.previousPosition,
                                                  spatial);
-            path.radiance += path.weight * crossed * contributionWeight(settings.contributions, path.depth);
+            gather(path.weight * crossed * contributionWeight(settings.contributions, path.depth));
             sawLight = path.depth == 0 && maxComponent(crossed) > 0.0f;
         }
         if (!hit.surface.valid) {
@@ -633,7 +724,7 @@ struct PathTracer {
             if (weighted)
                 misWeight = powerHeuristic(path.previousPdf, path.previousNeeProbability * domeSelectionProbability() *
                                                                  backend.environmentPdf(direction));
-            path.radiance += path.weight * li * (misWeight * contributionWeight(settings.contributions, path.depth));
+            gather(path.weight * li * (misWeight * contributionWeight(settings.contributions, path.depth)));
             path.active = false;
         }
         return hit;
@@ -742,8 +833,7 @@ struct PathTracer {
                 emissionWeight = powerHeuristic(path.previousPdf, path.previousNeeProbability * pdfArea *
                                                                       distance * distance / cosLight);
         }
-        path.radiance += path.weight * bs.emission *
-                         (emissionWeight * contributionWeight(settings.contributions, path.depth));
+        gather(path.weight * bs.emission * (emissionWeight * contributionWeight(settings.contributions, path.depth)));
         // A cutout hole crossed from the inside leaves the object, and with it
         // the medium entered by refraction; staying in it absorbed the rest of
         // the path and lost every path that then escaped to the environment.
@@ -786,8 +876,23 @@ struct PathTracer {
             contribution = path.weight * f.value * vertex.light.radiance * (misWeight / lightPdf);
         PathRay shadow = spawnRay(hit.surface, vertex.light.wi, false);
         if (isfinite(vertex.light.distance)) shadow.ray.tfar = vertex.light.distance * (1.0f - 1e-4f);
-        if (maxComponent(contribution) > 0.0f && visible(shadow, vertex.light.shadowBit))
-            path.radiance += contribution * contributionWeight(settings.contributions, path.depth + 1);
+        if (!(maxComponent(contribution) > 0.0f && visible(shadow, vertex.light.shadowBit))) return;
+#if PRISM_LIGHT_AOVS
+        if (aovs) {
+            const float3 c = contribution * contributionWeight(settings.contributions, path.depth + 1);
+            path.radiance += c;
+            // At the first vertex the BSDF's own diffuse part (as diffuse
+            // lobes see the light, with light lobes), else that vertex's.
+            const float3 d = path.aovPrimary
+                ? min(path.weight * f.diffuse * vertex.light.radiance * (misWeight / lightPdf) *
+                          contributionWeight(settings.contributions, path.depth + 1), c)
+                : c * path.firstDiffuse;
+            path.aov.diffuse += d;
+            path.aov.specular += c - d;
+            return;
+        }
+#endif
+        path.radiance += contribution * contributionWeight(settings.contributions, path.depth + 1);
     }
 
     // Absorption, media, Russian roulette and the next segment.
@@ -807,6 +912,15 @@ struct PathTracer {
                 path.inMedium = false;
             }
         }
+#if PRISM_LIGHT_AOVS
+        if (aovs && path.aovPrimary && !bs.null_event) {
+            // The first scattering vertex classifies the rest of the path: its
+            // diffuse part, or all of it into a scattering medium (subsurface).
+            path.aovPrimary = false;
+            path.firstDiffuse = material.sampleDiffuse;
+            if (path.inMedium && maxComponent(path.medium.sigmaS) > 0.0f) path.firstDiffuse = (float3)1.0f;
+        }
+#endif
         path.throughput *= bs.color;
         float rouletteWeight = 1.0f;
         if (path.depth >= rouletteDepth) {
@@ -817,6 +931,9 @@ struct PathTracer {
             }
             rouletteWeight = 1.0f / q;
             path.throughput *= rouletteWeight;
+#if PRISM_LIGHT_AOVS
+            if (aovs && path.albedoOpen) path.albedoWeight *= rouletteWeight;
+#endif
         }
         path.previousNee = vertex.canNee && !bs.delta && !bs.null_event && bs.pdf > 0.0f;
         path.receiver = vertex.receiver;
@@ -843,8 +960,15 @@ struct PathTracer {
         query.lightWi = vertex.light.wi;
         query.evaluateLight = vertex.light.valid;
         query.lobes = lobes;
+#if PRISM_LIGHT_AOVS
+        // The first vertex's lobes split diffuse from specular.
+        if (aovs && path.aovPrimary) query.lobes = true;
+#endif
         backend.pathWeight(path.throughput); // texture streaming feedback (GPU)
         const MaterialResult material = backend.shade(shading, query);
+#if PRISM_LIGHT_AOVS
+        if (aovs && path.albedoOpen) resolveAlbedo(material.sample);
+#endif
         if (!arrive(hit, vertex, material.sample)) return;
         connectLight(hit, vertex, material.light);
         continuePath(hit, vertex, material);
@@ -911,6 +1035,24 @@ struct PathTracer {
             if (peak > sampleSettings.sampleClamp) color *= sampleSettings.sampleClamp / peak;
         }
         result.color = color * sampleSettings.exposureScale;
+#if PRISM_LIGHT_AOVS
+        result.aovs.albedo = (float3)0.0f;
+        result.aovs.diffuse = (float3)0.0f;
+        result.aovs.specular = (float3)0.0f;
+        result.aovs.emission = (float3)0.0f;
+        if (aovs && result.coverage != 0.0f) {
+            // The colour's scale: sample clamp and exposure.
+            float scale = sampleSettings.exposureScale;
+            if (sampleSettings.sampleClamp > 0.0f) {
+                const float peak = maxComponent(traced.radiance);
+                if (peak > sampleSettings.sampleClamp) scale *= sampleSettings.sampleClamp / peak;
+            }
+            result.aovs.albedo = path.aov.albedo;
+            result.aovs.diffuse = path.aov.diffuse * scale;
+            result.aovs.specular = path.aov.specular * scale;
+            result.aovs.emission = path.aov.emission * scale;
+        }
+#endif
         return result;
     }
 };

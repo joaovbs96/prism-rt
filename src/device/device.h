@@ -62,6 +62,13 @@ struct NeeSettings {
     bool spatialLights = true;
 };
 
+// The light AOVs of a sample, or their mean over a pixel's samples
+// (LightAovSample, shaders/integrator/path_tracer.h): diffuse + specular +
+// emission is the colour; the albedo is that of the first non-delta vertex.
+struct LightAovPixel {
+    Color3 albedo, diffuse, specular, emission;
+};
+
 // Per-sample post-processing shared by every render loop.
 struct SampleShading {
     // Samples whose brightest channel exceeds this are scaled down (0 disables).
@@ -122,6 +129,9 @@ struct ImageRequest {
     // Light contributions to keep (kContribution* mask; noise analysis).
     unsigned contributions = 7;
     NeeSettings nee;
+    // When non-null, also renders the light AOVs: receives width*height
+    // means over the same samples as the colour, top row first.
+    std::vector<LightAovPixel>* lightAovs = nullptr;
 };
 
 // One progressive pass: one sample per pixel over the given tiles. All
@@ -144,6 +154,9 @@ struct PassRequest {
     unsigned int* rngStates = nullptr;
     Color3* colors = nullptr;
     float* coverage = nullptr;
+    // When non-null, also the light AOVs of each traced pixel's sample
+    // (width*height, like colors).
+    LightAovPixel* lightAovs = nullptr;
     // Polled between rows and tiles; returning true ends the pass early.
     std::function<bool()> abandoned;
     // While true, workers wait between tiles (unless abandoned).
@@ -174,6 +187,9 @@ struct PreviewRequest {
     // Called per preview pixel (px, py top row first); primary may be null.
     std::function<void(unsigned px, unsigned py, Color3 const& color, float coverage,
                        RayHit const* primary)> writePixel;
+    // When set, also renders the light AOVs and calls this per preview pixel
+    // (after writePixel).
+    std::function<void(unsigned px, unsigned py, LightAovPixel const& aovs)> writeLightAovs;
     std::atomic<uint64_t>* colorPixels = nullptr;
     // Receives the time spent tracing, without scene preparation.
     double* traceMilliseconds = nullptr;

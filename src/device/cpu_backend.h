@@ -5,6 +5,9 @@
 // classes, including native MDL code.
 
 #include "hlsl_math.h"
+// The light AOVs are compiled in and gathered when a render asks for them
+// (CpuPathTracer::aovs).
+#define PRISM_LIGHT_AOVS 1
 #include "../../shaders/integrator/path_tracer.h"
 #include "light_table.h"
 #include "../camera_rays.h"

@@ -86,9 +86,11 @@ bool AllMaterialsBlock(SceneManager& scene)
 // The sampler's sequence is indexed by `sample`, scrambled per pixel.
 SampleResult TraceSample(SceneManager& scene, CpuSceneState const& state, CameraParams const& camera,
                          SampleSettings const& settings, unsigned x, unsigned y, unsigned width,
-                         unsigned height, unsigned& seed, unsigned sample, unsigned pixelSeed)
+                         unsigned height, unsigned& seed, unsigned sample, unsigned pixelSeed,
+                         bool lightAovs = false)
 {
     CpuPathTracer tracer;
+    tracer.aovs = lightAovs;
     tracer.backend.scene = &scene;
     tracer.backend.opaqueScene = state.opaque;
     tracer.backend.lights = state.lights.get();
@@ -99,6 +101,19 @@ SampleResult TraceSample(SceneManager& scene, CpuSceneState const& state, Camera
     const SampleResult result = tracer.renderSample(camera, x, y, width, height, settings);
     seed = tracer.backend.rng.state;
     return result;
+}
+
+LightAovPixel ToLightAovs(LightAovSample const& a)
+{
+    return {ToFloat3(a.albedo), ToFloat3(a.diffuse), ToFloat3(a.specular), ToFloat3(a.emission)};
+}
+
+void Add(LightAovPixel& sum, LightAovSample const& a)
+{
+    sum.albedo += ToFloat3(a.albedo);
+    sum.diffuse += ToFloat3(a.diffuse);
+    sum.specular += ToFloat3(a.specular);
+    sum.emission += ToFloat3(a.emission);
 }
 
 } // namespace
@@ -161,6 +176,8 @@ std::vector<float> CpuDevice::RenderImage(SceneManager& scene, ImageRequest cons
     std::vector<Color3> sums(count, Color3(0));
     std::vector<Color3> evenSums(adaptive.Enabled() ? count : 0, Color3(0));
     std::vector<int> samples(count, 0);
+    const bool lightAovs = request.lightAovs != nullptr;
+    std::vector<LightAovPixel> aovSums(lightAovs ? count : 0);
     ActivePixels active;
     active.Reset(unsigned(width), unsigned(height));
     // Without adaptive sampling or a time limit this is one round of all
@@ -195,8 +212,9 @@ std::vector<float> CpuDevice::RenderImage(SceneManager& scene, ImageRequest cons
                 for (int sample = done; sample < next; ++sample) {
                     const auto result = TraceSample(scene, *state, camera, settings, unsigned(x),
                         unsigned(y), unsigned(width), unsigned(height), seed, unsigned(sample),
-                        seedImage(unsigned(x), unsigned(y), unsigned(width), request.seed));
+                        seedImage(unsigned(x), unsigned(y), unsigned(width), request.seed), lightAovs);
                     sums[pixel] += ToFloat3(result.color);
+                    if (lightAovs) Add(aovSums[pixel], result.aovs);
                     if (adaptive.Enabled() && sample % 2 == 0) evenSums[pixel] += ToFloat3(result.color);
                 }
                 samples[pixel] = next;
@@ -228,11 +246,20 @@ std::vector<float> CpuDevice::RenderImage(SceneManager& scene, ImageRequest cons
         Color3 value = sums[pixel];
         value /= float(samples[pixel]);
         for (int c = 0; c < 3; ++c) pixels[3 * pixel + c] = value[c];
+        if (lightAovs) {
+            LightAovPixel& a = aovSums[pixel];
+            const float scale = 1.0f / float(samples[pixel]);
+            a.albedo *= scale;
+            a.diffuse *= scale;
+            a.specular *= scale;
+            a.emission *= scale;
+        }
         total += samples[pixel];
         atMax += samples[pixel] >= request.samples;
     }
     if (request.meanSamples) *request.meanSamples = total / double(count);
     if (request.fractionAtMaxSamples) *request.fractionAtMaxSamples = count ? double(atMax) / double(count) : 0.0;
+    if (lightAovs) *request.lightAovs = std::move(aovSums);
     return pixels;
 }
 
@@ -301,10 +328,12 @@ void CpuDevice::RenderPass(SceneManager& scene, PassRequest const& request)
                                         static_cast<float>(y) + 0.5f,
                                         width, height, nullptr);
                             const auto result = TraceSample(scene, *state, camera, settings, x, y, width,
-                                height, seed, unsigned(request.sample), seedPass(x, y, width, request.seed));
+                                height, seed, unsigned(request.sample), seedPass(x, y, width, request.seed),
+                                request.lightAovs != nullptr);
                             ++colorWork.value;
                             request.colors[pixel] = ToFloat3(result.color);
                             request.coverage[pixel] = result.coverage;
+                            if (request.lightAovs) request.lightAovs[pixel] = ToLightAovs(result.aovs);
                         }
                     }
                     auto primaryStart = Clock::now();
@@ -374,7 +403,7 @@ bool CpuDevice::RenderPreview(SceneManager& scene, PreviewRequest const& request
                 ((py * previewWidth + px) ^ request.seed) ^ 0x9e3779b9u,
                 (px + 0x85ebca6bu) ^ (py * 0xc2b2ae35u));
             const auto result = TraceSample(scene, *state, camera, settings, x, y, width, height,
-                                            seed, 0u, seed);
+                                            seed, 0u, seed, bool(request.writeLightAovs));
             const Color3 color = ToFloat3(result.color);
             const float coverage = result.coverage;
             const RTCRay center = prism::MakeCameraRayWithLens(request.camera,
@@ -387,6 +416,7 @@ bool CpuDevice::RenderPreview(SceneManager& scene, PreviewRequest const& request
             } else {
                 request.writePixel(px, py, color, coverage, nullptr);
             }
+            if (request.writeLightAovs) request.writeLightAovs(px, py, ToLightAovs(result.aovs));
         }
     }
         });
