@@ -13,7 +13,7 @@
 class Material;
 namespace mdl { class Context; }
 
-namespace prism::hydra {
+namespace prism::materials {
 
 // Process-lifetime MDL runtime shared by renderer instances. Hydra renderer
 // objects may be created/destroyed repeatedly while compiled materials still
@@ -23,6 +23,9 @@ mdl::Context& SharedMdlContext();
 // Converts scene-index material data sources to PrismRT MDL materials. The
 // service owns the resulting materials. Prefetch captures Hydra data on the
 // calling sync thread, then compiles immutable MaterialX inputs in parallel.
+// Both front ends use it: the Hydra delegate with its scene index's material
+// prims, the standalone CLI (src/mesh/usd_mesh.h) with data sources it builds
+// from the composed UsdShade networks.
 class MaterialService {
 public:
     struct Request {
@@ -140,4 +143,4 @@ private:
     std::unique_ptr<Impl> m_impl;
 };
 
-} // namespace prism::hydra
+} // namespace prism::materials

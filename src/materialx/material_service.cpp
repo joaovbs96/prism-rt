@@ -1,4 +1,4 @@
-#include "materials.h"
+#include "material_service.h"
 
 #include "../mdl/context.h"
 #include "../materialx/usd_network.h"
@@ -72,7 +72,7 @@
 PXR_NAMESPACE_USING_DIRECTIVE
 namespace mx = MaterialX;
 
-namespace prism::hydra {
+namespace prism::materials {
 namespace {
 
 using prism::materialx::AddDisplacementShader;
@@ -2087,4 +2087,4 @@ MaterialService::MaterialStats MaterialService::GetStats() const
     return result;
 }
 
-} // namespace prism::hydra
+} // namespace prism::materials

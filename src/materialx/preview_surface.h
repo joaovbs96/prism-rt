@@ -1,8 +1,8 @@
 #pragma once
 
 // UsdPreviewSurface networks and displacement terminals for the MaterialX
-// conversion of USD materials, shared by the Hydra delegate's material service
-// (src/hydra/materials.cpp) and the standalone loader (src/mesh/usd_mesh.h).
+// conversion of USD materials in the material service
+// (src/materialx/material_service.cpp), which both front ends compile through.
 
 #include <pxr/imaging/hd/materialNetworkInterface.h>
 #include <pxr/imaging/hdMtlx/hdMtlx.h>

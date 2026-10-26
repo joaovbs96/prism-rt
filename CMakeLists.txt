@@ -462,8 +462,7 @@ if(PRISM_BUILD_HYDRA)
 
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/materials_test.cpp")
         add_executable(prism_hydra_materials_test
-            tests/hydra/materials_test.cpp
-            src/hydra/materials.cpp)
+            tests/hydra/materials_test.cpp)
         target_link_libraries(prism_hydra_materials_test PRIVATE PrismRT::core ${PXR_LIBRARIES})
         add_test(NAME prism_hydra_materials_test COMMAND prism_hydra_materials_test)
         set_tests_properties(prism_hydra_materials_test PROPERTIES ENVIRONMENT "${_prism_test_environment}")
@@ -500,7 +499,6 @@ if(PRISM_BUILD_HYDRA)
             tests/hydra/progress_status_test.cpp
             tests/hydra/gpu_preparation_preview_test.cpp
             src/hydra/scene_bridge.cpp
-            src/hydra/materials.cpp
             src/hydra/render_buffer.cpp
             src/hydra/task_delegate.cpp
             src/hydra/render_pass.cpp
@@ -742,7 +740,7 @@ if(PRISM_BUILD_HYDRA)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/material_loading_test.cpp")
         add_executable(prism_hydra_material_loading_test
-            tests/hydra/material_loading_test.cpp src/hydra/materials.cpp)
+            tests/hydra/material_loading_test.cpp)
         target_link_libraries(prism_hydra_material_loading_test PRIVATE PrismRT::core ${PXR_LIBRARIES})
         add_test(NAME prism_hydra_material_loading_test COMMAND prism_hydra_material_loading_test)
         set_tests_properties(prism_hydra_material_loading_test PROPERTIES ENVIRONMENT "${_prism_test_environment}")

@@ -1,7 +1,7 @@
 #include "scene_bridge.h"
 #include "fallback_material.h"
 
-#include "materials.h"
+#include "../materialx/material_service.h"
 #include "environment_cache.h"
 #include "render_buffer.h"
 #include "refinement_tiles.h"
@@ -96,6 +96,8 @@
 PXR_NAMESPACE_USING_DIRECTIVE
 
 namespace prism::hydra {
+using prism::materials::MaterialService;
+using prism::materials::SharedMdlContext;
 namespace {
 
 void _WarnUnsupportedAov(TfToken const &name)

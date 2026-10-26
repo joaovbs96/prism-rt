@@ -121,7 +121,7 @@ rising by 1 over 4 texels with `-bm 1` tilts the normal by 14°.
 `displacement` shader (float, along the normal) bound to the surfacematerial's
 `displacementshader` input — the shape USD MaterialX displacement has once
 the Hydra delegate merges a displacement terminal into the surface document
-(`AddDisplacementShader`, `src/hydra/materials.cpp`), so the material's MDL
+(`AddDisplacementShader`, `src/materialx/preview_surface.h`), so the material's MDL
 `geometry.displacement` carries it. The height is the map's red channel (or
 `-imfchan`), raw, placed by `-o`/`-s`; `-mm base gain` gives
 `base + gain × texel` (a `multiply` and an `add`, as `displacement` has a

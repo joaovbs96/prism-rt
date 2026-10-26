@@ -1,4 +1,4 @@
-#include "../../src/hydra/materials.h"
+#include "../../src/materialx/material_service.h"
 #include "../../src/mdl/context.h"
 #include "../../src/mdl_material.h"
 
@@ -24,7 +24,7 @@
 #include <iostream>
 
 PXR_NAMESPACE_USING_DIRECTIVE
-using namespace prism::hydra;
+using namespace prism::materials;
 
 namespace {
 

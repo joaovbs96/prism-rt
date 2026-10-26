@@ -25,7 +25,7 @@ functions.
 
 - **Only the `surface` and `displacement` terminals are read.**
   `SurfaceTerminalName` and `AddDisplacementShader` in
-  `src/hydra/materials.cpp` (around lines 315-339). A USD material's `volume`
+  `src/materialx/preview_surface.h`. A USD material's `volume`
   output is never looked at.
 - **Media come only from the surface shader's own MDL volume coefficients.**
   OpenPBR/standard_surface transmission depth and subsurface turn into an
