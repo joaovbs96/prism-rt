@@ -1,0 +1,81 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    upAxis = "Y"
+    metersPerUnit = 1
+)
+
+# UsdLuxShapingAPI spotlights over a diffuse floor (albedo 0.5), seen from
+# above by an orthographic camera: 512 x 128 pixels over x in [-8, 8],
+# z in [-2, 2] (image top: z = -2). Three point lights (treatAsPoint) 1 unit
+# above the floor, aimed down:
+#   Hard   x = -5: cone 30, softness 0
+#   Soft   x =  0: cone 40, softness 0.5
+#   Focus  x =  5: cone 50, focus 3, focusTint 0.25
+# prism_light_shaping_test spotlight checks each pixel against
+# rho / pi * I * shaping(theta) * cos(theta) / d^2 (I = intensity * pi r^2).
+def Xform "World"
+{
+    def Mesh "Floor"
+    {
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 1, 2, 3]
+        point3f[] points = [(-8.5, 0, 2.5), (8.5, 0, 2.5), (8.5, 0, -2.5), (-8.5, 0, -2.5)]
+        normal3f[] normals = [(0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0)] (interpolation = "vertex")
+        color3f[] primvars:displayColor = [(0.5, 0.5, 0.5)]
+    }
+
+    def SphereLight "Hard" (
+        prepend apiSchemas = ["ShapingAPI"]
+    )
+    {
+        float inputs:radius = 0.1
+        bool treatAsPoint = true
+        float inputs:intensity = 100
+        float inputs:shaping:cone:angle = 30
+        float inputs:shaping:cone:softness = 0
+        double3 xformOp:translate = (-5, 1, 0)
+        float3 xformOp:rotateXYZ = (-90, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
+    }
+
+    def SphereLight "Soft" (
+        prepend apiSchemas = ["ShapingAPI"]
+    )
+    {
+        float inputs:radius = 0.1
+        bool treatAsPoint = true
+        float inputs:intensity = 100
+        float inputs:shaping:cone:angle = 40
+        float inputs:shaping:cone:softness = 0.5
+        double3 xformOp:translate = (0, 1, 0)
+        float3 xformOp:rotateXYZ = (-90, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
+    }
+
+    def SphereLight "Focus" (
+        prepend apiSchemas = ["ShapingAPI"]
+    )
+    {
+        float inputs:radius = 0.1
+        bool treatAsPoint = true
+        float inputs:intensity = 100
+        float inputs:shaping:cone:angle = 50
+        float inputs:shaping:focus = 3
+        color3f inputs:shaping:focusTint = (0.25, 0.25, 0.25)
+        double3 xformOp:translate = (5, 1, 0)
+        float3 xformOp:rotateXYZ = (-90, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
+    }
+
+    def Camera "Camera"
+    {
+        token projection = "orthographic"
+        float horizontalAperture = 160
+        float verticalAperture = 40
+        float2 clippingRange = (0.1, 100)
+        double3 xformOp:translate = (0, 5, 0)
+        float3 xformOp:rotateXYZ = (-90, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
+    }
+}

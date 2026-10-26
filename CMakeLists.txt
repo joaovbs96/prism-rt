@@ -648,6 +648,15 @@ if(PRISM_BUILD_HYDRA)
         target_link_libraries(prism_lights_test PRIVATE PrismRT::core)
         add_test(NAME prism_lights_test COMMAND prism_lights_test)
     endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/light_shaping.cpp")
+        # UsdLuxShapingAPI and IES profiles (unit checks; the rendered checks
+        # are with the parity fixtures below).
+        add_executable(prism_light_shaping_test tests/light_shaping.cpp)
+        target_link_libraries(prism_light_shaping_test PRIVATE PrismRT::core OpenImageIO::OpenImageIO)
+        add_test(NAME prism_light_shaping_test COMMAND prism_light_shaping_test unit
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/ies/cosine_lobe.ies")
+        set_tests_properties(prism_light_shaping_test PROPERTIES ENVIRONMENT "${_prism_test_environment}")
+    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/scene_features.cpp")
         add_executable(prism_scene_features_test tests/scene_features.cpp)
         target_link_libraries(prism_scene_features_test PRIVATE OpenImageIO::OpenImageIO)
@@ -1088,6 +1097,66 @@ if(TARGET prism_hydra_render AND TARGET prism_compare_images)
         prism_add_parity_fixture(NAME instance_primvars_vulkan SCENE tests/hydra/fixtures/instance_primvars.usda
             CLI_DEVICE vulkan)
     endif()
+    # UsdLuxShapingAPI: point spotlights (cone, softness, focus) and IES
+    # profiles over a floor seen from above, checked pixel by pixel against
+    # the analytic irradiance (prism_light_shaping_test) in each loader and on
+    # Vulkan; every light shape shaped (spotlight_area: parity, CPU/Vulkan,
+    # and MIS against BSDF sampling alone).
+    set(_prism_shaping_devices cpu)
+    if(PRISM_ENABLE_VULKAN)
+        list(APPEND _prism_shaping_devices vulkan)
+    endif()
+    foreach(_device IN LISTS _prism_shaping_devices)
+        set(_tag "")
+        if(_device STREQUAL "vulkan")
+            set(_tag _vulkan)
+        endif()
+        prism_add_parity_fixture(NAME spotlight${_tag} SCENE tests/hydra/fixtures/spotlight.usda
+            WIDTH 512 HEIGHT 128 SPP 16 CLI_DEVICE ${_device})
+        prism_add_parity_fixture(NAME ies_light${_tag} SCENE tests/hydra/fixtures/ies_light.usda
+            WIDTH 512 HEIGHT 128 SPP 16 CLI_DEVICE ${_device})
+        prism_add_parity_fixture(NAME spotlight_area${_tag} SCENE tests/hydra/fixtures/spotlight_area.usda
+            WIDTH 96 HEIGHT 64 SPP 64 TOLERANCE 0.1 MEAN_TOLERANCE 0.01 CLI_DEVICE ${_device})
+        if(TARGET prism_light_shaping_test)
+            set(_frontends cli hydra)
+            if(_device STREQUAL "vulkan")
+                set(_frontends cli)
+            endif()
+            foreach(_frontend IN LISTS _frontends)
+                set(_suffix ${_frontend})
+                if(_device STREQUAL "vulkan")
+                    set(_suffix vulkan)
+                endif()
+                add_test(NAME prism_light_shaping_spotlight_${_suffix}
+                    COMMAND prism_light_shaping_test spotlight "${prism_parity_spotlight${_tag}_dir}/${_frontend}/image.exr")
+                set_tests_properties(prism_light_shaping_spotlight_${_suffix} PROPERTIES
+                    FIXTURES_REQUIRED prism_parity_spotlight${_tag})
+                add_test(NAME prism_light_shaping_ies_${_suffix}
+                    COMMAND prism_light_shaping_test ies "${prism_parity_ies_light${_tag}_dir}/${_frontend}/image.exr"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/ies/cosine_lobe.ies")
+                set_tests_properties(prism_light_shaping_ies_${_suffix} PROPERTIES
+                    FIXTURES_REQUIRED prism_parity_ies_light${_tag})
+            endforeach()
+        endif()
+    endforeach()
+    # Shaped lights stay unbiased under MIS: next-event estimation with MIS and
+    # BSDF sampling alone agree (the mean: 0.8% apart at 4096 spp, 0.2% at
+    # 32768, as noise; noise in the BSDF-only image).
+    foreach(_sampling mis bsdf)
+        add_test(NAME prism_light_shaping_area_${_sampling}_render
+            COMMAND PrismRT --scene "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/spotlight_area.usda"
+                --camera /World/Camera --width 48 --height 32 --spp 16384 ${_prism_fixed_sampling} --device cpu
+                --max-sample-radiance 0 --environment-sampling ${_sampling}
+                --output "${CMAKE_BINARY_DIR}/light_shaping/area_${_sampling}.exr")
+        set_tests_properties(prism_light_shaping_area_${_sampling}_render PROPERTIES
+            ENVIRONMENT "${_prism_test_environment};PRISM_DEVICE=cpu"
+            FIXTURES_SETUP prism_light_shaping_area_sampling)
+    endforeach()
+    add_test(NAME prism_light_shaping_area_consistency
+        COMMAND prism_compare_images "${CMAKE_BINARY_DIR}/light_shaping/area_mis.exr"
+            "${CMAKE_BINARY_DIR}/light_shaping/area_bsdf.exr" --tolerance 1 --mean-tolerance 0.01)
+    set_tests_properties(prism_light_shaping_area_consistency PROPERTIES
+        FIXTURES_REQUIRED prism_light_shaping_area_sampling)
     # Light inputs:diffuse / inputs:specular: the full image and its
     # diffuse-only and specular-only variants. As for "lights", the loaders
     # order the lights differently: noise, not bias (the mean agrees).
@@ -1456,6 +1525,7 @@ set(_prism_gpu_test_regex
     "|^prism_parity_.*_(vulkan|metal)_(cli|hydra|match)$"
     "|^prism_parity_.*_(vulkan|metal)_.*_(match|layer|exact)$"
     "|^prism_scene_features_.*_vulkan$"
+    "|^prism_light_shaping_.*_vulkan$"
     "|^prism_textured_emitters?(_glass)?_vulkan_(render|parity)$"
     "|^prism_thin_walled_glass_vulkan_(render|parity)$")
 string(JOIN "" _prism_gpu_test_regex ${_prism_gpu_test_regex})
