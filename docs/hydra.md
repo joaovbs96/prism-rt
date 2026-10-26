@@ -397,8 +397,10 @@ The usdview interaction script is `tests/hydra/usdview_smoke.py`, for the rebuil
 ## CLI and Hydra parity
 
 PrismRT has two USD loaders: the CLI's (`src/mesh/usd_mesh.h`,
-`src/standalone_cli.cpp`) and the delegate's scene index bridge. CTest keeps
-them in agreement. `prism_add_parity_fixture` (`cmake/PrismParity.cmake`)
+`src/standalone_cli.cpp`) and the delegate's scene index bridge. Both compile
+materials through the same material service
+([hydra_materials.md](hydra_materials.md)); the CLI hands it each bound
+material's composed UsdShade network. CTest keeps them in agreement. `prism_add_parity_fixture` (`cmake/PrismParity.cmake`)
 renders a fixture with both on the CPU device, then compares the results
 with `prism_compare_images`: normalized RMSE and relative mean luminance,
 each within the fixture's tolerance.

@@ -329,6 +329,15 @@ terminals (the delegate's network rewrite, `src/materialx/preview_surface.h`);
 materials read from the composed UsdShade network (referenced `.mtlx` files
 included); and the `primId`, `elementId` and `instanceId` AOVs.
 
+The CLI also compiles USD materials as the delegate does (done): it hands
+each bound material's composed network, as a Hydra material data source, to
+the delegate's material service (`src/materialx/material_service.cpp`, moved
+out of `src/hydra/`), so both front ends share its worker pool, material
+templates (one program for a group of compatible materials), folded class
+parameters (`PRISM_MDL_COMPILE_MODE`), process caches and on-disk caches.
+glTF and OBJ materials still compile one document after another with
+unfolded class parameters (they have no Hydra network to hand over).
+
 Left: UsdSkel blend shapes and skinned normals (authored normals of skinned
 meshes are not skinned), motion blur, and native instancing's numbering
 (prim and instance ids follow the CLI's traversal; the delegate numbers its

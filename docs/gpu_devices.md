@@ -838,6 +838,21 @@ called done there.
   `src/mdl_material.h` and `src/mdl/backend_compiler.cpp`): host-side only; the Metal kernel and its sources are
   unchanged. Check the build and that a textured emitter scene still renders
   the same on `--device metal` (no shader changes expected).
+- **The CLI compiles USD materials through the delegate's material service**
+  ([hydra_materials.md](hydra_materials.md)):
+  - No shader or device change. `src/hydra/materials.{h,cpp}` moved to
+    `src/materialx/material_service.{h,cpp}` (namespace `prism::materials`,
+    unchanged otherwise) and is now part of `prism_core`; the CLI
+    (`src/mesh/usd_mesh.h`, `src/standalone_cli.cpp`) hands it each bound
+    material's UsdShade network and uses `SharedMdlContext()`. The CLI's GPU
+    programs are now the delegate's: folded class parameters and templates
+    (OpenPBR playground: 37 programs of at most 0.58 MB instead of 22 of
+    about 2 MB), and fewer emitters classed as varying (constant emission
+    of folded materials is evaluated at load time).
+  - Runs: the CLI on the OpenPBR playground with `--device metal` against
+    `--device cpu` and its kernel/compile time against the previous build;
+    chess, egg_gold and Teapot at float level against the previous build;
+    `ctest -R prism_parity -LE gpu`.
 
 ## Diagnostics
 
