@@ -502,6 +502,53 @@ parity fixture each and a check in `prism_scene_features_test`:
   bit-identical to before. Fixtures `light_lobes.usda` and its `_diffuse` /
   `_specular` variants: they add up to the full image, and MIS and BSDF-only
   sampling agree per lobe.
+- **Spotlights and IES profiles** (`UsdLuxShapingAPI`, following the 26.08
+  schema text in `usdLux/schema.usda`) on sphere, rect, disk and cylinder
+  lights and points (`treatAsPoint`). The emission leaving the light in
+  direction e is scaled by, with theta = acos(axis . e) off the primary axis
+  (the light's local -Z):
+  - `shaping:cone:angle` / `shaping:cone:softness`: 0 beyond the cutoff,
+    else `1 - smoothstep(cutoff * (1 - softness), cutoff, theta)`
+    (softness clamped to [0, 1]; a cone of 180 degrees or more is no cone);
+  - `shaping:focus` / `shaping:focusTint`: `lerp(focusTint, 1, |cos theta|^focus)`
+    per channel (focus <= 0 ignored; the tint is a linear Rec.709 colour
+    like the light's);
+  - `shaping:ies:file`: the profile's intensity in the light's local frame
+    (vertical angle from local -Z, the nadir; horizontal angle from local +X
+    toward +Y), its theta first rescaled by `shaping:ies:angleScale`
+    (`theta / s` for s > 0, `(theta - pi) / -s + pi` for s < 0), in candela
+    after the file's multiplier; `shaping:ies:normalize` divides it by the
+    profile's mean intensity over the sphere (total power / 4 pi), so the
+    light keeps the power of an unshaped one. The schema writes the
+    normalization as a product with the profile power; it means a division
+    ("preserving the overall energy output").
+  The factors multiply (the openusd.org dev docs add that the cone "does
+  not affect IES profiles"; the 26.08 schema does not, and is followed). A light is shaped when one input has a value: applying
+  ShapingAPI gives every input its fallback, so the 90 degree cone fallback
+  then limits a sphere or cylinder light to the hemisphere around its -Z.
+  Both loaders read the inputs the same way (the delegate from
+  `HdLightTokens->shaping*`, which UsdImaging fills with the fallbacks of an
+  applied API) and resolve the IES file through Ar. Distant lights and
+  domes ignore shaping (a distant light's directions all lie within its
+  angle of the axis; the UsdLux overview notes that RenderMan applies only
+  focus to them).
+  Profiles (LM-63-1995/2002/2019, `src/lights/ies.cpp`; type C symmetries:
+  one horizontal angle, 0-90, 0-180, 90-270, full or partial 0-360) are
+  resampled to 1-degree grids (181 rows, 360 columns or one for rotational
+  symmetry), linear between the file's angles and zero past its vertical
+  range (over one grid step). Photometric types A and B are read as C with
+  a warning; the TILT block is skipped. A missing or malformed file prints
+  one warning per file and the light renders without the profile. Sampling
+  is unchanged (both strategies evaluate the same factor, so MIS stays
+  unbiased); spatial light selection bounds the factor over the directions
+  the light subtends at the shading point (cone and focus, and the IES
+  grid's row maxima over that theta range), and the light's power weight
+  takes the fraction its shaping leaves. Fixtures `spotlight.usda` and
+  `ies_light.usda` (point lights over a floor, checked pixel by pixel
+  against the analytic irradiance by `prism_light_shaping_test`: mean
+  relative error 0.007-0.06%, on the CPU in both loaders and on Vulkan) and
+  `spotlight_area.usda` (every shape; parity, CPU/Vulkan, and MIS against
+  BSDF sampling alone).
 - **`doubleSided`** behind `prism:honorDoubleSided` (off by default). With it, a
   back-face hit (the integrator's `front_face`: the transformed winding, so a
   mirroring transform turns a mesh around) on a single-sided triangle is

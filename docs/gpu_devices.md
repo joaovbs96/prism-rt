@@ -487,7 +487,10 @@ numbers in the same order and agree sample for sample.
   and cylinders, and for lights not linked to the receiver. Triangles and
   the dome keep their probabilities. BSDF hits on a light recompute its
   selection probability from the vertex that scattered the ray (not the ray
-  origin, which moves at cutout crossings).
+  origin, which moves at cutout crossings). Shaped lights (UsdLuxShapingAPI)
+  multiply it by a bound on their shaping over the directions the light
+  subtends at the point (zero outside a cone, exact for points), and their
+  power-table weight by the fraction of power their shaping leaves.
 - **Shapes.** Spheres: uniform cone. Rects: uniform solid angle (spherical
   rectangles, Urena et al. 2013) above 1e-3 sr, area below. Cylinders: the
   arc visible from the shading point, equiangular along the axis. Disks and
@@ -853,6 +856,30 @@ called done there.
     `--device cpu` and its kernel/compile time against the previous build;
     chess, egg_gold and Teapot at float level against the previous build;
     `ctest -R prism_parity -LE gpu`.
+- **UsdLuxShapingAPI spotlights and IES profiles** ([hydra.md](hydra.md#scene-features)):
+  - Shared shader code: `shaders/integrator/lights.h` (`kLightShaped`,
+    `LightShaping`, `shapingCone`/`shapingFocus`/`shapingConeFocus`,
+    `iesTheta`/`iesAngles`/`iesGridLookup`, `shapingImportance`,
+    `lightBoundingRadius`, `lightSpread`) and `path_tracer.h`
+    (`lightShaping`, `shapingFactor`, `iesTexel`, `iesImportance`; the
+    factor in `crossedLights` and `chooseLight`, the bound in
+    `linkedImportance`). No new binding and no record change: the shaping
+    blocks and IES grids follow the alias entries in the light-alias buffer
+    (`kSlotLightAlias`), which is now longer than `lightCount() + 1`; the
+    block index is `LightRecord::lobes.z` (float bits). HLSL is plain
+    (a dynamic loop over at most 33 grid rows in `iesImportance`, uint
+    bit packing, `acos`/`atan2`/`pow`).
+  - Shared host code: `src/device/light_table.h` (`SceneLightShaping`,
+    `ShapingPowerFraction`, `AppendShapingBlocks`), `src/lights.h`,
+    `src/lights/ies.{h,cpp}`, `src/hydra/scene_bridge.cpp`.
+  - Runs: `ctest -R "light_shaping|spotlight|ies_light"` (CPU); then
+    `spotlight.usda` and `ies_light.usda` (512x128, 16 spp) and
+    `spotlight_area.usda` (96x64, 64 spp) with `--device metal`, the first
+    two checked with `prism_light_shaping_test spotlight|ies` (the second
+    also takes `tests/hydra/fixtures/ies/cosine_lobe.ies`) and all three
+    against `--device cpu` with `prism_compare_images` (Vulkan: NRMSE
+    8.4e-7, 1.4e-6 and 5.8e-4); chess, egg_gold and Teapot bit-identical to
+    the previous build (no shaped lights).
 
 ## Diagnostics
 

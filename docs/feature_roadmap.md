@@ -56,7 +56,12 @@ Scenes: **Eggs** (MaterialEggs), **OpenPBR** (OpenPBRShaderPlayground),
 - **Per-light camera visibility, dome `colorTemperature`, `inputs:diffuse` /
   `inputs:specular` multipliers (done).** In both loaders, on every device; see
   [hydra.md](hydra.md#scene-features).
-- **Shaping and IES profiles** (`ShapingAPI`; ALab's are empty files).
+- **Shaping and IES profiles (done).** `UsdLuxShapingAPI` cones, softness,
+  focus, focus tint and LM-63 IES profiles on sphere, rect, disk, cylinder
+  and point lights, in both loaders, on every device; see
+  [hydra.md](hydra.md#scene-features). Not done: photometric types A and B
+  (read as type C with a warning) and the TILT block (ignored); ALab's
+  profiles are empty files (one warning each, the lights render unshaped).
 - **Light filters** and portal lights.
 - **Dome texture formats** other than lat-long (angular, mirrored ball,
   cube maps) are read as lat-long with a warning.
@@ -236,7 +241,7 @@ than from the renderer.
 | Subdivision | uniform | no | adaptive | ? | yes | yes |
 | Displacement | yes | no | yes | ? | ? | yes |
 | Motion blur | no | ? | no | ? | ? | yes |
-| IES / shaping | no | no | yes | ? | ? | yes |
+| IES / shaping | yes | no | yes | ? | ? | yes |
 | Adaptive sampling | yes | ? | yes | ? | ? | yes |
 | Denoiser | no | ? | ? | planned | OIDN | yes |
 | LPEs / light groups | no | ? | no | ? | ? | yes |
@@ -270,7 +275,7 @@ GPUs from every vendor. To close the gaps, in order:
      descriptor array and allocation count (see
      [Scale and performance](#scale-and-performance)).
 3. **Lights** (see [Lights](#lights)).
-   - IES profiles and `ShapingAPI`.
+   - IES profiles and `ShapingAPI` (done).
    - Light filters and portals.
    - Transmissive shadows, then manifold NEE, for colored shadows and
      caustics through glass (see [Lights](#lights)).
