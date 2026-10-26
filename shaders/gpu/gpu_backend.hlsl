@@ -1035,10 +1035,14 @@ struct GpuBackend {
             // Threads that run the same program continue together.
             prism_reorder_thread(callee.info.y, PRISM_REORDER_HINT_BITS);
 #endif
-            prism_call_material(callee.info.y, call);
-            bool light, lobes;
-            if ((call.flags & kMaterialCallEvaluated) == 0u && materialCallEvaluations(call.flags, light, lobes))
-                prism_call_material_evaluate(callee.info.y, call);
+            // One call site for both parts (each CallShader site costs the
+            // raygen shader stack): slot 2 x program, then 2 x program + 1.
+            [loop] for (uint part = 0u; part < 2u; ++part) {
+                prism_call_material_slot(2u * callee.info.y + part, call);
+                bool light, lobes;
+                if ((call.flags & kMaterialCallEvaluated) != 0u || !materialCallEvaluations(call.flags, light, lobes))
+                    break;
+            }
             rng.state = call.rng;
             return loadMaterialResult(call);
         }

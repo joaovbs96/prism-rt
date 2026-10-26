@@ -100,7 +100,7 @@ SamplerState imageSampler(uint index) { return g_samplers[NonUniformResourceInde
 // program: samples) and answers the cutout and emission queries, 2 x program
 // + 1 evaluates a split program's BSDF.
 #define prism_call_material(program, call) CallShader(2u * (program), call)
-#define prism_call_material_evaluate(program, call) CallShader(2u * (program) + 1u, call)
+#define prism_call_material_slot(slot, call) CallShader(slot, call)
 #endif
 
 #ifdef PRISM_REORDER_MATERIALS
