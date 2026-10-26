@@ -138,7 +138,10 @@ loader adds a node definition and graph cloned from the library's to the
 document (`ClonePrivateGraph`), rewrites the copy, names both by a hash of the
 rewritten graph (`ND_prism_<category>_<hash>`, `PublishPrivateGraph`) and
 points the node at it; the node keeps its inputs. A repair that finds an
-unexpected shape returns the node to the library's graph.
+unexpected shape returns the node to the library's graph. The copies drop
+the library file's source URI: MaterialX writes elements from another file
+as an XInclude of it, so neither the name nor the generation caches' keys
+(both read the written document) would see the rewrite.
 
 MaterialX's MDL generator emits a graph implementation as an MDL function
 whose internal constants are literals, but publishes every unconnected input
