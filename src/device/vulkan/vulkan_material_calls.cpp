@@ -480,6 +480,27 @@ void ReplaceAll(std::string& text, std::string const& from, std::string const& t
         text.replace(at, from.size(), to);
 }
 
+constexpr std::string_view kWholeDefine = "#define PRISM_MATERIAL_CALL_WHOLE 1\n";
+constexpr std::string_view kEvaluateDefine = "#define PRISM_MATERIAL_CALL_EVALUATE 1\n";
+
+std::string PartDefine(MaterialCallPart part)
+{
+    switch (part) {
+    case MaterialCallPart::Whole: return std::string(kWholeDefine);
+    case MaterialCallPart::Evaluate: return std::string(kEvaluateDefine);
+    default: return std::string();
+    }
+}
+
+const char* PartName(MaterialCallPart part)
+{
+    switch (part) {
+    case MaterialCallPart::Whole: return "whole";
+    case MaterialCallPart::Evaluate: return "evaluate";
+    default: return "sample";
+    }
+}
+
 } // namespace
 
 void WriteCacheFile(std::filesystem::path const& path, void const* data, size_t size, uint64_t extra)
@@ -556,14 +577,55 @@ bool RaygenSource(bool reorder, uint32_t programs, bool varyingEmitters, std::st
     return true;
 }
 
-bool ProgramCallableSource(gpu::MdlProgramCode const& program, std::string* source, std::string* error)
+size_t SplitProgramThresholdBytes()
+{
+    if (const char* value = Setting("PRISM_VULKAN_SPLIT_PROGRAM_KIB"))
+        return size_t(std::max(0ll, std::atoll(value))) << 10;
+    return size_t(1536) << 10;
+}
+
+bool SplitProgram(size_t codeBytes)
+{
+    return codeBytes > SplitProgramThresholdBytes();
+}
+
+std::vector<MaterialCallPart> ProgramParts(size_t codeBytes)
+{
+    if (SplitProgram(codeBytes)) return {MaterialCallPart::Sample, MaterialCallPart::Evaluate};
+    return {MaterialCallPart::Whole};
+}
+
+MaterialCallPart CallablePart(std::string const& source)
+{
+    // The part's define comes within the first lines (the program tag, the salt, the tables define).
+    const std::string_view head = std::string_view(source).substr(0, 512);
+    if (head.find(kWholeDefine) != std::string_view::npos) return MaterialCallPart::Whole;
+    if (head.find(kEvaluateDefine) != std::string_view::npos) return MaterialCallPart::Evaluate;
+    return MaterialCallPart::Sample;
+}
+
+std::vector<uint32_t> CallableSlots(std::vector<std::string> const& sources)
+{
+    std::vector<uint32_t> slots;
+    for (uint32_t i = 1; i < sources.size(); ++i) {
+        const MaterialCallPart part = CallablePart(sources[i]);
+        if (part == MaterialCallPart::Whole) slots.insert(slots.end(), {i, i});
+        else if (part == MaterialCallPart::Sample) slots.push_back(i);
+        else slots.push_back(i); // the evaluate part follows its sample part
+    }
+    return slots;
+}
+
+bool ProgramCallableSource(gpu::MdlProgramCode const& program, MaterialCallPart part, std::string* source,
+                           std::string* error)
 {
     if (!gpu::AssembleShader("gpu/vulkan/material_callable.hlsl", {"gpu/vulkan"}, program.code, source, error))
         return false;
-    *source = std::format("// MDL program {}\n", program.digest.substr(0, 12)) + ShaderSaltDefine() +
-        "#define PRISM_MDL_PROGRAM_TABLES 1\n" + *source;
+    *source = std::format("// MDL program {} {}\n", program.digest.substr(0, 12), PartName(part)) +
+        ShaderSaltDefine() + "#define PRISM_MDL_PROGRAM_TABLES 1\n" + PartDefine(part) + *source;
     if (const char* dir = std::getenv("PRISM_GPU_DUMP_PROGRAMS"); dir && *dir)
-        std::ofstream(std::filesystem::path(dir) / std::format("program_{}.hlsl", program.digest.substr(0, 12)),
+        std::ofstream(std::filesystem::path(dir) /
+                          std::format("program_{}_{}.hlsl", program.digest.substr(0, 12), PartName(part)),
                       std::ios::binary)
             << *source;
     return true;
@@ -572,25 +634,31 @@ bool ProgramCallableSource(gpu::MdlProgramCode const& program, std::string* sour
 bool MaterialCallSources(gpu::MdlShaderCode const& code, bool reorder, std::vector<std::string>* sources,
                          std::string* error, bool trim)
 {
+    sources->assign(1, std::string());
     if (code.perProgram) {
         const uint32_t programs = uint32_t(code.programs.size());
-        sources->assign(programs + 1, std::string());
         if (!RaygenSource(reorder, programs, code.varyingEmitters, &(*sources)[0], error, code.lightAovs))
             return false;
         for (uint32_t p = 0; p < programs; ++p)
-            if (!ProgramCallableSource(*code.programs[p], &(*sources)[p + 1], error)) return false;
+            for (MaterialCallPart part : ProgramParts(code.programs[p]->code.size())) {
+                sources->emplace_back();
+                if (!ProgramCallableSource(*code.programs[p], part, &sources->back(), error)) return false;
+            }
         return true;
     }
     const uint32_t programs = uint32_t(code.programDispatch.size());
-    sources->assign(programs + 1, std::string());
     if (!RaygenSource(reorder, programs, code.varyingEmitters, &(*sources)[0], error, code.lightAovs))
         return false;
     const std::string salt = ShaderSaltDefine();
+    // The trimmed code also decides the split, untrimmed sources included
+    // (they replace trimmed ones that fail, slot for slot).
     std::optional<LinkUnitTrimmer> trimmer;
-    if (trim && TrimCallablesSetting()) trimmer.emplace(code.targetCode);
+    trimmer.emplace(code.targetCode);
+    const bool trimmed = trim && TrimCallablesSetting() && trimmer->valid();
     for (uint32_t p = 0; p < programs; ++p) {
         std::string mdl;
-        if (trimmer && trimmer->valid()) {
+        size_t programBytes = 0;
+        if (trimmer->valid()) {
             // Only this program's functions remain, and only it reaches this
             // callable: without its index in the source (function names and
             // dispatch cases), the program compiles to the same callable in
@@ -601,20 +669,22 @@ bool MaterialCallSources(gpu::MdlShaderCode const& code, bool reorder, std::vect
             mdl = trimmer->trim(code.programDispatch[p] + code.sceneData) + dispatch + code.sceneData;
             ReplaceAll(mdl, std::format("prism_p{}_", p), "prism_p_");
             ReplaceAll(mdl, std::format("Prism material dispatch: program {} ", p), "Prism material dispatch ");
-        } else {
-            mdl = code.targetCode + code.programDispatch[p] + code.sceneData;
+            programBytes = mdl.size();
         }
-        if (!gpu::AssembleShader("gpu/vulkan/material_callable.hlsl", {"gpu/vulkan"}, mdl, &(*sources)[p + 1],
-                                 error))
+        if (!trimmed) mdl = code.targetCode + code.programDispatch[p] + code.sceneData;
+        std::string assembled;
+        if (!gpu::AssembleShader("gpu/vulkan/material_callable.hlsl", {"gpu/vulkan"}, mdl, &assembled, error))
             return false;
-        (*sources)[p + 1] = salt + (*sources)[p + 1];
-        if (const char* dir = std::getenv("PRISM_GPU_DUMP_PROGRAMS"); dir && *dir)
-            std::ofstream(std::filesystem::path(dir) / std::format("callable{}.hlsl", p), std::ios::binary)
-                << (*sources)[p + 1];
+        for (MaterialCallPart part : ProgramParts(programBytes)) {
+            sources->push_back(salt + PartDefine(part) + assembled);
+            if (const char* dir = std::getenv("PRISM_GPU_DUMP_PROGRAMS"); dir && *dir)
+                std::ofstream(std::filesystem::path(dir) / std::format("callable{}_{}.hlsl", p, PartName(part)),
+                              std::ios::binary)
+                    << sources->back();
+        }
     }
     return true;
 }
-
 // PRISM_VULKAN_SHADER_SALT=<n> changes every module's code, so DXC and the
 // driver (which keeps its own cache) compile anew: cold measurements.
 std::string ShaderSaltDefine()
@@ -691,11 +761,13 @@ uint64_t DriverCompileBytes(size_t spirvBytes)
     return uint64_t((256.0 + 24.0 * mib * mib) * double(1 << 20));
 }
 
-uint64_t DxcCompileBytes(size_t hlslBytes)
+uint64_t DxcCompileBytes(size_t hlslBytes, MaterialCallPart part)
 {
-    // An upper bound of the measurements: 64 MiB plus 260 MiB per square MiB.
+    // An upper bound of the measurements: 64 MiB plus 260 MiB per square MiB
+    // for a whole program; its parts legalize less of the same source.
     const double mib = double(hlslBytes) / double(1 << 20);
-    return uint64_t((64.0 + 260.0 * mib * mib) * double(1 << 20));
+    const double share = part == MaterialCallPart::Sample ? 0.6 : part == MaterialCallPart::Evaluate ? 0.45 : 1.0;
+    return uint64_t((64.0 + share * 260.0 * mib * mib) * double(1 << 20));
 }
 
 uint64_t DriverMemoryBudget()
@@ -950,7 +1022,8 @@ std::shared_ptr<ShaderBuild> MaterialCallShaders::compile(std::string const& sou
         {
             // DXC's process counts against the same memory as the driver's
             // compiles: the budget first, then a DXC job.
-            CompileMemorySlot memory(DxcCompileBytes(source.size()));
+            CompileMemorySlot memory(DxcCompileBytes(source.size(), raygen ? MaterialCallPart::Whole
+                                                                           : CallablePart(source)));
             Dxc().acquire();
             ok = gpu::CompileHlsl(source, gpu::HlslTarget::Spirv, directory, &bytes, &reason, kLibraryStage, &stats);
             Dxc().release();
@@ -1117,23 +1190,29 @@ bool MaterialCallPipeline::build(gpu::MdlShaderCode const& code, VkPipelineLayou
     }
     std::vector<std::string> sources;
     if (!MaterialCallSources(code, reorder, &sources, error)) return false;
-    const uint32_t programs = uint32_t(sources.size() - 1);
-    m_report.programs = programs;
+    const uint32_t callables = uint32_t(sources.size() - 1);
+    m_slots = CallableSlots(sources);
+    m_report.programs = uint32_t(m_slots.size() / 2);
     m_report.libraries = shaderSet.libraries();
-    progress::Detail(Phase::Kernel, std::format("compiling {} material callables", programs));
+    progress::Detail(Phase::Kernel, std::format("compiling {} material callables", callables));
     if (gpu::GpuVerbose())
-        std::cerr << std::format("PrismRT Vulkan: preparing {} material callables ({} DXC jobs, {} compile threads, "
-                                 "{})\n", programs, DxcJobs(), CompileThreads(),
+        std::cerr << std::format("PrismRT Vulkan: preparing {} material callables for {} programs ({} DXC jobs, {} "
+                                 "compile threads, {})\n", callables, m_report.programs, DxcJobs(), CompileThreads(),
                                  shaderSet.libraries() ? "pipeline libraries" : "one pipeline");
-    // Callables first, the raygen shader (usually compiling since device creation) last.
+    // The raygen shader (usually compiled since device creation, unless the
+    // scene needs a variant) compiles alongside the callables.
     std::vector<std::shared_ptr<const ShaderBuild>> shaders(sources.size());
     std::atomic<size_t> done{0};
     const auto start = Clock::now();
+    Clock::time_point raygenReady = start, callablesReady = start;
+    std::mutex readyMutex;
     tbb::task_arena arena{int(CompileThreads())};
     arena.execute([&] {
-        tbb::parallel_for(size_t(1), sources.size(), size_t(1), [&](size_t i) {
-            shaders[i] = shaderSet.shader(sources[i], false);
-            progress::Detail(Phase::Kernel, std::format("material callable {} of {}", ++done, programs));
+        tbb::parallel_for(size_t(0), sources.size(), size_t(1), [&](size_t i) {
+            shaders[i] = shaderSet.shader(sources[i], i == 0);
+            std::lock_guard lock(readyMutex);
+            (i == 0 ? raygenReady : callablesReady) = Clock::now();
+            if (i > 0) progress::Detail(Phase::Kernel, std::format("material callable {} of {}", ++done, callables));
         });
     });
     // A trimmed callable that does not compile (a reference the trimming
@@ -1147,9 +1226,7 @@ bool MaterialCallPipeline::build(gpu::MdlShaderCode const& code, VkPipelineLayou
                                  i - 1, shaders[i]->error.substr(0, 300));
         shaders[i] = shaderSet.shader(full[i], false);
     }
-    const auto callablesReady = Clock::now();
-    shaders[0] = shaderSet.shader(sources[0], true);
-    m_report.raygenWaitSeconds = SecondsSince(callablesReady);
+    m_report.raygenWaitSeconds = std::max(0.0, std::chrono::duration<double>(raygenReady - callablesReady).count());
     m_report.shadersSeconds = SecondsSince(start);
     for (size_t i = 0; i < shaders.size(); ++i) {
         ShaderBuild const& s = *shaders[i];
@@ -1331,7 +1408,8 @@ bool MaterialCallPipeline::createBindingTable(uint32_t groups, std::string* erro
     const uint32_t handleSize = p.shaderGroupHandleSize;
     const uint32_t stride = AlignUp(handleSize, p.shaderGroupHandleAlignment);
     const uint32_t callableOffset = AlignUp(stride, p.shaderGroupBaseAlignment);
-    const uint32_t callables = groups - 1;
+    // Callable slot c runs group m_slots[c]: a whole program fills both its slots.
+    const uint32_t callables = uint32_t(m_slots.size());
     const VkDeviceSize bytes = VkDeviceSize(callableOffset) + VkDeviceSize(std::max(callables, 1u)) * stride +
         p.shaderGroupBaseAlignment; // room to align the base address
     std::vector<uint8_t> handles(size_t(groups) * handleSize);
@@ -1376,7 +1454,8 @@ bool MaterialCallPipeline::createBindingTable(uint32_t groups, std::string* erro
     auto* table = static_cast<uint8_t*>(mapped) + (base - address);
     std::memcpy(table, handles.data(), handleSize);
     for (uint32_t c = 0; c < callables; ++c)
-        std::memcpy(table + callableOffset + c * stride, handles.data() + size_t(c + 1) * handleSize, handleSize);
+        std::memcpy(table + callableOffset + c * stride, handles.data() + size_t(m_slots[c]) * handleSize,
+                    handleSize);
     vkUnmapMemory(m_device, m_tableMemory);
     m_raygen = {base, stride, stride};
     m_callables = callables ? VkStridedDeviceAddressRegionKHR{base + callableOffset, stride,

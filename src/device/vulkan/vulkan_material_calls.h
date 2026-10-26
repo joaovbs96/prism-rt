@@ -47,6 +47,10 @@ struct RayTracingSupport {
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_PROPERTIES_KHR};
 };
 
+// The part of a program a callable compiles (see SplitProgram below).
+// MaterialCallPart::Whole is the program's whole material code.
+enum class MaterialCallPart : uint32_t { Whole, Sample, Evaluate };
+
 // When scenes use the callable path (PRISM_VULKAN_CALLABLES): by default
 // (`auto`) above the kernel size threshold or after the compute kernel was
 // found too large; 1 always (where ray tracing pipelines exist); 0 never.
@@ -78,8 +82,10 @@ std::string DriverSpirvLimitError(size_t bytes, std::string_view shader);
 // The estimated memory of the driver's compile of `spirvBytes` of SPIR-V.
 uint64_t DriverCompileBytes(size_t spirvBytes);
 // The estimated peak memory of DXC compiling `hlslBytes` of HLSL to SPIR-V
-// (2.65 MB of callable HLSL: 0.85-1.75 GB; 0.93 MB: 0.25 GB).
-uint64_t DxcCompileBytes(size_t hlslBytes);
+// (2.65 MB of callable HLSL: 0.85-1.75 GB; 0.93 MB: 0.25 GB). DXC's memory
+// follows the code it legalizes: a program's sample part peaked at up to 59%
+// of the whole's (1027 of 1740 MiB), its evaluate part at 42% (724).
+uint64_t DxcCompileBytes(size_t hlslBytes, MaterialCallPart part = MaterialCallPart::Whole);
 // The memory concurrent compiles may take together
 // (PRISM_VULKAN_DRIVER_MEMORY_MIB; default a quarter of what the process may
 // commit: the physical memory, or its job's memory limit when lower).
@@ -126,15 +132,36 @@ bool PipelineCacheDataMatches(std::vector<char> const& data, VkPhysicalDevicePro
 // (the hint bits cover `programs`).
 bool RaygenSource(bool reorder, uint32_t programs, bool varyingEmitters, std::string* source, std::string* error,
                   bool lightAovs = false);
-// The HLSL of the callable pipeline: the raygen shader, then one callable per
-// program of `code` (that program's dispatch and, with `trim`, only the
-// functions of the link unit it reaches), each compiled alone with the
-// kMaterialCallProfile library profile.
+// A program is one callable (Whole: the BSDF sample, evaluations and medium,
+// the cutout and emission queries) or, when its code is large, two: Sample
+// (the BSDF sample and medium, the cutout and emission queries) and Evaluate
+// (the BSDF evaluations). The driver compiles each part of a large program
+// in much less memory than the whole (it grows with the square of the SPIR-V
+// size: OpenPBR's coupled glass, 15 MB, 5-6 GB; its parts 9 and 6 MB), so
+// more compiles fit the memory budget at once; a split program costs a second
+// MDL init per evaluation at render time, so small programs stay whole.
+// Program p has callable slots 2p (whole or sample) and 2p + 1 (whole again,
+// or evaluate).
+// Programs whose generated code exceeds this are split
+// (PRISM_VULKAN_SPLIT_PROGRAM_KIB, default 1536; 0 splits every program).
+size_t SplitProgramThresholdBytes();
+bool SplitProgram(size_t codeBytes);
+// The part a callable source of MaterialCallSources or ProgramCallableSource compiles.
+MaterialCallPart CallablePart(std::string const& source);
+// For each callable slot of `sources` (MaterialCallSources), the index of its source.
+std::vector<uint32_t> CallableSlots(std::vector<std::string> const& sources);
+// The HLSL of the callable pipeline: the raygen shader, then each program of
+// `code` as one callable or two parts (that program's dispatch and, with
+// `trim`, only the functions of the link unit it reaches), each compiled
+// alone with the kMaterialCallProfile library profile.
 bool MaterialCallSources(gpu::MdlShaderCode const& code, bool reorder, std::vector<std::string>* sources,
                          std::string* error, bool trim = true);
-// The callable of one program translated alone (MdlProgramCode): the same
-// source in every scene, so it can compile before the scene is complete.
-bool ProgramCallableSource(gpu::MdlProgramCode const& program, std::string* source, std::string* error);
+// One part of the callables of one program translated alone (MdlProgramCode):
+// the same source in every scene, so it can compile before the scene is complete.
+bool ProgramCallableSource(gpu::MdlProgramCode const& program, MaterialCallPart part, std::string* source,
+                           std::string* error);
+// The parts a program's code of `codeBytes` compiles to (Whole, or Sample and Evaluate).
+std::vector<MaterialCallPart> ProgramParts(size_t codeBytes);
 extern const char* const kMaterialCallProfile; // lib_6_6
 
 // Prints the statistics of every executable of `pipeline` (created with
@@ -269,6 +296,7 @@ private:
     VkDeviceMemory m_tableMemory = VK_NULL_HANDLE;
     VkStridedDeviceAddressRegionKHR m_raygen{};
     VkStridedDeviceAddressRegionKHR m_callables{};
+    std::vector<uint32_t> m_slots;  // the group (shader) of each callable slot (CallableSlots)
     uint32_t m_stackSize = 0;       // set at each launch of a linked pipeline (dynamic state)
     bool m_dynamicStack = false;
     CallableBuildReport m_report;

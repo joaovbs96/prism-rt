@@ -3,7 +3,9 @@
 // src/device/vulkan/vulkan_material_calls.h). The caller packs the prepared
 // shading point and the material query; the program answers with
 // backend.shade's MaterialResult, the cutout opacity of a hit, or the
-// emission of a light sample's point (kMaterialCallEmitted).
+// emission of a light sample's point (kMaterialCallEmitted). A program split
+// into sample and evaluate parts answers the MaterialResult in two calls
+// (material_callable.hlsl).
 //
 // Only what the MDL state and the BSDF read travels: 48 words in, 24 out
 // (288 bytes). The payload goes through the callable's stack, so every word
@@ -23,6 +25,11 @@ static const uint kMaterialCallLobes = 2048u;   // MaterialQuery::lobes
 // Instead of shading: the emission toward the caller (`emission`), for light
 // samples on triangles of varying emission (GpuBackend::emitterRadiance).
 static const uint kMaterialCallEmitted = 1u << 24u;
+// The evaluate part: also the BSDF towards the sample's direction `wi` (light lobes).
+static const uint kMaterialCallEvaluateSample = 1u << 25u;
+// Output of a whole program's callable: the evaluations are done (no call of
+// the evaluate part follows).
+static const uint kMaterialCallEvaluated = 1u << 26u;
 // The caller's texture feedback: on, and its path weight (9 bits from bit 12).
 static const uint kMaterialCallFeedback = 1024u;
 static const uint kMaterialCallFeedbackWeightShift = 12u;
@@ -196,6 +203,40 @@ void storeMaterialResult(inout MaterialCall call, MaterialResult result)
     if (result.light.valid) flags |= kMaterialCallLightValid;
     if (result.medium.valid) flags |= kMaterialCallMediumValid;
     call.flags = flags;
+}
+
+// The evaluate part (PRISM_MATERIAL_CALL_EVALUATE): the BSDF towards
+// `lightWi` (kMaterialCallEvaluateLight) and the diffuse fraction towards the
+// sample `wi` (kMaterialCallLobes), in the fields loadMaterialResult reads.
+void storeMaterialEvaluation(inout MaterialCall call, BsdfEvaluation light, float3 sampleDiffuse)
+{
+    call.lightValue = light.value;
+    call.lightPdf = light.pdf;
+    if ((call.flags & kMaterialCallLobes) != 0u) {
+        const float3 fraction = diffuseFraction(light);
+        call.lobes0 = packUnorm16x2(fraction.x, fraction.y);
+        call.lobes1 = packUnorm16x2(fraction.z, sampleDiffuse.x);
+        call.lobes2 = packUnorm16x2(sampleDiffuse.y, sampleDiffuse.z);
+    }
+    uint flags = call.flags & (kMaterialCallModeMask | kMaterialCallFrontFace | kMaterialCallFiltered |
+                               kMaterialCallEvaluateLight | kMaterialCallLobes);
+    if (light.valid) flags |= kMaterialCallLightValid;
+    call.flags = flags;
+}
+
+// Merges the evaluate part's answer into the sample part's `result`.
+void loadMaterialEvaluation(MaterialCall call, inout MaterialResult result)
+{
+    result.light.value = call.lightValue;
+    result.light.pdf = call.lightPdf;
+    result.light.valid = (call.flags & kMaterialCallLightValid) != 0u;
+    result.light.diffuse = (float3)0.0f;
+    if ((call.flags & kMaterialCallLobes) != 0u) {
+        result.light.diffuse = result.light.value * float3(unpackUnorm16(call.lobes0, 0u),
+            unpackUnorm16(call.lobes0, 16u), unpackUnorm16(call.lobes1, 0u));
+        result.sampleDiffuse = float3(unpackUnorm16(call.lobes1, 16u), unpackUnorm16(call.lobes2, 0u),
+                                      unpackUnorm16(call.lobes2, 16u));
+    }
 }
 
 MaterialResult loadMaterialResult(MaterialCall call)

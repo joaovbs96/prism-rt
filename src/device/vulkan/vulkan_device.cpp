@@ -508,9 +508,22 @@ void ReportVulkanPrograms(SceneManager& scene, std::ostream& out)
         out << "callable sources failed: " << error << '\n';
         return;
     }
-    for (size_t i = 0; i < sources.size(); ++i)
-        compile(i == 0 ? std::string("raygen") : std::format("callable{}", i - 1), sources[i],
-                gpu::HlslStage{vulkan::kMaterialCallProfile, ""});
+    const std::vector<uint32_t> slots = vulkan::CallableSlots(sources);
+    for (size_t i = 0; i < sources.size(); ++i) {
+        // Per-program callables name their program's digest (ProgramCallableSource).
+        std::string label = "raygen";
+        if (i > 0) {
+            const size_t slot = std::find(slots.begin(), slots.end(), uint32_t(i)) - slots.begin();
+            const auto part = vulkan::CallablePart(sources[i]);
+            label = std::format("callable{}_{}", slot / 2,
+                                part == vulkan::MaterialCallPart::Whole      ? "whole"
+                                : part == vulkan::MaterialCallPart::Evaluate ? "evaluate"
+                                                                             : "sample");
+            constexpr std::string_view tag = "// MDL program ";
+            if (sources[i].starts_with(tag)) label += " program " + sources[i].substr(tag.size(), 12);
+        }
+        compile(label, sources[i], gpu::HlslStage{vulkan::kMaterialCallProfile, ""});
+    }
 }
 
 // Callables compiled while the scene's materials still compile: every program
@@ -550,10 +563,12 @@ struct CallableSpeculation {
             target = shaders;
             // Compile while holding the lock, so the device cannot go away
             // meanwhile; prefetch only queues the work.
-            for (auto const& program : start) {
-                std::string source, error;
-                if (vulkan::ProgramCallableSource(*program, &source, &error)) target->prefetch(std::move(source));
-            }
+            for (auto const& program : start)
+                for (auto part : vulkan::ProgramParts(program->code.size())) {
+                    std::string source, error;
+                    if (vulkan::ProgramCallableSource(*program, part, &source, &error))
+                        target->prefetch(std::move(source));
+                }
         }
     }
     // A scene's preparation starts: later programs belong to the next one.

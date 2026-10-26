@@ -98,29 +98,54 @@ int main(int argc, char** argv)
                       raygen.size() > 1000,
                   "light AOV raygen shader compiles to SPIR-V: " + error);
         }
-        // The callable path: the raygen shader (with reordering) and each program's callable.
-        std::vector<std::string> sources;
-        check(prism::device::vulkan::MaterialCallSources(code, true, &sources, &error) &&
-                  sources.size() == code.programCount + 1u,
-              "callable sources: " + error);
-        // Each callable keeps only its program's code, named without the program index.
-        std::vector<std::string> whole;
-        check(prism::device::vulkan::MaterialCallSources(code, true, &whole, &error, false) &&
-                  whole.size() == sources.size(),
-              "untrimmed callable sources: " + error);
-        for (size_t i = 1; i < sources.size() && i < whole.size(); ++i) {
-            check(sources[i].size() <= whole[i].size(), "callable " + std::to_string(i - 1) + " is trimmed");
-            check(sources[i].find(std::format("prism_p{}_", i - 1)) == std::string::npos &&
-                      sources[i].find("prism_p_") != std::string::npos,
-                  "callable " + std::to_string(i - 1) + " does not name its program index");
-        }
-        for (size_t i = 0; i < sources.size(); ++i) {
-            std::vector<char> library;
-            check(CompileHlsl(sources[i], HlslTarget::Spirv, ShaderCacheDirectory("test"), &library, &error,
-                              HlslStage{prism::device::vulkan::kMaterialCallProfile, ""}) &&
-                      library.size() > 1000,
-                  (i == 0 ? std::string("raygen shader") : "callable " + std::to_string(i - 1)) +
-                      " compiles to SPIR-V: " + error);
+        // The callable path: the raygen shader (with reordering) and each
+        // program as one whole callable, or split into its sample and
+        // evaluate parts (PRISM_VULKAN_SPLIT_PROGRAM_KIB=0 splits every one).
+        for (const char* split : {"", "0"}) {
+#ifdef _WIN32
+            _putenv_s("PRISM_VULKAN_SPLIT_PROGRAM_KIB", split);
+#else
+            if (*split) setenv("PRISM_VULKAN_SPLIT_PROGRAM_KIB", split, 1);
+            else unsetenv("PRISM_VULKAN_SPLIT_PROGRAM_KIB");
+#endif
+            namespace vk = prism::device::vulkan;
+            const bool splitAll = *split != '\0';
+            const std::string mode = splitAll ? " (split)" : "";
+            std::vector<std::string> sources;
+            check(vk::MaterialCallSources(code, true, &sources, &error) &&
+                      sources.size() == (splitAll ? 2u : 1u) * code.programCount + 1u,
+                  "callable sources" + mode + ": " + error);
+            // Two slots per program: whole twice, or sample then evaluate.
+            const std::vector<uint32_t> slots = vk::CallableSlots(sources);
+            check(slots.size() == 2u * code.programCount, "two callable slots per program" + mode);
+            for (size_t s = 0; s + 1 < slots.size(); s += 2) {
+                const auto first = vk::CallablePart(sources[slots[s]]);
+                const auto second = vk::CallablePart(sources[slots[s + 1]]);
+                check(splitAll ? first == vk::MaterialCallPart::Sample && second == vk::MaterialCallPart::Evaluate &&
+                                     slots[s + 1] == slots[s] + 1
+                               : first == vk::MaterialCallPart::Whole && slots[s + 1] == slots[s],
+                      std::format("program {}'s callable slots{}", s / 2, mode));
+            }
+            // Each callable keeps only its program's code, named without the program index.
+            std::vector<std::string> whole;
+            check(vk::MaterialCallSources(code, true, &whole, &error, false) && whole.size() == sources.size(),
+                  "untrimmed callable sources" + mode + ": " + error);
+            for (size_t s = 0; s < slots.size(); ++s) {
+                const size_t i = slots[s];
+                if (i >= whole.size()) continue;
+                check(sources[i].size() <= whole[i].size(), std::format("callable {} is trimmed{}", i - 1, mode));
+                check(sources[i].find(std::format("prism_p{}_", s / 2)) == std::string::npos &&
+                          sources[i].find("prism_p_") != std::string::npos,
+                      std::format("callable {} does not name its program index{}", i - 1, mode));
+            }
+            for (size_t i = 0; i < sources.size(); ++i) {
+                std::vector<char> library;
+                check(CompileHlsl(sources[i], HlslTarget::Spirv, ShaderCacheDirectory("test"), &library, &error,
+                                  HlslStage{vk::kMaterialCallProfile, ""}) &&
+                          library.size() > 1000,
+                      (i == 0 ? std::string("raygen shader") : "callable " + std::to_string(i - 1)) + mode +
+                          " compiles to SPIR-V: " + error);
+            }
         }
 #endif
         std::string source;

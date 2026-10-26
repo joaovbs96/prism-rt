@@ -95,9 +95,12 @@ Texture2D<float4> imageTexture(uint image) { return g_textures[NonUniformResourc
 SamplerState imageSampler(uint index) { return g_samplers[NonUniformResourceIndex(index)]; }
 
 #ifdef PRISM_CALL_MATERIALS
-// Material programs are the callable shaders of the ray tracing pipeline,
-// indexed by program (vulkan_material_calls.cpp).
-#define prism_call_material(program, call) CallShader(program, call)
+// Material programs are the callable shaders of the ray tracing pipeline, two
+// slots per program (vulkan_material_calls.cpp): 2 x program shades (a split
+// program: samples) and answers the cutout and emission queries, 2 x program
+// + 1 evaluates a split program's BSDF.
+#define prism_call_material(program, call) CallShader(2u * (program), call)
+#define prism_call_material_evaluate(program, call) CallShader(2u * (program) + 1u, call)
 #endif
 
 #ifdef PRISM_REORDER_MATERIALS

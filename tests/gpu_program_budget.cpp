@@ -80,6 +80,10 @@ int main(int argc, char** argv)
     check(vk::DriverCompileBytes(2 * MiB) < (uint64_t(512) << 20), "driver compile estimate of 2 MiB");
     // DXC's peak for the largest OpenPBR callable source (2671 KB) was 1740 MiB.
     check(vk::DxcCompileBytes(2671 * 1024) >= (uint64_t(1740) << 20), "DXC estimate covers the measured peak");
+    // Its parts' sources (2659 KB) peaked at 1027 MiB (sample) and 724 MiB (evaluate).
+    check(vk::DxcCompileBytes(2659 * 1024, vk::MaterialCallPart::Sample) >= (uint64_t(1027) << 20) &&
+              vk::DxcCompileBytes(2659 * 1024, vk::MaterialCallPart::Evaluate) >= (uint64_t(724) << 20),
+          "DXC estimates cover the parts' measured peaks");
     check(vk::DriverSpirvLimitError(size_t(vk::kDefaultMaxDriverSpirvMib) * MiB, "callable").empty() ||
               vk::DriverSpirvLimitError(size_t(vk::kDefaultMaxDriverSpirvMib) * MiB, "callable")
                   .find("needs about") != std::string::npos,
@@ -126,31 +130,57 @@ int main(int argc, char** argv)
         check(code.success && code.perProgram && code.varyingEmitters, "per-program code: " + code.error);
         std::vector<std::string> sources;
         std::string error;
-        check(vk::MaterialCallSources(code, false, &sources, &error) && sources.size() == code.programs.size() + 1,
-              "callable sources: " + error);
+        check(vk::MaterialCallSources(code, false, &sources, &error), "callable sources: " + error);
         check(sources.size() > 0 && sources[0].find("#define PRISM_VARYING_EMITTERS 1") != std::string::npos,
               "the raygen shader evaluates varying emitters");
-        size_t largest = 0, smallest = SIZE_MAX;
-        for (size_t i = 1; i < sources.size(); ++i) {
-            // One BSDF evaluation call site: DXC inlines each call of the
-            // program's code (a second one tripled the glass's SPIR-V).
-            check(Count(sources[i], "evaluate(shading, ") == 1,
-                  std::format("callable {}: one call site of the BSDF evaluation", i - 1));
-            std::vector<char> spirv;
-            const bool ok = gpu::CompileHlsl(sources[i], gpu::HlslTarget::Spirv, gpu::ShaderCacheDirectory("test"),
-                                             &spirv, &error, gpu::HlslStage{vk::kMaterialCallProfile, ""});
-            check(ok && spirv.size() > 1000, std::format("callable {} compiles: {}", i - 1, error));
-            check(vk::DriverSpirvLimitError(spirv.size(), "callable").empty(),
-                  std::format("callable {} ({} KB) fits the driver", i - 1, spirv.size() >> 10));
-            largest = std::max(largest, spirv.size());
-            smallest = std::min(smallest, spirv.size());
-            std::cout << std::format("callable {}: {} KB HLSL, {} KB SPIR-V, driver estimate {} MiB\n", i - 1,
-                                     sources[i].size() >> 10, spirv.size() >> 10,
-                                     vk::DriverCompileBytes(spirv.size()) >> 20);
+        // Large programs (the glass) are a sample and an evaluate part, which
+        // the driver compiles in much less memory than the whole program;
+        // the small ones (the emitters) stay whole.
+        const std::vector<uint32_t> slots = vk::CallableSlots(sources);
+        check(slots.size() == 2 * code.programs.size(), "two callable slots per program");
+        size_t largest = 0, smallest = SIZE_MAX, largestProgram = 0, split = 0;
+        for (uint32_t p = 0; p < code.programs.size() && 2 * p + 1 < slots.size(); ++p) {
+            const bool splitProgram = slots[2 * p] != slots[2 * p + 1];
+            check(splitProgram == vk::SplitProgram(code.programs[p]->code.size()),
+                  std::format("program {} is split by its code size", p));
+            split += splitProgram ? 1 : 0;
+            size_t program = 0;
+            for (uint32_t index : splitProgram ? std::vector<uint32_t>{slots[2 * p], slots[2 * p + 1]}
+                                               : std::vector<uint32_t>{slots[2 * p]}) {
+                std::string const& source = sources[index];
+                const auto part = vk::CallablePart(source);
+                const std::string label = std::format(
+                    "program {} {}", p,
+                    part == vk::MaterialCallPart::Whole ? "whole"
+                    : part == vk::MaterialCallPart::Evaluate ? "evaluate" : "sample");
+                check(part == (!splitProgram ? vk::MaterialCallPart::Whole
+                               : index == slots[2 * p] ? vk::MaterialCallPart::Sample
+                                                       : vk::MaterialCallPart::Evaluate),
+                      label + ": its part");
+                // One BSDF evaluation call site per part (DXC inlines each
+                // call of the program's code: a second one tripled the
+                // glass's SPIR-V).
+                check(Count(source, "evaluate(shading, ") == 2, label + ": the evaluation call sites");
+                std::vector<char> spirv;
+                const bool ok = gpu::CompileHlsl(source, gpu::HlslTarget::Spirv, gpu::ShaderCacheDirectory("test"),
+                                                 &spirv, &error, gpu::HlslStage{vk::kMaterialCallProfile, ""});
+                check(ok && spirv.size() > 1000, std::format("{} compiles: {}", label, error));
+                check(vk::DriverSpirvLimitError(spirv.size(), "callable").empty(),
+                      std::format("{} ({} KB) fits the driver", label, spirv.size() >> 10));
+                largest = std::max(largest, spirv.size());
+                smallest = std::min(smallest, spirv.size());
+                program += spirv.size();
+                std::cout << std::format("{}: {} KB HLSL, {} KB SPIR-V, driver estimate {} MiB\n", label,
+                                         source.size() >> 10, spirv.size() >> 10,
+                                         vk::DriverCompileBytes(spirv.size()) >> 20);
+            }
+            largestProgram = std::max(largestProgram, program);
         }
-        // The glass is the largest program: 8.7 MB of SPIR-V, 12.1 MB with
-        // two evaluation call sites.
-        check(largest < 10 * MiB, std::format("largest callable {} KB below 10 MiB", largest >> 10));
+        check(split == 1, std::format("only the glass program is split, not {}", split));
+        // The glass is the largest program: 8.7 MB of SPIR-V whole, 12.1 MB
+        // with two evaluation call sites; split, its sample part is 5.2 MB.
+        check(largestProgram < 10 * MiB, std::format("largest program {} KB below 10 MiB", largestProgram >> 10));
+        check(largest < 6 * MiB, std::format("largest callable {} KB below 6 MiB", largest >> 10));
         check(largest > 3 * smallest, "the glass callable is the largest by far");
         // A lower limit refuses it before any pipeline is created.
         SetVariable("PRISM_VULKAN_MAX_SPIRV_MIB", "4");

@@ -1013,14 +1013,19 @@ struct GpuBackend {
     }
 
     // The one call site of sample, evaluate and medium: each material's code
-    // is inlined once. With PRISM_CALL_MATERIALS an MDL program runs this
-    // same function in its own shader (material_callable.hlsl).
+    // is inlined once. With PRISM_CALL_MATERIALS an MDL program runs the
+    // same steps in its own two shaders, sample and medium in one, the
+    // evaluations in the other (material_callable.hlsl).
     MaterialResult shade(GpuShading shading, MaterialQuery query)
     {
 #ifdef PRISM_CALL_MATERIALS
         const GpuMaterial callee = gpu_material(shading.material);
         if (callee.info.x == kMaterialMdl) {
+            // The program's whole callable answers the query; a program split
+            // in two answers the sample, then (when the result needs it) its
+            // evaluate part the evaluations: the same arithmetic as below.
             MaterialCall call = materialCall(shading.surface, shading.material, kMaterialCallShade);
+            const uint inputs = call.flags;
             call.xi = query.xi;
             call.lightWi = query.lightWi;
             if (query.evaluateLight) call.flags |= kMaterialCallEvaluateLight;
@@ -1032,7 +1037,20 @@ struct GpuBackend {
 #endif
             prism_call_material(callee.info.y, call);
             rng.state = call.rng;
-            return loadMaterialResult(call);
+            MaterialResult result = loadMaterialResult(call);
+            if ((call.flags & kMaterialCallEvaluated) != 0u) return result;
+            const bool light = evaluatesLight(query, result.sample);
+            const bool lobes = query.lobes && result.sample.scattered && !result.sample.delta &&
+                               !result.sample.null_event;
+            if (light || lobes) {
+                call.flags = inputs | (light ? kMaterialCallEvaluateLight : 0u) |
+                             (query.lobes ? kMaterialCallLobes : 0u) | (lobes ? kMaterialCallEvaluateSample : 0u);
+                call.lightWi = query.lightWi;
+                call.wi = result.sample.wi;
+                prism_call_material_evaluate(callee.info.y, call);
+                loadMaterialEvaluation(call, result);
+            }
+            return result;
         }
 #endif
         MaterialResult result;
