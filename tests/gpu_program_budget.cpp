@@ -178,18 +178,21 @@ int main(int argc, char** argv)
             largestProgram = std::max(largestProgram, program);
         }
         check(split == 0, std::format("no program is split, not {}", split));
-        // The glass is the largest program: 2.3 MB of SPIR-V. Its dielectric
-        // repair rewrites a private copy of the surface's graph; flattened
-        // into the material instead, its constants became class parameters
-        // and the program 8.7 MB (12.1 MB with two evaluation call sites).
-        check(largestProgram < 3 * MiB, std::format("largest program {} KB below 3 MiB", largestProgram >> 10));
+        // The glass is the largest program: about 0.4 MB of SPIR-V with its
+        // class parameters folded, as the material service compiles a
+        // material of its own (2.3 MB unfolded). Its dielectric repair
+        // rewrites a private copy of the surface's graph; flattened into the
+        // material instead, its constants became class parameters and the
+        // unfolded program 8.7 MB (12.1 MB with two evaluation call sites).
+        check(largestProgram < MiB, std::format("largest program {} KB below 1 MiB", largestProgram >> 10));
         check(largest == largestProgram, "the largest program is one callable");
         check(largest > 2 * smallest, "the glass callable is the largest by far");
-        // A lower limit refuses it before any pipeline is created.
+        // A lower limit refuses a larger callable before any pipeline is created.
         SetVariable("PRISM_VULKAN_MAX_SPIRV_MIB", "2");
-        check(vk::DriverSpirvLimitError(largest, "material callable").find("too large for the driver") !=
-                  std::string::npos,
-              "PRISM_VULKAN_MAX_SPIRV_MIB=2 refuses the glass callable");
+        check(vk::DriverSpirvLimitError(largest, "material callable").empty() &&
+                  vk::DriverSpirvLimitError(3 * MiB, "material callable").find("too large for the driver") !=
+                      std::string::npos,
+              "PRISM_VULKAN_MAX_SPIRV_MIB=2 keeps the glass callable and refuses 3 MiB");
         SetVariable("PRISM_VULKAN_MAX_SPIRV_MIB", nullptr);
     }
     rtcReleaseDevice(device);
