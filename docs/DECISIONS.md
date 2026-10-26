@@ -2,6 +2,9 @@
 
 Design decisions and deliberate deviations, newest first. Each entry: date, decision, why.
 
+## 2026-10-26
+- **Vulkan shaders are checked and budgeted before the driver compiles them** (`PRISM_VULKAN_MAX_SPIRV_MIB`, `PRISM_VULKAN_DRIVER_MEMORY_MIB`): the driver's compiler runs in our process and ends it when it runs out of memory (OpenPBR playground: "LLVM ERROR: out of memory" with 16 large callables compiling at once), so concurrent DXC and driver compiles share a memory budget estimated from the shader sizes, and a shader too large for the machine falls back to the CPU device with a message instead of being handed to the driver. Slower cold compiles of scenes with very large programs (OpenPBR: 23 minutes under a 24 GB cap) are accepted over crashes; shrinking those programs is left for later.
+
 ## 2026-10-25
 - **Light AOVs split the colour by the first scattering vertex** (Cycles'/RenderMan's per-lobe convention, `C<RD>.*` / `C<RS>.*`): `emission` = light seen before any vertex (dome included, so the three add up to the colour without a fourth AOV); `diffuse` = MDL's `bsdf_diffuse` part at that vertex (diffuse transmission included) and subsurface entries; `specular` = the rest (glossy, delta, glass of any roughness). The split is the expected value of the lobe fractions of the sampled direction (the Phase 4 light-lobe machinery), not the sampled lobe's event type, so it needs no new MDL output and holds for MDL's stochastic lobe selection. LPEs other than the beauty's stay unsupported.
 - **The albedo AOV is a per-sample estimate** (the BSDF sample weight) at the first non-sharp vertex, not MDL's auxiliary albedo function (no new generated code; converges with the samples; exact for Lambertian). "Sharp" = delta or BSDF sample pdf ≥ 1000/sr: MDL reports smooth OpenPBR glass and mirrors as glossy lobes, not specular events. Escaped paths give 0.

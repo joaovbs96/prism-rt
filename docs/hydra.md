@@ -640,7 +640,7 @@ While a scene cannot render yet (and while an edit is converted), the renderer r
 | `prismMaterialsDone` / `prismMaterialsTotal` (int) | Materials compiled; the total grows when template seeds or fallback compiles are added |
 | `prismTexturesDone` / `prismTexturesTotal` (int) | Textures prepared ahead of material compilation |
 | `prismUploadDone` / `prismUploadTotal` (int) | Images prepared for the GPU (zero total outside the image stage; the stage is in `prismPhaseDetail`) |
-| `prismDevice` (string) | `vulkan: <GPU name>`, `cpu`, or `cpu (Vulkan fallback: <reason>)` when the GPU device was unavailable at creation or later could not prepare the scene (`kernel too large` only without ray tracing pipelines: otherwise large material sets compile as callable shaders, see [gpu_devices.md](gpu_devices.md#material-programs-as-callable-shaders-vulkan); `kernel compile failed`, ...); empty until the device exists |
+| `prismDevice` (string) | `vulkan: <GPU name>`, `cpu`, or `cpu (Vulkan fallback: <reason>)` when the GPU device was unavailable at creation or later could not prepare the scene (`kernel too large` only without ray tracing pipelines: otherwise large material sets compile as callable shaders, see [gpu_devices.md](gpu_devices.md#material-programs-as-callable-shaders-vulkan); `kernel compile failed`, `shader too large for the driver` (see [gpu_devices.md](gpu_devices.md#driver-compile-budget)), ...); empty until the device exists |
 | `prismGpuPreview` (bool) | True while the CPU renders a preview for a GPU device that is preparing; `prismDevice` is then `cpu (preview while the GPU prepares)` and `prismPhase` keeps naming the GPU phase |
 | `prismError` (string) | Last scene-conversion failure; cleared by the next published snapshot |
 

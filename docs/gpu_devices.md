@@ -284,6 +284,55 @@ the noise floor is the CPU with seed 1 against seed 0.
   (`VK_KHR_pipeline_executable_properties`), and Nsight Compute was not
   available.
 
+### Driver compile budget
+
+The driver compiles SPIR-V inside the process, and its memory grows with the
+square of a module's size. NVIDIA 610.88 (RTX 4070 Ti), one library at a
+time: 2 MB of SPIR-V took 5 s and 0.2-0.45 GB, 6.9 MB 44 s and 1.4 GB, 15 MB
+125-134 s and 4.9-6.1 GB. The CLI render of the OpenPBR playground ended in
+"LLVM ERROR: out of memory" from 179afa8 on: since the dielectric repairs
+(f54d91d, a9c2287) its transmissive OpenPBR programs are 3.5 times larger
+(tape: 2.7 to 9.5 MB of SPIR-V), since 4fed928 the CLI loads all 53 of its
+materials (14 of them transmissive: 9.5-21 MB each), and the device
+compiled 16 libraries at once. The emitter work of phase 5 was not involved
+(the same sizes without it). Three changes keep the driver within bounds:
+
+- **One BSDF evaluation call site** (`GpuBackend::shade`). DXC inlines every
+  call of a program's code; the light lobes' second evaluation made the
+  callables 1.4 times larger (OpenPBR 21 to 15 MB, 9.5 to 6.9, opaque 2.7 to
+  2.0). The light-sample and lobe evaluations now run in one loop.
+- **A compile memory budget.** Each driver compile (pipeline library,
+  compute kernel; a monolithic pipeline compiles on one thread when its
+  shaders together exceed the budget) and each callable's DXC process holds
+  an estimate of its memory (`DriverCompileBytes`: 256 MiB + 24 MiB per
+  square MiB of SPIR-V; `DxcCompileBytes`: 64 MiB + 260 MiB per square MiB
+  of HLSL) and waits while the compiles running hold too much of
+  `PRISM_VULKAN_DRIVER_MEMORY_MIB` (default a quarter of the memory the
+  process may commit: physical memory, or its job's limit). A compile larger
+  than the budget runs alone. DXC counts too: it runs in the same job.
+- **A size limit before pipeline creation.** SPIR-V above
+  `PRISM_VULKAN_MAX_SPIRV_MIB` (default 24), or whose estimated compile needs
+  more than half of what the process may commit, never reaches the driver:
+  the shader fails with "too large for the driver" and the scene renders on
+  the CPU device (status `cpu (Vulkan fallback: shader too large for the
+  driver)`). 0 disables the limit.
+
+OpenPBR playground, CLI, 640x360, 16 spp, cold (`PRISM_VULKAN_SHADER_SALT`),
+under a 24 GB job cap (budget 6 GB): 22 callables, DXC and driver 1390 s
+(libraries 1453 s summed, slowest 128 s), process peak 18.3 GB, rendered on
+Vulkan; against the CPU NRMSE 0.32 and mean 0.42% (noise floor, CPU seed 0
+against 1: 0.46, 0.42%). Warm runs read the pipeline caches. The cold
+compile stays long because the 8 largest programs (15 MB) compile one at a
+time under the cap; smaller transmissive programs (splitting a program's
+sample and evaluation into separate callables, or leaner dielectric repairs)
+would shorten it.
+
+`PRISM_GPU_PROGRAM_REPORT=1` makes the CLI print, after loading the scene,
+the layout, program count and each shader's HLSL and SPIR-V size, DXC time
+and estimated driver memory (DXC only, no device), and exit;
+`prism_gpu_program_budget_test` checks the same on
+`tests/hydra/fixtures/textured_emitters_glass.usda`.
+
 ## Mac GPU vs CPU
 
 Apple M5 (10 CPU threads, 8 GPU cores), macOS 26. Times are the renderer's
@@ -661,6 +710,21 @@ called done there.
     registers `cpu` and `vulkan` only); usdview on a dome-lit scene to a late
     sample count: the dome background must stay visible once most pixels
     have converged.
+- **One BSDF evaluation call site** ([driver compile budget](#driver-compile-budget)):
+  - Shared shader code: `GpuBackend::shade` in `shaders/gpu/gpu_backend.hlsl`
+    evaluates the BSDF towards the light sample and (light lobes) towards
+    the BSDF sample from one call in a loop, instead of two calls. Same
+    arithmetic; each call works on its own copy of the shading point. The
+    Metal kernel inlines every program at that call site, so it shrinks too.
+  - The compile budget and size limit are Vulkan only (`src/device/vulkan/`);
+    the Metal device compiles through the Metal shader converter and its own
+    pipeline compiler, whose memory was not measured.
+  - Runs: build the Metal kernel for chess, an egg and the OpenPBR playground
+    (its transmissive programs are the largest) and check its size and
+    compile time against the previous build; `tests/hydra/fixtures/textured_emitters_glass.usda`
+    and `light_lobes.usda` with `--device metal` against `--device cpu`
+    (`prism_compare_images`); chess and an egg against the previous build
+    (expect float-level differences at most, as the code moved).
 
 ## Diagnostics
 
@@ -680,6 +744,11 @@ called done there.
   `PRISM_VULKAN_COMPILE_THREADS=<n>`, `PRISM_VULKAN_PIPELINE_LIBRARIES=0`
   (one monolithic pipeline), `PRISM_VULKAN_TRIM_CALLABLES=0` (callables with
   the whole link unit): the callable path (above).
+- `PRISM_VULKAN_MAX_SPIRV_MIB=<n>` (0: no limit),
+  `PRISM_VULKAN_DRIVER_MEMORY_MIB=<n>` and `PRISM_GPU_PROGRAM_REPORT=1`
+  (CLI, no device): the [driver compile budget](#driver-compile-budget).
+  With `PRISM_GPU_VERBOSE=1` each pipeline library's log line also gives its
+  SPIR-V size and the process's commit growth during the driver's compile.
 - `PRISM_VULKAN_PIPELINE_STATS=1`: the driver's statistics of each compiled
   shader (registers, spills, stack) through
   `VK_KHR_pipeline_executable_properties`.
