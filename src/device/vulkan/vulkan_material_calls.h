@@ -25,6 +25,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -57,6 +58,45 @@ CallableMode CallableModeSetting();
 // raygen shader and runs faster (CornellBox, 256 KB: 1.7x); from the lion
 // (392 KB, 1 program, 3.3x slower) up, callables are faster or equal.
 size_t CallableThresholdBytes();
+// The driver compiles SPIR-V in this process, and its memory grows with the
+// square of the module's size (NVIDIA 610.88, RTX 4070 Ti: 2 MB of SPIR-V
+// 0.2-0.45 GB, 6.9 MB 1.4 GB, 15 MB 5-6 GB and 2 minutes). When it runs out,
+// the process ends ("LLVM ERROR: out of memory"): the OpenPBR playground's 14
+// transmissive callables of 9.5-21 MB, compiled on 16 threads at once. So
+// every module is checked before pipeline creation, and concurrent compiles
+// (the driver's, and DXC's processes, which count against the same job
+// memory limit) share a memory budget.
+//
+// The largest SPIR-V module handed to the driver (PRISM_VULKAN_MAX_SPIRV_MIB;
+// 0: no limit). Larger shaders, and those whose estimated compile needs more
+// than half the memory the process may commit, fail before pipeline creation
+// instead, and the scene renders on the CPU device.
+constexpr size_t kDefaultMaxDriverSpirvMib = 24;
+size_t MaxDriverSpirvBytes();
+// Empty when `bytes` of SPIR-V may go to the driver; otherwise the reason, naming `shader`.
+std::string DriverSpirvLimitError(size_t bytes, std::string_view shader);
+// The estimated memory of the driver's compile of `spirvBytes` of SPIR-V.
+uint64_t DriverCompileBytes(size_t spirvBytes);
+// The estimated peak memory of DXC compiling `hlslBytes` of HLSL to SPIR-V
+// (2.65 MB of callable HLSL: 0.85-1.75 GB; 0.93 MB: 0.25 GB).
+uint64_t DxcCompileBytes(size_t hlslBytes);
+// The memory concurrent compiles may take together
+// (PRISM_VULKAN_DRIVER_MEMORY_MIB; default a quarter of what the process may
+// commit: the physical memory, or its job's memory limit when lower).
+uint64_t DriverMemoryBudget();
+// Holds `bytes` of that budget for one compile: waits while the compiles
+// running hold too much of it. A compile larger than the whole budget runs
+// alone.
+class CompileMemorySlot {
+public:
+    explicit CompileMemorySlot(uint64_t bytes);
+    ~CompileMemorySlot();
+    CompileMemorySlot(CompileMemorySlot const&) = delete;
+    CompileMemorySlot& operator=(CompileMemorySlot const&) = delete;
+
+private:
+    uint64_t m_bytes = 0;
+};
 // Whether to reorder threads by material program (PRISM_VULKAN_REORDER=1, where supported). Off by
 // default: measured 2-8% slower on most scenes, 16% faster on the MaterialEggs countertop.
 bool ReorderSetting();
@@ -214,7 +254,7 @@ public:
 
 private:
     bool createBindingTable(uint32_t groups, std::string* error);
-    VkResult createPipeline(VkRayTracingPipelineCreateInfoKHR const& info, VkPipelineCache cache);
+    VkResult createPipeline(VkRayTracingPipelineCreateInfoKHR const& info, VkPipelineCache cache, bool allowParallel);
     bool createMonolithic(std::vector<std::shared_ptr<const ShaderBuild>> const& shaders, VkPipelineLayout layout,
                           std::string* error);
     bool link(std::vector<std::shared_ptr<const ShaderBuild>> const& shaders, VkPipelineLayout layout,

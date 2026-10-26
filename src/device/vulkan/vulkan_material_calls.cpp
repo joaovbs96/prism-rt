@@ -632,6 +632,114 @@ CallableMode CallableModeSetting()
     return CallableMode::Always;
 }
 
+size_t MaxDriverSpirvBytes()
+{
+    if (const char* value = Setting("PRISM_VULKAN_MAX_SPIRV_MIB"))
+        return size_t(std::max(0ll, std::atoll(value))) << 20;
+    return kDefaultMaxDriverSpirvMib << 20;
+}
+
+namespace {
+
+// The memory this process may commit: the physical memory, or the limit of
+// the job it runs in when lower.
+uint64_t CommitLimit()
+{
+    static const uint64_t limit = [] {
+        uint64_t bytes = uint64_t(16) << 30;
+#ifdef _WIN32
+        MEMORYSTATUSEX status{};
+        status.dwLength = sizeof(status);
+        if (GlobalMemoryStatusEx(&status)) bytes = status.ullTotalPhys;
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION job{};
+        if (QueryInformationJobObject(nullptr, JobObjectExtendedLimitInformation, &job, sizeof(job), nullptr)) {
+            const DWORD flags = job.BasicLimitInformation.LimitFlags;
+            if ((flags & JOB_OBJECT_LIMIT_JOB_MEMORY) && job.JobMemoryLimit)
+                bytes = std::min<uint64_t>(bytes, job.JobMemoryLimit);
+            if ((flags & JOB_OBJECT_LIMIT_PROCESS_MEMORY) && job.ProcessMemoryLimit)
+                bytes = std::min<uint64_t>(bytes, job.ProcessMemoryLimit);
+        }
+#else
+        const long pages = sysconf(_SC_PHYS_PAGES), size = sysconf(_SC_PAGE_SIZE);
+        if (pages > 0 && size > 0) bytes = uint64_t(pages) * uint64_t(size);
+#endif
+        return bytes;
+    }();
+    return limit;
+}
+
+// Compiles running (the driver's and DXC's), and the estimated memory they hold.
+struct RunningCompiles {
+    std::mutex mutex;
+    std::condition_variable released;
+    uint32_t running = 0;
+    uint64_t bytes = 0;
+};
+
+RunningCompiles& Compiles()
+{
+    static RunningCompiles compiles;
+    return compiles;
+}
+
+} // namespace
+
+uint64_t DriverCompileBytes(size_t spirvBytes)
+{
+    // Fitted to the measurements above: 256 MiB plus 24 MiB per square MiB.
+    const double mib = double(spirvBytes) / double(1 << 20);
+    return uint64_t((256.0 + 24.0 * mib * mib) * double(1 << 20));
+}
+
+uint64_t DxcCompileBytes(size_t hlslBytes)
+{
+    // An upper bound of the measurements: 64 MiB plus 260 MiB per square MiB.
+    const double mib = double(hlslBytes) / double(1 << 20);
+    return uint64_t((64.0 + 260.0 * mib * mib) * double(1 << 20));
+}
+
+uint64_t DriverMemoryBudget()
+{
+    if (const char* value = Setting("PRISM_VULKAN_DRIVER_MEMORY_MIB"))
+        return uint64_t(std::max(1ll, std::atoll(value))) << 20;
+    return std::max(CommitLimit() / 4, uint64_t(1) << 30);
+}
+
+CompileMemorySlot::CompileMemorySlot(uint64_t bytes) : m_bytes(bytes)
+{
+    auto& compiles = Compiles();
+    const uint64_t budget = DriverMemoryBudget();
+    std::unique_lock lock(compiles.mutex);
+    compiles.released.wait(lock, [&] { return compiles.running == 0 || compiles.bytes + m_bytes <= budget; });
+    ++compiles.running;
+    compiles.bytes += m_bytes;
+}
+
+CompileMemorySlot::~CompileMemorySlot()
+{
+    auto& compiles = Compiles();
+    {
+        std::lock_guard lock(compiles.mutex);
+        --compiles.running;
+        compiles.bytes -= m_bytes;
+    }
+    compiles.released.notify_all();
+}
+
+std::string DriverSpirvLimitError(size_t bytes, std::string_view shader)
+{
+    const size_t limit = MaxDriverSpirvBytes();
+    if (limit == 0) return {};
+    if (bytes > limit)
+        return std::format("{} too large for the driver: {} KB of SPIR-V, above the {} MiB limit "
+                           "(PRISM_VULKAN_MAX_SPIRV_MIB)", shader, bytes >> 10, limit >> 20);
+    if (const uint64_t needed = DriverCompileBytes(bytes); needed > CommitLimit() / 2)
+        return std::format("{} too large for the driver: {} KB of SPIR-V needs about {} MiB to compile, above "
+                           "half of the {} MiB this process may use (PRISM_VULKAN_MAX_SPIRV_MIB=0 tries anyway)",
+                           shader, bytes >> 10, needed >> 20, CommitLimit() >> 20);
+    return {};
+}
+
 size_t CallableThresholdBytes()
 {
     if (const char* value = Setting("PRISM_VULKAN_CALLABLE_THRESHOLD_KIB"))
@@ -838,10 +946,15 @@ std::shared_ptr<ShaderBuild> MaterialCallShaders::compile(std::string const& sou
     if (!PlausibleSpirv(bytes)) {
         gpu::HlslCompileStats stats;
         std::string reason;
-        Dxc().acquire();
-        const bool ok = gpu::CompileHlsl(source, gpu::HlslTarget::Spirv, directory, &bytes, &reason, kLibraryStage,
-                                         &stats);
-        Dxc().release();
+        bool ok;
+        {
+            // DXC's process counts against the same memory as the driver's
+            // compiles: the budget first, then a DXC job.
+            CompileMemorySlot memory(DxcCompileBytes(source.size()));
+            Dxc().acquire();
+            ok = gpu::CompileHlsl(source, gpu::HlslTarget::Spirv, directory, &bytes, &reason, kLibraryStage, &stats);
+            Dxc().release();
+        }
         built->dxcCompiled = true;
         built->dxcSeconds = stats.seconds;
         built->dxcPeakBytes = stats.peakBytes;
@@ -857,6 +970,12 @@ std::shared_ptr<ShaderBuild> MaterialCallShaders::compile(std::string const& sou
     }
     built->spirv.resize(bytes.size() / 4);
     std::memcpy(built->spirv.data(), bytes.data(), bytes.size());
+    // Never hand the driver a module its compiler may not survive.
+    if (std::string limit = DriverSpirvLimitError(bytes.size(), raygen ? "raygen shader" : "material callable");
+        !limit.empty()) {
+        built->error = limit + ProgramTag(source);
+        return built;
+    }
     if (!m_libraries) return built;
 
     // The library: one stage, one general group.
@@ -892,9 +1011,18 @@ std::shared_ptr<ShaderBuild> MaterialCallShaders::compile(std::string const& sou
     uint64_t recordedStack = 0;
     VkPipelineCache cache = LoadPipelineCache(m_device, m_properties, cacheFile, &loaded, &recordedStack);
     built->driverCacheHit = loaded > 0;
-    const auto start = Clock::now();
-    const VkResult result = m_createPipelines(m_device, VK_NULL_HANDLE, cache, 1, &info, nullptr, &built->library);
-    built->driverSeconds = SecondsSince(start);
+    std::optional<CommitSampler> commit;
+    VkResult result;
+    {
+        // A pipeline cache hit compiles nothing: no share of the budget.
+        std::optional<CompileMemorySlot> slot;
+        if (!built->driverCacheHit) slot.emplace(DriverCompileBytes(bytes.size()));
+        if (gpu::GpuVerbose()) commit.emplace();
+        const auto start = Clock::now();
+        result = m_createPipelines(m_device, VK_NULL_HANDLE, cache, 1, &info, nullptr, &built->library);
+        built->driverSeconds = SecondsSince(start);
+    }
+    const int64_t commitBytes = commit ? commit->stop() : 0;
     vkDestroyShaderModule(m_device, module, nullptr);
     if (result == VK_SUCCESS) {
         static auto groupStackSize = reinterpret_cast<PFN_vkGetRayTracingShaderGroupStackSizeKHR>(
@@ -910,9 +1038,10 @@ std::shared_ptr<ShaderBuild> MaterialCallShaders::compile(std::string const& sou
     StorePipelineCache(m_device, cache, cacheFile, built->stackSize != recordedStack ? 0 : loaded,
                        result == VK_SUCCESS, built->stackSize);
     if (gpu::GpuVerbose())
-        std::cerr << std::format("PrismRT Vulkan: library {} {:.2f} s{}, stack {} B{}\n", raygen ? "raygen" : "callable",
-                                 built->driverSeconds, built->driverCacheHit ? " (pipeline cache)" : "",
-                                 built->stackSize, ProgramTag(source));
+        std::cerr << std::format("PrismRT Vulkan: library {} {:.2f} s{}, stack {} B, {} KB SPIR-V, commit +{} MiB{}\n",
+                                 raygen ? "raygen" : "callable", built->driverSeconds,
+                                 built->driverCacheHit ? " (pipeline cache)" : "", built->stackSize,
+                                 bytes.size() >> 10, commitBytes >> 20, ProgramTag(source));
     if (result != VK_SUCCESS) {
         built->library = VK_NULL_HANDLE;
         built->error = std::format("cannot create a {} pipeline library (VkResult {})",
@@ -946,10 +1075,11 @@ MaterialCallPipeline::MaterialCallPipeline(VkDevice device, VkPhysicalDevice phy
         vkGetDeviceProcAddr(device, "vkDeferredOperationJoinKHR"));
 }
 
-VkResult MaterialCallPipeline::createPipeline(VkRayTracingPipelineCreateInfoKHR const& info, VkPipelineCache cache)
+VkResult MaterialCallPipeline::createPipeline(VkRayTracingPipelineCreateInfoKHR const& info, VkPipelineCache cache,
+                                              bool allowParallel)
 {
     VkDeferredOperationKHR deferred = VK_NULL_HANDLE;
-    const bool parallel = ParallelPipelineSetting() && m_createDeferred && m_destroyDeferred &&
+    const bool parallel = allowParallel && ParallelPipelineSetting() && m_createDeferred && m_destroyDeferred &&
         m_deferredConcurrency && m_deferredResult && m_joinDeferred &&
         m_createDeferred(m_device, nullptr, &deferred) == VK_SUCCESS;
     VkResult result = m_createPipelines(m_device, parallel ? deferred : VK_NULL_HANDLE, cache, 1, &info, nullptr,
@@ -1166,9 +1296,22 @@ bool MaterialCallPipeline::createMonolithic(std::vector<std::shared_ptr<const Sh
     vkGetPhysicalDeviceProperties(m_physical, &properties);
     VkPipelineCache cache = LoadPipelineCache(m_device, properties, cacheFile, &loaded);
     m_report.pipelineCacheHit = loaded > 0;
+    // The driver compiles the shaders on the threads that join the deferred
+    // operation: on one thread when their compiles together would exceed the
+    // compile memory budget (CompileMemorySlot), holding the largest one's share.
+    uint64_t together = 0;
+    size_t largest = 0;
+    for (auto const& s : shaders) {
+        together += DriverCompileBytes(s->spirv.size() * 4);
+        largest = std::max(largest, s->spirv.size() * 4);
+    }
+    const bool parallel = m_report.pipelineCacheHit || together <= DriverMemoryBudget();
+    std::optional<CompileMemorySlot> slot;
+    if (!m_report.pipelineCacheHit) slot.emplace(DriverCompileBytes(largest));
     const auto start = Clock::now();
     CommitSampler commit;
-    const VkResult result = createPipeline(info, cache);
+    const VkResult result = createPipeline(info, cache, parallel);
+    slot.reset();
     m_report.pipelineCommitBytes = commit.stop();
     m_report.pipelineSeconds = SecondsSince(start);
     destroyModules();

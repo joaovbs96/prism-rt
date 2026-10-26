@@ -36,6 +36,7 @@
 #include <fstream>
 #include <future>
 #include <mutex>
+#include <optional>
 #include <iostream>
 #include <thread>
 #include <condition_variable>
@@ -359,6 +360,7 @@ std::string PipelineCacheTag(VkPhysicalDeviceProperties const& properties)
 // A short reason for a scene the GPU cannot render, for the host's status line.
 static std::string FallbackSummary(std::string const& error)
 {
+    if (error.find("too large for the driver") != std::string::npos) return "shader too large for the driver";
     if (error.find("too large") != std::string::npos || gpu::HlslTooLarge(error)) return "kernel too large";
     if (error.starts_with("DXC failed") || error.starts_with("cannot run")) return "kernel compile failed";
     std::string first = error.substr(0, error.find_first_of("\r\n"));
@@ -468,7 +470,8 @@ void ReportVulkanPrograms(SceneManager& scene, std::ostream& out)
     if (data.mdlMaterials.empty()) return;
     const size_t estimate = KernelBaseBytes() + gpu::EstimatedLinkUnitBytes(gpu::ProgramCodes(data.mdlMaterials));
     const bool perProgram = double(estimate) > double(vulkan::CallableThresholdBytes()) * kEstimateMargin;
-    out << std::format("estimate_kb {} layout {}\n", estimate >> 10, perProgram ? "programs" : "link_unit");
+    out << std::format("estimate_kb {} layout {} driver_budget_mib {}\n", estimate >> 10,
+                       perProgram ? "programs" : "link_unit", vulkan::DriverMemoryBudget() >> 20);
     auto const shared = perProgram ? gpu::CachedProgramShaderCode(data.mdlMaterials)
                                    : gpu::CachedMdlShaderCode(data.mdlMaterials);
     auto const& code = *shared;
@@ -480,9 +483,12 @@ void ReportVulkanPrograms(SceneManager& scene, std::ostream& out)
         std::string error;
         const auto start = steady_clock::now();
         const bool ok = gpu::CompileHlsl(source, gpu::HlslTarget::Spirv, cache, &binary, &error, stage);
-        out << std::format("{} hlsl_kb {} spirv_kb {} dxc_s {:.1f}{}\n", label, source.size() >> 10,
-                           binary.size() >> 10, duration<double>(steady_clock::now() - start).count(),
-                           ok ? "" : " FAILED " + error.substr(0, 200));
+        const std::string limit = ok ? vulkan::DriverSpirvLimitError(binary.size(), label) : std::string();
+        out << std::format("{} hlsl_kb {} spirv_kb {} dxc_s {:.1f} driver_est_mib {}{}{}\n", label,
+                           source.size() >> 10, binary.size() >> 10,
+                           duration<double>(steady_clock::now() - start).count(),
+                           vulkan::DriverCompileBytes(binary.size()) >> 20, ok ? "" : " FAILED " + error.substr(0, 200),
+                           limit.empty() ? "" : " REFUSED " + limit);
     };
     if (!code.perProgram) {
         std::string source;
@@ -2036,6 +2042,11 @@ bool VulkanDevice::Impl::compilePipeline(std::shared_ptr<const gpu::MdlShaderCod
             return buildCallablePipeline(shared, "the kernel is too large for DXC", error);
         return false;
     }
+    if (std::string limit = vulkan::DriverSpirvLimitError(spirv.size() * 4, "compute kernel"); !limit.empty()) {
+        if (callableMode == vulkan::CallableMode::Auto) return buildCallablePipeline(shared, limit, error);
+        if (error) *error = limit;
+        return false;
+    }
     auto const compiled = Clock::now();
     const std::string key = gpu::SourceDigest(std::string(reinterpret_cast<const char*>(spirv.data()), spirv.size() * 4));
     if (auto found = pipelines.find(key); found != pipelines.end()) {
@@ -2076,7 +2087,12 @@ bool VulkanDevice::Impl::compilePipeline(std::shared_ptr<const gpu::MdlShaderCod
         if (vkCreatePipelineCache(device, &cacheInfo, nullptr, &pipelineCache) != VK_SUCCESS)
             pipelineCache = VK_NULL_HANDLE;
     }
-    const VkResult result = vkCreateComputePipelines(device, pipelineCache, 1, &info, nullptr, &pipeline);
+    VkResult result;
+    {
+        std::optional<vulkan::CompileMemorySlot> slot;
+        if (cacheData.empty()) slot.emplace(vulkan::DriverCompileBytes(spirv.size() * 4));
+        result = vkCreateComputePipelines(device, pipelineCache, 1, &info, nullptr, &pipeline);
+    }
     vkDestroyShaderModule(device, module, nullptr);
     if (pipelineCache) {
         size_t size = 0;
