@@ -19,6 +19,7 @@
 #include <pxr/usd/usdLux/domeLight_1.h>
 #include <pxr/usd/usdLux/lightAPI.h>
 #include <pxr/usd/usdLux/rectLight.h>
+#include <pxr/usd/usdLux/shapingAPI.h>
 #include <pxr/usd/usdLux/sphereLight.h>
 #include <pxr/usd/usdLux/tokens.h>
 #include <pxr/usd/usdGeom/xformCache.h>
@@ -418,6 +419,36 @@ std::string ResolvedLightTexture(SdfAssetPath const& asset) {
         resolved = ArGetResolver().Resolve(asset.GetAssetPath()).GetPathString();
     if (!resolved.empty() && !std::filesystem::exists(resolved)) resolved.clear();
     return resolved;
+}
+
+// UsdLuxShapingAPI inputs, as the Hydra delegate reads them
+// (scene_bridge.cpp _ShapingParameters): the light is shaped when one of
+// them has a value (the API applied, which gives every input its fallback,
+// or an input authored); unauthored ones take the schema's fallbacks.
+prism::LightShapingParameters ShapingParameters(UsdPrim const& prim, UsdTimeCode time)
+{
+    prism::LightShapingParameters s;
+    const UsdLuxShapingAPI shaping(prim);
+    auto read = [&](UsdAttribute const& attribute, auto* value) {
+        if (attribute && attribute.HasValue() && attribute.Get(value, time)) s.active = true;
+    };
+    GfVec3f tint(0.0f);
+    SdfAssetPath ies;
+    read(shaping.GetShapingFocusAttr(), &s.focus);
+    read(shaping.GetShapingFocusTintAttr(), &tint);
+    read(shaping.GetShapingConeAngleAttr(), &s.coneAngle);
+    read(shaping.GetShapingConeSoftnessAttr(), &s.coneSoftness);
+    read(shaping.GetShapingIesFileAttr(), &ies);
+    read(shaping.GetShapingIesAngleScaleAttr(), &s.iesAngleScale);
+    read(shaping.GetShapingIesNormalizeAttr(), &s.iesNormalize);
+    s.focusTint = Color3(tint[0], tint[1], tint[2]);
+    if (s.active && !ies.GetAssetPath().empty()) {
+        std::string resolved = ies.GetResolvedPath();
+        if (resolved.empty()) resolved = ArGetResolver().Resolve(ies.GetAssetPath()).GetPathString();
+        if (!resolved.empty() && std::filesystem::exists(resolved)) s.ies = prism::LoadIesProfile(resolved);
+        else prism::WarnUnresolvedIesProfile(ies.GetAssetPath());
+    }
+    return s;
 }
 
 // Light and shadow linking as the Hydra delegate gets it from
@@ -959,6 +990,7 @@ int runStandaloneCli(int argc, char** argv) {
                 light.GetNormalizeAttr().Get(&params.normalize, time);
                 light.GetDiffuseAttr().Get(&params.diffuse, time);
                 light.GetSpecularAttr().Get(&params.specular, time);
+                params.shaping = ShapingParameters(prim, time);
                 // Hydra's light:cameraVisibility, which UsdImaging reads from
                 // the prim's `cameraVisibility` attribute.
                 if (const UsdAttribute visibility = prim.GetAttribute(TfToken("cameraVisibility")))

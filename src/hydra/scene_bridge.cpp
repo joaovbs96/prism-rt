@@ -247,7 +247,11 @@ HdContainerDataSourceHandle _MakeStaticPrimCopy(
             HdLightTokens->radius, HdLightTokens->width, HdLightTokens->height,
             HdLightTokens->length, HdLightTokens->angle, _LightTokens().treatAsPoint,
             _LightTokens().cameraVisibility, HdLightTokens->diffuse, HdLightTokens->specular,
-            HdTokens->lightLink, HdTokens->shadowLink};
+            HdTokens->lightLink, HdTokens->shadowLink,
+            HdLightTokens->shapingFocus, HdLightTokens->shapingFocusTint,
+            HdLightTokens->shapingConeAngle, HdLightTokens->shapingConeSoftness,
+            HdLightTokens->shapingIesFile, HdLightTokens->shapingIesAngleScale,
+            HdLightTokens->shapingIesNormalize};
         for (TfToken const &token : consumed) {
             if (light->Get(token) &&
                 std::find(lightNames.begin(), lightNames.end(), token) ==
@@ -2549,6 +2553,41 @@ void _ApplyDefaultDome(HdSceneIndexBaseRefPtr const &scene, Snapshot *snapshot)
     _SetDomeEnvironment(scene, path, scene->GetPrim(path), snapshot);
 }
 
+// UsdLuxShapingAPI inputs (HdLightTokens->shaping*). The light is shaped when
+// one of them has a value; the others take the schema's fallbacks. The CLI
+// reads the same (standalone_cli.cpp ShapingParameters).
+prism::LightShapingParameters _ShapingParameters(HdContainerDataSourceHandle const &light)
+{
+    prism::LightShapingParameters s;
+    auto read = [&](TfToken const &name, auto *value) {
+        using T = std::remove_pointer_t<decltype(value)>;
+        if (HdSampledDataSourceHandle source = HdSampledDataSource::Cast(light->Get(name))) {
+            const VtValue v = source->GetValue(0.0f);
+            if (v.IsHolding<T>()) {
+                *value = v.UncheckedGet<T>();
+                s.active = true;
+            }
+        }
+    };
+    GfVec3f tint(0.0f);
+    SdfAssetPath ies;
+    read(HdLightTokens->shapingFocus, &s.focus);
+    read(HdLightTokens->shapingFocusTint, &tint);
+    read(HdLightTokens->shapingConeAngle, &s.coneAngle);
+    read(HdLightTokens->shapingConeSoftness, &s.coneSoftness);
+    read(HdLightTokens->shapingIesFile, &ies);
+    read(HdLightTokens->shapingIesAngleScale, &s.iesAngleScale);
+    read(HdLightTokens->shapingIesNormalize, &s.iesNormalize);
+    s.focusTint = Color3(tint[0], tint[1], tint[2]);
+    if (s.active && !ies.GetAssetPath().empty()) {
+        std::string resolved = ies.GetResolvedPath();
+        if (resolved.empty()) resolved = ArGetResolver().Resolve(ies.GetAssetPath()).GetPathString();
+        if (!resolved.empty() && std::filesystem::exists(resolved)) s.ies = prism::LoadIesProfile(resolved);
+        else prism::WarnUnresolvedIesProfile(ies.GetAssetPath());
+    }
+    return s;
+}
+
 // UsdLux sphere, rect, disk, cylinder and distant lights.
 void _AddAnalyticLight(HdSceneIndexBaseRefPtr const &scene,
                        SdfPath const &path, HdSceneIndexPrim const &prim,
@@ -2590,6 +2629,7 @@ void _AddAnalyticLight(HdSceneIndexBaseRefPtr const &scene,
     params.cameraVisible = _ContainerValue(light, _LightTokens().cameraVisibility, false);
     params.diffuse = _ContainerValue(light, HdLightTokens->diffuse, 1.0f);
     params.specular = _ContainerValue(light, HdLightTokens->specular, 1.0f);
+    params.shaping = _ShapingParameters(light);
     const GfMatrix4d world = _WorldTransform(scene, path);
     std::array<double, 16> matrix{};
     for (int row = 0; row < 4; ++row)
