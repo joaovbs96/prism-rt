@@ -582,6 +582,15 @@ if(PRISM_BUILD_HYDRA)
         set_tests_properties(prism_gpu_program_budget_test PROPERTIES ENVIRONMENT "${_prism_test_environment}")
     endif()
 
+    # Textured emitters note themselves while materials load, which prewarms
+    # the Vulkan raygen variant with PRISM_VARYING_EMITTERS; others do not.
+    add_executable(prism_raygen_prewarm_test tests/raygen_prewarm.cpp)
+    target_link_libraries(prism_raygen_prewarm_test PRIVATE PrismRT::core)
+    add_test(NAME prism_raygen_prewarm_test COMMAND prism_raygen_prewarm_test
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/textured_emitter.usda"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/parity.usda")
+    set_tests_properties(prism_raygen_prewarm_test PROPERTIES ENVIRONMENT "${_prism_test_environment}")
+
     add_executable(prism_gpu_codegen_dump tests/gpu_codegen_dump.cpp)
     target_link_libraries(prism_gpu_codegen_dump PRIVATE PrismRT::core)
 

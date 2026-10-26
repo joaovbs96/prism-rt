@@ -9,6 +9,7 @@
 #include "materialx/loader.h"
 #include "materialx/mdl_generator.h"
 #include "resource_limits.h"
+#include "varying_emitter_signal.h"
 
 #include <mi/mdl_sdk.h>
 #include <memory>
@@ -66,6 +67,7 @@ public:
     {
         evaluateUniformCutout();
         evaluateUniformEmission();
+        if (m_varyingEmission) prism::varying_emitters::Note();
         evaluateTransmission();
     }
     // Compiles a .mtlx file into a callable MDL material.
@@ -185,6 +187,7 @@ public:
         m_valid = true;
         evaluateUniformCutout();
         evaluateUniformEmission();
+        if (m_varyingEmission) prism::varying_emitters::Note();
         evaluateTransmission();
         // NOTE: prints the *resolved* name (material_name may be empty)
         if (PrismMdlVerbose())

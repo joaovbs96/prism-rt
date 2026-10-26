@@ -200,8 +200,12 @@ public:
 
     // Whether shaders become pipeline libraries (supported and not disabled).
     bool libraries() const { return m_libraries; }
-    // Starts compiling the scene-independent raygen shader on a background thread.
-    void prewarmRaygen();
+    // Starts compiling the scene-independent raygen shader on a background
+    // thread: with varyingEmitters the variant for scenes of textured
+    // emitters (PRISM_VARYING_EMITTERS). Once per variant.
+    void prewarmRaygen(bool varyingEmitters = false);
+    // Raygen variants prewarmed so far: bit 0 plain, bit 1 with varying emitters.
+    uint32_t prewarmedVariants() const { return m_prewarmed.load(); }
     // The shader of `source` (SPIR-V and, with libraries, its library); compiles it once.
     std::shared_ptr<const ShaderBuild> shader(std::string const& source, bool raygen);
     // Compiles the callable of `source` on a background compile thread
@@ -225,7 +229,9 @@ private:
     PFN_vkCreateRayTracingPipelinesKHR m_createPipelines = nullptr;
     std::mutex m_mutex;
     std::unordered_map<std::string, std::shared_future<std::shared_ptr<const ShaderBuild>>> m_shaders;
-    std::future<void> m_prewarm;
+    std::mutex m_prewarmMutex;
+    std::future<void> m_prewarm[2]; // plain, varying emitters
+    std::atomic<uint32_t> m_prewarmed{0};
     // Background compiles (prefetch).
     std::mutex m_queueMutex;
     std::condition_variable m_queueReady;

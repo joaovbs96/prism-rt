@@ -19,6 +19,7 @@
 #include "../../scene.h"
 #include "../../texture_service.h"
 #include "../../texture_gpu_file.h"
+#include "../../varying_emitter_signal.h"
 #include "../../load_profile.h"
 
 #include <OpenImageIO/imageio.h>
@@ -477,6 +478,12 @@ void ReportVulkanPrograms(SceneManager& scene, std::ostream& out)
     auto const& code = *shared;
     out << std::format("programs {} varying_define {} success {}\n", code.programCount, code.varyingEmitters,
                        code.success);
+    // The raygen variants a device prewarms while the materials load (a note
+    // of varying emission selects PRISM_VARYING_EMITTERS), and whether one
+    // of them is the scene's raygen shader.
+    const bool prewarmsEmitters = prism::varying_emitters::Notes() > 0;
+    out << std::format("raygen_prewarm {} covers_scene {}\n", prewarmsEmitters ? "plain+emitters" : "plain",
+                       prewarmsEmitters || !code.varyingEmitters);
     const auto cache = gpu::ShaderCacheDirectory("report");
     auto compile = [&](std::string const& label, std::string const& source, gpu::HlslStage const& stage) {
         std::vector<char> binary;
@@ -571,6 +578,20 @@ struct CallableSpeculation {
                 }
         }
     }
+    // A material of varying emission is classified (varying_emitter_signal.h):
+    // the scene's raygen shader needs PRISM_VARYING_EMITTERS, so that variant
+    // compiles now, not once the scene's programs are known.
+    // PRISM_VULKAN_PREWARM_EMITTERS=0 leaves it to then.
+    void varyingEmitter()
+    {
+        static const bool enabled = [] {
+            const char* value = std::getenv("PRISM_VULKAN_PREWARM_EMITTERS");
+            return !value || std::string_view(value) != "0";
+        }();
+        if (!enabled) return;
+        std::lock_guard lock(mutex);
+        if (shaders && mode != vulkan::CallableMode::Never) shaders->prewarmRaygen(true);
+    }
     // A scene's preparation starts: later programs belong to the next one.
     void reset()
     {
@@ -654,6 +675,7 @@ struct VulkanDevice::Impl {
     // Early MDL translations and the callables they start (CallableSpeculation).
     std::shared_ptr<CallableSpeculation> speculation = std::make_shared<CallableSpeculation>();
     int programListener = 0;
+    int emitterListener = 0;
 
     // Submissions to `queue` and waits for the device to be idle: the early
     // image uploads below submit from their own thread.
@@ -808,6 +830,7 @@ VulkanDevice::Impl::~Impl()
         return;
     }
     if (programListener) gpu::RemoveProgramListener(programListener);
+    if (emitterListener) prism::varying_emitters::Unsubscribe(emitterListener);
     {
         std::lock_guard lock(speculation->mutex);
         speculation->shaders = nullptr;
@@ -1148,6 +1171,9 @@ bool VulkanDevice::Impl::initialize(std::string* reason)
         speculation->shaders = callableShaders && callableShaders->libraries() ? callableShaders.get() : nullptr;
         speculation->mode = rayTracing.pipeline ? vulkan::CallableModeSetting() : vulkan::CallableMode::Never;
     }
+    // Materials of varying emission seen before this device (or from now on).
+    emitterListener = prism::varying_emitters::Subscribe([speculation = speculation] { speculation->varyingEmitter(); });
+    if (prism::varying_emitters::Notes() > 0) speculation->varyingEmitter();
     programListener = gpu::AddProgramListener(
         [speculation = speculation](std::shared_ptr<const gpu::MdlProgramCode> const& code) {
             speculation->program(code);

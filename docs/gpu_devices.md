@@ -381,7 +381,7 @@ of the process 12.3 GB (warm). The Hydra delegate (`prism_hydra_render`, 37
 folded programs) took 31 s cold and 13.7 s warm, as before the change; at
 979c870, before the repairs, 23 s cold: the rest is the raygen shader with
 `PRISM_VARYING_EMITTERS` (phase 5), compiled once the scene's programs are
-known (13.5 s in the driver) because the prewarmed raygen lacks it.
+known (13.5 s in the driver) because the prewarmed raygen lacks it. (Fixed by the raygen prewarm below.)
 `PRISM_GPU_PROGRAM_REPORT=1` makes the CLI print, after loading the scene,
 the layout, program count and each shader's HLSL and SPIR-V size, DXC time
 and estimated driver memory (DXC only, no device), and exit; the Hydra
@@ -389,6 +389,26 @@ delegate does the same when it would prepare its device (run it with
 `PRISM_DEVICE=cpu`, e.g. through `prism_hydra_render`);
 `prism_gpu_program_budget_test` checks the same on
 `tests/hydra/fixtures/textured_emitters_glass.usda`.
+
+### Raygen prewarm
+
+The device compiles the scene-independent raygen shader while the scene's
+materials still load (`MaterialCallShaders::prewarmRaygen`). Scenes with
+textured (varying) emitters need the variant compiled with
+`PRISM_VARYING_EMITTERS`, which the plain prewarm does not cover. Each
+`MDLMaterial` that classifies as a varying emitter (`variesEmission()`, known
+when its constructor ends, long before the device prepares the scene) calls
+`prism::varying_emitters::Note()` (`src/varying_emitter_signal.h`); the Vulkan
+device subscribes, and on the first note (or at creation, if a note came
+earlier) it prewarms the variant with the define as well. The plain raygen is
+still prewarmed at device creation, so a scene with emitters compiles both in
+the background; a scene without emitters compiles only the plain one. Both are
+the exact sources of the scene's raygen shader (no reordering, no light AOVs),
+so the shader cache keys are those of the later compile.
+`PRISM_VULKAN_PREWARM_EMITTERS=0` turns the early variant off.
+`PRISM_GPU_PROGRAM_REPORT=1` prints `raygen_prewarm plain|plain+emitters
+covers_scene <0|1>`; `prism_raygen_prewarm_test` checks that a textured
+emitter scene notes and a scene without one does not.
 
 ## Mac GPU vs CPU
 
@@ -812,6 +832,10 @@ called done there.
     `--device cpu`; egg_gold and Teapot bit-identical to the previous build
     (no repaired or thin-walled material), chess at float level (two
     repaired glasses).
+- **Raygen prewarm** (`src/varying_emitter_signal.h`, a call in
+  `src/mdl_material.h`): host-side only; the Metal kernel and its sources are
+  unchanged. Check the build and that a textured emitter scene still renders
+  the same on `--device metal` (no shader changes expected).
 
 ## Diagnostics
 

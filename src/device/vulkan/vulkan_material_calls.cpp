@@ -904,7 +904,8 @@ MaterialCallShaders::~MaterialCallShaders()
     }
     m_queueReady.notify_all();
     for (auto& worker : m_workers) worker.join();
-    if (m_prewarm.valid()) m_prewarm.wait();
+    for (auto& prewarm : m_prewarm)
+        if (prewarm.valid()) prewarm.wait();
     std::lock_guard lock(m_mutex);
     for (auto& [key, future] : m_shaders) {
         auto const& built = future.get();
@@ -912,17 +913,21 @@ MaterialCallShaders::~MaterialCallShaders()
     }
 }
 
-void MaterialCallShaders::prewarmRaygen()
+void MaterialCallShaders::prewarmRaygen(bool varyingEmitters)
 {
-    if (m_prewarm.valid() || !m_libraries) return;
-    m_prewarm = std::async(std::launch::async, [this] {
+    if (!m_libraries) return;
+    std::lock_guard prewarmLock(m_prewarmMutex);
+    auto& prewarm = m_prewarm[varyingEmitters ? 1 : 0];
+    if (prewarm.valid()) return;
+    m_prewarmed |= varyingEmitters ? 2u : 1u;
+    prewarm = std::async(std::launch::async, [this, varyingEmitters] {
 #ifdef _WIN32
         // The raygen shader is usually the last shader a first scene waits
         // for: ahead of the scene loading that runs meanwhile (DXC inherits it).
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
 #endif
         std::string source, error;
-        if (RaygenSource(false, 0, false, &source, &error)) (void)shader(source, true);
+        if (RaygenSource(false, 0, varyingEmitters, &source, &error)) (void)shader(source, true);
     });
 }
 
