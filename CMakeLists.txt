@@ -1199,6 +1199,25 @@ if(TARGET prism_hydra_render AND TARGET prism_compare_images)
                     --tolerance 0.15 --mean-tolerance 0.01)
             set_tests_properties(prism_textured_emitters_glass_vulkan_parity PROPERTIES
                 FIXTURES_REQUIRED "prism_textured_emitters_glass_cpu;prism_textured_emitters_glass_vulkan")
+            # A thin-walled glass box: its backface scatters with the
+            # surface's function (one copy of the code on both devices).
+            set(_prism_thin_glass "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/thin_walled_glass.usda")
+            foreach(_device cpu vulkan)
+                add_test(NAME prism_thin_walled_glass_${_device}_render
+                    COMMAND PrismRT --scene "${_prism_thin_glass}" --camera /World/Camera --width 64 --height 64
+                        --spp 256 ${_prism_fixed_sampling} --device ${_device} --max-sample-radiance 0
+                        --output "${CMAKE_BINARY_DIR}/scene_features/thin_walled_glass_${_device}.exr")
+                set_tests_properties(prism_thin_walled_glass_${_device}_render PROPERTIES
+                    ENVIRONMENT "${_prism_test_environment}"
+                    FIXTURES_SETUP prism_thin_walled_glass_${_device}
+                    FAIL_REGULAR_EXPRESSION "magenta error material;cannot render the scene on the GPU")
+            endforeach()
+            add_test(NAME prism_thin_walled_glass_vulkan_parity
+                COMMAND prism_compare_images "${CMAKE_BINARY_DIR}/scene_features/thin_walled_glass_cpu.exr"
+                    "${CMAKE_BINARY_DIR}/scene_features/thin_walled_glass_vulkan.exr"
+                    --tolerance 0.15 --mean-tolerance 0.01)
+            set_tests_properties(prism_thin_walled_glass_vulkan_parity PROPERTIES
+                FIXTURES_REQUIRED "prism_thin_walled_glass_cpu;prism_thin_walled_glass_vulkan")
         endif()
     endif()
     if(TARGET prism_render_settings_test)
@@ -1430,7 +1449,8 @@ set(_prism_gpu_test_regex
     "|^prism_parity_.*_(vulkan|metal)_(cli|hydra|match)$"
     "|^prism_parity_.*_(vulkan|metal)_.*_(match|layer|exact)$"
     "|^prism_scene_features_.*_vulkan$"
-    "|^prism_textured_emitters?(_glass)?_vulkan_(render|parity)$")
+    "|^prism_textured_emitters?(_glass)?_vulkan_(render|parity)$"
+    "|^prism_thin_walled_glass_vulkan_(render|parity)$")
 string(JOIN "" _prism_gpu_test_regex ${_prism_gpu_test_regex})
 get_property(_prism_tests DIRECTORY PROPERTY TESTS)
 foreach(_test IN LISTS _prism_tests)
