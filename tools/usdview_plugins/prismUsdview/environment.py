@@ -86,6 +86,10 @@ def set_environment(stage, texture, intensity=1.0, exposure=0.0, rotation=0.0,
         light.CreateTextureFormatAttr().Set(UsdLux.Tokens.latlong)
         light.CreateIntensityAttr().Set(float(intensity))
         light.CreateExposureAttr().Set(float(exposure))
+        # USD 26.08 warns ("invalid info:implementationSource value ''") on
+        # every light that doesn't author it; 'id' is its own fallback.
+        prim.CreateAttribute("info:implementationSource", Sdf.ValueTypeNames.Token,
+                             variability=Sdf.VariabilityUniform).Set("id")
         xform = UsdGeom.Xformable(prim)
         op = None
         for candidate in xform.GetOrderedXformOps():

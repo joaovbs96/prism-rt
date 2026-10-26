@@ -228,7 +228,8 @@ HdRenderSettingDescriptorList PrismTaskDelegate::GetRenderSettingDescriptors() c
             {"Sample clamp", _sampleClamp, VtValue(10.0f)},
             {"Adaptive sampling threshold (0 off)", _adaptiveThreshold, VtValue(d.adaptiveThreshold)},
             {"Adaptive sampling minimum samples", _adaptiveMinSamples, VtValue(d.adaptiveMinSamples)},
-            {"Time limit (seconds, 0 none)", _timeLimitSeconds, VtValue(d.timeLimitSeconds)},
+            // float: usdview's settings panel has no editor for double.
+            {"Time limit (seconds, 0 none)", _timeLimitSeconds, VtValue(float(d.timeLimitSeconds))},
             {"Minimum NEE probability (0 always samples)", _neeProbabilityMin, VtValue(0.0f)},
             {"Probabilistic NEE from depth", _neeFromDepth, VtValue(2)},
             {"Light selection (spatial, power)", _lightSelection, VtValue(std::string("spatial"))},
@@ -275,7 +276,7 @@ VtValue PrismTaskDelegate::GetRenderSetting(TfToken const &key) const
     if (key == _sampleClamp) return VtValue(s.sampleClamp);
     if (key == _adaptiveThreshold) return VtValue(s.adaptiveThreshold);
     if (key == _adaptiveMinSamples) return VtValue(s.adaptiveMinSamples);
-    if (key == _timeLimitSeconds) return VtValue(s.timeLimitSeconds);
+    if (key == _timeLimitSeconds) return VtValue(float(s.timeLimitSeconds));
     if (key == _subdivisionLevel) return VtValue(s.subdivisionLevel);
     if (key == _subdivisionMaxFaces) return VtValue(s.subdivisionMaxFaces);
     if (key == _subdivisionBudgetFaces) return VtValue(s.subdivisionBudgetFaces);
