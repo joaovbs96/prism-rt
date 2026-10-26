@@ -16,10 +16,10 @@ The handover for the main (orchestrating) session. Subagents don't read this fil
 - On a failure: stop, diagnose from evidence, fix narrowly with a regression test, rerun the focused suite, resume. No speculative fixes.
 - GPU safety rules in CLAUDE.md apply to every phase.
 
-## Current state (2026-10-25)
+## Current state (2026-10-26)
 
-- `main` is the development branch (fast-forwarded from `device-abstraction`; GitHub's `main` = fb2b235).
-- 11 local commits on top of it are not pushed: the layered-dielectric energy repairs and the albedo survey tool.
+- `main` is the development branch; GitHub's `main` = 686dd68 (everything through the CLI material path and the raygen prewarm is pushed).
+- Steps 4–8 below are done (Phases 5, 6, 7 and their follow-ups); steps 2–3 are João's; step 1 waits for the repository going public. Next: Phase 8a, then the SDK.
 - CI is off: GitHub Actions stopped on billing and João disabled the workflow. Revisit when the repository goes public (step 1). Until then, the local full serial `ctest -j 1` is the only gate.
 - Completed so far: see `docs/PROGRESS.md`. Decisions: `docs/DECISIONS.md`. Longer-term feature list: `docs/feature_roadmap.md`.
 
@@ -65,12 +65,23 @@ The handover for the main (orchestrating) session. Subagents don't read this fil
 - Extend the parity fixtures to every Hydra feature (one Vulkan variant under the GPU lock).
 - Mostly CPU-side loader work: may run in parallel with Phase 5 or 6 using `ctest -LE gpu`, with GPU checks serialized.
 
-### After the open phases: renderer SDK and Python API (idea, not started)
+### Next: Phase 8a — ShapingAPI spotlights and IES profiles
+- Cone angle/softness, focus/focus tint and IES profiles as an emission factor wherever lights are sampled or hit (`shaders/integrator/lights.h`) and in the light importance; an IES parser (`src/lights/ies.{h,cpp}`) in both loaders; the IES table in the existing light-texture slot. Verified against an analytic cone and a known IES profile, CLI-vs-Hydra and CPU/Vulkan parity.
+- Then the small fixes listed under "Later".
+
+### Then: renderer SDK and Python API (decided 2026-10-26; motion blur waits for it)
 - (a) Turn the renderer into a library/SDK that the CLI and Hydra both implement: a context object (`prism::Renderer`/`Session`) owning today's process-wide state (colour management, the shared `MDLGenerator`, the texture service, SSS fallback, binding purposes, the MDL SDK); public headers separated from internals (no Embree/MDL/TBB/USD types in the public API); scene building (meshes, instances, lights, cameras, MaterialX materials) with incremental edits (Hydra needs them), rendering (devices, settings, progressive passes, AOVs, cancellation, progress), and loaders (USD, glTF, OBJ) as optional modules so the core doesn't need USD. No ABI promise until a first release.
 - (b) A Python API with nanobind as a thin layer over that API: NumPy/DLPack zero-copy for mesh arrays and images, the GIL released during renders, cancellation through the progress callback, USD stages shared with `pxr` through `UsdUtils.StageCache` ids. Packaging (bundled DLLs, load order — cf. PySide6's old msvcp140) is its own task.
 - Order: a design-only investigation first (`docs/sdk_design.md`: API sketch, global-state inventory, header split, module boundaries); then the core API with the CLI ported onto it (its parity tests are the safety net); then Hydra; then the Python bindings. (b) only after (a).
+- Reserve motion in the design even though motion blur comes later: time-sampled transforms and attributes (or velocity/acceleration) in the scene-building API, a shutter interval in the render settings, a per-sample time in the render path (`Ray.time` exists), so motion blur doesn't break the API or the Python bindings.
+
+### After the SDK: motion blur (Phase 8b), in stages
+1. A time per sample within the shutter; both loaders read the shutter and time samples.
+2. CPU camera and transform motion (Embree time steps).
+3. CPU deformation and velocities (time-sampled points, PointInstancer/mesh velocities); memory for the extra samples.
+4. GPU (Vulkan) minimum: one instant per pass, stratified across passes, acceleration-structure refit with interpolated transforms, compute-interpolated vertices for deformation (no NVIDIA-only motion extension). Decide after seeing the CPU result.
+5. Metal with its native motion blur, later.
 
 ### Later (from the original plan; see docs/feature_roadmap.md)
-- Phase 8a: ShapingAPI spotlights and IES profiles. Phase 8b: motion blur.
 - Curves; volumes (`docs/volumes.md`); tile texture streaming; the ALab GPU work (parked branch).
-- Smaller: the OpenPBR wide-shot CPU/Vulkan brightness gap (~3–4%); a timeout on the CLI's GPU fence wait; coated OpenPBR glass reflecting twice (R 0.078 instead of 0.04); the repeated "approximate repair" log line; a glTF file-format plugin for usdview; MaterialX upstream reports (held back on purpose).
+- Smaller: the OpenPBR wide-shot CPU/Vulkan brightness gap (~3–4%); a timeout on the CLI's GPU fence wait; coated OpenPBR glass reflecting twice (R 0.078 instead of 0.04); the repeated "approximate repair" log line; Hydra's cold start ~6 s slower than before Phase 5 on scenes with textured emitters (skip the unused plain raygen prewarm, or make varying emitters a runtime switch); a glTF file-format plugin for usdview; MaterialX upstream reports (held back on purpose).

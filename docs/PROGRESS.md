@@ -2,6 +2,12 @@
 
 Phase reports, newest first. Detailed reports live in `local/reports/` (git-ignored).
 
+## 2026-10-26 — Fixes after Phases 5–7
+- **usdview:** Prism → Environment… (a session-layer dome; the stage's domes deactivated in the session layer, "Off" restores them); PyOpenColorIO 2.6.0 pinned (OCIO menus populated, warning gone, one OpenColorIO DLL in usdview); the time-limit setting is a float (usdview has no double editor); the session dome authors `info:implementationSource` (an OpenUSD 26.08 warning otherwise).
+- **Adaptive sampling in Hydra:** converged pixels were dropped from published buffers when the host still held the previous one (usdview on Vulkan lost the dome background around "87%"); fixed with a regression test on CPU and Vulkan.
+- **OpenPBR on Vulkan:** the NVIDIA shader compiler ran out of memory (glass repairs × all 53 materials in the CLI, up to 16 parallel driver compiles). Fixed by a compile memory budget, a SPIR-V size limit with CPU fallback, then smaller programs: repairs rewrite a private copy of the library graph (CLI glass programs 7–15 MB → ~2 MB), and the CLI compiles USD materials through the delegate's material service (now `src/materialx/material_service.*`). OpenPBR cold/warm on Vulkan: CLI 76.8/41.3 s → 29.7/13.1 s, Hydra ~31/14 s. The textured-emitter raygen is prewarmed while materials load (Hydra cold 39.3 → 29.3 s under load).
+- 347/347 tests. Reports: `local/reports/` (usdview_env_ocio, adaptive_hydra_background, openpbr_vulkan_crash, openpbr_vulkan_time, openpbr_load_time, cli_material_path, raygen_prewarm). Pushed (686dd68).
+
 ## 2026-10-25 — Phase 6: light AOVs and multi-part EXR
 - New AOVs on CPU and Vulkan (Metal: same code, compile-checked only), in Hydra and the CLI: `albedo` (denoising albedo through sharp bounces), `diffuse`, `specular`, `emission` (split by the first scattering vertex; their sum is the colour to < 1.1e-6 relative), `Pworld` (also `P`). Multi-part EXR per product (`prism:exr:multiPart`).
 - Without light AOVs: images bit-identical to bd75e3e (chess, egg_gold, OpenPBR, Teapot on CPU; chess, egg_gold, Teapot on Vulkan) and the Vulkan raygen/callable SPIR-V byte-identical; CPU time unchanged (alternating pairs, +0.3%). With them: CPU +9%, Vulkan +28% GPU time on chess (one run each).
