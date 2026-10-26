@@ -332,6 +332,128 @@ bool IsZero(const std::string& value)
     try { return !value.empty() && std::stod(value) == 0.0; } catch (...) { return false; }
 }
 
+// The constant an input of a node inside `instance`'s graph implementation
+// takes: its value, or the instance's for an interface input (empty when
+// bound to a node, or when the instance's input is).
+std::string ResolvedConstant(const MaterialX::InputPtr& input, const MaterialX::NodePtr& instance)
+{
+    if (!input) return {};
+    if (input->hasInterfaceName()) return instance ? ConstantOrDefault(instance, input->getInterfaceName()) : "";
+    return IsBound(input) ? std::string() : input->getValueString();
+}
+
+// Repairs rewrite a private copy of a node's genmdl graph implementation
+// instead of flattening the graph into the material. MaterialX's MDL
+// generator emits a graph implementation as an MDL function whose internal
+// constants are literals, but publishes every unconnected input of the
+// material's own nodes as a material parameter: a flattened open_pbr_surface
+// turned its ~100 internal constants into class-compilation arguments, the
+// uniform scatter modes among them, so every dielectric_bsdf kept all three of
+// its lobe variants (mx_dielectric_bsdf selects R, T or RT by scatter_mode)
+// and the GPU programs of repaired glass grew 3.5x. The copy has a nodedef
+// and category of its own, named by its content once rewritten, so materials
+// with the same repair share one MDL function (and class program) and keep
+// the surface's inputs as their parameters.
+struct PrivateGraph {
+    MaterialX::NodeGraphPtr graph;
+    MaterialX::NodeDefPtr nodedef;
+    std::string category, nodedefString; // the node's, before
+    std::string source;                  // the library nodedef
+    explicit operator bool() const { return bool(graph); }
+};
+
+// Copy the node's genmdl graph implementation under a draft name and point
+// the node at it (its inputs are unchanged).
+PrivateGraph ClonePrivateGraph(const MaterialX::NodePtr& node)
+{
+    const std::string target = "genmdl";
+    auto doc = node->getDocument();
+    auto nodedef = node->getNodeDef(target);
+    auto implementation = node->getImplementation(target);
+    auto source = implementation ? implementation->asA<MaterialX::NodeGraph>() : nullptr;
+    if (!doc || !nodedef || !source) return {};
+    PrivateGraph clone;
+    clone.category = node->getCategory();
+    clone.nodedefString = node->getNodeDefString();
+    clone.source = nodedef->getName();
+    const std::string draft = doc->createValidChildName("ND_prism_" + clone.category + "_draft");
+    const std::string category = draft.substr(3);
+    clone.nodedef = doc->addNodeDef(draft, "", category);
+    clone.nodedef->copyContentFrom(nodedef);
+    clone.nodedef->setNodeString(category);
+    clone.graph = doc->addNodeGraph(doc->createValidChildName("NG_" + category));
+    clone.graph->copyContentFrom(source);
+    clone.graph->setNodeDefString(draft);
+    clone.graph->removeAttribute(MaterialX::InterfaceElement::TARGET_ATTRIBUTE);
+    node->setCategory(category);
+    node->setNodeDefString(draft);
+    return clone;
+}
+
+// Undo ClonePrivateGraph: the node uses the library's graph again.
+void DiscardPrivateGraph(const MaterialX::NodePtr& node, PrivateGraph& clone)
+{
+    auto doc = node->getDocument();
+    doc->removeNodeGraph(clone.graph->getName());
+    doc->removeNodeDef(clone.nodedef->getName());
+    node->setCategory(clone.category);
+    if (clone.nodedefString.empty()) node->removeAttribute(MaterialX::InterfaceElement::NODE_DEF_ATTRIBUTE);
+    else node->setNodeDefString(clone.nodedefString);
+    clone = {};
+}
+
+// Name a rewritten copy by its content (FNV-1a of its XML): one definition
+// per distinct repair, shared by every node that needs it.
+void PublishPrivateGraph(const MaterialX::NodePtr& node, PrivateGraph& clone)
+{
+    auto doc = node->getDocument();
+    auto scratch = MaterialX::createDocument();
+    auto copy = scratch->addNodeGraph("graph");
+    copy->copyContentFrom(clone.graph);
+    copy->removeAttribute(MaterialX::InterfaceElement::NODE_DEF_ATTRIBUTE);
+    uint64_t hash = 1469598103934665603ull;
+    for (unsigned char c : clone.source + "|" + MaterialX::writeToXmlString(scratch)) {
+        hash ^= c;
+        hash *= 1099511628211ull;
+    }
+    const std::string category = std::format("prism_{}_{:016x}", clone.category, hash);
+    const std::string nodedefName = "ND_" + category;
+    if (doc->getNodeDef(nodedefName)) {
+        doc->removeNodeGraph(clone.graph->getName());
+        doc->removeNodeDef(clone.nodedef->getName());
+    } else {
+        clone.nodedef->setName(nodedefName);
+        clone.nodedef->setNodeString(category);
+        clone.graph->setName("NG_" + category);
+        clone.graph->setNodeDefString(nodedefName);
+    }
+    node->setCategory(category);
+    node->setNodeDefString(nodedefName);
+    clone = {};
+}
+
+// The ports reading a graph's result: its outputs.
+std::vector<MaterialX::PortElementPtr> OutputPorts(const MaterialX::NodeGraphPtr& graph)
+{
+    std::vector<MaterialX::PortElementPtr> ports;
+    for (auto const& output : graph->getOutputs()) ports.push_back(output);
+    return ports;
+}
+
+// The surface constructors a graph's outputs read.
+std::vector<MaterialX::NodePtr> ExpandedSurfaces(const MaterialX::GraphElementPtr& graph,
+                                                 const std::vector<MaterialX::PortElementPtr>& downstream)
+{
+    std::vector<MaterialX::NodePtr> surfaces;
+    for (auto const& port : downstream) {
+        auto surface = graph->getNode(port->getNodeName());
+        if (surface && surface->getCategory() == "surface" &&
+            std::find(surfaces.begin(), surfaces.end(), surface) == surfaces.end())
+            surfaces.push_back(surface);
+    }
+    return surfaces;
+}
+
 // MaterialX's MDL dielectric_bsdf hands its own IOR to the material
 // (pbrlib_1_9 mx_dielectric_bsdf: `ior: color(mxp_ior)`), and OpenPBR's
 // outermost dielectric is the coat: MDL refracts transmission with coat_ior
@@ -367,9 +489,10 @@ void RouteUncoatedTransmissionIor(const MaterialX::DocumentPtr& doc)
 // material is always closed: thin-walled glass refracts like a solid and
 // fills with the transmission_depth medium. 1.39.5 (OpenPBR 1.1.1, a single
 // graph) connects it, but the material still has no backface shader and keeps
-// the depth. Expand such nodes into their genmdl graph and set the
-// constructor's thin_walled flag; a thin-walled MDL material scatters with
-// its backface BSDF from the back, so the material gets the same shader there.
+// the depth. Such nodes get a private copy of their genmdl graph
+// (ClonePrivateGraph) whose constructor is thin-walled; a thin-walled MDL
+// material scatters with its backface BSDF from the back, so the material gets
+// the same shader there (whose scattering the backends then compile once).
 //
 // OpenPBR's thin wall is an infinitesimal sheet whose transmittance at normal
 // incidence is transmission_color, whatever transmission_depth says. The
@@ -382,7 +505,7 @@ void RouteUncoatedTransmissionIor(const MaterialX::DocumentPtr& doc)
 // thin-walled glass refracts like a solid (and loses energy leaving it, R + T
 // 0.64 at 41 degrees inside). Autodesk Standard Surface defines a thin wall
 // as an infinitely thin shell that transmits without refraction, so such
-// nodes get the same expansion when they transmit or scatter (an opaque one
+// nodes get the same thin-walled graph when they transmit or scatter (an opaque one
 // renders the same either way); standard_surface has no transmission medium.
 void ExpandThinWalledOpenPbr(const MaterialX::DocumentPtr& doc)
 {
@@ -398,18 +521,7 @@ void ExpandThinWalledOpenPbr(const MaterialX::DocumentPtr& doc)
     }
     if (nodes.empty()) return;
 
-    // The MDL generator's own choice of implementation (the library's genmdl
-    // target definition selects the MDL variant of the graph).
-    const std::string target = "genmdl";
-
     for (auto const& node : nodes) {
-        auto graph = node->getParent() ? node->getParent()->asA<MaterialX::GraphElement>() : nullptr;
-        auto implementation = node->getImplementation(target);
-        if (!graph || !implementation || !implementation->isA<MaterialX::NodeGraph>()) {
-            std::cerr << "[MaterialX] WARNING: no graph for thin-walled " << node->getNamePath()
-                      << "; it renders as a closed surface\n";
-            continue;
-        }
         if (node->getCategory() == "open_pbr_surface") {
             auto depth = node->getInput("transmission_depth");
             if (!depth) depth = node->addInput("transmission_depth", "float");
@@ -417,33 +529,41 @@ void ExpandThinWalledOpenPbr(const MaterialX::DocumentPtr& doc)
                 depth->removeAttribute(attribute);
             depth->setValue(0.0f);
         }
-
-        const std::string name = node->getName();
-        std::vector<MaterialX::PortElementPtr> downstream = node->getDownstreamPorts();
-        graph->flattenSubgraphs(target, [&](MaterialX::NodePtr candidate) { return candidate == node; });
-        if (graph->getNode(name) == node) continue; // not expanded
-
-        std::vector<MaterialX::NodePtr> surfaces;
-        for (auto const& port : downstream) {
-            auto surface = graph->getNode(port->getNodeName());
-            if (surface && surface->getCategory() == "surface" &&
-                std::find(surfaces.begin(), surfaces.end(), surface) == surfaces.end())
-                surfaces.push_back(surface);
+        // A private copy of the MDL generator's own choice of implementation
+        // (ClonePrivateGraph).
+        PrivateGraph clone = ClonePrivateGraph(node);
+        if (!clone) {
+            std::cerr << "[MaterialX] WARNING: no graph for thin-walled " << node->getNamePath()
+                      << "; it renders as a closed surface\n";
+            continue;
         }
+        const std::vector<MaterialX::NodePtr> surfaces = ExpandedSurfaces(clone.graph, OutputPorts(clone.graph));
         for (auto const& surface : surfaces) {
-            surface->setInputValue("thin_walled", true);
-            for (auto const& material : doc->getMaterialNodes()) {
-                auto front = material->getInput("surfaceshader");
-                if (!front || front->getConnectedNode() != surface) continue;
-                auto back = material->getInput("backsurfaceshader");
-                if (back && (back->hasNodeName() || back->hasNodeGraphString())) continue;
-                if (!back) back = material->addInput("backsurfaceshader", "surfaceshader");
-                back->copyContentFrom(front);
-            }
+            auto thin = surface->getInput("thin_walled");
+            if (!thin) thin = surface->addInput("thin_walled", "boolean");
+            for (const char* attribute : {"nodename", "nodegraph", "output", "interfacename"})
+                thin->removeAttribute(attribute);
+            thin->setValue(true);
+        }
+        if (surfaces.empty()) {
+            DiscardPrivateGraph(node, clone);
+            std::cerr << "[MaterialX] WARNING: no surface constructor for thin-walled " << node->getNamePath()
+                      << "; it renders as a closed surface\n";
+            continue;
+        }
+        const std::string name = node->getName();
+        PublishPrivateGraph(node, clone);
+        for (auto const& material : doc->getMaterialNodes()) {
+            auto front = material->getInput("surfaceshader");
+            if (!front || front->getConnectedNode() != node) continue;
+            auto back = material->getInput("backsurfaceshader");
+            if (back && (back->hasNodeName() || back->hasNodeGraphString())) continue;
+            if (!back) back = material->addInput("backsurfaceshader", "surfaceshader");
+            back->copyContentFrom(front);
         }
         if (VerboseMdl())
-            std::cout << "[MaterialX] thin-walled " << name << " expanded into its " << target
-                      << " graph (" << surfaces.size() << " surface constructor)\n";
+            std::cout << "[MaterialX] thin-walled " << name << " as " << node->getCategory() << " ("
+                      << surfaces.size() << " surface constructor)\n";
     }
 }
 
@@ -636,7 +756,7 @@ std::pair<MaterialX::NodePtr, std::string> SoleConsumer(const MaterialX::NodePtr
 // specular_color): RT stays untinted and prism_dielectric_split weights it by
 // both tints. Callers don't combine a split with a thin film.
 bool CoupleTransmissionFresnel(const MaterialX::GraphElementPtr& graph, const MaterialX::NodePtr& transmission,
-                               bool split = false)
+                               const MaterialX::NodePtr& instance, bool split = false)
 {
     auto mode = transmission->getInput("scatter_mode");
     if (!mode || IsBound(mode) || mode->getValueString() != "T") return false;
@@ -663,9 +783,9 @@ bool CoupleTransmissionFresnel(const MaterialX::GraphElementPtr& graph, const Ma
         plain = Producer(top, "bg");
         filmWeight = top->getInput("mix");
         if (!plain || !filmed) return false;
-        if (!filmWeight || (!IsBound(filmWeight) && IsZero(filmWeight->getValueString()))) filmed = nullptr;
+        if (!filmWeight || IsZero(ResolvedConstant(filmWeight, instance))) filmed = nullptr;
     } else if (auto film = top->getInput("thinfilm_thickness");
-               film && (IsBound(film) || !IsZero(film->getValueString()))) {
+               film && !IsZero(ResolvedConstant(film, instance))) {
         filmed = top;
     }
 
@@ -858,20 +978,6 @@ void ReportPartialRepair(const std::string& name, const DielectricPlan& plan)
               << "); its glass may lose energy\n";
 }
 
-// The surface constructors an expanded node's consumers now read.
-std::vector<MaterialX::NodePtr> ExpandedSurfaces(const MaterialX::GraphElementPtr& graph,
-                                                 const std::vector<MaterialX::PortElementPtr>& downstream)
-{
-    std::vector<MaterialX::NodePtr> surfaces;
-    for (auto const& port : downstream) {
-        auto surface = graph->getNode(port->getNodeName());
-        if (surface && surface->getCategory() == "surface" &&
-            std::find(surfaces.begin(), surfaces.end(), surface) == surfaces.end())
-            surfaces.push_back(surface);
-    }
-    return surfaces;
-}
-
 // Remove the nodes an expansion added that nothing reads (gltf_pbr's
 // unconnected volume divides by an absent attenuation_distance and fails
 // validation).
@@ -887,7 +993,7 @@ void PruneExpansion(const MaterialX::GraphElementPtr& graph, const std::set<std:
     }
 }
 
-// The scatter_mode "T" dielectric_bsdf among the nodes a flattening added.
+// The scatter_mode "T" dielectric_bsdf among a graph's nodes (but `before`).
 MaterialX::NodePtr AddedTransmission(const MaterialX::GraphElementPtr& graph, const std::set<std::string>& before)
 {
     MaterialX::NodePtr found;
@@ -901,14 +1007,14 @@ MaterialX::NodePtr AddedTransmission(const MaterialX::GraphElementPtr& graph, co
     return found;
 }
 
-// Expand the transmissive surfaces whose lobes agree into their genmdl graphs
-// and couple reflection and transmission (CoupleTransmissionFresnel).
-// Couple (and replace the smooth coat of) an expanded surface graph by its
-// plan; false when the graph didn't have the expected shape.
+// Couple (and replace the smooth coat of) a surface's private graph by its
+// plan; false when the graph didn't have the expected shape. `instance` is
+// the surface node (the values of the graph's interface inputs).
 bool RepairExpandedDielectric(const MaterialX::GraphElementPtr& graph, const MaterialX::NodePtr& transmission,
-                              const std::vector<MaterialX::NodePtr>& surfaces, DielectricPlan& plan)
+                              const std::vector<MaterialX::NodePtr>& surfaces, const MaterialX::NodePtr& instance,
+                              DielectricPlan& plan)
 {
-    if (!transmission || !CoupleTransmissionFresnel(graph, transmission, plan.split)) return false;
+    if (!transmission || !CoupleTransmissionFresnel(graph, transmission, instance, plan.split)) return false;
     if (plan.coat) {
         bool replaced = !surfaces.empty();
         for (auto const& surface : surfaces) replaced = ReplaceSmoothCoat(graph, surface) && replaced;
@@ -925,27 +1031,25 @@ void CoupleSurfaceTransmissionFresnel(const MaterialX::DocumentPtr& doc)
             DielectricPlan plan = PlanDielectric(node);
             if (plan.couple || !plan.partial.empty()) nodes.emplace_back(node, plan);
         }
-    const std::string target = "genmdl";
     for (auto& [node, plan] : nodes) {
         const std::string name = node->getName();
-        auto graph = node->getParent() ? node->getParent()->asA<MaterialX::GraphElement>() : nullptr;
-        auto implementation = node->getImplementation(target);
-        if (!plan.couple || !graph || !implementation || !implementation->isA<MaterialX::NodeGraph>()) {
+        PrivateGraph clone = plan.couple ? ClonePrivateGraph(node) : PrivateGraph{};
+        if (!clone) {
             ReportPartialRepair(name, plan);
             continue;
         }
-        std::set<std::string> before;
-        for (auto const& existing : graph->getNodes()) before.insert(existing->getName());
-        const std::vector<MaterialX::PortElementPtr> downstream = node->getDownstreamPorts();
-        graph->flattenSubgraphs(target, [&](MaterialX::NodePtr candidate) { return candidate == node; });
-        if (graph->getNode(name) == node) continue; // not expanded
-        const bool coupled = RepairExpandedDielectric(graph, AddedTransmission(graph, before),
-                                                      ExpandedSurfaces(graph, downstream), plan);
-        PruneExpansion(graph, before);
-        if (!coupled)
-            std::cerr << "[MaterialX] WARNING: " << name << " expanded without a layered transmission"
+        const bool coupled = RepairExpandedDielectric(clone.graph, AddedTransmission(clone.graph, {}),
+                                                      ExpandedSurfaces(clone.graph, OutputPorts(clone.graph)), node,
+                                                      plan);
+        if (!coupled) {
+            DiscardPrivateGraph(node, clone);
+            std::cerr << "[MaterialX] WARNING: " << name << "'s graph has no layered transmission"
                       << " lobe; its glass may lose energy\n";
-        else if (VerboseMdl())
+        } else {
+            PruneExpansion(clone.graph, {});
+            PublishPrivateGraph(node, clone);
+        }
+        if (coupled && VerboseMdl())
             std::cout << "[MaterialX] " << name << ": reflection and transmission share one Fresnel"
                       << " dielectric" << (plan.split ? " (split by tint)" : "")
                       << (plan.coat ? ", smooth coat as a Fresnel layer" : "") << "\n";
@@ -957,8 +1061,8 @@ void CoupleSurfaceTransmissionFresnel(const MaterialX::DocumentPtr& doc)
 // (an anisotropic_vdf absorbing attenuation_coeff) but never connects it, so
 // attenuation is dropped and thick glTF glass renders clear. open_pbr_surface
 // layers its transmission over its VDF, which the MDL generator turns into
-// the material's volume. Expand gltf_pbr nodes with a finite attenuation
-// distance into their genmdl graph and add that layer.
+// the material's volume. gltf_pbr nodes with a finite attenuation distance
+// get a private copy of their genmdl graph with that layer.
 void LayerGltfPbrVolume(const MaterialX::DocumentPtr& doc)
 {
     std::vector<MaterialX::NodePtr> nodes;
@@ -975,26 +1079,18 @@ void LayerGltfPbrVolume(const MaterialX::DocumentPtr& doc)
         }
         nodes.push_back(node);
     }
-    const std::string target = "genmdl";
     for (auto const& node : nodes) {
-        auto graph = node->getParent() ? node->getParent()->asA<MaterialX::GraphElement>() : nullptr;
-        auto implementation = node->getImplementation(target);
-        if (!graph || !implementation || !implementation->isA<MaterialX::NodeGraph>()) {
+        const std::string name = node->getName();
+        DielectricPlan plan = PlanDielectric(node);
+        PrivateGraph clone = ClonePrivateGraph(node);
+        if (!clone) {
             std::cerr << "[MaterialX] WARNING: no graph for " << node->getNamePath()
                       << "; its volume attenuation is ignored\n";
             continue;
         }
-        std::set<std::string> before;
-        for (auto const& existing : graph->getNodes()) before.insert(existing->getName());
-        const std::string name = node->getName();
-        DielectricPlan plan = PlanDielectric(node);
-        const std::vector<MaterialX::PortElementPtr> downstream = node->getDownstreamPorts();
-        graph->flattenSubgraphs(target, [&](MaterialX::NodePtr candidate) { return candidate == node; });
-        if (graph->getNode(name) == node) continue; // not expanded
-
+        const MaterialX::NodeGraphPtr graph = clone.graph;
         MaterialX::NodePtr transmission, volume;
         for (auto const& added : graph->getNodes()) {
-            if (before.contains(added->getName())) continue;
             if (added->getCategory() == "anisotropic_vdf") volume = added;
             else if (added->getCategory() == "dielectric_bsdf") {
                 auto mode = added->getInput("scatter_mode");
@@ -1002,36 +1098,38 @@ void LayerGltfPbrVolume(const MaterialX::DocumentPtr& doc)
             }
         }
         if (!transmission || !volume) {
-            std::cerr << "[MaterialX] WARNING: " << name << " expanded without a transmission BSDF and"
+            DiscardPrivateGraph(node, clone);
+            std::cerr << "[MaterialX] WARNING: " << name << "'s graph has no transmission BSDF and"
                       << " volume; its volume attenuation is ignored\n";
             continue;
         }
         const std::vector<MaterialX::PortElementPtr> consumers = transmission->getDownstreamPorts();
-        auto layer = graph->addNode("layer", graph->createValidChildName(name + "_volume_transmission"), "BSDF");
+        auto layer = graph->addNode("layer", graph->createValidChildName(transmission->getName() + "_volume"), "BSDF");
         layer->addInput("top", "BSDF")->setNodeName(transmission->getName());
         layer->addInput("base", "VDF")->setNodeName(volume->getName());
         for (auto const& port : consumers) port->setNodeName(layer->getName());
         if (VerboseMdl())
             std::cout << "[MaterialX] " << name << ": transmission layered over its volume ("
                       << consumers.size() << " consumers)\n";
-        if (plan.couple && !RepairExpandedDielectric(graph, transmission, ExpandedSurfaces(graph, downstream), plan))
+        if (plan.couple &&
+            !RepairExpandedDielectric(graph, transmission, ExpandedSurfaces(graph, OutputPorts(graph)), node, plan))
             std::cerr << "[MaterialX] WARNING: " << name << ": no layered transmission lobe; its glass may lose energy\n";
+        PruneExpansion(graph, {});
+        PublishPrivateGraph(node, clone);
         ReportPartialRepair(name, plan);
     }
 }
 
-// Expand one node into its genmdl graph; the names of the graph's nodes
-// before, or nullptr when it has no graph or wasn't expanded.
-MaterialX::GraphElementPtr ExpandNode(const MaterialX::NodePtr& node, std::set<std::string>& before)
+// Finish a repair of a private graph: publish it when `repaired`, else
+// return the node to the library's graph.
+void FinishPrivateGraph(const MaterialX::NodePtr& node, PrivateGraph& clone, bool repaired)
 {
-    const std::string target = "genmdl";
-    auto graph = node->getParent() ? node->getParent()->asA<MaterialX::GraphElement>() : nullptr;
-    auto implementation = node->getImplementation(target);
-    if (!graph || !implementation || !implementation->isA<MaterialX::NodeGraph>()) return nullptr;
-    for (auto const& existing : graph->getNodes()) before.insert(existing->getName());
-    const std::string name = node->getName();
-    graph->flattenSubgraphs(target, [&](MaterialX::NodePtr candidate) { return candidate == node; });
-    return graph->getNode(name) == node ? nullptr : graph;
+    if (!repaired) {
+        DiscardPrivateGraph(node, clone);
+        return;
+    }
+    PruneExpansion(clone.graph, {});
+    PublishPrivateGraph(node, clone);
 }
 
 std::vector<MaterialX::NodePtr> AddedNodes(const MaterialX::GraphElementPtr& graph, const std::set<std::string>& before,
@@ -1106,9 +1204,10 @@ void CoupleUsdPreviewTransmission(const MaterialX::DocumentPtr& doc)
             ReportPartialRepair(name, plan);
             continue;
         }
-        std::set<std::string> before;
-        auto graph = ExpandNode(node, before);
-        if (!graph) continue;
+        const std::set<std::string> before;
+        PrivateGraph clone = ClonePrivateGraph(node);
+        if (!clone) continue;
+        const MaterialX::NodeGraphPtr graph = clone.graph;
         auto transmissions = AddedNodes(graph, before, "dielectric_bsdf", "T");
         bool coupled = false;
         if (transmissions.size() == 1) {
@@ -1134,9 +1233,9 @@ void CoupleUsdPreviewTransmission(const MaterialX::DocumentPtr& doc)
                 }
             }
         }
-        PruneExpansion(graph, before);
+        FinishPrivateGraph(node, clone, coupled);
         if (!coupled)
-            std::cerr << "[MaterialX] WARNING: " << name << " expanded without a layered transmission"
+            std::cerr << "[MaterialX] WARNING: " << name << "'s graph has no layered transmission"
                       << " lobe; its glass may lose energy\n";
         else if (VerboseMdl())
             std::cout << "[MaterialX] " << name << ": transparent UsdPreviewSurface as an RT dielectric\n";
@@ -1159,9 +1258,10 @@ void CoupleLamaDielectric(const MaterialX::DocumentPtr& doc)
             ReportPartialRepair(name, plan);
             continue;
         }
-        std::set<std::string> before;
-        auto graph = ExpandNode(node, before);
-        if (!graph) continue;
+        const std::set<std::string> before;
+        PrivateGraph clone = ClonePrivateGraph(node);
+        if (!clone) continue;
+        const MaterialX::NodeGraphPtr graph = clone.graph;
         auto transmissions = AddedNodes(graph, before, "dielectric_bsdf", "T");
         auto reflections = AddedNodes(graph, before, "dielectric_bsdf", "R");
         bool coupled = false;
@@ -1175,9 +1275,9 @@ void CoupleLamaDielectric(const MaterialX::DocumentPtr& doc)
                 coupled = true;
             }
         }
-        PruneExpansion(graph, before);
+        FinishPrivateGraph(node, clone, coupled);
         if (!coupled)
-            std::cerr << "[MaterialX] WARNING: " << name << " expanded without a layered transmission"
+            std::cerr << "[MaterialX] WARNING: " << name << "'s graph has no layered transmission"
                       << " lobe; its glass may lose energy\n";
         else if (VerboseMdl())
             std::cout << "[MaterialX] " << name << ": LamaDielectric as an RT dielectric\n";
@@ -1244,11 +1344,12 @@ void RepairLamaGeneralizedSchlick(const MaterialX::DocumentPtr& doc)
     for (auto const& node : NodesOf(doc, "LamaGeneralizedSchlick")) {
         const std::string name = node->getName();
         const std::optional<float> ior = LamaSchlickIor(node);
-        std::set<std::string> before;
-        auto graph = ExpandNode(node, before);
-        if (!graph) continue;
+        const std::set<std::string> before;
+        PrivateGraph clone = ClonePrivateGraph(node);
+        if (!clone) continue;
+        const MaterialX::NodeGraphPtr graph = clone.graph;
         if (ior && LamaSchlickAsRt(graph, before, *ior)) {
-            PruneExpansion(graph, before);
+            FinishPrivateGraph(node, clone, true);
             if (VerboseMdl())
                 std::cout << "[MaterialX] " << name << ": LamaGeneralizedSchlick as an RT dielectric of IOR " << *ior
                           << "\n";
@@ -1279,7 +1380,7 @@ void RepairLamaGeneralizedSchlick(const MaterialX::DocumentPtr& doc)
             layer->getInput("top")->setNodeName(lobe->getName());
             repaired = true;
         }
-        PruneExpansion(graph, before);
+        FinishPrivateGraph(node, clone, repaired);
         if (!repaired) {
             std::cerr << "[MaterialX] WARNING: " << name << ": no tinted reflection over its transmission; "
                       << "MDL renders its reflection only\n";

@@ -60,8 +60,14 @@ std::vector<MaterialX::NodePtr> Find(const MaterialX::DocumentPtr& doc,
                                      const std::function<bool(const MaterialX::NodePtr&)>& match)
 {
     std::vector<MaterialX::NodePtr> found;
-    for (auto const& node : doc->getNodes())
-        if (match(node)) found.push_back(node);
+    auto scan = [&](const MaterialX::GraphElementPtr& graph) {
+        for (auto const& node : graph->getNodes())
+            if (match(node)) found.push_back(node);
+    };
+    scan(doc);
+    // Repairs rewrite private copies of the library graphs (NG_prism_*).
+    for (auto const& graph : doc->getNodeGraphs())
+        if (graph->getName().rfind("NG_prism_", 0) == 0) scan(graph);
     return found;
 }
 
@@ -178,7 +184,7 @@ void ThinWalledStandardSurface()
             "thin-walled standard_surface: constructor not thin-walled");
     auto material = doc->getNode("M");
     require(material && material->getInput("backsurfaceshader") &&
-                material->getInput("backsurfaceshader")->getConnectedNode() == surfaces.front(),
+                material->getInput("backsurfaceshader")->getConnectedNode() == Upstream(material, "surfaceshader"),
             "thin-walled standard_surface: no backface shader");
     auto opaque = Load("thin_ss_opaque", Shader("standard_surface", Input("thin_walled", "boolean", "true")));
     require(Category(opaque, "standard_surface").size() == 1, "opaque thin-walled standard_surface was expanded");

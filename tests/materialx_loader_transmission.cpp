@@ -1,5 +1,5 @@
-// DocumentLoader expands thin-walled open_pbr_surface nodes into their genmdl
-// graph and marks the surface constructor thin-walled (MaterialX's graphs drop
+// DocumentLoader gives thin-walled open_pbr_surface nodes a private copy of
+// their genmdl graph and marks its surface constructor thin-walled (MaterialX's graphs drop
 // geometry_thin_walled); the backface gets the same shader and the
 // transmission depth is cleared so transmission_color tints the thin sheet.
 // An uncoated transmissive surface gets its specular IOR as coat_ior, which
@@ -84,26 +84,30 @@ int run() {
     auto doc = loader.load(path.string());
     require(bool(doc), "load failed");
 
-    require(!doc->getNode("thin"), "thin-walled node not expanded");
+    // The thin wall is set in a private copy of the genmdl graph, which the
+    // node now uses with its own inputs.
     auto material = doc->getNode("thin_material");
-    auto surface = material->getInput("surfaceshader")->getConnectedNode();
-    require(surface && surface->getCategory() == "surface", "material not fed by the surface constructor");
+    auto thin = material->getInput("surfaceshader")->getConnectedNode();
+    require(thin && thin->getName() == "thin" && thin->getCategory().rfind("prism_open_pbr_surface_", 0) == 0,
+            "thin-walled node not given a private graph");
+    auto implementation = thin->getImplementation("genmdl");
+    auto graph = implementation ? implementation->asA<MaterialX::NodeGraph>() : nullptr;
+    require(graph && graph->getDocument() == doc, "the private graph is not the node's implementation");
+    auto surface = graph->getOutputs().front()->getConnectedNode();
+    require(surface && surface->getCategory() == "surface", "private graph not fed by the surface constructor");
     require(surface->getName().find("mdl_constructor") != std::string::npos, "genmdl graph not chosen");
-    require(surface->getInput("thin_walled") && surface->getInput("thin_walled")->getValueString() == "true",
+    require(surface->getInput("thin_walled") && !surface->getInput("thin_walled")->hasInterfaceName() &&
+                surface->getInput("thin_walled")->getValueString() == "true",
             "surface constructor not thin-walled");
     auto back = material->getInput("backsurfaceshader");
-    require(back && back->getConnectedNode() == surface, "backface does not use the same shader");
-    bool depthCleared = false, tintKept = false;
-    for (auto const& node : doc->getNodes()) {
-        if (node->getName().find("depth_use") != std::string::npos) {
-            auto in = node->getInput("in1");
-            depthCleared = in && !in->hasNodeName() && in->getValueString() == "0";
-        }
-        if (node->getName().find("tint_use") != std::string::npos)
-            tintKept = node->getInput("in1")->getValueString() == "0.5, 1, 0.05";
-    }
-    require(depthCleared, "transmission depth not cleared on the thin wall");
-    require(tintKept, "transmission color not carried into the graph");
+    require(back && back->getConnectedNode() == thin, "backface does not use the same shader");
+    auto depth = thin->getInput("transmission_depth");
+    require(depth && !depth->hasNodeName() && depth->getValueString() == "0",
+            "transmission depth not cleared on the thin wall");
+    auto tint = graph->getNode("tint_use");
+    require(tint && tint->getInput("in1")->getInterfaceName() == "transmission_color" &&
+                thin->getInput("transmission_color")->getValueString() == "0.5, 1, 0.05",
+            "transmission color not carried into the graph");
 
     // Closed (not thin-walled) surfaces are left as they are.
     auto solid = doc->getNode("solid");

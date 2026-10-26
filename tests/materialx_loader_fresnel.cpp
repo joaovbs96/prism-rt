@@ -3,7 +3,8 @@
 // mix(RT over its VDF, layer(R, opaque), w): MDL's custom-curve layer loses
 // the energy of light leaving the medium, the RT dielectric does not.
 // Untinted lobes share the RT lobe directly; tinted ones go through
-// prism_dielectric_split.
+// prism_dielectric_split. The rewrite happens in a private copy of the
+// surface's graph, shared by the surfaces that need the same repair.
 
 #include "../src/materialx/loader.h"
 #include <MaterialXCore/Node.h>
@@ -19,6 +20,16 @@ void require(bool condition, const char* message) {
 MaterialX::NodePtr Upstream(const MaterialX::NodePtr& node, const char* input) {
     auto port = node ? node->getInput(input) : nullptr;
     return port ? port->getConnectedNode() : nullptr;
+}
+
+// The rewritten copy of the library graph a repaired node now uses (its
+// nodedef and graph live in the material's document), or null.
+MaterialX::NodeGraphPtr PrivateGraph(const MaterialX::NodePtr& node) {
+    auto implementation = node ? node->getImplementation("genmdl") : nullptr;
+    auto graph = implementation ? implementation->asA<MaterialX::NodeGraph>() : nullptr;
+    if (!graph || graph->getDocument() != node->getDocument() || graph->getName().rfind("NG_prism_", 0) != 0)
+        return nullptr;
+    return graph;
 }
 
 int run() {
@@ -100,9 +111,22 @@ int run() {
     auto doc = loader.load(path.string());
     require(bool(doc), "load failed");
 
+    // The repair rewrites a private copy of the surface's graph, not the
+    // material: the node keeps its inputs (the MDL material's parameters)
+    // and the graph its constants, so a scatter mode stays a literal that
+    // MDL folds instead of a class parameter.
+    MaterialX::NodeGraphPtr clearGraph;
     for (const char* name : {"glass_material", "deep_material"}) {
-        auto constructor = Upstream(doc->getNode(name), "surfaceshader");
-        require(constructor && constructor->getCategory() == "surface", "transmissive glass not expanded");
+        auto shader = Upstream(doc->getNode(name), "surfaceshader");
+        require(shader && shader->getCategory().rfind("prism_open_pbr_surface_", 0) == 0 &&
+                    shader->getInput("transmission_weight"),
+                "transmissive glass not given a private graph");
+        auto graph = PrivateGraph(shader);
+        require(bool(graph), "the repaired graph is not the node's implementation");
+        require(!clearGraph || clearGraph == graph, "the same repair did not share one graph");
+        clearGraph = graph;
+        auto constructor = graph->getOutputs().front()->getConnectedNode();
+        require(constructor && constructor->getCategory() == "surface", "private graph has no surface constructor");
         auto coupled = Upstream(constructor, "bsdf");
         require(coupled && coupled->getCategory() == "mix", "dielectric not a mix of coupled and opaque lobes");
         auto rtLayer = Upstream(coupled, "fg");
@@ -116,22 +140,37 @@ int run() {
                     Upstream(opaqueLayer, "top")->getInputValue("scatter_mode")->getValueString() == "R" &&
                     Upstream(opaqueLayer, "base")->getCategory() == "oren_nayar_diffuse_bsdf",
                 "the opaque base lost its reflection layer");
-        const std::string weight = coupled->getInput("mix")->getValueString();
-        require(weight == (std::string(name) == "glass_material" ? "1" : "0.5"), "transmission weight not kept");
-        for (auto const& node : doc->getNodes())
+        require(coupled->getInput("mix")->getInterfaceName() == "transmission_weight" &&
+                    shader->getInput("transmission_weight")->getValueString() ==
+                        (std::string(name) == "glass_material" ? "1" : "0.5"),
+                "transmission weight not kept");
+        for (auto const& node : graph->getNodes()) {
             require(node->getName().find("dielectric_substrate") == std::string::npos ||
                         !node->getDownstreamPorts().empty(),
                     "the replaced substrate mix was left behind");
+            if (auto mode = node->getInput("scatter_mode"))
+                require(!mode->hasInterfaceName() && !mode->getValueString().empty(), "a scatter mode is not a literal");
+        }
     }
     // Differently tinted lobes are coupled through prism_dielectric_split
     // (materialx_loader_dielectric checks its shape).
-    for (const char* name : {"tinted", "reflection_tinted"})
-        require(!doc->getNode(name), "a tinted transmissive surface was not expanded");
-    size_t splits = 0;
-    for (auto const& node : doc->getNodes()) splits += node->getCategory() == "prism_dielectric_split";
-    require(splits == 2, "tinted surfaces were not split by their tints");
+    MaterialX::NodeGraphPtr tintedGraph;
+    for (const char* name : {"tinted", "reflection_tinted"}) {
+        auto graph = PrivateGraph(doc->getNode(name));
+        require(bool(graph), "a tinted transmissive surface was not repaired");
+        require(graph != clearGraph && (!tintedGraph || graph == tintedGraph),
+                "tinted surfaces do not share their own graph");
+        tintedGraph = graph;
+        size_t splits = 0;
+        for (auto const& node : graph->getNodes()) splits += node->getCategory() == "prism_dielectric_split";
+        require(splits == 1, "tinted surfaces were not split by their tints");
+    }
     auto opaqueNode = doc->getNode("opaque");
-    require(opaqueNode && opaqueNode->getCategory() == "open_pbr_surface", "an opaque surface was rewritten");
+    require(opaqueNode && opaqueNode->getCategory() == "open_pbr_surface" && !PrivateGraph(opaqueNode),
+            "an opaque surface was rewritten");
+    size_t privateGraphs = 0;
+    for (auto const& graph : doc->getNodeGraphs()) privateGraphs += graph->getName().rfind("NG_prism_", 0) == 0;
+    require(privateGraphs == 2, "expected one private graph per distinct repair");
 
     std::filesystem::remove(path);
     std::cout << "materialx loader fresnel ok\n";
