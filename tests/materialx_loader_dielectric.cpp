@@ -8,6 +8,7 @@
 #include "../src/materialx/loader.h"
 #include <MaterialXCore/Node.h>
 #include <MaterialXFormat/Util.h>
+#include <MaterialXFormat/XmlIo.h>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
@@ -126,6 +127,27 @@ void TintedGlass()
     auto clear = Load("clear", Shader("open_pbr_surface", kGlass));
     require(Category(clear, "prism_dielectric_split").empty() && !clear->getNodeDef("ND_prism_dielectric_split"),
             "untinted glass took the split");
+
+    // Two repairs in one document get two private graphs, named by their
+    // content: the copies are the document's own (no library source URI),
+    // so the written document, which names them and keys the generation
+    // caches, carries their nodes rather than an XInclude of the library.
+    auto both = Load("both", Shader("open_pbr_surface", kGlass + Input("transmission_color", "color3", "0.5, 0.8, 0.9")) +
+                                 "  <open_pbr_surface name=\"C\" type=\"surfaceshader\">\n" + kGlass +
+                                 "  </open_pbr_surface>\n");
+    auto graphOf = [&](const char* name) -> MaterialX::NodeGraphPtr {
+        auto node = both->getNode(name);
+        auto implementation = node ? node->getImplementation("genmdl") : nullptr;
+        auto graph = implementation ? implementation->asA<MaterialX::NodeGraph>() : nullptr;
+        return graph && graph->getDocument() == both ? graph : nullptr;
+    };
+    require(graphOf("S") && graphOf("C") && graphOf("S") != graphOf("C"),
+            "two different repairs in one document share a graph");
+    for (auto const& node : graphOf("S")->getNodes())
+        require(node->getSourceUri().empty(), "a private graph's node keeps the library's source URI");
+    const std::string written = MaterialX::writeToXmlString(both);
+    require(written.find("prism_dielectric_split") != std::string::npos && written.find("xi:include") == std::string::npos,
+            "the written document does not carry the private graphs");
 }
 
 void ThinFilm()

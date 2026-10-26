@@ -362,6 +362,16 @@ struct PrivateGraph {
     explicit operator bool() const { return bool(graph); }
 };
 
+// Make an element and its descendants the document's own: copies keep the
+// library file's source URI, and MaterialX writes such elements as an
+// XInclude of that file instead of their content (the generation cache keys
+// and PublishPrivateGraph's name read the written document).
+void ClearSourceUris(const MaterialX::ElementPtr& element)
+{
+    element->setSourceUri("");
+    for (auto const& child : element->getChildren()) ClearSourceUris(child);
+}
+
 // Copy the node's genmdl graph implementation under a draft name and point
 // the node at it (its inputs are unchanged).
 PrivateGraph ClonePrivateGraph(const MaterialX::NodePtr& node)
@@ -385,6 +395,8 @@ PrivateGraph ClonePrivateGraph(const MaterialX::NodePtr& node)
     clone.graph->copyContentFrom(source);
     clone.graph->setNodeDefString(draft);
     clone.graph->removeAttribute(MaterialX::InterfaceElement::TARGET_ATTRIBUTE);
+    ClearSourceUris(clone.nodedef);
+    ClearSourceUris(clone.graph);
     node->setCategory(category);
     node->setNodeDefString(draft);
     return clone;
@@ -411,8 +423,10 @@ void PublishPrivateGraph(const MaterialX::NodePtr& node, PrivateGraph& clone)
     auto copy = scratch->addNodeGraph("graph");
     copy->copyContentFrom(clone.graph);
     copy->removeAttribute(MaterialX::InterfaceElement::NODE_DEF_ATTRIBUTE);
+    MaterialX::XmlWriteOptions options;
+    options.writeXIncludeEnable = false;
     uint64_t hash = 1469598103934665603ull;
-    for (unsigned char c : clone.source + "|" + MaterialX::writeToXmlString(scratch)) {
+    for (unsigned char c : clone.source + "|" + MaterialX::writeToXmlString(scratch, &options)) {
         hash ^= c;
         hash *= 1099511628211ull;
     }

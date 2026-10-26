@@ -292,8 +292,8 @@ void TestGeneration(const std::filesystem::path& dir, const std::string& librari
 }
 
 // DocumentLoader's LayerGltfPbrVolume (src/materialx/loader.cpp): a gltf_pbr
-// with a finite attenuation_distance is expanded and its transmission layered
-// over its absorbing VDF; one without attenuation (the converter's 1e30) gets
+// with a finite attenuation_distance gets a private copy of its graph with its
+// transmission layered over its absorbing VDF; one without attenuation (the converter's 1e30) gets
 // no volume; other lobes (clearcoat) and texture inputs survive.
 void TestVolumeLayer(const std::filesystem::path& dir, const std::string& libraries)
 {
@@ -332,15 +332,27 @@ void TestVolumeLayer(const std::filesystem::path& dir, const std::string& librar
     std::filesystem::remove(path, ignored);
     Check(bool(doc), "volume layer fixture loads");
     if (!doc) return;
-    Check(!doc->getNode("absorbing"), "the attenuating gltf_pbr is expanded");
-    // The clear glass is expanded too, to couple its reflection and
-    // transmission (an RT dielectric), but gets no volume layer. The
-    // absorbing one (textured base_color) is coupled through
-    // prism_dielectric_split, its RT lobe over the volume.
-    Check(!doc->getNode("clear"), "the clear glass is coupled");
+    // Both nodes get a private copy of their graph (ClonePrivateGraph). The
+    // clear glass's couples its reflection and transmission (an RT
+    // dielectric) but has no volume layer. The absorbing one (textured
+    // base_color) is coupled through prism_dielectric_split, its RT lobe over
+    // the volume.
+    auto graphOf = [&](const char* name) -> MaterialX::NodeGraphPtr {
+        auto node = doc->getNode(name);
+        auto implementation = node ? node->getImplementation("genmdl") : nullptr;
+        auto graph = implementation ? implementation->asA<MaterialX::NodeGraph>() : nullptr;
+        return graph && graph->getDocument() == doc ? graph : nullptr;
+    };
+    auto absorbingGraph = graphOf("absorbing"), clearGraph = graphOf("clear");
+    Check(bool(absorbingGraph), "the attenuating gltf_pbr has a private graph");
+    Check(bool(clearGraph) && clearGraph != absorbingGraph, "the clear glass is coupled in a graph of its own");
     int layers = 0, volumeLayers = 0;
     bool clearcoat = false;
-    for (auto const& node : doc->getNodes()) {
+    std::vector<MaterialX::NodePtr> nodes;
+    for (auto const& graph : {absorbingGraph, clearGraph})
+        if (graph)
+            for (auto const& node : graph->getNodes()) nodes.push_back(node);
+    for (auto const& node : nodes) {
         if (node->getCategory() == "layer" && node->getType() == "BSDF") {
             auto top = Upstream(node, "top"), base = Upstream(node, "base");
             if (base && base->getCategory() == "anisotropic_vdf") ++volumeLayers;
