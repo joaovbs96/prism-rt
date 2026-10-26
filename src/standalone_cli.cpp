@@ -2,6 +2,7 @@
 #include "scene.h"
 #include "render_defaults.h"
 #include "materialx/loader.h"
+#include "materialx/material_service.h"
 #include "camera_rays.h"
 #include "camera_ray_diagnostics.h"
 #include "device/device.h"
@@ -819,7 +820,9 @@ int runStandaloneCli(int argc, char** argv) {
             viewRays.front().parameters, static_cast<unsigned int>(views.front().dataWidth),
             static_cast<unsigned int>(views.front().dataHeight), o.seed, "standalone");
         progress.Stage("Loading scene");
-        mdl::Context context;
+        // The process-lifetime runtime the material service shares its caches
+        // and templates through (as in the Hydra delegate).
+        mdl::Context& context = prism::materials::SharedMdlContext();
         if (!context.is_valid()) throw std::runtime_error(context.get_error());
         // Before any material loads.
         DocumentLoader::SetSssFallback(o.sssFallback);

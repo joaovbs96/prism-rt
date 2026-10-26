@@ -102,14 +102,14 @@ void writeClampStage(const std::filesystem::path& path,
     out<<"}\n";
 }
 void writeSingleTextureStage(const std::filesystem::path& path,
-                             const std::filesystem::path& texture) {
+                             const std::filesystem::path& texture,float weight) {
     std::ofstream out(path,std::ios::binary|std::ios::trunc);
     out << "#usda 1.0\n\ndef Xform \"World\" { def Scope \"Looks\" {\n"
         " def Material \"M\" { token outputs:mtlx:surface.connect = </World/Looks/M/Surface.outputs:out>\n"
         "  def Shader \"Image\" { uniform token info:id=\"ND_image_color3\"\n"
         "   asset inputs:file=@" << texture.generic_string() << "@\n   color3f outputs:out\n  }\n"
         "  def Shader \"Surface\" { uniform token info:id=\"ND_open_pbr_surface_surfaceshader\"\n"
-        "   float inputs:base_weight=.2\n   color3f inputs:base_color.connect=</World/Looks/M/Image.outputs:out>\n"
+        "   float inputs:base_weight=" << weight << "\n   color3f inputs:base_color.connect=</World/Looks/M/Image.outputs:out>\n"
         "   float inputs:specular_weight=0\n   token outputs:out\n  }\n }\n }\n"
         " def Mesh \"G\" (prepend apiSchemas=[\"MaterialBindingAPI\"]) {\n"
         "  int[] faceVertexCounts=[4]\n  int[] faceVertexIndices=[0,1,2,3]\n"
@@ -131,18 +131,20 @@ int main() {
             std::filesystem::remove_all(p,e);} } cleanup{root};
         for(int i=0;i<32;++i)writePpm(root/("t"+std::to_string(i)+".ppm"),i);
         const auto usd=root/"reuse.usda"; writeStage(usd,root);
-        mdl::Context context;
+        // The loader compiles through the material service, whose templates
+        // and process caches serve the process-lifetime runtime (as the CLI).
+        mdl::Context& context=prism::materials::SharedMdlContext();
         require(context.is_valid(),"MDL context initialization failed");
         prism::materialx::CompatibleTemplateRegistry::Shared().clear();
         prism::materialx::CapturedMaterialRegistry::Shared().clear();
         prism::materialx::CapturedMaterialRegistry::Shared().resetStats();
-        USDMesh mesh(usd,&context,libraries,mdlPath);
-        require(mesh.materials.size()==65,"standalone USD ingest lost material bindings");
+        auto mesh=std::make_unique<USDMesh>(usd,&context,libraries,mdlPath);
+        require(mesh->materials.size()==65,"standalone USD ingest lost material bindings");
         std::set<const mdl::CompiledProgram*> programs;
         std::set<uint64_t> argumentBlocks;
         std::set<std::array<int,3>> shadingValues;
         size_t fullyGenerated=0;
-        for(const auto& [id,base] : mesh.materials) {
+        for(const auto& [id,base] : mesh->materials) {
             auto* material=dynamic_cast<MDLMaterial*>(base);
             require(material&&material->is_valid(),"standalone material is not compiled MDL");
             const auto& target=material->get_target_code();
@@ -165,11 +167,17 @@ int main() {
         require(shadingValues.size()>=32,
                 "standalone resource variants did not produce distinct shading");
 
-        const auto templatedTextureValue=evaluate(
-            dynamic_cast<MDLMaterial*>(mesh.materials.at(0))->get_target_code());
+        // M1 (t1, base_weight 0.21) is bound to the template of M0. Released
+        // before the reference, which the process caches would otherwise
+        // serve with the same bound material.
+        auto* bound=dynamic_cast<MDLMaterial*>(mesh->materials.at(1));
+        require(bound&&bound->get_generated_uniforms().empty(),
+                "the second variant was not bound to the template");
+        const auto templatedTextureValue=evaluate(bound->get_target_code());
+        mesh.reset();
         prism::materialx::CompatibleTemplateRegistry::Shared().clear();
         const auto textureReference=root/"texture-reference.usda";
-        writeSingleTextureStage(textureReference,root/"t0.ppm");
+        writeSingleTextureStage(textureReference,root/"t1.ppm",0.21f);
         USDMesh textureFull(textureReference,&context,libraries,mdlPath);
         auto* fullTexture=dynamic_cast<MDLMaterial*>(textureFull.materials.at(0));
         require(fullTexture&&!fullTexture->get_generated_uniforms().empty(),
@@ -184,13 +192,16 @@ int main() {
         prism::materialx::CompatibleTemplateRegistry::Shared().clear();
         const auto clampVariants=root/"clamp-variants.usda";
         writeClampStage(clampVariants,clampColors);
-        USDMesh variants(clampVariants,&context,libraries,mdlPath);
-        require(variants.materials.size()==3,"clamp variant fixture did not load");
-        const auto boundHigh=hashBlock(dynamic_cast<MDLMaterial*>(
-            variants.materials.at(1))->get_target_code().argument_data());
-        const auto boundLow=hashBlock(dynamic_cast<MDLMaterial*>(
-            variants.materials.at(2))->get_target_code().argument_data());
-        std::array<uint64_t,2> independentlyCompiled{};
+        auto variants=std::make_unique<USDMesh>(clampVariants,&context,libraries,mdlPath);
+        require(variants->materials.size()==3,"clamp variant fixture did not load");
+        std::array<std::array<float,3>,2> boundValues{};
+        for(size_t i=0;i<2;++i) {
+            auto* material=dynamic_cast<MDLMaterial*>(variants->materials.at(int(i+1)));
+            require(material&&material->get_generated_uniforms().empty(),
+                    "clamp variant was not bound to the template");
+            boundValues[i]=evaluate(material->get_target_code());
+        }
+        variants.reset();
         for(size_t i=0;i<2;++i) {
             prism::materialx::CompatibleTemplateRegistry::Shared().clear();
             const auto single=root/("clamp-full-"+std::to_string(i)+".usda");
@@ -199,13 +210,11 @@ int main() {
             auto* material=dynamic_cast<MDLMaterial*>(full.materials.at(0));
             require(material&&!material->get_generated_uniforms().empty(),
                     "clamp reference did not take the full generation path");
-            independentlyCompiled[i]=hashBlock(
-                material->get_target_code().argument_data());
+            const auto value=evaluate(material->get_target_code());
+            for(size_t channel=0;channel<3;++channel)
+                require(std::abs(boundValues[i][channel]-value[channel])<1e-5f,
+                        "shared binder did not preserve full-compile clamp boundaries");
         }
-        require(boundHigh==independentlyCompiled[0] &&
-                    boundLow==independentlyCompiled[1],
-                "shared binder did not preserve full-compile clamp boundaries");
-        prism::materialx::CompatibleTemplateRegistry::Shared().eraseContext(&context);
         std::cout<<"standalone 65-material template reuse passed programs="
                  <<programs.size()<<" bindings="<<argumentBlocks.size()<<'\n';
         return 0;
