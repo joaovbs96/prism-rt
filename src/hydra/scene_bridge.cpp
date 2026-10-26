@@ -4647,6 +4647,14 @@ public:
             [this, device, prepared] {
                 const auto start = std::chrono::steady_clock::now();
                 prism::load_profile::Scope profile("device.prepare");
+                // Diagnostics, as in the CLI: print the scene's GPU programs
+                // (DXC only, no GPU work; run with PRISM_DEVICE=cpu) and exit.
+                if (const char *report = std::getenv("PRISM_GPU_PROGRAM_REPORT"); report && *report == '1') {
+                    if (!prism::device::ReportGpuPrograms(*prepared->scene, std::cout))
+                        std::cerr << "PrismRT: this build has no Vulkan device\n";
+                    std::cout.flush();
+                    std::_Exit(0);
+                }
                 // Test hook: stretches the preparation to exercise the CPU
                 // preview that covers it.
                 if (const char *delay = std::getenv("PRISM_TEST_GPU_PREPARATION_DELAY_MS");
