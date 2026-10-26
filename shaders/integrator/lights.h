@@ -36,6 +36,9 @@ static const uint kLightVaryingEmission = 8u;
 // Triangles: u and v hold the primitive's third and second vertex (placements
 // that flip orientation).
 static const uint kLightSwappedVertices = 16u;
+// Analytic lights with UsdLuxShapingAPI shaping: lobes.z holds the index of
+// their shaping block (as float bits; LightShaping).
+static const uint kLightShaped = 32u;
 
 static const uint kLightTextureNone = 0xffffffffu;
 
@@ -51,7 +54,8 @@ static const uint kLightTextureNone = 0xffffffffu;
 // the emitted radiance (irradiance for a parallel distant light); radiance.w
 // is 1 + the index of the shadow-link category bit (0: every surface casts
 // shadows). lobes holds the UsdLux diffuse (x) and specular (y) multipliers:
-// the light as diffuse and as glossy BSDF lobes see it (1 for triangles).
+// the light as diffuse and as glossy BSDF lobes see it (1 for triangles);
+// lobes.z the shaping block of kLightShaped lights.
 struct LightRecord {
     uint4 info;      // x: type, y: flags, z: texture (rect), w: light-link category bit (0: all)
     float4 p0;
@@ -625,3 +629,172 @@ struct LightPick {
     uint index;
     float pmf;
 };
+
+// UsdLuxShapingAPI (usdLux/schema.usda, ShapingAPI): emission scaled by the
+// direction e it leaves the light in (unit, from the light toward the
+// receiver), relative to the light's primary axis (its local -Z):
+//   cone     theta = acos(axis . e); zero beyond the cutoff (shaping:cone:angle),
+//            1 - smoothstep(smoothStart, cutoff, theta) with smoothStart =
+//            cutoff * (1 - softness) (shaping:cone:softness)
+//   focus    f = |axis . e|^focus; the colour lerp(focusTint, 1, f)
+//   IES      the profile at e in the light's local frame (iesLookup), its
+//            theta rescaled by shaping:ies:angleScale, times iesScale (the
+//            peak candela, divided by the profile's mean with
+//            shaping:ies:normalize)
+// The shaping blocks follow the light table's alias entries (lightAlias
+// from lightCount() + 1): four float4 per shaped light, then the IES grids
+// (width x height values, then each row's maximum: height values), four
+// values per float4:
+//   [0] xyz primary axis (world, unit), w focus (0: none)
+//   [1] xyz the light's local +X (world, unit; IES phi 0), w cutoff (radians; >= pi: no cone)
+//   [2] xyz focus tint, w smoothStart (radians)
+//   [3] x angle scale, y IES scale, z the profile's first float4 (as uint
+//       bits, from lightCount() + 1), w its width | height << 16 (0: no profile)
+struct LightShaping {
+    float3 axis;
+    float focus;
+    float3 xAxis;
+    float cutoff;
+    float3 tint;
+    float smoothStart;
+    float angleScale;
+    float iesScale;
+    uint profile;
+    uint profileSize;
+};
+
+inline LightShaping lightShapingFrom(float4 a, float4 b, float4 c, float4 d)
+{
+    LightShaping s;
+    s.axis = xyz(a);
+    s.focus = a.w;
+    s.xAxis = xyz(b);
+    s.cutoff = b.w;
+    s.tint = xyz(c);
+    s.smoothStart = c.w;
+    s.angleScale = d.x;
+    s.iesScale = d.y;
+    s.profile = asuint(d.z);
+    s.profileSize = asuint(d.w);
+    return s;
+}
+
+// 1 - smoothstep(smoothStart, cutoff, theta) inside the cone, 0 outside.
+inline float shapingCone(LightShaping s, float theta)
+{
+    if (!(s.cutoff < kPi)) return 1.0f;
+    if (theta > s.cutoff) return 0.0f;
+    if (!(s.smoothStart < s.cutoff) || theta <= s.smoothStart) return 1.0f;
+    const float t = saturate((theta - s.smoothStart) / (s.cutoff - s.smoothStart));
+    return 1.0f - t * t * (3.0f - 2.0f * t);
+}
+
+// lerp(focusTint, 1, |cos theta|^focus).
+inline float3 shapingFocus(LightShaping s, float cosTheta)
+{
+    if (!(s.focus > 0.0f)) return (float3)1.0f;
+    const float f = pow(abs(cosTheta), s.focus);
+    return s.tint + ((float3)1.0f - s.tint) * f;
+}
+
+// The cone and focus factors along e.
+inline float3 shapingConeFocus(LightShaping s, float3 e)
+{
+    const float cosTheta = clamp(dot(s.axis, e), -1.0f, 1.0f);
+    const float cone = shapingCone(s, acos(cosTheta));
+    if (!(cone > 0.0f)) return (float3)0.0f;
+    return shapingFocus(s, cosTheta) * cone;
+}
+
+// shaping:ies:angleScale applied to the light's theta (increasing in theta).
+inline float iesTheta(LightShaping s, float theta)
+{
+    if (s.angleScale > 0.0f) return theta / s.angleScale;
+    if (s.angleScale < 0.0f) return (theta - kPi) / -s.angleScale + kPi;
+    return theta;
+}
+
+// The IES angles (theta, phi) of e in radians: theta from the light's local
+// -Z, rescaled by shaping:ies:angleScale; phi from local +X toward +Y.
+inline float2 iesAngles(LightShaping s, float3 e)
+{
+    const float theta = acos(clamp(dot(s.axis, e), -1.0f, 1.0f));
+    const float3 yAxis = cross(s.xAxis, s.axis); // local +Y = (+Z) x (+X), +Z = -axis
+    float phi = atan2(dot(e, yAxis), dot(e, s.xAxis));
+    if (phi < 0.0f) phi += 2.0f * kPi;
+    return float2(iesTheta(s, theta), phi);
+}
+
+// The angle a sphere of radius r around a light's p0 subtends at distance
+// dist (pi from inside it).
+inline float lightSpread(float radius, float dist)
+{
+    return dist > radius ? acos(sqrt(max(0.0f, 1.0f - (radius / dist) * (radius / dist)))) : kPi;
+}
+
+// Bilinear lookup in an IES grid of `width` columns over phi in [0, 2 pi)
+// (periodic) and `height` rows over theta in [0, pi] (src/lights/ies.h).
+struct IesLookup {
+    uint i0;
+    uint i1;
+    uint j0;
+    float tx;
+    float ty;
+    bool valid;
+};
+
+inline IesLookup iesGridLookup(float theta, float phi, uint width, uint height)
+{
+    IesLookup l;
+    l.i0 = 0u;
+    l.i1 = 0u;
+    l.j0 = 0u;
+    l.tx = 0.0f;
+    l.ty = 0.0f;
+    l.valid = false;
+    if (!(theta >= 0.0f) || theta > kPi || height < 2u || width < 1u) return l;
+    const float y = theta / kPi * float(height - 1u);
+    l.j0 = min(uint(y), height - 2u);
+    l.ty = min(y - float(l.j0), 1.0f);
+    float x = phi / (2.0f * kPi) * float(width);
+    x = x - floor(x / float(width)) * float(width);
+    const float fx = floor(x);
+    l.i0 = min(uint(fx), width - 1u);
+    l.tx = clamp(x - fx, 0.0f, 1.0f);
+    l.i1 = l.i0 + 1u >= width ? 0u : l.i0 + 1u;
+    l.valid = true;
+    return l;
+}
+
+// A bound on the cone and focus factors over the directions from an
+// analytic light of bounding radius `radius` (around its record's p0) toward
+// p, over the angle range the light subtends there. Zero only where no point
+// of the light reaches p. (PathTracer::iesImportance bounds the profile.)
+inline float shapingImportance(LightShaping s, float3 p, float3 center, float radius)
+{
+    const float3 d = p - center;
+    const float dist = length(d);
+    if (!(dist > 0.0f)) return 1.0f;
+    const float theta = acos(clamp(dot(s.axis, d / dist), -1.0f, 1.0f));
+    const float spread = lightSpread(radius, dist);
+    const float nearest = max(0.0f, theta - spread);
+    const float cone = shapingCone(s, nearest);
+    if (!(cone > 0.0f)) return 0.0f;
+    const float cosMax = max(abs(cos(nearest)), abs(cos(min(kPi, theta + spread))));
+    // lerp(tint, 1, f) grows with f, unless a tint component exceeds 1.
+    const float3 focus = shapingFocus(s, cosMax);
+    float focusBound = max(focus.x, max(focus.y, focus.z));
+    if (s.focus > 0.0f) focusBound = max(focusBound, max(s.tint.x, max(s.tint.y, s.tint.z)));
+    return cone * focusBound;
+}
+
+// The radius of a sphere around p0 that holds an analytic light.
+inline float lightBoundingRadius(LightRecord light)
+{
+    const uint type = light.info.x;
+    if (type == kLightSphere) return light.p0.w;
+    if (type == kLightRect) return length(xyz(light.u)) + length(xyz(light.v));
+    if (type == kLightDisk) return max(length(xyz(light.u)), length(xyz(light.v)));
+    if (type == kLightCylinder) return length(xyz(light.u)) + length(xyz(light.v));
+    return 0.0f;
+}

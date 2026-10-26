@@ -457,7 +457,74 @@ struct PathTracer {
     float linkedImportance(LightRecord light, float3 p, uint receiver)
     {
         if (light.info.w != 0u && (receiver & light.info.w) == 0u) return 0.0f;
-        return lightImportance(light, p, settings.luminance);
+        const float importance = lightImportance(light, p, settings.luminance);
+        if ((light.info.y & kLightShaped) == 0u || !(importance > 0.0f)) return importance;
+        const LightShaping s = lightShaping(light);
+        const float radius = lightBoundingRadius(light);
+        const float shaped = importance * shapingImportance(s, p, xyz(light.p0), radius);
+        return s.profileSize != 0u && shaped > 0.0f ? shaped * iesImportance(s, p, xyz(light.p0), radius) : shaped;
+    }
+
+    // A bound on the IES factor toward p of a light of bounding radius
+    // `radius` around `center`: the largest row maximum of its grid over the
+    // theta range the light subtends (the scale alone over wide ranges).
+    float iesImportance(LightShaping s, float3 p, float3 center, float radius)
+    {
+        const float3 d = p - center;
+        const float dist = length(d);
+        if (!(dist > radius)) return s.iesScale;
+        const float theta = acos(clamp(dot(s.axis, d / dist), -1.0f, 1.0f));
+        const float spread = lightSpread(radius, dist);
+        const float lo = max(0.0f, iesTheta(s, max(0.0f, theta - spread)));
+        const float hi = min(kPi, iesTheta(s, min(kPi, theta + spread)));
+        if (lo > kPi || hi < 0.0f) return 0.0f;
+        const uint width = s.profileSize & 0xffffu;
+        const uint height = s.profileSize >> 16u;
+        const float step = kPi / float(height - 1u);
+        const uint j0 = min(height - 1u, uint(lo / step));
+        const uint j1 = min(height - 1u, uint(ceil(hi / step)));
+        if (j1 > j0 + 32u) return s.iesScale;
+        float bound = 0.0f;
+        for (uint j = j0; j <= j1; ++j) bound = max(bound, iesTexel(s.profile, width * height + j));
+        return bound * s.iesScale;
+    }
+
+    // UsdLuxShapingAPI (lights.h, LightShaping): the shaping block of a
+    // kLightShaped light, and its factor along e (unit, leaving the light).
+    LightShaping lightShaping(LightRecord light)
+    {
+        const uint base = backend.lightCount() + 1u + 4u * asuint(light.lobes.z);
+        return lightShapingFrom(backend.lightAlias(base), backend.lightAlias(base + 1u),
+                                backend.lightAlias(base + 2u), backend.lightAlias(base + 3u));
+    }
+
+    float iesTexel(uint profile, uint index)
+    {
+        const float4 q = backend.lightAlias(backend.lightCount() + 1u + profile + index / 4u);
+        const uint c = index & 3u;
+        return c == 0u ? q.x : (c == 1u ? q.y : (c == 2u ? q.z : q.w));
+    }
+
+    float3 shapingFactor(LightRecord light, float3 e)
+    {
+        const LightShaping s = lightShaping(light);
+        float3 factor = shapingConeFocus(s, e);
+        if (s.profileSize != 0u && maxComponent(factor) > 0.0f) {
+            const float2 angles = iesAngles(s, e);
+            const uint width = s.profileSize & 0xffffu;
+            const IesLookup l = iesGridLookup(angles.x, angles.y, width, s.profileSize >> 16u);
+            float ies = 0.0f;
+            if (l.valid) {
+                const uint row0 = l.j0 * width;
+                const uint row1 = row0 + width;
+                const float top = lerp(iesTexel(s.profile, row0 + l.i0), iesTexel(s.profile, row0 + l.i1), l.tx);
+                const float bottom =
+                    lerp(iesTexel(s.profile, row1 + l.i0), iesTexel(s.profile, row1 + l.i1), l.tx);
+                ies = lerp(top, bottom, l.ty);
+            }
+            factor = factor * (ies * s.iesScale);
+        }
+        return factor;
     }
 
     AnalyticLightSums analyticSums(float3 p, uint receiver)
@@ -524,6 +591,8 @@ struct PathTracer {
                 crossing = textured.hit;
                 if (crossing.hit && (light.info.y & kLightTextured) != 0u)
                     crossing.radiance *= backend.lightTexture(light.info.z, textured.texcoord);
+                if (crossing.hit && (light.info.y & kLightShaped) != 0u)
+                    crossing.radiance *= shapingFactor(light, -normalize(ray.ray.direction));
             }
             if (!crossing.hit) continue;
             float misWeight = 1.0f;
@@ -824,6 +893,11 @@ struct PathTracer {
             }
             if (light.valid && (record.info.y & kLightTextured) != 0u)
                 light.radiance *= backend.lightTexture(record.info.z, sampled.texcoord);
+            // Shaping: no shadow ray where it leaves nothing.
+            if (light.valid && (record.info.y & kLightShaped) != 0u) {
+                light.radiance *= shapingFactor(record, -light.wi);
+                light.valid = maxComponent(light.radiance) > 0.0f;
+            }
             if (lobes) {
                 specular = light.radiance * record.lobes.y;
                 light.radiance *= record.lobes.x;

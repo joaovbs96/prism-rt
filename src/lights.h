@@ -8,6 +8,7 @@
 #include "float3.h"
 #include "texture.h"
 #include "color/color_management.h"
+#include "lights/ies.h"
 
 #include <algorithm>
 #include <array>
@@ -18,6 +19,22 @@
 namespace prism {
 
 enum class LightShape { Sphere, Rect, Disk, Cylinder, Distant, Point };
+
+// UsdLuxShapingAPI inputs (usdLux/schema.usda, ShapingAPI). `active` when the
+// light has any of them (ShapingAPI applied, or one authored); both loaders
+// then fill every input with its value or the schema's fallback. Distant
+// lights (and domes) ignore shaping. focusTint is linear Rec.709, as UsdLux
+// authors colours; MakeSceneLight converts it into the working space.
+struct LightShapingParameters {
+    bool active = false;
+    float focus = 0.0f;                 // inputs:shaping:focus
+    Color3 focusTint = Color3(0.0f);    // inputs:shaping:focusTint
+    float coneAngle = 90.0f;            // inputs:shaping:cone:angle, degrees
+    float coneSoftness = 0.0f;          // inputs:shaping:cone:softness
+    std::shared_ptr<const IesProfile> ies; // inputs:shaping:ies:file (null: none or unreadable)
+    float iesAngleScale = 0.0f;         // inputs:shaping:ies:angleScale
+    bool iesNormalize = false;          // inputs:shaping:ies:normalize
+};
 
 struct SceneLight {
     LightShape shape = LightShape::Sphere;
@@ -38,6 +55,11 @@ struct SceneLight {
     float diffuse = 1.0f;
     float specular = 1.0f;
     std::shared_ptr<Texture<Color3>> texture; // rect lights
+    // Shaping (shaping.active): the primary axis (the transformed local -Z)
+    // and the local +X orthogonal to it, world space, unit.
+    LightShapingParameters shaping;
+    Float3 shapingAxis = Float3(0.0f, 0.0f, -1.0f);
+    Float3 shapingX = Float3(1.0f, 0.0f, 0.0f);
     // Light and shadow linking: the category bit of the surfaces the light
     // illuminates, and of those casting its shadows (0: every surface).
     uint32_t lightLinkBit = 0;
@@ -62,6 +84,7 @@ struct LightParameters {
     bool cameraVisible = false;
     float diffuse = 1.0f;         // inputs:diffuse
     float specular = 1.0f;        // inputs:specular
+    LightShapingParameters shaping;
 };
 
 // localToWorld in GfMatrix4d layout: row-vector convention, m[row * 4 + column],
@@ -151,6 +174,17 @@ inline SceneLight MakeSceneLight(LightParameters const& params, std::array<doubl
         scale *= pi * light.radius * light.radius;
     }
     light.radiance = prism::color::Active()->FromRec709(params.color) * scale;
+    if (params.shaping.active && light.shape != LightShape::Distant) {
+        light.shaping = params.shaping;
+        light.shaping.focusTint = prism::color::Active()->FromRec709(params.shaping.focusTint);
+        Float3 axis = -z;
+        if (!(axis.length() > 0.0f)) axis = Float3(0.0f, 0.0f, -1.0f);
+        axis = axis.normalize();
+        Float3 local = x - axis * dot(x, axis);
+        if (!(local.length() > 1e-6f)) local = cross(axis, std::abs(axis.x()) < 0.9f ? Float3(1, 0, 0) : Float3(0, 1, 0));
+        light.shapingAxis = axis;
+        light.shapingX = local.normalize();
+    }
     return light;
 }
 

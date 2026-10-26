@@ -43,6 +43,8 @@ struct LightTable {
     std::vector<LightRecord> records;      // analytic lights first
     uint32_t analyticCount = 0;
     // records.size() + 1 entries (the last: the dome); empty without records.
+    // After them, the shaping blocks of kLightShaped lights and their IES
+    // grids (LightShaping in shaders/integrator/lights.h).
     std::vector<float4> alias;
     std::vector<std::shared_ptr<Texture<Color3>>> textures; // LightRecord.info.z
     struct Emitter {
@@ -515,6 +517,64 @@ inline void AddVaryingEmitters(SceneManager& scene, LightTable& table, std::vect
 
 } // namespace light_table_detail
 
+// UsdLuxShapingAPI: the fraction of an analytic light's power its shaping
+// leaves (the luminance of the cone, focus and IES factors over the
+// directions it emits in, weighted as the shape emits: uniformly for spheres,
+// points and cylinders, by the cosine to the emitting side for rect and disk
+// lights), for its selection weight. 1 without shaping.
+inline LightShaping SceneLightShaping(prism::SceneLight const& light)
+{
+    constexpr float pi = 3.14159265358979323846f;
+    LightShapingParameters const& p = light.shaping;
+    LightShaping s{};
+    s.axis = light_table_detail::F3(light.shapingAxis);
+    s.xAxis = light_table_detail::F3(light.shapingX);
+    s.focus = std::max(0.0f, p.focus);
+    s.tint = light_table_detail::F3(p.focusTint);
+    const float cutoff = std::clamp(p.coneAngle, 0.0f, 180.0f) * pi / 180.0f;
+    s.cutoff = p.coneAngle >= 180.0f ? 4.0f : cutoff;
+    s.smoothStart = cutoff * (1.0f - std::clamp(p.coneSoftness, 0.0f, 1.0f));
+    s.angleScale = p.iesAngleScale;
+    s.iesScale = 0.0f;
+    if (p.ies) {
+        s.iesScale = p.ies->peak;
+        if (p.iesNormalize) s.iesScale = p.ies->mean > 0.0f ? p.ies->peak / p.ies->mean : 0.0f;
+        s.profileSize = uint(p.ies->width) | (uint(p.ies->height) << 16u);
+    }
+    return s;
+}
+
+inline double ShapingPowerFraction(prism::SceneLight const& light)
+{
+    if (!light.shaping.active || light.shape == prism::LightShape::Distant) return 1.0;
+    const LightShaping s = SceneLightShaping(light);
+    const bool planar = light.shape == prism::LightShape::Rect || light.shape == prism::LightShape::Disk;
+    const float3 normal = light_table_detail::F3(light.normal);
+    const float3 yAxis = cross(s.xAxis, s.axis);
+    const float3 zAxis = -s.axis;
+    constexpr int kTheta = 256, kPhi = 128;
+    double shaped = 0.0, total = 0.0;
+    for (int t = 0; t < kTheta; ++t) {
+        // Uniform in cos(theta) about the local +Z: equal solid angles.
+        const float cosTheta = 1.0f - 2.0f * (float(t) + 0.5f) / float(kTheta);
+        const float sinTheta = std::sqrt(std::max(0.0f, 1.0f - cosTheta * cosTheta));
+        for (int f = 0; f < kPhi; ++f) {
+            const float phi = 2.0f * 3.14159265358979f * (float(f) + 0.5f) / float(kPhi);
+            const float3 e = s.xAxis * (sinTheta * std::cos(phi)) + yAxis * (sinTheta * std::sin(phi)) + zAxis * cosTheta;
+            const float weight = planar ? std::max(0.0f, dot(e, normal)) : 1.0f;
+            if (!(weight > 0.0f)) continue;
+            float3 factor = shapingConeFocus(s, e);
+            if (light.shaping.ies) {
+                const float2 angles = iesAngles(s, e);
+                factor = factor * (light.shaping.ies->sample(angles.x, angles.y) * s.iesScale);
+            }
+            shaped += double(weight) * light_table_detail::Luminance(Color3(factor.x, factor.y, factor.z));
+            total += double(weight) * light_table_detail::Luminance(Color3(1.0f));
+        }
+    }
+    return total > 0.0 ? shaped / total : 0.0;
+}
+
 // Vose's alias method over the selection probabilities `pmf`: x the
 // probability of keeping the column, y its alias (as float bits), z the
 // entry's probability (PathTracer::pickLight).
@@ -545,6 +605,48 @@ inline std::vector<float4> BuildAliasTable(std::vector<double> const& pmf)
     return alias;
 }
 
+// The shaping blocks of the shaped lights, then their IES grids (shared
+// between lights), after the alias entries (LightShaping).
+inline void AppendShapingBlocks(LightTable& table, std::vector<prism::SceneLight const*> const& shaped)
+{
+    if (shaped.empty()) return;
+    const size_t base = table.alias.size();
+    table.alias.resize(base + 4 * shaped.size());
+    std::vector<std::pair<prism::IesProfile const*, uint32_t>> profiles; // grid offsets from base
+    for (size_t k = 0; k < shaped.size(); ++k) {
+        prism::SceneLight const& light = *shaped[k];
+        const LightShaping s = SceneLightShaping(light);
+        uint32_t profile = 0u;
+        if (light.shaping.ies) {
+            auto found = std::find_if(profiles.begin(), profiles.end(),
+                                      [&](auto const& p) { return p.first == light.shaping.ies.get(); });
+            if (found != profiles.end()) {
+                profile = found->second;
+            } else {
+                profile = uint32_t(table.alias.size() - base);
+                profiles.emplace_back(light.shaping.ies.get(), profile);
+                // The grid, then the maximum of each row.
+                prism::IesProfile const& ies = *light.shaping.ies;
+                std::vector<float> values = ies.grid;
+                for (int j = 0; j < ies.height; ++j)
+                    values.push_back(*std::max_element(ies.grid.begin() + size_t(j) * size_t(ies.width),
+                                                       ies.grid.begin() + size_t(j + 1) * size_t(ies.width)));
+                const size_t first = table.alias.size();
+                table.alias.resize(first + (values.size() + 3) / 4, float4(0.0f));
+                for (size_t i = 0; i < values.size(); ++i) {
+                    float4& q = table.alias[first + i / 4];
+                    (i % 4 == 0 ? q.x : i % 4 == 1 ? q.y : i % 4 == 2 ? q.z : q.w) = values[i];
+                }
+            }
+        }
+        float4* block = &table.alias[base + 4 * k];
+        block[0] = float4(s.axis, s.focus);
+        block[1] = float4(s.xAxis, s.cutoff);
+        block[2] = float4(s.tint, s.smoothStart);
+        block[3] = float4(s.angleScale, s.iesScale, asfloat(profile), asfloat(s.profileSize));
+    }
+}
+
 inline LightTable BuildLightTable(SceneManager& scene, size_t maxEmitterTriangles = kMaxEmitterTriangles)
 {
     using namespace light_table_detail;
@@ -563,6 +665,7 @@ inline LightTable BuildLightTable(SceneManager& scene, size_t maxEmitterTriangle
 
     table.lobes = EnvironmentHasLobes(scene.environment);
     std::vector<double> weights;
+    std::vector<prism::SceneLight const*> shaped; // kLightShaped records, by block
     for (prism::SceneLight const& light : scene.lights) {
         if (!(Luminance(light.radiance) > 0.0f)) continue;
         table.lobes |= light.diffuse != 1.0f || light.specular != 1.0f;
@@ -608,8 +711,15 @@ inline LightTable BuildLightTable(SceneManager& scene, size_t maxEmitterTriangle
             break;
         }
         if (record.info.x != kLightDistant && record.info.x != kLightPoint && !(light.area > 0.0f)) continue;
+        double weight = double(prism::LightPower(light, sceneRadius));
+        if (light.shaping.active && record.info.x != kLightDistant) {
+            record.info.y |= kLightShaped;
+            record.lobes.z = asfloat(uint32_t(shaped.size()));
+            shaped.push_back(&light);
+            weight *= ShapingPowerFraction(light);
+        }
         table.records.push_back(record);
-        weights.push_back(std::max(1e-12, double(prism::LightPower(light, sceneRadius))));
+        weights.push_back(std::max(1e-12, weight));
     }
     table.analyticCount = uint32_t(table.records.size());
 
@@ -743,6 +853,7 @@ inline LightTable BuildLightTable(SceneManager& scene, size_t maxEmitterTriangle
     }
 
     table.alias = BuildAliasTable(pmf);
+    AppendShapingBlocks(table, shaped);
     return table;
 }
 
