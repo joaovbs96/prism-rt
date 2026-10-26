@@ -458,6 +458,55 @@ static size_t KernelBaseBytes()
 // Closer to the threshold, the link unit decides as before.
 constexpr double kEstimateMargin = 1.15;
 
+void ReportVulkanPrograms(SceneManager& scene, std::ostream& out)
+{
+    using namespace std::chrono;
+    const GpuSceneData data = gpu::BuildGpuScene(scene);
+    size_t varying = 0;
+    for (auto const* m : data.mdlMaterials) varying += m->variesEmission() ? 1 : 0;
+    out << std::format("materials {} varying_emitters {}\n", data.mdlMaterials.size(), varying);
+    if (data.mdlMaterials.empty()) return;
+    const size_t estimate = KernelBaseBytes() + gpu::EstimatedLinkUnitBytes(gpu::ProgramCodes(data.mdlMaterials));
+    const bool perProgram = double(estimate) > double(vulkan::CallableThresholdBytes()) * kEstimateMargin;
+    out << std::format("estimate_kb {} layout {}\n", estimate >> 10, perProgram ? "programs" : "link_unit");
+    auto const shared = perProgram ? gpu::CachedProgramShaderCode(data.mdlMaterials)
+                                   : gpu::CachedMdlShaderCode(data.mdlMaterials);
+    auto const& code = *shared;
+    out << std::format("programs {} varying_define {} success {}\n", code.programCount, code.varyingEmitters,
+                       code.success);
+    const auto cache = gpu::ShaderCacheDirectory("report");
+    auto compile = [&](std::string const& label, std::string const& source, gpu::HlslStage const& stage) {
+        std::vector<char> binary;
+        std::string error;
+        const auto start = steady_clock::now();
+        const bool ok = gpu::CompileHlsl(source, gpu::HlslTarget::Spirv, cache, &binary, &error, stage);
+        out << std::format("{} hlsl_kb {} spirv_kb {} dxc_s {:.1f}{}\n", label, source.size() >> 10,
+                           binary.size() >> 10, duration<double>(steady_clock::now() - start).count(),
+                           ok ? "" : " FAILED " + error.substr(0, 200));
+    };
+    if (!code.perProgram) {
+        std::string source;
+        if (AssembleVulkanKernel(code.code, &source, nullptr)) {
+            const bool callables = source.size() > vulkan::CallableThresholdBytes();
+            out << std::format("link_unit_kernel_kb {} -> {}\n", source.size() >> 10,
+                               callables ? "callables" : "megakernel");
+            if (!callables) {
+                compile("megakernel", source, {});
+                return;
+            }
+        }
+    }
+    std::vector<std::string> sources;
+    std::string error;
+    if (!vulkan::MaterialCallSources(code, false, &sources, &error)) {
+        out << "callable sources failed: " << error << '\n';
+        return;
+    }
+    for (size_t i = 0; i < sources.size(); ++i)
+        compile(i == 0 ? std::string("raygen") : std::format("callable{}", i - 1), sources[i],
+                gpu::HlslStage{vulkan::kMaterialCallProfile, ""});
+}
+
 // Callables compiled while the scene's materials still compile: every program
 // translated early (gpu::AddProgramListener) gets its callable compiled in the
 // background once the material set is known to use callables. Shared with

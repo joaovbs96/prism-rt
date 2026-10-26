@@ -3,6 +3,7 @@
 #include "../cpu_device.h"
 #include "../gpu/gpu_device.h"
 
+#include <iosfwd>
 #include <memory>
 #include <string>
 
@@ -62,5 +63,8 @@ private:
 // With lightAovs, the variant that also writes the light AOVs (PRISM_LIGHT_AOVS).
 bool CompileVulkanKernel(std::string const& mdlCode, std::vector<uint32_t>* spirv, std::string* error,
                          uint32_t programCount = 0, bool lightAovs = false);
+
+// Diagnostics without a Vulkan device: the GPU programs of the scene's materials and their SPIR-V sizes.
+void ReportVulkanPrograms(SceneManager& scene, std::ostream& out);
 
 } // namespace prism::device

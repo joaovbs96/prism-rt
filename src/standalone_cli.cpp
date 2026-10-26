@@ -1014,6 +1014,11 @@ int runStandaloneCli(int argc, char** argv) {
                              "--default-dome false override this\n";
             }
         }
+        if (const char* report = std::getenv("PRISM_GPU_PROGRAM_REPORT"); report && *report == '1') {
+            if (!prism::device::ReportGpuPrograms(scene, std::cout))
+                std::cerr << "PrismRT: this build has no Vulkan device\n";
+            return 0;
+        }
         progress.Stage("Creating the render device");
         std::string deviceNote;
         auto renderDevice = prism::device::CreateDevice(o.device, &deviceNote);

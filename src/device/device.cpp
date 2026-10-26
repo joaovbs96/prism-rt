@@ -52,6 +52,17 @@ std::string RemovedDeviceMessage(std::string_view text)
     return {};
 }
 
+bool ReportGpuPrograms(SceneManager& scene, std::ostream& out)
+{
+#ifdef PRISM_HAS_VULKAN
+    ReportVulkanPrograms(scene, out);
+    return true;
+#else
+    (void)scene; (void)out;
+    return false;
+#endif
+}
+
 namespace {
 
 // Returns null (with a reason) if the device is unavailable.

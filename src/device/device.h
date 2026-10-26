@@ -16,6 +16,7 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <iosfwd>
 #include <memory>
 #include <span>
 #include <string>
@@ -257,6 +258,10 @@ public:
 
 // Devices compiled into this build with a usable adapter, CPU always last.
 std::vector<DeviceInfo> AvailableDevices();
+
+// Diagnostics without a GPU device (PRISM_GPU_PROGRAM_REPORT): the scene's GPU programs and their sizes.
+// False if this build has no Vulkan device.
+bool ReportGpuPrograms(SceneManager& scene, std::ostream& out);
 
 // Creates the preferred device. If it is unavailable, falls back to the CPU
 // device and explains why in *note (when non-null).
