@@ -678,6 +678,12 @@ if(PRISM_BUILD_HYDRA)
         add_test(NAME prism_dielectric_albedo_test COMMAND prism_dielectric_albedo_test)
         set_tests_properties(prism_dielectric_albedo_test PROPERTIES
             ENVIRONMENT "${_prism_test_environment}" SKIP_RETURN_CODE 77)
+        # Repaired dielectrics keep the library's class parameters and code size (CPU, no device).
+        add_executable(prism_dielectric_program_size_test tests/dielectric_program_size.cpp)
+        target_link_libraries(prism_dielectric_program_size_test PRIVATE PrismRT::core)
+        add_test(NAME prism_dielectric_program_size_test COMMAND prism_dielectric_program_size_test)
+        set_tests_properties(prism_dielectric_program_size_test PROPERTIES
+            ENVIRONMENT "${_prism_test_environment}" SKIP_RETURN_CODE 77)
     endif()
     # The CLI must exit cleanly: process-wide caches holding MDL handles once outlived
     # libmdl_sdk and crashed in static destruction after the image was written.

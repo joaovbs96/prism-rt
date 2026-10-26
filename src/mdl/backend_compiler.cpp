@@ -808,10 +808,20 @@ TargetCode BackendCompiler::generate_target_code(const CompiledMaterial& compile
     size_t backface_bsdf_idx = 0;
     size_t backface_edf_idx = 0;
     size_t backface_emission_intensity_idx = 0;
+    // A thin wall with the same shader on both sides (DocumentLoader's
+    // thin-walled repair) scatters its backface with the surface's function
+    // rather than a second copy of the same code.
+    const bool backfaceScatteringIsSurface =
+        classMaterial->get_slot_hash(mi::neuraylib::SLOT_BACKFACE_SCATTERING) ==
+        classMaterial->get_slot_hash(mi::neuraylib::SLOT_SURFACE_SCATTERING);
 
     if (has_backface) {
-        backface_bsdf_idx = descs.size();
-        descs.push_back(mi::neuraylib::Target_function_description("backface.scattering"));
+        if (backfaceScatteringIsSurface) {
+            backface_bsdf_idx = 1;
+        } else {
+            backface_bsdf_idx = descs.size();
+            descs.push_back(mi::neuraylib::Target_function_description("backface.scattering"));
+        }
 
         backface_edf_idx = descs.size();
         descs.push_back(mi::neuraylib::Target_function_description("backface.emission.emission"));

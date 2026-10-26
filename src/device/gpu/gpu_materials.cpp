@@ -101,6 +101,10 @@ struct ProgramTraits {
     bool backfaceEmissionZero = false;
     bool volumeZero = false;          // no medium behind the surface
     bool volumeAnisotropy = false;    // the phase function's anisotropy is addressable
+    // backface.scattering is surface.scattering (a thin wall with the same
+    // shader on both sides, DocumentLoader's thin-walled repair): its
+    // backface uses the surface's function instead of a second copy.
+    bool backfaceScatteringIsSurface = false;
 };
 
 mi::base::Handle<const mi::neuraylib::IValue> ConstantValue(
@@ -147,6 +151,8 @@ ProgramTraits TraitsOf(mi::neuraylib::ICompiled_material const* material)
     mi::base::Handle<const mi::neuraylib::IExpression> bias(
         material->lookup_sub_expression("volume.scattering.directional_bias"));
     traits.volumeAnisotropy = bias.is_valid_interface();
+    traits.backfaceScatteringIsSurface = material->get_slot_hash(mi::neuraylib::SLOT_BACKFACE_SCATTERING) ==
+                                         material->get_slot_hash(mi::neuraylib::SLOT_SURFACE_SCATTERING);
     return traits;
 }
 
@@ -157,7 +163,7 @@ bool NeedsEntry(ProgramTraits const& t, size_t entry)
     case E_EDF: case E_INTENSITY: return !t.emissionZero;
     case E_CUTOUT: return !t.cutoutConstant;
     case E_THIN_WALLED: return t.thinWalled < 0;
-    case E_BACK_BSDF: return t.thinWalled != 0;
+    case E_BACK_BSDF: return t.thinWalled != 0 && !t.backfaceScatteringIsSurface;
     case E_BACK_EDF: case E_BACK_INTENSITY: return t.thinWalled != 0 && !t.backfaceEmissionZero;
     case E_VOLUME_ABSORPTION: case E_VOLUME_SCATTERING: return !t.volumeZero && t.thinWalled != 1;
     case E_VOLUME_ANISOTROPY: return !t.volumeZero && t.thinWalled != 1 && t.volumeAnisotropy;
@@ -277,8 +283,35 @@ std::string GenerateDispatch(std::vector<std::array<bool, kEntryPointCount>> con
         std::string call = std::string("{}") + suffix + "(data, state); return true;";
         s += std::format("bool {}(uint program, bool backface, inout {} data, {} {} state)\n{{\n",
                          name, dataType, inoutState, state);
-        s += "    if (backface) {\n" + cases(back, call.c_str(), "break;") + "    }\n";
-        s += "    else {\n" + cases(front, call.c_str(), "break;") + "    }\n";
+        // Programs whose backface scatters with the surface's function
+        // (backfaceScatteringIsSurface) reach it from the surface's call
+        // site: DXC inlines every call of a program's code.
+        auto aliased = [&](size_t p) {
+            return back == E_BACK_BSDF && included(p) && !present[p][back] && present[p][front] &&
+                   traits[p].backfaceScatteringIsSurface;
+        };
+        bool anyAliased = false;
+        for (size_t p = 0; p < present.size(); ++p) anyAliased = anyAliased || aliased(p);
+        if (!anyAliased) {
+            s += "    if (backface) {\n" + cases(back, call.c_str(), "break;") + "    }\n";
+            s += "    else {\n" + cases(front, call.c_str(), "break;") + "    }\n";
+            s += "    return false;\n}\n\n";
+            return;
+        }
+        std::string backCases = selector;
+        for (size_t p = 0; p < present.size(); ++p) {
+            if (!included(p)) continue;
+            if (aliased(p)) {
+                backCases += std::format("    case {}u: useSurface = true; break;\n", p);
+            } else if (present[p][back]) {
+                const std::string function = ProgramFunction(uint32_t(p), back);
+                backCases += std::format("    case {}u: {}\n", p, std::vformat(call, std::make_format_args(function)));
+            }
+        }
+        backCases += "    default: break;\n    }\n";
+        s += "    bool useSurface = !backface;\n";
+        s += "    if (backface) {\n" + backCases + "    }\n";
+        s += "    if (useSurface) {\n" + cases(front, call.c_str(), "break;") + "    }\n";
         s += "    return false;\n}\n\n";
     };
     init("prism_mdl_init");
@@ -377,7 +410,7 @@ std::filesystem::path StructuralKeyFile(std::string const& identity)
     const std::string stable = colon == std::string::npos ? identity : identity.substr(colon + 1);
     return prism::PersistentCacheRoot() / "gpu-structure" /
         (Digest(stable + "|hlsl" +
-                "|mdl-" MI_NEURAYLIB_PRODUCT_VERSION_STRING "|v4") + ".key");
+                "|mdl-" MI_NEURAYLIB_PRODUCT_VERSION_STRING "|v5") + ".key");
 }
 
 // Defined with the per-program layout below.
@@ -850,7 +883,7 @@ std::filesystem::path ProgramFile(std::string const& classKey)
 {
     return prism::PersistentCacheRoot() / "gpu-programs" /
         (Digest(classKey + "|hlsl-alone|mdl-" MI_NEURAYLIB_PRODUCT_VERSION_STRING "|results-" +
-                std::to_string(kGpuTextureResults) + "|v2") + ".prog");
+                std::to_string(kGpuTextureResults) + "|v3") + ".prog");
 }
 
 constexpr char kProgramMagic[8] = {'P', 'R', 'S', 'M', 'P', 'R', 'G', '1'};

@@ -133,9 +133,10 @@ int main(int argc, char** argv)
         check(vk::MaterialCallSources(code, false, &sources, &error), "callable sources: " + error);
         check(sources.size() > 0 && sources[0].find("#define PRISM_VARYING_EMITTERS 1") != std::string::npos,
               "the raygen shader evaluates varying emitters");
-        // Large programs (the glass) are a sample and an evaluate part, which
-        // the driver compiles in much less memory than the whole program;
-        // the small ones (the emitters) stay whole.
+        // Large programs would be a sample and an evaluate part, which the
+        // driver compiles in much less memory than the whole program
+        // (prism_gpu_shader_compile_test covers that layout); here every
+        // program, the glass included, is small enough to stay whole.
         const std::vector<uint32_t> slots = vk::CallableSlots(sources);
         check(slots.size() == 2 * code.programs.size(), "two callable slots per program");
         size_t largest = 0, smallest = SIZE_MAX, largestProgram = 0, split = 0;
@@ -176,17 +177,19 @@ int main(int argc, char** argv)
             }
             largestProgram = std::max(largestProgram, program);
         }
-        check(split == 1, std::format("only the glass program is split, not {}", split));
-        // The glass is the largest program: 8.7 MB of SPIR-V whole, 12.1 MB
-        // with two evaluation call sites; split, its sample part is 5.2 MB.
-        check(largestProgram < 10 * MiB, std::format("largest program {} KB below 10 MiB", largestProgram >> 10));
-        check(largest < 6 * MiB, std::format("largest callable {} KB below 6 MiB", largest >> 10));
-        check(largest > 3 * smallest, "the glass callable is the largest by far");
+        check(split == 0, std::format("no program is split, not {}", split));
+        // The glass is the largest program: 2.3 MB of SPIR-V. Its dielectric
+        // repair rewrites a private copy of the surface's graph; flattened
+        // into the material instead, its constants became class parameters
+        // and the program 8.7 MB (12.1 MB with two evaluation call sites).
+        check(largestProgram < 3 * MiB, std::format("largest program {} KB below 3 MiB", largestProgram >> 10));
+        check(largest == largestProgram, "the largest program is one callable");
+        check(largest > 2 * smallest, "the glass callable is the largest by far");
         // A lower limit refuses it before any pipeline is created.
-        SetVariable("PRISM_VULKAN_MAX_SPIRV_MIB", "4");
+        SetVariable("PRISM_VULKAN_MAX_SPIRV_MIB", "2");
         check(vk::DriverSpirvLimitError(largest, "material callable").find("too large for the driver") !=
                   std::string::npos,
-              "PRISM_VULKAN_MAX_SPIRV_MIB=4 refuses the glass callable");
+              "PRISM_VULKAN_MAX_SPIRV_MIB=2 refuses the glass callable");
         SetVariable("PRISM_VULKAN_MAX_SPIRV_MIB", nullptr);
     }
     rtcReleaseDevice(device);
