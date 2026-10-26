@@ -572,6 +572,16 @@ if(PRISM_BUILD_HYDRA)
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/parity.usda")
     set_tests_properties(prism_gpu_shader_compile_test PROPERTIES ENVIRONMENT "${_prism_test_environment}")
 
+    # The Vulkan material shaders of several textured emitters and a rough
+    # glass stay within the driver's compile budget (DXC only, no device).
+    if(PRISM_ENABLE_VULKAN)
+        add_executable(prism_gpu_program_budget_test tests/gpu_program_budget.cpp)
+        target_link_libraries(prism_gpu_program_budget_test PRIVATE PrismRT::core)
+        add_test(NAME prism_gpu_program_budget_test COMMAND prism_gpu_program_budget_test
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/textured_emitters_glass.usda")
+        set_tests_properties(prism_gpu_program_budget_test PROPERTIES ENVIRONMENT "${_prism_test_environment}")
+    endif()
+
     add_executable(prism_gpu_codegen_dump tests/gpu_codegen_dump.cpp)
     target_link_libraries(prism_gpu_codegen_dump PRIVATE PrismRT::core)
 
@@ -1162,6 +1172,27 @@ if(TARGET prism_hydra_render AND TARGET prism_compare_images)
                     --tolerance 0.1 --mean-tolerance 0.005)
             set_tests_properties(prism_textured_emitter_vulkan_parity PROPERTIES
                 FIXTURES_REQUIRED "prism_scene_features_textured_emitter_mis;prism_textured_emitter_vulkan")
+            # Several textured emitters (each its own program, evaluated at
+            # light samples) and a rough tinted glass, the largest program:
+            # its callable compiles within the driver budget (no CPU
+            # fallback), and the image matches the CPU's.
+            set(_prism_emitters_glass "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/textured_emitters_glass.usda")
+            foreach(_device cpu vulkan)
+                add_test(NAME prism_textured_emitters_glass_${_device}_render
+                    COMMAND PrismRT --scene "${_prism_emitters_glass}" --camera /World/Camera --width 64 --height 64
+                        --spp 256 ${_prism_fixed_sampling} --device ${_device} --max-sample-radiance 0
+                        --output "${CMAKE_BINARY_DIR}/scene_features/textured_emitters_glass_${_device}.exr")
+                set_tests_properties(prism_textured_emitters_glass_${_device}_render PROPERTIES
+                    ENVIRONMENT "${_prism_test_environment}"
+                    FIXTURES_SETUP prism_textured_emitters_glass_${_device}
+                    FAIL_REGULAR_EXPRESSION "magenta error material;cannot render the scene on the GPU")
+            endforeach()
+            add_test(NAME prism_textured_emitters_glass_vulkan_parity
+                COMMAND prism_compare_images "${CMAKE_BINARY_DIR}/scene_features/textured_emitters_glass_cpu.exr"
+                    "${CMAKE_BINARY_DIR}/scene_features/textured_emitters_glass_vulkan.exr"
+                    --tolerance 0.15 --mean-tolerance 0.01)
+            set_tests_properties(prism_textured_emitters_glass_vulkan_parity PROPERTIES
+                FIXTURES_REQUIRED "prism_textured_emitters_glass_cpu;prism_textured_emitters_glass_vulkan")
         endif()
     endif()
     if(TARGET prism_render_settings_test)
@@ -1393,7 +1424,7 @@ set(_prism_gpu_test_regex
     "|^prism_parity_.*_(vulkan|metal)_(cli|hydra|match)$"
     "|^prism_parity_.*_(vulkan|metal)_.*_(match|layer|exact)$"
     "|^prism_scene_features_.*_vulkan$"
-    "|^prism_textured_emitter_vulkan_(render|parity)$")
+    "|^prism_textured_emitters?(_glass)?_vulkan_(render|parity)$")
 string(JOIN "" _prism_gpu_test_regex ${_prism_gpu_test_regex})
 get_property(_prism_tests DIRECTORY PROPERTY TESTS)
 foreach(_test IN LISTS _prism_tests)
