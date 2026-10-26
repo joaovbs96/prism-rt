@@ -144,10 +144,12 @@ int RunAuthoredSettingsTests()
             const VtValue previousTime = delegate.GetRenderSetting(timeLimit);
             const VtValue previousThreshold = delegate.GetRenderSetting(threshold);
             const VtValue previousLevel = delegate.GetRenderSetting(level);
-            delegate.SetRenderSetting(timeLimit, VtValue(2.5f));
+            // The time limit is a float setting (usdview has no editor for
+            // double); author it as a double.
+            delegate.SetRenderSetting(timeLimit, VtValue(2.5));
             delegate.SetRenderSetting(threshold, VtValue(0.02));
             delegate.SetRenderSetting(level, VtValue(9));
-            Require(delegate.GetRenderSetting(timeLimit).UncheckedGet<double>() == 2.5 &&
+            Require(delegate.GetRenderSetting(timeLimit).UncheckedGet<float>() == 2.5f &&
                         delegate.GetRenderSetting(threshold).UncheckedGet<float>() == 0.02f &&
                         delegate.GetRenderSetting(level).UncheckedGet<int>() == 6,
                     "Time limit, threshold or subdivision level were not applied (or not clamped)");
