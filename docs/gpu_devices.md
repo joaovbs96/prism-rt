@@ -140,7 +140,16 @@ ray tracing pipeline (`VK_KHR_ray_tracing_pipeline`,
   link unit gives it the same code. It runs the megakernel's own code: the
   program's init on the prepared shading point, then `GpuBackend::shade`
   (BSDF sample, BSDF towards the light sample, medium). With the integrator's
-  step functions that is one call per surface bounce.
+  step functions that is one call per surface bounce. Programs whose
+  generated code exceeds `PRISM_VULKAN_SPLIT_PROGRAM_KIB` (default 1536; the
+  OpenPBR playground's transmissive programs, about 2.4 MB, against 0.7 MB
+  for its opaque ones) are two callables instead, a sample part (init, BSDF
+  sample, medium; also the cutout and emission queries) and an evaluate part
+  (init, the BSDF evaluations), which the raygen shader calls only when the
+  sample needs an evaluation (see the [driver compile
+  budget](#driver-compile-budget)). Every program has two callable slots,
+  `2 x program` and `2 x program + 1`; a whole program fills both with its
+  one callable and answers `kMaterialCallEvaluated`.
 - **Intersection stays in inline ray queries** inside the raygen shader, not
   `TraceRay`: the hit shading is the material, which is already a callable;
   the query loop (including the analytic sphere test) is the megakernel's,
@@ -190,7 +199,10 @@ ray tracing pipeline (`VK_KHR_ray_tracing_pipeline`,
   materials are known.
 - **Payload.** 47 words in (the shading point fields the MDL state and BSDF
   read, the BSDF sample point, the light direction, the RNG state) and 21
-  out: 272 bytes through the callable's stack per call.
+  out: 272 bytes through the callable's stack per call. A split program's
+  sample part leaves its answer in the payload and its evaluate part adds
+  the evaluations, so the raygen shader keeps nothing else live across the
+  calls.
 - **Fallback.** If the pipeline cannot be built, the scene renders on the
   CPU device as before.
 
@@ -295,12 +307,28 @@ time: 2 MB of SPIR-V took 5 s and 0.2-0.45 GB, 6.9 MB 44 s and 1.4 GB, 15 MB
 (tape: 2.7 to 9.5 MB of SPIR-V), since 4fed928 the CLI loads all 53 of its
 materials (14 of them transmissive: 9.5-21 MB each), and the device
 compiled 16 libraries at once. The emitter work of phase 5 was not involved
-(the same sizes without it). Three changes keep the driver within bounds:
+(the same sizes without it). Four changes keep the driver within bounds and
+the cold compile short:
 
 - **One BSDF evaluation call site** (`GpuBackend::shade`). DXC inlines every
   call of a program's code; the light lobes' second evaluation made the
   callables 1.4 times larger (OpenPBR 21 to 15 MB, 9.5 to 6.9, opaque 2.7 to
   2.0). The light-sample and lobe evaluations now run in one loop.
+- **Large programs split into two callables** (`MaterialCallPart`,
+  `PRISM_VULKAN_SPLIT_PROGRAM_KIB`, default 1536 KiB of generated code; 0
+  splits every program). The sample part (init, BSDF sample, medium, cutout
+  and emission queries) and the evaluate part (init, BSDF evaluations) of
+  OpenPBR's coupled glass are 9.0 and 6.0 MB of SPIR-V instead of 15 MB
+  whole, estimated 2.1 and 1.1 GB to compile instead of 5.3 GB; its
+  thin-film glass 4.2 and 2.7 MB instead of 6.9. The raygen shader calls
+  slot `2 x program`, then `2 x program + 1` from the same call site only
+  when a split program's sample needs an evaluation; the sample part leaves
+  its answer in the payload. Images are bit-identical to whole programs
+  (OpenPBR, the glass fixture with every program split). A split program
+  runs the MDL init twice when it evaluates: OpenPBR at 640x360, 16 spp,
+  took 0.96 s of GPU time against 0.83 s with whole programs (single runs).
+  DXC's estimate for a part is 60% (sample) or 45% (evaluate) of the
+  whole's: measured peaks 1027 and 724 MiB against 1740 MiB whole.
 - **A compile memory budget.** Each driver compile (pipeline library,
   compute kernel; a monolithic pipeline compiles on one thread when its
   shaders together exceed the budget) and each callable's DXC process holds
@@ -317,16 +345,19 @@ compiled 16 libraries at once. The emitter work of phase 5 was not involved
   the CPU device (status `cpu (Vulkan fallback: shader too large for the
   driver)`). 0 disables the limit.
 
-OpenPBR playground, CLI, 640x360, 16 spp, cold (`PRISM_VULKAN_SHADER_SALT`),
-under a 24 GB job cap (budget 6 GB): 22 callables, DXC and driver 1390 s
-(libraries 1453 s summed, slowest 128 s), process peak 18.3 GB, rendered on
-Vulkan; against the CPU NRMSE 0.32 and mean 0.42% (noise floor, CPU seed 0
-against 1: 0.46, 0.42%). Warm runs read the pipeline caches. The cold
-compile stays long because the 8 largest programs (15 MB) compile one at a
-time under the cap; smaller transmissive programs (splitting a program's
-sample and evaluation into separate callables, or leaner dielectric repairs)
-would shorten it.
-
+OpenPBR playground, CLI, 640x360, 16 spp, `--adaptive-threshold 0`, 32 GB
+job cap (budget 8 GB). Cold (`PRISM_VULKAN_SHADER_SALT`): whole programs
+(before the split, 24 GB cap, budget 6 GB) 22 callables, DXC and driver
+1390 s (libraries 1453 s summed, slowest 128 s; the eight 15 MB programs
+compile one at a time), 1468 s in all; split, 37 callables (8 opaque
+programs whole, 14 transmissive split), 334 s (libraries 1299 s summed,
+slowest 64 s; DXC 30 s at most, peak 1031 MiB), 412 s in all, of which
+70 s are the scene load (USD, MDL, textures). Peak of PrismRT and DXC
+together 18-20 GB. Warm (SPIR-V and pipeline caches present): shaders 1 s,
+scene 3.7 s, 79 s in all. With the pipeline caches but not the SPIR-V
+cache (a shader source change that leaves the SPIR-V unchanged): 78 s of
+DXC. The image is bit-identical to the whole programs' (against the CPU:
+NRMSE 0.32, mean 0.42%; noise floor 0.46, 0.42%).
 `PRISM_GPU_PROGRAM_REPORT=1` makes the CLI print, after loading the scene,
 the layout, program count and each shader's HLSL and SPIR-V size, DXC time
 and estimated driver memory (DXC only, no device), and exit;
@@ -725,6 +756,17 @@ called done there.
     and `light_lobes.usda` with `--device metal` against `--device cpu`
     (`prism_compare_images`); chess and an egg against the previous build
     (expect float-level differences at most, as the code moved).
+- **Sample and evaluate callables** ([driver compile budget](#driver-compile-budget)):
+  - Shared shader code, Vulkan paths only: the `PRISM_CALL_MATERIALS` branch of
+    `GpuBackend::shade` (`shaders/gpu/gpu_backend.hlsl`), `material_call.hlsl`
+    (`kMaterialCallEvaluated`, `materialCallEvaluations`,
+    `storeMaterialEvaluation`; `storeMaterialResult` keeps the feedback
+    bits) and `shaders/gpu/vulkan/`. The Metal kernel is built without
+    `PRISM_CALL_MATERIALS`: its source only gains two unused
+    `material_call.hlsl` functions.
+  - Runs: build the Metal kernel for chess and an egg and check its DXIL is
+    identical to the previous build's (or the images bit-identical on
+    `--device metal`).
 
 ## Diagnostics
 
@@ -744,6 +786,8 @@ called done there.
   `PRISM_VULKAN_COMPILE_THREADS=<n>`, `PRISM_VULKAN_PIPELINE_LIBRARIES=0`
   (one monolithic pipeline), `PRISM_VULKAN_TRIM_CALLABLES=0` (callables with
   the whole link unit): the callable path (above).
+- `PRISM_VULKAN_SPLIT_PROGRAM_KIB=<n>` (0: split every program): programs
+  above this much generated code become sample and evaluate callables.
 - `PRISM_VULKAN_MAX_SPIRV_MIB=<n>` (0: no limit),
   `PRISM_VULKAN_DRIVER_MEMORY_MIB=<n>` and `PRISM_GPU_PROGRAM_REPORT=1`
   (CLI, no device): the [driver compile budget](#driver-compile-budget).
