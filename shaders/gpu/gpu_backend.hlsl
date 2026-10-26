@@ -1022,10 +1022,10 @@ struct GpuBackend {
         const GpuMaterial callee = gpu_material(shading.material);
         if (callee.info.x == kMaterialMdl) {
             // The program's whole callable answers the query; a program split
-            // in two answers the sample, then (when the result needs it) its
-            // evaluate part the evaluations: the same arithmetic as below.
+            // in two answers the sample, then (when the answer needs it) its
+            // evaluate part adds the evaluations to the payload: the same
+            // arithmetic as below. Nothing else stays live across the calls.
             MaterialCall call = materialCall(shading.surface, shading.material, kMaterialCallShade);
-            const uint inputs = call.flags;
             call.xi = query.xi;
             call.lightWi = query.lightWi;
             if (query.evaluateLight) call.flags |= kMaterialCallEvaluateLight;
@@ -1036,21 +1036,11 @@ struct GpuBackend {
             prism_reorder_thread(callee.info.y, PRISM_REORDER_HINT_BITS);
 #endif
             prism_call_material(callee.info.y, call);
-            rng.state = call.rng;
-            MaterialResult result = loadMaterialResult(call);
-            if ((call.flags & kMaterialCallEvaluated) != 0u) return result;
-            const bool light = evaluatesLight(query, result.sample);
-            const bool lobes = query.lobes && result.sample.scattered && !result.sample.delta &&
-                               !result.sample.null_event;
-            if (light || lobes) {
-                call.flags = inputs | (light ? kMaterialCallEvaluateLight : 0u) |
-                             (query.lobes ? kMaterialCallLobes : 0u) | (lobes ? kMaterialCallEvaluateSample : 0u);
-                call.lightWi = query.lightWi;
-                call.wi = result.sample.wi;
+            bool light, lobes;
+            if ((call.flags & kMaterialCallEvaluated) == 0u && materialCallEvaluations(call.flags, light, lobes))
                 prism_call_material_evaluate(callee.info.y, call);
-                loadMaterialEvaluation(call, result);
-            }
-            return result;
+            rng.state = call.rng;
+            return loadMaterialResult(call);
         }
 #endif
         MaterialResult result;

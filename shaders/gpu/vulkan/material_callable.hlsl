@@ -44,9 +44,10 @@ void material(inout MaterialCall call)
     gpu_mdl_init_shading(shading, material);
     GpuBackend backend;
     backend.rng.state = call.rng; // evaluations draw no random numbers
-    // shade's evaluation loop: one call site (DXC inlines each call).
-    const bool light = (call.flags & kMaterialCallEvaluateLight) != 0u;
-    const bool lobes = (call.flags & kMaterialCallEvaluateSample) != 0u;
+    // shade's evaluation loop: one call site (DXC inlines each call). The
+    // sample part's answer in the payload says what to evaluate.
+    bool light, lobes;
+    materialCallEvaluations(call.flags, light, lobes);
     BsdfEvaluation lightEvaluation = invalidBsdfEvaluation();
     float3 sampleDiffuse = (float3)0.0f;
     [loop] for (uint pass = light ? 0u : 1u; pass < (lobes ? 2u : 1u); ++pass) {

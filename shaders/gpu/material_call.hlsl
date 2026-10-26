@@ -25,8 +25,6 @@ static const uint kMaterialCallLobes = 2048u;   // MaterialQuery::lobes
 // Instead of shading: the emission toward the caller (`emission`), for light
 // samples on triangles of varying emission (GpuBackend::emitterRadiance).
 static const uint kMaterialCallEmitted = 1u << 24u;
-// The evaluate part: also the BSDF towards the sample's direction `wi` (light lobes).
-static const uint kMaterialCallEvaluateSample = 1u << 25u;
 // Output of a whole program's callable: the evaluations are done (no call of
 // the evaluate part follows).
 static const uint kMaterialCallEvaluated = 1u << 26u;
@@ -194,8 +192,10 @@ void storeMaterialResult(inout MaterialCall call, MaterialResult result)
         call.lobes1 = packUnorm16x2(light.z, result.sampleDiffuse.x);
         call.lobes2 = packUnorm16x2(result.sampleDiffuse.y, result.sampleDiffuse.z);
     }
+    // The inputs stay: a split program's evaluate part reads them next.
     uint flags = call.flags & (kMaterialCallModeMask | kMaterialCallFrontFace | kMaterialCallFiltered |
-                               kMaterialCallEvaluateLight | kMaterialCallLobes);
+                               kMaterialCallEvaluateLight | kMaterialCallLobes | kMaterialCallFeedback |
+                               (kMaterialCallFeedbackWeightMask << kMaterialCallFeedbackWeightShift));
     if (result.sample.scattered) flags |= kMaterialCallScattered;
     if (result.sample.delta) flags |= kMaterialCallDelta;
     if (result.sample.null_event) flags |= kMaterialCallNullEvent;
@@ -205,9 +205,21 @@ void storeMaterialResult(inout MaterialCall call, MaterialResult result)
     call.flags = flags;
 }
 
+// What a split program's evaluate part computes after its sample part
+// answered `flags` (GpuBackend::shade's conditions): the BSDF towards the light
+// sample, and (light lobes) towards the sampled direction. False: nothing.
+bool materialCallEvaluations(uint flags, out bool light, out bool lobes)
+{
+    const bool nullEvent = (flags & kMaterialCallNullEvent) != 0u;
+    light = (flags & kMaterialCallEvaluateLight) != 0u && !nullEvent;
+    lobes = (flags & kMaterialCallLobes) != 0u && (flags & kMaterialCallScattered) != 0u &&
+            (flags & kMaterialCallDelta) == 0u && !nullEvent;
+    return light || lobes;
+}
+
 // The evaluate part (PRISM_MATERIAL_CALL_EVALUATE): the BSDF towards
-// `lightWi` (kMaterialCallEvaluateLight) and the diffuse fraction towards the
-// sample `wi` (kMaterialCallLobes), in the fields loadMaterialResult reads.
+// `lightWi` and the diffuse fraction towards the sample `wi`, in the fields
+// loadMaterialResult reads. The sample part's answer stays in the payload.
 void storeMaterialEvaluation(inout MaterialCall call, BsdfEvaluation light, float3 sampleDiffuse)
 {
     call.lightValue = light.value;
@@ -218,27 +230,8 @@ void storeMaterialEvaluation(inout MaterialCall call, BsdfEvaluation light, floa
         call.lobes1 = packUnorm16x2(fraction.z, sampleDiffuse.x);
         call.lobes2 = packUnorm16x2(sampleDiffuse.y, sampleDiffuse.z);
     }
-    uint flags = call.flags & (kMaterialCallModeMask | kMaterialCallFrontFace | kMaterialCallFiltered |
-                               kMaterialCallEvaluateLight | kMaterialCallLobes);
-    if (light.valid) flags |= kMaterialCallLightValid;
-    call.flags = flags;
+    call.flags = (call.flags & ~kMaterialCallLightValid) | (light.valid ? kMaterialCallLightValid : 0u);
 }
-
-// Merges the evaluate part's answer into the sample part's `result`.
-void loadMaterialEvaluation(MaterialCall call, inout MaterialResult result)
-{
-    result.light.value = call.lightValue;
-    result.light.pdf = call.lightPdf;
-    result.light.valid = (call.flags & kMaterialCallLightValid) != 0u;
-    result.light.diffuse = (float3)0.0f;
-    if ((call.flags & kMaterialCallLobes) != 0u) {
-        result.light.diffuse = result.light.value * float3(unpackUnorm16(call.lobes0, 0u),
-            unpackUnorm16(call.lobes0, 16u), unpackUnorm16(call.lobes1, 0u));
-        result.sampleDiffuse = float3(unpackUnorm16(call.lobes1, 16u), unpackUnorm16(call.lobes2, 0u),
-                                      unpackUnorm16(call.lobes2, 16u));
-    }
-}
-
 MaterialResult loadMaterialResult(MaterialCall call)
 {
     MaterialResult result;
