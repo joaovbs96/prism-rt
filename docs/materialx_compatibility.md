@@ -82,11 +82,14 @@ solid and fills with the `transmission_depth` medium; on a single-sided or open
 mesh (a bottle, a jar) that medium has no inside, and a `transmission_color`
 meant as the sheet's tint becomes a strong absorption through the whole object.
 
-The loader expands each `open_pbr_surface` whose `geometry_thin_walled` is a
-constant `true` into its genmdl implementation graph (`flattenSubgraphs`,
-restricted to that node), sets `thin_walled` on the graph's surface
-constructor, and binds the material's `backsurfaceshader` to the same shader
-(a thin-walled MDL material scatters with its backface BSDF from behind).
+The loader gives each `open_pbr_surface` whose `geometry_thin_walled` is a
+constant `true` a [private copy](#private-graphs) of its genmdl implementation
+graph, sets `thin_walled` on that graph's surface constructor, and binds the
+material's `backsurfaceshader` to the same shader (a thin-walled MDL material
+scatters with its backface BSDF from behind). The backends see that
+`backface.scattering` is `surface.scattering` (equal slot hashes) and compile
+it once: the CPU and GPU backface use the surface's function (a second copy
+made thin-walled GPU programs 1.9x larger).
 OpenPBR's thin wall is an infinitesimal sheet whose normal-incidence
 transmittance is `transmission_color` whatever the depth, while the graph uses
 `transmission_color` as the tint only when `transmission_depth` is zero, so the
@@ -99,7 +102,7 @@ thin-walled `standard_surface` glass refracted like a solid (and lost energy
 leaving it, R + T 0.64 at 41 degrees inside). Autodesk Standard Surface
 defines a thin wall as an infinitely thin shell that transmits without
 refraction (and scatters subsurface light as translucency), which is MDL's
-`thin_walled`: a constant `true` gets the same expansion when the node
+`thin_walled`: a constant `true` gets the same thin-walled graph when the node
 transmits or scatters (`transmission` or `subsurface` not zero; an opaque one
 renders the same either way). The graph has no transmission medium.
 
@@ -121,10 +124,38 @@ MaterialX 1.39.5's `gltf_pbr` graph builds the `KHR_materials_volume` medium
 (an `anisotropic_vdf` absorbing `ln(attenuation_color) / attenuation_distance`)
 but never connects it, so attenuation is dropped and thick glTF glass renders
 clear. `open_pbr_surface` layers its transmission over its VDF, which the MDL
-generator turns into the material's `volume`. The loader expands each
-`gltf_pbr` with a finite `attenuation_distance` into its genmdl graph and adds
-that layer (`LayerGltfPbrVolume`), so the integrator traces the absorbing
-medium as it does for OpenPBR glass.
+generator turns into the material's `volume`. The loader gives each
+`gltf_pbr` with a finite `attenuation_distance` a [private copy](#private-graphs)
+of its genmdl graph with that layer (`LayerGltfPbrVolume`), so the integrator
+traces the absorbing medium as it does for OpenPBR glass.
+
+## Private graphs
+
+The repairs that change a surface's graph (thin walls, glTF volume, the
+dielectric coupling below, transparent UsdPreviewSurface, Lama) rewrite a
+private copy of the node's genmdl implementation, not the material: the
+loader adds a node definition and graph cloned from the library's to the
+document (`ClonePrivateGraph`), rewrites the copy, names both by a hash of the
+rewritten graph (`ND_prism_<category>_<hash>`, `PublishPrivateGraph`) and
+points the node at it; the node keeps its inputs. A repair that finds an
+unexpected shape returns the node to the library's graph.
+
+MaterialX's MDL generator emits a graph implementation as an MDL function
+whose internal constants are literals, but publishes every unconnected input
+of the material's own nodes as a material parameter. The repairs used to
+flatten the surface into the material (`flattenSubgraphs`), which made its
+~100 internal constants class-compilation parameters (OpenPBR glass: 150-180
+against 40-80), among them the uniform `scatter_mode` of every
+`dielectric_bsdf`: `mx_dielectric_bsdf` selects its R, T or RT lobe by it, so
+every lobe kept all three variants. The CLI compiles classes unfolded, and
+its repaired OpenPBR programs were 3.5x the library's (playground: 14 of 22
+GPU programs at 7-15 MB of SPIR-V instead of 2 MB, a 412 s cold Vulkan
+start). With the private graphs the parameters are the surface's inputs again
+and the programs the library's size (all 22 at 1.9-2.2 MB). Hydra folds
+constant parameters (`PRISM_MDL_COMPILE_MODE=auto`) and was never affected.
+Materials with the same repair share the graph, so they still share one class
+program; a decision a repair takes from the node's values (a constant zero
+thin-film weight drops the film's RT lobe) makes another graph.
 
 ## Energy loss of layered dielectric transmission
 
@@ -160,13 +191,13 @@ with MIS and with BSDF-only environment sampling alike.
 MaterialX's own `dielectric_bsdf` with `scatter_mode` `RT` (a GGX
 `scatter_reflect_transmit` lobe) splits by its exact Fresnel term, including
 total internal reflection, and conserves energy. Layering distributes over the
-mix, so the loader expands each transmissive surface into its genmdl graph and
-rewrites it as
+mix, so the loader rewrites a [private copy](#private-graphs) of each
+transmissive surface's genmdl graph as
 
     mix(RT [over its VDF], layer(R, opaque), transmission)
 
 (`CoupleSurfaceTransmissionFresnel`; `LayerGltfPbrVolume` couples the glTF
-graphs it expands). R and T share IOR and roughness in all three graphs
+graphs it copies). R and T share IOR and roughness in all three graphs
 (`standard_surface` only without `transmission_extra_roughness`, and with
 `specular` 1), so every closed transmissive surface is rewritten; how depends on
 what else is layered on the dielectric:

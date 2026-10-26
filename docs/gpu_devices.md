@@ -307,8 +307,16 @@ time: 2 MB of SPIR-V took 5 s and 0.2-0.45 GB, 6.9 MB 44 s and 1.4 GB, 15 MB
 (tape: 2.7 to 9.5 MB of SPIR-V), since 4fed928 the CLI loads all 53 of its
 materials (14 of them transmissive: 9.5-21 MB each), and the device
 compiled 16 libraries at once. The emitter work of phase 5 was not involved
-(the same sizes without it). Four changes keep the driver within bounds and
-the cold compile short:
+(the same sizes without it). The repairs themselves were not the cost but
+how they were applied: they flattened the surface's graph into the material,
+which made its internal constants (the scatter modes among them) class
+parameters, and the CLI compiles classes unfolded. They now rewrite a
+private copy of the graph ([MaterialX compatibility, private
+graphs](materialx_compatibility.md#private-graphs)), and a thin wall with one
+shader on both sides compiles its scattering once (the backface uses the
+surface's function): every playground program is 1.9-2.2 MB again, whole
+(below; Hydra, which folds the constants, was never affected). Four changes
+keep the driver within bounds and the cold compile short:
 
 - **One BSDF evaluation call site** (`GpuBackend::shade`). DXC inlines every
   call of a program's code; the light lobes' second evaluation made the
@@ -328,7 +336,10 @@ the cold compile short:
   runs the MDL init twice when it evaluates: OpenPBR at 640x360, 16 spp,
   took 0.96 s of GPU time against 0.83 s with whole programs (single runs).
   DXC's estimate for a part is 60% (sample) or 45% (evaluate) of the
-  whole's: measured peaks 1027 and 724 MiB against 1740 MiB whole.
+  whole's: measured peaks 1027 and 724 MiB against 1740 MiB whole. Since
+  the repairs use private graphs no playground program is above the
+  threshold; the split stays as the safety net for materials that are large
+  by themselves.
 - **A compile memory budget.** Each driver compile (pipeline library,
   compute kernel; a monolithic pipeline compiles on one thread when its
   shaders together exceed the budget) and each callable's DXC process holds
@@ -358,9 +369,24 @@ scene 3.7 s, 79 s in all. With the pipeline caches but not the SPIR-V
 cache (a shader source change that leaves the SPIR-V unchanged): 78 s of
 DXC. The image is bit-identical to the whole programs' (against the CPU:
 NRMSE 0.32, mean 0.42%; noise floor 0.46, 0.42%).
+
+With the repairs in private graphs (same scene and settings; caches of
+textures and MDL warm, shaders cold through the salt): 22 programs of
+1.9-2.2 MB of SPIR-V (generated code 0.7-0.75 MB, below the split
+threshold, so every program is one callable), DXC 7 s at most, libraries
+13.7 s at most and 244 s summed, shaders 35 s, 76 s in all (scene load
+35 s). Warm: shaders 0.3 s, 41 s in all; 16 samples took 0.66 s of GPU time
+(0.83 s with the whole inflated programs, 0.96 s split). Peak private bytes
+of the process 12.3 GB (warm). The Hydra delegate (`prism_hydra_render`, 37
+folded programs) took 31 s cold and 13.7 s warm, as before the change; at
+979c870, before the repairs, 23 s cold: the rest is the raygen shader with
+`PRISM_VARYING_EMITTERS` (phase 5), compiled once the scene's programs are
+known (13.5 s in the driver) because the prewarmed raygen lacks it.
 `PRISM_GPU_PROGRAM_REPORT=1` makes the CLI print, after loading the scene,
 the layout, program count and each shader's HLSL and SPIR-V size, DXC time
-and estimated driver memory (DXC only, no device), and exit;
+and estimated driver memory (DXC only, no device), and exit; the Hydra
+delegate does the same when it would prepare its device (run it with
+`PRISM_DEVICE=cpu`, e.g. through `prism_hydra_render`);
 `prism_gpu_program_budget_test` checks the same on
 `tests/hydra/fixtures/textured_emitters_glass.usda`.
 
@@ -767,6 +793,25 @@ called done there.
   - Runs: build the Metal kernel for chess and an egg and check its DXIL is
     identical to the previous build's (or the images bit-identical on
     `--device metal`).
+- **Dielectric repairs in private graphs; one copy of a thin wall's
+  scattering** ([MaterialX compatibility, private
+  graphs](materialx_compatibility.md#private-graphs)):
+  - Shared code: `src/materialx/loader.cpp` (every device compiles the
+    rewritten documents), `src/device/gpu/gpu_materials.cpp`
+    (`ProgramTraits::backfaceScatteringIsSurface`: no `backface_bsdf` entry
+    point, and the BSDF dispatch sends such a program's backface to the
+    surface function from the surface's call site, `useSurface`; other
+    programs' dispatch is unchanged) and `src/mdl/backend_compiler.cpp` (the
+    CPU's backface index is the surface's). The persistent translation caches
+    moved to new keys (`gpu-structure` v5, `gpu-programs` v3).
+  - Runs: the Metal kernel for the OpenPBR playground (transmissive and
+    thin-walled programs should be about the size of opaque ones) and its
+    compile time against the previous build;
+    `tests/hydra/fixtures/thin_walled_glass.usda` and
+    `textured_emitters_glass.usda` with `--device metal` against
+    `--device cpu`; egg_gold and Teapot bit-identical to the previous build
+    (no repaired or thin-walled material), chess at float level (two
+    repaired glasses).
 
 ## Diagnostics
 
@@ -790,7 +835,8 @@ called done there.
   above this much generated code become sample and evaluate callables.
 - `PRISM_VULKAN_MAX_SPIRV_MIB=<n>` (0: no limit),
   `PRISM_VULKAN_DRIVER_MEMORY_MIB=<n>` and `PRISM_GPU_PROGRAM_REPORT=1`
-  (CLI, no device): the [driver compile budget](#driver-compile-budget).
+  (CLI, or the Hydra delegate with `PRISM_DEVICE=cpu`; no device): the
+  [driver compile budget](#driver-compile-budget).
   With `PRISM_GPU_VERBOSE=1` each pipeline library's log line also gives its
   SPIR-V size and the process's commit growth during the driver's compile.
 - `PRISM_VULKAN_PIPELINE_STATS=1`: the driver's statistics of each compiled

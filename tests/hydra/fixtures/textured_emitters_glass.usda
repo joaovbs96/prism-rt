@@ -8,9 +8,10 @@
 # Several textured emitters next to rough glass (the GPU program budget
 # tests, docs/gpu_devices.md): three emitters of varying emission, each its
 # own MDL program, light a diffuse floor and a block of partly transmissive,
-# rough OpenPBR glass, whose program is the largest (like the OpenPBR
-# playground's tape, about 3.5 times the SPIR-V of an opaque OpenPBR
-# material). The scene has no other lights.
+# rough OpenPBR glass, whose program is the largest (its repaired
+# dielectric: 2.3 MB of SPIR-V, the emitters' 0.75 MB; 8.7 MB when the
+# repair flattened the surface into the material). The scene has no other
+# lights.
 def Xform "World"
 {
     def Mesh "Floor" (

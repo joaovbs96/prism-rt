@@ -147,8 +147,11 @@ one GPU program). Images are never decoded at load: ABeautifulGame loaded in
   solid; only its absorption is dropped. Volume attenuation spans the whole
   closed mesh (`thickness` and its texture are not used: the path tracer
   measures real path lengths).
-- A `gltf_pbr` with attenuation is expanded into its graph before MDL
-  generation, so it compiles longer (about 4–5 s instead of 0.5 s).
+- A `gltf_pbr` with attenuation gets a private copy of its graph before MDL
+  generation ([private graphs](materialx_compatibility.md#private-graphs)).
+  Flattened into the material, it compiled for 4–5 s instead of 0.5 s; with
+  the copy, `tests/gltf/volume_sphere.gltf` renders on the CPU (32x32, one
+  sample, generation cache off) in 2–3 s instead of 6–8 s.
 - Material variants (`KHR_materials_variants`), `KHR_materials_diffuse_transmission`, KTX2/Basis and
   WebP-only textures, Draco/meshopt compression, `KHR_lights_punctual`,
   cameras, skinning, morph targets and animation.
