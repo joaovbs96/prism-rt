@@ -8,6 +8,8 @@
 // The note outlives the scene: a later scene without such emitters at worst
 // costs a variant that goes unused.
 
+#include "load_profile.h"
+
 #include <atomic>
 #include <cstdint>
 #include <functional>
@@ -38,7 +40,7 @@ inline uint64_t Notes() { return detail::state().notes.load(); }
 inline void Note()
 {
     auto& s = detail::state();
-    ++s.notes;
+    if (s.notes.fetch_add(1) == 0) prism::load_profile::Mark("varying_emitter.first");
     std::vector<std::function<void()>> call;
     {
         std::lock_guard lock(s.mutex);

@@ -395,12 +395,14 @@ delegate does the same when it would prepare its device (run it with
 The device compiles the scene-independent raygen shader while the scene's
 materials still load (`MaterialCallShaders::prewarmRaygen`). Scenes with
 textured (varying) emitters need the variant compiled with
-`PRISM_VARYING_EMITTERS`, which the plain prewarm does not cover. Each
-`MDLMaterial` that classifies as a varying emitter (`variesEmission()`, known
-when its constructor ends, long before the device prepares the scene) calls
-`prism::varying_emitters::Note()` (`src/varying_emitter_signal.h`); the Vulkan
-device subscribes, and on the first note (or at creation, if a note came
-earlier) it prewarms the variant with the define as well. The plain raygen is
+`PRISM_VARYING_EMITTERS`, which the plain prewarm does not cover. A program
+whose emission is not provably uniform (`MDLMaterial::evaluateUniformEmission`'s
+rule, applied to the `CompiledProgram` in `src/mdl/backend_compiler.cpp` as
+the class compiles) and each `MDLMaterial` that classifies as a varying emitter
+(`variesEmission()`, for emission that is uniform per program but not per
+binding) call `prism::varying_emitters::Note()` (`src/varying_emitter_signal.h`);
+the Vulkan device subscribes, and on the first note (or at creation, if a note
+came earlier) it prewarms the variant with the define as well. The plain raygen is
 still prewarmed at device creation, so a scene with emitters compiles both in
 the background; a scene without emitters compiles only the plain one. Both are
 the exact sources of the scene's raygen shader (no reordering, no light AOVs),
@@ -832,8 +834,8 @@ called done there.
     `--device cpu`; egg_gold and Teapot bit-identical to the previous build
     (no repaired or thin-walled material), chess at float level (two
     repaired glasses).
-- **Raygen prewarm** (`src/varying_emitter_signal.h`, a call in
-  `src/mdl_material.h`): host-side only; the Metal kernel and its sources are
+- **Raygen prewarm** (`src/varying_emitter_signal.h`, calls in
+  `src/mdl_material.h` and `src/mdl/backend_compiler.cpp`): host-side only; the Metal kernel and its sources are
   unchanged. Check the build and that a textured emitter scene still renders
   the same on `--device metal` (no shader changes expected).
 

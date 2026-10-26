@@ -1,5 +1,6 @@
 #include "backend_compiler.h"
 #include "texture_runtime.h"
+#include "../varying_emitter_signal.h"
 
 #include <format>
 #include <algorithm>
@@ -1018,6 +1019,16 @@ TargetCode BackendCompiler::generate_target_code(const CompiledMaterial& compile
     program->backface_emission = backfaceEmission;
     program->backface_emission_matches_surface = backfaceEmissionMatchesSurface;
     program->has_displacement = hasDisplacement;
+    {
+        // MDLMaterial::evaluateUniformEmission classifies a program whose emission is
+        // not provably uniform as varying: note it now, long before its materials
+        // exist, so a device can prepare for textured emitters (varying_emitter_signal.h).
+        auto const& f = program->functions;
+        const bool surfaceEmits = !emissionZero && f.surface_edf_function_index != ~mi::Size(0);
+        const bool backEmits = backfaceEmission && f.backface_edf_function_index != ~mi::Size(0);
+        if ((surfaceEmits && !uniformEmission) || (!surfaceEmits && backEmits))
+            prism::varying_emitters::Note();
+    }
     program->builtin_resources = !binding->texture_runtime;
     program->identity = cacheKey;
     result.success = true;
