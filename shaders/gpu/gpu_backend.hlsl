@@ -1038,13 +1038,23 @@ struct GpuBackend {
         MaterialResult result;
         result.sample = sample(shading, query.xi);
         result.light = invalidBsdfEvaluation();
-        if (evaluatesLight(query, result.sample)) result.light = evaluate(shading, query.lightWi);
         result.medium = noMedium();
         if (entersMedium(result.sample, shading.surface.front_face)) result.medium = medium(shading);
-        // The diffuse part of the BSDF towards the sample (light lobes).
         result.sampleDiffuse = (float3)0.0f;
-        if (query.lobes && result.sample.scattered && !result.sample.delta && !result.sample.null_event)
-            result.sampleDiffuse = diffuseFraction(evaluate(shading, result.sample.wi));
+        // The BSDF towards the light sample, then (light lobes) the diffuse
+        // part of the BSDF towards the sample. One call site in a loop: DXC
+        // inlines every call, and a second one tripled the SPIR-V of large
+        // programs (a layered OpenPBR glass callable: 21 MB instead of 7).
+        // Each call works on its own copy of the shading point, so the order
+        // does not matter.
+        const bool light = evaluatesLight(query, result.sample);
+        const bool lobes = query.lobes && result.sample.scattered && !result.sample.delta &&
+                           !result.sample.null_event;
+        [loop] for (uint pass = light ? 0u : 1u; pass < (lobes ? 2u : 1u); ++pass) {
+            const BsdfEvaluation e = evaluate(shading, pass == 0u ? query.lightWi : result.sample.wi);
+            if (pass == 0u) result.light = e;
+            else result.sampleDiffuse = diffuseFraction(e);
+        }
         return result;
     }
 
