@@ -414,6 +414,20 @@ void DiscardPrivateGraph(const MaterialX::NodePtr& node, PrivateGraph& clone)
     clone = {};
 }
 
+// The library category of a node category, also when that is already a
+// published private copy's (prism_<category>_<16 hex digits>): a repair that
+// rewrites a copy another repair made names its result after the library
+// node too.
+std::string LibraryCategory(const std::string& category)
+{
+    const std::string prefix = "prism_";
+    if (category.size() > prefix.size() + 17 && category.rfind(prefix, 0) == 0 &&
+        category[category.size() - 17] == '_' &&
+        category.find_first_not_of("0123456789abcdef", category.size() - 16) == std::string::npos)
+        return category.substr(prefix.size(), category.size() - prefix.size() - 17);
+    return category;
+}
+
 // Name a rewritten copy by its content (FNV-1a of its XML): one definition
 // per distinct repair, shared by every node that needs it.
 void PublishPrivateGraph(const MaterialX::NodePtr& node, PrivateGraph& clone)
@@ -430,7 +444,7 @@ void PublishPrivateGraph(const MaterialX::NodePtr& node, PrivateGraph& clone)
         hash ^= c;
         hash *= 1099511628211ull;
     }
-    const std::string category = std::format("prism_{}_{:016x}", clone.category, hash);
+    const std::string category = std::format("prism_{}_{:016x}", LibraryCategory(clone.category), hash);
     const std::string nodedefName = "ND_" + category;
     if (doc->getNodeDef(nodedefName)) {
         doc->removeNodeGraph(clone.graph->getName());
@@ -443,6 +457,21 @@ void PublishPrivateGraph(const MaterialX::NodePtr& node, PrivateGraph& clone)
     }
     node->setCategory(category);
     node->setNodeDefString(nodedefName);
+    // A copy this one rewrote goes when no node uses it any more.
+    const std::string previous = clone.nodedefString;
+    if (previous != nodedefName && LibraryCategory(clone.category) != clone.category) {
+        bool used = false;
+        for (auto element : doc->traverseTree())
+            if (auto other = element->asA<MaterialX::Node>(); other && other->getNodeDefString() == previous) {
+                used = true;
+                break;
+            }
+        if (!used) {
+            for (auto const& graph : doc->getNodeGraphs())
+                if (graph->getNodeDefString() == previous) doc->removeNodeGraph(graph->getName());
+            doc->removeNodeDef(previous);
+        }
+    }
     clone = {};
 }
 
