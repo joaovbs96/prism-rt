@@ -76,6 +76,10 @@ The handover for the main (orchestrating) session. Subagents don't read this fil
 3. OIDN's Metal device sharing our `MTLBuffer`s (written here, verified on João's Mac).
 - Option if the generic Vulkan path is too slow on AMD/Intel: OIDN's own HIP/SYCL backends through Vulkan external memory.
 
+### Then: USD conformance (decided 2026-10-27)
+- Read the standard `UsdRenderSettings.renderingColorSpace` (`lin_rec709_scene`, `lin_ap1_scene`, `data`) in both loaders as the working space; precedence: CLI flag > `prism:colorManagement:workingSpace` > `renderingColorSpace` > default. The default stays ACEScg (Typhoon, the proposed OpenUSD reference renderer, defaults to `lin_rec709_scene`).
+- Run PrismRT against Typhoon's image regression suite (https://github.com/anderslanglands/typhoon-test-suite): render every scene through Hydra on CPU, compare with its references (with `renderingColorSpace` honoured), and list the deviations as bugs, spec differences or deliberate choices.
+
 ### Then: renderer SDK and Python API (decided 2026-10-26; motion blur waits for it)
 - (a) Turn the renderer into a library/SDK that the CLI and Hydra both implement: a context object (`prism::Renderer`/`Session`) owning today's process-wide state (colour management, the shared `MDLGenerator`, the texture service, SSS fallback, binding purposes, the MDL SDK); public headers separated from internals (no Embree/MDL/TBB/USD types in the public API); scene building (meshes, instances, lights, cameras, MaterialX materials) with incremental edits (Hydra needs them), rendering (devices, settings, progressive passes, AOVs, cancellation, progress), and loaders (USD, glTF, OBJ) as optional modules so the core doesn't need USD. No ABI promise until a first release.
 - (b) A Python API with nanobind as a thin layer over that API: NumPy/DLPack zero-copy for mesh arrays and images, the GIL released during renders, cancellation through the progress callback, USD stages shared with `pxr` through `UsdUtils.StageCache` ids. Packaging (bundled DLLs, load order — cf. PySide6's old msvcp140) is its own task.
