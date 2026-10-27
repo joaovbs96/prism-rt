@@ -97,6 +97,10 @@ struct Options {
     // The USD time code scenes load at (--time; default: the default time).
     std::optional<double> time;
     bool progress = true; // --no-progress
+    // --denoise: none, aov (the image also gets a denoised layer) or replace
+    // (its colour is the denoised colour); prism:denoise true is replace.
+    std::string denoise = "none";
+    prism::device::DenoiseSettings denoiseSettings;
     unsigned contributions = 7;
     prism::device::NeeSettings nee;
     prism::color::Options color;
@@ -150,6 +154,12 @@ void help() {
         "  --light-selection spatial|power (default spatial: analytic lights by their estimated\n"
         "                 irradiance at the shading point, mixed with power; power: by power only)\n"
         "  --texture-filtering filtered|bilinear (default filtered)\n"
+        "  --denoise none|aov|replace (default none; docs/denoising.md): aov adds a 'denoised' layer\n"
+        "                 to the EXR output, replace writes the denoised colour instead of the raw one\n"
+        "                 (render products: their colour vars). 'denoised' render vars are always\n"
+        "                 denoised. prism:denoise true in the render settings means replace\n"
+        "  --denoise-quality fast|balanced|high (default high)\n"
+        "  --denoise-prefilter true|false (default true: denoise the albedo and normal guides first)\n"
         "  --honor-double-sided true|false (default false: USD doubleSided is ignored; true: back faces of\n"
         "                 single-sided meshes are not hit, unless their material transmits)\n"
         "  --default-dome true|false (default true: a scene with no lights, emissive geometry or\n"
@@ -257,6 +267,16 @@ Options parse(int argc, char** argv) {
         else if (key == "--adaptive-min-samples") o.adaptiveMinSamples = integer(value);
         else if (key == "--time-limit") o.timeLimit = number(value);
         else if (key == "--texture-streaming") o.textureStreaming = boolean(key, value);
+        else if (key == "--denoise") {
+            if (value != "none" && value != "aov" && value != "replace")
+                throw std::runtime_error("--denoise takes none, aov or replace");
+            o.denoise = value;
+        }
+        else if (key == "--denoise-quality") {
+            if (!prism::device::ParseDenoiseQuality(value, &o.denoiseSettings.quality))
+                throw std::runtime_error("--denoise-quality takes fast, balanced or high");
+        }
+        else if (key == "--denoise-prefilter") o.denoiseSettings.prefilter = boolean(key, value);
         else if (key == "--gpu-texture-budget-mib") o.gpuTextureBudgetMiB = integer(value);
         else if (key == "--sss-fallback") o.sssFallback = boolean(key, value);
         else if (key == "--subdivision-level") o.subdivisionLevel = integer(value);
@@ -376,6 +396,14 @@ void applyRenderSettings(VtDictionary const& settings, Options& o) {
         if (auto const* v = value(name); v && v->IsHolding<bool>()) *field = v->UncheckedGet<bool>();
     };
     booleanSetting("honorDoubleSided", "--honor-double-sided", &o.honorDoubleSided);
+    // Denoising, as the delegate's: prism:denoise shows the denoised colour.
+    bool denoise = false;
+    booleanSetting("denoise", "--denoise", &denoise);
+    if (denoise) o.denoise = "replace";
+    if (auto quality = textSetting("denoiseQuality", "--denoise-quality"); !quality.empty() &&
+        !prism::device::ParseDenoiseQuality(quality, &o.denoiseSettings.quality))
+        throw std::runtime_error("prism:denoiseQuality takes fast, balanced or high");
+    booleanSetting("denoisePrefilter", "--denoise-prefilter", &o.denoiseSettings.prefilter);
     if (!o.given.count("--time-limit"))
         if (auto const* v = value("timeLimitSeconds"); v && v->CanCast<double>())
             o.timeLimit = VtValue::Cast<double>(*v).UncheckedGet<double>();
@@ -781,6 +809,9 @@ int runStandaloneCli(int argc, char** argv) {
             views = job->products;
             if (o.widthSet || o.heightSet)
                 std::cerr << "PrismRT: --width/--height do not apply to render products; ignored\n";
+            if (o.denoise == "aov")
+                std::cerr << "PrismRT: --denoise aov does not apply to render products (add a 'denoised' "
+                             "RenderVar); ignored\n";
         } else {
             prism::output::RenderProductRequest view;
             if (job) view = job->base;
@@ -802,7 +833,26 @@ int runStandaloneCli(int argc, char** argv) {
             color.kind = prism::output::AovKind::Color;
             color.components = 3;
             view.vars.push_back(color);
+            if (o.denoise == "aov") {
+                if (!prism::output::IsMultiChannelFormat(view.output))
+                    std::cerr << "PrismRT: --denoise aov adds a layer only EXR holds; " << view.output
+                              << " gets the raw colour (--denoise replace writes the denoised one)\n";
+                prism::output::RenderVarRequest denoised = color;
+                denoised.name = "denoised";
+                denoised.kind = prism::output::AovKind::Denoised;
+                view.vars.push_back(denoised);
+            }
             views.push_back(std::move(view));
+        }
+        // The denoiser is needed for --denoise replace and for denoised vars.
+        bool anyDenoised = o.denoise == "replace";
+        for (auto const& view : views)
+            for (auto const& var : view.vars) anyDenoised |= var.kind == prism::output::AovKind::Denoised;
+        if (anyDenoised && !prism::device::DenoisingAvailable()) {
+            std::string reason;
+            prism::device::SharedCpuDenoiser(&reason);
+            throw std::runtime_error("denoising was asked for (--denoise, prism:denoise or a 'denoised' "
+                                     "render var) but " + reason);
         }
         const UsdTimeCode time = o.time ? UsdTimeCode(*o.time) : UsdTimeCode::Default();
         // Before anything loads: materials, lights and textures convert into
@@ -1066,6 +1116,7 @@ int runStandaloneCli(int argc, char** argv) {
         const double loadSeconds = seconds();
         using prism::output::AovKind;
         double renderSeconds = 0, meanSamples = o.samples, fractionAtMaxSamples = 1.0;
+        double denoiseMilliseconds = 0;
         bool timeLimitReached = false;
         std::vector<prism::output::RenderedAov> rendered;
         for (size_t index = 0; index < views.size(); ++index) {
@@ -1083,8 +1134,13 @@ int runStandaloneCli(int argc, char** argv) {
             // The light AOVs render with the colour: ask for them if a
             // product sharing this view has one.
             bool lightAovs = false;
+            // The denoised colour, likewise (and for --denoise replace).
+            bool denoise = o.denoise == "replace";
             for (size_t other = index; other < views.size() && views[other].SameView(view); ++other)
-                for (auto const& var : views[other].vars) lightAovs |= prism::output::LightAov(var.kind);
+                for (auto const& var : views[other].vars) {
+                    lightAovs |= prism::output::LightAov(var.kind);
+                    denoise |= var.kind == AovKind::Denoised;
+                }
             std::vector<AovKind> geometric;
             for (auto const& var : view.vars) {
                 auto const* info = prism::output::FindAov(var.kind);
@@ -1094,7 +1150,7 @@ int runStandaloneCli(int argc, char** argv) {
                               << "') is only available in the Hydra delegate; skipped\n";
                     continue;
                 }
-                if (var.kind == AovKind::Color || prism::output::LightAov(var.kind)) {
+                if (prism::output::ColorAov(var.kind) || prism::output::LightAov(var.kind)) {
                     prism::device::ImageRequest imageRequest;
                     imageRequest.camera = rays.parameters;
                     imageRequest.width = width;
@@ -1117,6 +1173,13 @@ int runStandaloneCli(int argc, char** argv) {
                     }
                     std::vector<prism::device::LightAovPixel> lightPixels;
                     if (lightAovs) imageRequest.lightAovs = &lightPixels;
+                    std::vector<float> denoisedPixels;
+                    double viewDenoiseMilliseconds = 0;
+                    if (denoise) {
+                        imageRequest.denoise = o.denoiseSettings;
+                        imageRequest.denoised = &denoisedPixels;
+                        imageRequest.denoiseMilliseconds = &viewDenoiseMilliseconds;
+                    }
                     progress.BeginRender(&imageProgress, o.adaptiveThreshold > 0,
                         views.size() > 1 ? "view " + std::to_string(index + 1) + "/" + std::to_string(views.size()) : "",
                         imageRequest.timeLimitSeconds);
@@ -1127,6 +1190,19 @@ int runStandaloneCli(int argc, char** argv) {
                     const float scale = exposureScales[index];
                     if (scale != 1.0f)
                         for (float& value : rendered.back().pixels) value *= scale;
+                    if (denoise) {
+                        // HDR denoising is scale invariant (OIDN scales its input
+                        // to its training range), so the exposure applies after.
+                        if (scale != 1.0f)
+                            for (float& value : denoisedPixels) value *= scale;
+                        denoiseMilliseconds += viewDenoiseMilliseconds;
+                        std::cout << "Denoised " << width << "x" << height << " in " << viewDenoiseMilliseconds
+                                  << " ms (" << prism::device::ToString(o.denoiseSettings.quality) << " quality"
+                                  << (o.denoiseSettings.prefilter ? ", prefiltered guides" : "") << ")\n";
+                        // --denoise replace: the colour outputs are the denoised colour.
+                        if (o.denoise == "replace") rendered.back().pixels = denoisedPixels;
+                        rendered.push_back({AovKind::Denoised, 3, std::move(denoisedPixels)});
+                    }
                     if (lightAovs) {
                         // Radiance AOVs take the colour's exposure; the albedo does not.
                         for (AovKind kind : {AovKind::Albedo, AovKind::Diffuse, AovKind::Specular, AovKind::Emission}) {
@@ -1217,6 +1293,7 @@ int runStandaloneCli(int argc, char** argv) {
                   << ",\"fractionAtMaxSamples\":" << fractionAtMaxSamples
                   << ",\"timeLimitReached\":" << (timeLimitReached ? "true" : "false")
                   << ",\"outputSeconds\":" << outputSeconds
+                  << ",\"denoiseMilliseconds\":" << denoiseMilliseconds
                   << ",\"textureFiltering\":\"" << o.textureFiltering << "\""
                   << ",\"texturePrepareCalls\":" << textureStats.prepareCalls
                   << ",\"textureMemoryCacheHits\":" << textureStats.memoryCacheHits

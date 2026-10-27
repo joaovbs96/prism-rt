@@ -24,7 +24,7 @@ void Warn(std::vector<std::string> *warnings, std::string message)
 
 int VarComponents(AovKind kind, TfToken const &dataType)
 {
-    if (kind == AovKind::Color) {
+    if (ColorAov(kind)) {
         const std::string &type = dataType.GetString();
         return type == "color4f" || type == "color4h" || type == "float4" || type == "half4" ? 4 : 3;
     }
@@ -133,13 +133,13 @@ Image BuildProductImage(RenderProductRequest const &product,
         beautyTaken = beautyTaken || beauty;
         ImageLayer layer;
         layer.name = var.name;
-        layer.color = var.kind == AovKind::Color;
+        layer.color = ColorAov(var.kind);
         layer.channels = LayerChannels(var.name, var.kind, var.components, beauty);
         layer.pixels.resize(pixels * size_t(var.components));
         const int available = found->components;
         // The CLI renders RGB only; its images are opaque (as the delegate's
         // with the dome visible to the camera).
-        const bool opaqueAlpha = var.kind == AovKind::Color && available == 3;
+        const bool opaqueAlpha = ColorAov(var.kind) && available == 3;
         if (var.components > available && !opaqueAlpha)
             Warn(warnings, "Render var <" + var.path.GetString() + "> asks for " +
                  std::to_string(var.components) + " channels; the render has " +

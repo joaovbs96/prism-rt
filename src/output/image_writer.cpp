@@ -129,7 +129,7 @@ std::vector<std::string> LayerChannels(std::string const &layer, AovKind kind,
     const std::string prefix = beauty ? std::string() : layer + ".";
     for (int c = 0; c < components; ++c) {
         const char *suffix = nullptr;
-        if (kind == AovKind::Color || LightAov(kind)) suffix = color[std::min(c, 3)];
+        if (ColorAov(kind) || LightAov(kind)) suffix = color[std::min(c, 3)];
         else if (kind == AovKind::St && components == 2) suffix = coordinates[c];
         else if (components == 1)
             suffix = kind == AovKind::Depth || kind == AovKind::CameraDepth ? "Z" : "id";

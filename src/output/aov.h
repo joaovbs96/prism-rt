@@ -5,7 +5,8 @@
 // (docs/hydra.md, "Render products"). To add an AOV: add a kind and a row to
 // Aovs(), produce it in the device or in ResolveGeometricAov, and map it in
 // the Hydra bridge. The light AOVs (albedo, diffuse, specular, emission) come
-// from the path tracer with the colour (LightAovPixel, src/device/device.h).
+// from the path tracer with the colour (LightAovPixel, src/device/device.h);
+// the denoised colour from the device's denoiser (docs/denoising.md).
 
 #include "../ray.h"
 
@@ -25,6 +26,7 @@ enum class AovKind {
     Color, Depth, CameraDepth, Normal, Neye, Peye, St,
     PrimId, ElementId, InstanceId,
     Albedo, Diffuse, Specular, Emission, Pworld,
+    Denoised,
     Unknown
 };
 
@@ -44,7 +46,7 @@ struct AovInfo {
 
 inline std::span<const AovInfo> Aovs()
 {
-    static constexpr std::array<AovInfo, 15> table{{
+    static constexpr std::array<AovInfo, 16> table{{
         {AovKind::Color, "color", 4, false, false, true},
         {AovKind::Depth, "depth", 1, false, true, true},
         {AovKind::CameraDepth, "cameraDepth", 1, false, true, true},
@@ -60,6 +62,7 @@ inline std::span<const AovInfo> Aovs()
         {AovKind::Specular, "specular", 3, false, false, true},
         {AovKind::Emission, "emission", 3, false, false, true},
         {AovKind::Pworld, "Pworld", 3, false, true, true},
+        {AovKind::Denoised, "denoised", 4, false, false, true},
     }};
     return table;
 }
@@ -87,6 +90,9 @@ inline bool LightAov(AovKind kind)
     return kind == AovKind::Albedo || kind == AovKind::Diffuse || kind == AovKind::Specular ||
         kind == AovKind::Emission;
 }
+
+// Radiance outputs: the colour and its denoised version.
+inline bool ColorAov(AovKind kind) { return kind == AovKind::Color || kind == AovKind::Denoised; }
 
 inline int AovComponents(AovKind kind)
 {
