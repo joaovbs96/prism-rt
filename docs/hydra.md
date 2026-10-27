@@ -68,6 +68,10 @@ running delegate.
 | `prism:sssFallback` | false (env `PRISM_SSS_FALLBACK`) | `--sss-fallback` | every material generates again | Render subsurface scattering as its diffuse lobe instead of tracing it ([MaterialX compatibility](materialx_compatibility.md)). Process-wide, like the colour management |
 | `prism:honorDoubleSided` | false | `--honor-double-sided` | rebuilds the scene | Honour USD `doubleSided`: back faces of single-sided meshes (`doubleSided` false, USD's default) are not hit, unless their material transmits. Off, every mesh is two-sided as before (most path tracers ignore `doubleSided`). See [Scene features](#scene-features) |
 | `prism:device` | `auto` | `--device` | switches the render device | `auto`, `cpu`, `vulkan` or `metal`; env `PRISM_DEVICE` sets the initial value (`cpu-reference` was removed: it warns and is ignored) |
+| `prism:denoise` | false | `--denoise none\|aov\|replace` (true is `replace`) | restarts the accumulation | Delegate: show the colour AOV denoised every `prism:denoiseInterval` passes and when the render converges or pauses (its accumulation stays raw). CLI: write the denoised colour instead of the raw one. A `denoised` AOV or RenderVar is always denoised. See [denoising.md](denoising.md) |
+| `prism:denoiseQuality` | `high` | `--denoise-quality` | resumes (a converged render denoises again) | Open Image Denoise's quality: `fast`, `balanced` or `high` |
+| `prism:denoisePrefilter` | true | `--denoise-prefilter` | like `denoiseQuality` | Denoise the albedo and normal guides first and treat them as clean (final frames); false passes them noisy (cheaper) |
+| `prism:denoiseInterval` | 16 | Hydra only (interactive) | like `denoiseQuality` | Passes between the delegate's denoises of the display (the last pass always denoises) |
 | `prism:colorManagement:ocioConfig` | empty | `--ocio-config` | rebuilds the scene | OpenColorIO config; empty uses `$OCIO`, else `ocio://studio-config-latest`. See [colour management](color_management.md) |
 | `prism:colorManagement:workingSpace` | empty | `--working-space` | rebuilds the scene | Working space; empty is ACEScg. `lin_rec709` renders as before colour management |
 | `prism:colorManagement:display`, `prism:colorManagement:view` | empty | `--display`, `--view` | none | Recorded only in the delegate: the colour AOV stays linear in the working space and usdview applies its own colour correction (`OCIO=ocio://studio-config-latest` for its OCIO mode). The CLI encodes 8-bit outputs with them |
@@ -239,7 +243,7 @@ after a topology notice until the replacement picking table publishes.
 
 The launcher also loads PrismRT's Python usdview extension from `tools/usdview_plugins`. Stock usdview drops the selected instance index when forwarding selection to its scene index (`UsdImagingGLEngine::AddSelected` ignores it on the scene-index path in 26.05 and still in 26.08). Our extension forwards the selection model's original indices through the internal `prism:usdviewSelection` renderer setting, preserving individual-instance outlines without patching USD. It uses usdview's plugin registration and `StageView` renderer-setting methods; it does not replace usdview functions. Other hosts can supply complete Hydra selection data directly. Without the extension, stock usdview still renders and picks correctly, but individual-instance highlighting follows its upstream whole-prim selection limitation.
 
-The render buffers expose linear floating-point `color` (in the working space, ACEScg by default), projected `depth` in `[0,1]`, `cameraDepth`, world `normal`, eye-space `Neye` and `Peye`, `primvars:st`, and integer `primId`, `instanceId`, and `elementId`. IDs and geometric AOVs use a deterministic center ray independent of antialiasing and depth-of-field samples. `Peye` is the hit position transformed into eye space and `Pworld` (also bound as `P`) the world-space hit position (0 on a miss); `primvars:st` is the interpolated first UV set, with hit UVs used when that primvar is absent. The path tracer also fills the [light AOVs](#light-aovs) `albedo`, `diffuse`, `specular` and `emission` (`Float32Vec3`), accumulated with the colour. `elementId` refers to the coarse polygon face. Prim, instance, and face picking use visible primary intersections; edge, vertex, and deep picking are deferred. Signed and unsigned 16-bit integer AOV buffers and signed 32-bit integer buffers are supported; Int32 IDs retain their exact values. Packed float32/uint8 buffers are rejected with a Hydra warning. Extra Hydra camera clip planes are not applied to ray intersections.
+The render buffers expose linear floating-point `color` (in the working space, ACEScg by default), projected `depth` in `[0,1]`, `cameraDepth`, world `normal`, eye-space `Neye` and `Peye`, `primvars:st`, and integer `primId`, `instanceId`, and `elementId`. IDs and geometric AOVs use a deterministic center ray independent of antialiasing and depth-of-field samples. `Peye` is the hit position transformed into eye space and `Pworld` (also bound as `P`) the world-space hit position (0 on a miss); `primvars:st` is the interpolated first UV set, with hit UVs used when that primvar is absent. The path tracer also fills the [light AOVs](#light-aovs) `albedo`, `diffuse`, `specular` and `emission` (`Float32Vec3`), accumulated with the colour, and the denoiser the `denoised` colour (`Float32Vec4`, like `color`; [denoising.md](denoising.md)). `elementId` refers to the coarse polygon face. Prim, instance, and face picking use visible primary intersections; edge, vertex, and deep picking are deferred. Signed and unsigned 16-bit integer AOV buffers and signed 32-bit integer buffers are supported; Int32 IDs retain their exact values. Packed float32/uint8 buffers are rejected with a Hydra warning. Extra Hydra camera clip planes are not applied to ray intersections.
 
 Color alpha accumulates primary coverage, including stochastic cutouts and silhouette samples. With no dome, or `domeLightCameraVisibility=false`, primary rays that escape the scene produce transparent black; unresolved early terminations retain coverage. A visible dome keeps opaque alpha. Changing dome camera visibility restarts preview and full accumulation.
 
@@ -295,6 +299,7 @@ render settings menu, `prism_hydra_render --render-settings` and
   | `normal`, `Neye`, `Peye` (`raw`) | world/eye normal, eye position | `<var>.X/Y/Z` |
   | `Pworld`, `P` (`raw`) | world position | `<var>.X/Y/Z` |
   | `albedo`, `diffuse`, `specular`, `emission` (`raw`) | [light AOVs](#light-aovs) | `<var>.R/G/B` |
+  | `denoised` (`raw`) | the [denoised](denoising.md) colour | `<var>.R/G/B` (`A` for `color4f`) |
   | `primvars:st` (`raw`), `st` (`primvar`) | hit texture coordinates | `<var>.U/V` |
   | `primId`, `instanceId`, `elementId` (`raw`) | Hydra ids (not in the CLI) | `<var>.id` |
 
@@ -358,7 +363,9 @@ restarts keep them consistent.
   restructured but equivalent integrator gave other SPIR-V and a 10-28%
   slower Vulkan kernel; now the raygen and callable SPIR-V are byte-identical
   to the previous build's. With the AOVs the output buffers hold four more
-  `float4` per pixel (kernel.hlsl, `gpu_store_aovs` / `gpu_accumulate_aovs`).
+  `float4` per pixel (kernel.hlsl, `gpu_store_aovs` / `gpu_accumulate_aovs`);
+  the denoiser's normal guide travels in the `w` of the first three
+  ([denoising.md](denoising.md)).
 
 ```powershell
 # Every product of the stage's render settings, into build/products:
@@ -450,6 +457,7 @@ noise but no bias.
 | animated_time | 0.010 (mean 0.01%) | 3% (mean 0.2%): smoothed vs per-triangle tangent frames |
 | light_aovs (colour, albedo, diffuse, specular, emission), light_aovs_albedo | below 2e-7; Position exact | 1% |
 | light_aovs_vulkan, light_aovs_albedo_vulkan (CLI on Vulkan, delegate on the CPU) | below 2e-3 per layer | 1% |
+| denoise (colour, denoised, albedo; one part and a part per var) | see `local/reports/denoise_part1.md` | 5% (mean 1%) |
 
 Since phase 7 the CLI loads every fixture like the delegate (feature
 roadmap, "Standalone CLI"). The remaining differences are noise, never bias:

@@ -222,7 +222,9 @@ Scenes: **Eggs** (MaterialEggs), **OpenPBR** (OpenPBRShaderPlayground),
     of the needed texture, mip and tile from shading, loaded from the already
     tiled `.tx.exr` files into a resident tile pool. Whole mip levels first,
     tiles later. They may also need acceleration-structure compaction.
-- **Denoising** (e.g. Intel Open Image Denoise).
+- **Denoising**: Open Image Denoise on the CPU ([denoising.md](denoising.md); part 1).
+  Open: vk_oidn on the Vulkan device (part 2), OIDN's Metal device (part 3),
+  denoised light AOVs, the material's bump-mapped normal as the guide.
 
 ## Closing the gap to other Hydra renderers
 
@@ -243,7 +245,7 @@ than from the renderer.
 | Motion blur | no | ? | no | ? | ? | yes |
 | IES / shaping | yes | no | yes | ? | ? | yes |
 | Adaptive sampling | yes | ? | yes | ? | ? | yes |
-| Denoiser | no | ? | ? | planned | OIDN | yes |
+| Denoiser | OIDN (CPU; GPUs via the CPU) | ? | ? | planned | OIDN | yes |
 | LPEs / light groups | no | ? | no | ? | ? | yes |
 | Status | active | active | branch on hold (refactor) | in progress | archived 2025-08 | production |
 
@@ -254,13 +256,14 @@ GPUs from every vendor. To close the gaps, in order:
 
 1. **Common features.** These are the items the table marks "no" for Prism
    and "yes" for most of the others.
-   - **Denoising** with Open Image Denoise, fed by albedo and normal AOVs
-     (both exist: the `albedo` light AOV follows delta bounces as OIDN asks,
-     [hydra.md](hydra.md#light-aovs)). It runs on the CPU and on NVIDIA, AMD
-     and Intel GPUs.
+   - **Denoising** with Open Image Denoise, fed by the albedo light AOV and a
+     normal at the same vertex (both through delta bounces, as OIDN asks):
+     done on the CPU device, the GPU devices denoise through it for now
+     ([denoising.md](denoising.md)). Next: vk_oidn on Vulkan (NVIDIA, AMD,
+     Intel), OIDN's Metal device.
    - **Adaptive sampling** is on by default (Cycles' error estimate, threshold
      0.01, up to 2048 samples, with a render time limit; [hydra.md](hydra.md#adaptive-sampling-and-time-limit)).
-     Left: pairing it with the denoiser.
+     Left: pairing it with the denoiser (stop earlier when denoising).
    - **Motion blur** (see [Geometry](#geometry)). Do it on the CPU first,
      because Embree has time-sampled geometry. Vulkan's motion-blur extension
      is NVIDIA-only, so the other GPUs need several time steps or the CPU.

@@ -880,6 +880,30 @@ called done there.
     against `--device cpu` with `prism_compare_images` (Vulkan: NRMSE
     8.4e-7, 1.4e-6 and 5.8e-4); chess, egg_gold and Teapot bit-identical to
     the previous build (no shaped lights).
+- **Denoising, part 1** ([denoising.md](denoising.md)):
+  - Shared shader code: `LightAovSample::normal` in
+    `shaders/integrator/path_tracer.h` (set where the albedo resolves,
+    `resolveAlbedo(bs, hit.surface.n)`; zeroed in `beginPath`,
+    `renderSample` and the debug view of `kernel.hlsl`), stored in the `w` of
+    the first three light AOV entries (`gpu_store_aovs`,
+    `gpu_accumulate_aovs` in `shaders/gpu/accessors.hlsl`). No new binding
+    or size; only the light AOV kernel variant changes.
+  - Shared host code: `src/device/gpu/gpu_device.cpp` (`ReadLightAovs`
+    reads the normal from those `w`s; `RenderImage` builds the AOV variant
+    when `ImageRequest::denoised` is set and denoises at the end through
+    `DenoiseRenderedImage`), `src/device/device.{h,cpp}`,
+    `src/device/denoiser.{h,cpp}` (OIDN's CPU device, the Metal device's
+    denoiser until part 3), `src/hydra/scene_bridge.cpp`,
+    `render_buffer.{h,cpp}`, `task_delegate.cpp`.
+  - Build: OIDN 2.x with its CPU device (Homebrew's `open-image-denoise` or
+    a source build; `OpenImageDenoise_DIR`); without it `PRISM_ENABLE_OIDN`
+    is off and denoising is unavailable.
+  - Runs: `ctest -R prism_denoise` (CPU); then `tests/hydra/fixtures/denoise.usda`
+    (96x64, `--max-depth 12`, 16 spp) with `--device metal --denoise aov`
+    against the 4096 spp CPU reference (`prism_denoise_test --error`, at most
+    half the colour's NRMSE) and its `denoised` layer against `--device cpu`'s;
+    `light_aovs.usda`'s albedo layer on Metal unchanged; chess, egg_gold and
+    Teapot bit-identical to the previous build (no denoising, no light AOVs).
 
 ## Diagnostics
 
