@@ -173,7 +173,9 @@ void help() {
         "PrismRT --list-devices\n"
         "EXR output is linear in the working space after the sample clamp; other formats go\n"
         "through the display and view. Light colors are linear Rec.709.\n"
-        "The environment option follows the original EnvironmentMap radiance convention.\n"
+        "--env lights like an untransformed USD DomeLight of FILE at intensity 1: radiance is the\n"
+        "texel (linear Rec.709) times 2^--env-exposure. --env-color r,g,b is a constant dome of\n"
+        "that radiance (also times 2^--env-exposure).\n"
         "Without --env, USD scenes use their authored dome lighting, and a scene with no lights,\n"
         "emissive geometry or environment gets USD's default dome (--default-dome false: black).\n";
 }
@@ -966,7 +968,9 @@ int runStandaloneCli(int argc, char** argv) {
             if (!std::filesystem::exists(o.environment)) throw std::runtime_error("Environment does not exist: " + o.environment);
             envImage = std::make_unique<ImageTexture<Color3>>(o.environment, prism::color::kLightColorSpace);
             envImage->adjustExposure(o.exposure);
-            env = std::make_unique<EnvironmentMap>(envImage.get());
+            // As an untransformed USD dome of the file at intensity 1: the
+            // texels times 2^--env-exposure.
+            env = std::make_unique<EnvironmentMap>(envImage.get(), Color3(1.0f));
             scene.environment = env.get();
         }
         std::vector<std::unique_ptr<Texture<Color3>>> domeTextures;
@@ -1089,7 +1093,7 @@ int runStandaloneCli(int argc, char** argv) {
                              "--env-color)\n";
             } else {
                 // As a USD dome (intensity 1, exposure 0, untransformed), like
-                // usdview's, not --env's EnvironmentMap with its factor of two.
+                // usdview's.
                 envImage = std::make_unique<ImageTexture<Color3>>(texture, prism::color::kLightColorSpace);
                 env = std::make_unique<TransformedEnvironmentMap>(envImage.get(), Color3(1.0f),
                                                                   std::array<float, 9>{1, 0, 0, 0, 1, 0, 0, 0, 1});

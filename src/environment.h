@@ -121,7 +121,7 @@ class GradientBackground : public Environment {
 
 class EnvironmentMap : public Environment {
     public:
-    EnvironmentMap(Texture<Color3>* texture, Color3 multiplier = Color3(2.0f)) : texture(texture), multiplier(multiplier) { buildDistribution(); }
+    EnvironmentMap(Texture<Color3>* texture, Color3 multiplier) : texture(texture), multiplier(multiplier) { buildDistribution(); }
 
     Color3 sample(const RayHit& ray_hit) override {
         return radiance(ray_hit.d);

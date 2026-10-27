@@ -106,7 +106,7 @@ int main() {
         }
         std::vector<unsigned char> black(8*4*3,0);
         auto blackTexture=image(black,8,4);
-        EnvironmentMap blackMap(&blackTexture);
+        EnvironmentMap blackMap(&blackTexture, Color3(1.0f));
         auto blackSample=blackMap.sampleDirection(seed);
         require(blackSample.radiance.is_zero() && std::isfinite(blackSample.pdf) && blackSample.pdf>0,
                 "Black HDR must fall back to a valid uniform distribution");
