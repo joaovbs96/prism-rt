@@ -352,21 +352,13 @@ bool _PurposeMatches(HdContainerDataSourceHandle const &ds,
     return std::find(renderTags.begin(), renderTags.end(), value) != renderTags.end();
 }
 
-// RenderSettings::materialBindingPurposes of the latest SetSettings: read by
-// every snapshot build and refresh, which do not carry the settings.
-std::atomic<std::shared_ptr<const TfTokenVector>> &_BindingPurposes()
-{
-    static std::atomic<std::shared_ptr<const TfTokenVector>> purposes{
-        std::make_shared<const TfTokenVector>(RenderSettings{}.materialBindingPurposes)};
-    return purposes;
-}
-
-SdfPath _MaterialPath(HdContainerDataSourceHandle const &ds)
+// The prim's material: its binding for the first of `purposes` it has (the
+// render settings' materialBindingPurposes, Snapshot::bindingPurposes).
+SdfPath _MaterialPath(HdContainerDataSourceHandle const &ds, TfTokenVector const &purposes)
 {
     HdMaterialBindingsSchema bindings = HdMaterialBindingsSchema::GetFromParent(ds);
     if (!bindings) return {};
-    const auto purposes = _BindingPurposes().load();
-    for (TfToken const &purpose : *purposes) {
+    for (TfToken const &purpose : purposes) {
         if (auto p = bindings.GetMaterialBinding(purpose).GetPath())
             return p->GetTypedValue(0.0f);
     }
@@ -554,6 +546,11 @@ struct Snapshot {
     };
     RTCDevice device = nullptr;
     std::unique_ptr<SceneManager> scene;
+    // The renderer's material settings the snapshot was built with
+    // (MaterialSettings::Identity: working space, SSS fallback), and the
+    // material binding purposes its prims resolve their materials for.
+    std::string materialIdentity;
+    TfTokenVector bindingPurposes;
     std::vector<std::shared_ptr<Geometry>> geometries;
     // Cached diagnostics: recomputed with snapshot construction or geometry
     // refreshes, never while polling GetStats().
@@ -853,7 +850,7 @@ Material const *_DisplacingMaterial(HdSceneIndexBaseRefPtr const &sceneIndex,
                                     HdContainerDataSourceHandle const &ds,
                                     MaterialService *materials, Snapshot *snapshot)
 {
-    const SdfPath materialPath = _MaterialPath(ds);
+    const SdfPath materialPath = _MaterialPath(ds, snapshot->bindingPurposes);
     if (materialPath.IsEmpty()) return nullptr;
     std::shared_ptr<Material> material = _ResolveMaterial(sceneIndex, materialPath, materials, snapshot);
     return material && material->hasDisplacement() ? material.get() : nullptr;
@@ -1523,7 +1520,7 @@ bool _AppendMesh(HdSceneIndexBaseRefPtr const &sceneIndex,
             snapshot->displayMaterialsByPath.emplace(path, material);
         }
     }
-    const SdfPath materialPath = _MaterialPath(prim.dataSource);
+    const SdfPath materialPath = _MaterialPath(prim.dataSource, snapshot->bindingPurposes);
     if (!materialPath.IsEmpty())
         _RecordMaterialUser(snapshot, materialPath, path);
     if (std::shared_ptr<Material> resolved = _ResolveMaterial(
@@ -1546,7 +1543,7 @@ bool _AppendMesh(HdSceneIndexBaseRefPtr const &sceneIndex,
         }
         VtIntArray faces;
         if (!_ReadArray(subset.GetIndices(), &faces)) continue;
-        const SdfPath subsetMaterialPath = _MaterialPath(child.dataSource);
+        const SdfPath subsetMaterialPath = _MaterialPath(child.dataSource, snapshot->bindingPurposes);
         if (subsetMaterialPath.IsEmpty() ||
             (!materials && !snapshot->materialsSeeded)) continue;
         _RecordMaterialUser(snapshot, subsetMaterialPath, path);
@@ -1668,7 +1665,7 @@ Material *_BaseMaterial(HdSceneIndexBaseRefPtr const &sceneIndex,
         }
     }
     if (std::shared_ptr<Material> resolved = _ResolveMaterial(
-            sceneIndex, _MaterialPath(prim.dataSource), materials, snapshot))
+            sceneIndex, _MaterialPath(prim.dataSource, snapshot->bindingPurposes), materials, snapshot))
         material = resolved.get();
     return material;
 }
@@ -2009,7 +2006,7 @@ bool _AppendSphere(HdSceneIndexBaseRefPtr const &sceneIndex,
                 path.GetText());
         return false;
     }
-    const SdfPath sphereMaterialPath = _MaterialPath(prim.dataSource);
+    const SdfPath sphereMaterialPath = _MaterialPath(prim.dataSource, snapshot->bindingPurposes);
     if (!sphereMaterialPath.IsEmpty())
         _RecordMaterialUser(snapshot, sphereMaterialPath, path);
     Material *material = _BaseMaterial(
@@ -2741,9 +2738,9 @@ void _CollectMeshes(HdSceneIndexBaseRefPtr const &scene, SdfPath const &path,
 // Whether the material bound to a mesh can displace it: only a network with a
 // connected displacement terminal can. Reads the network, compiles nothing.
 bool _MaterialMayDisplace(HdSceneIndexBaseRefPtr const &scene,
-                          HdContainerDataSourceHandle const &ds)
+                          HdContainerDataSourceHandle const &ds, TfTokenVector const &purposes)
 {
-    const SdfPath materialPath = _MaterialPath(ds);
+    const SdfPath materialPath = _MaterialPath(ds, purposes);
     if (materialPath.IsEmpty()) return false;
     return MaterialService::MayDisplace(scene->GetPrim(materialPath).dataSource);
 }
@@ -2779,7 +2776,7 @@ MeshPreparation _PrepareMeshes(HdSceneIndexBaseRefPtr const &scene,
     if (speculative) {
         size_t count = 0;
         for (size_t i = 0; i < candidates.size(); ++i)
-            count += deferred[i] = _MaterialMayDisplace(scene, candidates[i].second);
+            count += deferred[i] = _MaterialMayDisplace(scene, candidates[i].second, snapshot->bindingPurposes);
         speculative = count < candidates.size();
         if (!speculative) std::fill(deferred.begin(), deferred.end(), 0);
     }
@@ -3124,12 +3121,13 @@ void _CollectMaterialRequests(HdSceneIndexBaseRefPtr const &scene,
                               std::unordered_set<SdfPath, SdfPath::Hash> *seen,
                               std::vector<MaterialService::Request> *requests,
                               TfTokenVector const &renderTags,
+                              TfTokenVector const &purposes,
                               std::function<bool()> const& cancelled)
 {
     if (cancelled && cancelled()) return;
     HdSceneIndexPrim const prim = scene->GetPrim(path);
     auto add = [&](HdContainerDataSourceHandle const& source) {
-        const SdfPath materialPath = _MaterialPath(source);
+        const SdfPath materialPath = _MaterialPath(source, purposes);
         if (!materialPath.IsEmpty() && seen->insert(materialPath).second)
             requests->push_back({scene->GetPrim(materialPath).dataSource, materialPath});
     };
@@ -3149,7 +3147,7 @@ void _CollectMaterialRequests(HdSceneIndexBaseRefPtr const &scene,
         }
     }
     for (SdfPath const &child : scene->GetChildPrimPaths(path))
-        _CollectMaterialRequests(scene, child, seen, requests, renderTags, cancelled);
+        _CollectMaterialRequests(scene, child, seen, requests, renderTags, purposes, cancelled);
 }
 
 void _ApplyLinkMasks(HdSceneIndexBaseRefPtr const &index, Snapshot *snapshot);
@@ -3158,7 +3156,7 @@ void _ApplyInstancePrimvars(HdSceneIndexBaseRefPtr const &index, Snapshot *snaps
 std::shared_ptr<Snapshot> _BuildSnapshot(HdSceneIndexBaseRefPtr const &scene,
                                          MaterialService *materials,
                                          RenderSettings const &settings,
-                                         std::shared_ptr<const prism::color::ColorManagement> const &color,
+                                         prism::MaterialSettings const &materialSettings,
                                          TfTokenVector const &renderTags,
                                          RTCDevice sharedDevice,
                                          std::shared_ptr<PrototypePool> const& pool = {},
@@ -3182,7 +3180,9 @@ std::shared_ptr<Snapshot> _BuildSnapshot(HdSceneIndexBaseRefPtr const &scene,
         result->materialsSeeded = true;
     }
     if (!result->device) return {};
-    result->scene = std::make_unique<SceneManager>(result->device, color);
+    result->scene = std::make_unique<SceneManager>(result->device, materialSettings.color);
+    result->materialIdentity = materialSettings.Identity();
+    result->bindingPurposes = settings.materialBindingPurposes;
     ++result->prototypePool->topLevelSceneBuilds;
     result->scene->max_depth = settings.maxDepth;
     result->scene->rr_min_depth = settings.rouletteDepth;
@@ -3237,7 +3237,8 @@ std::shared_ptr<Snapshot> _BuildSnapshot(HdSceneIndexBaseRefPtr const &scene,
             std::unordered_set<SdfPath, SdfPath::Hash> seen;
             std::vector<MaterialService::Request> requests;
             _CollectMaterialRequests(scene, SdfPath::AbsoluteRootPath(),
-                                     &seen, &requests, renderTags, cancelled);
+                                     &seen, &requests, renderTags,
+                                     settings.materialBindingPurposes, cancelled);
             materials->Prefetch(requests, cancelled);
         } catch (...) {
             materialError = std::current_exception();
@@ -4054,7 +4055,7 @@ void _RefreshMaterials(HdSceneIndexBaseRefPtr const &index,
         _RemovePrototypeMaterialUsers(snapshot, path);
         snapshot->displayMaterialsByPath.erase(path);
         HdSceneIndexPrim const prim = index->GetPrim(path);
-        const SdfPath materialPath = _MaterialPath(prim.dataSource);
+        const SdfPath materialPath = _MaterialPath(prim.dataSource, snapshot->bindingPurposes);
         if (!materialPath.IsEmpty())
             _RecordMaterialUser(snapshot, materialPath, path);
         Material *material = _BaseMaterial(index, path, prim, materials, snapshot);
@@ -4077,7 +4078,7 @@ void _RefreshMaterials(HdSceneIndexBaseRefPtr const &index,
         HdSceneIndexPrim const prim = index->GetPrim(path);
         snapshot->displayMaterialsByPath.erase(path);
         Material *base = _BaseMaterial(index, path, prim, materials, snapshot);
-        const SdfPath materialPath = _MaterialPath(prim.dataSource);
+        const SdfPath materialPath = _MaterialPath(prim.dataSource, snapshot->bindingPurposes);
         if (!materialPath.IsEmpty())
             _RecordMaterialUser(snapshot, materialPath, path);
         if (auto resolved = _ResolveMaterial(
@@ -4091,7 +4092,7 @@ void _RefreshMaterials(HdSceneIndexBaseRefPtr const &index,
             if (!subset) continue;
             VtIntArray faces;
             if (!_ReadArray(subset.GetIndices(), &faces)) continue;
-            const SdfPath subsetMaterialPath = _MaterialPath(child.dataSource);
+            const SdfPath subsetMaterialPath = _MaterialPath(child.dataSource, snapshot->bindingPurposes);
             if (!subsetMaterialPath.IsEmpty())
                 _RecordMaterialUser(snapshot, subsetMaterialPath, path);
             if (auto resolved = _ResolveMaterial(
@@ -4906,7 +4907,7 @@ public:
         buildIsSpare = true;
         buildFuture = std::async(std::launch::async,
             [generation, retained = jobScene, tags = jobRenderTags,
-             settings = jobSettings, color = jobColor, resolverContext = jobResolverContext,
+             settings = jobSettings, materials = jobMaterials, resolverContext = jobResolverContext,
              device = device, prototypePool = prototypePool,
              canonicalSeed = canonicalPrimIds,
              cancel = std::move(cancel), seed = std::move(seed)]() {
@@ -4919,7 +4920,7 @@ public:
                 try {
                     ArResolverContextBinder binder(resolverContext);
                     result.spareSnapshot = _BuildSnapshot(
-                        retained, nullptr, settings, color, tags, device,
+                        retained, nullptr, settings, materials, tags, device,
                         prototypePool, [cancel] {
                             return cancel->load(std::memory_order_relaxed);
                         }, seed ? &*seed : nullptr);
@@ -5172,7 +5173,7 @@ public:
     HdSceneIndexBaseRefPtr jobScene;
     TfTokenVector jobRenderTags;
     RenderSettings jobSettings;
-    std::shared_ptr<const prism::color::ColorManagement> jobColor;
+    prism::MaterialSettings jobMaterials;
     ArResolverContext jobResolverContext;
     bool buildIsSpare = false;
     std::chrono::steady_clock::time_point constructionTime =
@@ -5237,7 +5238,7 @@ SceneBridge::SceneBridge(HdSceneIndexBaseRefPtr sceneIndex, HdRenderThread *thre
         TF_WARN("PrismRT: %s", error.what());
     }
     // Likewise the SSS fallback (prism:sssFallback).
-    DocumentLoader::SetSssFallback(_impl->settings.sssFallback);
+    _impl->renderer->setSssFallback(_impl->settings.sssFallback);
 }
 SceneBridge::~SceneBridge()
 {
@@ -5515,9 +5516,8 @@ void SceneBridge::SetSettings(RenderSettings const &requested)
         _impl->lastRebuildReason = "resource revision changed";
     }
     if (bindingsChanged) {
-        _BindingPurposes().store(
-            std::make_shared<const TfTokenVector>(settings.materialBindingPurposes));
-        // Every prim may bind another material.
+        // Every prim may bind another material (snapshots resolve bindings
+        // for their settings' purposes, Snapshot::bindingPurposes).
         if (_impl->snapshot) {
             _impl->sceneDirty = true;
             if (_impl->buildCancel)
@@ -5585,7 +5585,7 @@ void SceneBridge::SetSettings(RenderSettings const &requested)
     // The SSS fallback rewrites the MaterialX documents: every material
     // generates again (as for a new resource revision).
     if (sssChanged) {
-        DocumentLoader::SetSssFallback(settings.sssFallback);
+        _impl->renderer->setSssFallback(settings.sssFallback);
         if (_impl->snapshot) {
             if (_impl->materialService) _impl->materialService->InvalidateAll();
             _impl->sceneDirty = true;
@@ -6088,7 +6088,6 @@ bool SceneBridge::Prepare(CameraState const &camera,
             // The colour management the snapshot is built in (the renderer's
             // current one, which SetSettings changes).
             const prism::MaterialSettings jobMaterials = _impl->renderer->materialSettings();
-            const auto jobColor = jobMaterials.color;
             unsigned int jobDirtyKinds = _impl->captureDirtyKinds;
             auto jobDirtyPaths = _impl->captureDirtyPaths;
             decltype(jobDirtyPaths) jobPlacementPaths, jobPrototypePaths, jobMaterialPaths;
@@ -6109,8 +6108,10 @@ bool SceneBridge::Prepare(CameraState const &camera,
                 _impl->snapshot ? _impl->snapshot->picking : nullptr;
             const bool pinnedBankFallback = bank && bank.use_count() > 1;
             if (pinnedBankFallback) bank.reset();
-            // A bank loaded in another working space cannot be updated.
-            if (bank && bank->scene && bank->scene->colorManagement != jobColor) bank.reset();
+            // A bank loaded in another working space or with another SSS
+            // fallback or binding purposes cannot be updated.
+            if (bank && (bank->materialIdentity != jobMaterials.Identity() ||
+                         bank->bindingPurposes != jobSettings.materialBindingPurposes)) bank.reset();
             const uint64_t bankGeneration = _impl->inactiveGeneration;
             {
                 // Even without a bank, each kind must keep its own paths.
@@ -6191,7 +6192,7 @@ bool SceneBridge::Prepare(CameraState const &camera,
             _impl->jobScene = retained;
             _impl->jobRenderTags = tags;
             _impl->jobSettings = jobSettings;
-            _impl->jobColor = jobColor;
+            _impl->jobMaterials = jobMaterials;
             _impl->jobResolverContext = resolverContext;
             _impl->buildIsSpare = false;
             _impl->buildLightingOnly =
@@ -6212,7 +6213,7 @@ bool SceneBridge::Prepare(CameraState const &camera,
                  publishedPicking = std::move(publishedPicking),
                  prototypePool = std::move(prototypePool),
                  cancel = std::move(cancel),
-                 renderer = _impl->renderer, jobMaterials, jobColor]() mutable {
+                 renderer = _impl->renderer, jobMaterials]() mutable {
                     SceneBridge::Impl::BuildResult result;
                     result.generation = generation;
                     result.pinnedBankFallback = pinnedBankFallback;
@@ -6313,7 +6314,7 @@ bool SceneBridge::Prepare(CameraState const &camera,
                                         return cancel->load(std::memory_order_relaxed);
                                     })) {
                                     if (cancel->load(std::memory_order_relaxed)) return result;
-                                    bank = _BuildSnapshot(retained,result.materialService.get(),jobSettings,jobColor,tags,
+                                    bank = _BuildSnapshot(retained,result.materialService.get(),jobSettings,jobMaterials,tags,
                                         device,prototypePool,[cancel] { return cancel->load(std::memory_order_relaxed); });
                                     if (!bank) return result;
                                     batchNeedsFullSnapshot = true; placementRebuiltAll = true;
@@ -6345,7 +6346,7 @@ bool SceneBridge::Prepare(CameraState const &camera,
                                     tags, &handledBatchPaths, true)) {
                                 bank = _BuildSnapshot(
                                     retained, result.materialService.get(),
-                                    jobSettings, jobColor, tags, device, prototypePool,
+                                    jobSettings, jobMaterials, tags, device, prototypePool,
                                     [cancel] {
                                         return cancel->load(
                                             std::memory_order_relaxed);
@@ -6369,7 +6370,7 @@ bool SceneBridge::Prepare(CameraState const &camera,
                                     retained, jobPrototypePaths, result.materialService.get(),
                                     bank.get(), tags, &displacedStorage)) {
                                     bank = _BuildSnapshot(retained, result.materialService.get(),
-                                        jobSettings, jobColor, tags, device, prototypePool, [cancel] {
+                                        jobSettings, jobMaterials, tags, device, prototypePool, [cancel] {
                                             return cancel->load(std::memory_order_relaxed);
                                         });
                                     if (!bank) return result;
@@ -6408,7 +6409,7 @@ bool SceneBridge::Prepare(CameraState const &camera,
                                 placementNeedsFullSnapshot) {
                                 bank = _BuildSnapshot(
                                     retained, result.materialService.get(),
-                                    jobSettings, jobColor, tags, device, prototypePool,
+                                    jobSettings, jobMaterials, tags, device, prototypePool,
                                     [cancel] {
                                         return cancel->load(
                                             std::memory_order_relaxed);
@@ -6490,7 +6491,7 @@ bool SceneBridge::Prepare(CameraState const &camera,
                         } else {
                             result.snapshot = _BuildSnapshot(
                                 retained, result.materialService.get(),
-                                jobSettings, jobColor, tags, device, prototypePool,
+                                jobSettings, jobMaterials, tags, device, prototypePool,
                                 [cancel] {
                                     return cancel->load(
                                         std::memory_order_relaxed);

@@ -692,9 +692,9 @@ public:
         // workers, cache directory); its MaterialX paths are the
         // constructor's. Default: the environment's, as for the subdivision.
         prism::RendererOptions renderer = prism::RendererOptions::FromEnvironment();
-        // The colour management materials convert into and the cache
-        // directory (the renderer's). Without a colour management: one
-        // made from renderer.color.
+        // The colour management materials convert into, the SSS fallback and
+        // the cache directory (the renderer's). Without a colour management:
+        // those of `renderer`.
         prism::MaterialSettings materials;
     };
 
@@ -877,7 +877,11 @@ private:
             serviceOptions.materials.materialxLibraries = mx_libraries_path;
             serviceOptions.materials.materialxMdlPath = mx_mdl_path;
             prism::MaterialSettings settings = m_options.materials;
-            if (!settings.color) settings.color = prism::color::ColorManagement::Create(serviceOptions.color);
+            if (!settings.color) {
+                // No renderer's settings: those of the options.
+                settings.color = prism::color::ColorManagement::Create(serviceOptions.color);
+                settings.sssFallback = serviceOptions.materials.sssFallback;
+            }
             if (settings.cacheDirectory.empty()) settings.cacheDirectory = serviceOptions.CacheRoot();
             prism::materials::MaterialService service(mdl_context, serviceOptions, settings);
             // Loads the MaterialX and MDL libraries while bindings are read.

@@ -20,12 +20,15 @@ struct MaterialSettings {
     // The root of the persistent caches; generated documents go to its
     // "materials" directory.
     std::filesystem::path cacheDirectory;
+    // Subsurface scattering renders its diffuse lobe (DocumentLoader's
+    // fallback_sss_to_diffuse; prism:sssFallback, PRISM_SSS_FALLBACK).
+    bool sssFallback = false;
 
-    // The colour identity: part of every shared cache key of compiled
-    // materials.
+    // The colour identity and the SSS fallback: part of every shared cache
+    // key of compiled materials.
     std::string Identity() const
     {
-        return color ? color->identity() : std::string();
+        return (color ? color->identity() : std::string()) + (sssFallback ? "|sss-fallback" : "");
     }
 };
 

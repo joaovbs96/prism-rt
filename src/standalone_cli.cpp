@@ -872,6 +872,8 @@ int runStandaloneCli(int argc, char** argv) {
         // Every loader takes its MDL modules from the MaterialX libraries'
         // mdl directory.
         rendererOptions.materials.materialxMdlPath = rendererOptions.materials.materialxLibraries + "/mdl";
+        // --sss-fallback and prism:sssFallback (default PRISM_SSS_FALLBACK).
+        rendererOptions.materials.sssFallback = o.sssFallback;
         const prism::RendererContext renderer(rendererOptions);
         // Before anything loads: materials, lights and textures convert into
         // the working space as they are read.
@@ -923,8 +925,6 @@ int runStandaloneCli(int argc, char** argv) {
         // and templates through (as in the Hydra delegate).
         mdl::Context& context = prism::materials::SharedMdlContext();
         if (!context.is_valid()) throw std::runtime_error(context.get_error());
-        // Before any material loads.
-        DocumentLoader::SetSssFallback(o.sssFallback);
         SceneManager scene(device.value, colorManagement);
         const std::string libraryPath = renderer.options().materials.materialxLibraries;
         const std::string mdlPath = renderer.options().materials.materialxMdlPath;

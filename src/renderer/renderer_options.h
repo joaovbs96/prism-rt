@@ -17,6 +17,9 @@ namespace prism {
 struct MaterialOptions {
     std::string materialxLibraries;   // PRISM_MATERIALX_LIBRARY_PATH
     std::string materialxMdlPath;     // PRISM_MATERIALX_MDL (empty: <libraries>/mdl)
+    // Subsurface scattering renders its diffuse lobe (PRISM_SSS_FALLBACK;
+    // the front ends' prism:sssFallback overrides it).
+    bool sssFallback = false;
     // Prefetch compile policy (PRISM_MDL_COMPILE_MODE): Auto folds every
     // class parameter that no material of a batch needs to rebind; Class
     // keeps all but strings runtime arguments.

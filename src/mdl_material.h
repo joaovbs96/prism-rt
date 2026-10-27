@@ -78,7 +78,7 @@ public:
     //   mx_libraries_path: path to MaterialX install libraries/
     //   mx_mdl_path:       path to MaterialX install libraries/mdl/
     //   settings:          the renderer's colour management (the working
-    //                      space colours convert into)
+    //                      space colours convert into) and SSS fallback
     //   material_name:     name of the material node (empty = use first material found)
     //   select:            which class parameters to fold (empty = none)
     MDLMaterial(const std::string& mtlx_path,
@@ -101,7 +101,7 @@ public:
         // MaterialX standard library.
         const auto generationStart = std::chrono::steady_clock::now();
         MDLGenerator& generator = *MDLGenerator::workerLocal(mx_libraries_path, settings.color.get());
-        DocumentLoader doc_loader(generator.get_stdlib(), true);
+        DocumentLoader doc_loader(generator.get_stdlib(), true, settings.sssFallback);
         {
             const auto color = settings.color;
             doc_loader.setUniformColorConversion({color->materialXSpace(),

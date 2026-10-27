@@ -33,14 +33,21 @@ public:
     // options and keeps the current one.
     std::shared_ptr<const color::ColorManagement> setColor(color::Options const& options);
 
-    // The current colour management and the material options, for loaders
-    // and the material service.
+    // Whether subsurface scattering renders its diffuse lobe (initially
+    // options().materials.sssFallback; the Hydra delegate's prism:sssFallback
+    // changes it). Materials compiled before keep theirs.
+    bool sssFallback() const;
+    void setSssFallback(bool enabled);
+
+    // The current colour management and material options, for loaders and
+    // the material service.
     MaterialSettings materialSettings() const;
 
 private:
     RendererOptions m_options;
     mutable std::mutex m_mutex;
     mutable std::shared_ptr<const color::ColorManagement> m_color;
+    bool m_sssFallback = false;
 };
 
 } // namespace prism

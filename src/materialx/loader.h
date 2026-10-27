@@ -16,17 +16,10 @@ public:
     // fallback_sss_to_diffuse replaces the SSS weight with zero before code
     // generation, restoring the shader's diffuse lobe instead of the random
     // walk through the MDL volume (shaders/integrator/path_tracer.h). Off by
-    // default; the prism:sssFallback setting (SetSssFallback) or, without it,
-    // PRISM_SSS_FALLBACK=1 turns it on (DefaultSssFallback). Independent of the
-    // color clamp.
+    // default; the renderer's material settings (prism:sssFallback,
+    // PRISM_SSS_FALLBACK=1) turn it on. Independent of the color clamp.
     explicit DocumentLoader(MaterialX::DocumentPtr stdlib, bool clamp = false,
-                            bool fallback_sss_to_diffuse = DefaultSssFallback());
-
-    static bool DefaultSssFallback();
-    // Process-wide, like the colour management: the frontends set it from
-    // their settings before loading materials. Without a call, the
-    // environment variable decides.
-    static void SetSssFallback(bool enabled);
+                            bool fallback_sss_to_diffuse = false);
 
     // Constant colours on uniform inputs (gltf_pbr's attenuation_color,
     // UsdUVTexture's scale and bias) in a colour space other than the working

@@ -69,6 +69,7 @@ RendererOptions RendererOptions::FromEnvironment()
     auto& materials = options.materials;
     if (const char* value = std::getenv("PRISM_MATERIALX_LIBRARY_PATH")) materials.materialxLibraries = value;
     if (const char* value = std::getenv("PRISM_MATERIALX_MDL")) materials.materialxMdlPath = value;
+    materials.sssFallback = defaults::FromEnvironment().sssFallback;
     if (const char* value = std::getenv("PRISM_MDL_COMPILE_MODE")) {
         const std::string_view mode(value);
         if (mode == "class") materials.compileMode = MaterialOptions::CompileMode::Class;
