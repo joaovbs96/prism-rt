@@ -13,6 +13,8 @@
 # its Vulkan version:
 #   PRISM_OIDN_ROOT        D:/prism-deps/oidn-2.5.1
 #   PRISM_VK_OIDN_ROOT     D:/prism-deps/vk_oidn-0.2.0
+# On macOS, tools/ci/build_oidn_macos.sh builds OIDN with its Metal device
+# (the Metal device's denoiser); PRISM_OIDN_ROOT points at its prefix.
 # The versions themselves live only in tools/deps.json; the configure checks
 # that what it finds matches (cmake/PrismDeps.cmake).
 set(pxr_DIR "$ENV{PRISM_OPENUSD_ROOT}" CACHE PATH "OpenUSD package config directory")

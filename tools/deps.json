@@ -7,12 +7,13 @@
   "onetbb": { "version": "2022.2.0" },
   "embree": { "version": "4.4.0" },
   "oidn": {
-    "_comment": "Built from source with the CPU device only, against onetbb (tools/ci/build_oidn.ps1; docs/DECISIONS.md).",
+    "_comment": "Built from source against onetbb: on Windows with the CPU device only (tools/ci/build_oidn.ps1), on macOS with the CPU and Metal devices (tools/ci/build_oidn_macos.sh; docs/DECISIONS.md). ispc_sha256 is the Windows ISPC zip, ispc_macos_sha256 the macOS universal tarball.",
     "version": "2.5.1",
     "tag": "v2.5.1",
     "source_sha256": "E71FD043A70F1CC80E301D1B90DF6C1F536098C4DD94BAA612742F6DB3369C36",
     "ispc": "1.30.0",
-    "ispc_sha256": "E126A78FD15F12475BAC6204F2536B3986E07973127E4F8E7336C3D304C4A69F"
+    "ispc_sha256": "E126A78FD15F12475BAC6204F2536B3986E07973127E4F8E7336C3D304C4A69F",
+    "ispc_macos_sha256": "4A45B95D9CD590ACBDCD158D287F9398D4A1961461E9456BDA09181E7B34912E"
   },
   "vk_oidn": {
     "_comment": "Vulkan denoiser (OIDN 2.5.1 weights): the prebuilt SDK package and the commit of its tag, for pack_weights.py (tools/ci/fetch_vk_oidn.ps1; docs/DECISIONS.md).",
