@@ -2,6 +2,12 @@
 
 Phase reports, newest first. Detailed reports live in `local/reports/` (git-ignored).
 
+## 2026-10-27 — USD conformance: renderingColorSpace, Typhoon suite, SDK design
+- `UsdRenderSettings.renderingColorSpace` is the working space in both loaders (flag > `prism:colorManagement:workingSpace` > attribute > ACEScg); `data`/`raw` render in linear Rec.709. Scenes without it bit-identical to c0e44c1.
+- Typhoon's regression suite run on CPU through Hydra (`tools/conformance/run_typhoon_suite.py`): 474 cases, classified. Bugs being fixed next: domes 90° off the UsdLux lat-long convention, a `triplanarprojection` crash, EON diffuse's white energy-compensation lobe in MaterialX's MDL, 8 "doesn't match declaration" magenta scenes. Report: `local/reports/conformance.md`.
+- `docs/sdk_design.md`: the SDK/Python design (global-state inventory, API sketch, modules, motion reservation, migration steps, 17 open questions).
+- 435/435 tests in the main checkout (with part 3). Status: merged locally, not pushed.
+
 ## 2026-10-27 — Denoising, part 3: OIDN's Metal device (unbuilt)
 - The Metal device denoises with OIDN 2.5.1's Metal device on its own queue and shared `MTLBuffer`s (resolve kernel from the accumulation, no host round trip; host images for the delegate), falling back to OIDN's CPU device. `tools/ci/build_oidn_macos.sh` builds OIDN with CPU + Metal devices. Apple-only tests: `prism_denoise_*metal*`.
 - Written on Windows: Metal code never compiled or run. Windows build and tests unaffected. Mac checklist: docs/gpu_devices.md. Report: `local/reports/denoise_part3.md`.
