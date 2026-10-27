@@ -928,6 +928,16 @@ called done there.
     tests/gltf/studio_env.hdr --adaptive-threshold 0 --max-sample-radiance 0`
     against the same without `--env` (the scene's dome) on `--device cpu`:
     means within 1%, not 2x.
+- **Tagged colours on uniform inputs** ([materialx_compatibility.md](materialx_compatibility.md#tagged-colours-on-uniform-inputs)):
+  shared host code only: `src/materialx/loader.{h,cpp}` (`ConvertUniformColors`),
+  `src/mdl_material.h` (the conversion it passes the loader) and
+  `src/materialx/prepared_template.h` (a tagged `gltf_pbr`
+  `attenuation_color` stays structural). Materials that compiled before
+  generate the same MDL. No shader or device change.
+  - Runs: `ctest -R gltf_uniform_colorspace` (CPU); then
+    `tests/hydra/fixtures/gltf_uniform_colorspace.usda` with
+    `prism_hydra_render` and `PrismRT --device metal`: no `C219` or magenta
+    error material, and within noise of `--device cpu`.
 
 ## Diagnostics
 

@@ -36,6 +36,36 @@ their textures would stay unconverted. The loader maps these aliases to
 MaterialX's names (`srgb_texture`, `lin_rec709`, `acescg`, ...) on the document
 and on every element (`CanonicalColorSpace` in `src/materialx/loader.cpp`).
 
+## Tagged colours on uniform inputs
+
+A few library inputs are `uniform`: `gltf_pbr`'s `attenuation_color` (the only
+`color3` one in MaterialX 1.39.5) and `UsdUVTexture`'s `color4` `scale` and
+`bias`. When such an input holds a constant in a color space other than the
+working space (its own `colorspace`, or one inherited from the document), the
+generator transforms it with a function call and makes the material parameter
+varying (`Surface_attenuation_color_cm_in`), which cannot feed the uniform MDL
+parameter: `C219 'NG_prism_gltf_pbr_<hash>' : cannot convert argument
+'attenuation_color' from 'color' to 'uniform color'`, and the material renders
+magenta. This happens whenever a transform is generated (the tag `lin_rec709`
+or `srgb_texture` in the ACEScg working space), not when the tag is the working
+space, and with or without folded class parameters.
+
+`ConvertUniformColors` converts such constants into the working space in memory
+and tags them with it, so no transform is generated. It does so for the spaces
+the generator would transform (`lin_rec709` and those of the library's
+`<space>_to_lin_rec709` nodes); `MDLMaterial` supplies the conversion:
+`lin_rec709` through the working space's matrix (`ColorManagement::FromRec709`,
+exactly as the glTF converter converts `KHR_materials_volume`'s attenuation
+colour), other spaces through OpenColorIO. Untagged values, `none`, a tag equal
+to the working space, connected inputs and varying inputs are left alone.
+
+The material service binds a template's colours as authored, which would bind
+such a colour unconverted, so a tagged `gltf_pbr` `attenuation_color` stays
+part of the template structure (`IsCompatibleTemplateValue` in
+`src/materialx/prepared_template.h`): materials that differ in it compile
+separately. Not repaired: a uniform input bound through a nodegraph interface
+input that carries the color space.
+
 ## Input types
 
 Documents written by exporters, and those hdMtlx regenerates from USD shading
@@ -421,7 +451,13 @@ repairs and layer distribution, and `materialx_loader_transmission` the
 thin-walled expansion and the refraction IOR, `materialx_loader_fresnel` the
 coupled transmission graph, `materialx_loader_dielectric` (against MaterialX's
 own library graphs, from the MaterialX install) the split, thin-film, coat,
-thin-walled `standard_surface`, `UsdPreviewSurface` and Lama rewrites.
+thin-walled `standard_surface`, `UsdPreviewSurface` and Lama rewrites, and
+`materialx_loader_uniform_color` the tagged uniform colours (and that the
+library has no other uniform `color3` input). The
+`prism_parity_gltf_uniform_colorspace_*` tests (main build) render
+`tests/hydra/fixtures/gltf_uniform_colorspace.usda` through both frontends
+without a compile failure and compare it with the same colours authored
+untagged in ACEScg.
 `prism_openpbr_transmission_test`
 (main build) samples compiled OpenPBR glass: thin walls transmit undeflected and
 tinted, closed glass refracts with `specular_ior` and carries its medium.
