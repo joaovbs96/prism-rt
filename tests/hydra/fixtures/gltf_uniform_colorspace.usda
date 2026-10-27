@@ -1,0 +1,93 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    upAxis = "Y"
+)
+
+# gltf_pbr's attenuation_color is a uniform input. A constant authored with a
+# colour space (here lin_rec709, which differs from the ACEScg working space)
+# must reach MDL already in the working space: a generated colour transform is
+# varying and fails to compile into a uniform parameter (C219). The two balls
+# share one material structure with different colours, so the second binds
+# onto the first's template. gltf_uniform_colorspace_converted.usda authors
+# the same colours untagged, converted to ACEScg.
+def Xform "World"
+{
+    def Sphere "Amber" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        double radius = 0.7
+        double3 xformOp:translate = (-0.8, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        rel material:binding = </World/Looks/Amber>
+    }
+
+    def Sphere "Teal" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        double radius = 0.7
+        double3 xformOp:translate = (0.8, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        rel material:binding = </World/Looks/Teal>
+    }
+
+    def Scope "Looks"
+    {
+        def Material "Amber"
+        {
+            token outputs:mtlx:surface.connect = </World/Looks/Amber/Surface.outputs:out>
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_gltf_pbr_surfaceshader"
+                color3f inputs:attenuation_color = (0.785, 0.6521, 0.1448) (
+                    colorSpace = "lin_rec709"
+                )
+                float inputs:attenuation_distance = 0.5
+                color3f inputs:base_color = (1, 1, 1)
+                float inputs:metallic = 0
+                float inputs:roughness = 0
+                float inputs:thickness = 1.4
+                float inputs:transmission = 1
+                token outputs:out
+            }
+        }
+
+        def Material "Teal"
+        {
+            token outputs:mtlx:surface.connect = </World/Looks/Teal/Surface.outputs:out>
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_gltf_pbr_surfaceshader"
+                color3f inputs:attenuation_color = (0.12, 0.62, 0.55) (
+                    colorSpace = "lin_rec709"
+                )
+                float inputs:attenuation_distance = 0.5
+                color3f inputs:base_color = (1, 1, 1)
+                float inputs:metallic = 0
+                float inputs:roughness = 0
+                float inputs:thickness = 1.4
+                float inputs:transmission = 1
+                token outputs:out
+            }
+        }
+    }
+
+    def DomeLight "Dome"
+    {
+        color3f inputs:color = (1, 1, 1)
+        float inputs:intensity = 1
+    }
+
+    def Camera "Camera"
+    {
+        float focalLength = 50
+        float horizontalAperture = 36
+        float verticalAperture = 36
+        double3 xformOp:translate = (0, 0, 4)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+}

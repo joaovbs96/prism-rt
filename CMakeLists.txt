@@ -1080,6 +1080,29 @@ if(TARGET prism_hydra_render AND TARGET prism_compare_images)
         COMMAND prism_compare_images "${prism_parity_env_dome_dir}/cli/dome.exr"
             "${prism_parity_env_dome_dir}/cli/image.exr")
     set_tests_properties(prism_parity_env_dome_cli_dome_match PROPERTIES FIXTURES_REQUIRED prism_parity_env_dome)
+    # A colour-space-tagged constant on gltf_pbr's uniform attenuation_color
+    # compiles (DocumentLoader converts it into the working space; the varying
+    # transform MaterialX generates did not compile), in both frontends, and
+    # equals the same colours authored untagged in ACEScg, the second material
+    # included (a template bound it unconverted: NRMSE 0.017). Within float
+    # rounding: the untagged materials share a template, the tagged ones
+    # compile separately with folded parameters.
+    prism_add_parity_fixture(NAME gltf_uniform_colorspace SCENE tests/hydra/fixtures/gltf_uniform_colorspace.usda
+        ARGS --working-space acescg)
+    set_tests_properties(prism_parity_gltf_uniform_colorspace_cli prism_parity_gltf_uniform_colorspace_hydra
+        PROPERTIES FAIL_REGULAR_EXPRESSION "magenta error material;C219")
+    add_test(NAME prism_parity_gltf_uniform_colorspace_converted
+        COMMAND PrismRT --scene "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/gltf_uniform_colorspace_converted.usda"
+            --camera /World/Camera --width 64 --height 64 --spp 16 --device cpu ${_prism_fixed_sampling}
+            --working-space acescg --output "${prism_parity_gltf_uniform_colorspace_dir}/cli/converted.exr")
+    set_tests_properties(prism_parity_gltf_uniform_colorspace_converted PROPERTIES
+        ENVIRONMENT "${_prism_test_environment};PRISM_DEVICE=cpu" FIXTURES_SETUP prism_parity_gltf_uniform_colorspace
+        FAIL_REGULAR_EXPRESSION "magenta error material")
+    add_test(NAME prism_parity_gltf_uniform_colorspace_converted_exact
+        COMMAND prism_compare_images "${prism_parity_gltf_uniform_colorspace_dir}/cli/converted.exr"
+            "${prism_parity_gltf_uniform_colorspace_dir}/cli/image.exr" --tolerance 1e-5)
+    set_tests_properties(prism_parity_gltf_uniform_colorspace_converted_exact PROPERTIES
+        FIXTURES_REQUIRED prism_parity_gltf_uniform_colorspace)
     foreach(_settings Default Proxy)
         string(TOLOWER "${_settings}" _name)
         prism_add_parity_fixture(NAME mesh_features_${_name} SCENE tests/hydra/fixtures/mesh_features.usda

@@ -1,0 +1,86 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    upAxis = "Y"
+)
+
+# gltf_uniform_colorspace.usda with its lin_rec709 attenuation colours authored
+# untagged, converted to ACEScg as the glTF converter converts them (the
+# float values PrismRT computes, printed to 9 digits): rendered in ACEScg the
+# two scenes must match exactly.
+def Xform "World"
+{
+    def Sphere "Amber" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        double radius = 0.7
+        double3 xformOp:translate = (-0.8, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        rel material:binding = </World/Looks/Amber>
+    }
+
+    def Sphere "Teal" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        double radius = 0.7
+        double3 xformOp:translate = (0.8, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        rel material:binding = </World/Looks/Teal>
+    }
+
+    def Scope "Looks"
+    {
+        def Material "Amber"
+        {
+            token outputs:mtlx:surface.connect = </World/Looks/Amber/Surface.outputs:out>
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_gltf_pbr_surfaceshader"
+                color3f inputs:attenuation_color = (0.709545076, 0.654604316, 0.213582844)
+                float inputs:attenuation_distance = 0.5
+                color3f inputs:base_color = (1, 1, 1)
+                float inputs:metallic = 0
+                float inputs:roughness = 0
+                float inputs:thickness = 1.4
+                float inputs:transmission = 1
+                token outputs:out
+            }
+        }
+
+        def Material "Teal"
+        {
+            token outputs:mtlx:surface.connect = </World/Looks/Teal/Surface.outputs:out>
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_gltf_pbr_surfaceshader"
+                color3f inputs:attenuation_color = (0.310134739, 0.583961546, 0.548805177)
+                float inputs:attenuation_distance = 0.5
+                color3f inputs:base_color = (1, 1, 1)
+                float inputs:metallic = 0
+                float inputs:roughness = 0
+                float inputs:thickness = 1.4
+                float inputs:transmission = 1
+                token outputs:out
+            }
+        }
+    }
+
+    def DomeLight "Dome"
+    {
+        color3f inputs:color = (1, 1, 1)
+        float inputs:intensity = 1
+    }
+
+    def Camera "Camera"
+    {
+        float focalLength = 50
+        float horizontalAperture = 36
+        float verticalAperture = 36
+        double3 xformOp:translate = (0, 0, 4)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+}

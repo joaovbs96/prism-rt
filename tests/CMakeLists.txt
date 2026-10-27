@@ -35,6 +35,13 @@ get_filename_component(_prism_materialx_root "${MaterialX_DIR}/../../.." ABSOLUT
 target_compile_definitions(materialx_loader_dielectric PRIVATE PRISM_TEST_MATERIALX_ROOT="${_prism_materialx_root}")
 add_test(NAME materialx_loader_dielectric COMMAND materialx_loader_dielectric)
 set_tests_properties(materialx_loader_dielectric PROPERTIES SKIP_RETURN_CODE 77)
+# Colour-space-tagged constants on uniform inputs, by the library's definitions.
+add_executable(materialx_loader_uniform_color materialx_loader_uniform_color.cpp ../src/materialx/loader.cpp)
+target_compile_features(materialx_loader_uniform_color PRIVATE cxx_std_20)
+target_link_libraries(materialx_loader_uniform_color PRIVATE MaterialXCore MaterialXFormat)
+target_compile_definitions(materialx_loader_uniform_color PRIVATE PRISM_TEST_MATERIALX_ROOT="${_prism_materialx_root}")
+add_test(NAME materialx_loader_uniform_color COMMAND materialx_loader_uniform_color)
+set_tests_properties(materialx_loader_uniform_color PROPERTIES SKIP_RETURN_CODE 77)
 
 # CPU-only; see the labels in the top-level CMakeLists.txt.
 get_property(_prism_materialx_tests DIRECTORY PROPERTY TESTS)
