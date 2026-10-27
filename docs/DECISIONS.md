@@ -3,6 +3,18 @@
 Design decisions and deliberate deviations, newest first. Each entry: date, decision, why.
 
 ## 2026-10-27
+- **SDK decisions** (answers to `docs/sdk_design.md` section 8):
+  - Errors are C++ exceptions (`prism::Error` with codes; Python exceptions). No C API before the first release.
+  - Names: `prism::Renderer` / `Scene` / `Session`; the Python distribution and import name are both `prismrt` (submodules `prismrt.usd`, `.gltf`, `.obj`).
+  - Several renderers per process are allowed (Hydra needs one per delegate instance, as HdPrman and Cycles do); shared cache keys are audited and tested (same material, two working spaces, one process).
+  - Python honours the `PRISM_*` environment variables by default (`Renderer(env=False)` opts out); all of them are documented for now and filtered later.
+  - One writer per scene plus `commit()`; mesh data copied at `commit()` in v1 (zero-copy shared buffers are a possible follow-up).
+  - MaterialX stays out of the public C++ API: files and strings, plus a header-only helper that serialises a `MaterialX::DocumentPtr` in the caller's code; Python accepts `MaterialX.Document` objects. A built-in material preview (shaderball and default dome) renders a MaterialX document with no user scene.
+  - Platforms: Windows, Linux and macOS from the start (development on Windows); Python 3.11+ supported, wheels built for 3.11 first.
+  - USD in the Python package: option A — a private, internally namespaced USD inside `prismrt` (`PXR_SET_INTERNAL_NAMESPACE`/library prefix), so it coexists with any `pxr`; stages from the user's USD pass as files or exported layers. One more USD build to maintain; no in-memory stage sharing. hdPrism keeps using the host's USD.
+  - Cancellation: a progress callback returning `False` and an explicit `cancel()`. Python's default device is `auto`. AOV names are the Hydra tokens next to the enum.
+  - Order as planned (core + CLI, then Hydra, then Python). The first release with the SDK and Python is 0.2.0; the API freezes later (likely 1.0.0).
+  - Licences for wheels: MDL SDK (BSD-3-Clause), DXC (NCSA; `dxil.dll` not shipped), vk_oidn and its weights (Apache-2.0) are redistributable with their notices. The Metal shader converter's terms are unknown (Apple's licence ships with its installer): open packaging item.
 - **Domes follow UsdLux's lat-long orientation** (the OpenEXR convention in `usdLux/domeLight.h`: longitude 0 = +Z at the image's centre, +pi/2 = +X): PrismRT read longitude from +X, a quarter turn off (Typhoon's `usdlux/dome` grid: FLIP 0.883 -> 0.014). Fixed at the mapping (lookups and importance sampling, CPU and GPU), so USD domes, `--env` and the default dome all turn; textured-dome images change. The glTF/OBJ test environment `tests/gltf/studio_env.hdr` was regenerated rolled by a quarter (its generator now places its lights by UsdLux), so the tests it lights keep their lighting; the legacy references of QuadTest and `hydra_parity` were re-rendered (NRMSE 0.012-0.027 against the old ones, mean luminance within 0.04%). `DomeLight_1`'s `poleAxis` is still not read.
 - **Rect light textures read upright from the lit side**: UsdLux's "a texture file's min coordinates should be at (+X, +Y)" is read as the first pixel (the data window's min, the top left, as the dome text uses it), which is how Typhoon renders `usdlux/visibleRect`; PrismRT had the image upside down.
 - **triplanarprojection with tagged files: the first file's colour space converts the output** (as MaterialX's main branch now does), not each image separately: the generator converts such a node's output as a whole, and per-image conversion would need a graph rewrite; files tagged differently are logged.
