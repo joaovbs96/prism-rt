@@ -7,8 +7,13 @@
 //       is: NRMSE(denoised) <= MAX_RATIO * NRMSE(colour)
 //   prism_denoise_test --same A LAYER_A B LAYER_B TOLERANCE
 //       two layers agree within TOLERANCE NRMSE ('-' is the beauty R, G, B)
+//   prism_denoise_test --vulkan NAME_PREFIX TOLERANCE
+//       the Vulkan device's denoiser (named NAME_PREFIX...) on the synthetic
+//       images, within TOLERANCE NRMSE of OIDN's CPU device on the same images
+//       (exit code 77: no Vulkan device)
 
 #include "../src/device/denoiser.h"
+#include "../src/device/device.h"
 
 #include <OpenImageIO/imagebuf.h>
 #if PRISM_HAS_OIDN
@@ -268,6 +273,102 @@ std::vector<float> ReadLayer(std::string const &path, std::string const &layer, 
     return result;
 }
 
+// The Vulkan device's denoiser on host images (the delegate's path: vk_oidn,
+// or OIDN's CPU device when vk_oidn cannot run), against OIDN's CPU device
+// on the same images: every quality, with and without prefiltered guides.
+int VulkanTests(std::string const &namePrefix, double tolerance)
+{
+    std::string note;
+    const auto device = CreateDevice(DevicePreference::Vulkan, &note);
+    if (device->Info().kind != DeviceKind::Vulkan) {
+        std::cout << "No Vulkan device (" << note << "): skipped\n";
+        return 77;
+    }
+    std::string error;
+    const auto gpu = device->CreateDenoiser(&error);
+    Require(gpu != nullptr, "the Vulkan device has no denoiser: " + error);
+    const auto cpu = SharedCpuDenoiser(&error);
+    Require(cpu != nullptr, "no CPU denoiser: " + error);
+    std::cout << "Denoiser: " << gpu->Name() << '\n';
+    Require(gpu->Name().rfind(namePrefix, 0) == 0, "expected a denoiser named " + namePrefix + "...");
+
+    const Synthetic s = MakeSynthetic(256, 192);
+    const double noisy = Nrmse(s.clean, s.noisy);
+    double worst = 0;
+    for (DenoiseQuality q : {DenoiseQuality::Fast, DenoiseQuality::Balanced, DenoiseQuality::High})
+        for (bool prefilter : {false, true}) {
+            std::vector<float> fromGpu(s.noisy.size(), -1.0f), fromCpu(s.noisy.size(), -1.0f);
+            DenoiseRequest request;
+            request.width = s.width;
+            request.height = s.height;
+            request.color = {s.noisy.data(), 3};
+            request.albedo = {s.albedo.data(), 3};
+            request.normal = {s.normal.data(), 3};
+            request.settings.quality = q;
+            request.settings.prefilter = prefilter;
+            request.output = fromGpu.data();
+            gpu->Denoise(request);
+            request.output = fromCpu.data();
+            cpu->Denoise(request);
+            const double denoised = Nrmse(s.clean, fromGpu), agreement = Nrmse(fromCpu, fromGpu);
+            std::cout << ToString(q) << (prefilter ? " prefiltered" : "") << ": NRMSE " << noisy << " -> "
+                      << denoised << " (CPU device " << Nrmse(s.clean, fromCpu) << "); against the CPU device "
+                      << agreement << '\n';
+            Require(std::isfinite(denoised) && denoised < 0.35 * noisy, "denoising did not reduce the error enough");
+            worst = std::max(worst, agreement);
+        }
+    std::cout << "Largest difference from the CPU device: " << worst << " (tolerance " << tolerance << ")\n";
+    Require(worst <= tolerance, "the Vulkan denoiser differs from OIDN's CPU device");
+
+    // RGBA in place with interleaved guides (the delegate's layout) at
+    // another size (new filters): prefiltered albedo and normal, the albedo
+    // alone, no guides.
+    const Synthetic small = MakeSynthetic(100, 60);
+    const size_t pixels = size_t(small.width) * small.height;
+    std::vector<float> rgba(pixels * 4), guides(pixels * 6);
+    for (size_t p = 0; p < pixels; ++p) {
+        for (int c = 0; c < 3; ++c) {
+            rgba[4 * p + c] = small.noisy[3 * p + c];
+            guides[6 * p + c] = small.albedo[3 * p + c];
+            guides[6 * p + 3 + c] = small.normal[3 * p + c];
+        }
+        rgba[4 * p + 3] = 0.25f;
+    }
+    for (int guide = 0; guide < 3; ++guide) {
+        DenoiseRequest request;
+        request.width = small.width;
+        request.height = small.height;
+        request.settings.prefilter = guide == 0;
+        if (guide < 2) request.albedo = {guides.data(), 6};
+        if (guide < 1) request.normal = {guides.data() + 3, 6};
+        std::vector<float> fromCpu(pixels * 3);
+        request.color = {small.noisy.data(), 3};
+        request.output = fromCpu.data();
+        cpu->Denoise(request);
+        std::vector<float> inPlace = rgba;
+        request.color = {inPlace.data(), 4};
+        request.output = inPlace.data();
+        request.outputStride = 4;
+        gpu->Denoise(request);
+        for (size_t p = 0; p < pixels; ++p) Require(inPlace[4 * p + 3] == 0.25f, "denoising changed alpha");
+        const double agreement = Nrmse(fromCpu, inPlace, 4);
+        std::cout << "100x60 RGBA in place, "
+                  << (guide == 0 ? "prefiltered albedo and normal" : guide == 1 ? "albedo" : "no guides")
+                  << ": against the CPU device " << agreement << '\n';
+        Require(agreement <= tolerance, "the strided denoise differs from the CPU device's");
+    }
+
+    bool threw = false;
+    try {
+        DenoiseRequest empty;
+        gpu->Denoise(empty);
+    } catch (std::runtime_error const &) {
+        threw = true;
+    }
+    Require(threw, "an empty request did not fail");
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char **argv)
@@ -295,6 +396,11 @@ int main(int argc, char **argv)
                       << " (ratio " << filtered / raw << ", at most " << maxRatio << ")\n";
             return filtered <= maxRatio * raw ? 0 : 1;
         }
+        if (mode == "--vulkan" && argc == 4) {
+            const int status = VulkanTests(argv[2], std::stod(argv[3]));
+            if (status == 0) std::cout << "Vulkan denoiser tests passed\n";
+            return status;
+        }
         if (mode == "--same" && argc == 7) {
             int w0, h0, w1, h1;
             const auto a = ReadLayer(argv[2], argv[3], &w0, &h0);
@@ -305,7 +411,7 @@ int main(int argc, char **argv)
             return nrmse <= tolerance ? 0 : 1;
         }
         std::cerr << "usage: prism_denoise_test [--timing W H | --error REF TEST MAX_RATIO [LAYER] |"
-                     " --same A LAYER_A B LAYER_B TOLERANCE]\n";
+                     " --same A LAYER_A B LAYER_B TOLERANCE | --vulkan NAME_PREFIX TOLERANCE]\n";
         return 2;
     } catch (std::exception const &e) {
         std::cerr << "prism_denoise_test: " << e.what() << '\n';

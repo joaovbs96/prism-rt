@@ -236,8 +236,18 @@ std::vector<float> GpuRenderDevice::RenderImage(SceneManager& scene, ImageReques
     if (request.meanSamples) *request.meanSamples = total / double(count);
     if (request.fractionAtMaxSamples)
         *request.fractionAtMaxSamples = count ? double(atMax) / double(count) : 0.0;
-    // Part 2 denoises on the GPU instead, before the read-back.
-    DenoiseRenderedImage(*this, request, pixels, aovs);
+    // On the device when it has a denoiser of its own (Vulkan: vk_oidn on
+    // the accumulation), otherwise on the host images.
+    if (request.denoised) {
+        const auto denoiseStart = std::chrono::steady_clock::now();
+        if (DenoiseAccumulation(request, samples)) {
+            if (request.denoiseMilliseconds)
+                *request.denoiseMilliseconds = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - denoiseStart).count();
+        } else {
+            DenoiseRenderedImage(*this, request, pixels, aovs);
+        }
+    }
     if (request.lightAovs) *request.lightAovs = std::move(aovs);
     if (GpuVerbose())
         std::cerr << LogPrefix() << std::format("{} samples, GPU {:.3f} s\n", request.samples, gpuSeconds);

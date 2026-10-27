@@ -83,6 +83,7 @@ void DenoiseRenderedImage(RenderDevice& device, ImageRequest const& request,
     denoise.output = request.denoised->data();
     denoise.settings = request.denoise;
     denoiser->Denoise(denoise);
+    if (request.denoiser) *request.denoiser = denoiser->Name();
     if (request.denoiseMilliseconds)
         *request.denoiseMilliseconds = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - start).count();

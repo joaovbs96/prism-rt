@@ -9,6 +9,9 @@
 
 #include "vulkan_device.h"
 #include "vulkan_material_calls.h"
+#if PRISM_HAS_VK_OIDN
+#include "vulkan_denoiser.h"
+#endif
 
 #include "../gpu/gpu_materials.h"
 #include "../gpu/texture_budget.h"
@@ -821,7 +824,60 @@ struct VulkanDevice::Impl {
     bool writeDescriptors(std::string* error);
     void* renderBuffer(int slot, size_t bytes);
     bool dispatch(GpuFrame const& frame, uint32_t threads, double* gpuSeconds, std::string* error);
+
+#if PRISM_HAS_VK_OIDN
+    // The denoiser (vk_oidn): its features are enabled with the device when
+    // the GPU has them (denoiseUnavailable empty); it is created at its
+    // first use, which logs once which denoiser the device uses.
+    std::vector<const char*> enabledExtensions;
+    std::string denoiseUnavailable;
+    std::mutex denoiserMutex;
+    bool denoiserTried = false;
+    std::shared_ptr<vulkan::VulkanDenoiser> denoiser;
+    std::shared_ptr<vulkan::VulkanDenoiser> gpuDenoiser();
+#endif
 };
+
+#if PRISM_HAS_VK_OIDN
+namespace {
+// PRISM_GPU_DENOISER=cpu: the GPU devices denoise with OIDN's CPU device on
+// host copies (and the Vulkan device enables no feature for vk_oidn).
+bool GpuDenoiserWanted()
+{
+    const char* value = std::getenv("PRISM_GPU_DENOISER");
+    return !(value && std::string_view(value) == "cpu");
+}
+} // namespace
+
+std::shared_ptr<vulkan::VulkanDenoiser> VulkanDevice::Impl::gpuDenoiser()
+{
+    std::lock_guard lock(denoiserMutex);
+    if (!denoiserTried) {
+        denoiserTried = true;
+        if (denoiseUnavailable.empty()) {
+            vulkan::DenoiseDevice host;
+            host.instance = instance;
+            host.physical = physical;
+            host.device = device;
+            host.queue = queue;
+            host.queueFamily = queueFamily;
+            host.queueMutex = &queueMutex;
+            host.extensions = enabledExtensions;
+            const auto start = Clock::now();
+            denoiser = vulkan::VulkanDenoiser::Create(host, &denoiseUnavailable);
+            if (denoiser && gpu::GpuVerbose())
+                std::cerr << std::format("PrismRT Vulkan: vk_oidn set up in {:.1f} ms\n",
+                                         std::chrono::duration<double, std::milli>(Clock::now() - start).count());
+        }
+        if (denoiser)
+            std::cerr << "PrismRT Vulkan: denoising on the GPU with " << denoiser->Name() << '\n';
+        else
+            std::cerr << "PrismRT Vulkan: denoising with OIDN's CPU device on host copies (" << denoiseUnavailable
+                      << ")\n";
+    }
+    return denoiser;
+}
+#endif
 
 VulkanDevice::Impl::~Impl()
 {
@@ -849,6 +905,11 @@ VulkanDevice::Impl::~Impl()
     }
     streaming.changed.notify_all();
     if (streaming.worker.joinable()) streaming.worker.join();
+#if PRISM_HAS_VK_OIDN
+    // A frontend may still hold the denoiser (the delegate's denoise jobs):
+    // its Vulkan objects go now, later calls use the CPU device.
+    if (denoiser) denoiser->Shutdown();
+#endif
     vkDeviceWaitIdle(device);
     for (auto& ready : streaming.ready) destroyImage(ready.image);
     streaming.ready.clear();
@@ -1033,6 +1094,25 @@ bool VulkanDevice::Impl::initialize(std::string* reason)
     VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     features.features.samplerAnisotropy = VK_TRUE;
     features.pNext = &vulkan12;
+#if PRISM_HAS_VK_OIDN
+    // The denoiser's features (vk_oidn), when the GPU has them all; chained
+    // in front: features -> 1.1 -> 1.3 [-> cooperative matrices] -> 1.2 -> ...
+    VkPhysicalDeviceVulkan11Features vulkan11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
+    VkPhysicalDeviceVulkan13Features vulkan13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    VkPhysicalDeviceCooperativeMatrixFeaturesKHR coopMat{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
+    bool cooperativeMatrix = false;
+    if (!GpuDenoiserWanted()) {
+        denoiseUnavailable = "PRISM_GPU_DENOISER=cpu";
+    } else if (vulkan::EnableDenoiseFeatures(physical, features, vulkan11, vulkan12, vulkan13, coopMat,
+                                             &cooperativeMatrix, enabled, &denoiseUnavailable)) {
+        coopMat.pNext = &vulkan12;
+        vulkan13.pNext = cooperativeMatrix ? static_cast<void*>(&coopMat) : static_cast<void*>(&vulkan12);
+        vulkan11.pNext = &vulkan13;
+        features.pNext = &vulkan11;
+    }
+    enabledExtensions = enabled;
+#endif
     const float priority = 1.0f;
     VkDeviceQueueCreateInfo queueInfo{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     queueInfo.queueFamilyIndex = queueFamily;
@@ -3453,6 +3533,31 @@ void* VulkanDevice::RenderBuffer(int slot, size_t bytes) { return m_impl->render
 bool VulkanDevice::Dispatch(GpuFrame const& frame, uint32_t threads, double* gpuSeconds, std::string* error)
 {
     return m_impl->dispatch(frame, threads, gpuSeconds, error);
+}
+
+std::shared_ptr<Denoiser> VulkanDevice::CreateDenoiser(std::string* error)
+{
+#if PRISM_HAS_VK_OIDN
+    if (auto denoiser = m_impl->gpuDenoiser()) return denoiser;
+#endif
+    return GpuRenderDevice::CreateDenoiser(error);
+}
+
+bool VulkanDevice::DenoiseAccumulation(ImageRequest const& request, std::vector<int> const& samples)
+{
+#if PRISM_HAS_VK_OIDN
+    // Under m_renderMutex (RenderImage): the accumulation stays in place.
+    auto denoiser = m_impl->gpuDenoiser();
+    if (!denoiser) return false;
+    denoiser->DenoiseAccumulation(m_impl->buffers[kSlotAccumulation].address, samples, request.width,
+                                  request.height, request.denoise, request.denoised);
+    if (request.denoiser) *request.denoiser = denoiser->Name();
+    return true;
+#else
+    (void)request;
+    (void)samples;
+    return false;
+#endif
 }
 
 } // namespace prism::device

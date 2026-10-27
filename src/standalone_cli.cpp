@@ -1117,6 +1117,7 @@ int runStandaloneCli(int argc, char** argv) {
         using prism::output::AovKind;
         double renderSeconds = 0, meanSamples = o.samples, fractionAtMaxSamples = 1.0;
         double denoiseMilliseconds = 0;
+        std::string denoiserName; // the last denoise's (for the profile)
         bool timeLimitReached = false;
         std::vector<prism::output::RenderedAov> rendered;
         for (size_t index = 0; index < views.size(); ++index) {
@@ -1179,6 +1180,7 @@ int runStandaloneCli(int argc, char** argv) {
                         imageRequest.denoise = o.denoiseSettings;
                         imageRequest.denoised = &denoisedPixels;
                         imageRequest.denoiseMilliseconds = &viewDenoiseMilliseconds;
+                        imageRequest.denoiser = &denoiserName;
                     }
                     progress.BeginRender(&imageProgress, o.adaptiveThreshold > 0,
                         views.size() > 1 ? "view " + std::to_string(index + 1) + "/" + std::to_string(views.size()) : "",
@@ -1197,7 +1199,8 @@ int runStandaloneCli(int argc, char** argv) {
                             for (float& value : denoisedPixels) value *= scale;
                         denoiseMilliseconds += viewDenoiseMilliseconds;
                         std::cout << "Denoised " << width << "x" << height << " in " << viewDenoiseMilliseconds
-                                  << " ms (" << prism::device::ToString(o.denoiseSettings.quality) << " quality"
+                                  << " ms with " << denoiserName << " ("
+                                  << prism::device::ToString(o.denoiseSettings.quality) << " quality"
                                   << (o.denoiseSettings.prefilter ? ", prefiltered guides" : "") << ")\n";
                         // --denoise replace: the colour outputs are the denoised colour.
                         if (o.denoise == "replace") rendered.back().pixels = denoisedPixels;
@@ -1294,6 +1297,7 @@ int runStandaloneCli(int argc, char** argv) {
                   << ",\"timeLimitReached\":" << (timeLimitReached ? "true" : "false")
                   << ",\"outputSeconds\":" << outputSeconds
                   << ",\"denoiseMilliseconds\":" << denoiseMilliseconds
+                  << ",\"denoiser\":\"" << denoiserName << "\""
                   << ",\"textureFiltering\":\"" << o.textureFiltering << "\""
                   << ",\"texturePrepareCalls\":" << textureStats.prepareCalls
                   << ",\"textureMemoryCacheHits\":" << textureStats.memoryCacheHits

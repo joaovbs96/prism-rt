@@ -52,6 +52,17 @@ protected:
     virtual bool Dispatch(GpuFrame const& frame, uint32_t threads, double* gpuSeconds,
                           std::string* error) = 0;
     virtual const char* LogPrefix() const = 0;
+    // Denoises a whole-image render where its accumulation lives
+    // (kSlotAccumulation: the colour sums, then the light AOV sums; `samples`
+    // per pixel) into *request.denoised, and names the denoiser in
+    // *request.denoiser. False when the device has no denoiser of its own:
+    // RenderImage then denoises the host images (DenoiseRenderedImage).
+    virtual bool DenoiseAccumulation(ImageRequest const& request, std::vector<int> const& samples)
+    {
+        (void)request;
+        (void)samples;
+        return false;
+    }
 
     std::mutex m_renderMutex; // one render at a time
 

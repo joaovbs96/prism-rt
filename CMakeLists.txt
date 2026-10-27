@@ -95,6 +95,26 @@ option(PRISM_ENABLE_OIDN "Build the Open Image Denoise denoiser (default: ON whe
 if(PRISM_ENABLE_OIDN)
     find_package(OpenImageDenoise 2 CONFIG REQUIRED)
 endif()
+# The Vulkan device's denoiser: nvpro-samples' vk_oidn (OIDN's network as
+# Vulkan compute), its prebuilt SDK package with OIDN's guide prefilter
+# networks packed beside it (tools/ci/fetch_vk_oidn.ps1). Optional; needs
+# OIDN (the CPU fallback) and the Vulkan device.
+find_package(vk_oidn 0.2 CONFIG QUIET)
+if(vk_oidn_FOUND AND PRISM_ENABLE_OIDN)
+    set(_prism_vk_oidn_default ON)
+else()
+    set(_prism_vk_oidn_default OFF)
+endif()
+option(PRISM_ENABLE_VK_OIDN "Denoise on the Vulkan device with vk_oidn (default: ON when found)"
+    ${_prism_vk_oidn_default})
+set(PRISM_VK_OIDN_ROOT "")
+if(PRISM_ENABLE_VK_OIDN)
+    if(NOT PRISM_ENABLE_OIDN)
+        message(FATAL_ERROR "PRISM_ENABLE_VK_OIDN needs Open Image Denoise (PRISM_ENABLE_OIDN)")
+    endif()
+    find_package(vk_oidn 0.2 CONFIG REQUIRED)
+    get_filename_component(PRISM_VK_OIDN_ROOT "${vk_oidn_DIR}/../../.." ABSOLUTE)
+endif()
 prism_check_dependency_versions()
 
 # OpenUSD built against a Python whose interpreter statically links libpython
@@ -177,7 +197,7 @@ set(PRISM_PYTHON_ROOT "" CACHE PATH "Python runtime root used by OpenUSD")
 if(NOT PRISM_PYTHON_ROOT AND Python3_EXECUTABLE)
     get_filename_component(PRISM_PYTHON_ROOT "${Python3_EXECUTABLE}" DIRECTORY)
 endif()
-foreach(_runtime_path IN ITEMS PRISM_USD_ROOT PRISM_OPENSUBDIV_ROOT PRISM_MATERIALX_ROOT PRISM_MATERIALX_LIBRARY_PATH PRISM_MATERIALX_MDL MDL_SDK_DIR PRISM_TBB_REDIST PRISM_EMBREE_RUNTIME_DIR PRISM_EMBREE_BUILD_RUNTIME PRISM_VCPKG_BIN PRISM_PYTHON_ROOT PRISM_OIDN_RUNTIME)
+foreach(_runtime_path IN ITEMS PRISM_USD_ROOT PRISM_OPENSUBDIV_ROOT PRISM_MATERIALX_ROOT PRISM_MATERIALX_LIBRARY_PATH PRISM_MATERIALX_MDL MDL_SDK_DIR PRISM_TBB_REDIST PRISM_EMBREE_RUNTIME_DIR PRISM_EMBREE_BUILD_RUNTIME PRISM_VCPKG_BIN PRISM_PYTHON_ROOT PRISM_OIDN_RUNTIME PRISM_VK_OIDN_ROOT)
     file(TO_CMAKE_PATH "${${_runtime_path}}" ${_runtime_path}_JSON)
 endforeach()
 configure_file(cmake/PrismRuntime.json.in "${CMAKE_BINARY_DIR}/prism-runtime.json" @ONLY)
@@ -276,6 +296,32 @@ if(PRISM_ENABLE_VULKAN)
                                       "${CMAKE_CURRENT_SOURCE_DIR}/src/device/vulkan/vulkan_material_calls.cpp")
     target_compile_definitions(prism_core PRIVATE PRISM_HAS_VULKAN=1)
     target_link_libraries(prism_core PUBLIC Vulkan::Vulkan)
+endif()
+# vk_oidn (above): the denoiser, and the prefilter weights embedded in the
+# library (cmake/embed_files.py), so nothing is loaded at run time.
+if(PRISM_ENABLE_VK_OIDN AND NOT PRISM_ENABLE_VULKAN)
+    message(STATUS "PrismRT: vk_oidn found, but the Vulkan device is off: no GPU denoiser")
+elseif(PRISM_ENABLE_VK_OIDN)
+    set(_prism_prefilter_weights "")
+    foreach(_model IN ITEMS rt_alb rt_alb_large rt_nrm rt_nrm_large)
+        set(_file "${PRISM_VK_OIDN_ROOT}/prefilter/${_model}.vkoidnw")
+        if(NOT EXISTS "${_file}")
+            message(FATAL_ERROR "vk_oidn's prefilter weights are missing (${_file}): install vk_oidn with "
+                                "tools/ci/fetch_vk_oidn.ps1, or set PRISM_ENABLE_VK_OIDN=OFF")
+        endif()
+        list(APPEND _prism_prefilter_weights "${_file}")
+    endforeach()
+    set(PRISM_VK_OIDN_WEIGHTS_SOURCE "${CMAKE_CURRENT_BINARY_DIR}/generated/vk_oidn_prefilter_weights.cpp")
+    add_custom_command(
+        OUTPUT "${PRISM_VK_OIDN_WEIGHTS_SOURCE}"
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_files.py"
+                "${PRISM_VK_OIDN_WEIGHTS_SOURCE}" VkOidnPrefilterWeights ${_prism_prefilter_weights}
+        DEPENDS ${_prism_prefilter_weights} "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_files.py"
+        COMMENT "Embedding vk_oidn's prefilter weights")
+    target_sources(prism_core PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/device/vulkan/vulkan_denoiser.cpp"
+                                      "${PRISM_VK_OIDN_WEIGHTS_SOURCE}")
+    target_compile_definitions(prism_core PRIVATE PRISM_HAS_VK_OIDN=1)
+    target_link_libraries(prism_core PRIVATE vk_oidn::vk_oidn)
 endif()
 target_include_directories(prism_core PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/external/tinygltf"
@@ -1150,6 +1196,79 @@ if(TARGET prism_hydra_render AND TARGET prism_compare_images)
             set_tests_properties(prism_denoise_error_${_device} PROPERTIES
                 FIXTURES_REQUIRED "prism_denoise_reference;prism_denoise_${_device}")
         endforeach()
+        # The Vulkan device's denoisers. prism_denoise_render_vulkan above
+        # runs vk_oidn on the accumulation (tensor cores on NVIDIA); here its
+        # generic convolutions (VK_OIDN_COOPMAT=0) and the CPU fallback on
+        # host copies (PRISM_GPU_DENOISER=cpu), on the same raw render (the
+        # same colour, checked), whose denoised layers must agree with the
+        # CPU device's within 1e-2 NRMSE (fp16 tensors; measured 1.5e-3,
+        # docs/denoising.md); the delegate on Vulkan (vk_oidn on host
+        # images); and the host-image path against OIDN's CPU device on
+        # synthetic images, every quality, with and without prefiltering.
+        if(PRISM_ENABLE_VULKAN)
+            set(_prism_vulkan_denoisers cpu)
+            if(PRISM_ENABLE_VK_OIDN)
+                set_tests_properties(prism_denoise_render_vulkan PROPERTIES FAIL_REGULAR_EXPRESSION "on host copies")
+                list(APPEND _prism_vulkan_denoisers generic)
+            endif()
+            foreach(_variant IN LISTS _prism_vulkan_denoisers)
+                if(_variant STREQUAL "generic")
+                    set(_env "VK_OIDN_COOPMAT=0")
+                    set(_fail "cooperative matrices|on host copies")
+                else()
+                    set(_env "PRISM_GPU_DENOISER=cpu")
+                    set(_fail "with vk_oidn")
+                endif()
+                add_test(NAME prism_denoise_render_vulkan_${_variant}
+                    COMMAND PrismRT --scene "${_prism_denoise_scene}" ${_prism_denoise_view} --spp 16
+                        --device vulkan --denoise aov --output "${_prism_denoise_dir}/vulkan_${_variant}.exr")
+                set_tests_properties(prism_denoise_render_vulkan_${_variant} PROPERTIES
+                    ENVIRONMENT "${_prism_test_environment};${_env}" FAIL_REGULAR_EXPRESSION "${_fail}"
+                    FIXTURES_SETUP prism_denoise_vulkan_${_variant})
+                add_test(NAME prism_denoise_error_vulkan_${_variant}
+                    COMMAND prism_denoise_test --error "${_prism_denoise_dir}/reference.exr"
+                        "${_prism_denoise_dir}/vulkan_${_variant}.exr" 0.5)
+                set_tests_properties(prism_denoise_error_vulkan_${_variant} PROPERTIES
+                    FIXTURES_REQUIRED "prism_denoise_reference;prism_denoise_vulkan_${_variant}")
+            endforeach()
+            if(PRISM_ENABLE_VK_OIDN)
+                add_test(NAME prism_denoise_vulkan_same_raw
+                    COMMAND prism_denoise_test --same "${_prism_denoise_dir}/vulkan.exr" -
+                        "${_prism_denoise_dir}/vulkan_cpu.exr" - 0)
+                set_tests_properties(prism_denoise_vulkan_same_raw PROPERTIES
+                    FIXTURES_REQUIRED "prism_denoise_vulkan;prism_denoise_vulkan_cpu")
+                foreach(_variant IN ITEMS "" _generic)
+                    add_test(NAME prism_denoise_vulkan${_variant}_matches_cpu
+                        COMMAND prism_denoise_test --same "${_prism_denoise_dir}/vulkan${_variant}.exr" denoised
+                            "${_prism_denoise_dir}/vulkan_cpu.exr" denoised 1e-2)
+                    set_tests_properties(prism_denoise_vulkan${_variant}_matches_cpu PROPERTIES
+                        FIXTURES_REQUIRED "prism_denoise_vulkan${_variant};prism_denoise_vulkan_cpu")
+                endforeach()
+                add_test(NAME prism_denoise_render_hydra_vulkan
+                    COMMAND prism_hydra_render "${_prism_denoise_scene}" /World/Camera
+                        "${_prism_denoise_dir}/hydra_vulkan.exr" 96 64 16 ${_prism_fixed_sampling}
+                        --render-settings /Render/Settings --denoise aov)
+                set_tests_properties(prism_denoise_render_hydra_vulkan PROPERTIES
+                    ENVIRONMENT "${_prism_test_environment};PRISM_DEVICE=vulkan"
+                    FAIL_REGULAR_EXPRESSION "Render stat denoiser: (OIDN|none)"
+                    FIXTURES_SETUP prism_denoise_hydra_vulkan)
+                add_test(NAME prism_denoise_error_hydra_vulkan
+                    COMMAND prism_denoise_test --error "${_prism_denoise_dir}/reference.exr"
+                        "${_prism_denoise_dir}/hydra_vulkan.exr" 0.5)
+                set_tests_properties(prism_denoise_error_hydra_vulkan PROPERTIES
+                    FIXTURES_REQUIRED "prism_denoise_reference;prism_denoise_hydra_vulkan")
+                add_test(NAME prism_denoise_vulkan_test COMMAND prism_denoise_test --vulkan "vk_oidn" 1.5e-2)
+                add_test(NAME prism_denoise_vulkan_generic_test
+                    COMMAND prism_denoise_test --vulkan "vk_oidn 0.2.0 Vulkan (generic" 1.5e-2)
+                set_tests_properties(prism_denoise_vulkan_test prism_denoise_vulkan_generic_test PROPERTIES
+                    SKIP_RETURN_CODE 77)
+                set_tests_properties(prism_denoise_vulkan_generic_test PROPERTIES
+                    ENVIRONMENT "VK_OIDN_COOPMAT=0")
+            endif()
+            add_test(NAME prism_denoise_vulkan_fallback_test COMMAND prism_denoise_test --vulkan "OIDN" 0)
+            set_tests_properties(prism_denoise_vulkan_fallback_test PROPERTIES
+                SKIP_RETURN_CODE 77 ENVIRONMENT "PRISM_GPU_DENOISER=cpu")
+        endif()
         # prism:denoise in the render settings: the CLI's image is the
         # denoised colour, the same as --denoise aov's layer.
         add_test(NAME prism_denoise_replace_cpu
@@ -1615,7 +1734,8 @@ set(_prism_gpu_test_regex
     "|^prism_parity_.*_(vulkan|metal)_(cli|hydra|match)$"
     "|^prism_parity_.*_(vulkan|metal)_.*_(match|layer|exact)$"
     "|^prism_scene_features_.*_vulkan$"
-    "|^prism_denoise_(render|error)_vulkan$"
+    "|^prism_denoise_(render|error)_(hydra_)?vulkan(_generic|_cpu)?$"
+    "|^prism_denoise_vulkan_.*$"
     "|^prism_light_shaping_.*_vulkan$"
     "|^prism_textured_emitters?(_glass)?_vulkan_(render|parity)$"
     "|^prism_thin_walled_glass_vulkan_(render|parity)$")

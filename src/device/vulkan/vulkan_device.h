@@ -30,6 +30,9 @@ public:
     bool AccumulationOutdated(SceneManager& scene) override;
     bool SettleTextures(SceneManager& scene, PassRequest const& request) override;
     TextureStreamingStats TextureStreaming() const override;
+    // vk_oidn on this GPU when it can run there (docs/denoising.md),
+    // otherwise OIDN's CPU device on host copies.
+    std::shared_ptr<Denoiser> CreateDenoiser(std::string* error = nullptr) override;
 
     struct Impl;
 
@@ -47,6 +50,7 @@ protected:
     bool Dispatch(GpuFrame const& frame, uint32_t threads, double* gpuSeconds,
                   std::string* error) override;
     const char* LogPrefix() const override { return "PrismRT Vulkan: "; }
+    bool DenoiseAccumulation(ImageRequest const& request, std::vector<int> const& samples) override;
 
 private:
     explicit VulkanDevice(std::unique_ptr<Impl> impl);

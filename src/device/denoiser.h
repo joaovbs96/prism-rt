@@ -8,12 +8,13 @@
 // can denoise its own whole-image render (ImageRequest::denoise), so callers
 // never pick a backend:
 //   CPU device     OIDN's CPU device on host images (this file);
-//   Vulkan, Metal  the same CPU denoiser on host copies for now. Part 2 gives
-//                  the Vulkan device vk_oidn (OIDN's network as Vulkan compute,
-//                  recorded into its own command buffer on buffers it holds),
-//                  part 3 the Metal device OIDN's Metal device on shared
-//                  MTLBuffers; both behind the same two entry points.
-// Every backend runs the same network weights.
+//   Vulkan         vk_oidn, OIDN's network as Vulkan compute, on the device's
+//                  queue and buffers the denoiser holds
+//                  (vulkan/vulkan_denoiser.h); the CPU denoiser on host copies
+//                  when vk_oidn cannot run on the GPU;
+//   Metal          the CPU denoiser on host copies for now (part 3: OIDN's
+//                  Metal device on shared MTLBuffers).
+// Every backend runs the same network weights (OIDN 2.5.1's).
 
 #include <memory>
 #include <string>
