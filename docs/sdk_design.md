@@ -102,7 +102,7 @@ How to read it:
 
 | # | State | Where | Today | Target |
 |---|---|---|---|---|
-| 7 | Active colour management | `gActive` `src/color/color_management.cpp:273-300` (`Active`, `SetActive`, `Activate`). Set: `standalone_cli.cpp:855`, `scene_bridge.cpp:5219,5376`. Read at load: `lights.h:176,179,196`, `environment.h:245`, `texture.h:62,122,242`, `texture_service.cpp:654`, `mdl_material.h:98`, `mdl_generator.cpp:272`, `prepared_template.h:402,438`, `gltf_mesh.h:135,433`, `scene_bridge.cpp:2486`. Read **while rendering**: `cpu_device.cpp:31`, `gpu_device.cpp:72`, `light_table.h:101`, `environment.h:79` | Process-wide, "last Activate wins"; Hydra rebuilds the scene on change | **Renderer** (immutable `std::shared_ptr<const ColorManagement>`). Scenes keep the renderer's pointer; render-time reads take it from the scene, not a global. Changing colour = `Renderer::setColorManagement` which marks every scene for reload (Hydra's behaviour today). |
+| 7 | Active colour management | `gActive` `src/color/color_management.cpp:273-300` (`Active`, `SetActive`, `Activate`). Set: `standalone_cli.cpp:862`, `scene_bridge.cpp:5219,5376`. Read at load: `lights.h:176,179,196`, `environment.h:245`, `texture.h:62,122,242`, `texture_service.cpp:654`, `mdl_material.h:98`, `mdl_generator.cpp:272`, `prepared_template.h:402,438`, `gltf_mesh.h:135,433`, `scene_bridge.cpp:2486`. Read **while rendering**: `cpu_device.cpp:31`, `gpu_device.cpp:72`, `light_table.h:101`, `environment.h:79` | Process-wide, "last Activate wins"; Hydra rebuilds the scene on change | **Renderer** (immutable `std::shared_ptr<const ColorManagement>`). Scenes keep the renderer's pointer; render-time reads take it from the scene, not a global. Changing colour = `Renderer::setColorManagement` which marks every scene for reload (Hydra's behaviour today). |
 | 8 | `OCIO` env | `color_management.cpp:111` | Read in `Create` | **Renderer** option `color.config`; `RendererOptions::FromEnvironment()` fills it from `OCIO`. |
 | 9 | SSS fallback | `sssFallbackSetting` `src/materialx/loader.cpp:1486-1499`; default arg `loader.h:23`; set `standalone_cli.cpp:911`, `scene_bridge.cpp:5224,5571`; env `PRISM_SSS_FALLBACK` (`loader.cpp:1492`, `render_defaults.h:65`) | Process-wide atomic | **Renderer** material option (`MaterialOptions::sssFallback`), passed to `DocumentLoader` explicitly; part of every material cache key (verify, 7.3 risk). |
 | 10 | Material binding purposes | `_BindingPurposes()` `src/hydra/scene_bridge.cpp:356-360`, read `:367`, set `:5501` | Process-wide atomic in Hydra | **Front end**: `prism::usd::LoadOptions::bindingPurposes` (the CLI already passes them through `USDMesh::LoadOptions`, `standalone_cli.cpp:927`); Hydra keeps them per delegate. |
@@ -205,3 +205,651 @@ scene, and scene-build options stored with render settings.
   sizes, refinement delay). They split into `RenderSettings`,
   `SceneOptions`/loader options, `RendererOptions` and Hydra-only options.
 - The CLI's `Options` (`standalone_cli.cpp:66-110`) mirrors the same split.
+
+## 3. Public API sketch (C++)
+
+Namespace `prism`, headers under `include/prism/`. Types are pimpl classes or
+plain structs; no third-party types. Sketches, not final signatures.
+
+### 3.1 Object model
+
+```
+Runtime (internal, process-wide, ref-counted)
+  MDL SDK, shared caches (2.3), admission budgets, OIDN CPU device
+Renderer  (public context; several per process allowed)
+  options, colour management, material system, texture service,
+  Embree device, task arena, logger, progress hub
+  Scene     (several per renderer)  handles: Mesh, Spheres, Instance,
+                                    Material, Light, Environment, Camera
+  Session   (several per renderer)  device + RenderSettings + film (AOVs);
+                                    renders committed revisions of one Scene
+```
+
+Ownership: `Renderer`, `Scene`, `Session` are cheap handles to ref-counted
+implementations (`std::shared_ptr<Impl>`), like OIDN's `DeviceRef`. A scene
+keeps its renderer alive; a session keeps its scene and renderer alive, so
+Python objects never dangle.
+
+### 3.2 Common types (`prism/types.h`)
+
+```cpp
+namespace prism {
+// The renderer's own math types (src/float2.h, float3.h, float4.h) become
+// public as they are: std-only. Color3 is a Float3.
+using ::Float2; using ::Float3; using ::Float4; using Color3 = Float3;
+// Row-major 4x4 for column vectors (p' = M p). Double for transforms.
+struct Matrix4d { std::array<double, 16> m; static Matrix4d identity(); };
+
+// A typed view of caller memory. With `owner` set, the core may keep a
+// reference instead of copying (zero-copy; Python passes the ndarray owner).
+enum class DataType : uint8_t { Float32, Float64, Int32, UInt32, UInt8 };
+struct BufferView {
+    const void* data = nullptr;
+    size_t count = 0;              // elements
+    uint32_t components = 1;       // per element (3 for points)
+    DataType type = DataType::Float32;
+    size_t strideBytes = 0;        // 0: tightly packed
+    std::shared_ptr<const void> owner;   // optional keep-alive
+};
+
+// Time samples (section 5). One sample = not animated.
+template <class T> struct TimeSample { double time = 0.0; T value; };
+template <class T> using Sampled = std::vector<TimeSample<T>>;
+
+enum class LogLevel { Debug, Info, Warning, Error };
+}
+```
+
+### 3.3 Errors
+
+Proposal (open question 8.1): exceptions, as the code does today
+(`std::runtime_error` everywhere).
+- `prism::Error : std::runtime_error` with `ErrorCode code()`:
+  `InvalidArgument`, `InvalidHandle`, `NotFound` (file), `Unsupported`
+  (feature or device not in this build), `DeviceLost`, `OutOfMemory`,
+  `Cancelled`, `Internal`.
+- Non-fatal problems are diagnostics, not errors: a material that fails to
+  compile renders with the magenta error material and adds a
+  `Diagnostic{level, category, message, handle}` to `Scene::diagnostics()` and
+  the log. Same behaviour as today (`ErrorMaterial`, warnings on `std::cerr`).
+- Errors on render threads are kept by the session and rethrown by `wait()` /
+  `render()`; `status()` reports them without throwing.
+- nanobind maps `prism::Error` to Python exceptions (`prism.Error`, a
+  subclass per code; `Cancelled` → `prism.CancelledError`).
+
+### 3.4 Renderer (`prism/renderer.h`)
+
+```cpp
+namespace prism {
+struct ColorOptions {              // today prism::color::Options
+    std::string config;            // empty: studio config
+    std::string workingSpace;      // empty: ACEScg
+    std::string display, view;
+};
+struct MaterialOptions {
+    std::string materialxLibraries;   // PRISM_MATERIALX_LIBRARY_PATH
+    std::string materialxMdlPath;     // PRISM_MATERIALX_MDL
+    bool sssFallback = false;         // was DocumentLoader::SetSssFallback
+    enum class CompileMode { Auto, Class } compileMode = CompileMode::Auto;
+    bool prewarm = true;
+};
+struct Limits {                       // 2.2 rows 14-15; 0 = built-in default
+    uint64_t materialCacheMiB = 0, preparationMiB = 0, textureCacheMiB = 0,
+             texturePrepareMiB = 0, diskCacheGiB = 0;
+    unsigned materialThreads = 0, textureThreads = 0, textureWriterThreads = 0,
+             textureOpenFiles = 0;
+};
+struct RendererOptions {
+    ColorOptions color;
+    MaterialOptions materials;
+    Limits limits;
+    std::string cacheDirectory;       // empty: the platform cache directory
+    unsigned threads = 0;             // task arena size; 0: all cores
+    std::vector<DeviceKind> disabledDevices;   // PRISM_DISABLE_VULKAN/METAL
+    std::function<void(LogLevel, std::string_view category, std::string_view)> log;
+    LogLevel logLevel = LogLevel::Warning;
+    // The front ends' defaults: each field from its env var (OCIO, PRISM_*).
+    static RendererOptions FromEnvironment();
+};
+
+class Renderer {
+public:
+    explicit Renderer(RendererOptions const& = {});
+    RendererOptions const& options() const;
+
+    // Colour management. Changing it marks every scene of this renderer for
+    // reload (materials, lights, textures), as the Hydra delegate does today.
+    ColorInfo color() const;          // working space, display, view, config name
+    void setColor(ColorOptions const&);
+
+    std::vector<DeviceInfo> devices() const;   // today AvailableDevices(), CPU last
+    Capabilities capabilities() const;         // denoiser, devices, motionBlur
+    Scene createScene(SceneOptions const& = {});
+    Session createSession(Scene const&, SessionOptions const& = {});
+
+    RendererStats stats() const;      // texture + material counters (the CLI's [PrismProfile])
+};
+}
+```
+
+Notes:
+- `RendererOptions::FromEnvironment()` replaces the scattered `getenv` reads
+  of 2.2. The CLI and Hydra call it; Python by default too (open question 8.6).
+- Heavy members (texture service, material system, Embree device) are created
+  on first use, so `devices()` stays cheap.
+
+### 3.5 Scene (`prism/scene.h`)
+
+```cpp
+namespace prism {
+// Handles: 32-bit slot + 32-bit generation, typed value types. A removed
+// handle throws InvalidHandle.
+struct MeshId { uint64_t v; };     struct SpheresId { uint64_t v; };
+struct InstanceId { uint64_t v; }; struct MaterialId { uint64_t v; };
+struct LightId { uint64_t v; };    struct EnvironmentId { uint64_t v; };
+struct CameraId { uint64_t v; };
+
+enum class Interpolation { Constant, Uniform, Vertex, FaceVarying, Instance };
+struct Primvar {                   // named data for MDL scene-data lookups
+    std::string name; Interpolation interpolation; BufferView data;
+};
+
+struct SubdivisionDesc {           // today prism::mesh::SubdivisionSettings + USD tags
+    enum class Scheme { None, CatmullClark, Loop, Bilinear } scheme = Scheme::None;
+    int level = -1;                // -1: SceneOptions default
+    BufferView creaseIndices, creaseLengths, creaseSharpness,
+               cornerIndices, cornerSharpness, holeIndices;
+};
+
+struct MeshDesc {
+    Sampled<BufferView> points;          // section 5: one sample today
+    BufferView faceVertexCounts;         // empty: all triangles
+    BufferView faceVertexIndices;
+    BufferView normals;  Interpolation normalsInterpolation = Interpolation::Vertex;
+    BufferView uvs;      Interpolation uvsInterpolation = Interpolation::FaceVarying;
+    BufferView tangents;
+    std::vector<Primvar> primvars;
+    BufferView velocities, accelerations;   // reserved (section 5)
+    SubdivisionDesc subdivision;
+    // Per-face material slots (USD GeomSubsets, glTF primitives, OBJ usemtl):
+    // faceMaterialSlots[i] indexes InstanceDesc::materials.
+    BufferView faceMaterialSlots;
+    bool doubleSided = true;
+    BufferView singleSidedFaces;         // per-face flags (the CLI's merged meshes)
+};
+
+struct SpheresDesc {                     // analytic spheres (Sphere, BatchedSpheres)
+    Sampled<BufferView> centers;  BufferView radii;
+};
+
+struct InstanceDesc {
+    std::variant<MeshId, SpheresId> prototype;
+    Sampled<Matrix4d> transform{{0.0, Matrix4d::identity()}};
+    std::vector<MaterialId> materials;   // slot 0 is the default
+    std::vector<Primvar> primvars;       // instance-rate (InstancePrimvars)
+    bool visible = true;                 // Hydra visibility (disabled_placements)
+    std::vector<std::string> lightLinkCategories, shadowLinkCategories;
+    // Reported by the primId/instanceId AOVs and by pick(): the front end's
+    // numbering (Hydra prim ids; the CLI numbers placements like Hydra).
+    int32_t primId = -1, instanceId = -1;
+    uint64_t userData = 0;               // opaque, returned by pick()
+};
+
+struct LightDesc {                       // today prism::LightParameters
+    LightShape shape;                    // Sphere, Rect, Disk, Cylinder, Distant, Point
+    Sampled<Matrix4d> transform{{0.0, Matrix4d::identity()}};
+    Color3 color{1.0f};                  // authored, in colorSpace
+    std::string colorSpace = "lin_rec709";
+    float intensity = 1, exposure = 0, diffuse = 1, specular = 1;
+    bool normalize = false, cameraVisible = false;
+    std::optional<float> temperature;    // enableColorTemperature
+    float radius = 0.5f, width = 1, height = 1, length = 1, angle = 0.53f;
+    bool treatAsPoint = false;
+    LightShaping shaping;                // cone, focus, IES file
+    std::string texture, textureColorSpace;   // rect lights
+    std::string lightLinkCategory, shadowLinkCategory;
+};
+
+struct EnvironmentDesc {                 // USD dome, --env, --env-color
+    std::string texture;                 // empty: constant colour
+    std::string textureColorSpace;
+    Color3 color{1.0f}; float intensity = 1, exposure = 0;
+    float diffuse = 1, specular = 1;
+    Sampled<Matrix4d> transform{{0.0, Matrix4d::identity()}};
+    bool cameraVisible = true;           // domeLightCameraVisibility
+};
+
+struct CameraDesc {
+    Sampled<Matrix4d> cameraToWorld{{0.0, Matrix4d::identity()}};
+    enum class Projection { Perspective, Orthographic } projection{};
+    float focalLength = 50, horizontalAperture = 36, verticalAperture = 24,
+          horizontalApertureOffset = 0, verticalApertureOffset = 0;
+    float nearClip = 0.001f, farClip = 1e30f;
+    float fStop = 0, focusDistance = 1;
+    float exposureScale = 1;             // UsdGeomCamera::ComputeLinearExposureScale
+    std::optional<Shutter> shutter;      // reserved (section 5)
+    // For Hydra: explicit matrices (HdCamera, pass camera).
+    std::optional<Matrix4d> worldToView, projectionMatrix;
+};
+
+struct SceneOptions {                    // build options (were render settings)
+    int subdivisionLevel = 2, subdivisionMaxFaces = 1 << 16,
+        subdivisionBudgetFaces = 24 << 20;
+    int displacementLevel = 4, displacementMaxFaces = 1 << 18;
+    bool sphereBatching = false;
+    uint64_t hiddenGeometryBudgetMiB = 0;
+    bool defaultDome = false;            // usdview's dome when nothing emits
+    double timeCodesPerSecond = 24;      // velocities (section 5)
+};
+
+class Scene {
+public:
+    MeshId addMesh(MeshDesc const&);
+    void updateMesh(MeshId, MeshDesc const&);                    // full replace
+    void updateMeshPoints(MeshId, Sampled<BufferView> const&);   // deformation only
+    SpheresId addSpheres(SpheresDesc const&);
+    InstanceId addInstance(InstanceDesc const&);
+    void setTransform(InstanceId, Sampled<Matrix4d> const&);
+    void setVisible(InstanceId, bool);
+    void setMaterials(InstanceId, std::vector<MaterialId> const&);
+    MaterialId addMaterial(MaterialDesc const&);                 // 3.6
+    void updateMaterial(MaterialId, MaterialDesc const&);
+    LightId addLight(LightDesc const&);     void updateLight(LightId, LightDesc const&);
+    EnvironmentId addEnvironment(EnvironmentDesc const&);       // several: composite
+    CameraId addCamera(CameraDesc const&);  void updateCamera(CameraId, CameraDesc const&);
+    template <class Id> void remove(Id);
+
+    // Publishes the edits since the last commit as a new revision: converts
+    // meshes (subdivision, displacement), compiles new materials, prepares
+    // textures, builds the Embree scene. Sessions take the new revision at
+    // their next pass. Blocking; the callback can cancel it.
+    CommitResult commit(ProgressCallback const& = {});
+    uint64_t revision() const;
+    std::vector<Diagnostic> diagnostics() const;
+    SceneStats stats() const;            // meshes, triangles, materials, memory
+};
+}
+```
+
+Edit semantics:
+- Edits are recorded, not applied: nothing a session renders changes before
+  `commit()` (Embree's model; Hydra's snapshot publication today:
+  `Snapshot` and the spare "banks" in `scene_bridge.cpp`).
+- `commit()` builds the next revision beside the published one and swaps it
+  in. Sessions keep rendering the old revision meanwhile and restart
+  accumulation on the swap. The Hydra bridge already does this with its
+  double-buffered snapshots; that machinery moves into the core (7, step 5).
+- `commit()` classifies edits with the dirty kinds Hydra uses today
+  (`SceneDirtyKind`, `scene_bridge.h:116-124`: placement, prototype,
+  material, environment, structure), so a transform edit refits instances and
+  does not convert prototypes, and a light edit does not rebuild the BVH.
+- `CommitResult` says what changed so sessions restart only what they must
+  (GPU: re-upload light table vs full scene).
+
+Threading rules:
+- One writer per `Scene` at a time (externally synchronized, as Embree
+  objects). Edits may run on any thread, also while sessions render.
+- `commit()` must not overlap edits of the same scene; it may run while
+  sessions render the previous revision.
+- `Renderer` methods and read-only queries are thread-safe.
+- Callbacks (progress, log) run on internal threads and must not edit the
+  scene that is committing.
+
+### 3.6 Materials (`prism/material.h`)
+
+```cpp
+namespace prism {
+struct MaterialDesc {
+    enum class Kind { MaterialXFile, MaterialXString, Diffuse, Emissive } kind;
+    std::string path;            // .mtlx file
+    std::string document;        // .mtlx XML text
+    std::string materialName;    // empty: the first material of the document
+    std::string searchPath;      // base for relative textures of a string
+    Color3 color{0.18f};         // Diffuse / Emissive
+    float opacity = 1.0f;
+    // Overrides of exposed inputs: runtime arguments where the compiled
+    // program has them (template rebinding), else a recompile.
+    std::vector<std::pair<std::string, ParameterValue>> parameters;
+};
+}
+```
+- Built-ins map to `Diffuse` (the displayColor/displayOpacity fallback),
+  `Emissive` and the error material (`src/material.h:136,180,213`).
+- MaterialX strings: `MDLMaterial` compiles only from a file path today
+  (`src/mdl_material.h:81`). A string is written into the renderer's material
+  cache under a content hash (the glTF and OBJ converters already publish
+  generated documents there) and compiled from that file. Later
+  `DocumentLoader` can take the document in memory.
+- `prism/materialx_interop.h` (optional, header-only, needs MaterialX) turns a
+  `MaterialX::DocumentPtr` into a string; the core stays free of MaterialX
+  types.
+- UsdShade networks come through `prism_usd`
+  (`prism::usd::addMaterial(scene, stage, path)`), which runs today's
+  `MaterialService` on Hydra data sources inside the module and returns a
+  `MaterialId`.
+- Compilation happens in `commit()` (load time), never in the render loop
+  (CLAUDE.md). `commit()` hands the new materials to the material system's
+  worker pool in one batch, as `MaterialService::Prefetch` does today.
+
+### 3.7 Render settings, devices, sessions (`prism/session.h`)
+
+```cpp
+namespace prism {
+enum class DeviceKind { Cpu, Vulkan, Metal };
+enum class DevicePreference { Auto, Cpu, Vulkan, Metal };
+struct DeviceInfo { DeviceKind kind; std::string name; bool hardwareRayTracing; };
+
+struct Shutter { double open = 0.0, close = 0.0; };   // reserved (section 5)
+
+struct RenderSettings {          // merged hydra::RenderSettings + the CLI's Options
+    int samples = 2048;          // defaults from src/render_defaults.h
+    float adaptiveThreshold = 0.01f;  int adaptiveMinSamples = 64;
+    double timeLimitSeconds = 0;
+    int maxDepth = 32, rouletteDepth = 4;
+    uint32_t seed = 0;
+    float sampleClamp = 0;       // 0: off (Hydra's default is 10)
+    bool environmentMis = true;  // environmentSampling mis | bsdf
+    TextureFiltering textureFiltering = TextureFiltering::Filtered;
+    bool honorDoubleSided = false;
+    bool transparentBackground = false;   // SampleShading::transparentEscapes
+    NeeSettings nee;             // probabilityMin, fromDepth, spatialLights
+    bool textureStreaming = true, textureStreamingPrepass = false;
+    int gpuTextureBudgetMiB = 0;
+    Shutter shutter;             // reserved (section 5)
+    std::map<std::string, std::string> advanced;   // 2.2 rows 19-20; env defaults
+};
+
+struct DenoiseSettings { enum class Quality { Fast, Balanced, High } quality; bool prefilter = true; };
+
+enum class Aov { Color, Depth, CameraDepth, Normal, Neye, Peye, Pworld, St,
+                 PrimId, ElementId, InstanceId,
+                 Albedo, Diffuse, Specular, Emission, Denoised };   // src/output/aov.h:25-31
+
+struct SessionOptions {
+    DevicePreference device = DevicePreference::Auto;
+    bool allowFallback = true;   // to the CPU device, with a note
+    unsigned width = 0, height = 0;
+    struct Window { unsigned x, y, width, height; };
+    std::optional<Window> dataWindow;      // render products' data window
+    std::vector<Aov> aovs{Aov::Color};
+    RenderSettings settings;
+    std::optional<DenoiseSettings> denoise;   // required by Aov::Denoised
+    ProgressiveOptions progressive;        // preview size, refinement delay,
+                                           // denoise interval, GPU preparation preview
+};
+
+struct Progress {                // today prism::Progress::Snapshot + ImageProgress
+    std::string phase;           // device, loading, materials, textures, kernel,
+                                 // upload, rendering, idle, error
+    double phaseSeconds = 0; std::string detail, device, error;
+    double fraction = 0;         // ImageProgress::Fraction()
+    double meanSamples = 0; int pass = 0;
+};
+// Called on an internal thread, rate-limited (default 10 Hz, and at the end
+// of each pass). Returning false cancels: the blocking call then throws
+// Cancelled, or the progressive session stops.
+using ProgressCallback = std::function<bool(Progress const&)>;
+
+class Image {                    // host pixels with shared ownership
+public:
+    unsigned width() const; unsigned height() const; unsigned channels() const;
+    DataType type() const;       // Float32, or Int32 for id AOVs
+    const void* data() const;    // row-major, top row first
+    std::shared_ptr<const void> owner() const;   // for zero-copy wrappers
+};
+
+class Session {
+public:
+    DeviceInfo device() const;
+    std::string deviceNote() const;        // why it fell back to the CPU
+
+    // A change restarts accumulation.
+    void setSettings(RenderSettings const&);
+    void setCamera(CameraId);
+    void setCamera(CameraDesc const&);     // per-pass camera (Hydra)
+    void resize(unsigned width, unsigned height, std::optional<Window> = {});
+
+    // Device setup (kernel compile, upload, light tables): today's
+    // RenderDevice::Prepare. Optional; rendering calls it.
+    void prepare(ProgressCallback const& = {});
+
+    // Batch: to completion (samples, adaptive, time limit) through today's
+    // RenderDevice::RenderImage path. Blocking.
+    RenderResult render(ProgressCallback const& = {});
+
+    // Progressive: passes on an internal thread; takes new scene revisions
+    // between passes.
+    void start(ProgressCallback const& = {});
+    void pause(); void resume();
+    void cancel();                         // asynchronous; wait() returns
+    void restart();                        // accumulation from sample 0
+    SessionStatus wait(double timeoutSeconds = -1);   // rethrows render errors
+    SessionStatus status() const;          // running, converged, paused, error
+
+    // Film snapshots, safe while start() runs (copied at a pass boundary).
+    Image aov(Aov) const;
+    Image denoised() const;                // denoise now (progressive)
+    Pick pick(unsigned x, unsigned y) const;   // instance, primitive, userData, position
+};
+
+struct RenderResult {
+    std::map<Aov, Image> aovs;
+    double meanSamples, fractionAtMaxSamples, renderSeconds, denoiseMilliseconds;
+    bool timeLimitReached;
+    std::string denoiser;
+};
+}
+```
+
+Notes:
+- Two render paths stay, as today: `render()` uses `RenderDevice::RenderImage`
+  (the CLI's whole-image path), `start()` the `RenderPass` loop with tiles,
+  adaptive `ActivePixels`, previews and publication that lives in
+  `scene_bridge.cpp` today (`SceneBridge::Render` `:6612`, passes
+  `:7141-7199`, denoise interval `:7418`). Both keep CPU/Vulkan parity and the
+  CLI/Hydra parity fixtures.
+- Exposure: the camera's `exposureScale` applies after the sample clamp, to
+  colour and radiance AOVs, not to albedo (`standalone_cli.cpp:1196-1226`).
+  The session does it; front ends stop repeating it.
+- Geometric AOVs (depth, normals, ids, Pworld, st) come from pixel-centre
+  primary hits on both paths, as today (`standalone_cli.cpp:1234-1270`;
+  Hydra's `resolvePrimary`).
+- Files are not in the core: `prism_io` (OIIO) writes `Image`s as EXR layers
+  or display-encoded 8-bit through the renderer's colour management (today
+  `src/output/image_writer.cpp`). Render products/vars come from USD
+  (`src/output/render_products.cpp`), so they go to `prism_usd`.
+- "One GPU process at a time" is a machine rule, not enforced by the API.
+
+### 3.8 Lifetimes and shutdown
+- The last handle to a renderer joins its sessions' threads (sessions hold
+  references, so nothing renders on a dead renderer).
+- The Runtime lives for the process (the MDL SDK cannot restart). Its caches
+  with MDL handles are emptied by the existing MDL shutdown hooks (row 3) at
+  exit, not when the last renderer goes.
+- Python: an `atexit` hook cancels and joins all sessions before the
+  interpreter finalizes, so no render thread touches Python afterwards.
+
+### 3.9 How the front ends map onto the API
+
+CLI (`src/standalone_cli.cpp`, 1317 lines) becomes argument parsing plus:
+
+| CLI today | API |
+|---|---|
+| `EmbreeDevice`, `color::Activate`, `SharedMdlContext()`, `SetSssFallback`, `getenv("PRISM_MATERIALX_LIBRARY_PATH")` (`:742,862,908-913`) | `Renderer r(options)` with `RendererOptions::FromEnvironment()` + flags |
+| `UsdStage::Open`, `ResolveRenderJob` (`:788-794`) | `prism::usd::openStage`, `prism::usd::resolveRenderJob` |
+| `USDMesh` / `glTFMesh` / `ObjMesh` + `attachImportedMesh` (`:925-949`) | `prism::usd::load(scene, stage, opts)`, `prism::gltf::load(scene, file)`, `prism::obj::load(scene, file, opts)` |
+| UsdLux traversal and domes (`:979-1080`) | inside `prism::usd::load` (`LightDesc`, `EnvironmentDesc`) |
+| `--env`, `--env-color`, default dome (`:960-975,1087-1104`) | `scene.addEnvironment(...)`; `SceneOptions::defaultDome` |
+| `scene.commitScene()` (`:1083`) | `scene.commit(progress)` |
+| `CreateDevice`, `SceneChanged` (`:1113-1119`) | `r.createSession(scene, {device, ...})` |
+| `ImageRequest`, `RenderImage`, exposure, light AOVs, denoise (`:1159-1228`) | `session.render(progress)` → `RenderResult` |
+| geometric AOV loop (`:1234-1270`) | inside `render()` (requested `aovs`) |
+| `BuildProductImage`, `WriteImage` (`:1274-1282`) | `prism::usd::writeProduct` / `prism::io::write` |
+| `ProgressPrinter` polling `Progress::Current()` and `ImageProgress` (`:575-740`) | the progress callback |
+
+Hydra (`src/hydra/`):
+
+| Hydra today | API |
+|---|---|
+| `SceneBridge::Impl` ctor: `rtcNewDevice`, `PRISM_*` env, `MaterialService` (`scene_bridge.cpp:4613-4660`) | a `Renderer` per delegate (or one shared, open question 8.12); `prism::usd` material adapter around `MaterialService` |
+| snapshot build/refresh from the scene index, banks, dirty notices (bulk of `scene_bridge.cpp`, ~1300-4400) | scene-index observer turns prims into `Scene` edits + `commit()`; the bank/snapshot machinery moves into `Scene::commit` |
+| `SetSettings` (`:5363`), `color::Activate` (`:5219,5376`), `SetSssFallback` (`:5224,5571`), `_BindingPurposes` (`:5501`) | `session.setSettings`, `renderer.setColor`, renderer material options, per-delegate binding purposes |
+| render thread: `RenderPreview`, `RenderPass`, adaptive, accumulation, denoise interval (`:6612-7430`) | `session.start()`; `PrismRenderBuffer`s read `session.aov()` snapshots (or a zero-copy frame callback) |
+| picking (`PickingTable`, `PublishedFrame` `scene_bridge.h:155-180`; `RenderDevice::Intersect` `device.h:273`) | `session.pick(x, y)` → `instanceId`/`primId`/`userData`; USD path tables stay in Hydra |
+| `GetStats`, `GetProgress` (`scene_bridge.h:205-209`) | `session.status()`, the progress callback, `renderer.stats()` |
+| GPU preparation preview (CPU renders while the GPU prepares) | `ProgressiveOptions::gpuPreparationPreview` |
+
+## 4. Header split and module boundaries
+
+### 4.1 Modules (CMake targets)
+
+| Target | Contents | Links (private) | Public deps |
+|---|---|---|---|
+| `prism` (shared library, `PRISM_API` exports) | Renderer, Scene, Session, materials (MaterialX → MDL), devices (CPU, Vulkan, Metal), integrator, colour, textures, denoisers | Embree, oneTBB, MDL SDK (loaded at run time), MaterialX, OIIO, OCIO, OIDN, Vulkan/Metal, OpenSubdiv | std only |
+| `prism_io` | image writing (`src/output/image_writer.cpp`) | OIIO | `prism` |
+| `prism_usd` | stage loading (`usd_mesh.h`), UsdLux, UsdShade via `MaterialService`, render settings/products, Vt mesh adapter, StageCache lookup | usd, usdGeom, usdLux, usdShade, usdRender, hd (data sources), hdMtlx | `prism` (+ pxr types in `prism/usd.h` only) |
+| `prism_gltf` | `gltf_mesh.h`, `gltf_material.cpp` | tinygltf, MaterialX | `prism` |
+| `prism_obj` | `obj_mesh.h`, `obj_material.cpp` | tinyobjloader, MaterialX | `prism` |
+| `PrismRT` (CLI) | argument parsing, printing | `prism`, `prism_io`, `prism_usd`, `prism_gltf`, `prism_obj` | |
+| `hdPrism` (plugin) | `src/hydra/*` | `prism`, `prism_usd`, hd, hdx | |
+| `_prism` (Python extension) | nanobind bindings | `prism`, `prism_io`, loaders; `prism_usd` optional | |
+
+`prism` must be a shared library:
+- Today `prism_core` is static (`CMakeLists.txt:236`) and linked into both
+  `PrismRT` and `hdPrism` (`src/hydra/CMakeLists.txt:11`).
+- A Python process that loads `hdPrism` (usdview, or `UsdImagingGL` from a
+  script) and `_prism` would hold two copies of every global of section 2,
+  including two owners of the one `INeuray`.
+- One shared `prism` keeps the Runtime unique per process. `prism_usd` holds
+  module state (rows 29-31, 33), so it is shared too when both `hdPrism` and
+  `_prism` use it. `prism_gltf`/`prism_obj` can stay static.
+
+### 4.2 Where the current files go
+
+| Current | Target |
+|---|---|
+| `src/scene.h` (`SceneManager`) | `prism` internal; the public `Scene` wraps it |
+| `src/device/*` (`device.h`, `cpu_*`, `gpu/*`, `vulkan/*`, `metal/*`, `denoiser.*`, `adaptive_sampling.h`, `light_table.h`) | `prism` internal; `DeviceInfo`, `DeviceKind`, `DenoiseSettings`, `NeeSettings` become public types |
+| `shaders/` | `prism` (embedded) |
+| `src/color/*` | `prism`; `ColorManagement` internal, `ColorOptions`/`ColorInfo` public |
+| `src/materialx/loader.*`, `mdl_generator.*`, `generated_cache.*`, `cached_document.h`, `prepared_template.h` (minus Hd parts), `resolved_resource.h`, `udim_resource.h` | `prism` internal |
+| `src/materialx/material_service.*`, `captured_material.h`, `usd_network.h`, `hdmtlx_names.h`, `preview_surface.h` | `prism_usd` (Hydra data sources) |
+| `src/materialx/gltf_material.*`, `obj_material.*` | `prism_gltf`, `prism_obj` |
+| `src/mdl/*`, `src/mdl_material.h` | `prism` internal |
+| `src/mesh/usd_mesh.h`, Vt part of `mesh_conversion.*` | `prism_usd` |
+| `src/mesh/subdivision.*` (std-only), std part of `mesh_conversion.*` | `prism` internal (used by `commit()`) |
+| `src/mesh/gltf_mesh.h`, `obj_mesh.h` | `prism_gltf`, `prism_obj` |
+| `src/output/aov.h` | `prism` (enum public, `ResolveGeometricAov` internal) |
+| `src/output/render_products.*` | `prism_usd` |
+| `src/output/image_writer.*` | `prism_io` |
+| `src/texture*`, `texture_service.*` | `prism` internal |
+| `src/lights.h`, `src/lights/ies.*`, `src/environment.h` | `prism` internal; `LightDesc`/`EnvironmentDesc` public |
+| `src/progress.h` | `prism` internal; `Progress` snapshot public |
+| `src/render_defaults.h` | public `prism/defaults.h` (already std-only) |
+| `src/float2.h`, `float3.h`, `float4.h` | public `prism/math.h` |
+| `src/camera_rays.h`, `camera_ray_diagnostics.h` | `prism` internal (after the Gf removal below) |
+| `src/standalone_cli.*`, `main.cpp` | `PrismRT` |
+| `src/hydra/*` | `hdPrism` |
+
+### 4.3 Concrete offenders
+
+USD (`pxr`) in code the core needs:
+- `src/camera_rays.h:6-8,16-17,48-73`: `CameraRayParameters` stores
+  `pxr::GfMatrix4d` and does camera math with `GfVec*`. It sits in
+  `ImageRequest`/`PassRequest`, so every device depends on USD. Replace with
+  `prism::Matrix4d` and own inverse/transform helpers (exact results must not
+  change: check `--exact`).
+- `src/output/aov.h:13-15`: `GfMatrix4d` in `ResolveGeometricAov`. Same fix.
+- `src/mesh/obj_mesh.h:33-35,171-188` and `src/mesh/mesh_conversion.h:12-14`:
+  the OBJ loader builds `VtVec3fArray`/`VtValue`/`TfToken` to reuse
+  `ConvertMesh` for subdivision. Split `mesh_conversion` into a std-only
+  `MeshSource` (spans) used by `commit()` and a Vt adapter in `prism_usd`.
+  Then glTF and OBJ need no USD.
+- `src/materialx/material_service.h:9-11`: Hd data sources and `SdfPath` in
+  the material service API. The service goes to `prism_usd`; its USD-free
+  caches (rows 28, 32, 34, 35) go into the core material system.
+- `src/scene.h:20-22,58-100`: includes all three loaders;
+  `attachImportedMesh` casts to `USDMesh`. Loaders call `Scene` instead.
+- `CMakeLists.txt:336-346`: `prism_core` links `${PXR_LIBRARIES}` and puts
+  `${PXR_INCLUDE_DIRS}` and `${Python3_INCLUDE_DIRS}` in its PUBLIC include
+  path. They move to `prism_usd`.
+
+Embree types in today's front-end-facing headers:
+- `src/device/device.h:273`: `RenderDevice::Intersect` returns `RTCRayHit`;
+  `PassRequest::resolvePrimary` (`:184`) and `PreviewRequest::writePixel`
+  (`:207`) pass `RayHit`, which wraps Embree (`src/ray.h:3,43-45`). They stay
+  internal; the public `Session::pick` returns `Pick`.
+- `src/ray.h:3,36-39` (`PathRay` holds `RTCRay`), `src/geometry.h:14,28`
+  (`setupEmbree(RTCDevice&, RTCScene&)`), `src/scene.h:11-12,46-50,373-378`
+  (`RTCDevice&` constructor, `RTCScene`, `RTCGeometry` maps): internal.
+
+MDL SDK, MaterialX, OIIO, TBB:
+- `src/mdl_material.h:15` (`mi/mdl_sdk.h`) and `src/mdl/*.h`: internal.
+- `src/materialx/mdl_generator.h:3-4`, `loader.h` (MaterialX): internal.
+- `src/texture.h:13-16`: OIIO in a header that `material.h:7`,
+  `environment.h:4` and `lights.h:9` include, so every internal header pulls
+  OIIO. Internal, so not blocking; a pimpl later helps build times.
+- `src/texture_service.h` (OIIO): internal.
+- TBB is only in `.cpp` files and `light_table.h` (internal). The task arena
+  (row 6) lives in `Renderer::Impl`.
+
+Process-wide setters that leave the API:
+- `prism::color::Active/SetActive/Activate` (`color_management.h:96-102`).
+- `DocumentLoader::SetSssFallback/DefaultSssFallback` (`loader.h:25-29`).
+- `TextureService::Acquire` and its static observers
+  (`texture_service.h:125,182-185`).
+- `MDLGenerator::shared/workerLocal/reserveWorkers` (`mdl_generator.h:38-46`)
+  become Runtime members.
+- `prism::Progress::Current/Install` (`progress.h:86-87`).
+
+## 5. Motion reservation
+
+Goal: motion blur (Phase 8b) adds behaviour, not API breaks. The shapes are
+reserved now; the first SDK release accepts them and renders one instant.
+
+API shapes (in the sketches above):
+- Transforms: `Sampled<Matrix4d>` in `InstanceDesc::transform`,
+  `LightDesc::transform`, `EnvironmentDesc::transform`,
+  `CameraDesc::cameraToWorld`, and `Scene::setTransform(InstanceId,
+  Sampled<Matrix4d>)`.
+- Deformation: `MeshDesc::points` and `SpheresDesc::centers` are
+  `Sampled<BufferView>`; `Scene::updateMeshPoints(MeshId,
+  Sampled<BufferView>)`. Topology is not time-sampled (USD's rule).
+- Velocities: `MeshDesc::velocities`, `accelerations` (per point, units per
+  second), converted with `SceneOptions::timeCodesPerSecond` as USD does.
+  Instance velocities (PointInstancer) can be added to `InstanceDesc` the same
+  way.
+- Other attributes (light colour/intensity, camera focus) are plain values.
+  If they need samples later, `Sampled<>` siblings can be added without
+  breaking callers.
+- Time unit: offsets from the frame time in time codes, the unit of
+  `UsdTimeCode` and of Hydra's shutter (`HdCameraTokens->shutterOpen/Close`).
+  The frame time itself is the front end's (the CLI's `--time`, Hydra's
+  current time).
+- Shutter: `RenderSettings::shutter`, overridden by `CameraDesc::shutter`
+  when set (USD cameras carry it). Default `{0, 0}`: no motion.
+- Samples: sorted, distinct times; times outside the shutter are fine
+  (interpolation brackets it); attributes may have different sample counts.
+
+Render path (Phase 8b, from PLAN.md):
+- Per-sample time `t = lerp(open, close, u)`, `u` from its own RNG dimension
+  (stratified per pixel), fixed along the path.
+- CPU: Embree's `RTCRay::time` exists (`PathRay::ray` is an `RTCRay`,
+  `src/ray.h:36-39`), normalized over the geometry's time range; Embree time
+  steps through `rtcSetGeometryTimeStepCount` and per-step transforms and
+  vertex buffers. Nothing sets `time` today (zero-initialized).
+- Shared integrator: `Ray` (`shaders/integrator/types.h:145-150`) has no
+  time. Add `float time` when Phase 8b starts (it changes the GPU layout, so
+  not now); the public API does not depend on it.
+- MDL: `state.animation_time` is fixed at 0 (`src/mdl_material.h:698`,
+  `shaders/gpu/gpu_backend.hlsl:544`); it becomes the sample time.
+- Vulkan: one instant per pass (PLAN.md stage 4), so the internal pass request
+  gets a `time` field when the pass loop moves into the session.
+
+Until implemented:
+- `Renderer::capabilities().motionBlur == false`.
+- With several samples, the core uses the sample nearest to the shutter centre
+  (time 0 for `{0,0}`) and logs one warning per scene. That equals today's
+  behaviour (both loaders evaluate one time code).
+- Python takes the same shapes from day one (6.3), so scripts written now get
+  motion blur later without changes.
