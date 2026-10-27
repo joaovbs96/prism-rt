@@ -2,6 +2,11 @@
 
 Phase reports, newest first. Detailed reports live in `local/reports/` (git-ignored).
 
+## 2026-10-27 — Denoising, part 2: vk_oidn on the Vulkan device
+- vk_oidn 0.2.0 (NVIDIA's prebuilt SDK package, OIDN 2.5.1 weights; `tools/ci/fetch_vk_oidn.ps1`) with OIDN's albedo/normal prefilter networks packed for it; the Vulkan device enables its features when the GPU has them, denoises whole-image renders on its accumulation (resolve pass) and the delegate's host images by upload; OIDN's CPU device on host copies otherwise (`PRISM_GPU_DENOISER=cpu` forces it). The CLI and the delegate name the denoiser.
+- 1080p high, RTX 4070 Ti, first denoise with set-up: 177 ms (GPU 36 ms), 481 ms prefiltered (GPU 88 ms); generic convolutions 92 / 360 ms; OIDN CPU 448 / 2866 ms. GPU vs CPU denoised on the same raw render: NRMSE 1.3e-3–1.4e-3. 16 spp error ratio 0.274 (CPU 0.264).
+- Validation (GPU-AV, sync) clean on denoise.usda and the host-image test; denoise off bit-identical to 90d1abc (CPU and Vulkan, chess/egg_gold/Teapot). Report: `local/reports/denoise_part2.md`. Not verified: usdview by hand, a GPU without vk_oidn's features, Metal.
+
 ## 2026-10-27 — Denoising, part 1: interface and OIDN on the CPU
 - OIDN 2.5.1 built from source against our oneTBB (`tools/ci/build_oidn.ps1`); a denoiser interface on the render device; guides from the `albedo` AOV and a world-space shading normal. Vulkan/Metal denoise through host copies until parts 2–3.
 - CLI `--denoise none|aov|replace`, `--denoise-quality`, `--denoise-prefilter`; `prism:denoise*` settings; a `denoised` AOV; usdview shows a denoised frame every 16 passes, on pause and at convergence (off the render thread).

@@ -13,13 +13,13 @@ A render device hands out its denoiser (`RenderDevice::CreateDenoiser`,
 The interface is `prism::device::Denoiser` (`src/device/denoiser.h`): one call
 with the colour, albedo and normal images and the settings.
 
-| Device | Part 1 (now) | Later |
-| --- | --- | --- |
-| `cpu` | OIDN's CPU device on host images | |
-| `vulkan` | the same CPU denoiser on host copies (correct, slower) | part 2: nvpro-samples' vk_oidn (OIDN's network as Vulkan compute) recorded into the device's own command buffer, on buffers it holds (device addresses), with a resolve pass from the accumulation to RGBA colour/albedo/normal |
-| `metal` | the same CPU denoiser on host copies | part 3: OIDN's Metal device on shared `MTLBuffer`s |
+| Device | Denoiser |
+| --- | --- |
+| `cpu` | OIDN's CPU device on host images |
+| `vulkan` | vk_oidn 0.2.0: OIDN 2.5.1's network as Vulkan compute, on the GPU (below); OIDN's CPU device on host copies when the GPU cannot run it |
+| `metal` | OIDN's CPU device on host copies (part 3: OIDN's Metal device on shared `MTLBuffer`s) |
 
-All backends run OIDN's network weights. OIDN is built from Intel's source
+All backends run OIDN 2.5.1's network weights. OIDN is built from Intel's source
 release with only its CPU device, against PrismRT's oneTBB 2022.2
 (`tools/ci/build_oidn.ps1`; why not the prebuilt package: DECISIONS.md), and is
 optional at build time: `PRISM_ENABLE_OIDN` defaults to ON when CMake finds
@@ -27,18 +27,68 @@ optional at build time: `PRISM_ENABLE_OIDN` defaults to ON when CMake finds
 as before; asking it to denoise is an error in the CLI and a warning (the
 denoised AOV then holds the raw colour) in the delegate.
 
-Where the data lives, and how parts 2 and 3 plug in:
-- Whole-image renders (the CLI) accumulate on the device. The device
-  denoises at the end of `RenderImage` (`DenoiseRenderedImage`); today every
-  device reads its sums back and calls the CPU denoiser. Part 2 overrides
-  that in the Vulkan device: resolve and `cmdDenoise` on the GPU, then read
-  back only the colour and the denoised colour.
+Where the data lives:
+- Whole-image renders (the CLI) accumulate on the device, which denoises at
+  the end of `RenderImage`: the Vulkan device on the GPU, on its
+  accumulation buffer (`GpuRenderDevice::DenoiseAccumulation`); the others
+  read their sums back and call their denoiser (`DenoiseRenderedImage`).
 - Progressive passes (the delegate) hand each pass's samples to the frontend,
   which accumulates on the host (its render buffers), so the denoiser takes
-  host images there. The Vulkan denoiser of part 2 can take them by upload;
-  avoiding that copy would mean keeping the pass accumulation on the GPU,
-  which `PassRequest` does not do yet.
+  host images there; the Vulkan denoiser uploads them. Avoiding that copy
+  would mean keeping the pass accumulation on the GPU, which `PassRequest`
+  does not do.
 
+## The Vulkan denoiser (vk_oidn)
+
+nvpro-samples' [vk_oidn](https://github.com/nvpro-samples/vk_oidn)
+(Apache-2.0) is OIDN's `RT` filter as Vulkan compute: the same U-Net and
+weights (OIDN 2.5.1's), FP16 tensors, tensor cores through
+`VK_KHR_cooperative_matrix` on NVIDIA GPUs and generic convolutions on
+others. It records its dispatches into a command buffer and never submits or
+waits by itself. PrismRT links NVIDIA's prebuilt SDK package (a static
+library with the kernels and weights; `tools/ci/fetch_vk_oidn.ps1`, why not a
+source build: DECISIONS.md); `PRISM_ENABLE_VK_OIDN` defaults to ON when CMake
+finds it (`vk_oidn_DIR`) and the build has OIDN.
+
+`src/device/vulkan/vulkan_denoiser.{h,cpp}`:
+- Device features: when the GPU has all that vk_oidn needs (`shaderInt64`,
+  `shaderInt16`, `storageBuffer16BitAccess`, `shaderFloat16`, the Vulkan
+  memory model with device scope, `maintenance4`, `subgroupSizeControl`,
+  `computeFullSubgroups`; `VK_KHR_cooperative_matrix` when present), the
+  Vulkan device enables them at creation; otherwise it enables none and
+  denoises with OIDN's CPU device on host copies.
+- At its first use the device creates the denoiser (vk_oidn's context and
+  pipelines, a small pipeline of PrismRT's own passes,
+  `shaders/gpu/vulkan/denoise.hlsl`) and prints once which denoiser it uses:
+  `PrismRT Vulkan: denoising on the GPU with vk_oidn 0.2.0 Vulkan
+  (cooperative matrices)`, `(generic convolutions)`, or `denoising with
+  OIDN's CPU device on host copies (<reason>)`. The CLI prints the denoiser
+  with each denoise and records it in `[PrismProfile]` (`denoiser`); the
+  delegate reports it in its `denoiser` statistic.
+- Whole-image renders: a resolve pass reads the accumulation buffer (colour
+  sums, then the light AOV sums) times each pixel's 1 / samples (the same
+  product the host computes for the returned colour) into RGBA float colour,
+  albedo and normal buffers; the filters run; only the denoised colour is
+  copied back. Host images (the delegate, or any `Denoiser::Denoise` call):
+  packed into an upload buffer, copied, denoised, read back. One submission
+  per denoise on the device's queue (shared with the render under its queue
+  lock), waited with a fence.
+- Prefiltering (`prism:denoisePrefilter`): vk_oidn has no albedo or normal
+  filter of its own, so OIDN's (`rt_alb`, `rt_nrm`; `_large` for high
+  quality, as OIDN picks them) are packed for it by the fetch script and
+  embedded in the build; they run as vk_oidn LDR filters (the albedo with
+  OIDN's sRGB transfer, the normal with the linear one on `n * 0.5 + 0.5`,
+  mapped there and back by two small passes, as OIDN's own input and output
+  processing do), then the colour filter takes the guides as clean.
+- Filters are kept for the last size and settings (a change re-creates them
+  and uploads their weights).
+
+| Variable | Effect |
+| --- | --- |
+| `PRISM_GPU_DENOISER=cpu` | The Vulkan device uses OIDN's CPU device on host copies (and enables none of vk_oidn's features) |
+| `VK_OIDN_COOPMAT=0` / `1` | vk_oidn's generic convolutions / tensor cores also on non-NVIDIA GPUs |
+| `VK_OIDN_PROFILE=1` | vk_oidn prints per-layer GPU times when a filter is destroyed |
+| `PRISM_GPU_VERBOSE=1` | The filters' memory and tile count when created |
 ## Inputs
 
 | Input | What | Where |
@@ -106,8 +156,8 @@ In the delegate (usdview), with `prism:denoise` or a bound `denoised` AOV:
   a converged render denoises again with them.
 
 Statistics: `denoises` (published), `denoiseMilliseconds` (the last one),
-`denoiser` (backend name). The CLI prints the denoise time and records
-`denoiseMilliseconds` in its `[PrismProfile]` line.
+`denoiser` (backend name). The CLI prints the denoise time and the denoiser
+and records `denoiseMilliseconds` and `denoiser` in its `[PrismProfile]` line.
 
 ## Cost
 
@@ -118,6 +168,27 @@ one denoise (with set-up); prefiltered guides 3.1 s. It shares
 the process's oneTBB threads with a CPU render. Memory: the delegate keeps 10
 floats and a count per pixel while denoising (about 44 bytes, 90 MB at 1080p
 with the input copy).
+
+The Vulkan denoiser, RTX 4070 Ti (driver 610.88), the CLI's one denoise of a
+1920x1080 render of denoise.usda at 16 spp, high quality (single runs; the
+first denoise of a process includes creating the filters and uploading
+their weights; "GPU" is the submission's resolve, filters and read-back copy):
+
+| Denoiser | Prefiltered guides | CLI denoise | of which filter set-up | GPU |
+| --- | --- | --- | --- | --- |
+| vk_oidn, cooperative matrices | no | 177 ms | 126 ms | 36 ms |
+| vk_oidn, cooperative matrices | yes | 481 ms | 379 ms | 88 ms |
+| vk_oidn, generic (`VK_OIDN_COOPMAT=0`) | no | 92 ms | 11 ms | 66 ms |
+| vk_oidn, generic | yes | 360 ms | 36 ms | 309 ms |
+| OIDN CPU on host copies (`PRISM_GPU_DENOISER=cpu`) | no | 448 ms | | |
+| OIDN CPU on host copies | yes | 2866 ms | | |
+
+Device memory of the filters at 1080p: 385 MiB, 1.5 GiB with the prefilters
+(three large networks' intermediate tensors). On the same raw render, the
+denoised images agree with the CPU device's within NRMSE 1.3e-3 to 1.4e-3
+(both vk_oidn paths, with and without prefiltering; at 96x64 1.4e-3); on the
+synthetic test images, high quality within 1.3e-3 and fast/balanced (FP16
+accumulation in vk_oidn) within 7.4e-3.
 
 ## Tests
 
@@ -130,3 +201,17 @@ NRMSE; `prism_denoise_replace_matches_cpu` (`prism:denoise` in the CLI);
 part per var); `prism_denoise_interval_hydra` (interval denoises before
 convergence); `prism_hydra_render_buffer_test` (the denoised display) and
 `prism_hydra_task_delegate_settings_test` (settings, AOV descriptor).
+
+The Vulkan denoisers (`gpu` label): `prism_denoise_{render,error}_vulkan`
+(vk_oidn on the accumulation; fails if the log says it fell back),
+`_vulkan_generic` (`VK_OIDN_COOPMAT=0`) and `_vulkan_cpu`
+(`PRISM_GPU_DENOISER=cpu`, the host-copy fallback), each at most half the
+colour's NRMSE; `prism_denoise_vulkan_same_raw` (those renders' raw colours
+are identical) and `prism_denoise_vulkan{,_generic}_matches_cpu` (so their
+denoised layers compare the GPU and CPU denoisers on the same input, within
+1e-2 NRMSE); `prism_denoise_{render,error}_hydra_vulkan` (the delegate on
+Vulkan: vk_oidn on uploaded host images); `prism_denoise_vulkan_test` and
+`_vulkan_generic_test` (`prism_denoise_test --vulkan`: the host-image path
+against OIDN's CPU device on the synthetic images, every quality with and
+without prefiltering, within 1.5e-2, plus strided RGBA in place, the albedo
+alone, no guides) and `prism_denoise_vulkan_fallback_test`.

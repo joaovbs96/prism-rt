@@ -904,6 +904,21 @@ called done there.
     half the colour's NRMSE) and its `denoised` layer against `--device cpu`'s;
     `light_aovs.usda`'s albedo layer on Metal unchanged; chess, egg_gold and
     Teapot bit-identical to the previous build (no denoising, no light AOVs).
+- **Denoising, part 2: vk_oidn on Vulkan** ([denoising.md](denoising.md)):
+  - Shared host code: `src/device/gpu/gpu_device.{h,cpp}`: `RenderImage`
+    first asks the device to denoise its accumulation in place
+    (`GpuRenderDevice::DenoiseAccumulation`, default false: Metal keeps
+    `DenoiseRenderedImage` on host copies until part 3, which overrides
+    it); `src/device/device.{h,cpp}` (`ImageRequest::denoiser`, the
+    denoiser's name, which the CLI prints and records in `[PrismProfile]`);
+    `src/device/denoiser.h` (comments). No shared shader change:
+    `shaders/gpu/vulkan/denoise.hlsl` (the resolve and normal mapping
+    passes) is Vulkan-only, but sits in the embedded shader tree.
+  - Runs: `ctest -R prism_denoise` (CPU); then denoise.usda with
+    `--device metal --denoise aov` as in part 1: still the CPU denoiser
+    (`Denoised ... with OIDN 2.5.1 CPU` in the CLI's output), its `denoised`
+    layer within part 1's tolerance of `--device cpu`'s; chess, egg_gold
+    and Teapot bit-identical to the previous build.
 
 ## Diagnostics
 
