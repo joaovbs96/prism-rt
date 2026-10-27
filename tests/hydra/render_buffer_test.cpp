@@ -396,6 +396,48 @@ int main() {
             if(tiled.CapturePresentationState().snapshot)
                 throw std::runtime_error("resize retained incompatible tile packet");
         }
+        {
+            // The denoised display (prism:denoise): shown for its frame,
+            // over refinement tiles and later passes, never in Map/Capture.
+            PrismRenderBuffer denoised(SdfPath("/denoised"), nullptr);
+            denoised.Allocate(GfVec3i(2, 1, 1), HdFormatFloat32Vec4, false);
+            auto first = std::make_shared<prism::hydra::PublishedFrame>();
+            const float raw[4] = {1, 1, 1, 1};
+            for (unsigned x = 0; x < 2; ++x) denoised.WriteFloat(x, 0, raw, 4, false);
+            denoised.Publish(first);
+            auto shown = std::make_shared<std::vector<uint8_t>>(*denoised.CapturePublished().pixels);
+            reinterpret_cast<float *>(shown->data())[0] = .5f;
+            auto stale = std::make_shared<prism::hydra::PublishedFrame>();
+            denoised.SetDenoisedPresentation(shown, stale);
+            if (denoised.HasDenoisedPresentation(first) ||
+                denoised.CapturePresentation().pixels != denoised.CapturePublished().pixels)
+                throw std::runtime_error("denoised display accepted for another frame");
+            denoised.SetDenoisedPresentation(std::make_shared<std::vector<uint8_t>>(4), first);
+            if (denoised.HasDenoisedPresentation(first))
+                throw std::runtime_error("denoised display of the wrong size accepted");
+            denoised.SetDenoisedPresentation(shown, first);
+            if (!denoised.HasDenoisedPresentation(first) || denoised.CapturePresentation().pixels != shown ||
+                denoised.CapturePresentationState().snapshot)
+                throw std::runtime_error("denoised display not presented");
+            const auto *mapped = static_cast<const float *>(denoised.Map());
+            if (mapped[0] != 1) throw std::runtime_error("denoised display changed the raw accumulation");
+            denoised.Unmap();
+            // A later pass of the same accumulation keeps it.
+            for (unsigned x = 0; x < 2; ++x) denoised.WriteFloat(x, 0, raw, 4, false);
+            denoised.Publish(first);
+            if (denoised.CapturePresentation().pixels != shown)
+                throw std::runtime_error("a pass of the same accumulation dropped the denoised display");
+            // A new accumulation (frame) does not.
+            auto second = std::make_shared<prism::hydra::PublishedFrame>();
+            for (unsigned x = 0; x < 2; ++x) denoised.WriteFloat(x, 0, raw, 4, false);
+            denoised.Publish(second);
+            if (denoised.HasDenoisedPresentation(second) || denoised.CapturePresentation().pixels == shown)
+                throw std::runtime_error("a new accumulation showed the previous denoised display");
+            denoised.SetDenoisedPresentation(std::make_shared<std::vector<uint8_t>>(*shown), second);
+            denoised.Allocate(GfVec3i(2, 1, 1), HdFormatFloat32Vec4, false);
+            if (denoised.HasDenoisedPresentation(second))
+                throw std::runtime_error("reallocation kept the denoised display");
+        }
         std::cout << "Mapped storage survives publication, nested maps, and resize\n";
     } catch(const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
 }

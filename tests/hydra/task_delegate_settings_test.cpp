@@ -157,6 +157,40 @@ int RunAuthoredSettingsTests()
             delegate.SetRenderSetting(threshold, previousThreshold);
             delegate.SetRenderSetting(level, previousLevel);
         }
+        // Denoising (docs/denoising.md): off, every 16 passes, high quality
+        // with prefiltered guides; the denoised AOV is RGBA like the colour.
+        {
+            const TfToken denoise("prism:denoise"), interval("prism:denoiseInterval");
+            const TfToken quality("prism:denoiseQuality"), prefilter("prism:denoisePrefilter");
+            Require(!delegate.GetRenderSetting(denoise).UncheckedGet<bool>() &&
+                        delegate.GetRenderSetting(interval).UncheckedGet<int>() == 16 &&
+                        delegate.GetRenderSetting(quality).UncheckedGet<std::string>() == "high" &&
+                        delegate.GetRenderSetting(prefilter).UncheckedGet<bool>(),
+                    "Denoise defaults are not off, 16 passes, high, prefiltered");
+            bool described = false;
+            for (auto const &descriptor : delegate.GetRenderSettingDescriptors())
+                described |= descriptor.key == quality;
+            Require(described, "prism:denoiseQuality has no descriptor");
+            delegate.SetRenderSetting(denoise, VtValue(true));
+            delegate.SetRenderSetting(interval, VtValue(0));
+            delegate.SetRenderSetting(quality, VtValue(TfToken("fast")));
+            delegate.SetRenderSetting(prefilter, VtValue(false));
+            Require(delegate.GetRenderSetting(denoise).UncheckedGet<bool>() &&
+                        delegate.GetRenderSetting(interval).UncheckedGet<int>() == 1 &&
+                        delegate.GetRenderSetting(quality).UncheckedGet<std::string>() == "fast" &&
+                        !delegate.GetRenderSetting(prefilter).UncheckedGet<bool>(),
+                    "Denoise settings were not applied (or the interval not clamped to 1)");
+            delegate.SetRenderSetting(quality, VtValue(std::string("best")));
+            Require(delegate.GetRenderSetting(quality).UncheckedGet<std::string>() == "fast",
+                    "An unknown denoise quality replaced the previous one");
+            delegate.SetRenderSetting(denoise, VtValue(false));
+            delegate.SetRenderSetting(interval, VtValue(16));
+            delegate.SetRenderSetting(quality, VtValue(std::string("high")));
+            delegate.SetRenderSetting(prefilter, VtValue(true));
+            const HdAovDescriptor aov = delegate.GetDefaultAovDescriptor(TfToken("denoised"));
+            Require(aov.format == HdFormatFloat32Vec4 && aov.clearValue.IsHolding<GfVec4f>(),
+                    "The denoised AOV is not float RGBA");
+        }
         delegate.SetRenderSetting(hiddenBudget, VtValue(12));
         Require(delegate.GetRenderSetting(hiddenBudget).UncheckedGet<int>() == 12,
                 "Hidden geometry budget was not applied");

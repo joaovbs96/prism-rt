@@ -83,6 +83,18 @@ else()
 endif()
 find_package(MaterialX REQUIRED)
 find_package(Python3 COMPONENTS Development Interpreter REQUIRED)
+# Denoising (docs/denoising.md): Intel Open Image Denoise's CPU device,
+# optional. tools/ci/build_oidn.ps1 builds it against this oneTBB.
+find_package(OpenImageDenoise 2 CONFIG QUIET)
+if(OpenImageDenoise_FOUND)
+    set(_prism_oidn_default ON)
+else()
+    set(_prism_oidn_default OFF)
+endif()
+option(PRISM_ENABLE_OIDN "Build the Open Image Denoise denoiser (default: ON when found)" ${_prism_oidn_default})
+if(PRISM_ENABLE_OIDN)
+    find_package(OpenImageDenoise 2 CONFIG REQUIRED)
+endif()
 prism_check_dependency_versions()
 
 # OpenUSD built against a Python whose interpreter statically links libpython
@@ -143,6 +155,14 @@ endif()
 if(NOT PRISM_EMBREE_BUILD_RUNTIME AND DEFINED ENV{PRISM_EMBREE_BUILD_RUNTIME})
     set(PRISM_EMBREE_BUILD_RUNTIME "$ENV{PRISM_EMBREE_BUILD_RUNTIME}")
 endif()
+# OIDN's DLLs (OpenImageDenoise*.dll; the device DLLs load from beside them).
+set(PRISM_OIDN_RUNTIME "" CACHE PATH "Open Image Denoise runtime directory")
+if(PRISM_ENABLE_OIDN AND NOT PRISM_OIDN_RUNTIME)
+    get_target_property(_prism_oidn_dll OpenImageDenoise IMPORTED_LOCATION_RELEASE)
+    if(_prism_oidn_dll)
+        get_filename_component(PRISM_OIDN_RUNTIME "${_prism_oidn_dll}" DIRECTORY)
+    endif()
+endif()
 if(NOT PRISM_VCPKG_BIN AND DEFINED ENV{PRISM_VCPKG_BIN})
     set(PRISM_VCPKG_BIN "$ENV{PRISM_VCPKG_BIN}")
 endif()
@@ -157,7 +177,7 @@ set(PRISM_PYTHON_ROOT "" CACHE PATH "Python runtime root used by OpenUSD")
 if(NOT PRISM_PYTHON_ROOT AND Python3_EXECUTABLE)
     get_filename_component(PRISM_PYTHON_ROOT "${Python3_EXECUTABLE}" DIRECTORY)
 endif()
-foreach(_runtime_path IN ITEMS PRISM_USD_ROOT PRISM_OPENSUBDIV_ROOT PRISM_MATERIALX_ROOT PRISM_MATERIALX_LIBRARY_PATH PRISM_MATERIALX_MDL MDL_SDK_DIR PRISM_TBB_REDIST PRISM_EMBREE_RUNTIME_DIR PRISM_EMBREE_BUILD_RUNTIME PRISM_VCPKG_BIN PRISM_PYTHON_ROOT)
+foreach(_runtime_path IN ITEMS PRISM_USD_ROOT PRISM_OPENSUBDIV_ROOT PRISM_MATERIALX_ROOT PRISM_MATERIALX_LIBRARY_PATH PRISM_MATERIALX_MDL MDL_SDK_DIR PRISM_TBB_REDIST PRISM_EMBREE_RUNTIME_DIR PRISM_EMBREE_BUILD_RUNTIME PRISM_VCPKG_BIN PRISM_PYTHON_ROOT PRISM_OIDN_RUNTIME)
     file(TO_CMAKE_PATH "${${_runtime_path}}" ${_runtime_path}_JSON)
 endforeach()
 configure_file(cmake/PrismRuntime.json.in "${CMAKE_BINARY_DIR}/prism-runtime.json" @ONLY)
@@ -280,6 +300,10 @@ target_link_libraries(prism_core PUBLIC
     MaterialXGenMdl)
 if(MSVC)
     target_compile_options(prism_core PUBLIC "/Zc:preprocessor")
+endif()
+if(PRISM_ENABLE_OIDN)
+    target_link_libraries(prism_core PUBLIC OpenImageDenoise)
+    target_compile_definitions(prism_core PUBLIC PRISM_HAS_OIDN=1)
 endif()
 
 add_executable(PrismRT src/main.cpp src/standalone_cli.cpp)
@@ -1091,6 +1115,72 @@ if(TARGET prism_hydra_render AND TARGET prism_compare_images)
             endforeach()
         endif()
     endforeach()
+    # Denoising (docs/denoising.md): the denoiser on synthetic images; 16 spp
+    # denoised against a 4096 spp reference of a room with textures, glass
+    # and a mirror (the CLI, CPU and the Vulkan device's CPU fallback); the
+    # CLI's prism:denoise (replace) writing the denoised colour; both loaders'
+    # denoised RenderVars (one part and a part per var); the delegate
+    # denoising every few passes (prism:denoiseInterval).
+    if(PRISM_ENABLE_OIDN)
+        add_executable(prism_denoise_test tests/denoise.cpp)
+        target_link_libraries(prism_denoise_test PRIVATE PrismRT::core)
+        add_test(NAME prism_denoise_test COMMAND prism_denoise_test)
+        set(_prism_denoise_scene "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/denoise.usda")
+        set(_prism_denoise_dir "${CMAKE_BINARY_DIR}/denoise")
+        set(_prism_denoise_view --camera /World/Camera --width 96 --height 64 --max-depth 12 --no-progress
+            ${_prism_fixed_sampling})
+        add_test(NAME prism_denoise_reference
+            COMMAND PrismRT --scene "${_prism_denoise_scene}" ${_prism_denoise_view} --spp 4096 --device cpu
+                --output "${_prism_denoise_dir}/reference.exr")
+        set_tests_properties(prism_denoise_reference PROPERTIES
+            ENVIRONMENT "${_prism_test_environment}" FIXTURES_SETUP prism_denoise_reference)
+        set(_prism_denoise_devices cpu)
+        if(PRISM_ENABLE_VULKAN)
+            list(APPEND _prism_denoise_devices vulkan)
+        endif()
+        foreach(_device IN LISTS _prism_denoise_devices)
+            add_test(NAME prism_denoise_render_${_device}
+                COMMAND PrismRT --scene "${_prism_denoise_scene}" ${_prism_denoise_view} --spp 16
+                    --device ${_device} --denoise aov --output "${_prism_denoise_dir}/${_device}.exr")
+            set_tests_properties(prism_denoise_render_${_device} PROPERTIES
+                ENVIRONMENT "${_prism_test_environment}" FIXTURES_SETUP prism_denoise_${_device})
+            add_test(NAME prism_denoise_error_${_device}
+                COMMAND prism_denoise_test --error "${_prism_denoise_dir}/reference.exr"
+                    "${_prism_denoise_dir}/${_device}.exr" 0.5)
+            set_tests_properties(prism_denoise_error_${_device} PROPERTIES
+                FIXTURES_REQUIRED "prism_denoise_reference;prism_denoise_${_device}")
+        endforeach()
+        # prism:denoise in the render settings: the CLI's image is the
+        # denoised colour, the same as --denoise aov's layer.
+        add_test(NAME prism_denoise_replace_cpu
+            COMMAND PrismRT --scene "${_prism_denoise_scene}" ${_prism_denoise_view} --spp 16 --device cpu
+                --render-settings /Render/Replace --output "${_prism_denoise_dir}/replace.exr")
+        set_tests_properties(prism_denoise_replace_cpu PROPERTIES
+            ENVIRONMENT "${_prism_test_environment}" FIXTURES_SETUP prism_denoise_replace)
+        add_test(NAME prism_denoise_replace_matches_cpu
+            COMMAND prism_denoise_test --same "${_prism_denoise_dir}/replace.exr" -
+                "${_prism_denoise_dir}/cpu.exr" denoised 1e-6)
+        set_tests_properties(prism_denoise_replace_matches_cpu PROPERTIES
+            FIXTURES_REQUIRED "prism_denoise_replace;prism_denoise_cpu")
+        # Both loaders' products; the denoised layers agree like the colours.
+        prism_add_parity_fixture(NAME denoise SCENE tests/hydra/fixtures/denoise.usda
+            PRODUCTS denoise.exr denoise_parts.exr LAYERS denoise.exr:Denoised denoise.exr:Albedo
+            TOLERANCE 0.05 MEAN_TOLERANCE 0.01)
+        add_test(NAME prism_denoise_error_hydra
+            COMMAND prism_denoise_test --error "${_prism_denoise_dir}/reference.exr"
+                "${prism_parity_denoise_dir}/hydra/denoise.exr" 0.5 Denoised)
+        set_tests_properties(prism_denoise_error_hydra PROPERTIES
+            FIXTURES_REQUIRED "prism_denoise_reference;prism_parity_denoise")
+        # Interval denoises in the delegate, shown before the render converges.
+        add_test(NAME prism_denoise_interval_hydra
+            COMMAND prism_hydra_render "${_prism_denoise_scene}" /World/Camera
+                "${_prism_denoise_dir}/interval.exr" 96 64 32 ${_prism_fixed_sampling}
+                --denoise aov --denoise-interval 4)
+        set_tests_properties(prism_denoise_interval_hydra PROPERTIES
+            ENVIRONMENT "${_prism_test_environment};PRISM_DEVICE=cpu"
+            PASS_REGULAR_EXPRESSION "Render stat denoises: ([2-9]|[1-9][0-9])")
+    endif()
+
     # The CLI on Vulkan against the delegate on the CPU: instanced prototypes,
     # placement transforms and instance primvars in the GPU scene.
     if(PRISM_ENABLE_VULKAN)
@@ -1525,6 +1615,7 @@ set(_prism_gpu_test_regex
     "|^prism_parity_.*_(vulkan|metal)_(cli|hydra|match)$"
     "|^prism_parity_.*_(vulkan|metal)_.*_(match|layer|exact)$"
     "|^prism_scene_features_.*_vulkan$"
+    "|^prism_denoise_(render|error)_vulkan$"
     "|^prism_light_shaping_.*_vulkan$"
     "|^prism_textured_emitters?(_glass)?_vulkan_(render|parity)$"
     "|^prism_thin_walled_glass_vulkan_(render|parity)$")

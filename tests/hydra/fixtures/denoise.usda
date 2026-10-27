@@ -1,0 +1,223 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    renderSettingsPrimPath = "/Render/Settings"
+    upAxis = "Y"
+)
+
+# Denoising (docs/denoising.md): a closed room lit by one small sphere light
+# (noisy indirect light) with a checker-textured floor, a smooth glass sphere
+# (the albedo and normal guides pass through it to the floor), a mirror
+# sphere and a rough textured sphere. The products hold the colour, the
+# denoised colour and the albedo, in one part and in a part per var.
+def Scope "Render"
+{
+    def RenderSettings "Settings"
+    {
+        rel camera = </World/Camera>
+        uniform int2 resolution = (96, 64)
+        rel products = [</Render/Products/Denoise>, </Render/Products/DenoiseParts>]
+        int prism:samplesPerPixel = 16
+        int prism:maxDepth = 12
+    }
+
+    # The CLI's prism:denoise: its single image is the denoised colour.
+    def RenderSettings "Replace"
+    {
+        rel camera = </World/Camera>
+        uniform int2 resolution = (96, 64)
+        int prism:samplesPerPixel = 16
+        int prism:maxDepth = 12
+        bool prism:denoise = true
+    }
+
+    def Scope "Products"
+    {
+        def RenderProduct "Denoise"
+        {
+            uniform token productName = "denoise.exr"
+            rel orderedVars = [</Render/Vars/Color>, </Render/Vars/Denoised>, </Render/Vars/Albedo>]
+        }
+
+        def RenderProduct "DenoiseParts"
+        {
+            uniform token productName = "denoise_parts.exr"
+            bool prism:exr:multiPart = true
+            rel orderedVars = [</Render/Vars/Color>, </Render/Vars/Denoised>, </Render/Vars/Albedo>]
+        }
+    }
+
+    def Scope "Vars"
+    {
+        def RenderVar "Color"
+        {
+            uniform token dataType = "color3f"
+            uniform string sourceName = "color"
+        }
+
+        def RenderVar "Denoised"
+        {
+            uniform token dataType = "color3f"
+            uniform string sourceName = "denoised"
+        }
+
+        def RenderVar "Albedo"
+        {
+            uniform token dataType = "color3f"
+            uniform string sourceName = "albedo"
+        }
+    }
+}
+
+def Xform "World"
+{
+    def Camera "Camera"
+    {
+        float focalLength = 24
+        float horizontalAperture = 36
+        float verticalAperture = 24
+        double3 xformOp:translate = (0, 1.2, 4.5)
+        float3 xformOp:rotateXYZ = (-10, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
+    }
+
+    # The room: walls and ceiling around the camera; the floor below closes it.
+    def Mesh "Room"
+    {
+        int[] faceVertexCounts = [4, 4, 4, 4, 4]
+        int[] faceVertexIndices = [3, 2, 1, 0, 4, 5, 6, 7, 2, 3, 7, 6, 1, 2, 6, 5, 3, 0, 4, 7]
+        point3f[] points = [(-4, 0, -4), (4, 0, -4), (4, 4, -4), (-4, 4, -4),
+                            (-4, 0, 6), (4, 0, 6), (4, 4, 6), (-4, 4, 6)]
+        uniform token subdivisionScheme = "none"
+        color3f[] primvars:displayColor = [(0.75, 0.7, 0.6)]
+    }
+
+    def Mesh "Floor" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 1, 2, 3]
+        point3f[] points = [(-4, 0, 6), (4, 0, 6), (4, 0, -4), (-4, 0, -4)]
+        texCoord2f[] primvars:st = [(0, 0), (4, 0), (4, 5), (0, 5)] (
+            interpolation = "vertex"
+        )
+        uniform token subdivisionScheme = "none"
+        rel material:binding = </World/Looks/Checker>
+    }
+
+    def Sphere "Glass" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        double radius = 0.6
+        double3 xformOp:translate = (-1.3, 0.6, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        rel material:binding = </World/Looks/Glass>
+    }
+
+    def Sphere "Mirror" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        double radius = 0.5
+        double3 xformOp:translate = (1.4, 0.5, -0.6)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        rel material:binding = </World/Looks/Mirror>
+    }
+
+    def Sphere "Rough" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        double radius = 0.45
+        double3 xformOp:translate = (0.2, 0.45, 0.9)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        rel material:binding = </World/Looks/Rough>
+    }
+
+    def SphereLight "Light"
+    {
+        float radius = 0.2
+        float inputs:intensity = 60
+        double3 xformOp:translate = (2, 3.4, -2.5)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+
+    def Scope "Looks"
+    {
+        def Material "Checker"
+        {
+            token outputs:mtlx:surface.connect = </World/Looks/Checker/Surface.outputs:out>
+
+            def Shader "Image"
+            {
+                uniform token info:id = "ND_image_color3"
+                asset inputs:file = @./textured_emitter_checker.ppm@ (
+                    colorSpace = "lin_rec709"
+                )
+                color3f outputs:out
+            }
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_standard_surface_surfaceshader"
+                float inputs:base = 0.8
+                color3f inputs:base_color.connect = </World/Looks/Checker/Image.outputs:out>
+                float inputs:specular = 0
+                token outputs:out
+            }
+        }
+
+        def Material "Glass"
+        {
+            token outputs:mtlx:surface.connect = </World/Looks/Glass/Surface.outputs:out>
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_open_pbr_surface_surfaceshader"
+                float inputs:base_weight = 0
+                float inputs:specular_roughness = 0
+                float inputs:specular_ior = 1.5
+                float inputs:transmission_weight = 1
+                token outputs:out
+            }
+        }
+
+        def Material "Mirror"
+        {
+            token outputs:mtlx:surface.connect = </World/Looks/Mirror/Surface.outputs:out>
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_open_pbr_surface_surfaceshader"
+                float inputs:base_metalness = 1
+                color3f inputs:base_color = (0.9, 0.9, 0.9)
+                float inputs:specular_roughness = 0
+                token outputs:out
+            }
+        }
+
+        def Material "Rough"
+        {
+            token outputs:mtlx:surface.connect = </World/Looks/Rough/Surface.outputs:out>
+
+            def Shader "Image"
+            {
+                uniform token info:id = "ND_image_color3"
+                asset inputs:file = @./textured_emitter_checker.ppm@ (
+                    colorSpace = "lin_rec709"
+                )
+                color3f outputs:out
+            }
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_open_pbr_surface_surfaceshader"
+                color3f inputs:base_color.connect = </World/Looks/Rough/Image.outputs:out>
+                float inputs:specular_roughness = 0.4
+                token outputs:out
+            }
+        }
+    }
+}
