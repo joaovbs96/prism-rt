@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <iostream>
 #include <map>
 #include <mutex>
 #include <sstream>
@@ -86,7 +87,40 @@ std::string Digits(Matrix3 const &m)
     return text;
 }
 
+std::string LoadedConfig(std::string const &requested)
+{
+    if (!requested.empty()) return requested;
+    const char *env = std::getenv("OCIO");
+    return env && *env ? env : kDefaultConfig;
+}
+
+std::string RenderingSpace(OCIO::ConstConfigRcPtr const &config, std::string const &token, std::string *warning)
+{
+    if (warning) warning->clear();
+    if (token.empty() || token == "unknown") return {};
+    // No source colour transforms: colours are used as authored, which USD
+    // authors in linear Rec.709 when untagged.
+    const std::string name = token == "data" || token == "raw" || token == "identity" ? kLightColorSpace : token;
+    auto space = config->getColorSpace(name.c_str());
+    if (space && !space->isData() && config->isColorSpaceLinear(space->getName(), OCIO::REFERENCE_SPACE_SCENE))
+        return space->getName();
+    if (warning)
+        *warning = "renderingColorSpace '" + token + "' is not a scene-linear colour space of the OpenColorIO "
+                   "config; using the default working space";
+    return {};
+}
+
 } // namespace
+
+std::string RenderingColorSpaceWorkingSpace(std::string const &token, std::string const &config, std::string *warning)
+{
+    const std::string path = LoadedConfig(config);
+    try {
+        return RenderingSpace(OCIO::Config::CreateFromFile(path.c_str()), token, warning);
+    } catch (OCIO::Exception const &error) {
+        throw std::runtime_error("cannot load the OpenColorIO config '" + path + "': " + error.what());
+    }
+}
 
 struct ColorManagement::Impl {
     Options requested;
@@ -106,11 +140,7 @@ std::shared_ptr<const ColorManagement> ColorManagement::Create(Options const &op
 {
     auto impl = std::make_shared<Impl>();
     impl->requested = options;
-    impl->config = options.config;
-    if (impl->config.empty()) {
-        const char *env = std::getenv("OCIO");
-        impl->config = env && *env ? env : kDefaultConfig;
-    }
+    impl->config = LoadedConfig(options.config);
     try {
         impl->ocio = OCIO::Config::CreateFromFile(impl->config.c_str());
     } catch (OCIO::Exception const &error) {
@@ -120,6 +150,11 @@ std::shared_ptr<const ColorManagement> ColorManagement::Create(Options const &op
     impl->configName = config->getName() ? config->getName() : "";
 
     std::string working = options.workingSpace;
+    if (working.empty() && !options.renderingColorSpace.empty()) {
+        std::string warning;
+        working = RenderingSpace(config, options.renderingColorSpace, &warning);
+        if (!warning.empty()) std::cerr << "PrismRT: " << warning << std::endl;
+    }
     if (working.empty()) {
         if (config->getColorSpace(kDefaultWorkingSpace)) working = kDefaultWorkingSpace;
         else if (auto role = config->getColorSpace(OCIO::ROLE_SCENE_LINEAR)) working = role->getName();

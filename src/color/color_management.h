@@ -39,6 +39,10 @@ struct Options {
     std::string workingSpace; // empty: ACEScg (the config's scene_linear role if it has none)
     std::string display;      // empty: the config's default display
     std::string view;         // empty: the display's default view
+    // UsdRenderSettings.renderingColorSpace (lin_rec709_scene, lin_ap1_scene,
+    // data, ...): the working space when workingSpace is empty
+    // (RenderingColorSpaceWorkingSpace).
+    std::string renderingColorSpace;
     bool operator==(Options const &) const = default;
 };
 
@@ -99,6 +103,18 @@ void SetActive(std::shared_ptr<const ColorManagement> colorManagement);
 // Makes a colour management for `options` active unless the active one was
 // made from the same options; returns the active one.
 std::shared_ptr<const ColorManagement> Activate(Options const &options);
+
+// The working space that a UsdRenderSettings.renderingColorSpace token asks
+// for in the OpenColorIO config `config` (empty: $OCIO, else the default
+// config), as a name of that config; empty for the default working space.
+// USD's names (GfColorSpaceNames: lin_rec709_scene, lin_ap1_scene, ...)
+// resolve through the config's aliases. data, raw and identity ("no source
+// colour transforms") take linear Rec.709, the space USD authors untagged
+// colours and light colours in. unknown and an empty token take the default;
+// so do names the config lacks and spaces that are not scene-linear, with a
+// message in *warning.
+std::string RenderingColorSpaceWorkingSpace(std::string const &token, std::string const &config,
+                                            std::string *warning = nullptr);
 
 // Colour space names of the colour-space metadata authored on USD attributes
 // (UsdColorSpaceAPI and ASWF interop names such as lin_rec709_scene) resolve

@@ -178,6 +178,9 @@ std::optional<RenderJob> ResolveRenderJob(UsdStageRefPtr const &stage,
     job.includedPurposes = spec.includedPurposes;
     job.materialBindingPurposes = spec.materialBindingPurposes;
     job.namespacedSettings = spec.namespacedSettings;
+    TfToken renderingColorSpace;
+    if (settings.GetRenderingColorSpaceAttr().Get(&renderingColorSpace))
+        job.renderingColorSpace = renderingColorSpace.GetString();
 
     // The settings prim's own values (UsdRenderComputeSpec only resolves
     // them into products).

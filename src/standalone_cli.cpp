@@ -166,7 +166,8 @@ void help() {
         "                 environment is lit by USD's default dome, as in usdview)\n"
         "  --device auto|cpu|vulkan|metal (default auto: GPU if available, else CPU)\n"
         "  --ocio-config FILE|URI (default $OCIO, else ocio://studio-config-latest)\n"
-        "  --working-space NAME (default ACEScg; lin_rec709 renders in linear Rec.709 as before)\n"
+        "  --working-space NAME (default the render settings' renderingColorSpace, else ACEScg;\n"
+        "                 lin_rec709 renders in linear Rec.709 as before)\n"
         "  --display NAME --view NAME (8-bit outputs; default the config's: sRGB - Display and\n"
         "                 ACES 2.0 - SDR 100 nits (Rec.709). The earlier gamma 2.2 output is\n"
         "                 --display \"Gamma 2.2 Rec.709 - Display\" --view Un-tone-mapped)\n"
@@ -794,6 +795,9 @@ int runStandaloneCli(int argc, char** argv) {
             for (auto const& warning : warnings) std::cerr << "PrismRT: " << warning << '\n';
             if (job) {
                 applyRenderSettings(job->namespacedSettings, o);
+                // The working space when neither --working-space nor
+                // prism:colorManagement:workingSpace names one.
+                o.color.renderingColorSpace = job->renderingColorSpace;
                 if (!o.widthSet && job->base.width > 0) o.width = job->base.width;
                 if (!o.heightSet && job->base.height > 0) o.height = job->base.height;
             }

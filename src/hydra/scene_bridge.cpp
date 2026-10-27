@@ -5433,7 +5433,8 @@ void SceneBridge::SetSettings(RenderSettings const &requested)
         sssChanged = current.sssFallback != settings.sssFallback;
         // Display and view do not touch the linear colour AOV.
         colorChanged = current.color.config != settings.color.config ||
-            current.color.workingSpace != settings.color.workingSpace;
+            current.color.workingSpace != settings.color.workingSpace ||
+            current.color.renderingColorSpace != settings.color.renderingColorSpace;
         imageChanged = current.maxDepth != settings.maxDepth ||
             current.rouletteDepth != settings.rouletteDepth ||
             current.seed != settings.seed ||

@@ -65,6 +65,8 @@ struct RenderJob {
     pxr::VtArray<pxr::TfToken> materialBindingPurposes;
     // prism:* attributes of the settings prim.
     pxr::VtDictionary namespacedSettings;
+    // Its renderingColorSpace (empty when not authored).
+    std::string renderingColorSpace;
 };
 
 // The RenderSettings prim at `settingsPath`, or the stage's

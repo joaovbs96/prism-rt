@@ -618,7 +618,10 @@ void PrismTaskDelegate::_SyncAuthoredSettings()
     }
     _activeRenderSettings = active ? activePath : SdfPath();
     TfTokenVector bindingPurposes = prism::hydra::RenderSettings{}.materialBindingPurposes;
+    std::string renderingColorSpace;
     if (active) {
+        if (const auto space = active.GetRenderingColorSpace())
+            renderingColorSpace = space->GetTypedValue(0).GetString();
         const auto namespaced = active.GetNamespacedSettings();
         for (const auto& name : namespaced.GetNames()) {
             if (name.GetString().rfind("prism:", 0) == 0)
@@ -632,8 +635,12 @@ void PrismTaskDelegate::_SyncAuthoredSettings()
     }
     {
         prism::hydra::RenderSettings s = _bridge->GetSettings();
-        if (s.materialBindingPurposes != bindingPurposes) {
+        // renderingColorSpace is the working space unless
+        // prism:colorManagement:workingSpace names one (SetRenderSetting).
+        if (s.materialBindingPurposes != bindingPurposes ||
+            s.color.renderingColorSpace != renderingColorSpace) {
             s.materialBindingPurposes = bindingPurposes;
+            s.color.renderingColorSpace = renderingColorSpace;
             _bridge->SetSettings(s);
         }
     }

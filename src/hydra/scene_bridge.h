@@ -102,8 +102,10 @@ struct RenderSettings {
     // The preview is skipped for scenes whose Embree memory exceeds this
     // many MiB (0 never skips).
     int gpuPreparationPreviewMaxMiB = 8192;
-    // prism:colorManagement:{ocioConfig,workingSpace,display,view}; empty
-    // fields take the defaults (docs/color_management.md). The colour AOV is
+    // prism:colorManagement:{ocioConfig,workingSpace,display,view}, and the
+    // active render settings prim's renderingColorSpace (the working space
+    // when workingSpace is empty); empty fields take the defaults
+    // (docs/color_management.md). The colour AOV is
     // linear in the working space; display and view only record the request.
     prism::color::Options color;
     // The active render settings prim's materialBindingPurposes: a prim's
