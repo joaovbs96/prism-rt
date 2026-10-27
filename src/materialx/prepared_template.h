@@ -65,6 +65,16 @@ inline bool IsCompatibleTemplateValue(const CapturedNode& node,
     if ((type.find("standard_surface")!=std::string::npos && name=="subsurface") ||
         (type.find("open_pbr_surface")!=std::string::npos && name=="subsurface_weight"))
         return false;
+    // DocumentLoader converts a colour-space-tagged constant on a uniform
+    // colour input into the working space (ConvertUniformColors in
+    // loader.cpp), so the prototype's argument holds the converted colour; a
+    // bound variant would bind its authored one. Such values stay structural.
+    // gltf_pbr's attenuation_color is the library's only uniform color3 input
+    // (materialx_loader_uniform_color checks); the color4 ones are never
+    // template values.
+    if (type.find("gltf_pbr")!=std::string::npos && name=="attenuation_color" &&
+        !parameter.data.colorSpace.IsEmpty())
+        return false;
     // DocumentLoader gives an uncoated transmissive open_pbr_surface its
     // specular IOR as coat_ior, which becomes the MDL refraction IOR. The
     // values that decide and feed it stay structural, so a bound variant never
