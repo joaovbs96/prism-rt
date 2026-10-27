@@ -369,6 +369,15 @@ bool MayExtendHdMtlxLibrary(HdMaterialNetworkInterface& net, std::string* why = 
     return false;
 }
 
+// The parameters ResolveTextureAssets materializes: image nodes' file (or
+// filename) and any other asset-valued input, such as triplanarprojection's
+// filex, filey and filez (left as authored, a relative path fails the MDL
+// module: C293 "strict relative file paths ... are not supported").
+bool IsTextureParameter(TfToken const& name, VtValue const& value)
+{
+    return name == TfToken("file") || name == TfToken("filename") || value.IsHolding<SdfAssetPath>();
+}
+
 std::string ResolveTextureAssets(HdMaterialNetworkInterface& net,
                                  const std::filesystem::path& cacheDir,
                                  const ArResolverContext& resolverContext,
@@ -396,9 +405,9 @@ std::string ResolveTextureAssets(HdMaterialNetworkInterface& net,
                     net.SetNodeParameterData(node, param, wrap);
                 }
             }
-            if (param != TfToken("file") && param != TfToken("filename")) continue;
             HdMaterialNetworkInterface::NodeParamData data =
                 net.GetNodeParameterData(node, param);
+            if (!IsTextureParameter(param, data.value)) continue;
             std::string authored;
             std::string preResolved;
             if (data.value.IsHolding<SdfAssetPath>()) {
@@ -525,8 +534,7 @@ void CollectTextureWork(const NetworkSnapshot& network,
 {
     for (const auto& node : network.nodes) {
         for (const auto& parameter : node.parameters) {
-            if (parameter.name != TfToken("file") && parameter.name != TfToken("filename"))
-                continue;
+            if (!IsTextureParameter(parameter.name, parameter.data.value)) continue;
             // Conversion drops a value whose input is connected.
             if (std::any_of(node.connections.begin(), node.connections.end(),
                     [&](const auto& connection) {
