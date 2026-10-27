@@ -2,6 +2,12 @@
 
 Phase reports, newest first. Detailed reports live in `local/reports/` (git-ignored).
 
+## 2026-10-27 — Denoising, part 1: interface and OIDN on the CPU
+- OIDN 2.5.1 built from source against our oneTBB (`tools/ci/build_oidn.ps1`); a denoiser interface on the render device; guides from the `albedo` AOV and a world-space shading normal. Vulkan/Metal denoise through host copies until parts 2–3.
+- CLI `--denoise none|aov|replace`, `--denoise-quality`, `--denoise-prefilter`; `prism:denoise*` settings; a `denoised` AOV; usdview shows a denoised frame every 16 passes, on pause and at convergence (off the render thread).
+- 16 spp NRMSE 0.246 → 0.065. 1080p CPU: 0.5 s, 3.1 s with guide prefiltering (default on). Denoise off: bit-identical to ca2ed1a.
+- 391/391 tests in the main checkout. Report: `local/reports/denoise_part1.md`. Not verified: usdview by hand, Metal. Status: merged locally, not pushed.
+
 ## 2026-10-26 — Fixes after Phases 5–7
 - **usdview:** Prism → Environment… (a session-layer dome; the stage's domes deactivated in the session layer, "Off" restores them); PyOpenColorIO 2.6.0 pinned (OCIO menus populated, warning gone, one OpenColorIO DLL in usdview); the time-limit setting is a float (usdview has no double editor); the session dome authors `info:implementationSource` (an OpenUSD 26.08 warning otherwise).
 - **Adaptive sampling in Hydra:** converged pixels were dropped from published buffers when the host still held the previous one (usdview on Vulkan lost the dome background around "87%"); fixed with a regression test on CPU and Vulkan.
