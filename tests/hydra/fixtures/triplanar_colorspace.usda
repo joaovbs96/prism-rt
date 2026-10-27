@@ -1,0 +1,91 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    upAxis = "Y"
+    metersPerUnit = 1
+)
+
+# MaterialX's triplanarprojection with its three files tagged with a colour
+# space (as the Typhoon suite's triplanarprojection_color3): MaterialX 1.39.5
+# converted the node's output once per tagged file and crashed generating it
+# (DocumentLoader keeps one transform, docs/materialx_compatibility.md). Both
+# loaders must compile it without the error material.
+def Xform "World"
+{
+    def Camera "Camera"
+    {
+        float focalLength = 35
+        float horizontalAperture = 20
+        float verticalAperture = 20
+        double3 xformOp:translate = (0, 0, 4)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+
+    def Cube "Box" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        double size = 1.2
+        float3 xformOp:rotateXYZ = (30, 40, 0)
+        uniform token[] xformOpOrder = ["xformOp:rotateXYZ"]
+        rel material:binding = </World/Looks/Triplanar>
+    }
+
+    def DomeLight "Dome"
+    {
+        float inputs:intensity = 1
+    }
+
+    def Scope "Looks"
+    {
+        def Material "Triplanar"
+        {
+            token outputs:mtlx:surface.connect = </World/Looks/Triplanar/Surface.outputs:out>
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_standard_surface_surfaceshader"
+                color3f inputs:base_color.connect = </World/Looks/Triplanar/Graph.outputs:out>
+                float inputs:specular = 0
+                token outputs:out
+            }
+
+            def NodeGraph "Graph"
+            {
+                color3f outputs:out.connect = </World/Looks/Triplanar/Graph/Project.outputs:out>
+
+                def Shader "Position"
+                {
+                    uniform token info:id = "ND_position_vector3"
+                    string inputs:space = "object"
+                    float3 outputs:out
+                }
+
+                def Shader "Normal"
+                {
+                    uniform token info:id = "ND_normal_vector3"
+                    string inputs:space = "object"
+                    float3 outputs:out
+                }
+
+                def Shader "Project"
+                {
+                    uniform token info:id = "ND_triplanarprojection_color3"
+                    asset inputs:filex = @./rect_light_texture.ppm@ (
+                        colorSpace = "srgb_rec709_scene"
+                    )
+                    asset inputs:filey = @./color_patch.ppm@ (
+                        colorSpace = "srgb_rec709_scene"
+                    )
+                    asset inputs:filez = @./textured_emitter_checker.ppm@ (
+                        colorSpace = "srgb_rec709_scene"
+                    )
+                    float inputs:blend = 0.25
+                    float3 inputs:position.connect = </World/Looks/Triplanar/Graph/Position.outputs:out>
+                    float3 inputs:normal.connect = </World/Looks/Triplanar/Graph/Normal.outputs:out>
+                    color3f outputs:out
+                }
+            }
+        }
+    }
+}

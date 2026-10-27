@@ -1101,6 +1101,11 @@ if(TARGET prism_hydra_render AND TARGET prism_compare_images)
         set_tests_properties(prism_scene_features_dome_orientation_sampling PROPERTIES
             FIXTURES_REQUIRED prism_scene_features_dome_orientation_sampling)
     endif()
+    # triplanarprojection with colour-space-tagged files compiles in both
+    # loaders (MaterialX 1.39.5's generator crashed on it).
+    prism_add_parity_fixture(NAME triplanar_colorspace SCENE tests/hydra/fixtures/triplanar_colorspace.usda)
+    set_tests_properties(prism_parity_triplanar_colorspace_cli prism_parity_triplanar_colorspace_hydra
+        PROPERTIES FAIL_REGULAR_EXPRESSION "magenta error material;MDL generation failed")
     # UsdLuxRectLight's texture orientation, on a camera-visible light.
     prism_add_parity_fixture(NAME rect_light_texture SCENE tests/hydra/fixtures/rect_light_texture.usda
         ARGS --working-space lin_rec709)
