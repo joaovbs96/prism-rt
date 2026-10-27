@@ -2,6 +2,12 @@
 
 Phase reports, newest first. Detailed reports live in `local/reports/` (git-ignored).
 
+## 2026-10-27 — Typhoon suite fixes: dome orientation, triplanarprojection, EON, declarations
+- Domes follow UsdLux's lat-long orientation (longitude 0 = +Z at the image's centre); PrismRT was a quarter turn off (`usdlux/dome` FLIP 0.883 -> 0.014). Lookups and sampling, CPU and GPU, every dome source; textured-dome images change. Rect light textures now read upright, as UsdLux and Typhoon have them.
+- triplanarprojection with tagged files crashed both loaders (MaterialX 1.39.5 use after free with several output colour transforms, fixed upstream since): one transform kept in `DocumentLoader`; asset inputs other than `file` are now materialized.
+- EON energy compensation tinted by the albedo (MaterialX's MDL library left it white: up to 2.3x too bright in a dark channel); `eon_diffuse_openpbr_compare` with sphere meshes 0.99/0.99/1.00 of Typhoon (was 1.00/1.14/1.34).
+- Six suite scenes rendered magenta ("Could not find a nodedef"): versioned definitions, enum names for integers, OpenPBR's `normal`, `UsdPrimvarReader_matrix` (its fallback) now repaired.
+- Whole suite on the CPU: FLIP pass 66 -> 76 of 474 (test-suite 19 -> 28), no crashes (2 before), error material in 2 scenes (unsupported string primvars; 8 before). 469/469 tests. Report: `local/reports/typhoon_fixes.md`. Status: worktree branch, not merged.
 ## 2026-10-27 — USD conformance: renderingColorSpace, Typhoon suite, SDK design
 - `UsdRenderSettings.renderingColorSpace` is the working space in both loaders (flag > `prism:colorManagement:workingSpace` > attribute > ACEScg); `data`/`raw` render in linear Rec.709. Scenes without it bit-identical to c0e44c1.
 - Typhoon's regression suite run on CPU through Hydra (`tools/conformance/run_typhoon_suite.py`): 474 cases, classified. Bugs being fixed next: domes 90° off the UsdLux lat-long convention, a `triplanarprojection` crash, EON diffuse's white energy-compensation lobe in MaterialX's MDL, 8 "doesn't match declaration" magenta scenes. Report: `local/reports/conformance.md`.
