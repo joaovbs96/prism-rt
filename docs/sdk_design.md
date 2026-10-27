@@ -853,3 +853,292 @@ Until implemented:
   behaviour (both loaders evaluate one time code).
 - Python takes the same shapes from day one (6.3), so scripts written now get
   motion blur later without changes.
+
+## 6. Python API sketch (nanobind)
+
+A thin layer: one Python class per C++ class, snake_case names, keyword
+arguments for the `*Desc` structs. No logic that the C++ API lacks.
+
+### 6.1 Module layout
+
+```
+prismrt/                     # package name: open question 8.3
+  __init__.py                # DLL directories, version check, re-exports
+  _prism.pyd / .so           # Renderer, Scene, Session, types, gltf, obj, io
+  usd.py + _prism_usd.pyd    # needs pxr; imported on first use of prismrt.usd
+```
+- `prismrt.Renderer`, `Scene`, `Session`, `RenderSettings`, `Aov`,
+  `DeviceKind`, `Error` (+ subclasses), `MeshDesc`-style keyword functions.
+- `prismrt.gltf.load(scene, path)`, `prismrt.obj.load(scene, path, ...)`.
+- `prismrt.usd.load(scene, path_or_stage, time=..., ...)`,
+  `prismrt.usd.render_job(stage, settings_path)`,
+  `prismrt.usd.write_products(job, result)`.
+- `prismrt.io.write_image(path, image, renderer)` (EXR linear, or 8-bit
+  through the view).
+
+### 6.2 Example: load a USD file and render to NumPy
+
+```python
+import numpy as np
+import prismrt as prism
+
+r = prism.Renderer()                    # RendererOptions.FromEnvironment() by default
+scene = r.create_scene()
+loaded = prism.usd.load(scene, "assets/scenes/CornellBox.usda", time=0)
+scene.commit()                          # converts meshes, compiles materials (GIL released)
+
+session = r.create_session(
+    scene, device="cpu", width=512, height=512,
+    camera=loaded.cameras["/World/Camera"],
+    aovs=["color", "albedo", "normal"],
+    settings=prism.RenderSettings(samples=64, adaptive_threshold=0.0, seed=1))
+result = session.render()               # blocking, GIL released
+rgb = np.asarray(result.aovs["color"])  # (512, 512, 3) float32, zero-copy view
+print(result.mean_samples, session.device)
+```
+
+### 6.3 Example: a scene from NumPy arrays
+
+```python
+points = np.array([[-1, 0, -1], [1, 0, -1], [1, 0, 1], [-1, 0, 1]], np.float32)
+indices = np.array([[0, 1, 2], [0, 2, 3]], np.int32)
+uvs = np.array([[0, 0], [1, 0], [1, 1], [0, 1]], np.float32)
+
+floor = scene.add_mesh(points=points, indices=indices, uvs=uvs,
+                       uvs_interpolation="vertex")
+gold = scene.add_material(mtlx_file="materials/gold.mtlx")
+red = scene.add_material(diffuse=(0.8, 0.1, 0.1))
+scene.add_instance(floor, transform=np.eye(4), materials=[red])
+
+ball = scene.add_spheres(centers=np.zeros((1, 3), np.float32),
+                         radii=np.array([0.5], np.float32))
+# Motion shapes (section 5): accepted now, one instant rendered until 8b.
+scene.add_instance(ball, materials=[gold],
+                   transform=[(0.0, translate(0, 0.5, 0)), (1.0, translate(0.2, 0.5, 0))])
+
+scene.add_light(shape="rect", width=2, height=2, intensity=10,
+                transform=look_down(4))
+scene.add_environment(color=(0.05, 0.05, 0.05))
+cam = scene.add_camera(prism.Camera.look_at(eye=(0, 2, 5), target=(0, 0, 0),
+                                            vertical_fov=40))
+scene.commit()
+```
+
+### 6.4 Example: progressive render with a callback and cancellation
+
+```python
+import threading
+stop = threading.Event()
+
+def on_progress(p: prism.Progress) -> bool:
+    print(f"\r{p.phase:10} {p.fraction:6.1%} {p.mean_samples:7.1f} spp", end="")
+    return not stop.is_set()            # False cancels
+
+session = r.create_session(scene, device="vulkan", width=1280, height=720,
+                           camera=cam, settings=prism.RenderSettings(samples=1024))
+session.start(on_progress)              # returns at once; passes run on a C++ thread
+try:
+    while session.wait(timeout=0.5) == prism.Status.RUNNING:
+        preview = np.asarray(session.aov("color"))   # snapshot at a pass edge
+except KeyboardInterrupt:
+    session.cancel()
+    session.wait()
+
+# Blocking form: a False from the callback, or Ctrl-C, raises.
+try:
+    session.render(on_progress)
+except prism.CancelledError:
+    pass
+```
+
+### 6.5 Example: a pxr stage through `UsdUtils.StageCache`
+
+```python
+from pxr import Usd, UsdGeom, UsdUtils  # pxr first (DLL load order, 6.7)
+import prismrt as prism
+
+stage = Usd.Stage.Open("shot.usda")
+UsdGeom.Sphere(stage.GetPrimAtPath("/World/Ball")).GetRadiusAttr().Set(2.0)  # unsaved edit
+
+# What prism.usd.load(scene, stage) does inside:
+stage_id = UsdUtils.StageCache.Get().Insert(stage).ToLongInt()
+loaded = prism.usd._load_cached(scene, stage_id, time=Usd.TimeCode.Default())
+#   C++: UsdUtilsStageCache::Get().Find(UsdStageCache::Id::FromLongInt(id))
+scene.commit()
+```
+- Both sides must be the same USD build in the same process (same DLLs): the
+  extension checks `pxr.Usd.GetVersion()` and the loaded `usd_usd` module
+  against the version it was built with and raises `ImportError` otherwise.
+- The stage stays in the cache while prism holds it; `load` removes the entry
+  if it inserted it.
+- Live updates (later): `prism.usd.StageSync(scene, stage)` built on
+  `UsdImagingStageSceneIndex` and the same scene-index translator as the
+  Hydra delegate (step 5), so stage edits become scene edits.
+
+### 6.6 GIL, threads and zero-copy
+
+GIL:
+- Released (`nb::call_guard<nb::gil_scoped_release>`) in every call that can
+  take long: `Renderer()` (MDL start-up), `commit`, `render`, `prepare`,
+  `wait`, `aov` (readback/copy), `usd.load`, `gltf.load`, `obj.load`.
+- Callbacks (progress, log) run on C++ threads. The binding takes the GIL
+  (`nb::gil_scoped_acquire`), calls, and turns a Python exception into a
+  cancel (rethrown later from the blocking call). The C++ side calls them
+  without holding its own locks and at most ~10 times a second.
+- Ctrl-C: a blocking call runs the work on a C++ thread and waits in 100 ms
+  slices; between slices it takes the GIL and calls `PyErr_CheckSignals()`;
+  on `KeyboardInterrupt` it cancels, joins and re-raises.
+- `atexit`: cancel and join every session before finalization (3.8).
+- Free-threaded Python (3.13t) is not a target for the first version.
+
+Zero-copy inputs:
+- Accepted: `nb::ndarray<const T, nb::c_contig, nb::device::cpu>` with the
+  expected dtype and shape (`(N, 3)` float32 points, `(M, 3)` or flat int32
+  indices, ...). The binding makes a `BufferView` whose `owner` holds a Python
+  reference (its deleter takes the GIL).
+- Other dtypes or layouts are converted once (a copy), not rejected.
+- The core reads the buffers at `commit()` and converts them into its own
+  structures (Embree buffers, GPU uploads); after `commit()` it drops the
+  references. In-place changes to an array after `commit()` have no effect
+  until `update_mesh_points` (or `update_mesh`) and another commit.
+  Zero-copy into Embree (`rtcSetSharedGeometryBuffer`) is a later
+  optimization (open question 8.8).
+
+Zero-copy outputs:
+- `Image` exposes `__array__` / the buffer protocol and `__dlpack__` /
+  `__dlpack_device__` (`kDLCPU`), as a read-only `nb::ndarray` whose owner
+  capsule keeps the C++ `Image` alive. `np.asarray(img)` and
+  `torch.from_dlpack(img)` do not copy.
+- Images are host memory. GPU-resident DLPack (`kDLVulkan`, `kDLMetal`)
+  is out of scope (few consumers).
+
+### 6.7 GPU devices from Python, and packaging constraints
+
+Device selection:
+- `prism.devices()` / `r.devices()` list what the build and machine have
+  (`AvailableDevices`, CPU last).
+- `create_session(..., device="auto" | "cpu" | "vulkan" | "metal",
+  allow_fallback=True)`; `session.device` and `session.device_note` say what
+  was used and why it fell back; `allow_fallback=False` raises
+  `prism.UnsupportedError`.
+- Default device for Python: open question 8.14 (GPU faults froze this PC).
+
+What a Python package must carry (for the packaging task):
+- `prism` shared library and its dependencies: Embree, oneTBB, MaterialX,
+  OIIO, OCIO, OIDN (+ its device modules), the MDL SDK (`libmdl_sdk` and the
+  `nv_openimageio` plugin), OpenSubdiv, vk_oidn.
+- Data: the MaterialX libraries folder (default `materialx.libraries` =
+  package-relative when `PRISM_MATERIALX_LIBRARY_PATH` is unset).
+- GPU: the GPU devices compile HLSL at run time with the DXC executable
+  (`hlsl_compiler.cpp:113-121`, `PRISM_DXC`): ship `dxc` + `dxcompiler` +
+  `dxil`; Metal also needs the Metal shader converter library. Shaders are
+  embedded already (`prism_embedded_shaders.cpp`).
+- Windows DLL search: Python 3.8+ ignores `PATH` for dependencies;
+  `__init__.py` calls `os.add_dll_directory` for the package's `bin`.
+- Load order: `import pxr` before PySide6 (PySide6's old `msvcp140` breaks
+  USD's DLLs); the same risk applies to prism's own MSVC-built DLLs.
+  `__init__.py` can detect an older `msvcp140` already loaded and raise a
+  clear error.
+- `prismrt.usd` must match the user's `pxr` build exactly (6.5): a wheel per
+  USD distribution or a bundled USD (open question 8.10).
+- Writable cache directory (`RendererOptions::cacheDirectory`); the shader
+  and texture caches must not land on the slow D: drive on this machine.
+
+## 7. Migration plan
+
+Rules for every step:
+- The CLI and Hydra keep working; both build with `PRISM_BUILD_HYDRA=ON`
+  (the parity harness needs it).
+- Steps that should not change images are checked bit-identical against the
+  previous build (`--exact`, CLAUDE.md), with `--adaptive-threshold 0` and
+  fixed samples.
+- Focused suites per step, the full serial `ctest -j 1` once at the end
+  (merge gate). GPU tests only with the machine-safety rules.
+- Load and edit timings compared with alternating runs of old/new builds
+  (`tests/hydra/benchmark_loading.py`), reported as ratios.
+
+| Step | What | Safety net | Size |
+|---|---|---|---|
+| 0 | João answers section 8; record decisions in `docs/DECISIONS.md` | — | S |
+| 1a | Internal `Renderer::Impl` context + `RendererOptions::FromEnvironment()`; API-level env reads (rows 8, 11-18) go through it; front ends create the context | `prism_render_settings_test`, `prism_render_settings_hydra_test`, `prism_cli_*`, parity fixtures; `--exact` | S |
+| 1b | Colour management explicit (row 7): loaders, materials, textures, lights, devices take it from the context/scene; delete `Active/SetActive/Activate` | `prism_color_management_test`, `prism_color_*` (patches, view, legacy CLI/Hydra), parity `color_*`, `gltf_uniform_colorspace`; `--exact` | M |
+| 1c | SSS fallback and binding purposes as options (rows 9-10) | parity `sss_fallback`, `binding_*`, `prism_scene_features_sss_fallback_*`, `materialx_loader_sss` | S |
+| 1d | Runtime object: caches and registries (rows 23-54) behind it; `TextureService` owned by the context; per-device `groupStackSize` (row 54); audit cache keys for colour identity and SSS fallback, with a regression test (same material, two working spaces, one process) | `prism_texture_service_test`, `prism_texture_streaming_test`, `prism_generated_mdl_*` (fresh, concurrent process), `prism_material_generation_cache_test`, `prism_standalone_material_reuse_test`, `prism_hydra_material_loading_test`, `prism_gpu_program_budget_test` (gpu); load benchmark | M |
+| 1e | Progress and logging per renderer (rows 55-56, 58-59, 62); log sink callback | `prism_hydra_scene_bridge_test` (its progress-status cases, `tests/hydra/progress_status_test.cpp`), `prism_cli_clean_exit_*`, `prism_cli_time_limit`, `tests/cli_smoke.py` (manual) | S |
+| 2 | Core without USD: `Matrix4d` in `camera_rays.h`/`aov.h`; std-only `MeshSource` split from `mesh_conversion`; render settings off `SceneManager` (2.7); CMake targets `prism`, `prism_usd`, `prism_gltf`, `prism_obj`, `prism_io`; a configure check that builds `prism` without pxr | `prism_camera_rays_test`, `prism_subdivision_test`, `prism_obj_*`, `prism_gltf_*`, parity (`subdivision_*`, `displacement`, `camera_exposure`, `id_aovs`); `--exact` (camera math must be bit-identical) | M |
+| 3 | Public `Scene` API (handles; `commit()` = full rebuild); glTF, OBJ and USD loaders emit into it; the CLI uses it | all parity fixtures (the Hydra side is unchanged, so a CLI regression shows as a mismatch: `instances`, `instance_primvars`, `linking`, `lights`, `env_dome`, `implicit_surfaces`, `animated_*`, `skinned_*`, `id_aovs`, `double_sided`), `prism_gltf_*`, `prism_obj_*`, `prism_usd_spheres_test`, `prism_scene_features_*_cli`; `--exact` vs the previous CLI | L |
+| 4 | Public `Session` batch path (`render()`, `RenderResult`, AOVs, exposure, denoise) and `prism_io`; the CLI becomes a thin front end | `prism_render_products_*`, `prism_render_crop_*`, `prism_denoise_*` (CPU; Vulkan with the gpu label), `prism_scene_features_light_aovs_*`, `prism_cli_time_limit`, CPU/Vulkan parity tests (`*_vulkan_parity`); `--exact` | M |
+| 5a | Progressive `Session` (`start/pause/cancel/restart/aov/pick`): move the pass loop, previews, adaptive publication, denoise interval and GPU preparation preview out of `scene_bridge.cpp`; Hydra still builds its own `SceneManager` | `prism_hydra_scene_bridge_test`, `prism_hydra_adaptive_publication_*`, `prism_hydra_render_buffer_test` (the bridge test includes the picking, accumulation and multisampled-presentation cases), `prism_hydra_time_limit`, `prism_denoise_interval_hydra`, parity | L |
+| 5b | Incremental `commit()`: dirty kinds, double-buffered revisions (the snapshot/bank machinery moves into the core); Hydra's scene-index observer becomes a translator to `Scene` edits (placements, materials, lights first; structure and prototypes last) | `prism_hydra_setting_change_test`, `prism_hydra_animation_exercise`, `prism_hydra_scene_bridge_test` (dependency-update and environment-cache cases), streaming tests, parity; edit-latency benchmark; manual usdview check | L |
+| 6 | `prism` as a shared library with `PRISM_API` exports, internals hidden; `hdPrism`, CLI link it | full serial `ctest`; usdview smoke; export list review | M |
+| 7 | Python bindings (nanobind) + pytest under CTest (CPU; Vulkan tests with the gpu label and lock) | new tests: Python-vs-CLI images exact (CPU, fixed seed), zero-copy (array addresses), cancellation, StageCache, `atexit` join | M |
+| 8 | Packaging (wheel, DLLs, load order) | install test in a clean venv | M-L |
+| 9 | Motion blur (Phase 8b) on the reserved shapes | its own plan | L |
+
+Notes:
+- Step 6 is mechanical and can move earlier if the CLI/Hydra double copy of
+  globals bites (it does not today: no process loads both).
+- Steps 1a-1e keep today's internal APIs and only make state explicit, so
+  they are low risk and give most of the "no globals" value early.
+- Step 5 is the largest and riskiest; split as above and keep the old
+  `SceneBridge` path working until 5b lands.
+
+Risks:
+- Hydra edit latency and threading (5b): the snapshot/bank code is tuned
+  (spare banks, prototype pools, residency reuse); moving it can regress
+  usdview interactivity. Mitigation: move code, not rewrite; benchmarks.
+- Cache keys (1d): today they can assume one colour space and one SSS setting
+  per process; with several renderers a missing key component returns a wrong
+  material silently. Mitigation: the regression test in 1d.
+- MDL SDK single instance: the Runtime must be the only owner; a second copy
+  of `prism` in the process (static linking) breaks it. Mitigation: step 6
+  before Python ships.
+- Parity tests exist only with `PRISM_BUILD_HYDRA=ON`: keep Hydra in every
+  build during the migration.
+- USD ABI coupling for Python (6.5): mismatched `pxr` builds crash, not
+  error. Mitigation: version check at import.
+- Exactness: moving math off `GfMatrix4d` (step 2) can change rounding;
+  `--exact` comparisons catch it, and a noise-floor comparison decides if a
+  change is acceptable.
+
+## 8. Open questions for João
+
+1. **Errors**: C++ exceptions (`prism::Error` with codes; matches the code
+   today, maps to Python exceptions) or status codes? Proposal: exceptions.
+2. **C API**: none until the first release (proposal), or a C API now (as
+   Embree, OIDN, OSPRay) for ABI stability and other languages?
+3. **Names**: `prism::Renderer` / `Scene` / `Session`? Python package name
+   (`prismrt`; `prism` is likely taken on PyPI) and import name.
+4. **Shared library**: `prism` as a DLL (needed once `hdPrism` and Python
+   share a process). Keep a static option for the CLI?
+5. **Several renderers per process** with different colour spaces / SSS
+   settings (proposal: yes, with audited cache keys), or one active renderer
+   with a clear error?
+6. **Environment variables**: should Python honour `PRISM_*` by default
+   (proposal: yes, `Renderer(env=False)` to opt out)? Which env vars become
+   documented options and which stay developer-only (rows 19, 63)?
+7. **Scene threading**: single writer per scene + `commit()` (proposal), or
+   internally synchronized edits from many threads (costlier)?
+8. **Mesh data**: copy at `commit()` (proposal for v1) or zero-copy shared
+   buffers into Embree (lower memory; the caller must keep arrays unchanged)?
+9. **MaterialX in the API**: files and strings only, plus an optional
+   header-only interop for `MaterialX::DocumentPtr` (proposal), or MaterialX
+   types in the public API?
+10. **Packaging targets**: Windows first? Linux, macOS? Which USD for
+    `prismrt.usd` (our bundled build, `usd-core` from PyPI, Houdini/Omniverse
+    builds)? Which Python versions (3.11 only today)?
+11. **Versioning**: 0.x semver with `PRISM_VERSION_*` macros and
+    `prismrt.__version__`; when is the first release that freezes the API?
+12. **Hydra**: one `Renderer` per delegate instance (proposal: isolation,
+    heavy caches still shared through the Runtime) or one per process?
+13. **Cancellation**: progress callback returning `False` plus an explicit
+    `cancel()` (proposal: both)? Default callback rate (10 Hz)?
+14. **Python default device**: `auto` like the CLI, or `cpu` unless asked,
+    given the GPU faults on this machine?
+15. **Order**: as planned (core + CLI, then Hydra, then Python), or Python
+    bindings on the batch API right after step 4 (earlier use; Hydra port in
+    parallel)?
+16. **AOV names**: Hydra tokens (`color`, `primvars:st`, `primId`) as the
+    public string names next to the enum?
+17. **Redistribution**: are the MDL SDK, DXC, Metal shader converter and
+    vk_oidn licences fine for wheels (for the packaging task)?
