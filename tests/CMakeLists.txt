@@ -46,6 +46,13 @@ target_link_libraries(materialx_loader_uniform_color PRIVATE MaterialXCore Mater
 target_compile_definitions(materialx_loader_uniform_color PRIVATE PRISM_TEST_MATERIALX_ROOT="${_prism_materialx_root}")
 add_test(NAME materialx_loader_uniform_color COMMAND materialx_loader_uniform_color)
 set_tests_properties(materialx_loader_uniform_color PROPERTIES SKIP_RETURN_CODE 77)
+# Nodes that do not match their definitions, by the library's definitions.
+add_executable(materialx_loader_declarations materialx_loader_declarations.cpp ../src/materialx/loader.cpp)
+target_compile_features(materialx_loader_declarations PRIVATE cxx_std_20)
+target_link_libraries(materialx_loader_declarations PRIVATE MaterialXCore MaterialXFormat)
+target_compile_definitions(materialx_loader_declarations PRIVATE PRISM_TEST_MATERIALX_ROOT="${_prism_materialx_root}")
+add_test(NAME materialx_loader_declarations COMMAND materialx_loader_declarations)
+set_tests_properties(materialx_loader_declarations PROPERTIES SKIP_RETURN_CODE 77)
 # EON's tinted energy compensation, in the library's graphs.
 add_executable(materialx_loader_eon materialx_loader_eon.cpp ../src/materialx/loader.cpp)
 target_compile_features(materialx_loader_eon PRIVATE cxx_std_20)
