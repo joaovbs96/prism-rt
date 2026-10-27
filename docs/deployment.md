@@ -76,7 +76,8 @@ The dependency roots default from the same `PRISM_*` variables as
 The package contains `cmake --install` output (`PrismRT.exe`, the Hydra
 delegate, the usdview extension, the sample scenes), the runtime DLLs of
 OpenUSD, oneTBB, Embree, the MDL SDK (`mdl\bin`), vcpkg, the MSVC runtime and
-the Vulkan loader, the MaterialX libraries, DXC (compiles the GPU kernel at run
+the Vulkan loader, Open Image Denoise's CPU device (`OpenImageDenoise*.dll`,
+when the build has the denoiser; it runs on the package's one `tbb12.dll`), the MaterialX libraries, DXC (compiles the GPU kernel at run
 time), and a private Python 3.11 with PySide6 (Essentials, 6.7.2), PyOpenGL,
 numpy and PyOpenColorIO installed with pip into `python\Lib\site-packages`
 (the PyOpenColorIO wheel without its own OpenColorIO DLL, see
@@ -110,7 +111,8 @@ vulkan device").
 ## Dependency versions
 
 `tools/deps.json` is the only list of dependency versions: OpenUSD, MaterialX
-and OpenSubdiv tags, oneTBB, Embree, the MDL SDK (tag, release build, clang
+and OpenSubdiv tags, oneTBB, Embree, Open Image Denoise (version, source and
+ISPC checksums), the MDL SDK (tag, release build, clang
 and the SDK's vcpkg baseline), Python and the PySide6/PyOpenGL/numpy/opencolorio pins, the
 Vulkan SDK, PrismRT's vcpkg baseline (OpenImageIO, OpenColorIO), and `stack_revision`, a
 counter that forces CI to rebuild its cached stacks. Its consumers:
@@ -124,10 +126,11 @@ counter that forces CI to rebuild its cached stacks. Its consumers:
 - `tools/ci/export_deps.ps1`: exports the versions and cache keys to each CI job
   (`GITHUB_ENV` and step outputs, including `setup-python`'s version).
   `windows.yml` has no version literals.
-- `tools/ci/build_usd_stack.ps1`, `fetch_prebuilt.ps1`, `build_mdl_sdk.ps1`,
+- `tools/ci/build_usd_stack.ps1`, `fetch_prebuilt.ps1`, `build_mdl_sdk.ps1`, `build_oidn.ps1`,
   `tools/build_deps_local.ps1` and `tools/package_windows.ps1`.
 - `cmake/PrismDeps.cmake`: the configure reports the OpenUSD, MaterialX,
-  OpenSubdiv, oneTBB, Embree, OpenImageIO, OpenColorIO, Python and MDL SDK versions it found
+  OpenSubdiv, oneTBB, Embree, OpenImageIO, OpenColorIO, Python, MDL SDK and (when enabled) Open Image
+  Denoise versions it found
   and, on Windows, fails when one differs from `deps.json`
   (`-DPRISM_STRICT_DEPENDENCY_VERSIONS=OFF` turns that into a warning, the
   default on other platforms, whose stacks may come from system packages). It also

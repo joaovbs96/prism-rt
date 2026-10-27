@@ -10,6 +10,8 @@ $env:PRISM_MATERIALX_MDL = Join-Path $env:PRISM_MATERIALX_LIBRARY_PATH "mdl"
 $env:PRISM_MDL_SDK_ROOT = "C:\deps\mdl-sdk-2026.0.2-nocuda"
 $env:PRISM_EMBREE_RUNTIME_DIR = "C:\deps\embree-4.4.0\bin"
 $env:PRISM_TBB_REDIST = "C:\deps\oneapi-tbb-2022.2.0\redist\intel64\vc14"
+# Optional denoiser, built by tools/ci/build_oidn.ps1.
+$env:PRISM_OIDN_RUNTIME = "D:\prism-deps\oidn-2.5.1\bin"
 $env:PRISM_VCPKG_BIN = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) "build\vcpkg_installed\x64-windows\bin"
 $env:PRISM_PYTHON_ROOT = Join-Path $env:LOCALAPPDATA "Programs\Python\Python311"
 # build_usd_stack.ps1 copies usdview's entry point into the install.

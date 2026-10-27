@@ -130,9 +130,45 @@ jobs:
           path: D:\deps\mdl
           key: ${{ steps.deps.outputs.mdl_key }}
 
+  # Open Image Denoise (the denoiser): built from source with only its CPU
+  # device against deps.json's oneTBB (tools/ci/build_oidn.ps1); its own job
+  # and cache, keyed on the OIDN/ISPC/oneTBB versions and the script.
+  oidn:
+    name: Open Image Denoise (CPU)
+    runs-on: windows-2022
+    timeout-minutes: 120
+    outputs:
+      key: ${{ steps.deps.outputs.oidn_key }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Versions and cache keys from tools/deps.json
+        id: deps
+        run: ./tools/ci/export_deps.ps1
+      - name: Look up cache
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: D:\deps\oidn
+          key: ${{ steps.deps.outputs.oidn_key }}
+          lookup-only: true
+      - name: Fetch oneTBB
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: ./tools/ci/fetch_prebuilt.ps1 -Prefix $env:DEPS -Components tbb
+      - name: Build Open Image Denoise
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          ./tools/ci/build_oidn.ps1 -TbbRoot "$env:DEPS\tbb\oneapi-tbb-$env:PRISM_DEP_ONETBB" `
+            -WorkDir D:\oidn-work -Prefix "$env:DEPS\oidn"
+      - name: Save cache
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: D:\deps\oidn
+          key: ${{ steps.deps.outputs.oidn_key }}
+
   build:
     name: Build, test and package
-    needs: [usd, mdl]
+    needs: [usd, mdl, oidn]
     permissions:
       contents: write # attaching the zip to a release
     runs-on: windows-2022
@@ -171,6 +207,13 @@ jobs:
         with:
           path: D:\deps\mdl
           key: ${{ needs.mdl.outputs.key }}
+          fail-on-cache-miss: true
+
+      - name: Restore Open Image Denoise
+        uses: actions/cache/restore@v4
+        with:
+          path: D:\deps\oidn
+          key: ${{ needs.oidn.outputs.key }}
           fail-on-cache-miss: true
 
       - name: Fetch oneTBB and Embree
@@ -241,6 +284,7 @@ jobs:
           $env:PRISM_EMBREE_ROOT = "$deps/embree"
           $env:PRISM_EMBREE_RUNTIME_DIR = "$deps/embree/bin"
           $env:PRISM_MDL_SDK_ROOT = "$deps/mdl"
+          $env:PRISM_OIDN_ROOT = "$deps/oidn"
           $env:PRISM_VCPKG_PREFIX = $vcpkgPrefix
           $env:PRISM_VCPKG_BIN = "$vcpkgPrefix/bin"
           $env:PRISM_OPENIMAGEIO_DIR = "$vcpkgPrefix/share/openimageio"

@@ -4,8 +4,8 @@
 
 .DESCRIPTION
   Installs PrismRT from an existing build, copies the runtime dependencies
-  (OpenUSD, MaterialX libraries, oneTBB, Embree, MDL SDK, vcpkg DLLs, DXC, the
-  MSVC runtime), bundles a private Python with PySide6, PyOpenGL and numpy
+  (OpenUSD, MaterialX libraries, oneTBB, Embree, Open Image Denoise, MDL SDK,
+  vcpkg DLLs, DXC, the MSVC runtime), bundles a private Python with PySide6, PyOpenGL and numpy
   (versions from tools/deps.json), writes the launcher .bat files and README,
   and zips the result.
 
@@ -23,6 +23,8 @@ param(
     [string] $OpenSubdivRoot = "",
     [string] $TbbRuntime = "",
     [string] $EmbreeRuntime = "",
+    # Open Image Denoise's bin (the denoiser); required when the build has it.
+    [string] $OidnRuntime = "",
     [string] $MdlSdkRoot = "",
     [string] $VcpkgBin = "",
     [string] $PythonRoot = "",
@@ -69,6 +71,9 @@ $TbbRuntime = Pick $TbbRuntime @("PRISM_TBB_REDIST") $runtime.tbbRuntime
 $EmbreeRuntime = Pick $EmbreeRuntime @("PRISM_EMBREE_RUNTIME_DIR", "PRISM_EMBREE_BUILD_RUNTIME") `
     $(if ($runtime.embreeRuntime) { $runtime.embreeRuntime } else { $runtime.embreeBuildRuntime })
 $MdlSdkRoot = Pick $MdlSdkRoot @("PRISM_MDL_SDK_ROOT") $runtime.mdlSdkRoot
+$OidnRuntime = Pick $OidnRuntime @("PRISM_OIDN_RUNTIME") $runtime.oidnRuntime
+# The build links OIDN when its runtime description names it.
+$buildHasOidn = [bool] $runtime.oidnRuntime
 $VcpkgBin = Pick $VcpkgBin @("PRISM_VCPKG_BIN") $runtime.vcpkgRuntime
 $PythonRoot = Pick $PythonRoot @("PRISM_PYTHON_ROOT") $runtime.pythonRoot
 $UsdviewScript = Pick $UsdviewScript @("PRISM_USDVIEW") ""
@@ -97,6 +102,7 @@ Require-Path "usdview.py (-UsdviewScript)" $UsdviewScript
 Require-Path "MaterialX libraries (-MaterialXRoot)" (Join-Path $MaterialXRoot "libraries")
 Require-Path "oneTBB runtime (-TbbRuntime)" (Join-Path $TbbRuntime $tbbDll)
 Require-Path "Embree runtime (-EmbreeRuntime)" (Join-Path $EmbreeRuntime $embreeDll)
+if ($buildHasOidn) { Require-Path "Open Image Denoise runtime (-OidnRuntime)" (Join-Path $OidnRuntime "OpenImageDenoise.dll") }
 Require-Path "vcpkg runtime (-VcpkgBin)" $VcpkgBin
 Require-Path "Python (-PythonRoot)" (Join-Path $PythonRoot "python.exe")
 Require-Path "DXC (-DxcDir)" (Join-Path $DxcDir "dxc.exe")
@@ -157,6 +163,20 @@ Remove-Item -LiteralPath $stage -Recurse -Force
 $binDir = Join-Path $pkg "bin"
 Copy-Dlls $TbbRuntime $binDir @($tbbDll, "tbbmalloc.dll")
 Copy-Dlls $EmbreeRuntime $binDir @($embreeDll)
+# The denoiser: OIDN's API, core (with the network weights) and CPU device
+# DLLs. Built against the oneTBB above (tools/ci/build_oidn.ps1), so they use
+# the package's tbb12.dll; a tbb DLL beside them would be a second oneTBB.
+if ($buildHasOidn) {
+    if (Get-ChildItem -LiteralPath $OidnRuntime -Filter "tbb*.dll" -File) {
+        throw "$OidnRuntime contains a tbb DLL: use OIDN built against PrismRT's oneTBB (tools/ci/build_oidn.ps1)"
+    }
+    Copy-Dlls $OidnRuntime $binDir @("OpenImageDenoise*.dll")
+    foreach ($dll in @("OpenImageDenoise.dll", "OpenImageDenoise_core.dll", "OpenImageDenoise_device_cpu.dll")) {
+        if (-not (Test-Path -LiteralPath (Join-Path $binDir $dll))) { throw "$dll missing from $OidnRuntime" }
+    }
+} else {
+    Write-Host "The build has no denoiser (PRISM_ENABLE_OIDN off): no OIDN DLLs"
+}
 Copy-Dlls $VcpkgBin $binDir
 # Colour management links OpenColorIO directly; its built-in configs are
 # compiled into the DLL, so no config files ship.
@@ -255,13 +275,19 @@ $ocioCopies = @(Get-ChildItem -LiteralPath $pkg -Recurse -Filter "OpenColorIO*.d
 if ($ocioCopies.Count -ne 1) {
     throw "Expected one OpenColorIO DLL in the package, found: $($ocioCopies.FullName -join ', ')"
 }
+# USD, Embree and OIDN share one oneTBB.
+$tbbCopies = @(Get-ChildItem -LiteralPath $pkg -Recurse -Filter $tbbDll -File)
+if ($tbbCopies.Count -ne 1) {
+    throw "Expected one $tbbDll in the package, found: $($tbbCopies.FullName -join ', ')"
+}
 
 # 4. Launchers and README (CRLF so cmd.exe is happy whatever the checkout's EOLs).
 foreach ($name in @("usdview.bat", "prism_render.bat", "list_devices.bat", "env_setup.bat", "README.txt")) {
     $text = [IO.File]::ReadAllText((Join-Path $templates $name))
     $versions = @(
         "  OpenUSD $($deps.openusd.version), MaterialX $($deps.materialx.version), OpenSubdiv $($deps.opensubdiv.version)",
-        "  oneTBB $($deps.onetbb.version), Embree $($deps.embree.version), MDL SDK $($deps.mdl_sdk.version)",
+        ("  oneTBB $($deps.onetbb.version), Embree $($deps.embree.version), MDL SDK $($deps.mdl_sdk.version)" +
+            $(if ($buildHasOidn) { ", Open Image Denoise $($deps.oidn.version)" } else { "" })),
         "  OpenImageIO $($deps.vcpkg.openimageio), OpenColorIO $($deps.vcpkg.opencolorio), Python $($deps.python.version), PySide6 $PySideVersion"
     ) -join "`n"
     $text = $text.Replace("@PRISM_DEPENDENCY_VERSIONS@", $versions) -replace "`r?`n", "`r`n"
@@ -284,6 +310,12 @@ foreach ($n in @("LICENSE.md", "LICENSE_THIRDPARTY.md", "LICENSE.txt", "LICENSE"
 $embreeRoot = Split-Path -Parent $EmbreeRuntime
 foreach ($n in @("LICENSE.txt", "doc\LICENSE.txt", "third-party-programs.txt", "doc\third-party-programs.txt")) {
     Copy-IfExists (Join-Path $embreeRoot $n) $lic ("Embree-" + (Split-Path -Leaf $n))
+}
+if ($buildHasOidn) {
+    $oidnDoc = Join-Path (Split-Path -Parent $OidnRuntime) "share\doc\OpenImageDenoise"
+    foreach ($n in @("LICENSE.txt", "third-party-programs.txt", "third-party-programs-oneTBB.txt")) {
+        Copy-IfExists (Join-Path $oidnDoc $n) $lic ("OpenImageDenoise-" + $n)
+    }
 }
 $tbbRoot = $TbbRuntime
 for ($i = 0; $i -lt 3; $i++) { $tbbRoot = Split-Path -Parent $tbbRoot }

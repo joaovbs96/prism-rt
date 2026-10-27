@@ -8,6 +8,7 @@
   Environment and outputs:
     USD_STACK_KEY / usd_key   OpenSubdiv + MaterialX + OpenUSD cache key
     MDL_SDK_KEY   / mdl_key   MDL SDK cache key
+    OIDN_KEY      / oidn_key  Open Image Denoise cache key
     PRISM_DEP_<NAME>          one per version (ONETBB, EMBREE, PYTHON, ...)
     python                    for actions/setup-python
   Outside Actions (no GITHUB_ENV) it prints them, as a dry run.
@@ -18,11 +19,13 @@ $d = Get-PrismDeps
 $values = [ordered]@{
     USD_STACK_KEY             = Get-PrismCacheKey -Stack usd
     MDL_SDK_KEY               = Get-PrismCacheKey -Stack mdl
+    OIDN_KEY                  = Get-PrismCacheKey -Stack oidn
     PRISM_DEP_OPENUSD         = $d.openusd.version
     PRISM_DEP_MATERIALX       = $d.materialx.version
     PRISM_DEP_OPENSUBDIV      = $d.opensubdiv.version
     PRISM_DEP_ONETBB          = $d.onetbb.version
     PRISM_DEP_EMBREE          = $d.embree.version
+    PRISM_DEP_OIDN            = $d.oidn.version
     PRISM_DEP_MDL_SDK         = $d.mdl_sdk.version
     PRISM_DEP_PYTHON          = $d.python.version
     PRISM_DEP_VULKAN_SDK      = $d.vulkan_sdk.version
@@ -31,6 +34,7 @@ $values = [ordered]@{
 $outputs = [ordered]@{
     usd_key = $values.USD_STACK_KEY
     mdl_key = $values.MDL_SDK_KEY
+    oidn_key = $values.OIDN_KEY
     python  = $d.python.version
 }
 if ($env:GITHUB_ENV) {

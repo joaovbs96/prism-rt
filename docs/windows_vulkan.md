@@ -37,6 +37,7 @@ table.
 | MaterialX | 1.39.5 | Built by the same script (the version OpenUSD 26.08 builds against); PrismRT needs `libraries\` and `libraries\mdl\`. |
 | oneTBB | 2022.2.0 | Binary release, shared by USD and PrismRT (`tbb12.dll`). |
 | Embree | 4.4.0 | Intel binary release. |
+| Open Image Denoise | 2.5.1 | Optional (the denoiser, [denoising.md](denoising.md)). Built from Intel's source release with only the CPU device, against the oneTBB above, by `tools/ci/build_oidn.ps1` (needs ISPC 1.30.0, which it downloads). Intel's prebuilt package is built against a newer oneTBB and ships its own `tbb12.dll`, see [DECISIONS.md](DECISIONS.md). |
 | NVIDIA MDL SDK | 2026.0.2 | Built from source without CUDA, see below. Do not use the binary release zip. |
 | OpenImageIO | 3.1.14 | vcpkg, installed into `build\vcpkg_installed\x64-windows`. |
 | OpenColorIO | 2.6.0 | vcpkg (also an OpenImageIO dependency). Colour management ([color_management.md](color_management.md)); its built-in configs ship inside `OpenColorIO_2_6.dll`. OpenUSD's Hdx (usdview's OpenColorIO colour correction) links the same version, so one `OpenColorIO_2_6.dll`, vcpkg's, serves both, and the pip `PyOpenColorIO` wheel binds to the loaded one by name (see [color_management.md](color_management.md)). |

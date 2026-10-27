@@ -9,6 +9,8 @@
 #   PRISM_OPENUSD_ROOT     D:/prism-deps/openusd-26.08-ocio2.6.0-p7e45c2c5
 #   PRISM_MATERIALX_ROOT   D:/prism-deps/materialx-1.39.5
 #   PRISM_OPENSUBDIV_ROOT  D:/prism-deps/opensubdiv-3.6.1
+# and tools/ci/build_oidn.ps1 the optional denoiser:
+#   PRISM_OIDN_ROOT        D:/prism-deps/oidn-2.5.1
 # The versions themselves live only in tools/deps.json; the configure checks
 # that what it finds matches (cmake/PrismDeps.cmake).
 set(pxr_DIR "$ENV{PRISM_OPENUSD_ROOT}" CACHE PATH "OpenUSD package config directory")
@@ -24,3 +26,8 @@ set(PRISM_MATERIALX_LIBRARY_PATH "$ENV{PRISM_MATERIALX_ROOT}/libraries" CACHE PA
 set(PRISM_MATERIALX_MDL "$ENV{PRISM_MATERIALX_ROOT}/libraries/mdl" CACHE PATH "MaterialX MDL libraries")
 set(CMAKE_PREFIX_PATH "$ENV{PRISM_VCPKG_PREFIX}" CACHE STRING "Additional package prefix paths")
 set(OpenImageIO_DIR "$ENV{PRISM_OPENIMAGEIO_DIR}" CACHE PATH "OpenImageIO package config directory")
+# Optional: without it the build has no denoiser (PRISM_ENABLE_OIDN).
+if(DEFINED ENV{PRISM_OIDN_ROOT})
+    file(GLOB _prism_oidn_dir LIST_DIRECTORIES true "$ENV{PRISM_OIDN_ROOT}/lib/cmake/OpenImageDenoise-*")
+    set(OpenImageDenoise_DIR "${_prism_oidn_dir}" CACHE PATH "Open Image Denoise package config")
+endif()

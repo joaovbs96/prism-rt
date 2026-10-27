@@ -6,6 +6,7 @@
   Import-Module ./tools/deps.psm1
   (Get-PrismDeps).openusd.tag          # v26.08
   Get-PrismCacheKey -Stack usd         # usd-26.08-p<patch hash>-osd-3.6.1-...-ocio-2.6.0-vcpkg-...-<script hash>
+  Get-PrismCacheKey -Stack oidn        # oidn-2.5.1-ispc-1.30.0-tbb-2022.2.0-...-<script hash>
 #>
 $script:DepsJson = Join-Path $PSScriptRoot "deps.json"
 $script:RepoRoot = Split-Path -Parent $PSScriptRoot
@@ -67,7 +68,7 @@ function Get-PrismUsdPatchHash {
 #>
 function Get-PrismCacheKey {
     param(
-        [Parameter(Mandatory)] [ValidateSet("usd", "mdl")] [string] $Stack,
+        [Parameter(Mandatory)] [ValidateSet("usd", "mdl", "oidn")] [string] $Stack,
         [string] $Platform = $(if ($env:ImageOS) { $env:ImageOS } else { "local" })
     )
     $d = Get-PrismDeps
@@ -82,6 +83,10 @@ function Get-PrismCacheKey {
                 "mtlx-$($d.materialx.version)", "tbb-$($d.onetbb.version)",
                 "ocio-$($d.vcpkg.opencolorio)", "vcpkg-$($d.vcpkg.baseline.Substring(0, 10))",
                 "py$($d.python.version)", ("pip-" + ((Get-PrismPipRequirements) -join "_").Replace("==", "")))
+        }
+        "oidn" {
+            $files = @("tools/ci/build_oidn.ps1")
+            $parts = @("oidn-$($d.oidn.version)", "ispc-$($d.oidn.ispc)", "tbb-$($d.onetbb.version)")
         }
         "mdl" {
             $files = @("tools/ci/build_mdl_sdk.ps1", "tools/ci/mdl_vcpkg/vcpkg.json")

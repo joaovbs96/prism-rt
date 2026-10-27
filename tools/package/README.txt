@@ -80,6 +80,7 @@ Their license files are in the licenses folder where the projects ship them.
   - OpenSubdiv (Pixar), Modified Apache 2.0 (linked statically)
   - NVIDIA MDL SDK, BSD 3-clause
   - Intel Embree, Apache 2.0
+  - Intel Open Image Denoise (CPU device), Apache 2.0
   - Intel oneTBB, Apache 2.0
   - OpenImageIO, OpenColorIO, OpenEXR/Imath and other libraries from vcpkg
     (BSD / Apache 2.0 / MIT, see licenses\vcpkg)

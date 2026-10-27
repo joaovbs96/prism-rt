@@ -6,6 +6,14 @@
   "opensubdiv": { "version": "3.6.1", "tag": "v3_6_1" },
   "onetbb": { "version": "2022.2.0" },
   "embree": { "version": "4.4.0" },
+  "oidn": {
+    "_comment": "Built from source with the CPU device only, against onetbb (tools/ci/build_oidn.ps1; docs/DECISIONS.md).",
+    "version": "2.5.1",
+    "tag": "v2.5.1",
+    "source_sha256": "E71FD043A70F1CC80E301D1B90DF6C1F536098C4DD94BAA612742F6DB3369C36",
+    "ispc": "1.30.0",
+    "ispc_sha256": "E126A78FD15F12475BAC6204F2536B3986E07973127E4F8E7336C3D304C4A69F"
+  },
   "mdl_sdk": {
     "version": "2026.0.2",
     "tag": "2026.0.2",

@@ -10,6 +10,7 @@
   "embreeBuildRuntime": "@PRISM_EMBREE_BUILD_RUNTIME_JSON@",
   "vcpkgRuntime": "@PRISM_VCPKG_BIN_JSON@",
   "pythonRoot": "@PRISM_PYTHON_ROOT_JSON@",
+  "oidnRuntime": "@PRISM_OIDN_RUNTIME_JSON@",
   "pluginPath": "../lib/usd/plugins/prism/resources",
   "usdviewPluginPath": "../lib/usd/plugins/prism/usdview_plugins"
 }

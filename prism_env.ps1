@@ -22,7 +22,8 @@ if (Test-Path -LiteralPath $runtimeConfig) {
         @{ Name = "PRISM_EMBREE_RUNTIME_DIR"; Value = $runtime.embreeRuntime },
         @{ Name = "PRISM_EMBREE_BUILD_RUNTIME"; Value = $runtime.embreeBuildRuntime },
         @{ Name = "PRISM_VCPKG_BIN"; Value = $runtime.vcpkgRuntime },
-        @{ Name = "PRISM_PYTHON_ROOT"; Value = $runtime.pythonRoot }
+        @{ Name = "PRISM_PYTHON_ROOT"; Value = $runtime.pythonRoot },
+        @{ Name = "PRISM_OIDN_RUNTIME"; Value = $runtime.oidnRuntime }
     )) {
         if (-not [Environment]::GetEnvironmentVariable($setting.Name) -and $setting.Value) {
             [Environment]::SetEnvironmentVariable($setting.Name, $setting.Value, "Process")
@@ -50,7 +51,7 @@ $runtimeRoots = @(
     (Join-Path $projectRoot "build\RelWithDebInfo"),
     (Get-PrismSubPath $mtlxRoot "bin"), (Get-PrismSubPath $mtlxRoot "lib"),
     $env:PRISM_TBB_REDIST, $env:PRISM_EMBREE_BUILD_RUNTIME,
-    $env:PRISM_EMBREE_RUNTIME_DIR,
+    $env:PRISM_EMBREE_RUNTIME_DIR, $env:PRISM_OIDN_RUNTIME,
     (Get-PrismSubPath $mdlRoot "bin"), (Get-PrismSubPath $mdlRoot "nt-x86-64\lib")
 ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) }
 $env:PATH = (($runtimeRoots + @($env:PATH)) -join ";")
@@ -66,7 +67,7 @@ if (-not $env:PXR_USD_WINDOWS_DLL_PATH) {
         (Get-PrismSubPath $pythonRoot "DLLs"), $env:PRISM_TBB_REDIST,
         $env:PRISM_VCPKG_BIN, (Get-PrismSubPath $mtlxRoot "bin"),
         (Get-PrismSubPath $mtlxRoot "lib"), $env:PRISM_EMBREE_BUILD_RUNTIME,
-        $env:PRISM_EMBREE_RUNTIME_DIR, (Get-PrismSubPath $mdlRoot "bin"),
+        $env:PRISM_EMBREE_RUNTIME_DIR, $env:PRISM_OIDN_RUNTIME, (Get-PrismSubPath $mdlRoot "bin"),
         (Get-PrismSubPath $mdlRoot "nt-x86-64\lib"))
     $env:PXR_USD_WINDOWS_DLL_PATH = ($usdDllRoots | Where-Object {
         $_ -and (Test-Path -LiteralPath $_)

@@ -30,6 +30,10 @@
   -UsdOnly rebuilds OpenUSD alone against the existing OpenSubdiv and
   MaterialX prefixes (for an OpenUSD-only change such as adding OpenColorIO).
 
+  -Oidn also builds the optional denoiser, Intel Open Image Denoise (CPU
+  device, against the same oneTBB), into <Root>\oidn-<version> with
+  tools/ci/build_oidn.ps1; -OidnOnly builds only that.
+
   Afterwards point cmake/PrismLocalDependencies.cmake and prism_local_env.ps1
   at the printed prefixes (see the .example files).
 
@@ -37,6 +41,7 @@
   ./tools/build_deps_local.ps1 -TbbRoot C:\deps\oneapi-tbb-2022.2.0 -WorkDir D:\prism-deps\src -VcpkgRoot D:\prism-deps\vcpkg
   ./tools/build_deps_local.ps1 -DownloadTbb -WorkDir D:\prism-deps\src
   ./tools/build_deps_local.ps1 -UsdOnly -TbbRoot C:\deps\oneapi-tbb-2022.2.0 -WorkDir D:\prism-deps\src-usd
+  ./tools/build_deps_local.ps1 -OidnOnly -TbbRoot C:\deps\oneapi-tbb-2022.2.0 -WorkDir D:\prism-deps\src
 #>
 param(
     # oneTBB binary release root (with lib\cmake\tbb). See -DownloadTbb.
@@ -57,7 +62,10 @@ param(
     # An existing vcpkg x64-windows prefix with OpenColorIO from that baseline.
     [string] $OcioRoot = "",
     # Rebuild OpenUSD only; OpenSubdiv and MaterialX prefixes must exist.
-    [switch] $UsdOnly
+    [switch] $UsdOnly,
+    # Also build Open Image Denoise (the denoiser); -OidnOnly: only that.
+    [switch] $Oidn,
+    [switch] $OidnOnly
 )
 $ErrorActionPreference = "Stop"
 Import-Module (Join-Path $PSScriptRoot "deps.psm1") -Force
@@ -77,6 +85,17 @@ $v = Get-Content -LiteralPath $tbbVersionHeader | Select-String "#define TBB_VER
     ForEach-Object { $_.Matches[0].Groups[2].Value }
 if (($v -join ".") -ne $deps.onetbb.version) {
     throw "oneTBB $($deps.onetbb.version) expected (tools/deps.json), $TbbRoot is $($v -join '.')"
+}
+
+$oidnPrefix = Join-Path $Root "oidn-$($deps.oidn.version)"
+function Build-Oidn {
+    & (Join-Path $PSScriptRoot "ciuild_oidn.ps1") -TbbRoot $TbbRoot -WorkDir $WorkDir -Prefix $oidnPrefix `
+        -Jobs $Jobs
+    Write-Host "  Open Image Denoise: $oidnPrefix (PRISM_OIDN_ROOT / OpenImageDenoise_DIR, PRISM_OIDN_RUNTIME)"
+}
+if ($OidnOnly) {
+    Build-Oidn
+    return
 }
 
 if (-not $PythonRoot) {
@@ -118,3 +137,4 @@ $prefixes.GetEnumerator() | Sort-Object Name | ForEach-Object { Write-Host "  $(
 Write-Host "  oneTBB: $TbbRoot"
 Write-Host "  OpenColorIO (build only): $OcioRoot"
 Write-Host "  Python: $PythonRoot"
+if ($Oidn) { Build-Oidn }

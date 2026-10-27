@@ -25,8 +25,9 @@ if [ -f "$_prism_config" ]; then
     : "${PRISM_MATERIALX_MDL:=$(_prism_json materialXMdl)}"
     : "${PRISM_MDL_SDK_ROOT:=$(_prism_json mdlSdkRoot)}"
     : "${PRISM_PYTHON_ROOT:=$(_prism_json pythonRoot)}"
+    : "${PRISM_OIDN_RUNTIME:=$(_prism_json oidnRuntime)}"
     export PRISM_USD_ROOT PRISM_MATERIALX_ROOT PRISM_MATERIALX_LIBRARY_PATH PRISM_MATERIALX_MDL
-    export PRISM_MDL_SDK_ROOT PRISM_PYTHON_ROOT
+    export PRISM_MDL_SDK_ROOT PRISM_PYTHON_ROOT PRISM_OIDN_RUNTIME
 fi
 
 # Command Line Tools work without an accepted Xcode license.
@@ -51,6 +52,7 @@ _prism_prepend "$_prism_libvar" \
     "${PRISM_USD_ROOT:+$PRISM_USD_ROOT/lib}" \
     "${PRISM_MATERIALX_ROOT:+$PRISM_MATERIALX_ROOT/lib}" \
     "${PRISM_MDL_SDK_ROOT:+$PRISM_MDL_SDK_ROOT/lib}" \
+    "${PRISM_OIDN_RUNTIME:-}" \
     "$_prism_root/build-mac/hydra/plugin"
 _prism_prepend PATH \
     "${PRISM_USD_ROOT:+$PRISM_USD_ROOT/bin}" \
