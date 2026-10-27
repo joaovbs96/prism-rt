@@ -1112,6 +1112,11 @@ if(TARGET prism_hydra_render AND TARGET prism_compare_images)
     prism_add_parity_fixture(NAME triplanar_colorspace SCENE tests/hydra/fixtures/triplanar_colorspace.usda)
     set_tests_properties(prism_parity_triplanar_colorspace_cli prism_parity_triplanar_colorspace_hydra
         PROPERTIES FAIL_REGULAR_EXPRESSION "magenta error material;MDL generation failed")
+    # Networks whose MaterialX documents do not match MaterialX's definitions
+    # (DocumentLoader's declaration repairs) compile in both loaders.
+    prism_add_parity_fixture(NAME declaration_repairs SCENE tests/hydra/fixtures/declaration_repairs.usda)
+    set_tests_properties(prism_parity_declaration_repairs_cli prism_parity_declaration_repairs_hydra
+        PROPERTIES FAIL_REGULAR_EXPRESSION "magenta error material;MDL generation failed")
     # UsdLuxRectLight's texture orientation, on a camera-visible light.
     prism_add_parity_fixture(NAME rect_light_texture SCENE tests/hydra/fixtures/rect_light_texture.usda
         ARGS --working-space lin_rec709)

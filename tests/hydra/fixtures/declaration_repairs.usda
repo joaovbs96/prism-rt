@@ -1,0 +1,177 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    upAxis = "Y"
+    metersPerUnit = 1
+)
+
+# Shading networks whose MaterialX documents do not match MaterialX's
+# definitions as hdMtlx writes them (from the Typhoon suite), which rendered
+# as the magenta error material ("Could not find a nodedef"); DocumentLoader
+# repairs them (docs/materialx_compatibility.md, "Input types"):
+# - UsdPreviewSurface's opacityMode authored as a token (MaterialX declares an
+#   integer with enum names);
+# - standard_surface's emission_color fed by a vector3 (standard_surface has
+#   two versions, so its definition is the default one's);
+# - open_pbr_surface's geometry_normal authored as `normal`;
+# - UsdPrimvarReader_matrix, which MaterialX cannot read (its fallback).
+def Xform "World"
+{
+    def Camera "Camera"
+    {
+        float focalLength = 35
+        float horizontalAperture = 36
+        float verticalAperture = 36
+        double3 xformOp:translate = (0, 0, 6)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+
+    def DomeLight "Dome"
+    {
+        float inputs:intensity = 1
+    }
+
+    def Cube "Presence" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        double size = 1
+        double3 xformOp:translate = (-1, 1, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        rel material:binding = </World/Looks/Presence>
+    }
+
+    def Cube "Emission" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        double size = 1
+        double3 xformOp:translate = (1, 1, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        rel material:binding = </World/Looks/Emission>
+    }
+
+    def Cube "Bumped" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        double size = 1
+        double3 xformOp:translate = (-1, -1, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        rel material:binding = </World/Looks/Bumped>
+    }
+
+    def Cube "Matrix" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        double size = 1
+        double3 xformOp:translate = (1, -1, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        rel material:binding = </World/Looks/Matrix>
+    }
+
+    def Scope "Looks"
+    {
+        def Material "Presence"
+        {
+            token outputs:surface.connect = </World/Looks/Presence/Preview.outputs:surface>
+
+            def Shader "Preview"
+            {
+                uniform token info:id = "UsdPreviewSurface"
+                color3f inputs:diffuseColor = (0.8, 0.3, 0.2)
+                float inputs:opacity = 0.5
+                token inputs:opacityMode = "presence"
+                token outputs:surface
+            }
+        }
+
+        def Material "Emission"
+        {
+            token outputs:mtlx:surface.connect = </World/Looks/Emission/Surface.outputs:out>
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_standard_surface_surfaceshader"
+                float inputs:base = 0
+                float inputs:emission = 1
+                color3f inputs:emission_color.connect = </World/Looks/Emission/Graph.outputs:out>
+                token outputs:out
+            }
+
+            def NodeGraph "Graph"
+            {
+                vector3f outputs:out.connect = </World/Looks/Emission/Graph/Normal.outputs:out>
+
+                def Shader "Normal"
+                {
+                    uniform token info:id = "ND_normal_vector3"
+                    vector3f outputs:out
+                }
+            }
+        }
+
+        def Material "Bumped"
+        {
+            token outputs:mtlx:surface.connect = </World/Looks/Bumped/Surface.outputs:out>
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_open_pbr_surface_surfaceshader"
+                color3f inputs:base_color = (0.5, 0.6, 0.7)
+                vector3f inputs:normal.connect = </World/Looks/Bumped/Bump.outputs:out>
+                token outputs:out
+            }
+
+            def Shader "Bump"
+            {
+                uniform token info:id = "ND_bump_vector3"
+                float inputs:height = 0.5
+                float inputs:scale = 0.2
+                vector3f outputs:out
+            }
+        }
+
+        def Material "Matrix"
+        {
+            token outputs:surface.connect = </World/Looks/Matrix/Preview.outputs:surface>
+
+            def Shader "ReadMatrix"
+            {
+                uniform token info:id = "UsdPrimvarReader_matrix"
+                string inputs:varname = "tintMatrix"
+                matrix4d outputs:result
+            }
+
+            def Shader "Tint"
+            {
+                uniform token info:id = "ND_constant_vector3"
+                vector3f inputs:value = (0.8, 0.45, 0.25)
+                vector3f outputs:out
+            }
+
+            def Shader "Apply"
+            {
+                uniform token info:id = "ND_transformmatrix_vector3M4"
+                vector3f inputs:in.connect = </World/Looks/Matrix/Tint.outputs:out>
+                matrix4d inputs:mat.connect = </World/Looks/Matrix/ReadMatrix.outputs:result>
+                vector3f outputs:out
+            }
+
+            def Shader "ToColor"
+            {
+                uniform token info:id = "ND_convert_vector3_color3"
+                vector3f inputs:in.connect = </World/Looks/Matrix/Apply.outputs:out>
+                color3f outputs:out
+            }
+
+            def Shader "Preview"
+            {
+                uniform token info:id = "UsdPreviewSurface"
+                color3f inputs:diffuseColor.connect = </World/Looks/Matrix/ToColor.outputs:out>
+                token outputs:surface
+            }
+        }
+    }
+}
