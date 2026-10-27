@@ -1054,6 +1054,60 @@ if(TARGET prism_hydra_render AND TARGET prism_compare_images)
                 FIXTURES_REQUIRED prism_parity_double_sided)
         endforeach()
     endif()
+    # UsdLuxDomeLight's lat-long orientation (the OpenEXR convention), seen
+    # from two cameras by both loaders and by the CLI's --env, which replaces
+    # the dome with the same image.
+    foreach(_camera NegZ PosZ)
+        prism_add_parity_fixture(NAME dome_orientation_${_camera} SCENE tests/hydra/fixtures/dome_orientation.usda
+            CAMERA /World/Camera${_camera} SPP 32 ARGS --working-space lin_rec709
+            CLI_ARGS --max-sample-radiance 0 HYDRA_ARGS --sample-clamp 0)
+        add_test(NAME prism_dome_orientation_env_${_camera}
+            COMMAND PrismRT --scene "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/dome_orientation.usda"
+                --camera /World/Camera${_camera} --width 64 --height 64 --spp 32 --device cpu ${_prism_fixed_sampling}
+                --working-space lin_rec709 --max-sample-radiance 0 --env "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/dome_orientation.hdr"
+                --output "${prism_parity_dome_orientation_${_camera}_dir}/env/image.exr")
+        set_tests_properties(prism_dome_orientation_env_${_camera} PROPERTIES
+            ENVIRONMENT "${_prism_test_environment};PRISM_DEVICE=cpu" FIXTURES_SETUP prism_dome_orientation_env)
+    endforeach()
+    if(TARGET prism_scene_features_test)
+        foreach(_frontend cli hydra env)
+            set(_fixtures prism_parity_dome_orientation_NegZ prism_parity_dome_orientation_PosZ)
+            if(_frontend STREQUAL "env")
+                set(_fixtures prism_dome_orientation_env)
+            endif()
+            add_test(NAME prism_scene_features_dome_orientation_${_frontend}
+                COMMAND prism_scene_features_test dome_orientation
+                    "${prism_parity_dome_orientation_NegZ_dir}/${_frontend}/image.exr"
+                    "${prism_parity_dome_orientation_PosZ_dir}/${_frontend}/image.exr")
+            set_tests_properties(prism_scene_features_dome_orientation_${_frontend} PROPERTIES
+                FIXTURES_REQUIRED "${_fixtures}")
+        endforeach()
+        # The dome's importance sampling agrees with its lookups: next-event
+        # estimation of the sun and BSDF sampling alone light the ball alike.
+        foreach(_sampling mis bsdf)
+            add_test(NAME prism_scene_features_dome_orientation_${_sampling}_render
+                COMMAND PrismRT --scene "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/dome_orientation.usda"
+                    --camera /World/CameraNegZ --width 32 --height 32 --spp 16384 ${_prism_fixed_sampling} --device cpu
+                    --max-sample-radiance 0 --environment-sampling ${_sampling}
+                    --output "${CMAKE_BINARY_DIR}/scene_features/dome_orientation_${_sampling}.exr")
+            set_tests_properties(prism_scene_features_dome_orientation_${_sampling}_render PROPERTIES
+                ENVIRONMENT "${_prism_test_environment};PRISM_DEVICE=cpu"
+                FIXTURES_SETUP prism_scene_features_dome_orientation_sampling)
+        endforeach()
+        add_test(NAME prism_scene_features_dome_orientation_sampling
+            COMMAND prism_scene_features_test dome_orientation_consistency
+                "${CMAKE_BINARY_DIR}/scene_features/dome_orientation_mis.exr"
+                "${CMAKE_BINARY_DIR}/scene_features/dome_orientation_bsdf.exr")
+        set_tests_properties(prism_scene_features_dome_orientation_sampling PROPERTIES
+            FIXTURES_REQUIRED prism_scene_features_dome_orientation_sampling)
+    endif()
+    if(PRISM_ENABLE_VULKAN)
+        # The GPU device's lookups and sampling (gpu_backend.hlsl) against the
+        # CPU's.
+        prism_add_parity_fixture(NAME dome_orientation_vulkan SCENE tests/hydra/fixtures/dome_orientation.usda
+            CAMERA /World/CameraNegZ SPP 32 ARGS --working-space lin_rec709
+            CLI_ARGS --max-sample-radiance 0 HYDRA_ARGS --sample-clamp 0 CLI_DEVICE vulkan)
+    endif()
     # prism:sssFallback (and --sss-fallback) from the render settings, on both
     # loaders; the check shows the setting took effect.
     prism_add_parity_fixture(NAME sss_fallback SCENE tests/hydra/fixtures/sss_fallback.usda

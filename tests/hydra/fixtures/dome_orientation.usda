@@ -1,0 +1,47 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    upAxis = "Y"
+)
+
+# UsdLuxDomeLight's lat-long orientation (the OpenEXR convention: longitude 0
+# is +Z, +pi/2 is +X, the image's left edge is longitude +pi, its top row +Y).
+# dome_orientation.hdr (64x32) has a longitude band per axis direction:
+# -Z red, +X green, +Z blue, -X yellow, with a cyan cap above 45 degrees, a
+# gray one below -45 degrees and a bright white "sun" toward +X, 22.5 to 45
+# degrees up. Two 120-degree cameras at the origin look down -Z (with a white
+# sphere below the horizon, lit by the sun from its +X side) and +Z;
+# prism_scene_features_test dome_orientation checks the colours each sees.
+def Xform "World"
+{
+    def Sphere "Ball"
+    {
+        double radius = 0.6
+        color3f[] primvars:displayColor = [(0.8, 0.8, 0.8)]
+        double3 xformOp:translate = (0, -1.2, -2)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+
+    def DomeLight "Dome"
+    {
+        asset inputs:texture:file = @./dome_orientation.hdr@
+        token inputs:texture:format = "latlong"
+        float inputs:intensity = 1
+    }
+
+    def Camera "CameraNegZ"
+    {
+        float focalLength = 10
+        float horizontalAperture = 34.641
+        float verticalAperture = 34.641
+    }
+
+    def Camera "CameraPosZ"
+    {
+        float focalLength = 10
+        float horizontalAperture = 34.641
+        float verticalAperture = 34.641
+        float xformOp:rotateY = 180
+        uniform token[] xformOpOrder = ["xformOp:rotateY"]
+    }
+}

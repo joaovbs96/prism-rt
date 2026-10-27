@@ -39,6 +39,12 @@
 //   light_aovs_albedo  light_aovs_albedo.usda: the albedo through the glass
 //                      and the mirror sphere is the walls' colour, that of
 //                      the diffuse sphere its own.
+//   dome_orientation   NEGZ POSZ: dome_orientation.usda from its two
+//                      cameras: the dome follows UsdLux's lat-long
+//                      convention, and its sun lights the ball's +X side.
+//   dome_orientation_consistency  MIS BSDF: CameraNegZ's render with the
+//                      dome importance sampled and with BSDF sampling only
+//                      agrees on the ball.
 //   exr_parts          LAYERS PARTS: the multi-part EXR PARTS holds a named
 //                      part per layer of the single-part LAYERS, with the
 //                      same channels and pixels.
@@ -385,6 +391,85 @@ void GlassFurnace(Image const& image)
     Check(worst <= 0.02, Describe("the largest pixel difference from the dome", float(worst)));
 }
 
+// dome_orientation.usda: the colour the 120-degree camera sees in the
+// camera-space direction (x, y, z) (z < 0 ahead), as the mean of a 3x3 box.
+void DomeColor(Image const& image, float x, float y, float z, float rgb[3])
+{
+    const float tanHalf = std::tan(60.0f * 3.14159265f / 180.0f);
+    const int px = int(std::lround((x / -z / tanHalf + 1.0f) * 0.5f * image.width - 0.5f));
+    const int py = int(std::lround((1.0f - y / -z / tanHalf) * 0.5f * image.height - 0.5f));
+    for (int c = 0; c < 3; ++c) rgb[c] = image.Mean(px, py, c, 1);
+}
+
+// The dome band `name` with colour `expected` is seen in direction (x, y, z).
+void DomeBand(Image const& image, char const* camera, char const* name, float x, float y, float z,
+              float const (&expected)[3])
+{
+    float rgb[3];
+    DomeColor(image, x, y, z, rgb);
+    bool ok = true;
+    for (int c = 0; c < 3; ++c) ok = ok && std::abs(rgb[c] - expected[c]) <= 0.1f;
+    char text[256];
+    std::snprintf(text, sizeof(text), "%s sees %s toward (%.2f, %.2f, %.2f): (%.3f, %.3f, %.3f)", camera, name,
+                  x, y, z, rgb[0], rgb[1], rgb[2]);
+    Check(ok, text);
+}
+
+// dome_orientation.usda, the renders of /World/CameraNegZ and
+// /World/CameraPosZ: UsdLux's lat-long convention (-Z red, +X green, +Z
+// blue, -X yellow, cyan above 45 degrees), and the sun toward +X lights the
+// ball's +X side.
+void DomeOrientation(std::vector<Image> const& images)
+{
+    static const float red[3] = {0.5f, 0, 0}, green[3] = {0, 0.5f, 0}, blue[3] = {0, 0, 0.5f},
+                       yellow[3] = {0.5f, 0.5f, 0}, cyan[3] = {0, 0.5f, 0.5f};
+    const float s = std::sin(0.96f), c = std::cos(0.96f); // 55 degrees off the view axis
+    Image const& negZ = images[0];
+    // CameraNegZ: camera space is world space.
+    DomeBand(negZ, "CameraNegZ", "-Z (red)", 0, 0.15f, -1, red);
+    DomeBand(negZ, "CameraNegZ", "+X (green) on its right", s, 0.15f, -c, green);
+    DomeBand(negZ, "CameraNegZ", "-X (yellow) on its left", -s, 0.15f, -c, yellow);
+    DomeBand(negZ, "CameraNegZ", "+Y (cyan) above", 0, 1.43f, -1, cyan);
+    // CameraPosZ looks down +Z: its right is world -X.
+    Image const& posZ = images[1];
+    DomeBand(posZ, "CameraPosZ", "+Z (blue)", 0, 0.15f, -1, blue);
+    DomeBand(posZ, "CameraPosZ", "-X (yellow) on its right", s, 0.15f, -c, yellow);
+    DomeBand(posZ, "CameraPosZ", "+X (green) on its left", -s, 0.15f, -c, green);
+    DomeBand(posZ, "CameraPosZ", "+Y (cyan) above", 0, 1.43f, -1, cyan);
+    // The ball (centre (0, -1.2, -2), radius 0.6) seen from the origin: the
+    // points with normals (+-0.75, 0, 0.66).
+    float lit[3], unlit[3];
+    DomeColor(negZ, 0.45f, -1.2f, -2 + 0.396f, lit);
+    DomeColor(negZ, -0.45f, -1.2f, -2 + 0.396f, unlit);
+    const float a = (lit[0] + lit[1] + lit[2]) / 3, b = (unlit[0] + unlit[1] + unlit[2]) / 3;
+    char text[256];
+    std::snprintf(text, sizeof(text), "the sun lights the ball's +X side: %.3f against %.3f on its -X side", a, b);
+    Check(a > 3.0f * b && a > 0.3f, text);
+}
+
+// dome_orientation.usda from CameraNegZ with the dome importance sampled
+// (MIS) and with BSDF sampling only: the ball, lit mostly by the small sun,
+// is as bright in both. A sampled direction that disagreed with the lookup's
+// texel would bias the first.
+void DomeOrientationConsistency(std::vector<Image> const& images)
+{
+    Image const& mis = images[0];
+    Image const& bsdf = images[1];
+    // The ball's box: centre (0, -1.2, -2) seen 31 degrees below the axis.
+    const int x0 = mis.width * 10 / 32, x1 = mis.width * 22 / 32;
+    const int y0 = mis.height * 16 / 32, y1 = mis.height * 28 / 32;
+    double a = 0.0, b = 0.0;
+    for (int y = y0; y < y1; ++y)
+        for (int x = x0; x < x1; ++x)
+            for (int c = 0; c < 3; ++c) {
+                a += mis.At(x, y, c);
+                b += bsdf.At(x, y, c);
+            }
+    char text[256];
+    std::snprintf(text, sizeof(text), "the ball: MIS %.4f, BSDF sampling %.4f", a, b);
+    Check(std::abs(a - b) <= 0.02 * std::max(a, b), text);
+}
+
 // The three channels <layer>.R/G/B (R, G, B for an empty layer); false if
 // one is missing.
 bool LayerChannels(Image const& image, std::string const& layer, int* indices, char const* const* suffixes = nullptr)
@@ -599,6 +684,8 @@ int main(int argc, char** argv)
         {"instance_primvars", single(InstancePrimvars)},
         {"sss_fallback", single(SssFallback)},
         {"glass_furnace", single(GlassFurnace)},
+        {"dome_orientation", {2, DomeOrientation}},
+        {"dome_orientation_consistency", {2, DomeOrientationConsistency}},
         {"textured_emitter", single(TexturedEmitter)},
         {"textured_emitter_consistency", {2, TexturedEmitterConsistency}},
         // Diagnostics: the pixels where two images differ most.
