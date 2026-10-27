@@ -736,16 +736,22 @@ float gpu_texel_solid_angle(uint y, uint width, uint height)
         sin(kPi / (2.0f * float(height)));
 }
 
+// LatLongS (environment.h): UsdLux's lat-long horizontal coordinate,
+// atan2(x, -z) / 2pi in [0, 1) (longitude 0 = +Z at the image's centre).
+float gpu_latlong_s(float3 d)
+{
+    float s = atan2(d.x, -d.z) / (2.0f * kPi);
+    return s < 0.0f ? s + 1.0f : s;
+}
+
 // EnvironmentMap::radiance in the map's local frame.
 float3 gpu_latlong_radiance(GpuEnvironment env, float3 direction, float angle)
 {
     float3 d = normalize(direction);
-    float lon = atan2(d.z, d.x);
-    if (lon < 0.0f) lon += 2.0f * kPi;
     float lat = atan2(hypot(d.x, d.z), d.y);
     float3 result;
     if (env.info.y != kImageNone) {
-        float s = lon / (2.0f * kPi);
+        float s = gpu_latlong_s(d);
         float t = lat / kPi;
         float2 dx = float2(0.0f, 0.0f);
         float2 dy = float2(0.0f, 0.0f);
@@ -755,9 +761,7 @@ float3 gpu_latlong_radiance(GpuEnvironment env, float3 direction, float angle)
             float3 bitangent = cross(d, tangent);
             for (int k = 0; k < 2; ++k) {
                 float3 q = normalize(d + angle * (k == 0 ? tangent : bitangent));
-                float qlon = atan2(q.z, q.x);
-                if (qlon < 0.0f) qlon += 2.0f * kPi;
-                float ds = qlon / (2.0f * kPi) - s;
+                float ds = gpu_latlong_s(q) - s;
                 ds -= round(ds);
                 float dt = atan2(hypot(q.x, q.z), q.y) / kPi - t;
                 if (k == 0) dx = float2(ds, dt);
@@ -870,7 +874,8 @@ EnvironmentLightSample gpu_latlong_sample_local(GpuEnvironment env, float4 u)
                                                                            : gpu_env_alias(env.info3.x + column);
     uint px = index % width;
     uint py = index / width;
-    float phi = 2.0f * kPi * (float(px) + u.z) / float(width);
+    // LatLongDirection (environment.h).
+    float phi = 2.0f * kPi * ((float(px) + u.z) / float(width));
     float theta0 = kPi * float(py) / float(height);
     float theta1 = kPi * float(py + 1u) / float(height);
     float r = u.w;
@@ -883,7 +888,7 @@ EnvironmentLightSample gpu_latlong_sample_local(GpuEnvironment env, float4 u)
     float onePlusCos = lerp(2.0f * c0 * c0, 2.0f * c1 * c1, r);
     float cosTheta = 0.5f * (onePlusCos - oneMinusCos);
     float sinTheta = sqrt(max(0.0f, oneMinusCos * onePlusCos));
-    s.wi = float3(sinTheta * cos(phi), cosTheta, sinTheta * sin(phi));
+    s.wi = float3(sinTheta * sin(phi), cosTheta, -sinTheta * cos(phi));
     s.pdf = gpu_env_texel_pdf(env.info3.x + index) / gpu_texel_solid_angle(py, width, height);
     return s;
 }
@@ -894,9 +899,7 @@ float gpu_latlong_pdf_local(GpuEnvironment env, float3 direction)
     uint height = env.info2.x;
     if (width == 0u) return 1.0f / (4.0f * kPi);
     float3 d = normalize(direction);
-    float phi = atan2(d.z, d.x);
-    if (phi < 0.0f) phi += 2.0f * kPi;
-    uint x = min(uint(int(phi * float(width) / (2.0f * kPi))), width - 1u);
+    uint x = min(uint(int(gpu_latlong_s(d) * float(width))), width - 1u);
     uint y = min(uint(int(atan2(hypot(d.x, d.z), d.y) * float(height) / kPi)), height - 1u);
     return gpu_env_texel_pdf(env.info3.x + y * width + x) / gpu_texel_solid_angle(y, width, height);
 }

@@ -1,5 +1,6 @@
 #include "../src/environment.h"
 
+#include <algorithm>
 #include <cmath>
 #include <iostream>
 #include <stdexcept>
@@ -45,19 +46,61 @@ int main() {
         for (float p : brightMap.texelProbability)
             require(p > 0, "Filtered HDR sampling must retain full support");
         int observed=0; const int samples=250000;
+        Float3 brightDirection(0.0f);
         for (int i=0;i<samples;++i) {
             EnvironmentSample s=brightMap.sampleDirection(seed);
             require(std::fabs(s.pdf-brightMap.directionPdf(s.wi)) < 1e-5f,
                     "sample and queried PDFs differ");
-            float phi=std::atan2f(s.wi.z(),s.wi.x()); if(phi<0)phi+=2*PI;
-            int x=std::min(int(phi*8/(2*PI)),7);
+            int x=std::min(int(LatLongS(s.wi)*8),7);
             int y=std::min(int(std::acosf(std::clamp(s.wi.y(),-1.f,1.f))*4/PI),3);
-            if(y*8+x==bright) ++observed;
+            if(y*8+x==bright) { ++observed; brightDirection += s.wi; }
         }
         const double expected=brightMap.texelProbability[bright];
         const double sigma=std::sqrt(expected*(1-expected)/samples);
         require(std::fabs(double(observed)/samples-expected) < 5*sigma+1e-4,
                 "alias frequencies do not match target distribution");
+        // UsdLux's lat-long convention: column 3 of 8 (s 0.375 to 0.5) lies
+        // between longitudes pi/4 and 0, i.e. between +Z and +X, nearer +Z;
+        // row 2 of 4 is just below the horizon.
+        brightDirection = brightDirection.normalize();
+        require(brightDirection.z() > brightDirection.x() && brightDirection.x() > 0.1f &&
+                brightDirection.y() < 0.0f && brightDirection.y() > -0.6f,
+                "the bright texel is not sampled toward UsdLux's longitude for it");
+
+        // Lookups follow UsdLux (the OpenEXR lat-long convention): the image's
+        // centre column is +Z, its quarter +X, its three quarters -X and its
+        // edges -Z; the top row is +Y. Two columns of eight per direction, the
+        // top and bottom rows of four their own colours.
+        {
+            std::vector<unsigned char> bands(8*4*3, 0);
+            auto set = [&](int x, int y, unsigned char r, unsigned char g, unsigned char b) {
+                unsigned char* p = &bands[(size_t(y)*8+x)*3]; p[0]=r; p[1]=g; p[2]=b;
+            };
+            for (int y=0;y<4;++y)
+                for (int x=0;x<8;++x) {
+                    if (y==0) set(x,y,0,255,255);          // +Y: cyan
+                    else if (y==3) set(x,y,255,0,255);     // -Y: magenta
+                    else if (x==7 || x==0) set(x,y,255,0,0); // -Z: red
+                    else if (x<=2) set(x,y,0,255,0);       // +X: green
+                    else if (x<=4) set(x,y,0,0,255);       // +Z: blue
+                    else set(x,y,255,255,0);               // -X: yellow
+                }
+            auto bandTexture = image(bands, 8, 4);
+            EnvironmentMap bandMap(&bandTexture, Color3(1.0f));
+            struct Probe { Float3 direction; Color3 colour; const char* what; };
+            const Probe probes[] = {
+                {Float3(0,0,-1), Color3(1,0,0), "-Z must read the image's left and right edges"},
+                {Float3(1,0,0), Color3(0,1,0), "+X must read the image's first quarter"},
+                {Float3(0,0,1), Color3(0,0,1), "+Z must read the image's centre"},
+                {Float3(-1,0,0), Color3(1,1,0), "-X must read the image's third quarter"},
+                {Float3(0,1,0), Color3(0,1,1), "+Y must read the image's top row"},
+                {Float3(0,-1,0), Color3(1,0,1), "-Y must read the image's bottom row"},
+            };
+            for (auto const& probe : probes) {
+                const Color3 value = bandMap.radiance(probe.direction);
+                require((value - probe.colour).length() < 1e-3f, probe.what);
+            }
+        }
 
         // Non-uniform transforms exercise the solid-angle Jacobian. E[1/pdf]
         // remains the sphere area when sample and PDF transforms agree.

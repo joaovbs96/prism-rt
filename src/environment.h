@@ -119,6 +119,24 @@ class GradientBackground : public Environment {
 };
 
 
+// UsdLuxDomeLight's lat-long parameterization (the OpenEXR convention): the
+// image's left edge is longitude +pi, its centre longitude 0, and longitude 0
+// points into +Z, +pi/2 into +X; the top row is +Y. So the horizontal texture
+// coordinate s = (pi - longitude) / 2pi is atan2(x, -z) / 2pi, in [0, 1), and
+// t = polar angle from +Y / pi. gpu_backend.hlsl mirrors these.
+inline float LatLongS(const Float3& d)
+{
+    float s = std::atan2(d.x(), -d.z()) / (2.f * PI);
+    return s < 0.f ? s + 1.f : s;
+}
+
+// The direction of s (as above) and the polar angle's sine and cosine.
+inline Float3 LatLongDirection(float s, float sinTheta, float cosTheta)
+{
+    const float phi = 2.0f * PI * s;
+    return Float3(sinTheta * std::sin(phi), cosTheta, -sinTheta * std::cos(phi));
+}
+
 class EnvironmentMap : public Environment {
     public:
     EnvironmentMap(Texture<Color3>* texture, Color3 multiplier) : texture(texture), multiplier(multiplier) { buildDistribution(); }
@@ -132,14 +150,13 @@ class EnvironmentMap : public Environment {
     }
     Color3 radiance(const Float3& direction, const prism::DirectionFootprint& footprint) const override {
         Float3 d = direction.normalize();
-        float lon = std::atan2f(d.z(), d.x());
-        if (lon < 0.f) lon += 2.f * PI;
+        const float s = LatLongS(d);
         const float lat = std::atan2(std::hypot(d.x(), d.z()), d.y());
         Color3 result;
         if (auto* image = dynamic_cast<ImageTexture<Color3>*>(texture);
             image && image->width > 0 && image->height > 0) {
             prism::TextureLookup lookup{};
-            lookup.s = lon / (2.f * PI); lookup.t = lat / PI;
+            lookup.s = s; lookup.t = lat / PI;
             lookup.wrapS = prism::TextureWrap::Periodic;
             lookup.wrapT = prism::TextureWrap::Clamp;
             lookup.filtering = footprint.filtering;
@@ -149,9 +166,7 @@ class EnvironmentMap : public Environment {
                 Float3 bitangent = cross(d, tangent);
                 const auto derivatives = [&](const Float3& offset, float& ds, float& dt) {
                     const Float3 q = (d + angle * offset).normalize();
-                    float qlon = std::atan2(q.z(),q.x());
-                    if (qlon < 0) qlon += 2.f * PI;
-                    ds = qlon/(2.f*PI) - lookup.s;
+                    ds = LatLongS(q) - lookup.s;
                     ds -= std::round(ds);
                     dt = std::atan2(std::hypot(q.x(),q.z()),q.y())/PI - lookup.t;
                 };
@@ -166,7 +181,7 @@ class EnvironmentMap : public Environment {
             }
             result = multiplier * image->lookup(lookup);
         } else {
-            result = multiplier * texture->sampleInterp(lon / (2.f * PI),
+            result = multiplier * texture->sampleInterp(s,
                 std::min(lat / PI, std::nextafter(1.0f, 0.0f)), Float3(0.f));
         }
         for (int i = 0; i < 3; ++i)
@@ -211,7 +226,7 @@ class EnvironmentMap : public Environment {
         const size_t column = std::min(static_cast<size_t>(x), n - 1);
         const size_t index = (x - std::floor(x) < probability[column]) ? column : alias[column];
         const int px = static_cast<int>(index % width), py = static_cast<int>(index / width);
-        const float phi = 2.0f * PI * (static_cast<float>(px) + u[2]) / width;
+        const float s = (static_cast<float>(px) + u[2]) / width;
         constexpr double pi = 3.14159265358979323846;
         const double theta0 = pi * py / height;
         const double theta1 = pi * (py + 1) / height;
@@ -219,17 +234,16 @@ class EnvironmentMap : public Environment {
         // Keep polar angular detail even when the float y component rounds to
         // +/-1. atan2(xz,y) below can still recover the correct HDR texel row.
         const float sinTheta = float(std::sqrt(std::max(0.0, 1.0 - cosTheta * cosTheta)));
-        EnvironmentSample s;
-        s.wi = Float3(sinTheta * std::cos(phi), float(cosTheta), sinTheta * std::sin(phi));
-        s.pdf = texelProbability[index] / texelSolidAngle(py);
-        return s;
+        EnvironmentSample sample;
+        sample.wi = LatLongDirection(s, sinTheta, float(cosTheta));
+        sample.pdf = texelProbability[index] / texelSolidAngle(py);
+        return sample;
     }
 
     float directionPdf(const Float3& direction) const override {
         if (texelProbability.empty()) return Environment::directionPdf(direction);
         Float3 d = direction.normalize();
-        float phi = std::atan2f(d.z(), d.x()); if (phi < 0) phi += 2.f * PI;
-        int x = std::min(static_cast<int>(phi * width / (2.f * PI)), width - 1);
+        int x = std::min(static_cast<int>(LatLongS(d) * width), width - 1);
         int y = std::min(static_cast<int>(std::atan2(std::hypot(d.x(), d.z()), d.y()) * height / PI), height - 1);
         return texelProbability[static_cast<size_t>(y) * width + x] / texelSolidAngle(y);
     }
