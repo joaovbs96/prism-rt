@@ -457,7 +457,7 @@ noise but no bias.
 | animated_time | 0.010 (mean 0.01%) | 3% (mean 0.2%): smoothed vs per-triangle tangent frames |
 | light_aovs (colour, albedo, diffuse, specular, emission), light_aovs_albedo | below 2e-7; Position exact | 1% |
 | light_aovs_vulkan, light_aovs_albedo_vulkan (CLI on Vulkan, delegate on the CPU) | below 2e-3 per layer | 1% |
-| denoise (colour, denoised, albedo; one part and a part per var) | see `local/reports/denoise_part1.md` | 5% (mean 1%) |
+| denoise (colour, denoised, albedo; one part and a part per var) | colour 2.1e-3, denoised 3.3e-4, albedo 0 | 5% (mean 1%) |
 
 Since phase 7 the CLI loads every fixture like the delegate (feature
 roadmap, "Standalone CLI"). The remaining differences are noise, never bias:

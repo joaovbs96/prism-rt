@@ -61,7 +61,10 @@ without light AOVs) nothing runs and the images are bit-identical to before.
 `prism:denoisePrefilter` (default true) denoises the albedo and normal first
 and then passes them as clean (`cleanAux`), OIDN's recommendation for final
 frames with noisy guides (depth of field, rough glass); false passes them as
-they are with `cleanAux` off (cheaper, for interactive use).
+they are with `cleanAux` off. Prefiltering costs about six times the plain
+denoise on the CPU (1080p, high: 3.1 s against 0.5 s) for about 10% less
+error on the test room; at high resolutions in usdview, turn it off (or use
+`fast`) for quicker interval denoises.
 
 ## Settings and outputs
 
@@ -108,9 +111,10 @@ Statistics: `denoises` (published), `denoiseMilliseconds` (the last one),
 
 ## Cost
 
-OIDN's CPU device, i7-14700K (28 threads), 1920x1080 with albedo and normal:
-see the timings in `local/reports/denoise_part1.md`; high quality takes a few
-hundred milliseconds per frame and prefiltering about triples it. It shares
+OIDN's CPU device, i7-14700K (28 threads), 1920x1080 with albedo and normal,
+high quality: about 0.4 s steady state (OIDN's benchmark on these DLLs: 398 ms;
+Intel's prebuilt, compiled with Intel's clang: 376 ms) and 0.5 s for the CLI's
+one denoise (with set-up); prefiltered guides 3.1 s. It shares
 the process's oneTBB threads with a CPU render. Memory: the delegate keeps 10
 floats and a count per pixel while denoising (about 44 bytes, 90 MB at 1080p
 with the input copy).
