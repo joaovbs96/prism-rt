@@ -919,6 +919,15 @@ called done there.
     (`Denoised ... with OIDN 2.5.1 CPU` in the CLI's output), its `denoised`
     layer within part 1's tolerance of `--device cpu`'s; chess, egg_gold
     and Teapot bit-identical to the previous build.
+- **`--env` follows UsdLux** ([hydra.md](hydra.md)): `EnvironmentMap` (`src/environment.h`,
+  shared host code) has no default multiplier; the CLI's `--env` passes 1
+  instead of the old factor of two, and the GPU scene mirrors the map's
+  multiplier as before. No shader or device change.
+  - Runs: `ctest -R prism_parity_env_dome` (CPU); then
+    `tests/hydra/fixtures/env_dome.usda` with `--device metal --env
+    tests/gltf/studio_env.hdr --adaptive-threshold 0 --max-sample-radiance 0`
+    against the same without `--env` (the scene's dome) on `--device cpu`:
+    means within 1%, not 2x.
 
 ## Diagnostics
 
