@@ -1101,6 +1101,34 @@ if(TARGET prism_hydra_render AND TARGET prism_compare_images)
         set_tests_properties(prism_scene_features_dome_orientation_sampling PROPERTIES
             FIXTURES_REQUIRED prism_scene_features_dome_orientation_sampling)
     endif()
+    # UsdLuxRectLight's texture orientation, on a camera-visible light.
+    prism_add_parity_fixture(NAME rect_light_texture SCENE tests/hydra/fixtures/rect_light_texture.usda
+        ARGS --working-space lin_rec709)
+    if(TARGET prism_scene_features_test)
+        foreach(_frontend cli hydra)
+            add_test(NAME prism_scene_features_rect_light_texture_${_frontend}
+                COMMAND prism_scene_features_test rect_light_texture
+                    "${prism_parity_rect_light_texture_dir}/${_frontend}/image.exr")
+            set_tests_properties(prism_scene_features_rect_light_texture_${_frontend} PROPERTIES
+                FIXTURES_REQUIRED prism_parity_rect_light_texture)
+        endforeach()
+    endif()
+    if(PRISM_ENABLE_VULKAN AND TARGET prism_scene_features_test)
+        # The GPU device shares rectTexcoord (shaders/integrator/lights.h). Not
+        # a parity test: the CPU filters rect light textures differently
+        # (ImageTexture::sampleInterp), which shows at the quadrants' edges.
+        add_test(NAME prism_scene_features_rect_light_texture_render_vulkan
+            COMMAND PrismRT --scene "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/rect_light_texture.usda"
+                --camera /World/Camera --width 64 --height 64 --spp 16 --device vulkan ${_prism_fixed_sampling}
+                --working-space lin_rec709 --output "${prism_parity_rect_light_texture_dir}/vulkan/image.exr")
+        set_tests_properties(prism_scene_features_rect_light_texture_render_vulkan PROPERTIES
+            ENVIRONMENT "${_prism_test_environment};PRISM_DEVICE=vulkan" FIXTURES_SETUP prism_rect_light_texture_vulkan)
+        add_test(NAME prism_scene_features_rect_light_texture_vulkan
+            COMMAND prism_scene_features_test rect_light_texture
+                "${prism_parity_rect_light_texture_dir}/vulkan/image.exr")
+        set_tests_properties(prism_scene_features_rect_light_texture_vulkan PROPERTIES
+            FIXTURES_REQUIRED prism_rect_light_texture_vulkan)
+    endif()
     if(PRISM_ENABLE_VULKAN)
         # The GPU device's lookups and sampling (gpu_backend.hlsl) against the
         # CPU's.

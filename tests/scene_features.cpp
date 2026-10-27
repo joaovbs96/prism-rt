@@ -45,6 +45,8 @@
 //   dome_orientation_consistency  MIS BSDF: CameraNegZ's render with the
 //                      dome importance sampled and with BSDF sampling only
 //                      agrees on the ball.
+//   rect_light_texture rect_light_texture.usda: a camera-visible textured
+//                      rect light shows its image upright and unmirrored.
 //   exr_parts          LAYERS PARTS: the multi-part EXR PARTS holds a named
 //                      part per layer of the single-part LAYERS, with the
 //                      same channels and pixels.
@@ -470,6 +472,28 @@ void DomeOrientationConsistency(std::vector<Image> const& images)
     Check(std::abs(a - b) <= 0.02 * std::max(a, b), text);
 }
 
+// rect_light_texture.usda, 64x64, linear Rec.709: the camera-visible rect
+// light shows its texture upright and unmirrored, each quadrant's colour at
+// its centre (the quadrant centres are 10.7 pixels from the image centre).
+void RectLightTexture(Image const& image)
+{
+    struct Quadrant { const char* name; int x, y; float r, g, b; };
+    const int lo = image.width * 21 / 64, hi = image.width * 42 / 64;
+    const Quadrant quadrants[] = {
+        {"top left (red)", lo, lo, 1, 0, 0},
+        {"top right (green)", hi, lo, 0, 1, 0},
+        {"bottom left (blue)", lo, hi, 0, 0, 1},
+        {"bottom right (white)", hi, hi, 1, 1, 1},
+    };
+    for (auto const& q : quadrants) {
+        const float r = image.Mean(q.x, q.y, 0), g = image.Mean(q.x, q.y, 1), b = image.Mean(q.x, q.y, 2);
+        char text[256];
+        std::snprintf(text, sizeof(text), "the texture's %s quadrant is seen there: (%.3f, %.3f, %.3f)", q.name, r,
+                      g, b);
+        Check(std::abs(r - q.r) < 0.05f && std::abs(g - q.g) < 0.05f && std::abs(b - q.b) < 0.05f, text);
+    }
+}
+
 // The three channels <layer>.R/G/B (R, G, B for an empty layer); false if
 // one is missing.
 bool LayerChannels(Image const& image, std::string const& layer, int* indices, char const* const* suffixes = nullptr)
@@ -686,6 +710,7 @@ int main(int argc, char** argv)
         {"glass_furnace", single(GlassFurnace)},
         {"dome_orientation", {2, DomeOrientation}},
         {"dome_orientation_consistency", {2, DomeOrientationConsistency}},
+        {"rect_light_texture", single(RectLightTexture)},
         {"textured_emitter", single(TexturedEmitter)},
         {"textured_emitter_consistency", {2, TexturedEmitterConsistency}},
         // Diagnostics: the pixels where two images differ most.
