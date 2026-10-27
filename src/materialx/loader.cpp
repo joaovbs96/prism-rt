@@ -1424,6 +1424,47 @@ void NormalizeColorSpaces(const MaterialX::DocumentPtr& doc)
     }
 }
 
+// MaterialX 1.39.5's shader generator converts the colour output of a node
+// whose filename inputs carry a colour space (the node is converted as a
+// whole, not image by image), and it does so once per such input
+// (ShaderGraph::applyInputTransforms). A node with several, such as
+// triplanarprojection (filex, filey, filez), gets several transform nodes
+// with one name; adding the second frees the first while the output still
+// lists its input, and ShaderGraph::finalize crashes (use after free in
+// ShaderInput::breakConnection). Upstream MaterialX keeps the first request
+// for an output since then. Do the same: the first filename input keeps its
+// colour space, the others are tagged "none", which the generator skips.
+void KeepOneOutputColorTransform(const MaterialX::DocumentPtr& doc)
+{
+    std::vector<MaterialX::NodePtr> nodes;
+    for (auto element : doc->traverseTree())
+        if (auto node = element->asA<MaterialX::Node>()) nodes.push_back(node);
+    for (auto const& node : nodes) {
+        const std::string& type = node->getType();
+        if (type != "color3" && type != "color4" && type != MaterialX::MULTI_OUTPUT_TYPE_STRING) continue;
+        std::vector<MaterialX::InputPtr> tagged;
+        for (auto const& input : node->getInputs()) {
+            if (input->getType() != MaterialX::FILENAME_TYPE_STRING) continue;
+            if (!input->hasValueString() && !input->hasInterfaceName()) continue;
+            const std::string space = input->getActiveColorSpace();
+            if (!space.empty() && space != "none") tagged.push_back(input);
+        }
+        if (tagged.size() < 2) continue;
+        const std::string kept = tagged.front()->getActiveColorSpace();
+        for (size_t i = 1; i < tagged.size(); ++i) {
+            const std::string space = tagged[i]->getActiveColorSpace();
+            if (space != kept)
+                std::cerr << "[MaterialX] WARNING: " << node->getNamePath() << " converts its output from '" << kept
+                          << "' (its " << tagged.front()->getName() << "), not from " << tagged[i]->getName()
+                          << "'s '" << space << "'\n";
+            tagged[i]->setColorSpace("none");
+        }
+        if (VerboseMdl())
+            std::cout << "[MaterialX] " << node->getNamePath() << ": one colour transform from '" << kept
+                      << "' for its " << tagged.size() << " filename inputs\n";
+    }
+}
+
 // A constant colour on a uniform input (by the node's definition) that the
 // generator would transform into the working space: the generated transform
 // is varying and cannot feed the uniform MDL parameter. Convert the value
@@ -1515,6 +1556,7 @@ MaterialX::DocumentPtr DocumentLoader::load(const std::string& filepath)
         // below. Run before importing stdlib so library implementations are not
         // rewritten. Only this in-memory document changes, never the asset file.
         NormalizeColorSpaces(doc);
+        KeepOneOutputColorTransform(doc);
         FixDeclaredInputTypes(doc, m_stdlib);
         FixConnectionTypes(doc);
         DistributeLayersOverMixes(doc);
