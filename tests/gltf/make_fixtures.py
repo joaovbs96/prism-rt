@@ -358,7 +358,12 @@ def environment(out, width=64, height=32):
     for y in range(height):
         theta = math.pi * (y + 0.5) / height
         for x in range(width):
-            phi = 2 * math.pi * (x + 0.5) / width
+            # phi is the angle from +X toward +Z: the direction is
+            # (sin theta cos phi, cos theta, sin theta sin phi), placed in the
+            # image by UsdLux's lat-long convention (the image's centre is +Z,
+            # its first quarter +X), so column x looks toward phi = 2 pi (x +
+            # 0.5) / width - pi / 2.
+            phi = (2 * math.pi * (x + 0.5) / width - math.pi / 2) % (2 * math.pi)
             sky = max(math.cos(theta), 0.0)
             r, g, b = 0.25 + 0.5 * sky, 0.3 + 0.55 * sky, 0.35 + 0.7 * sky
             if math.cos(theta) < 0:
