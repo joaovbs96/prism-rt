@@ -216,6 +216,11 @@ jobs:
           key: ${{ needs.oidn.outputs.key }}
           fail-on-cache-miss: true
 
+      # The Vulkan denoiser: vk_oidn's prebuilt package and OIDN's prefilter
+      # networks packed for it (a download and a few seconds of Python).
+      - name: Fetch vk_oidn
+        run: ./tools/ci/fetch_vk_oidn.ps1 -WorkDir D:\vk-oidn-work -Prefix "$env:DEPS\vk_oidn"
+
       - name: Fetch oneTBB and Embree
         run: ./tools/ci/fetch_prebuilt.ps1 -Prefix $env:DEPS -Components tbb,embree
 
@@ -285,6 +290,7 @@ jobs:
           $env:PRISM_EMBREE_RUNTIME_DIR = "$deps/embree/bin"
           $env:PRISM_MDL_SDK_ROOT = "$deps/mdl"
           $env:PRISM_OIDN_ROOT = "$deps/oidn"
+          $env:PRISM_VK_OIDN_ROOT = "$deps/vk_oidn"
           $env:PRISM_VCPKG_PREFIX = $vcpkgPrefix
           $env:PRISM_VCPKG_BIN = "$vcpkgPrefix/bin"
           $env:PRISM_OPENIMAGEIO_DIR = "$vcpkgPrefix/share/openimageio"

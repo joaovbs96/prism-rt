@@ -81,6 +81,9 @@ Their license files are in the licenses folder where the projects ship them.
   - NVIDIA MDL SDK, BSD 3-clause
   - Intel Embree, Apache 2.0
   - Intel Open Image Denoise (CPU device), Apache 2.0
+  - NVIDIA vk_oidn (Open Image Denoise's network as Vulkan compute, the GPU
+    denoiser; linked statically), Apache 2.0, with the Open Image Denoise
+    weights (Intel, Apache 2.0)
   - Intel oneTBB, Apache 2.0
   - OpenImageIO, OpenColorIO, OpenEXR/Imath and other libraries from vcpkg
     (BSD / Apache 2.0 / MIT, see licenses\vcpkg)

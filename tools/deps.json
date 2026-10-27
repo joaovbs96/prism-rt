@@ -14,6 +14,15 @@
     "ispc": "1.30.0",
     "ispc_sha256": "E126A78FD15F12475BAC6204F2536B3986E07973127E4F8E7336C3D304C4A69F"
   },
+  "vk_oidn": {
+    "_comment": "Vulkan denoiser (OIDN 2.5.1 weights): the prebuilt SDK package and the commit of its tag, for pack_weights.py (tools/ci/fetch_vk_oidn.ps1; docs/DECISIONS.md).",
+    "version": "0.2.0",
+    "tag": "v0.2.0",
+    "commit": "81b75b54f064da71f79b821eab067de81cfe65d6",
+    "package_sha256": "5077A0FCE672F0E4933B5BF2241A4E31192401C996A9A803F3B012A75836F0C7",
+    "pack_weights_sha256": "06A8B65E6CEACB0471180EA1CDBC08BCBF3709BFDCADB2A3EFED5B362852F26E",
+    "oidn_weights": "2.5.1"
+  },
   "mdl_sdk": {
     "version": "2026.0.2",
     "tag": "2026.0.2",

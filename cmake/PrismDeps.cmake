@@ -9,7 +9,7 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${PRISM_DEPS_JSO
 file(READ "${PRISM_DEPS_JSON}" _prism_deps_json)
 
 # PRISM_DEP_<COMPONENT>_VERSION for every component of deps.json.
-foreach(_component openusd materialx opensubdiv onetbb embree oidn mdl_sdk python vulkan_sdk)
+foreach(_component openusd materialx opensubdiv onetbb embree oidn vk_oidn mdl_sdk python vulkan_sdk)
     string(TOUPPER "${_component}" _upper)
     string(JSON PRISM_DEP_${_upper}_VERSION GET "${_prism_deps_json}" ${_component} version)
 endforeach()
@@ -105,6 +105,9 @@ macro(prism_check_dependency_versions)
     prism_check_dependency_version(OpenImageIO "${OpenImageIO_VERSION}" "${PRISM_DEP_OPENIMAGEIO_VERSION}")
     if(PRISM_ENABLE_OIDN)
         prism_check_dependency_version("Open Image Denoise" "${OpenImageDenoise_VERSION}" "${PRISM_DEP_OIDN_VERSION}")
+    endif()
+    if(PRISM_ENABLE_VK_OIDN)
+        prism_check_dependency_version(vk_oidn "${vk_oidn_VERSION}" "${PRISM_DEP_VK_OIDN_VERSION}")
     endif()
     prism_check_dependency_version(OpenColorIO "${OpenColorIO_VERSION}" "${PRISM_DEP_OPENCOLORIO_VERSION}")
     if(Python3_VERSION_MAJOR)

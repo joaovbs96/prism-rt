@@ -25,6 +25,8 @@ param(
     [string] $EmbreeRuntime = "",
     # Open Image Denoise's bin (the denoiser); required when the build has it.
     [string] $OidnRuntime = "",
+    # vk_oidn's install (the Vulkan denoiser, linked statically: only its licenses ship).
+    [string] $VkOidnRoot = "",
     [string] $MdlSdkRoot = "",
     [string] $VcpkgBin = "",
     [string] $PythonRoot = "",
@@ -74,6 +76,8 @@ $MdlSdkRoot = Pick $MdlSdkRoot @("PRISM_MDL_SDK_ROOT") $runtime.mdlSdkRoot
 $OidnRuntime = Pick $OidnRuntime @("PRISM_OIDN_RUNTIME") $runtime.oidnRuntime
 # The build links OIDN when its runtime description names it.
 $buildHasOidn = [bool] $runtime.oidnRuntime
+$VkOidnRoot = Pick $VkOidnRoot @("PRISM_VK_OIDN_ROOT") $runtime.vkOidnRoot
+$buildHasVkOidn = [bool] $runtime.vkOidnRoot
 $VcpkgBin = Pick $VcpkgBin @("PRISM_VCPKG_BIN") $runtime.vcpkgRuntime
 $PythonRoot = Pick $PythonRoot @("PRISM_PYTHON_ROOT") $runtime.pythonRoot
 $UsdviewScript = Pick $UsdviewScript @("PRISM_USDVIEW") ""
@@ -287,7 +291,8 @@ foreach ($name in @("usdview.bat", "prism_render.bat", "list_devices.bat", "env_
     $versions = @(
         "  OpenUSD $($deps.openusd.version), MaterialX $($deps.materialx.version), OpenSubdiv $($deps.opensubdiv.version)",
         ("  oneTBB $($deps.onetbb.version), Embree $($deps.embree.version), MDL SDK $($deps.mdl_sdk.version)" +
-            $(if ($buildHasOidn) { ", Open Image Denoise $($deps.oidn.version)" } else { "" })),
+            $(if ($buildHasOidn) { ", Open Image Denoise $($deps.oidn.version)" } else { "" }) +
+            $(if ($buildHasVkOidn) { ", vk_oidn $($deps.vk_oidn.version)" } else { "" })),
         "  OpenImageIO $($deps.vcpkg.openimageio), OpenColorIO $($deps.vcpkg.opencolorio), Python $($deps.python.version), PySide6 $PySideVersion"
     ) -join "`n"
     $text = $text.Replace("@PRISM_DEPENDENCY_VERSIONS@", $versions) -replace "`r?`n", "`r`n"
@@ -316,6 +321,12 @@ if ($buildHasOidn) {
     foreach ($n in @("LICENSE.txt", "third-party-programs.txt", "third-party-programs-oneTBB.txt")) {
         Copy-IfExists (Join-Path $oidnDoc $n) $lic ("OpenImageDenoise-" + $n)
     }
+}
+# vk_oidn (Apache-2.0, derived from OIDN) and the OIDN weights packed for its prefilters.
+if ($buildHasVkOidn) {
+    Copy-IfExists (Join-Path $VkOidnRoot "LICENSE") $lic "vk_oidn-LICENSE.txt"
+    Copy-IfExists (Join-Path $VkOidnRoot "NOTICE") $lic "vk_oidn-NOTICE.txt"
+    Copy-IfExists (Join-Path $VkOidnRoot "prefilter\LICENSE-oidn-weights.txt") $lic "oidn-weights-LICENSE.txt"
 }
 $tbbRoot = $TbbRuntime
 for ($i = 0; $i -lt 3; $i++) { $tbbRoot = Split-Path -Parent $tbbRoot }

@@ -34,6 +34,10 @@
   device, against the same oneTBB), into <Root>\oidn-<version> with
   tools/ci/build_oidn.ps1; -OidnOnly builds only that.
 
+  -VkOidn also installs vk_oidn, the Vulkan device's denoiser (the prebuilt
+  SDK package and the packed prefilter weights), into <Root>\vk_oidn-<version>
+  with tools/ci/fetch_vk_oidn.ps1; -VkOidnOnly installs only that.
+
   Afterwards point cmake/PrismLocalDependencies.cmake and prism_local_env.ps1
   at the printed prefixes (see the .example files).
 
@@ -42,6 +46,7 @@
   ./tools/build_deps_local.ps1 -DownloadTbb -WorkDir D:\prism-deps\src
   ./tools/build_deps_local.ps1 -UsdOnly -TbbRoot C:\deps\oneapi-tbb-2022.2.0 -WorkDir D:\prism-deps\src-usd
   ./tools/build_deps_local.ps1 -OidnOnly -TbbRoot C:\deps\oneapi-tbb-2022.2.0 -WorkDir D:\prism-deps\src
+  ./tools/build_deps_local.ps1 -VkOidnOnly -WorkDir D:\prism-deps\src
 #>
 param(
     # oneTBB binary release root (with lib\cmake\tbb). See -DownloadTbb.
@@ -65,13 +70,26 @@ param(
     [switch] $UsdOnly,
     # Also build Open Image Denoise (the denoiser); -OidnOnly: only that.
     [switch] $Oidn,
-    [switch] $OidnOnly
+    [switch] $OidnOnly,
+    # Also install vk_oidn (the Vulkan denoiser); -VkOidnOnly: only that.
+    [switch] $VkOidn,
+    [switch] $VkOidnOnly
 )
 $ErrorActionPreference = "Stop"
 Import-Module (Join-Path $PSScriptRoot "deps.psm1") -Force
 $deps = Get-PrismDeps
 if (-not $Root) { $Root = Split-Path -Parent ([IO.Path]::GetFullPath($WorkDir)) }
 $Root = [IO.Path]::GetFullPath($Root)
+
+$vkOidnPrefix = Join-Path $Root "vk_oidn-$($deps.vk_oidn.version)"
+function Install-VkOidn {
+    & (Join-Path $PSScriptRoot "ci\fetch_vk_oidn.ps1") -WorkDir $WorkDir -Prefix $vkOidnPrefix
+    Write-Host "  vk_oidn: $vkOidnPrefix (PRISM_VK_OIDN_ROOT / vk_oidn_DIR)"
+}
+if ($VkOidnOnly) {
+    Install-VkOidn
+    return
+}
 
 if ($DownloadTbb) {
     $tbbPrefix = Join-Path $Root "onetbb-$($deps.onetbb.version)"
@@ -89,7 +107,7 @@ if (($v -join ".") -ne $deps.onetbb.version) {
 
 $oidnPrefix = Join-Path $Root "oidn-$($deps.oidn.version)"
 function Build-Oidn {
-    & (Join-Path $PSScriptRoot "ciuild_oidn.ps1") -TbbRoot $TbbRoot -WorkDir $WorkDir -Prefix $oidnPrefix `
+    & (Join-Path $PSScriptRoot "ci\build_oidn.ps1") -TbbRoot $TbbRoot -WorkDir $WorkDir -Prefix $oidnPrefix `
         -Jobs $Jobs
     Write-Host "  Open Image Denoise: $oidnPrefix (PRISM_OIDN_ROOT / OpenImageDenoise_DIR, PRISM_OIDN_RUNTIME)"
 }
@@ -138,3 +156,4 @@ Write-Host "  oneTBB: $TbbRoot"
 Write-Host "  OpenColorIO (build only): $OcioRoot"
 Write-Host "  Python: $PythonRoot"
 if ($Oidn) { Build-Oidn }
+if ($VkOidn) { Install-VkOidn }

@@ -35,6 +35,7 @@ def expected_versions(deps):
         "Open Image Denoise": deps["oidn"]["version"],
         "OIDN": deps["oidn"]["version"],
         "ISPC": deps["oidn"]["ispc"],
+        "vk_oidn": deps["vk_oidn"]["version"],
         "MDL SDK": deps["mdl_sdk"]["version"],
         "Python": deps["python"]["version"],
         "PySide6": packages["PySide6"],

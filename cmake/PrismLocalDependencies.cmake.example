@@ -9,8 +9,10 @@
 #   PRISM_OPENUSD_ROOT     D:/prism-deps/openusd-26.08-ocio2.6.0-p7e45c2c5
 #   PRISM_MATERIALX_ROOT   D:/prism-deps/materialx-1.39.5
 #   PRISM_OPENSUBDIV_ROOT  D:/prism-deps/opensubdiv-3.6.1
-# and tools/ci/build_oidn.ps1 the optional denoiser:
+# tools/ci/build_oidn.ps1 the optional denoiser and tools/ci/fetch_vk_oidn.ps1
+# its Vulkan version:
 #   PRISM_OIDN_ROOT        D:/prism-deps/oidn-2.5.1
+#   PRISM_VK_OIDN_ROOT     D:/prism-deps/vk_oidn-0.2.0
 # The versions themselves live only in tools/deps.json; the configure checks
 # that what it finds matches (cmake/PrismDeps.cmake).
 set(pxr_DIR "$ENV{PRISM_OPENUSD_ROOT}" CACHE PATH "OpenUSD package config directory")
@@ -30,4 +32,8 @@ set(OpenImageIO_DIR "$ENV{PRISM_OPENIMAGEIO_DIR}" CACHE PATH "OpenImageIO packag
 if(DEFINED ENV{PRISM_OIDN_ROOT})
     file(GLOB _prism_oidn_dir LIST_DIRECTORIES true "$ENV{PRISM_OIDN_ROOT}/lib/cmake/OpenImageDenoise-*")
     set(OpenImageDenoise_DIR "${_prism_oidn_dir}" CACHE PATH "Open Image Denoise package config")
+endif()
+# Optional: without it the Vulkan device denoises on the CPU (PRISM_ENABLE_VK_OIDN).
+if(DEFINED ENV{PRISM_VK_OIDN_ROOT})
+    set(vk_oidn_DIR "$ENV{PRISM_VK_OIDN_ROOT}/lib/cmake/vk_oidn" CACHE PATH "vk_oidn package config")
 endif()
