@@ -142,7 +142,8 @@ struct ImageRequest {
     // the returned colour, guided by the light AOVs' albedo and normal
     // (rendered for it even when lightAovs is null). The device denoises
     // where its accumulation lives (the Vulkan device on the GPU with
-    // vk_oidn; RenderDevice::CreateDenoiser). Throws when the build has no
+    // vk_oidn, the Metal device with OIDN's Metal device;
+    // RenderDevice::CreateDenoiser). Throws when the build has no
     // denoiser.
     DenoiseSettings denoise;
     std::vector<float>* denoised = nullptr;
@@ -274,9 +275,9 @@ public:
 
     // The denoiser for this device's images (docs/denoising.md); null with
     // the reason in *error when the build has none. The default is OIDN's CPU
-    // device on host images: the CPU device's own, and the Metal device's for
-    // now (part 3: OIDN's Metal device). The Vulkan device returns vk_oidn's
-    // when it can run (host images are uploaded), else this default.
+    // device on host images (the CPU device's). The Vulkan device returns
+    // vk_oidn's and the Metal device OIDN's Metal device when they can run
+    // (host images are copied to the GPU), else this default.
     virtual std::shared_ptr<Denoiser> CreateDenoiser(std::string* error = nullptr);
 };
 

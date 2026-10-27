@@ -11,6 +11,8 @@
 //       the Vulkan device's denoiser (named NAME_PREFIX...) on the synthetic
 //       images, within TOLERANCE NRMSE of OIDN's CPU device on the same images
 //       (exit code 77: no Vulkan device)
+//   prism_denoise_test --metal NAME_PREFIX TOLERANCE
+//       the same for the Metal device's denoiser (exit code 77: no Metal device)
 
 #include "../src/device/denoiser.h"
 #include "../src/device/device.h"
@@ -273,20 +275,22 @@ std::vector<float> ReadLayer(std::string const &path, std::string const &layer, 
     return result;
 }
 
-// The Vulkan device's denoiser on host images (the delegate's path: vk_oidn,
-// or OIDN's CPU device when vk_oidn cannot run), against OIDN's CPU device
-// on the same images: every quality, with and without prefiltered guides.
-int VulkanTests(std::string const &namePrefix, double tolerance)
+// A GPU device's denoiser on host images (the delegate's path: vk_oidn on
+// Vulkan, OIDN's Metal device on Metal, or OIDN's CPU device when neither
+// can run), against OIDN's CPU device on the same images: every quality,
+// with and without prefiltered guides.
+int GpuDenoiserTests(DevicePreference preference, DeviceKind kind, std::string const &label,
+                     std::string const &namePrefix, double tolerance)
 {
     std::string note;
-    const auto device = CreateDevice(DevicePreference::Vulkan, &note);
-    if (device->Info().kind != DeviceKind::Vulkan) {
-        std::cout << "No Vulkan device (" << note << "): skipped\n";
+    const auto device = CreateDevice(preference, &note);
+    if (device->Info().kind != kind) {
+        std::cout << "No " << label << " device (" << note << "): skipped\n";
         return 77;
     }
     std::string error;
     const auto gpu = device->CreateDenoiser(&error);
-    Require(gpu != nullptr, "the Vulkan device has no denoiser: " + error);
+    Require(gpu != nullptr, "the " + label + " device has no denoiser: " + error);
     const auto cpu = SharedCpuDenoiser(&error);
     Require(cpu != nullptr, "no CPU denoiser: " + error);
     std::cout << "Denoiser: " << gpu->Name() << '\n';
@@ -318,7 +322,7 @@ int VulkanTests(std::string const &namePrefix, double tolerance)
             worst = std::max(worst, agreement);
         }
     std::cout << "Largest difference from the CPU device: " << worst << " (tolerance " << tolerance << ")\n";
-    Require(worst <= tolerance, "the Vulkan denoiser differs from OIDN's CPU device");
+    Require(worst <= tolerance, "the " + label + " denoiser differs from OIDN's CPU device");
 
     // RGBA in place with interleaved guides (the delegate's layout) at
     // another size (new filters): prefiltered albedo and normal, the albedo
@@ -397,8 +401,15 @@ int main(int argc, char **argv)
             return filtered <= maxRatio * raw ? 0 : 1;
         }
         if (mode == "--vulkan" && argc == 4) {
-            const int status = VulkanTests(argv[2], std::stod(argv[3]));
+            const int status =
+                GpuDenoiserTests(DevicePreference::Vulkan, DeviceKind::Vulkan, "Vulkan", argv[2], std::stod(argv[3]));
             if (status == 0) std::cout << "Vulkan denoiser tests passed\n";
+            return status;
+        }
+        if (mode == "--metal" && argc == 4) {
+            const int status =
+                GpuDenoiserTests(DevicePreference::Metal, DeviceKind::Metal, "Metal", argv[2], std::stod(argv[3]));
+            if (status == 0) std::cout << "Metal denoiser tests passed\n";
             return status;
         }
         if (mode == "--same" && argc == 7) {
@@ -411,7 +422,8 @@ int main(int argc, char **argv)
             return nrmse <= tolerance ? 0 : 1;
         }
         std::cerr << "usage: prism_denoise_test [--timing W H | --error REF TEST MAX_RATIO [LAYER] |"
-                     " --same A LAYER_A B LAYER_B TOLERANCE | --vulkan NAME_PREFIX TOLERANCE]\n";
+                     " --same A LAYER_A B LAYER_B TOLERANCE | --vulkan NAME_PREFIX TOLERANCE |"
+                     " --metal NAME_PREFIX TOLERANCE]\n";
         return 2;
     } catch (std::exception const &e) {
         std::cerr << "prism_denoise_test: " << e.what() << '\n';

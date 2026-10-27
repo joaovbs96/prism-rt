@@ -12,8 +12,9 @@
 //                  queue and buffers the denoiser holds
 //                  (vulkan/vulkan_denoiser.h); the CPU denoiser on host copies
 //                  when vk_oidn cannot run on the GPU;
-//   Metal          the CPU denoiser on host copies for now (part 3: OIDN's
-//                  Metal device on shared MTLBuffers).
+//   Metal          OIDN's Metal device on the device's queue and MTLBuffers
+//                  the denoiser shares with it (metal/metal_denoiser.h); the
+//                  CPU denoiser on host copies when OIDN has no Metal device.
 // Every backend runs the same network weights (OIDN 2.5.1's).
 
 #include <memory>

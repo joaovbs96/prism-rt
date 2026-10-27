@@ -11,6 +11,9 @@
 #include <metal_irconverter_runtime/metal_irconverter_runtime.h>
 
 #include "metal_device.h"
+#if PRISM_HAS_METAL_OIDN
+#include "metal_denoiser.h"
+#endif
 
 #include "../gpu/gpu_device.h"
 #include "../gpu/gpu_materials.h"
@@ -167,7 +170,52 @@ struct MetalDevice::Impl {
     // Resizes a per-render buffer slot to at least `size` bytes.
     id<MTLBuffer> renderBuffer(int slot, size_t size);
     bool dispatch(GpuFrame const& frame, uint32_t threads, double* gpuSeconds, std::string* error);
+
+#if PRISM_HAS_METAL_OIDN
+    // The denoiser (OIDN's Metal device), created at its first use, which
+    // logs once which denoiser the device uses.
+    std::mutex denoiserMutex;
+    bool denoiserTried = false;
+    std::string denoiseUnavailable;
+    std::shared_ptr<MetalDenoiser> denoiser;
+    std::shared_ptr<MetalDenoiser> gpuDenoiser();
+#endif
+    ~Impl();
 };
+
+#if PRISM_HAS_METAL_OIDN
+std::shared_ptr<MetalDenoiser> MetalDevice::Impl::gpuDenoiser()
+{
+    std::lock_guard lock(denoiserMutex);
+    if (!denoiserTried) {
+        denoiserTried = true;
+        if (!MetalGpuDenoiserWanted()) {
+            denoiseUnavailable = "PRISM_GPU_DENOISER=cpu";
+        } else {
+            const auto start = Clock::now();
+            denoiser = MetalDenoiser::Create(device, queue, &denoiseUnavailable);
+            if (denoiser && Verbose())
+                std::cerr << std::format("PrismRT Metal: OIDN's Metal device set up in {:.1f} ms\n",
+                                         SecondsSince(start) * 1e3);
+        }
+        if (denoiser)
+            std::cerr << "PrismRT Metal: denoising on the GPU with " << denoiser->Name() << '\n';
+        else
+            std::cerr << "PrismRT Metal: denoising with OIDN's CPU device on host copies (" << denoiseUnavailable
+                      << ")\n";
+    }
+    return denoiser;
+}
+#endif
+
+MetalDevice::Impl::~Impl()
+{
+#if PRISM_HAS_METAL_OIDN
+    // A frontend may still hold the denoiser (the delegate's denoise jobs):
+    // its Metal and OIDN objects go now, later calls use the CPU device.
+    if (denoiser) denoiser->Shutdown();
+#endif
+}
 
 id<MTLBuffer> MetalDevice::Impl::buffer(const void* bytes, size_t size)
 {
@@ -745,6 +793,31 @@ void* MetalDevice::RenderBuffer(int slot, size_t bytes) { return m_impl->renderB
 bool MetalDevice::Dispatch(GpuFrame const& frame, uint32_t threads, double* gpuSeconds, std::string* error)
 {
     return m_impl->dispatch(frame, threads, gpuSeconds, error);
+}
+
+std::shared_ptr<Denoiser> MetalDevice::CreateDenoiser(std::string* error)
+{
+#if PRISM_HAS_METAL_OIDN
+    if (auto denoiser = m_impl->gpuDenoiser()) return denoiser;
+#endif
+    return GpuRenderDevice::CreateDenoiser(error);
+}
+
+bool MetalDevice::DenoiseAccumulation(ImageRequest const& request, std::vector<int> const& samples)
+{
+#if PRISM_HAS_METAL_OIDN
+    // Under m_renderMutex (RenderImage): the accumulation stays in place.
+    auto denoiser = m_impl->gpuDenoiser();
+    if (!denoiser) return false;
+    denoiser->DenoiseAccumulation(m_impl->buffers[kSlotAccumulation], samples, request.width, request.height,
+                                  request.denoise, request.denoised);
+    if (request.denoiser) *request.denoiser = denoiser->Name();
+    return true;
+#else
+    (void)request;
+    (void)samples;
+    return false;
+#endif
 }
 
 } // namespace prism::device

@@ -258,6 +258,14 @@ if(PRISM_ENABLE_METAL)
             "and DXC (PRISM_DXC_EXECUTABLE); or set PRISM_ENABLE_METAL=OFF.")
     endif()
     set(_prism_metal_sources "${CMAKE_CURRENT_SOURCE_DIR}/src/device/metal/metal_device.mm")
+    # The Metal device's denoiser: OIDN's Metal device on the render queue
+    # (docs/denoising.md). Built with any OIDN; an OIDN built without
+    # OIDN_DEVICE_METAL makes it fall back to OIDN's CPU device at run time
+    # (tools/ci/build_oidn_macos.sh builds OIDN with both devices).
+    if(PRISM_ENABLE_OIDN)
+        list(APPEND _prism_metal_sources "${CMAKE_CURRENT_SOURCE_DIR}/src/device/metal/metal_denoiser.mm")
+        target_compile_definitions(prism_core PRIVATE PRISM_HAS_METAL_OIDN=1)
+    endif()
     set_source_files_properties(${_prism_metal_sources} PROPERTIES
         LANGUAGE CXX COMPILE_FLAGS "-x objective-c++ -fobjc-arc")
     target_sources(prism_core PRIVATE ${_prism_metal_sources})
@@ -1250,6 +1258,9 @@ if(TARGET prism_hydra_render AND TARGET prism_compare_images)
         if(PRISM_ENABLE_VULKAN)
             list(APPEND _prism_denoise_devices vulkan)
         endif()
+        if(PRISM_ENABLE_METAL)
+            list(APPEND _prism_denoise_devices metal)
+        endif()
         foreach(_device IN LISTS _prism_denoise_devices)
             add_test(NAME prism_denoise_render_${_device}
                 COMMAND PrismRT --scene "${_prism_denoise_scene}" ${_prism_denoise_view} --spp 16
@@ -1334,6 +1345,53 @@ if(TARGET prism_hydra_render AND TARGET prism_compare_images)
             add_test(NAME prism_denoise_vulkan_fallback_test COMMAND prism_denoise_test --vulkan "OIDN" 0)
             set_tests_properties(prism_denoise_vulkan_fallback_test PROPERTIES
                 SKIP_RETURN_CODE 77 ENVIRONMENT "PRISM_GPU_DENOISER=cpu")
+        endif()
+        # The Metal device's denoisers (macOS only), as Vulkan's above.
+        # prism_denoise_render_metal runs OIDN's Metal device on the
+        # accumulation; prism_denoise_render_metal_cpu the CPU fallback on
+        # host copies (PRISM_GPU_DENOISER=cpu), on the same raw render, whose
+        # denoised layers must agree within 1e-2 NRMSE (as vk_oidn's); the
+        # delegate on Metal (OIDN's Metal device on host images); and the
+        # host-image path against OIDN's CPU device on synthetic images.
+        if(PRISM_ENABLE_METAL)
+            set_tests_properties(prism_denoise_render_metal PROPERTIES FAIL_REGULAR_EXPRESSION "on host copies")
+            add_test(NAME prism_denoise_render_metal_cpu
+                COMMAND PrismRT --scene "${_prism_denoise_scene}" ${_prism_denoise_view} --spp 16
+                    --device metal --denoise aov --output "${_prism_denoise_dir}/metal_cpu.exr")
+            set_tests_properties(prism_denoise_render_metal_cpu PROPERTIES
+                ENVIRONMENT "${_prism_test_environment};PRISM_GPU_DENOISER=cpu"
+                FAIL_REGULAR_EXPRESSION "on the GPU with" FIXTURES_SETUP prism_denoise_metal_cpu)
+            add_test(NAME prism_denoise_error_metal_cpu
+                COMMAND prism_denoise_test --error "${_prism_denoise_dir}/reference.exr"
+                    "${_prism_denoise_dir}/metal_cpu.exr" 0.5)
+            set_tests_properties(prism_denoise_error_metal_cpu PROPERTIES
+                FIXTURES_REQUIRED "prism_denoise_reference;prism_denoise_metal_cpu")
+            add_test(NAME prism_denoise_metal_same_raw
+                COMMAND prism_denoise_test --same "${_prism_denoise_dir}/metal.exr" -
+                    "${_prism_denoise_dir}/metal_cpu.exr" - 0)
+            add_test(NAME prism_denoise_metal_matches_cpu
+                COMMAND prism_denoise_test --same "${_prism_denoise_dir}/metal.exr" denoised
+                    "${_prism_denoise_dir}/metal_cpu.exr" denoised 1e-2)
+            set_tests_properties(prism_denoise_metal_same_raw prism_denoise_metal_matches_cpu PROPERTIES
+                FIXTURES_REQUIRED "prism_denoise_metal;prism_denoise_metal_cpu")
+            add_test(NAME prism_denoise_render_hydra_metal
+                COMMAND prism_hydra_render "${_prism_denoise_scene}" /World/Camera
+                    "${_prism_denoise_dir}/hydra_metal.exr" 96 64 16 ${_prism_fixed_sampling}
+                    --render-settings /Render/Settings --denoise aov)
+            set_tests_properties(prism_denoise_render_hydra_metal PROPERTIES
+                ENVIRONMENT "${_prism_test_environment};PRISM_DEVICE=metal"
+                FAIL_REGULAR_EXPRESSION "Render stat denoiser: (.*CPU.*|none)"
+                FIXTURES_SETUP prism_denoise_hydra_metal)
+            add_test(NAME prism_denoise_error_hydra_metal
+                COMMAND prism_denoise_test --error "${_prism_denoise_dir}/reference.exr"
+                    "${_prism_denoise_dir}/hydra_metal.exr" 0.5)
+            set_tests_properties(prism_denoise_error_hydra_metal PROPERTIES
+                FIXTURES_REQUIRED "prism_denoise_reference;prism_denoise_hydra_metal")
+            add_test(NAME prism_denoise_metal_test COMMAND prism_denoise_test --metal "OIDN 2.5.1 Metal" 1.5e-2)
+            add_test(NAME prism_denoise_metal_fallback_test COMMAND prism_denoise_test --metal "OIDN 2.5.1 CPU" 0)
+            set_tests_properties(prism_denoise_metal_test prism_denoise_metal_fallback_test PROPERTIES
+                SKIP_RETURN_CODE 77)
+            set_tests_properties(prism_denoise_metal_fallback_test PROPERTIES ENVIRONMENT "PRISM_GPU_DENOISER=cpu")
         endif()
         # prism:denoise in the render settings: the CLI's image is the
         # denoised colour, the same as --denoise aov's layer.
@@ -1802,6 +1860,8 @@ set(_prism_gpu_test_regex
     "|^prism_scene_features_.*_vulkan$"
     "|^prism_denoise_(render|error)_(hydra_)?vulkan(_generic|_cpu)?$"
     "|^prism_denoise_vulkan_.*$"
+    "|^prism_denoise_(render|error)_(hydra_)?metal(_cpu)?$"
+    "|^prism_denoise_metal_.*$"
     "|^prism_light_shaping_.*_vulkan$"
     "|^prism_textured_emitters?(_glass)?_vulkan_(render|parity)$"
     "|^prism_thin_walled_glass_vulkan_(render|parity)$")
