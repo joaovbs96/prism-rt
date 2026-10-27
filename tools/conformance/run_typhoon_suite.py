@@ -17,6 +17,10 @@ Settings taken from each scene's active RenderSettings prim:
                                          not, --working-space lin_rec709
                                          (Typhoon's default)
   start time code / usdlux frames        --time
+With --spheres-as-meshes, scenes with UsdGeomSphere prims render a derived
+layer that replaces them with UsdImaging's 10x10 catmullClark sphere mesh at
+--subdivision-level 3, which is what Typhoon renders (its spheres are about
+7% smaller than the implicit ones); this isolates shading differences.
 Fixed: --adaptive-threshold 0, --seed 0, --sample-clamp 0 (PrismRT's clamp
 limits whole samples, which would cut visible lights; Typhoon clamps
 contributions), and a per-scene --time-limit.
@@ -146,15 +150,75 @@ def scene_settings(scene: str) -> dict:
     }
 
 
+def derived_scene(scene: str, out: Path, spheres_as_meshes: bool, dome_rotate_y: float) -> bool:
+    """Writes `out`, a diagnostic layer over `scene`:
+    - spheres_as_meshes: every UsdGeomSphere replaced by the catmullClark mesh
+      UsdImaging makes of it (GeomUtilSphereMeshGenerator, 10 x 10; Typhoon
+      renders that mesh refined, a sphere about 7% smaller than the implicit one);
+    - dome_rotate_y: an extra rotateY on every authored DomeLight (to factor
+      out a dome orientation difference).
+    False when neither changes the scene."""
+    from pxr import GeomUtil, UsdGeom, UsdLux
+    source = Usd.Stage.Open(scene)
+    spheres = [prim for prim in source.Traverse() if prim.IsA(UsdGeom.Sphere)] if spheres_as_meshes else []
+    domes = [prim for prim in source.Traverse() if prim.IsA(UsdLux.DomeLight) or prim.IsA(UsdLux.DomeLight_1)] \
+        if dome_rotate_y else []
+    if not spheres and not domes:
+        return False
+    out.parent.mkdir(parents=True, exist_ok=True)
+    layer = Sdf.Layer.CreateNew(str(out))
+    layer.subLayerPaths.append(scene)
+    stage = Usd.Stage.Open(layer)
+    stage.SetMetadata("renderSettingsPrimPath", source.GetMetadata("renderSettingsPrimPath"))
+    generator = GeomUtil.SphereMeshGenerator
+    topology = generator.GenerateTopology(10, 10, True)
+    for prim in spheres:
+        radius = UsdGeom.Sphere(prim).GetRadiusAttr().Get()
+        stage.OverridePrim(prim.GetPath()).SetActive(False)
+        mesh = UsdGeom.Mesh.Define(stage, prim.GetPath().GetParentPath().AppendChild(prim.GetName() + "_mesh"))
+        mesh.GetPointsAttr().Set(generator.GeneratePoints(10, 10, radius))
+        mesh.GetFaceVertexCountsAttr().Set(topology.GetFaceVertexCounts())
+        mesh.GetFaceVertexIndicesAttr().Set(topology.GetFaceVertexIndices())
+        mesh.GetSubdivisionSchemeAttr().Set("catmullClark")
+        mesh.GetOrientationAttr().Set(topology.GetOrientation())
+        mesh.AddTransformOp().Set(UsdGeom.Xformable(prim).GetLocalTransformation())
+        for name in ("primvars:displayColor", "primvars:displayOpacity", "doubleSided", "visibility", "purpose"):
+            attribute = prim.GetAttribute(name)
+            if attribute and attribute.HasAuthoredValue():
+                mesh.GetPrim().CreateAttribute(name, attribute.GetTypeName()).Set(attribute.Get())
+        binding = prim.GetRelationship("material:binding")
+        if binding and binding.GetTargets():
+            mesh.GetPrim().AddAppliedSchema("MaterialBindingAPI")
+            mesh.GetPrim().CreateRelationship("material:binding").SetTargets(binding.GetTargets())
+    for prim in domes:
+        order = list(UsdGeom.Xformable(prim).GetXformOpOrderAttr().Get() or [])
+        over = stage.OverridePrim(prim.GetPath())
+        over.CreateAttribute("xformOp:rotateY:typhoonDome", Sdf.ValueTypeNames.Float).Set(float(dome_rotate_y))
+        over.CreateAttribute("xformOpOrder", Sdf.ValueTypeNames.TokenArray, False).Set(
+            order + ["xformOp:rotateY:typhoonDome"])
+    layer.Save()
+    return True
+
+
 # --- rendering ---------------------------------------------------------------
 
 def render(case: dict, args, output: Path, log: Path) -> dict:
     s = scene_settings(case["scene"])
     spp = min(s["spp"], args.spp_cap)
-    command = [case["scene"], s["camera"], str(output), str(s["width"]), str(s["height"]), str(spp),
+    scene = case["scene"]
+    extra = []
+    if args.spheres_as_meshes or args.dome_rotate_y:
+        derived = output.parent.parent / "derived" / (output.stem + ".usda")
+        if derived.exists():
+            derived.unlink()
+        if derived_scene(scene, derived, args.spheres_as_meshes, args.dome_rotate_y):
+            scene = str(derived)
+            if args.spheres_as_meshes:
+                extra = ["--subdivision-level", "3"]
+    command = [scene, s["camera"], str(output), str(s["width"]), str(s["height"]), str(spp),
                "--render-settings", s["settings"], "--adaptive-threshold", "0", "--seed", "0",
                "--sample-clamp", "0", "--max-depth", str(s["max_bounces"] + 2),
-               "--time-limit", str(args.time_limit)]
+               "--time-limit", str(args.time_limit)] + extra
     if not s["rendering_color_space"]:
         command += ["--working-space", "lin_rec709"]
     when = case["frame"] if case["frame"] is not None else s["start_time"]
@@ -370,6 +434,11 @@ def main() -> int:
     parser.add_argument("--only", nargs="*", default=[], help="case key globs or substrings")
     parser.add_argument("--compare-only", action="store_true", help="compare existing renders")
     parser.add_argument("--classification", type=Path, help="JSON list of {match, bucket, note}")
+    parser.add_argument("--spheres-as-meshes", action="store_true",
+                        help="render UsdGeomSpheres as Typhoon does: UsdImaging's catmullClark mesh, level 3")
+    parser.add_argument("--dome-rotate-y", type=float, default=0.0,
+                        help="diagnostic: extra rotateY (degrees) on authored DomeLights; 90 factors out "
+                             "PrismRT's lat-long orientation difference")
     args = parser.parse_args()
     # Absolute paths: run_capped.ps1 starts the renderer from its own directory.
     args.renderer = str(Path(args.renderer).resolve())
