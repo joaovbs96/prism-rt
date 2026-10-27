@@ -6,6 +6,7 @@
 #include "mdl/material_compiler.h"
 #include "mdl/backend_compiler.h"
 #include "mdl/texture_runtime.h"
+#include "color/color_management.h"
 #include "materialx/loader.h"
 #include "materialx/mdl_generator.h"
 #include "resource_limits.h"
@@ -96,6 +97,21 @@ public:
         const auto generationStart = std::chrono::steady_clock::now();
         MDLGenerator& generator = *MDLGenerator::workerLocal(mx_libraries_path);
         DocumentLoader doc_loader(generator.get_stdlib(), true);
+        if (auto color = prism::color::Active()) {
+            doc_loader.setUniformColorConversion({color->materialXSpace(),
+                [color](const std::string& space, std::array<float, 3>& rgb) {
+                    // Linear Rec.709 as the glTF converter's attenuation
+                    // colour (gltf_mesh.h); other spaces through OpenColorIO.
+                    if (space == prism::color::kLightColorSpace) {
+                        const Float3 c = color->FromRec709(Float3(rgb[0], rgb[1], rgb[2]));
+                        rgb = {c.x(), c.y(), c.z()};
+                        return true;
+                    }
+                    if (color->Resolve(space).empty()) return false;
+                    color->ToWorkingSpace(space, rgb.data(), 1, 3);
+                    return true;
+                }});
+        }
 
         MaterialX::DocumentPtr doc = doc_loader.load(mtlx_path);
         if (timings) timings->loadSeconds = std::chrono::duration<double>(

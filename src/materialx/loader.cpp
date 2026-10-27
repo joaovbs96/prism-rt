@@ -1423,6 +1423,62 @@ void NormalizeColorSpaces(const MaterialX::DocumentPtr& doc)
         }
     }
 }
+
+// A constant colour on a uniform input (by the node's definition) that the
+// generator would transform into the working space: the generated transform
+// is varying and cannot feed the uniform MDL parameter. Convert the value
+// here and tag it with the working space instead. The generator transforms
+// lin_rec709 and the spaces of the library's <space>_to_lin_rec709 nodes
+// (ColorTransformLibrary in mdl_generator.cpp); others it leaves as they are,
+// and so does this.
+void ConvertUniformColors(const MaterialX::DocumentPtr& doc,
+                          const DocumentLoader::UniformColorConversion& conversion)
+{
+    if (!conversion.convert || conversion.target.empty()) return;
+    std::vector<MaterialX::NodePtr> nodes;
+    for (auto element : doc->traverseTree())
+        if (auto node = element->asA<MaterialX::Node>()) nodes.push_back(node);
+    for (auto const& node : nodes) {
+        const MaterialX::NodeDefPtr definition = node->getNodeDef();
+        if (!definition) continue;
+        for (auto const& input : node->getInputs()) {
+            const std::string& type = input->getType();
+            if ((type != "color3" && type != "color4") || IsBound(input) || !input->getValue()) continue;
+            const MaterialX::InputPtr declaration = definition->getActiveInput(input->getName());
+            if (!declaration || !declaration->getIsUniform()) continue;
+            const std::string space = input->getActiveColorSpace();
+            if (space.empty() || space == "none" || space == conversion.target) continue;
+            if (space != "lin_rec709" &&
+                doc->getMatchingNodeDefs(space + "_to_lin_rec709").empty())
+                continue;
+            std::array<float, 3> rgb{};
+            float alpha = 1.0f;
+            if (type == "color3") {
+                const auto value = input->getValue()->asA<MaterialX::Color3>();
+                rgb = {value[0], value[1], value[2]};
+            } else {
+                const auto value = input->getValue()->asA<MaterialX::Color4>();
+                rgb = {value[0], value[1], value[2]};
+                alpha = value[3];
+            }
+            const std::array<float, 3> authored = rgb;
+            if (!conversion.convert(space, rgb)) {
+                std::cerr << "[MaterialX] WARNING: cannot convert " << input->getNamePath() << " from '" << space
+                          << "' to the working space; it is a uniform input, so its colour transform will "
+                             "not compile\n";
+                continue;
+            }
+            if (type == "color3") input->setValue(MaterialX::Color3(rgb[0], rgb[1], rgb[2]));
+            else input->setValue(MaterialX::Color4(rgb[0], rgb[1], rgb[2], alpha));
+            input->setColorSpace(conversion.target);
+            if (VerboseMdl())
+                std::cout << std::format("[MaterialX] uniform colour {} converted from {} to {}: "
+                                         "({:.9g}, {:.9g}, {:.9g}) -> ({:.9g}, {:.9g}, {:.9g})\n",
+                                         input->getNamePath(), space, conversion.target, authored[0],
+                                         authored[1], authored[2], rgb[0], rgb[1], rgb[2]);
+        }
+    }
+}
 }
 
 namespace {
@@ -1571,7 +1627,8 @@ MaterialX::DocumentPtr DocumentLoader::load(const std::string& filepath)
         // Attach after preprocessing so shared standard-library graphs retain
         // their original behavior. Validate the final document used for generation.
         AttachLibrary(doc, m_stdlib);
-        // Both need the library (declared defaults, graph implementations).
+        // These need the library (declared defaults, graph implementations).
+        ConvertUniformColors(doc, m_uniformColors);
         RouteUncoatedTransmissionIor(doc);
         ExpandThinWalledOpenPbr(doc);
         LayerGltfPbrVolume(doc);
