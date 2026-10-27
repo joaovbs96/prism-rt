@@ -919,6 +919,79 @@ called done there.
     (`Denoised ... with OIDN 2.5.1 CPU` in the CLI's output), its `denoised`
     layer within part 1's tolerance of `--device cpu`'s; chess, egg_gold
     and Teapot bit-identical to the previous build.
+- **Denoising, part 3: OIDN's Metal device** ([denoising.md](denoising.md#the-metal-denoiser-oidns-metal-device)).
+  Written on Windows and never compiled: the Mac build is its first.
+  - Metal-only code: `src/device/metal/metal_denoiser.{h,mm}` (new; OIDN's
+    Metal device on the render queue, shared `MTLBuffer`s, a resolve kernel in
+    MSL compiled at run time), `src/device/metal/metal_device.{h,mm}`
+    (`CreateDenoiser`, `DenoiseAccumulation` overrides, the denoiser created
+    on first use, shut down with the device). CMake adds
+    `metal_denoiser.mm` and `PRISM_HAS_METAL_OIDN` when the Metal device and
+    OIDN are both on. No shared shader or host change (the comments in
+    `src/device/denoiser.h`, `device.h`; `tests/denoise.cpp` gained
+    `--metal`).
+  - Build OIDN with its Metal device (Homebrew's `open-image-denoise` may
+    lack it, and is built against Homebrew's oneTBB):
+    1. Xcode 15+ with the Metal compiler: `xcrun --sdk macosx --find metal`
+       must succeed (Xcode 26+: `xcodebuild -downloadComponent
+       MetalToolchain`). Run the script with
+       `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer` (not after
+       `. ./prism_env.sh`, which points it at the Command Line Tools).
+    2. `tools/ci/build_oidn_macos.sh --work-dir ~/prism-deps/src --prefix
+       ~/prism-deps/oidn-2.5.1 --tbb-root <the oneTBB prefix PrismRT links>`
+       (pinned source and ISPC 1.30.0 checksums from `tools/deps.json`; it
+       fails if no `libOpenImageDenoise_device_metal*` was installed or a
+       `libtbb*` was). Expect `libOpenImageDenoise`, `_core`, `_device_cpu`,
+       `_device_metal` dylibs.
+    3. Configure with `-DOpenImageDenoise_DIR=~/prism-deps/oidn-2.5.1/lib/cmake/OpenImageDenoise-2.5.1`
+       (or `PRISM_OIDN_ROOT` through the local dependency file): `cmake
+       --preset prism-hydra-mac` prints `PrismRT: Open Image Denoise 2.5.1`;
+       `build-mac/prism-runtime.json` has `oidnRuntime` = `<prefix>/lib`.
+       Build: `cmake --build --preset prism-hydra-mac`.
+  - Tests (`. ./prism_env.sh` first): `ctest --test-dir build-mac -R
+    prism_denoise -E vulkan -j 1 --output-on-failure` (the `_vulkan` ones are
+    not for the Mac). The Metal ones, all `gpu` + `RESOURCE_LOCK gpu`,
+    registered only with the Metal device:
+    - `prism_denoise_render_metal` (log `PrismRT Metal: denoising on the GPU
+      with OIDN 2.5.1 Metal`; fails on `on host copies`) and
+      `prism_denoise_error_metal`: 16 spp `denoise.usda` (96x64, depth 12)
+      denoised NRMSE at most 0.5 x the colour's against the 4096 spp CPU
+      reference (CPU 0.264, Vulkan 0.274; expect ~0.26-0.28);
+    - `prism_denoise_render_metal_cpu` / `_error_metal_cpu`
+      (`PRISM_GPU_DENOISER=cpu`, the host-copy fallback, same limit);
+    - `prism_denoise_metal_same_raw`: the two renders' raw colours identical
+      (NRMSE 0; assumes the Metal render is deterministic, as Vulkan's is);
+    - `prism_denoise_metal_matches_cpu`: their `denoised` layers within 1e-2
+      NRMSE (vk_oidn measured 1.3e-3 to 1.5e-3; OIDN's Metal device should be
+      in that range or closer);
+    - `prism_denoise_render_hydra_metal` / `_error_hydra_metal`: the delegate
+      on Metal (host images through OIDN's Metal device; fails if `Render
+      stat denoiser:` names a CPU denoiser), same 0.5 limit;
+    - `prism_denoise_metal_test`: `prism_denoise_test --metal "OIDN 2.5.1
+      Metal" 1.5e-2`, the host path against OIDN's CPU device on synthetic
+      images, every quality with and without prefiltering, strided RGBA in
+      place, albedo only, no guides; `prism_denoise_metal_fallback_test`.
+  - By hand: `PRISM_GPU_VERBOSE=1 PrismRT --scene tests/hydra/fixtures/denoise.usda
+    --camera /World/Camera --width 1920 --height 1080 --max-depth 12 --spp 16
+    --adaptive-threshold 0 --device metal --denoise aov --output m.exr`, with
+    `--denoise-prefilter true` and `false`, and the same with
+    `PRISM_GPU_DENOISER=cpu`: note the CLI's `Denoised ... in X ms with ...`
+    and the `OIDN denoise ...: resolve ... filters ...` line, and compare the
+    `denoised` layers with `prism_denoise_test --same a.exr denoised b.exr
+    denoised 1`. usdview: `PRISM_DEVICE=metal ./run_usdview.sh
+    tests/hydra/fixtures/denoise.usda --renderer PrismRT`, turn on denoising
+    (`prism:denoise`): the view turns clean every 16 passes and at
+    convergence, the `denoiser` stat reads `OIDN 2.5.1 Metal`; pause and
+    resume, change the quality, resize the viewport (new filter sizes), then
+    quit: no crash or hang at exit (the denoiser is shut down with the
+    device while the delegate may still hold it). Also chess, egg_gold and
+    Teapot on `--device metal` without denoising, bit-identical
+    (`prism_compare_images --exact`) to the previous build.
+  - Report back: the build log of `build_oidn_macos.sh` (errors or
+    warnings) and of `metal_denoiser.mm`/`metal_device.mm`; the ctest
+    summary with the NRMSE lines of the Metal tests; the 1080p times (Metal
+    vs CPU fallback, prefilter on/off) and agreement; the usdview result;
+    any Metal API validation message (`MTL_DEBUG_LAYER=1` on one CLI run).
 - **`--env` follows UsdLux** ([hydra.md](hydra.md)): `EnvironmentMap` (`src/environment.h`,
   shared host code) has no default multiplier; the CLI's `--env` passes 1
   instead of the old factor of two, and the GPU scene mirrors the map's

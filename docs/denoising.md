@@ -17,11 +17,12 @@ with the colour, albedo and normal images and the settings.
 | --- | --- |
 | `cpu` | OIDN's CPU device on host images |
 | `vulkan` | vk_oidn 0.2.0: OIDN 2.5.1's network as Vulkan compute, on the GPU (below); OIDN's CPU device on host copies when the GPU cannot run it |
-| `metal` | OIDN's CPU device on host copies (part 3: OIDN's Metal device on shared `MTLBuffer`s) |
+| `metal` | OIDN's Metal device on the render queue and shared `MTLBuffer`s (below); OIDN's CPU device on host copies when OIDN has no Metal device |
 
-All backends run OIDN 2.5.1's network weights. OIDN is built from Intel's source
-release with only its CPU device, against PrismRT's oneTBB 2022.2
-(`tools/ci/build_oidn.ps1`; why not the prebuilt package: DECISIONS.md), and is
+All backends run OIDN 2.5.1's network weights. On Windows OIDN is built from
+Intel's source release with only its CPU device, against PrismRT's oneTBB 2022.2
+(`tools/ci/build_oidn.ps1`; why not the prebuilt package: DECISIONS.md); on
+macOS with its CPU and Metal devices (`tools/ci/build_oidn_macos.sh`). It is
 optional at build time: `PRISM_ENABLE_OIDN` defaults to ON when CMake finds
 `OpenImageDenoise` 2.x (`OpenImageDenoise_DIR`). A build without it renders
 as before; asking it to denoise is an error in the CLI and a warning (the
@@ -29,12 +30,14 @@ denoised AOV then holds the raw colour) in the delegate.
 
 Where the data lives:
 - Whole-image renders (the CLI) accumulate on the device, which denoises at
-  the end of `RenderImage`: the Vulkan device on the GPU, on its
-  accumulation buffer (`GpuRenderDevice::DenoiseAccumulation`); the others
-  read their sums back and call their denoiser (`DenoiseRenderedImage`).
+  the end of `RenderImage`: the Vulkan and Metal devices on the GPU, on
+  their accumulation buffer (`GpuRenderDevice::DenoiseAccumulation`); the
+  CPU device (and a GPU device without its GPU denoiser) reads the sums back
+  and calls its denoiser (`DenoiseRenderedImage`).
 - Progressive passes (the delegate) hand each pass's samples to the frontend,
   which accumulates on the host (its render buffers), so the denoiser takes
-  host images there; the Vulkan denoiser uploads them. Avoiding that copy
+  host images there; the Vulkan and Metal denoisers copy them into their
+  buffers. Avoiding that copy
   would mean keeping the pass accumulation on the GPU, which `PassRequest`
   does not do.
 
@@ -89,6 +92,42 @@ finds it (`vk_oidn_DIR`) and the build has OIDN.
 | `VK_OIDN_COOPMAT=0` / `1` | vk_oidn's generic convolutions / tensor cores also on non-NVIDIA GPUs |
 | `VK_OIDN_PROFILE=1` | vk_oidn prints per-layer GPU times when a filter is destroyed |
 | `PRISM_GPU_VERBOSE=1` | The filters' memory and tile count when created |
+
+## The Metal denoiser (OIDN's Metal device)
+
+OIDN ships a Metal device of its own (`OIDN_DEVICE_METAL`, Apple silicon,
+macOS 13+): the same `RT` filter, weights and prefilter networks as its CPU
+device, run with Metal Performance Shaders Graph. It is not in OIDN's
+default build, so `tools/ci/build_oidn_macos.sh` builds OIDN 2.5.1 with the
+CPU and Metal devices (it needs Xcode's Metal compiler; see the script).
+
+`src/device/metal/metal_denoiser.{h,mm}` (built with the Metal device when the
+build has OIDN, `PRISM_HAS_METAL_OIDN`):
+- At its first use the Metal device creates the denoiser: `oidnNewMetalDevice`
+  on the render device's own `MTLCommandQueue` (so OIDN's command buffers are
+  ordered with the renders), and a small resolve kernel (Metal Shading
+  Language, compiled at run time). It prints once which denoiser it uses:
+  `PrismRT Metal: denoising on the GPU with OIDN 2.5.1 Metal`, or `denoising
+  with OIDN's CPU device on host copies (<reason>)` when
+  `oidnIsMetalDeviceSupported` says no (an OIDN without its Metal device, or a
+  GPU OIDN does not support) or the device cannot be created.
+- Images: four packed RGB float `MTLBuffer`s (colour, albedo, normal,
+  output), shared storage with hazard tracking, handed to OIDN with
+  `oidnNewSharedBufferFromMetal`. Whole-image renders: the resolve kernel reads
+  the accumulation buffer (colour sums, then the light AOV sums) times each
+  pixel's 1 / samples (the host's float product) into the colour, albedo and
+  normal buffers on the GPU; OIDN filters them there; the host reads only the
+  denoised colour (shared storage: no copy). Host images (the delegate, any
+  `Denoiser::Denoise` call) are written into the same buffers first.
+- Prefiltering is OIDN's own (the albedo and normal through `RT` filters in
+  place, then `cleanAux`), as on the CPU device. Filters are kept and
+  recommitted for each call.
+- `PRISM_GPU_DENOISER=cpu` forces the host-copy CPU fallback;
+  `PRISM_GPU_VERBOSE=1` prints the set-up and per-denoise times.
+- Not measured yet (no Mac run): timings and the agreement with the CPU
+  device. The tests below expect it within 1e-2 NRMSE of OIDN's CPU device
+  on the same raw render, like vk_oidn.
+
 ## Inputs
 
 | Input | What | Where |
@@ -215,3 +254,13 @@ Vulkan: vk_oidn on uploaded host images); `prism_denoise_vulkan_test` and
 against OIDN's CPU device on the synthetic images, every quality with and
 without prefiltering, within 1.5e-2, plus strided RGBA in place, the albedo
 alone, no guides) and `prism_denoise_vulkan_fallback_test`.
+
+The Metal denoisers (`gpu` label, registered only when the build has the
+Metal device): `prism_denoise_{render,error}_metal` (OIDN's Metal device on
+the accumulation; fails if the log says it fell back), `_metal_cpu`
+(`PRISM_GPU_DENOISER=cpu`), `prism_denoise_metal_same_raw`,
+`prism_denoise_metal_matches_cpu` (1e-2), `prism_denoise_{render,error}_hydra_metal`
+(the delegate on Metal; fails if its `denoiser` stat is a CPU one),
+`prism_denoise_metal_test` (`prism_denoise_test --metal`, 1.5e-2) and
+`prism_denoise_metal_fallback_test`. The Mac checklist is in
+[gpu_devices.md](gpu_devices.md#metal-checklist).

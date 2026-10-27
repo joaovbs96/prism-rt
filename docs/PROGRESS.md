@@ -2,6 +2,10 @@
 
 Phase reports, newest first. Detailed reports live in `local/reports/` (git-ignored).
 
+## 2026-10-27 — Denoising, part 3: OIDN's Metal device (unbuilt)
+- The Metal device denoises with OIDN 2.5.1's Metal device on its own queue and shared `MTLBuffer`s (resolve kernel from the accumulation, no host round trip; host images for the delegate), falling back to OIDN's CPU device. `tools/ci/build_oidn_macos.sh` builds OIDN with CPU + Metal devices. Apple-only tests: `prism_denoise_*metal*`.
+- Written on Windows: Metal code never compiled or run. Windows build and tests unaffected. Mac checklist: docs/gpu_devices.md. Report: `local/reports/denoise_part3.md`.
+
 ## 2026-10-27 — `--env` convention and tagged uniform colours
 - The CLI's `--env` dropped a historical ×2 (`EnvironmentMap`'s default multiplier) and now matches a UsdLux dome of the same HDR (NRMSE 3.7e-8); USD domes, `--env-color` and the default dome were already unscaled. Earlier `--env` renders: add `--env-exposure 1` to reproduce.
 - A colour-space tag on a constant feeding a uniform MDL input (`gltf_pbr` `attenuation_color`) failed with C219 and rendered magenta in USD scenes (found converting DragonAttenuation for Hydra); `DocumentLoader` converts such constants to the working space up front, and such materials stay out of templates.
