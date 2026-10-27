@@ -87,11 +87,10 @@ std::string Digits(Matrix3 const &m)
     return text;
 }
 
+// $OCIO reaches here through RendererOptions::FromEnvironment.
 std::string LoadedConfig(std::string const &requested)
 {
-    if (!requested.empty()) return requested;
-    const char *env = std::getenv("OCIO");
-    return env && *env ? env : kDefaultConfig;
+    return requested.empty() ? kDefaultConfig : requested;
 }
 
 std::string RenderingSpace(OCIO::ConstConfigRcPtr const &config, std::string const &token, std::string *warning)

@@ -23,6 +23,7 @@
 #include "../materialx/resolved_resource.h"
 #include "../mdl/context.h"
 #include "../progress.h"
+#include "../renderer/renderer_context.h"
 #include "../rng.h"
 #include "../scene.h"
 #include "../texture.h"
@@ -4640,10 +4641,8 @@ public:
         try {
             mdl::Context &context = SharedMdlContext();
             if (context.is_valid()) {
-                const char *mx = std::getenv("PRISM_MATERIALX_LIBRARY_PATH");
-                const char *mdl = std::getenv("PRISM_MATERIALX_MDL");
                 materialService = std::make_unique<MaterialService>(
-                    &context, mx ? mx : "", mdl ? mdl : "",
+                    &context, renderer->options(),
                     reinterpret_cast<uint64_t>(sceneIndex.operator->()));
                 // Overlaps scene capture; the build job's services share its
                 // key, so their first Prefetch waits for it instead.
@@ -4652,6 +4651,14 @@ public:
         } catch (std::exception const &e) {
             TF_WARN("PrismRT: MDL initialization failed: %s", e.what());
         }
+    }
+
+    // The colour options of render settings: an empty config is the
+    // renderer's ($OCIO).
+    prism::color::Options ColorOptions(prism::color::Options options) const
+    {
+        if (options.config.empty()) options.config = renderer->options().color.config;
+        return options;
     }
 
     // Waits for a device job, returning false (and leaving the job running)
@@ -4723,7 +4730,7 @@ public:
             deviceCreation = std::async(std::launch::async, [preference, this] {
                 prism::load_profile::Scope profile("device.create");
                 CreatedDevice created;
-                created.device = prism::device::CreateDevice(preference, &created.note);
+                created.device = prism::device::CreateDevice(preference, renderer->options().devices, &created.note);
                 progress.End(prism::Phase::Device);
                 return created;
             });
@@ -4739,7 +4746,7 @@ public:
             TF_WARN("PrismRT: render device creation failed: %s", e.what());
         }
         if (!created.device) created.device = prism::device::CreateDevice(
-            prism::device::DevicePreference::Cpu, &created.note);
+            prism::device::DevicePreference::Cpu, renderer->options().devices, &created.note);
         if (!created.note.empty()) TF_WARN("PrismRT: %s", created.note.c_str());
         const auto info = created.device->Info();
         progress.SetDevice(DescribeDevice(*created.device, preference, created.note));
@@ -4858,7 +4865,7 @@ public:
         }
         if (AdvanceDevicePreparation(device, prepared)) return PreparationOutcome::Ready;
         if (!previewDevice)
-            previewDevice = prism::device::CreateDevice(prism::device::DevicePreference::Cpu);
+            previewDevice = prism::device::CreateDevice(prism::device::DevicePreference::Cpu, renderer->options().devices);
         return PreparationOutcome::Preview;
     }
 
@@ -4977,6 +4984,10 @@ public:
 
     // Declared first so it outlives every worker that reports to it.
     prism::Progress progress;
+    // This delegate's renderer context (its options from the environment;
+    // render settings override some per render).
+    std::shared_ptr<prism::RendererContext> renderer =
+        std::make_shared<prism::RendererContext>(prism::RendererOptions::FromEnvironment());
     HdSceneIndexBaseRefPtr sceneIndex;
     HdRenderThread *renderThread;
     RTCDevice device = nullptr;
@@ -5216,7 +5227,7 @@ SceneBridge::SceneBridge(HdSceneIndexBaseRefPtr sceneIndex, HdRenderThread *thre
     // A new delegate starts from the default colour management, whatever an
     // earlier one in this process selected.
     try {
-        prism::color::Activate(_impl->settings.color);
+        prism::color::Activate(_impl->ColorOptions(_impl->settings.color));
     } catch (std::exception const &error) {
         TF_WARN("PrismRT: %s", error.what());
     }
@@ -5373,7 +5384,7 @@ void SceneBridge::SetSettings(RenderSettings const &requested)
         RenderSettings const previous = GetSettings();
         if (settings.color != previous.color) {
             try {
-                prism::color::Activate(settings.color);
+                prism::color::Activate(_impl->ColorOptions(settings.color));
             } catch (std::exception const &error) {
                 TF_WARN("PrismRT: %s; retaining the previous colour management", error.what());
                 settings.color = previous.color;
@@ -6157,10 +6168,6 @@ bool SceneBridge::Prepare(CameraState const &camera,
             _impl->lastPrototypeDirtyPathCount = jobPrototypePaths.size();
             _impl->lastMaterialDirtyPathCount = jobMaterialPaths.size();
             _impl->inactiveGeneration = 0;
-            std::string mx = std::getenv("PRISM_MATERIALX_LIBRARY_PATH") ?
-                std::getenv("PRISM_MATERIALX_LIBRARY_PATH") : "";
-            std::string mdl = std::getenv("PRISM_MATERIALX_MDL") ?
-                std::getenv("PRISM_MATERIALX_MDL") : "";
             _impl->captureActive = false;
             _impl->captureScene.Reset();
             _impl->sceneDirty = false;
@@ -6193,7 +6200,7 @@ bool SceneBridge::Prepare(CameraState const &camera,
                  publishedPicking = std::move(publishedPicking),
                  prototypePool = std::move(prototypePool),
                  cancel = std::move(cancel),
-                 mx = std::move(mx), mdl = std::move(mdl)]() mutable {
+                 renderer = _impl->renderer]() mutable {
                     SceneBridge::Impl::BuildResult result;
                     result.generation = generation;
                     result.pinnedBankFallback = pinnedBankFallback;
@@ -6209,7 +6216,7 @@ bool SceneBridge::Prepare(CameraState const &camera,
                         if (context.is_valid()) {
                             result.materialService =
                                 std::make_unique<MaterialService>(
-                                    &context, mx, mdl, associationScope);
+                                    &context, renderer->options(), associationScope);
                             result.materialService->SetResourceRevision(
                                 static_cast<uint64_t>(
                                     jobSettings.resourceRevision));

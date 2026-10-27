@@ -401,8 +401,9 @@ public:
     // asks for instead of whole textures (prism:textureStreaming).
     bool textureStreaming = true;
     // GPU texture budget in MiB (prism:gpuTextureBudgetMiB); 0 is 45% of the
-    // device's memory. Textures beyond it upload at reduced resolution.
-    int gpuTextureBudgetMiB = prism::defaults::FromEnvironment().gpuTextureBudgetMiB;
+    // device's memory. Textures beyond it upload at reduced resolution. The
+    // front ends set it (their default is PRISM_GPU_TEXTURE_BUDGET_MIB).
+    int gpuTextureBudgetMiB = 0;
     // USD doubleSided (prism:honorDoubleSided, off by default): with it, the
     // back faces of single-sided geometry are not hit, unless their material
     // transmits. Single-sided are the placements listed here (Hydra) and the

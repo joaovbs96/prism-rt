@@ -119,21 +119,14 @@ inline constexpr uint64_t kMaterialCompileReservationBytes = 192ull * 1024ull * 
 // A template bind performs no native JIT, so it needs far less than a full compile.
 inline constexpr uint64_t kMaterialBindReservationBytes = 64ull * 1024ull * 1024ull;
 
-inline unsigned MaterialWorkerCount() {
-    const unsigned fallback = std::max(1u, std::min(8u, std::thread::hardware_concurrency() / 2));
-    return static_cast<unsigned>(ResourceLimit("PRISM_MATERIAL_THREADS", fallback, 64));
-}
-
-// Textures a material batch prepares concurrently ahead of its compiles. One
-// preparation of a W x H image with C channels holds the decoded pixels as
-// floats (4WHC bytes), a second such buffer while a per-pixel conversion runs,
-// and make_texture's mip chain (a third more) plus tile buffers: at most about
-// 2.5 x 4WHC. That is ~120 MiB for a 2048x2048 RGB texture (~1 GiB for eight)
-// and ~640 MiB for a 4096x4096 RGBA one. The source file copy made while
-// materializing it is small by comparison.
-inline unsigned TexturePreparationThreadCount() {
-    const unsigned fallback = std::max(1u, std::min(8u, std::thread::hardware_concurrency() / 2));
-    return static_cast<unsigned>(ResourceLimit("PRISM_TEXTURE_THREADS", fallback, 64));
-}
+// Material compile workers and texture preparation threads per batch:
+// Limits::MaterialWorkers and Limits::TexturePreparationThreads
+// (renderer/renderer_options.h). One preparation of a W x H image with C
+// channels holds the decoded pixels as floats (4WHC bytes), a second such
+// buffer while a per-pixel conversion runs, and make_texture's mip chain (a
+// third more) plus tile buffers: at most about 2.5 x 4WHC. That is ~120 MiB
+// for a 2048x2048 RGB texture (~1 GiB for eight) and ~640 MiB for a
+// 4096x4096 RGBA one. The source file copy made while materializing it is
+// small by comparison.
 
 } // namespace prism

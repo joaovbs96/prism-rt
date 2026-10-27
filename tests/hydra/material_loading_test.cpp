@@ -201,14 +201,23 @@ HdContainerDataSourceHandle MakeImageMetalMaterial(const SdfPath& path,
     return HdRetainedContainerDataSource::New(HdMaterialSchemaTokens->material,material);
 }
 
+// The service options of this process: the environment's (as the front ends
+// take them) with the MaterialX libraries given.
+prism::RendererOptions ServiceOptions(const std::filesystem::path& libraries)
+{
+    auto options=prism::RendererOptions::FromEnvironment();
+    options.materials.materialxLibraries=libraries.string();
+    options.materials.materialxMdlPath=(libraries/"mdl").string();
+    return options;
+}
+
+// The service whose compile mode SetCompileMode switches (auto unless "class").
+MaterialService* gCompileModeService=nullptr;
 void SetCompileMode(const char* mode)
 {
-#ifdef _WIN32
-    _putenv_s("PRISM_MDL_COMPILE_MODE",mode ? mode : "");
-#else
-    if (mode) setenv("PRISM_MDL_COMPILE_MODE",mode,1);
-    else unsetenv("PRISM_MDL_COMPILE_MODE");
-#endif
+    if (gCompileModeService)
+        gCompileModeService->SetCompileMode(mode && std::string(mode)=="class" ?
+            prism::MaterialOptions::CompileMode::Class : prism::MaterialOptions::CompileMode::Auto);
 }
 
 // Evaluation, sampling and cutout of two materials at a few shading states.
@@ -347,7 +356,7 @@ int PrewarmChild(const std::string& mode, const std::string& run)
         mdl::Context scoped;
         if (!scoped.is_valid()) return 3;
         {
-            MaterialService service(&scoped,libraries.string(),(libraries/"mdl").string());
+            MaterialService service(&scoped,ServiceOptions(libraries));
             service.Prewarm();
         }
         std::cout << "teardown finished\n";
@@ -355,7 +364,7 @@ int PrewarmChild(const std::string& mode, const std::string& run)
     }
     mdl::Context& context=SharedMdlContext();
     if (!context.is_valid()) return 3;
-    MaterialService service(&context,libraries.string(),(libraries/"mdl").string());
+    MaterialService service(&context,ServiceOptions(libraries));
     const auto batch=MakePrewarmBatch();
     if (mode=="prewarm") {
         std::vector<std::future<void>> calls;
@@ -363,7 +372,7 @@ int PrewarmChild(const std::string& mode, const std::string& run)
             calls.push_back(std::async(std::launch::async,[&] { service.Prewarm(); }));
         for (auto& call : calls) call.get();
         {
-            MaterialService other(&context,libraries.string(),(libraries/"mdl").string());
+            MaterialService other(&context,ServiceOptions(libraries));
             other.Prewarm();
         }
         service.WaitForPrewarm();
@@ -554,8 +563,8 @@ int main(int argc, char** argv)
     mdl::Context& context = SharedMdlContext();
     if (!context.is_valid()) return 3;
     const std::filesystem::path libraries(root);
-    MaterialService service(&context, libraries.string(),
-                            (libraries / "mdl").string());
+    MaterialService service(&context, ServiceOptions(libraries));
+    gCompileModeService = &service;
     const SdfPath redPath("/Looks/M0"), bluePath("/Looks/M99");
     std::vector<HdContainerDataSourceHandle> sources;
     std::vector<MaterialService::Request> requests;
@@ -1152,14 +1161,10 @@ int main(int argc, char** argv)
             }
             return batch;
         };
-        auto setPrefetchMode=[](const char* mode) {
-#ifdef _WIN32
-            _putenv_s("PRISM_TEXTURE_PREPARE",mode);
-#else
-            if (*mode) setenv("PRISM_TEXTURE_PREPARE",mode,1);
-            else unsetenv("PRISM_TEXTURE_PREPARE");
-#endif
+        auto setPrefetchMode=[&](const char* mode) {
+            service.SetParallelTexturePreparation(std::string(mode)!="serial");
         };
+
         const auto textures=prism::TextureService::Acquire();
         const auto parallel=makePrefetchBatch("Prefetch",writePrefetchImages("prefetch_"," "));
         setPrefetchMode("");

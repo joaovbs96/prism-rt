@@ -10,6 +10,8 @@
 #include <pxr/usd/sdf/path.h>
 #include <pxr/imaging/hd/dataSourceTypeDefs.h>
 
+#include "../renderer/renderer_options.h"
+
 class Material;
 namespace mdl { class Context; }
 
@@ -74,9 +76,11 @@ public:
         // Pre-warm jobs started in this process, for every key.
         uint64_t prewarmJobs = 0;
     };
+    // The MaterialX library and MDL paths, the cache directory, the compile
+    // policy and the worker counts come from `options` (the renderer's;
+    // an empty MDL path is <libraries>/mdl).
     MaterialService(mdl::Context* context,
-                    std::string materialXLibrariesPath = {},
-                    std::string materialXMdlPath = {},
+                    prism::RendererOptions const& options,
                     uint64_t associationScope = 0);
     ~MaterialService();
 
@@ -102,8 +106,8 @@ public:
     // process for this context and MaterialX library/MDL paths; thread-safe.
     // Prefetch and Resolve wait for a running pre-warm of the same key, and
     // the destructor waits for one this service started. A failure is logged
-    // and materials then initialize on first use. PRISM_MATERIAL_PREWARM=0
-    // disables it.
+    // and materials then initialize on first use. MaterialOptions::prewarm
+    // (PRISM_MATERIAL_PREWARM=0) disables it.
     void Prewarm();
     // Blocks until the pre-warm of this service's key, if any, has finished.
     void WaitForPrewarm();
@@ -119,6 +123,9 @@ public:
                   const std::function<bool()>& cancelled = {});
     // Partitions process-wide records by the caller's resource generation.
     void SetResourceRevision(uint64_t revision);
+    // The compile policy of later Prefetch batches (initially the options').
+    void SetCompileMode(prism::MaterialOptions::CompileMode mode);
+    void SetParallelTexturePreparation(bool parallel);
     // These also invalidate matching process-wide conversion records.
     void Invalidate(const pxr::SdfPath& path, bool subtree = false);
     // Drops only path-to-result shortcuts. Immutable exact graph/content

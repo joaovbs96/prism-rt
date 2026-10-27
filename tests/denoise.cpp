@@ -283,7 +283,7 @@ int GpuDenoiserTests(DevicePreference preference, DeviceKind kind, std::string c
                      std::string const &namePrefix, double tolerance)
 {
     std::string note;
-    const auto device = CreateDevice(preference, &note);
+    const auto device = CreateDevice(preference, prism::RendererOptions::FromEnvironment().devices, &note);
     if (device->Info().kind != kind) {
         std::cout << "No " << label << " device (" << note << "): skipped\n";
         return 77;

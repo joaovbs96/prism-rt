@@ -1,0 +1,102 @@
+#include "renderer_options.h"
+
+#include "../render_defaults.h"
+
+#include <algorithm>
+#include <cstdlib>
+#include <iostream>
+#include <string_view>
+#include <thread>
+
+namespace prism {
+
+namespace {
+
+const char* Text(const char* name)
+{
+    const char* value = std::getenv(name);
+    return value && *value ? value : nullptr;
+}
+
+// A positive integer of at most `maximum`; 0 (the built-in default) when the
+// variable is unset or invalid (reported, as ResourceLimit does).
+uint64_t PositiveLimit(const char* name, uint64_t maximum)
+{
+    const char* text = Text(name);
+    if (!text) return 0;
+    char* end = nullptr;
+    const auto value = std::strtoull(text, &end, 10);
+    if (*text == '-' || end == text || *end || value == 0 || value > maximum) {
+        std::cerr << "PrismRT: ignoring invalid " << name << '\n';
+        return 0;
+    }
+    return value;
+}
+
+unsigned DefaultWorkers()
+{
+    return std::max(1u, std::min(8u, std::thread::hardware_concurrency() / 2));
+}
+
+} // namespace
+
+unsigned Limits::MaterialWorkers() const
+{
+    return materialThreads ? materialThreads : DefaultWorkers();
+}
+
+unsigned Limits::TexturePreparationThreads() const
+{
+    return textureThreads ? textureThreads : DefaultWorkers();
+}
+
+std::filesystem::path DefaultCacheDirectory()
+{
+    if (const char* value = Text("LOCALAPPDATA")) return std::filesystem::path(value) / "PrismRT" / "cache";
+    return std::filesystem::temp_directory_path() / "PrismRT" / "cache";
+}
+
+std::filesystem::path RendererOptions::CacheRoot() const
+{
+    return cacheDirectory.empty() ? DefaultCacheDirectory() : cacheDirectory;
+}
+
+RendererOptions RendererOptions::FromEnvironment()
+{
+    RendererOptions options;
+    if (const char* value = Text("OCIO")) options.color.config = value;
+
+    auto& materials = options.materials;
+    if (const char* value = std::getenv("PRISM_MATERIALX_LIBRARY_PATH")) materials.materialxLibraries = value;
+    if (const char* value = std::getenv("PRISM_MATERIALX_MDL")) materials.materialxMdlPath = value;
+    if (const char* value = std::getenv("PRISM_MDL_COMPILE_MODE")) {
+        const std::string_view mode(value);
+        if (mode == "class") materials.compileMode = MaterialOptions::CompileMode::Class;
+        else if (!mode.empty() && mode != "auto")
+            std::cerr << "PrismRT: PRISM_MDL_COMPILE_MODE must be auto or class; using auto\n";
+    }
+    if (const char* value = std::getenv("PRISM_MATERIAL_PREWARM"))
+        materials.prewarm = std::string_view(value) != "0";
+    if (const char* value = std::getenv("PRISM_TEXTURE_PREPARE")) {
+        const std::string_view mode(value);
+        if (mode == "serial") materials.parallelTexturePreparation = false;
+        else if (!mode.empty() && mode != "parallel")
+            std::cerr << "PrismRT: PRISM_TEXTURE_PREPARE must be parallel or serial; using parallel\n";
+    }
+
+    options.limits.materialThreads = unsigned(PositiveLimit("PRISM_MATERIAL_THREADS", 64));
+    options.limits.textureThreads = unsigned(PositiveLimit("PRISM_TEXTURE_THREADS", 64));
+
+    auto disabled = [](const char* name) {
+        const char* value = Text(name);
+        return value && *value != '0';
+    };
+    options.devices.disableVulkan = disabled("PRISM_DISABLE_VULKAN");
+    options.devices.disableMetal = disabled("PRISM_DISABLE_METAL");
+    options.devices.initialTextureBudgetMiB = defaults::FromEnvironment().gpuTextureBudgetMiB;
+
+    if (const char* value = Text("PRISM_CACHE_DIR")) options.cacheDirectory = value;
+    return options;
+}
+
+} // namespace prism

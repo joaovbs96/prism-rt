@@ -103,19 +103,27 @@ bool ReportGpuPrograms(SceneManager& scene, std::ostream& out)
 namespace {
 
 // Returns null (with a reason) if the device is unavailable.
-std::unique_ptr<RenderDevice> TryCreate(DeviceKind kind, std::string* reason)
+std::unique_ptr<RenderDevice> TryCreate(DeviceKind kind, DeviceOptions const& options, std::string* reason)
 {
     switch (kind) {
     case DeviceKind::Cpu:
         return std::make_unique<CpuDevice>();
     case DeviceKind::Vulkan:
+        if (options.disableVulkan) {
+            if (reason) *reason = "disabled by PRISM_DISABLE_VULKAN";
+            return nullptr;
+        }
 #ifdef PRISM_HAS_VULKAN
-        return VulkanDevice::Create(reason);
+        return VulkanDevice::Create(options.initialTextureBudgetMiB, reason);
 #else
         if (reason) *reason = "the Vulkan device is not part of this build";
         return nullptr;
 #endif
     case DeviceKind::Metal:
+        if (options.disableMetal) {
+            if (reason) *reason = "disabled by PRISM_DISABLE_METAL";
+            return nullptr;
+        }
 #ifdef PRISM_HAS_METAL
         return MetalDevice::Create(reason);
 #else
@@ -138,17 +146,18 @@ std::vector<DeviceKind> AutoOrder()
 
 } // namespace
 
-std::vector<DeviceInfo> AvailableDevices()
+std::vector<DeviceInfo> AvailableDevices(DeviceOptions const& options)
 {
     std::vector<DeviceInfo> devices;
     for (DeviceKind kind : {DeviceKind::Metal, DeviceKind::Vulkan}) {
-        if (auto device = TryCreate(kind, nullptr)) devices.push_back(device->Info());
+        if (auto device = TryCreate(kind, options, nullptr)) devices.push_back(device->Info());
     }
     devices.push_back(CpuDevice().Info());
     return devices;
 }
 
-std::unique_ptr<RenderDevice> CreateDevice(DevicePreference preference, std::string* note)
+std::unique_ptr<RenderDevice> CreateDevice(DevicePreference preference, DeviceOptions const& options,
+                                           std::string* note)
 {
     std::vector<DeviceKind> order;
     switch (preference) {
@@ -160,7 +169,7 @@ std::unique_ptr<RenderDevice> CreateDevice(DevicePreference preference, std::str
     std::string reasons;
     for (DeviceKind kind : order) {
         std::string reason;
-        if (auto device = TryCreate(kind, &reason)) return device;
+        if (auto device = TryCreate(kind, options, &reason)) return device;
         if (!reasons.empty()) reasons += "; ";
         reasons += std::string(ToString(kind)) + ": " + reason;
     }

@@ -31,17 +31,17 @@ int main()
           RemovedDeviceMessage("CPU-Reference") == "the cpu-reference device was removed; use cpu",
           "the removed cpu-reference device is rejected with a plain message");
 
-    const auto devices = AvailableDevices();
+    const auto devices = AvailableDevices(prism::RendererOptions::FromEnvironment().devices);
     check(!devices.empty() && devices.back().kind == DeviceKind::Cpu,
           "the CPU device is always available and listed last");
 
     std::string note;
-    auto cpu = CreateDevice(DevicePreference::Cpu, &note);
+    auto cpu = CreateDevice(DevicePreference::Cpu, prism::RendererOptions::FromEnvironment().devices, &note);
     check(cpu && cpu->Info().kind == DeviceKind::Cpu && note.empty(),
           "an explicit CPU request creates the CPU device without a note");
 
     // Auto always yields a device: a GPU when available, else the CPU with a note.
-    auto automatic = CreateDevice(DevicePreference::Auto, &note);
+    auto automatic = CreateDevice(DevicePreference::Auto, prism::RendererOptions::FromEnvironment().devices, &note);
     check(automatic != nullptr, "auto creates a device");
     if (automatic && automatic->Info().kind == DeviceKind::Cpu)
         check(!note.empty(), "falling back to the CPU explains why");
@@ -50,7 +50,7 @@ int main()
               "auto picks the first available GPU device");
 
     for (DevicePreference gpu : {DevicePreference::Metal, DevicePreference::Vulkan}) {
-        auto device = CreateDevice(gpu, &note);
+        auto device = CreateDevice(gpu, prism::RendererOptions::FromEnvironment().devices, &note);
         check(device != nullptr, std::string("requesting ") + ToString(gpu) + " yields a device");
         if (device && device->Info().kind == DeviceKind::Cpu)
             check(!note.empty(), std::string("unavailable ") + ToString(gpu) + " falls back with a note");

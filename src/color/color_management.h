@@ -2,7 +2,8 @@
 
 // Colour management (docs/color_management.md). The renderer works in one
 // scene-linear working space (ACEScg by default) taken from an OpenColorIO
-// config ($OCIO, else the built-in studio config). Everything that enters the
+// config (the renderer's, by default $OCIO, else the built-in studio config;
+// RendererOptions::FromEnvironment). Everything that enters the
 // renderer converts into it once: MaterialX colour-space tags (the MDL
 // generator's colour transforms), light colours and blackbody temperatures
 // (authored as linear Rec.709), and textures prepared with a colour space.
@@ -35,7 +36,7 @@ inline Float3 Apply(Matrix3 const &m, Float3 const &c)
 }
 
 struct Options {
-    std::string config;       // empty: $OCIO, else kDefaultConfig
+    std::string config;       // empty: kDefaultConfig (front ends fill in $OCIO)
     std::string workingSpace; // empty: ACEScg (the config's scene_linear role if it has none)
     std::string display;      // empty: the config's default display
     std::string view;         // empty: the display's default view
@@ -105,8 +106,8 @@ void SetActive(std::shared_ptr<const ColorManagement> colorManagement);
 std::shared_ptr<const ColorManagement> Activate(Options const &options);
 
 // The working space that a UsdRenderSettings.renderingColorSpace token asks
-// for in the OpenColorIO config `config` (empty: $OCIO, else the default
-// config), as a name of that config; empty for the default working space.
+// for in the OpenColorIO config `config` (empty: the default config), as a
+// name of that config; empty for the default working space.
 // USD's names (GfColorSpaceNames: lin_rec709_scene, lin_ap1_scene, ...)
 // resolve through the config's aliases. data, raw and identity ("no source
 // colour transforms") take linear Rec.709, the space USD authors untagged

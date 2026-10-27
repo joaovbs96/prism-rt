@@ -12,6 +12,7 @@
 #include "../camera_rays.h"
 #include "../float3.h"
 #include "../ray.h"
+#include "../renderer/renderer_options.h"
 
 #include <algorithm>
 #include <atomic>
@@ -27,6 +28,8 @@
 class SceneManager;
 
 namespace prism::device {
+
+using prism::DeviceOptions;
 
 enum class DeviceKind { Cpu, Vulkan, Metal };
 
@@ -287,16 +290,18 @@ public:
 void DenoiseRenderedImage(RenderDevice& device, ImageRequest const& request,
                           std::vector<float> const& color, std::vector<LightAovPixel> const& aovs);
 
-// Devices compiled into this build with a usable adapter, CPU always last.
-std::vector<DeviceInfo> AvailableDevices();
+// Devices compiled into this build with a usable adapter and not disabled by
+// `options`, CPU always last.
+std::vector<DeviceInfo> AvailableDevices(DeviceOptions const& options);
 
 // Diagnostics without a GPU device (PRISM_GPU_PROGRAM_REPORT): the scene's GPU programs and their sizes.
 // False if this build has no Vulkan device.
 bool ReportGpuPrograms(SceneManager& scene, std::ostream& out);
 
 // Creates the preferred device. If it is unavailable, falls back to the CPU
-// device and explains why in *note (when non-null).
-std::unique_ptr<RenderDevice> CreateDevice(DevicePreference preference,
+// device and explains why in *note (when non-null). `options` disable
+// devices and set their initial texture budget (the renderer's).
+std::unique_ptr<RenderDevice> CreateDevice(DevicePreference preference, DeviceOptions const& options,
                                            std::string* note = nullptr);
 
 } // namespace prism::device

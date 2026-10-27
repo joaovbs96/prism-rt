@@ -186,23 +186,6 @@ bool TemplateStructure(NetworkSnapshot graph, NetworkSnapshot* structure)
         std::move(graph), structure);
 }
 
-// Prefetch compile policy. "auto" (default) folds every class parameter that
-// no material of the batch needs to rebind; "class" keeps all but strings runtime
-// arguments, which is how Resolve and the standalone loader always compile.
-bool FoldingCompileMode()
-{
-    const char* value = std::getenv("PRISM_MDL_COMPILE_MODE");
-    const std::string mode = value ? value : "";
-    if (mode == "class") return false;
-    if (!mode.empty() && mode != "auto") {
-        static std::once_flag warned;
-        std::call_once(warned, [&] {
-            std::cerr << "PrismRT: PRISM_MDL_COMPILE_MODE must be auto or class; using auto\n";
-        });
-    }
-    return true;
-}
-
 using TemplateValueKey = std::pair<TfToken, TfToken>;
 
 // Template values on which at least two captured group members disagree. All
@@ -267,14 +250,6 @@ uint64_t CurrentProcessIdValue()
 #else
     return static_cast<uint64_t>(getpid());
 #endif
-}
-
-std::string EnvOr(const char* name, std::string value)
-{
-    if (value.empty()) {
-        if (const char* env = std::getenv(name)) value = env;
-    }
-    return value;
 }
 
 std::string HashText(const std::string& text)
@@ -502,22 +477,6 @@ std::string ResolveTextureAssets(HdMaterialNetworkInterface& net,
     return dependencyFingerprint;
 }
 
-// PRISM_TEXTURE_PREPARE=serial leaves every texture to the compile of the
-// material that uses it; the default prepares a batch's textures ahead.
-bool ParallelTexturePreparation()
-{
-    const char* value = std::getenv("PRISM_TEXTURE_PREPARE");
-    const std::string mode = value ? value : "";
-    if (mode == "serial") return false;
-    if (!mode.empty() && mode != "parallel") {
-        static std::once_flag warned;
-        std::call_once(warned, [] {
-            std::cerr << "PrismRT: PRISM_TEXTURE_PREPARE must be parallel or serial; using parallel\n";
-        });
-    }
-    return true;
-}
-
 // One texture file as ResolveTextureAssets materializes it, owned so that
 // worker threads never touch a captured graph or a Hydra data source.
 struct TextureWork {
@@ -572,14 +531,14 @@ void CollectTextureWork(const NetworkSnapshot& network,
 class TexturePrefetch {
 public:
     TexturePrefetch(std::vector<TextureWork> work, std::filesystem::path cacheDir,
-                    std::function<bool()> cancelled, std::atomic<uint64_t>* bytesRead)
+                    std::function<bool()> cancelled, std::atomic<uint64_t>* bytesRead,
+                    unsigned threads)
         : m_work(std::move(work)), m_cacheDir(std::move(cacheDir)),
           m_cancelled(std::move(cancelled)), m_bytesRead(bytesRead),
           m_results(m_work.size()),
           // No slot is reserved for the calling thread: it goes on to
           // convert and compile while the arena's workers prepare.
-          m_arena(static_cast<int>(std::min<size_t>(
-              prism::TexturePreparationThreadCount(), m_work.size())), 0)
+          m_arena(static_cast<int>(std::min<size_t>(threads, m_work.size())), 0)
     {
         if (prism::load_profile::Enabled()) {
             m_profile = std::make_unique<prism::load_profile::Scope>("texture.prefetch");
@@ -661,14 +620,6 @@ private:
     tbb::task_group m_group;
 };
 
-// PRISM_MATERIAL_PREWARM=0 leaves every one-time cost to the first material,
-// as before the pre-warm existed; used for measurement.
-bool PrewarmEnabled()
-{
-    const char* value = std::getenv("PRISM_MATERIAL_PREWARM");
-    return !value || std::string_view(value) != "0";
-}
-
 struct PrewarmResult {
     double seconds = 0.0;
     std::string error;
@@ -739,7 +690,8 @@ std::string LoadSupportModules(mdl::Context& context, const std::string& librari
 }
 
 PrewarmResult RunPrewarm(mdl::Context* context, const std::string& libraries,
-                         const std::string& mdlPath, const std::filesystem::path& cacheDir)
+                         const std::string& mdlPath, const std::filesystem::path& cacheDir,
+                         unsigned workers)
 {
     const auto start = std::chrono::steady_clock::now();
     prism::load_profile::Scope profile("materials.prewarm");
@@ -749,7 +701,7 @@ PrewarmResult RunPrewarm(mdl::Context* context, const std::string& libraries,
         (void)HdMtlxStdLibraries();
         // Loads the generator's standard library and digest, and leaves a
         // generator for each worker of the first batch.
-        MDLGenerator::reserveWorkers(libraries, prism::MaterialWorkerCount());
+        MDLGenerator::reserveWorkers(libraries, workers);
         // As Prefetch registers them; loading modules by name needs the path.
         if (!mdlPath.empty()) {
             context->add_mdl_path(mdlPath);
@@ -846,22 +798,22 @@ public:
             prepared.resourceRevision,
             prepared.resolverContext, prepared.network, prepared.dependencies, material});
     }
-    Impl(mdl::Context* context, std::string libraries, std::string mdlPath,
+    Impl(mdl::Context* context, prism::RendererOptions const& options,
          uint64_t requestedAssociationScope)
         : context(context)
+        , libraries(options.materials.materialxLibraries)
+        , mdlPath(options.materials.materialxMdlPath)
+        , cacheDir(options.CacheRoot() / "materials")
         , associationScope(requestedAssociationScope ? requestedAssociationScope :
               static_cast<uint64_t>(reinterpret_cast<std::uintptr_t>(context)))
-        , libraries(EnvOr("PRISM_MATERIALX_LIBRARY_PATH", std::move(libraries)))
-        , mdlPath(EnvOr("PRISM_MATERIALX_MDL", std::move(mdlPath)))
+        , foldParameters(options.materials.compileMode == prism::MaterialOptions::CompileMode::Auto)
+        , prewarmEnabled(options.materials.prewarm)
+        , parallelTexturePreparation(options.materials.parallelTexturePreparation)
+        , materialWorkers(options.limits.MaterialWorkers())
+        , textureThreads(options.limits.TexturePreparationThreads())
     {
         if (this->mdlPath.empty() && !this->libraries.empty())
             this->mdlPath = (std::filesystem::path(this->libraries) / "mdl").string();
-        if (const char* cache = std::getenv("PRISM_CACHE_DIR"); cache && *cache)
-            cacheDir = std::filesystem::path(cache) / "materials";
-        else if (const char* local = std::getenv("LOCALAPPDATA"); local && *local)
-            cacheDir = std::filesystem::path(local) / "PrismRT" / "cache" / "materials";
-        else
-            cacheDir = std::filesystem::temp_directory_path() / "prism-rt" / "materials";
         prewarmKey = PrewarmContextPrefix(context) + this->libraries + "\n" + this->mdlPath;
         std::lock_guard<std::mutex> cacheLock(gMaterialCacheMutex);
         ++gAssociationScopeUsers[associationScope];
@@ -1474,6 +1426,15 @@ public:
     std::filesystem::path cacheDir;
     uint64_t resourceRevision = 0;
     uint64_t associationScope = 0;
+    // Prefetch compile policy (MaterialOptions::compileMode): fold every class
+    // parameter that no material of the batch needs to rebind (Auto), or keep
+    // all but strings runtime arguments (Class), which is how Resolve and the
+    // standalone loader always compile.
+    std::atomic<bool> foldParameters{true};
+    bool prewarmEnabled = true;
+    std::atomic<bool> parallelTexturePreparation{true};
+    unsigned materialWorkers = 1;
+    unsigned textureThreads = 1;
     std::mutex mutex;
     struct PathEntry {
         HdContainerDataSourceHandle source;
@@ -1509,11 +1470,9 @@ public:
 };
 
 MaterialService::MaterialService(mdl::Context* context,
-                                 std::string materialXLibrariesPath,
-                                 std::string materialXMdlPath,
+                                 prism::RendererOptions const& options,
                                  uint64_t associationScope)
-    : m_impl(std::make_unique<Impl>(context, std::move(materialXLibrariesPath),
-                                    std::move(materialXMdlPath), associationScope))
+    : m_impl(std::make_unique<Impl>(context, options, associationScope))
 {}
 
 MaterialService::~MaterialService() {
@@ -1565,7 +1524,7 @@ std::shared_ptr<Material> MaterialService::Resolve(
 void MaterialService::Prewarm()
 {
     Impl& impl = *m_impl;
-    if (!PrewarmEnabled() || !impl.context || !impl.context->is_valid() ||
+    if (!impl.prewarmEnabled || !impl.context || !impl.context->is_valid() ||
         impl.libraries.empty()) return;
     std::lock_guard lock(gPrewarmMutex);
     auto& entry = gPrewarms[impl.prewarmKey];
@@ -1574,8 +1533,9 @@ void MaterialService::Prewarm()
             // Owns copies only: the service may be destroyed while it runs.
             entry = std::async(std::launch::async,
                 [context = impl.context, libraries = impl.libraries,
-                 mdlPath = impl.mdlPath, cacheDir = impl.cacheDir] {
-                    return RunPrewarm(context, libraries, mdlPath, cacheDir);
+                 mdlPath = impl.mdlPath, cacheDir = impl.cacheDir,
+                 workers = impl.materialWorkers] {
+                    return RunPrewarm(context, libraries, mdlPath, cacheDir, workers);
                 }).share();
             ++gPrewarmJobs;
         } catch (const std::exception& error) {
@@ -1653,7 +1613,7 @@ void MaterialService::Prefetch(const std::vector<Request>& requests,
     // the material that needs it. Declared after captured so that an early
     // return waits for the preparations first.
     std::unique_ptr<TexturePrefetch> texturePrefetch;
-    if (ParallelTexturePreparation()) {
+    if (m_impl->parallelTexturePreparation) {
         std::vector<TextureWork> work;
         std::unordered_set<std::string> seenTextures;
         for (const auto& item : captured)
@@ -1662,7 +1622,8 @@ void MaterialService::Prefetch(const std::vector<Request>& requests,
                     std::to_string(item.resourceRevision), &seenTextures, &work);
         if (!work.empty())
             texturePrefetch = std::make_unique<TexturePrefetch>(
-                std::move(work), m_impl->cacheDir, cancelled, &m_impl->textureBytes);
+                std::move(work), m_impl->cacheDir, cancelled, &m_impl->textureBytes,
+                m_impl->textureThreads);
     }
     struct Group { NetworkSnapshot structure; std::vector<size_t> indices; };
     std::vector<Group> groups;
@@ -1685,7 +1646,7 @@ void MaterialService::Prefetch(const std::vector<Request>& requests,
         std::cerr << "\n";
     }
 
-    const bool fold = FoldingCompileMode();
+    const bool fold = m_impl->foldParameters;
     // A material compiled alone folds everything except resources; no other
     // material is expected to share its program.
     auto foldAlone = [&](Impl::Prepared value) {
@@ -1709,7 +1670,7 @@ void MaterialService::Prefetch(const std::vector<Request>& requests,
         // The main pass is counted up front; seeds and fallbacks add to it.
         if (!grownKeepSets) prism::progress::AddTotal(prism::Phase::Materials, items.size());
         const unsigned workers = std::min<unsigned>(
-            prism::MaterialWorkerCount(), static_cast<unsigned>(items.size()));
+            m_impl->materialWorkers, static_cast<unsigned>(items.size()));
         prism::load_profile::Scope poolProfile("materials.compile_pool");
         poolProfile.detail("items=" + std::to_string(items.size()) +
                            " workers=" + std::to_string(workers));
@@ -1950,6 +1911,16 @@ void MaterialService::SetResourceRevision(uint64_t revision)
     if (m_impl->resourceRevision == revision) return;
     m_impl->resourceRevision = revision;
     m_impl->pathCache.clear();
+}
+
+void MaterialService::SetCompileMode(prism::MaterialOptions::CompileMode mode)
+{
+    m_impl->foldParameters = mode == prism::MaterialOptions::CompileMode::Auto;
+}
+
+void MaterialService::SetParallelTexturePreparation(bool parallel)
+{
+    m_impl->parallelTexturePreparation = parallel;
 }
 
 void MaterialService::Invalidate(const SdfPath& path, bool subtree)

@@ -688,6 +688,10 @@ public:
         // includedPurposes); empty: render.
         std::vector<pxr::TfToken> includedPurposes;
         prism::mesh::SubdivisionSettings subdivision = DefaultSubdivision();
+        // The renderer's options for the material service (compile policy,
+        // workers, cache directory); its MaterialX paths are the
+        // constructor's. Default: the environment's, as for the subdivision.
+        prism::RendererOptions renderer = prism::RendererOptions::FromEnvironment();
     };
 
     static prism::mesh::SubdivisionSettings DefaultSubdivision()
@@ -865,8 +869,10 @@ private:
         if (mdl_context && !mx_libraries_path.empty()) {
             ArResolverContextBinder materialResolver(
                 stage->GetPathResolverContext());
-            prism::materials::MaterialService service(
-                mdl_context, mx_libraries_path, mx_mdl_path);
+            prism::RendererOptions serviceOptions = m_options.renderer;
+            serviceOptions.materials.materialxLibraries = mx_libraries_path;
+            serviceOptions.materials.materialxMdlPath = mx_mdl_path;
+            prism::materials::MaterialService service(mdl_context, serviceOptions);
             // Loads the MaterialX and MDL libraries while bindings are read.
             service.Prewarm();
             std::cout << "[USDMesh] Scanning for MaterialX materials...\n";

@@ -721,10 +721,8 @@ bool MetalDevice::Impl::dispatch(GpuFrame const& frame, uint32_t threads, double
 
 std::unique_ptr<MetalDevice> MetalDevice::Create(std::string* reason)
 {
-    if (const char* disabled = std::getenv("PRISM_DISABLE_METAL"); disabled && *disabled && *disabled != '0') {
-        if (reason) *reason = "disabled by PRISM_DISABLE_METAL";
-        return nullptr;
-    }
+    // DeviceOptions::disableMetal (PRISM_DISABLE_METAL) is checked by
+    // CreateDevice (device.cpp).
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
     if (!device) {
         if (reason) *reason = "no Metal GPU";

@@ -674,6 +674,12 @@ if(PRISM_BUILD_HYDRA)
     target_link_libraries(prism_device_selection_test PRIVATE PrismRT::core)
     add_test(NAME prism_device_selection_test COMMAND prism_device_selection_test)
 
+    # The renderer's options come from the environment only through
+    # RendererOptions::FromEnvironment (docs/sdk_design.md, step 1a).
+    add_executable(prism_renderer_options_test tests/renderer_options.cpp)
+    target_link_libraries(prism_renderer_options_test PRIVATE PrismRT::core)
+    add_test(NAME prism_renderer_options_test COMMAND prism_renderer_options_test)
+
     add_executable(prism_ray_footprint_test tests/ray_footprint.cpp)
     target_link_libraries(prism_ray_footprint_test PRIVATE PrismRT::core)
     add_test(NAME prism_ray_footprint_test COMMAND prism_ray_footprint_test)

@@ -24,7 +24,7 @@ using namespace prism::hydra::test;
 
 bool Available(prism::device::DeviceKind kind)
 {
-    for (auto const &info : prism::device::AvailableDevices())
+    for (auto const &info : prism::device::AvailableDevices(prism::RendererOptions::FromEnvironment().devices))
         if (info.kind == kind) return true;
     return false;
 }

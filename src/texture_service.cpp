@@ -154,7 +154,7 @@ int openFileLimit()
 
 // Memory admitted to cold preparations at once. A preparation holds the
 // decoded source, its float copy and the mip chain while it runs (about
-// 2.5 x 4WHC; see TexturePreparationThreadCount), so callers that prepare
+// 2.5 x 4WHC; see resource_limits.h), so callers that prepare
 // many images concurrently, such as a UDIM family, wait here instead of
 // exhausting memory. An image larger than the whole budget runs alone.
 class PreparationBudget {
@@ -806,7 +806,7 @@ struct PendingTexture {
 
 // Threads writing prepared .tx.exr files after their GPU-ready copies were
 // published, so a GPU device need not wait for them. At most
-// TexturePreparationThreadCount() run at once; queued jobs hold their
+// Limits::TexturePreparationThreads() run at once; queued jobs hold their
 // preparation-budget reservation, which bounds their memory. Destruction
 // finishes every queued job.
 // Writers run beside the decodes that feed them and the MDL compiles;

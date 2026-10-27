@@ -700,6 +700,8 @@ struct VulkanDevice::Impl {
     std::thread earlyWorker;
     bool earlyStop = false, earlyPaused = false, earlyBusy = false;
     uint64_t earlyBytes = 0, earlyBudget = 0;
+    // DeviceOptions::initialTextureBudgetMiB: the budget of the early uploads.
+    int initialTextureBudgetMiB = 0;
     std::vector<gpu::ImageFootprint> earlyFootprints; // every image offered since the last scene
     uint32_t earlyUploaded = 0, earlySkipped = 0;
     double earlySeconds = 0.0;
@@ -1284,7 +1286,7 @@ bool VulkanDevice::Impl::initialize(std::string* reason)
         for (uint32_t h = 0; h < memoryProperties.memoryHeapCount; ++h)
             if (memoryProperties.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
                 deviceLocal = std::max<uint64_t>(deviceLocal, memoryProperties.memoryHeaps[h].size);
-        earlyBudget = gpu::TextureBudget(deviceLocal, prism::defaults::FromEnvironment().gpuTextureBudgetMiB);
+        earlyBudget = gpu::TextureBudget(deviceLocal, initialTextureBudgetMiB);
         vkCreateCommandPool(device, &poolInfo, nullptr, &earlyPool);
         vkCreateFence(device, &fenceInfo, nullptr, &earlyFence);
         if (earlyPool && earlyFence)
@@ -3421,18 +3423,17 @@ bool VulkanDevice::Impl::dispatch(GpuFrame const& work, uint32_t threads, double
     return true;
 }
 
-std::unique_ptr<VulkanDevice> VulkanDevice::Create(std::string* reason)
+std::unique_ptr<VulkanDevice> VulkanDevice::Create(int initialTextureBudgetMiB, std::string* reason)
 {
-    if (const char* disabled = std::getenv("PRISM_DISABLE_VULKAN"); disabled && *disabled && *disabled != '0') {
-        if (reason) *reason = "disabled by PRISM_DISABLE_VULKAN";
-        return nullptr;
-    }
+    // DeviceOptions::disableVulkan (PRISM_DISABLE_VULKAN) is checked by
+    // CreateDevice (device.cpp).
     std::string source;
     if (!gpu::LoadShaderSource("gpu/kernel.hlsl", &source)) {
         if (reason) *reason = "the Vulkan kernel sources are missing";
         return nullptr;
     }
     auto impl = std::make_unique<Impl>();
+    impl->initialTextureBudgetMiB = initialTextureBudgetMiB;
     if (!impl->initialize(reason)) return nullptr;
     return std::unique_ptr<VulkanDevice>(new VulkanDevice(std::move(impl)));
 }

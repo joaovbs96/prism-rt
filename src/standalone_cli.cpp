@@ -8,6 +8,7 @@
 #include "device/device.h"
 #include "device/light_table.h"
 #include "color/color_management.h"
+#include "renderer/renderer_context.h"
 #include "output/image_writer.h"
 #include "output/render_products.h"
 #include <pxr/usd/usdGeom/camera.h>
@@ -764,8 +765,11 @@ int runStandaloneCli(int argc, char** argv) {
             help();
             return 0;
         }
+        // The renderer's options: the environment's (OCIO, PRISM_*), which
+        // flags and render settings override below.
+        prism::RendererOptions rendererOptions = prism::RendererOptions::FromEnvironment();
         if (argc == 2 && std::string(argv[1]) == "--list-devices") {
-            for (auto const& info : prism::device::AvailableDevices())
+            for (auto const& info : prism::device::AvailableDevices(rendererOptions.devices))
                 std::cout << prism::device::ToString(info.kind) << ": " << info.name
                           << (info.hardwareRayTracing ? " (hardware ray tracing)" : "") << '\n';
             return 0;
@@ -861,6 +865,14 @@ int runStandaloneCli(int argc, char** argv) {
                                      "render var) but " + reason);
         }
         const UsdTimeCode time = o.time ? UsdTimeCode(*o.time) : UsdTimeCode::Default();
+        // Colour options from the flags and render settings; the config
+        // defaults to the renderer's ($OCIO).
+        if (o.color.config.empty()) o.color.config = rendererOptions.color.config;
+        rendererOptions.color = o.color;
+        // Every loader takes its MDL modules from the MaterialX libraries'
+        // mdl directory.
+        rendererOptions.materials.materialxMdlPath = rendererOptions.materials.materialxLibraries + "/mdl";
+        const prism::RendererContext renderer(rendererOptions);
         // Before anything loads: materials, lights and textures convert into
         // the working space as they are read.
         const auto colorManagement = prism::color::Activate(o.color);
@@ -914,8 +926,8 @@ int runStandaloneCli(int argc, char** argv) {
         // Before any material loads.
         DocumentLoader::SetSssFallback(o.sssFallback);
         SceneManager scene(device.value);
-        const char* libraries = std::getenv("PRISM_MATERIALX_LIBRARY_PATH");
-        const std::string libraryPath = libraries ? libraries : "";
+        const std::string libraryPath = renderer.options().materials.materialxLibraries;
+        const std::string mdlPath = renderer.options().materials.materialxMdlPath;
         std::unique_ptr<Mesh> mesh;
         // Subdivision surfaces and load-time displacement (USD meshes; OBJ
         // faces their MTL disp displaces).
@@ -936,13 +948,14 @@ int runStandaloneCli(int argc, char** argv) {
             }
             load.time = time;
             load.subdivision = subdivision;
-            mesh = std::make_unique<USDMesh>(stage, &context, libraryPath, libraryPath + "/mdl", std::move(load));
+            load.renderer = renderer.options();
+            mesh = std::make_unique<USDMesh>(stage, &context, libraryPath, mdlPath, std::move(load));
         }
         else if (extension == ".gltf" || extension == ".glb") {
-            mesh = std::make_unique<glTFMesh>(o.scene, &context, libraryPath, libraryPath + "/mdl");
+            mesh = std::make_unique<glTFMesh>(o.scene, &context, libraryPath, mdlPath);
         }
         else if (extension == ".obj")
-            mesh = std::make_unique<ObjMesh>(o.scene, &context, libraryPath, libraryPath + "/mdl", subdivision);
+            mesh = std::make_unique<ObjMesh>(o.scene, &context, libraryPath, mdlPath, subdivision);
         else throw std::runtime_error("Unsupported scene format: " + extension);
         const auto usdMesh = dynamic_cast<USDMesh*>(mesh.get());
         if (usdMesh ? usdMesh->renderablePlacementCount() == 0
@@ -1114,7 +1127,7 @@ int runStandaloneCli(int argc, char** argv) {
         }
         progress.Stage("Creating the render device");
         std::string deviceNote;
-        auto renderDevice = prism::device::CreateDevice(o.device, &deviceNote);
+        auto renderDevice = prism::device::CreateDevice(o.device, renderer.options().devices, &deviceNote);
         progress.Stage("");
         if (!deviceNote.empty()) std::cerr << "PrismRT: " << deviceNote << '\n';
         const auto deviceInfo = renderDevice->Info();

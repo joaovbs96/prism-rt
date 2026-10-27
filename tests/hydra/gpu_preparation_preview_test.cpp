@@ -31,7 +31,7 @@ void SetEnvironment(const char *name, const char *value)
 
 bool VulkanAvailable()
 {
-    for (auto const &info : prism::device::AvailableDevices())
+    for (auto const &info : prism::device::AvailableDevices(prism::RendererOptions::FromEnvironment().devices))
         if (info.kind == prism::device::DeviceKind::Vulkan) return true;
     return false;
 }

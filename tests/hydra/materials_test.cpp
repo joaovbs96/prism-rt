@@ -28,6 +28,16 @@ using namespace prism::materials;
 
 namespace {
 
+// The environment's options (as the front ends take them) with the MaterialX
+// libraries given.
+prism::RendererOptions ServiceOptions(const std::filesystem::path& libraries)
+{
+    auto options = prism::RendererOptions::FromEnvironment();
+    options.materials.materialxLibraries = libraries.string();
+    options.materials.materialxMdlPath = (libraries / "mdl").string();
+    return options;
+}
+
 HdContainerDataSourceHandle MakeMaterial(bool materialXContext,
                                          const std::string& texturePath,
                                          const std::string& resolvedTexturePath,
@@ -173,8 +183,7 @@ int main()
         return 14;
     }
 
-    MaterialService service(&context, libraries.string(),
-        (libraries / "mdl").string());
+    MaterialService service(&context, ServiceOptions(libraries));
 
     const SdfPath materialPath("/Looks/Test");
     const std::string relativeTexture = texture.filename().string();
@@ -242,12 +251,10 @@ int main()
 
     std::shared_ptr<Material> survivor;
     {
-        MaterialService transient(&context, libraries.string(),
-            (libraries / "mdl").string());
+        MaterialService transient(&context, ServiceOptions(libraries));
         survivor = transient.Resolve(universal, materialPath);
     }
-    MaterialService replacement(&context, libraries.string(),
-        (libraries / "mdl").string());
+    MaterialService replacement(&context, ServiceOptions(libraries));
     const auto replacementBefore = replacement.GetStats();
     const auto afterReplacement = replacement.Resolve(universal, materialPath);
     const auto replacementAfter = replacement.GetStats();
