@@ -2,6 +2,11 @@
 
 Phase reports, newest first. Detailed reports live in `local/reports/` (git-ignored).
 
+## 2026-10-27 — `--env` convention and tagged uniform colours
+- The CLI's `--env` dropped a historical ×2 (`EnvironmentMap`'s default multiplier) and now matches a UsdLux dome of the same HDR (NRMSE 3.7e-8); USD domes, `--env-color` and the default dome were already unscaled. Earlier `--env` renders: add `--env-exposure 1` to reproduce.
+- A colour-space tag on a constant feeding a uniform MDL input (`gltf_pbr` `attenuation_color`) failed with C219 and rendered magenta in USD scenes (found converting DragonAttenuation for Hydra); `DocumentLoader` converts such constants to the working space up front, and such materials stay out of templates.
+- 414/414 tests in the main checkout. Report: `local/reports/env_uniform_fix.md`. Status: merged locally, not pushed.
+
 ## 2026-10-27 — Denoising, part 2: vk_oidn on the Vulkan device
 - vk_oidn 0.2.0 (NVIDIA's prebuilt SDK package, OIDN 2.5.1 weights; `tools/ci/fetch_vk_oidn.ps1`) with OIDN's albedo/normal prefilter networks packed for it; the Vulkan device enables its features when the GPU has them, denoises whole-image renders on its accumulation (resolve pass) and the delegate's host images by upload; OIDN's CPU device on host copies otherwise (`PRISM_GPU_DENOISER=cpu` forces it). The CLI and the delegate name the denoiser.
 - 1080p high, RTX 4070 Ti, first denoise with set-up: 177 ms (GPU 36 ms), 481 ms prefiltered (GPU 88 ms); generic convolutions 92 / 360 ms; OIDN CPU 448 / 2866 ms. GPU vs CPU denoised on the same raw render: NRMSE 1.3e-3–1.4e-3. 16 spp error ratio 0.274 (CPU 0.264).
