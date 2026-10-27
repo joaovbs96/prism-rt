@@ -14,7 +14,7 @@ the texture service, the MaterialX generator and the render devices read it.
 | Setting | CLI | Hydra render setting | Default |
 | --- | --- | --- | --- |
 | Config | `--ocio-config FILE\|URI` | `prism:colorManagement:ocioConfig` | `$OCIO`, else `ocio://studio-config-latest` |
-| Working space | `--working-space NAME` | `prism:colorManagement:workingSpace` | `ACEScg` (the config's `scene_linear` role if it has no ACEScg) |
+| Working space | `--working-space NAME` | `prism:colorManagement:workingSpace`, else the settings prim's `renderingColorSpace` | `ACEScg` (the config's `scene_linear` role if it has no ACEScg) |
 | Display | `--display NAME` | `prism:colorManagement:display` | the config's default display |
 | View | `--view NAME` | `prism:colorManagement:view` | the display's default view |
 
@@ -31,6 +31,37 @@ the texture service, the MaterialX generator and the render devices read it.
 - The CLI reads the stage's `prism:colorManagement:*` attributes on the
   RenderSettings prim named by `renderSettingsPrimPath`, as the Hydra delegate
   does; command-line options take precedence.
+- **`renderingColorSpace`**, the standard `UsdRenderSettings` attribute
+  ("the rendering color space the renderer should use for internal color
+  calculations"), is the working space when neither `--working-space` nor
+  `prism:colorManagement:workingSpace` names one. Precedence: flag >
+  `prism:colorManagement:workingSpace` > `renderingColorSpace` > ACEScg. Both
+  loaders read it from the active settings prim (the CLI through
+  `ResolveRenderJob`, the delegate from the Hydra render settings schema).
+  `prism::color::RenderingColorSpaceWorkingSpace` maps its token:
+  - USD's names (`GfColorSpaceNames`: `lin_rec709_scene`, `lin_ap1_scene`,
+    `lin_p3d65_scene`, `lin_rec2020_scene`, `lin_adobergb_scene`, ...)
+    resolve through the config's aliases (the studio config has the ASWF
+    interop names), e.g. `lin_ap1_scene` is ACEScg.
+  - `data`, `raw` and `identity` render in **linear Rec.709**. Typhoon
+    (NVIDIA's proposed reference renderer) documents `data` as "bypasses
+    source color transforms"; PrismRT has no mode that skips them, and linear
+    Rec.709 is the space USD authors untagged values and light colours in, so
+    those reach the image unchanged exactly as with no transforms. Only
+    inputs tagged with another space (a `colorSpace`, a MaterialX
+    `colorspace`, an sRGB image) still convert. See docs/DECISIONS.md.
+  - `unknown` and an unauthored attribute take the default (ACEScg). A name
+    the config lacks or a space that is not scene-linear (`srgb_rec709_scene`,
+    `g22_ap1_scene`) also takes the default, with a message (`PrismRT:
+    renderingColorSpace '...' is not a scene-linear colour space ...`)
+    instead of failing the render: the attribute is authored for every
+    renderer.
+  - Typhoon's default is `lin_rec709_scene`; PrismRT's stays ACEScg. A stage
+    that wants the same image in both authors the attribute.
+  Tests: `ctest -R color_rendering_space` (both loaders: the patches in linear
+  Rec.709 and bit-identical to `--working-space lin_rec709`; the flag and
+  `prism:colorManagement:workingSpace` override it) and
+  `prism_color_management_test` (the token mapping).
 - In Hydra, changing the config or working space rebuilds the scene
   (materials, lights, domes and their textures convert again). Display and
   view are only recorded there: the colour AOV is linear.

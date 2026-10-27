@@ -938,6 +938,16 @@ called done there.
     `tests/hydra/fixtures/gltf_uniform_colorspace.usda` with
     `prism_hydra_render` and `PrismRT --device metal`: no `C219` or magenta
     error material, and within noise of `--device cpu`.
+- **`renderingColorSpace` sets the working space** ([color_management.md](color_management.md#config-working-space-and-view)):
+  shared host code only: `src/color/color_management.{h,cpp}`
+  (`Options::renderingColorSpace`, `RenderingColorSpaceWorkingSpace`),
+  `src/hydra/task_delegate.cpp` (reads it from the active settings prim) and
+  `src/hydra/scene_bridge.cpp` (a change rebuilds the scene). No shader or
+  device change.
+  - Runs: `ctest -R color_rendering_space` (CPU); then
+    `tests/hydra/fixtures/color_rendering_space.usda` with `prism_hydra_render
+    ... /World/Camera out.exr 128 64 4 --max-depth 1` on Metal and
+    `prism_color_management_test --check-patches out.exr lin_rec709`.
 
 ## Diagnostics
 
