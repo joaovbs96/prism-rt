@@ -121,6 +121,41 @@ void TestMatrices()
     Check(threw, "an unknown view is refused");
 }
 
+// UsdRenderSettings.renderingColorSpace: the working space below
+// --working-space / prism:colorManagement:workingSpace.
+void TestRenderingColorSpace()
+{
+    using prism::color::RenderingColorSpaceWorkingSpace;
+    std::string warning;
+    Check(RenderingColorSpaceWorkingSpace("lin_rec709_scene", "", &warning) == "Linear Rec.709 (sRGB)" &&
+              warning.empty(), "lin_rec709_scene is linear Rec.709");
+    Check(RenderingColorSpaceWorkingSpace("lin_ap1_scene", "") == "ACEScg", "lin_ap1_scene is ACEScg");
+    for (const char* bypass : {"data", "raw", "identity"})
+        Check(RenderingColorSpaceWorkingSpace(bypass, "") == "Linear Rec.709 (sRGB)",
+              std::string(bypass) + " takes linear Rec.709 (no source transforms)");
+    Check(RenderingColorSpaceWorkingSpace("unknown", "", &warning).empty() && warning.empty() &&
+              RenderingColorSpaceWorkingSpace("", "").empty(), "unknown and empty take the default");
+    for (const char* refused : {"srgb_rec709_scene", "no_such_space"}) {
+        Check(RenderingColorSpaceWorkingSpace(refused, "", &warning).empty() && !warning.empty(),
+              std::string(refused) + " takes the default with a warning");
+    }
+
+    prism::color::Options options;
+    options.renderingColorSpace = "lin_rec709_scene";
+    auto rendering = prism::color::ColorManagement::Create(options);
+    Check(rendering->rec709() && rendering->workingSpace() == "Linear Rec.709 (sRGB)",
+          "renderingColorSpace sets the working space: " + rendering->workingSpace());
+    options.workingSpace = "acescg";
+    Check(prism::color::ColorManagement::Create(options)->workingSpace() == "ACEScg",
+          "workingSpace takes precedence over renderingColorSpace");
+    options = {};
+    options.renderingColorSpace = "srgb_rec709_scene";
+    Check(prism::color::ColorManagement::Create(options)->workingSpace() == "ACEScg",
+          "a non-linear renderingColorSpace keeps the default working space");
+    options.renderingColorSpace = "data";
+    Check(prism::color::ColorManagement::Create(options)->rec709(), "data renders in linear Rec.709");
+}
+
 void TestViews()
 {
     auto legacy = prism::color::ColorManagement::Create(Legacy());
@@ -392,6 +427,7 @@ int main(int argc, char** argv)
         if (argc >= 4 && std::string(argv[1]) == "--side-by-side")
             return SideBySide(argv[2], std::vector<std::string>(argv + 3, argv + argc));
         TestMatrices();
+        TestRenderingColorSpace();
         TestViews();
         TestConversions();
         const char* cache = std::getenv("PRISM_CACHE_DIR");

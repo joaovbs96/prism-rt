@@ -1,0 +1,20 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    renderSettingsPrimPath = "/Render/Settings"
+    subLayers = [@color_management.usda@]
+    upAxis = "Y"
+)
+
+# color_management.usda with the standard UsdRenderSettings
+# renderingColorSpace: both loaders render it in linear Rec.709, as with
+# --working-space lin_rec709 (docs/color_management.md).
+def Scope "Render"
+{
+    def RenderSettings "Settings"
+    {
+        rel camera = </World/Camera>
+        uniform int2 resolution = (128, 64)
+        uniform token renderingColorSpace = "lin_rec709_scene"
+    }
+}

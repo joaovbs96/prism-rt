@@ -907,6 +907,33 @@ if(TARGET prism_hydra_render AND TARGET prism_compare_images AND TARGET prism_co
                 ENVIRONMENT "${_prism_color_env}" FIXTURES_REQUIRED prism_parity_color_${_space})
         endforeach()
     endforeach()
+    # UsdRenderSettings.renderingColorSpace sets the working space in both
+    # loaders (the same image as --working-space lin_rec709); --working-space
+    # and prism:colorManagement:workingSpace take precedence over it.
+    prism_add_parity_fixture(NAME color_rendering_space SCENE tests/hydra/fixtures/color_rendering_space.usda
+        WIDTH 128 HEIGHT 64 SPP 4 ARGS --max-depth 1)
+    prism_add_parity_fixture(NAME color_rendering_space_flag SCENE tests/hydra/fixtures/color_rendering_space.usda
+        WIDTH 128 HEIGHT 64 SPP 4 ARGS --max-depth 1 --working-space acescg)
+    prism_add_parity_fixture(NAME color_rendering_space_setting
+        SCENE tests/hydra/fixtures/color_rendering_space_setting.usda WIDTH 128 HEIGHT 64 SPP 4 ARGS --max-depth 1)
+    foreach(_case color_rendering_space:lin_rec709 color_rendering_space_flag:acescg
+            color_rendering_space_setting:acescg)
+        string(REPLACE ":" ";" _parts "${_case}")
+        list(GET _parts 0 _name)
+        list(GET _parts 1 _space)
+        foreach(_loader cli hydra)
+            add_test(NAME prism_${_name}_${_loader}_patches
+                COMMAND prism_color_management_test --check-patches
+                    "${prism_parity_${_name}_dir}/${_loader}/image.exr" ${_space})
+            set_tests_properties(prism_${_name}_${_loader}_patches PROPERTIES
+                ENVIRONMENT "${_prism_color_env}" FIXTURES_REQUIRED prism_parity_${_name})
+            add_test(NAME prism_${_name}_${_loader}_matches_working_space
+                COMMAND prism_compare_images "${prism_parity_color_${_space}_dir}/${_loader}/image.exr"
+                    "${prism_parity_${_name}_dir}/${_loader}/image.exr" --exact)
+            set_tests_properties(prism_${_name}_${_loader}_matches_working_space PROPERTIES
+                FIXTURES_REQUIRED "prism_parity_${_name};prism_parity_color_${_space}")
+        endforeach()
+    endforeach()
     add_test(NAME prism_color_view_render
         COMMAND PrismRT --scene "${_prism_color_fixture}" --camera /World/Camera
             --width 128 --height 64 --spp 4 --max-depth 1 ${_prism_fixed_sampling} --device cpu --output "${_prism_color}/cli_view.png")

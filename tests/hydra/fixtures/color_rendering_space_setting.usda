@@ -1,0 +1,17 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    renderSettingsPrimPath = "/Render/Settings"
+    subLayers = [@color_rendering_space.usda@]
+    upAxis = "Y"
+)
+
+# color_rendering_space.usda with prism:colorManagement:workingSpace, which
+# takes precedence over renderingColorSpace: the render is in ACEScg.
+over "Render"
+{
+    over "Settings"
+    {
+        string prism:colorManagement:workingSpace = "ACEScg"
+    }
+}
