@@ -4271,8 +4271,12 @@ bool _IntegerAov(AovKind kind) { return prism::output::IntegerAov(kind); }
 // colour, over the same samples.
 bool _LightAov(AovKind kind) { return prism::output::LightAov(kind); }
 
-// Outputs of the path tracer: the colour and the light AOVs.
-bool _TracedAov(AovKind kind) { return kind == AovKind::Color || _LightAov(kind); }
+// Outputs of the path tracer: the colour, the light AOVs and the denoised
+// colour (written by the denoiser, not by the passes).
+bool _TracedAov(AovKind kind)
+{
+    return kind == AovKind::Color || _LightAov(kind) || kind == AovKind::Denoised;
+}
 
 Color3 const &_LightAovValue(prism::device::LightAovPixel const &pixel, AovKind kind)
 {
@@ -4307,6 +4311,103 @@ void _ResolvePrimaryAov(AovKind kind, RayHit const &hit, CameraState const &came
         prism::output::ResolveGeometricAov(kind, hit, camera.worldToView, camera.projection, values);
     }
 }
+
+// One denoise of the accumulation (docs/denoising.md): its means, copied
+// when it starts, and the denoised colour, top row first.
+struct DenoiseJob {
+    unsigned int width = 0, height = 0;
+    uint64_t samples = 0;
+    std::shared_ptr<const PublishedFrame> frame;
+    prism::device::DenoiseSettings settings;
+    // Null: the build has no denoiser and the output is the raw colour.
+    std::shared_ptr<prism::device::Denoiser> denoiser;
+    // RGBA colour, then albedo and normal (kDenoiseFloats per pixel).
+    std::vector<float> input;
+    std::vector<float> output; // RGBA
+    std::string error;
+    double milliseconds = 0.0;
+    std::atomic<bool> done{false};
+    bool published = false; // render worker only
+};
+
+// Per pixel: the colour's RGBA sums, then the albedo's and the normal's.
+constexpr size_t kDenoiseFloats = 10;
+
+void _ExecuteDenoise(DenoiseJob &job)
+{
+    const size_t pixels = static_cast<size_t>(job.width) * job.height;
+    job.output.resize(pixels * 4);
+    for (size_t p = 0; p < pixels; ++p)
+        std::copy_n(job.input.data() + p * kDenoiseFloats, 4, job.output.data() + 4 * p);
+    if (!job.denoiser) return;
+    const auto start = std::chrono::steady_clock::now();
+    prism::device::DenoiseRequest request;
+    request.width = job.width;
+    request.height = job.height;
+    request.color = {job.input.data(), unsigned(kDenoiseFloats)};
+    request.albedo = {job.input.data() + 4, unsigned(kDenoiseFloats)};
+    request.normal = {job.input.data() + 7, unsigned(kDenoiseFloats)};
+    // In the RGB of the RGBA output; alpha stays the coverage.
+    request.output = job.output.data();
+    request.outputStride = 4;
+    request.settings = job.settings;
+    try {
+        job.denoiser->Denoise(request);
+    } catch (std::exception const &error) {
+        job.error = error.what();
+        for (size_t p = 0; p < pixels; ++p)
+            std::copy_n(job.input.data() + p * kDenoiseFloats, 4, job.output.data() + 4 * p);
+    }
+    job.milliseconds = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - start).count();
+}
+
+// Runs denoise jobs off the render worker, the latest submitted first: the
+// worker never waits for a denoise (it publishes finished jobs at pass
+// boundaries). The thread starts with the first job and coordinates only;
+// OIDN's CPU device runs on the process's oneTBB.
+class DenoiseWorker {
+public:
+    ~DenoiseWorker()
+    {
+        {
+            std::lock_guard lock(m_mutex);
+            m_stop = true;
+        }
+        m_wake.notify_all();
+        if (m_thread.joinable()) m_thread.join();
+    }
+    void Submit(std::shared_ptr<DenoiseJob> job)
+    {
+        std::lock_guard lock(m_mutex);
+        if (!m_thread.joinable()) m_thread = std::thread([this] { Run(); });
+        // A job not started yet is replaced (its accumulation moved on).
+        if (m_pending) m_pending->done.store(true, std::memory_order_release);
+        m_pending = std::move(job);
+        m_wake.notify_all();
+    }
+
+private:
+    void Run()
+    {
+        for (;;) {
+            std::shared_ptr<DenoiseJob> job;
+            {
+                std::unique_lock lock(m_mutex);
+                m_wake.wait(lock, [&] { return m_stop || m_pending; });
+                if (m_stop) return;
+                job = std::move(m_pending);
+            }
+            _ExecuteDenoise(*job);
+            job->done.store(true, std::memory_order_release);
+        }
+    }
+    std::mutex m_mutex;
+    std::condition_variable m_wake;
+    std::shared_ptr<DenoiseJob> m_pending;
+    bool m_stop = false;
+    std::thread m_thread;
+};
 
 PreviewResult _RenderPreview(std::shared_ptr<Snapshot> const &snapshot,
     CameraState const &camera, RenderSettings const &settings,
@@ -4350,7 +4451,8 @@ PreviewResult _RenderPreview(std::shared_ptr<Snapshot> const &snapshot,
         target.buffer = buffer;
         target.name = binding.aovName;
         target.kind = _AovKind(binding.aovName);
-        if (binding.aovName == HdAovTokens->color) {
+        // The denoised AOV shows the raw preview until the first denoise.
+        if (prism::output::ColorAov(target.kind)) {
             target.components = 4; target.floats.resize(pixels * 4);
         } else if (_LightAov(target.kind)) {
             target.components = 3; target.floats.resize(pixels * 3);
@@ -4408,7 +4510,7 @@ PreviewResult _RenderPreview(std::shared_ptr<Snapshot> const &snapshot,
         const size_t pixel =
             (static_cast<size_t>(result.height - 1 - py) * result.width + px);
         for (Target &target : targets) {
-            if (target.kind == AovKind::Color) {
+            if (prism::output::ColorAov(target.kind)) {
                 float *dst = target.floats.data() + pixel * 4;
                 dst[0] = color.x(); dst[1] = color.y();
                 dst[2] = color.z(); dst[3] = coverage;
@@ -4441,7 +4543,7 @@ PreviewResult _RenderPreview(std::shared_ptr<Snapshot> const &snapshot,
         else
             target.buffer->PublishPreviewFloat(result.width, result.height,
                                                 target.floats, target.components, frame,
-                                                target.kind == AovKind::Color);
+                                                prism::output::ColorAov(target.kind));
     }
     result.publicationMilliseconds = 1000.0 * std::chrono::duration<double>(
         std::chrono::steady_clock::now() - publicationStart).count();
@@ -4937,6 +5039,34 @@ public:
     // still sampled.
     std::vector<float> adaptiveSums;
     prism::device::ActivePixels adaptiveActive;
+    // Denoising (docs/denoising.md; render worker): the accumulation's sums
+    // as the denoiser takes them (kDenoiseFloats per pixel) and their sample
+    // counts, kept while it resumes; the latest denoise (in flight, or done
+    // and maybe not yet published) and what it denoised.
+    std::vector<float> denoiseSums;
+    std::vector<uint32_t> denoiseCounts;
+    std::shared_ptr<DenoiseJob> denoiseJob;
+    uint64_t denoisedSamples = 0;
+    prism::device::DenoiseSettings denoisedSettings;
+    bool denoiserWarned = false;
+    std::atomic<uint64_t> denoisesPublished{0};
+    std::atomic<double> lastDenoiseMilliseconds{0.0};
+    std::string denoiserName; // under mutex
+    std::unique_ptr<DenoiseWorker> denoiseWorker;
+    // A new accumulation of `pixels` pixels (0: not denoised). A denoise in
+    // flight finishes on the worker unseen.
+    void ResetDenoise(size_t pixels)
+    {
+        if (pixels) {
+            denoiseSums.assign(pixels * kDenoiseFloats, 0.0f);
+            denoiseCounts.assign(pixels, 0u);
+        } else {
+            std::vector<float>().swap(denoiseSums);
+            std::vector<uint32_t>().swap(denoiseCounts);
+        }
+        denoiseJob.reset();
+        denoisedSamples = 0;
+    }
     // Progress of the accumulation (percentDone): the fraction of pixels
     // adaptive sampling still traces, and the elapsed fraction of the time
     // limit. Written by the render worker.
@@ -5293,6 +5423,9 @@ void SceneBridge::SetSettings(RenderSettings const &requested)
             current.gpuPreparationPreview == settings.gpuPreparationPreview &&
             current.gpuPreparationPreviewMaxMiB == settings.gpuPreparationPreviewMaxMiB &&
             current.device == settings.device && current.color == settings.color &&
+            current.denoise == settings.denoise &&
+            current.denoiseInterval == settings.denoiseInterval &&
+            current.denoiseSettings == settings.denoiseSettings &&
             current.materialBindingPurposes == settings.materialBindingPurposes)
             return;
         bindingsChanged = current.materialBindingPurposes != settings.materialBindingPurposes;
@@ -5319,9 +5452,15 @@ void SceneBridge::SetSettings(RenderSettings const &requested)
             current.environmentSampling != settings.environmentSampling ||
             current.domeLightCameraVisibility != settings.domeLightCameraVisibility ||
             current.device != settings.device || colorChanged || bindingsChanged ||
-            geometryChanged || sssChanged;
+            geometryChanged || sssChanged ||
+            // Denoising needs its guides from the accumulation's first sample.
+            current.denoise != settings.denoise;
+        // Other denoise settings resume the accumulation, which then denoises
+        // again with them (a converged render at once).
         budgetChanged = current.samples != settings.samples ||
-            current.timeLimitSeconds != settings.timeLimitSeconds;
+            current.timeLimitSeconds != settings.timeLimitSeconds ||
+            current.denoiseInterval != settings.denoiseInterval ||
+            current.denoiseSettings != settings.denoiseSettings;
         if (budgetChanged && !imageChanged && _converged.load() &&
             _impl->samples.load() != 0 &&
             std::none_of(_impl->bindings.begin(), _impl->bindings.end(),
@@ -6532,14 +6671,20 @@ void SceneBridge::Render()
     }
     bindings = std::move(uniqueBindings);
     // hasColor: some bound output is path traced (the colour or a light AOV).
-    bool hasColor = false, hasGeometric = false, hasLight = false;
+    bool hasColor = false, hasGeometric = false, hasLight = false, hasDenoised = false;
     for (auto const &binding : bindings) {
         if (!dynamic_cast<PrismRenderBuffer *>(binding.renderBuffer)) continue;
         const AovKind kind = _AovKind(binding.aovName);
         hasColor |= _TracedAov(kind);
         hasLight |= _LightAov(kind);
+        hasDenoised |= kind == AovKind::Denoised;
         hasGeometric |= !_TracedAov(kind) && kind != AovKind::Unknown;
     }
+    // Denoising (docs/denoising.md): the displayed colour (prism:denoise) or
+    // a bound denoised AOV. Its albedo and normal guides come with the light
+    // AOVs; without it nothing below changes.
+    const bool denoising = hasColor && (settings.denoise || hasDenoised);
+    hasLight |= denoising;
     const int sampleCount = hasColor ? std::max(1, settings.samples) : 1;
     if (!snapshot || !snapshot->scene || width == 0 || height == 0) {
         for (HdRenderPassAovBinding const &binding : bindings)
@@ -6692,7 +6837,11 @@ void SceneBridge::Render()
         _impl->activePixelFraction.store(1.0);
         _impl->timeLimitFraction.store(0.0);
         _impl->timeLimitReached.store(false);
+        _impl->ResetDenoise(denoising ? static_cast<size_t>(width) * height : 0);
     }
+    // A resumed accumulation keeps its sums (they always match its size).
+    if (denoising && _impl->denoiseCounts.size() != static_cast<size_t>(width) * height)
+        _impl->ResetDenoise(static_cast<size_t>(width) * height);
     prism::CameraRayParameters const cameraParameters =
         _CameraParameters(camera);
     prism::DumpCameraRayDiagnostics(
@@ -6744,6 +6893,77 @@ void SceneBridge::Render()
         }
         resolvedBindings.push_back({buffer, kind, plane});
     }
+    // Starts a denoise of the accumulation so far on the denoise worker.
+    auto launchDenoise = [&] {
+        const size_t count = static_cast<size_t>(width) * height;
+        auto job = std::make_shared<DenoiseJob>();
+        job->width = width;
+        job->height = height;
+        job->samples = _impl->samples.load();
+        job->frame = frame;
+        job->settings = settings.denoiseSettings;
+        std::string error;
+        job->denoiser = renderDevice->CreateDenoiser(&error);
+        if (!job->denoiser && !_impl->denoiserWarned) {
+            _impl->denoiserWarned = true;
+            TF_WARN("PrismRT: cannot denoise (%s); the denoised colour is the raw colour", error.c_str());
+        }
+        job->input.resize(count * kDenoiseFloats);
+        float const *sums = _impl->denoiseSums.data();
+        uint32_t const *counts = _impl->denoiseCounts.data();
+        tbb::parallel_for(size_t(0), count, [&](size_t pixel) {
+            const float scale = counts[pixel] ? 1.0f / float(counts[pixel]) : 0.0f;
+            for (size_t i = 0; i < kDenoiseFloats; ++i)
+                job->input[pixel * kDenoiseFloats + i] = sums[pixel * kDenoiseFloats + i] * scale;
+        });
+        if (!_impl->denoiseWorker) _impl->denoiseWorker = std::make_unique<DenoiseWorker>();
+        _impl->denoiseWorker->Submit(job);
+        _impl->denoiseJob = std::move(job);
+        _impl->denoisedSamples = _impl->samples.load();
+        _impl->denoisedSettings = settings.denoiseSettings;
+    };
+    // Publishes a finished denoise of this accumulation: the denoised AOVs,
+    // and with prism:denoise the colour's display. True when one was.
+    auto publishDenoise = [&]() -> bool {
+        auto const job = _impl->denoiseJob;
+        if (!job || job->published || !job->done.load(std::memory_order_acquire)) return false;
+        job->published = true;
+        if (job->frame != frame || job->output.size() != static_cast<size_t>(width) * height * 4)
+            return false;
+        if (!job->error.empty()) TF_WARN("PrismRT: denoising failed: %s", job->error.c_str());
+        for (auto const &resolved : resolvedBindings) {
+            if (resolved.kind != AovKind::Denoised || !resolved.buffer) continue;
+            tbb::parallel_for(0u, height, [&](unsigned int y) {
+                for (unsigned int x = 0; x < width; ++x)
+                    resolved.buffer->WriteFloat(x, height - 1 - y,
+                        job->output.data() + (static_cast<size_t>(y) * width + x) * 4, 4, false);
+            });
+            resolved.buffer->Publish(frame);
+        }
+        if (settings.denoise) {
+            // Render-buffer rows are bottom-up float4, as the colour's.
+            auto bytes = std::make_shared<std::vector<uint8_t>>(job->output.size() * sizeof(float));
+            const size_t rowBytes = static_cast<size_t>(width) * 4 * sizeof(float);
+            for (unsigned int y = 0; y < height; ++y)
+                std::memcpy(bytes->data() + static_cast<size_t>(height - 1 - y) * rowBytes,
+                            job->output.data() + static_cast<size_t>(y) * width * 4, rowBytes);
+            std::shared_ptr<const std::vector<uint8_t>> shown = std::move(bytes);
+            for (auto const &resolved : resolvedBindings)
+                if (resolved.kind == AovKind::Color && resolved.buffer &&
+                    resolved.buffer->GetFormat() == HdFormatFloat32Vec4)
+                    resolved.buffer->SetDenoisedPresentation(shown, frame);
+        }
+        _impl->denoisesPublished.fetch_add(1);
+        _impl->lastDenoiseMilliseconds.store(job->milliseconds);
+        {
+            std::lock_guard lock(_impl->mutex);
+            _impl->denoiserName = job->denoiser ? job->denoiser->Name() : std::string("none (raw colour)");
+        }
+        return true;
+    };
+    auto denoiseInFlight = [&] {
+        return _impl->denoiseJob && !_impl->denoiseJob->done.load(std::memory_order_acquire);
+    };
     std::vector<Color3> passColors(hasColor ? scratchPixels : 0);
     std::vector<float> passCoverage(hasColor ? scratchPixels : 0);
     std::vector<prism::device::LightAovPixel> passLightAovs(hasLight ? scratchPixels : 0);
@@ -6836,6 +7056,13 @@ void SceneBridge::Render()
         if (_impl->renderThread->IsStopRequested()) return;
         while (_impl->renderThread->IsPauseRequested()) {
             if (_impl->renderThread->IsStopRequested()) return;
+            // Paused: show the accumulation so far denoised.
+            if (denoising) {
+                publishDenoise();
+                if (!denoiseInFlight() && _impl->samples.load() > _impl->denoisedSamples &&
+                    _impl->samples.load() > 0)
+                    launchDenoise();
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
         // Pass boundary: continue on the GPU from this sample index. The
@@ -6876,6 +7103,7 @@ void SceneBridge::Render()
                 _impl->adaptiveActive.Reset(width, height);
             }
             _impl->samples.store(0);
+            if (denoising) _impl->ResetDenoise(static_cast<size_t>(width) * height);
             _impl->textureStreamingRestarts.fetch_add(1);
             prism::load_profile::Mark("frame.texture_restart", "sample=" + std::to_string(sample));
             restarted = true;
@@ -6892,6 +7120,7 @@ void SceneBridge::Render()
                     [buffer](auto const &t) { return t.buffer == buffer; })) continue;
             auto base = buffer->CapturePublished();
             if (base.format != HdFormatFloat32Vec4 || base.frame != frame || !base.pixels) continue;
+            if (buffer->HasDenoisedPresentation(frame)) continue;
             displays.push_back({buffer, base, {}});
             displays.back().tiles.resize(tiles.size());
         }
@@ -6993,6 +7222,7 @@ void SceneBridge::Render()
             }
             waitMilliseconds += milliseconds(Clock::now()-waitStart);
             if (done) break;
+            if (denoising && !_impl->renderThread->IsStopRequested()) publishDenoise();
             if (!_impl->renderThread->IsStopRequested() && !displays.empty()) {
                 const auto payloadStart = Clock::now();
                 std::vector<size_t> completed;
@@ -7076,6 +7306,8 @@ void SceneBridge::Render()
                             const AovKind kind = resolved.kind;
                             if ((sample != 0 || restarted) && !_TracedAov(kind))
                                 continue;
+                            // Written by the denoise publication.
+                            if (kind == AovKind::Denoised) continue;
                             auto *buffer = resolved.buffer;
                             if (!buffer) continue;
                             const auto writeStart = _impl->profileBufferWrites
@@ -7124,6 +7356,7 @@ void SceneBridge::Render()
             // Geometric AOVs are deterministic and only written on sample 0.
             // Color changes every pass as accumulation progresses.
             if ((sample != 0 || restarted) && !_TracedAov(_AovKind(binding.aovName))) continue;
+            if (_AovKind(binding.aovName) == AovKind::Denoised) continue;
             if (auto *buffer = dynamic_cast<PrismRenderBuffer *>(binding.renderBuffer))
                 buffer->Publish(frame);
         }
@@ -7137,6 +7370,23 @@ void SceneBridge::Render()
             _impl->lastPassWaitMilliseconds = waitMilliseconds;
             _impl->lastPassPayloadMilliseconds = payloadMilliseconds;
             _impl->lastPassPublicationMilliseconds = publicationMilliseconds;
+        }
+        if (denoising) {
+            float *sums = _impl->denoiseSums.data();
+            uint32_t *counts = _impl->denoiseCounts.data();
+            tbb::parallel_for(size_t(0), passColors.size(), [&](size_t pixel) {
+                if (!traced(pixel)) return;
+                float *s = sums + kDenoiseFloats * pixel;
+                Color3 const &c = passColors[pixel];
+                auto const &a = passLightAovs[pixel];
+                for (int i = 0; i < 3; ++i) {
+                    s[i] += c[i];
+                    s[4 + i] += a.albedo[i];
+                    s[7 + i] += a.normal[i];
+                }
+                s[3] += passCoverage[pixel];
+                ++counts[pixel];
+            });
         }
         if (adaptive.Enabled()) {
             float *sums = _impl->adaptiveSums.data();
@@ -7163,12 +7413,35 @@ void SceneBridge::Render()
         }
         _impl->committedRngStates.swap(rngStates);
         _impl->samples.store(static_cast<uint64_t>(sample + 1));
+        if (denoising) {
+            publishDenoise();
+            // Every denoiseInterval passes (the last pass denoises below).
+            if (!denoiseInFlight() && sample + 1 < sampleCount &&
+                static_cast<uint64_t>(sample + 1) >=
+                    _impl->denoisedSamples + static_cast<uint64_t>(std::max(1, settings.denoiseInterval)))
+                launchDenoise();
+        }
         if (sample == 0 && !restarted) {
             std::vector<AovPlane>().swap(primaryPlanes);
             prism::load_profile::Mark("frame.full_sample", "generation=" + std::to_string(generation));
         }
     }
     if (_impl->renderThread->IsStopRequested()) return;
+    // The final denoise: the last samples with the current settings. The
+    // worker waits for it here, still answering a stop at once.
+    if (denoising && _impl->samples.load() > 0) {
+        for (;;) {
+            if (_impl->renderThread->IsStopRequested()) return;
+            publishDenoise();
+            if (!denoiseInFlight()) {
+                const bool current = _impl->denoiseJob && _impl->denoisedSamples == _impl->samples.load() &&
+                    _impl->denoisedSettings == settings.denoiseSettings;
+                if (!current) launchDenoise();
+                else if (_impl->denoiseJob->published) break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+    }
     for (HdRenderPassAovBinding const &binding : bindings)
         if (auto *buffer = dynamic_cast<PrismRenderBuffer *>(binding.renderBuffer))
             buffer->SetConverged(!preparing);
@@ -7295,6 +7568,10 @@ VtDictionary SceneBridge::GetStats() const
         std::clamp(100.0 * progress, 0.0, std::nextafter(100.0, 0.0)));
     result["activePixelFraction"] = VtValue(active);
     result["timeLimitReached"] = VtValue(_impl->timeLimitReached.load());
+    // Denoising (docs/denoising.md): denoises shown and the last one's time.
+    result["denoises"] = VtValue(static_cast<int64_t>(_impl->denoisesPublished.load()));
+    result["denoiseMilliseconds"] = VtValue(_impl->lastDenoiseMilliseconds.load());
+    result["denoiser"] = VtValue(_impl->denoiserName);
     result["refinementPublishes"] = VtValue(static_cast<int64_t>(_impl->refinementPublishes));
     result["devicePreparing"] = VtValue(_impl->devicePreparedEpoch != _impl->deviceSceneEpoch);
     result["devicePreparations"] = VtValue(static_cast<int64_t>(_impl->devicePreparations.load()));

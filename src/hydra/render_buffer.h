@@ -83,6 +83,14 @@ public:
     void SetPresentationPixels(std::shared_ptr<const std::vector<uint8_t>> pixels,
                                Frame frame);
     void ClearPresentationPixels();
+    // The denoised colour (prism:denoise, docs/denoising.md): presented
+    // instead of the published pixels and their refinement tiles while the
+    // buffer publishes `frame` (later passes of the same accumulation
+    // included). Map and Capture keep the raw accumulation. Ignored unless it
+    // matches the published pixels' size.
+    void SetDenoisedPresentation(std::shared_ptr<const std::vector<uint8_t>> pixels,
+                                 Frame frame);
+    bool HasDenoisedPresentation(Frame const &frame) const;
     // Only the viewport upload uses this composited copy. Map/Capture retain
     // the original premultiplied RGBA for rendered-image export.
     void SetPresentationClearColor(VtValue const &value);
@@ -163,6 +171,8 @@ private:
     mutable GfVec4f _cachedPresentationClearColor{0.0f};
     std::shared_ptr<const std::vector<uint8_t>> _refinementPixels;
     Frame _refinementFrame;
+    std::shared_ptr<const std::vector<uint8_t>> _denoisedPixels;
+    Frame _denoisedFrame;
     std::shared_ptr<const PresentationSnapshot> _presentationSnapshot;
     mutable std::weak_ptr<const PresentationSnapshot> _materializedSnapshot;
     mutable std::shared_ptr<const std::vector<uint8_t>> _materializedPixels;

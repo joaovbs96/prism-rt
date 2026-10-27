@@ -56,6 +56,7 @@ bool PrismRenderBuffer::Allocate(GfVec3i const &d, HdFormat format, bool ms)
         static_cast<size_t>(_width) * _height * HdDataSizeOfFormat(_format), 0);
     _frame.reset();
     _ClearRefinement();
+    _denoisedPixels.reset(); _denoisedFrame.reset();
     _presentationSource.reset();
     _presentationPixels.reset();
     _workingPixels = *_pixels;
@@ -79,6 +80,7 @@ void PrismRenderBuffer::_Deallocate()
     _pixels.reset();
     _frame.reset();
     _ClearRefinement();
+    _denoisedPixels.reset(); _denoisedFrame.reset();
     _presentationSource.reset();
     _presentationPixels.reset();
     _workingPixels.clear();
@@ -148,6 +150,22 @@ void PrismRenderBuffer::SetPresentationPixels(
     _refinementPixels=std::move(pixels); _refinementFrame=std::move(frame);
 }
 
+void PrismRenderBuffer::SetDenoisedPresentation(
+    std::shared_ptr<const std::vector<uint8_t>> pixels, Frame frame)
+{
+    std::lock_guard lock(_mutex);
+    if (!pixels || !frame || frame != _frame || !_pixels || pixels->size() != _pixels->size()) return;
+    _denoisedPixels = std::move(pixels);
+    _denoisedFrame = std::move(frame);
+    _presentationSource.reset(); _presentationPixels.reset();
+}
+
+bool PrismRenderBuffer::HasDenoisedPresentation(Frame const &frame) const
+{
+    std::lock_guard lock(_mutex);
+    return _denoisedPixels && frame && _denoisedFrame == frame && _frame == frame;
+}
+
 void PrismRenderBuffer::_ClearRefinement()
 {
     _refinementPixels.reset(); _refinementFrame.reset();
@@ -196,6 +214,12 @@ PrismRenderBuffer::PresentationState PrismRenderBuffer::CapturePresentationState
     if (_refinementPixels && result.raw.frame == _refinementFrame &&
         result.raw.width == _width && result.raw.height == _height &&
         result.raw.format == _format) result.legacyPixels = _refinementPixels;
+    // The denoised colour of this accumulation replaces both.
+    if (_denoisedPixels && result.raw.frame && result.raw.frame == _denoisedFrame &&
+        result.raw.pixels && result.raw.pixels->size() == _denoisedPixels->size()) {
+        result.legacyPixels = _denoisedPixels;
+        result.snapshot.reset();
+    }
     return result;
 }
 

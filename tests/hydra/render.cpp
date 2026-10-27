@@ -390,6 +390,10 @@ int main(int argc, char** argv) {
         UsdTimeCode renderTime = UsdTimeCode::Default();
         std::string editPrim;
         int seed = 0;
+        // --denoise none|aov|replace, as the CLI's (docs/denoising.md): with an
+        // explicit camera, aov adds the denoised layer, replace writes the
+        // denoised colour; render products take their 'denoised' vars.
+        std::string denoise = "none";
         // prism:colorManagement:* render settings, set only when given.
         std::vector<std::pair<std::string, std::string>> colorSettings;
         // Options given (product mode sets only these renderer settings).
@@ -447,6 +451,17 @@ int main(int argc, char** argv) {
                 editPrim = argv[i];
             }
             else if (option == "--nee-probability-min") neeProbabilityMin = std::stof(argv[i]);
+            else if (option == "--denoise") {
+                denoise = argv[i];
+                if (denoise != "none" && denoise != "aov" && denoise != "replace")
+                    throw std::runtime_error("--denoise takes none, aov or replace");
+            }
+            else if (option == "--denoise-quality")
+                optional.emplace_back("denoiseQuality", VtValue(std::string(argv[i])));
+            else if (option == "--denoise-interval")
+                optional.emplace_back("denoiseInterval", VtValue(std::stoi(argv[i])));
+            else if (option == "--denoise-prefilter")
+                optional.emplace_back("denoisePrefilter", VtValue(std::string(argv[i]) == "true"));
             else if (option == "--light-selection") lightSelection = argv[i];
             // Render, then change the maximum depth and render again: the saved
             // image must match a render made at the new depth from the start.
@@ -459,6 +474,9 @@ int main(int argc, char** argv) {
             throw std::runtime_error("Invalid sampling mode or sample clamp");
         if (width <= 0 || height <= 0 || spp <= 0)
             throw std::runtime_error("Dimensions and spp must be positive");
+        if (productMode && denoise != "none")
+            throw std::runtime_error("--denoise takes an explicit camera and output (render products "
+                                     "denoise their 'denoised' vars)");
         if (productMode && (exercise || animationExercise || previewSequence || editSequence ||
                             changeDepth || hideDomeBackground))
             throw std::runtime_error("Validation exercises take an explicit camera and output");
@@ -628,9 +646,13 @@ int main(int argc, char** argv) {
         }
         auto const& view = views.front();
         frame(view);
-        engine.SetRendererAovs({HdAovTokens->color, HdAovTokens->depth,
-            HdAovTokens->cameraDepth, HdAovTokens->normal, HdAovTokens->Neye,
-            HdAovTokens->primId, HdAovTokens->instanceId, HdAovTokens->elementId});
+        {
+            TfTokenVector aovs{HdAovTokens->color, HdAovTokens->depth,
+                HdAovTokens->cameraDepth, HdAovTokens->normal, HdAovTokens->Neye,
+                HdAovTokens->primId, HdAovTokens->instanceId, HdAovTokens->elementId};
+            if (denoise != "none") aovs.emplace_back("denoised");
+            engine.SetRendererAovs(aovs);
+        }
         if (animationExercise) {
             runAnimationExercise(argv[1], argv[2], width, height, spp);
             std::cout << "Hydra animation exercise passed\n";
@@ -700,8 +722,21 @@ int main(int argc, char** argv) {
                   << center<float>(engine, HdAovTokens->cameraDepth, HdFormatFloat32) << '\n';
         {
             std::vector<std::string> outputWarnings;
-            const auto image = prism::output::BuildProductImage(view,
-                {{prism::output::AovKind::Color, 4, initial}}, &outputWarnings);
+            std::vector<prism::output::RenderedAov> outputs{{prism::output::AovKind::Color, 4, initial}};
+            auto outputView = view;
+            if (denoise != "none") {
+                auto denoised = readAov(engine, prism::output::AovKind::Denoised, outputWidth, outputHeight);
+                if (denoise == "replace") {
+                    outputs.front().pixels = std::move(denoised.pixels);
+                } else {
+                    auto var = outputView.vars.front();
+                    var.name = "denoised";
+                    var.kind = prism::output::AovKind::Denoised;
+                    outputView.vars.push_back(var);
+                    outputs.push_back(std::move(denoised));
+                }
+            }
+            const auto image = prism::output::BuildProductImage(outputView, outputs, &outputWarnings);
             prism::output::WriteImage(argv[3], image, *prism::color::Active(), &outputWarnings);
             printWarnings(outputWarnings);
         }

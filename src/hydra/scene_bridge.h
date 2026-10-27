@@ -89,6 +89,13 @@ struct RenderSettings {
         EnvironmentSampling::Mis;
     // Requested render device; unavailable GPU devices fall back to the CPU.
     prism::device::DevicePreference device = prism::device::DevicePreference::Auto;
+    // Denoising (docs/denoising.md). prism:denoise shows the colour AOV
+    // denoised every denoiseInterval passes and when the render converges or
+    // pauses (its accumulation, which Map reads, stays raw); a bound
+    // 'denoised' AOV is denoised whatever it says.
+    bool denoise = false;
+    int denoiseInterval = 16;
+    prism::device::DenoiseSettings denoiseSettings;
     // While a GPU device prepares the scene (kernel compile, upload), render
     // progressively on the CPU device and hand over when the GPU is ready.
     bool gpuPreparationPreview = true;

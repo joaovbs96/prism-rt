@@ -64,6 +64,10 @@ TfToken const _textureFiltering("prism:textureFiltering");
 TfToken const _textureStreaming("prism:textureStreaming");
 TfToken const _textureStreamingPrepass("prism:textureStreamingPrepass");
 TfToken const _device("prism:device");
+TfToken const _denoise("prism:denoise");
+TfToken const _denoiseInterval("prism:denoiseInterval");
+TfToken const _denoiseQuality("prism:denoiseQuality");
+TfToken const _denoisePrefilter("prism:denoisePrefilter");
 TfToken const _gpuPreparationPreview("prism:gpuPreparationPreview");
 TfToken const _gpuPreparationPreviewMaxMiB("prism:gpuPreparationPreviewMaxMiB");
 TfToken const _resourceRevision("prism:resourceRevision");
@@ -198,6 +202,9 @@ HdAovDescriptor PrismTaskDelegate::GetDefaultAovDescriptor(TfToken const &name) 
     // World position (Pworld, also P) and the light AOVs (albedo, diffuse,
     // specular, emission; src/output/aov.h).
     const auto kind = prism::output::AovKindFromName(name.GetString());
+    // The denoised colour (docs/denoising.md), like the colour.
+    if (kind == prism::output::AovKind::Denoised)
+        return {HdFormatFloat32Vec4, false, VtValue(GfVec4f(0, 0, 0, 1))};
     if (name == HdAovTokens->normal || name == HdAovTokens->Neye ||
         name == HdAovTokens->Peye || kind == prism::output::AovKind::Pworld ||
         prism::output::LightAov(kind))
@@ -253,6 +260,11 @@ HdRenderSettingDescriptorList PrismTaskDelegate::GetRenderSettingDescriptors() c
             {"GPU texture streaming", _textureStreaming, VtValue(true)},
             {"Settle streamed textures before rendering", _textureStreamingPrepass, VtValue(false)},
             {"Device (auto, cpu, vulkan, metal)", _device, VtValue(std::string("auto"))},
+            {"Denoise the displayed colour", _denoise, VtValue(d.denoise)},
+            {"Denoise every N passes", _denoiseInterval, VtValue(d.denoiseInterval)},
+            {"Denoise quality (fast, balanced, high)", _denoiseQuality,
+             VtValue(std::string(prism::device::ToString(d.denoiseSettings.quality)))},
+            {"Denoise the albedo and normal first", _denoisePrefilter, VtValue(d.denoiseSettings.prefilter)},
             {"CPU preview while the GPU prepares", _gpuPreparationPreview, VtValue(true)},
             {"CPU preview scene limit (MiB, 0 unlimited)", _gpuPreparationPreviewMaxMiB, VtValue(8192)},
             {"Resource revision", _resourceRevision, VtValue(0)},
@@ -307,6 +319,11 @@ VtValue PrismTaskDelegate::GetRenderSetting(TfToken const &key) const
     if (key == _gpuPreparationPreviewMaxMiB) return VtValue(s.gpuPreparationPreviewMaxMiB);
     if (key == _resourceRevision) return VtValue(s.resourceRevision);
     if (key == _device) return VtValue(std::string(prism::device::ToString(s.device)));
+    if (key == _denoise) return VtValue(s.denoise);
+    if (key == _denoiseInterval) return VtValue(s.denoiseInterval);
+    if (key == _denoiseQuality)
+        return VtValue(std::string(prism::device::ToString(s.denoiseSettings.quality)));
+    if (key == _denoisePrefilter) return VtValue(s.denoiseSettings.prefilter);
     if (key == _colorConfig) return VtValue(s.color.config);
     if (key == _colorWorkingSpace) return VtValue(s.color.workingSpace);
     if (key == _colorDisplay) return VtValue(s.color.display);
@@ -475,6 +492,22 @@ void PrismTaskDelegate::SetRenderSetting(TfToken const &key, VtValue const &valu
         s.gpuPreparationPreviewMaxMiB = std::max(0, _Get(value, s.gpuPreparationPreviewMaxMiB));
     else if (key == _resourceRevision)
         s.resourceRevision = _Get(value, s.resourceRevision);
+    else if (key == _denoise)
+        s.denoise = _Get(value, s.denoise);
+    else if (key == _denoiseInterval)
+        s.denoiseInterval = std::max(1, _Number(value, s.denoiseInterval));
+    else if (key == _denoisePrefilter)
+        s.denoiseSettings.prefilter = _Get(value, s.denoiseSettings.prefilter);
+    else if (key == _denoiseQuality &&
+             (value.IsHolding<std::string>() || value.IsHolding<TfToken>())) {
+        const std::string name = value.IsHolding<std::string>()
+            ? value.UncheckedGet<std::string>()
+            : value.UncheckedGet<TfToken>().GetString();
+        if (!prism::device::ParseDenoiseQuality(name, &s.denoiseSettings.quality)) {
+            TF_WARN("PrismRT: prism:denoiseQuality must be fast, balanced or high; retaining the previous quality");
+            return;
+        }
+    }
     else if (key == _device &&
              (value.IsHolding<std::string>() || value.IsHolding<TfToken>())) {
         const std::string name = value.IsHolding<std::string>()
