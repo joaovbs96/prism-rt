@@ -136,11 +136,96 @@ std::string ConvertValueString(std::string const& value, std::string const& type
     return {};
 }
 
+// An integer input's value named by its declaration's enum (UsdPreviewSurface's
+// opacityMode "transparent" / "presence", which USD authors as a token and
+// MaterialX declares as an integer with enum names and enumvalues).
+std::string EnumValueString(const MaterialX::InputPtr& declared, const std::string& name)
+{
+    const std::vector<std::string> names =
+        MaterialX::splitString(declared->getAttribute(MaterialX::ValueElement::ENUM_ATTRIBUTE), ",");
+    const std::vector<std::string> values =
+        MaterialX::splitString(declared->getAttribute(MaterialX::ValueElement::ENUM_VALUES_ATTRIBUTE), ",");
+    const std::string key = MaterialX::trimSpaces(name);
+    for (size_t i = 0; i < names.size(); ++i) {
+        if (MaterialX::trimSpaces(names[i]) != key) continue;
+        if (values.empty()) return std::to_string(i);
+        return i < values.size() ? MaterialX::trimSpaces(values[i]) : std::string();
+    }
+    return {};
+}
+
+// The definition a node without an explicit (or known) nodedef gets, as
+// Node::getNodeDef picks it: its category and output type, and its version
+// (the default version when it names none); empty when that is ambiguous
+// (convert has one definition per input type for the same output type).
+MaterialX::NodeDefPtr DeclaredNodeDef(const MaterialX::DocumentPtr& doc, const MaterialX::DocumentPtr& library,
+                                      const MaterialX::NodePtr& node)
+{
+    if (node->hasNodeDefString()) {
+        if (auto nodedef = library->getNodeDef(node->getNodeDefString())) return nodedef;
+        if (auto nodedef = doc->getNodeDef(node->getNodeDefString())) return nodedef;
+    }
+    std::vector<MaterialX::NodeDefPtr> candidates = library->getMatchingNodeDefs(node->getCategory());
+    auto local = doc->getMatchingNodeDefs(node->getCategory());
+    candidates.insert(candidates.end(), local.begin(), local.end());
+    MaterialX::NodeDefPtr nodedef;
+    int matches = 0;
+    for (auto const& candidate : candidates)
+        if (candidate->getType() == node->getType() && candidate->isVersionCompatible(node->getVersionString())) {
+            nodedef = candidate;
+            ++matches;
+        }
+    return matches == 1 ? nodedef : nullptr;
+}
+
+// USD's UsdPrimvarReader_matrix has no MaterialX counterpart (MaterialX
+// 1.39.5 leaves ND_UsdPrimvarReader_matrix44 commented out: "Getting primvar
+// of matrix type is not supported"). hdMtlx then finds no definition for
+// ND_UsdPrimvarReader_matrix and writes a node of another category and type
+// ("surface", surfaceshader) that nothing can generate, and the material
+// renders as the error material. Such a reader becomes a constant of its
+// fallback (identity by default), as when the primvar is missing, with a
+// warning.
+void ReplaceMatrixPrimvarReaders(const MaterialX::DocumentPtr& doc, const MaterialX::DocumentPtr& library)
+{
+    if (!library) return;
+    const std::string name = "ND_UsdPrimvarReader_matrix";
+    if (library->getNodeDef(name) || doc->getNodeDef(name) || !library->getNodeDef("ND_constant_matrix44")) return;
+    std::vector<MaterialX::NodePtr> nodes;
+    for (auto element : doc->traverseTree())
+        if (auto node = element->asA<MaterialX::Node>(); node && node->getNodeDefString() == name)
+            nodes.push_back(node);
+    for (auto const& node : nodes) {
+        std::string fallback = "1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1";
+        // An authored fallback: a constant matrix (sixteen numbers).
+        if (auto input = node->getInput("fallback"); input && input->hasValueString() && !input->hasNodeName() &&
+            !input->hasNodeGraphString() && !input->hasInterfaceName()) {
+            const std::string value = input->getValueString();
+            if (std::count(value.begin(), value.end(), ',') == 15) fallback = value;
+        }
+        for (auto const& input : node->getInputs()) node->removeInput(input->getName());
+        node->setCategory("constant");
+        node->setType("matrix44");
+        node->setNodeDefString("ND_constant_matrix44");
+        node->addInput("value", "matrix44")->setValueString(fallback);
+        std::cerr << "[MaterialX] WARNING: " << node->getNamePath()
+                  << ": MaterialX cannot read matrix primvars (UsdPrimvarReader_matrix); using its fallback\n";
+    }
+}
+
 // Inputs whose type contradicts their node definition (hdMtlx types a
 // shader input after the graph output feeding it, and some exporters write
-// vector parameters as strings or flags as integers) get their declared
-// type; values are converted, and a graph output feeding them gets the
-// extract/convert node the connection implies.
+// vector parameters as strings, flags as integers or enum names for
+// integers) get their declared type; values are converted, and a graph
+// output feeding them gets the extract/convert node the connection implies.
+//
+// Inputs the definition does not declare make MaterialX find no definition
+// for a node that does not name one (Node::getNodeDef matches the inputs),
+// and the material fails. open_pbr_surface's geometry inputs
+// written under standard_surface's names (normal, tangent, coat_normal,
+// thin_walled) take OpenPBR's names (the Typhoon suite's bump test connects
+// `normal`, and Typhoon renders its bump); other undeclared inputs are
+// dropped with a warning.
 void FixDeclaredInputTypes(const MaterialX::DocumentPtr& doc, const MaterialX::DocumentPtr& library)
 {
     if (!library) return;
@@ -148,29 +233,31 @@ void FixDeclaredInputTypes(const MaterialX::DocumentPtr& doc, const MaterialX::D
     for (auto element : doc->traverseTree())
         if (auto node = element->asA<MaterialX::Node>()) nodes.push_back(node);
     for (auto const& node : nodes) {
-        MaterialX::NodeDefPtr nodedef;
-        if (node->hasNodeDefString()) {
-            nodedef = library->getNodeDef(node->getNodeDefString());
-            if (!nodedef) nodedef = doc->getNodeDef(node->getNodeDefString());
-        }
-        if (!nodedef) {
-            std::vector<MaterialX::NodeDefPtr> candidates = library->getMatchingNodeDefs(node->getCategory());
-            auto local = doc->getMatchingNodeDefs(node->getCategory());
-            candidates.insert(candidates.end(), local.begin(), local.end());
-            // Only an unambiguous definition: nodes such as convert have one
-            // per input type for the same output type.
-            int matches = 0;
-            for (auto const& candidate : candidates)
-                if (candidate->getType() == node->getType()) {
-                    nodedef = candidate;
-                    ++matches;
-                }
-            if (matches != 1) nodedef = nullptr;
-        }
+        MaterialX::NodeDefPtr nodedef = DeclaredNodeDef(doc, library, node);
         if (!nodedef) continue;
         for (auto input : node->getInputs()) {
             auto declared = nodedef->getActiveInput(input->getName());
-            if (!declared || declared->getType() == input->getType()) continue;
+            // (A node naming its definition gets it whatever its inputs.)
+            if (!declared && node->hasNodeDefString()) continue;
+            if (!declared) {
+                const std::string name = input->getName();
+                const std::string renamed = "geometry_" + name;
+                auto geometry = node->getCategory() == "open_pbr_surface" &&
+                        (name == "normal" || name == "tangent" || name == "coat_normal" || name == "thin_walled")
+                    ? nodedef->getActiveInput(renamed) : nullptr;
+                if (geometry && !node->getInput(renamed)) {
+                    input->setName(renamed);
+                    declared = geometry;
+                    std::cerr << "[MaterialX] " << node->getNamePath() << ": input '" << name << "' read as '"
+                              << renamed << "'\n";
+                } else {
+                    std::cerr << "[MaterialX] WARNING: " << node->getNamePath() << " has no input '" << name
+                              << "' (" << nodedef->getName() << "); ignored\n";
+                    node->removeInput(name);
+                    continue;
+                }
+            }
+            if (declared->getType() == input->getType()) continue;
             const std::string from = input->getType(), to = declared->getType();
             auto graphElement = node->getParent() ? node->getParent()->asA<MaterialX::GraphElement>() : nullptr;
             auto graph = input->hasNodeGraphString() ? doc->getNodeGraph(input->getNodeGraphString()) : nullptr;
@@ -186,7 +273,8 @@ void FixDeclaredInputTypes(const MaterialX::DocumentPtr& doc, const MaterialX::D
                 auto upstream = graphElement ? graphElement->getNode(input->getNodeName()) : nullptr;
                 if (!upstream) continue;
             } else if (input->hasValueString()) {
-                const std::string value = ConvertValueString(input->getValueString(), to);
+                std::string value = ConvertValueString(input->getValueString(), to);
+                if (value.empty() && to == "integer") value = EnumValueString(declared, input->getValueString());
                 if (value.empty()) continue;
                 input->setValueString(value);
             } else if (input->hasInterfaceName()) {
@@ -1678,6 +1766,7 @@ MaterialX::DocumentPtr DocumentLoader::load(const std::string& filepath)
         // rewritten. Only this in-memory document changes, never the asset file.
         NormalizeColorSpaces(doc);
         KeepOneOutputColorTransform(doc);
+        ReplaceMatrixPrimvarReaders(doc, m_stdlib);
         FixDeclaredInputTypes(doc, m_stdlib);
         FixConnectionTypes(doc);
         DistributeLayersOverMixes(doc);
