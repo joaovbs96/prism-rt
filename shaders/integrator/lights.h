@@ -349,8 +349,11 @@ inline float lightImportance(LightRecord light, float3 p, float3 luminance)
 }
 
 // Texture coordinates of a point on a rect light, in image space (top row
-// first): UsdLuxRectLight puts the texture's (0, 0) at local (+X, +Y).
-inline float2 rectTexcoord(float a, float b) { return float2(0.5f * (1.0f - a), 0.5f * (1.0f + b)); }
+// first): UsdLuxRectLight puts "a texture file's min coordinates" (its first
+// pixel, the top left) at local (+X, +Y) and its max coordinates at (-X, -Y),
+// so the image reads upright and unmirrored from the side the light emits to
+// (-Z). a and b are the point's local x and y over the half width and height.
+inline float2 rectTexcoord(float a, float b) { return float2(0.5f * (1.0f - a), 0.5f * (1.0f - b)); }
 
 // Samples light `light` from shading point p. The radiance of textured rect
 // lights still has to be multiplied by the texture at `texcoord`; for
