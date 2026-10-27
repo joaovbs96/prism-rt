@@ -8,6 +8,8 @@
 #endif
 
 #include <cctype>
+#include <chrono>
+#include <stdexcept>
 
 namespace prism::device {
 
@@ -50,6 +52,40 @@ std::string RemovedDeviceMessage(std::string_view text)
     for (char& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     if (lower == "cpu-reference") return "the cpu-reference device was removed; use cpu";
     return {};
+}
+
+std::shared_ptr<Denoiser> RenderDevice::CreateDenoiser(std::string* error)
+{
+    return SharedCpuDenoiser(error);
+}
+
+void DenoiseRenderedImage(RenderDevice& device, ImageRequest const& request,
+                          std::vector<float> const& color, std::vector<LightAovPixel> const& aovs)
+{
+    if (!request.denoised) return;
+    const auto start = std::chrono::steady_clock::now();
+    std::string error;
+    const auto denoiser = device.CreateDenoiser(&error);
+    if (!denoiser) throw std::runtime_error("cannot denoise: " + error);
+    const size_t count = size_t(request.width) * request.height;
+    if (color.size() != 3 * count || aovs.size() != count)
+        throw std::runtime_error("cannot denoise: the render has no guides");
+    // LightAovPixel holds five RGB triples: albedo first, normal last.
+    static_assert(sizeof(LightAovPixel) == 15 * sizeof(float));
+    const auto* guides = reinterpret_cast<const float*>(aovs.data());
+    request.denoised->assign(3 * count, 0.0f);
+    DenoiseRequest denoise;
+    denoise.width = request.width;
+    denoise.height = request.height;
+    denoise.color = {color.data(), 3};
+    denoise.albedo = {guides + offsetof(LightAovPixel, albedo) / sizeof(float), 15};
+    denoise.normal = {guides + offsetof(LightAovPixel, normal) / sizeof(float), 15};
+    denoise.output = request.denoised->data();
+    denoise.settings = request.denoise;
+    denoiser->Denoise(denoise);
+    if (request.denoiseMilliseconds)
+        *request.denoiseMilliseconds = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - start).count();
 }
 
 bool ReportGpuPrograms(SceneManager& scene, std::ostream& out)

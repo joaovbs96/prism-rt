@@ -105,7 +105,8 @@ SampleResult TraceSample(SceneManager& scene, CpuSceneState const& state, Camera
 
 LightAovPixel ToLightAovs(LightAovSample const& a)
 {
-    return {ToFloat3(a.albedo), ToFloat3(a.diffuse), ToFloat3(a.specular), ToFloat3(a.emission)};
+    return {ToFloat3(a.albedo), ToFloat3(a.diffuse), ToFloat3(a.specular), ToFloat3(a.emission),
+            ToFloat3(a.normal)};
 }
 
 void Add(LightAovPixel& sum, LightAovSample const& a)
@@ -114,6 +115,7 @@ void Add(LightAovPixel& sum, LightAovSample const& a)
     sum.diffuse += ToFloat3(a.diffuse);
     sum.specular += ToFloat3(a.specular);
     sum.emission += ToFloat3(a.emission);
+    sum.normal += ToFloat3(a.normal);
 }
 
 } // namespace
@@ -176,7 +178,8 @@ std::vector<float> CpuDevice::RenderImage(SceneManager& scene, ImageRequest cons
     std::vector<Color3> sums(count, Color3(0));
     std::vector<Color3> evenSums(adaptive.Enabled() ? count : 0, Color3(0));
     std::vector<int> samples(count, 0);
-    const bool lightAovs = request.lightAovs != nullptr;
+    // Denoising needs the albedo and normal guides of the light AOVs.
+    const bool lightAovs = request.lightAovs != nullptr || request.denoised != nullptr;
     std::vector<LightAovPixel> aovSums(lightAovs ? count : 0);
     ActivePixels active;
     active.Reset(unsigned(width), unsigned(height));
@@ -253,13 +256,15 @@ std::vector<float> CpuDevice::RenderImage(SceneManager& scene, ImageRequest cons
             a.diffuse *= scale;
             a.specular *= scale;
             a.emission *= scale;
+            a.normal *= scale;
         }
         total += samples[pixel];
         atMax += samples[pixel] >= request.samples;
     }
     if (request.meanSamples) *request.meanSamples = total / double(count);
     if (request.fractionAtMaxSamples) *request.fractionAtMaxSamples = count ? double(atMax) / double(count) : 0.0;
-    if (lightAovs) *request.lightAovs = std::move(aovSums);
+    DenoiseRenderedImage(*this, request, pixels, aovSums);
+    if (request.lightAovs) *request.lightAovs = std::move(aovSums);
     return pixels;
 }
 

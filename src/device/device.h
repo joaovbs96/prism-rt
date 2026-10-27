@@ -8,6 +8,7 @@
 // presentation, and describe each unit of work with a request struct.
 
 #include "adaptive_sampling.h"
+#include "denoiser.h"
 #include "../camera_rays.h"
 #include "../float3.h"
 #include "../ray.h"
@@ -65,9 +66,12 @@ struct NeeSettings {
 
 // The light AOVs of a sample, or their mean over a pixel's samples
 // (LightAovSample, shaders/integrator/path_tracer.h): diffuse + specular +
-// emission is the colour; the albedo is that of the first non-delta vertex.
+// emission is the colour; the albedo is that of the first non-delta vertex,
+// and the normal (world space, the denoiser's guide) that vertex's shading
+// normal.
 struct LightAovPixel {
     Color3 albedo, diffuse, specular, emission;
+    Float3 normal;
 };
 
 // Per-sample post-processing shared by every render loop.
@@ -133,6 +137,17 @@ struct ImageRequest {
     // When non-null, also renders the light AOVs: receives width*height
     // means over the same samples as the colour, top row first.
     std::vector<LightAovPixel>* lightAovs = nullptr;
+    // When `denoised` is non-null, also denoises the colour with `denoise`
+    // (docs/denoising.md): *denoised receives width*height RGB triples like
+    // the returned colour, guided by the light AOVs' albedo and normal
+    // (rendered for it even when lightAovs is null). The device denoises
+    // where its accumulation lives (RenderDevice::CreateDenoiser; the GPU
+    // devices' own denoisers come in parts 2 and 3). Throws when the build
+    // has no denoiser.
+    DenoiseSettings denoise;
+    std::vector<float>* denoised = nullptr;
+    // Receives the denoising time in milliseconds (when non-null).
+    double* denoiseMilliseconds = nullptr;
 };
 
 // One progressive pass: one sample per pixel over the given tiles. All
@@ -254,7 +269,21 @@ public:
     virtual bool RenderPreview(SceneManager& scene, PreviewRequest const& request) = 0;
     // Closest hit of a single ray (picking).
     virtual RTCRayHit Intersect(SceneManager& scene, prism::PathRay const& ray) = 0;
+
+    // The denoiser for this device's images (docs/denoising.md); null with
+    // the reason in *error when the build has none. The default is OIDN's CPU
+    // device on host images: the CPU device's own, and for now also the GPU
+    // devices' (their images reach the host anyway: whole-image renders
+    // return them, progressive passes hand their samples to the frontend).
+    // Part 2 overrides it on Vulkan (vk_oidn), part 3 on Metal.
+    virtual std::shared_ptr<Denoiser> CreateDenoiser(std::string* error = nullptr);
 };
+
+// ImageRequest::denoised for a render's colour and light AOVs (width*height
+// each), on the device's denoiser: the devices' RenderImage call it. Throws
+// std::runtime_error when the device has no denoiser.
+void DenoiseRenderedImage(RenderDevice& device, ImageRequest const& request,
+                          std::vector<float> const& color, std::vector<LightAovPixel> const& aovs);
 
 // Devices compiled into this build with a usable adapter, CPU always last.
 std::vector<DeviceInfo> AvailableDevices();

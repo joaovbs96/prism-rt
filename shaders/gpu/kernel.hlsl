@@ -147,6 +147,7 @@ void renderThread(uint thread)
         result.aovs.diffuse = (float3)0.0f;
         result.aovs.specular = (float3)0.0f;
         result.aovs.emission = (float3)0.0f;
+        result.aovs.normal = (float3)0.0f;
 #endif
     } else {
         result = tracer.renderSample(camera, x, y, width, height, settings);

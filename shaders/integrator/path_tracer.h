@@ -234,6 +234,10 @@ struct AnalyticLightSums {
 //             lobe (MDL's bsdf_diffuse part, which includes diffuse
 //             transmission) or into a scattering medium (subsurface)
 //   specular  the rest: glossy and delta reflection and transmission
+//   normal    the shading normal (world space, facing the ray) at the
+//             albedo's vertex, or at the surface where the path ends before
+//             one; 0 if the path leaves the scene first (the denoiser's
+//             normal guide, docs/denoising.md)
 // diffuse + specular + emission is the colour.
 // The albedo AOV passes through BSDF samples that are delta or whose density
 // is at least this (per steradian): MDL reports smooth glass and mirrors as
@@ -246,6 +250,7 @@ struct LightAovSample {
     float3 diffuse;
     float3 specular;
     float3 emission;
+    float3 normal;
 };
 #endif
 
@@ -644,14 +649,16 @@ struct PathTracer {
     }
 
     // The albedo AOV at a surface vertex (LightAovSample): sharp bounces and
-    // cutout crossings hand it on to the next vertex.
-    void resolveAlbedo(BsdfSample bs)
+    // cutout crossings hand it on to the next vertex. The normal guide is
+    // that vertex's shading normal.
+    void resolveAlbedo(BsdfSample bs, float3 normal)
     {
         if (bs.null_event || (bs.scattered && (bs.delta || bs.pdf >= kAlbedoSharpPdf))) {
             path.albedoWeight *= bs.color;
             return;
         }
         path.albedoOpen = false;
+        path.aov.normal = normal;
         if (bs.scattered) path.aov.albedo = path.albedoWeight * bs.color;
     }
 #endif
@@ -701,6 +708,7 @@ struct PathTracer {
         path.aov.diffuse = (float3)0.0f;
         path.aov.specular = (float3)0.0f;
         path.aov.emission = (float3)0.0f;
+        path.aov.normal = (float3)0.0f;
         path.aovPrimary = true;
         path.firstDiffuse = (float3)0.0f;
         path.albedoOpen = true;
@@ -1054,7 +1062,7 @@ struct PathTracer {
         backend.pathWeight(path.throughput); // texture streaming feedback (GPU)
         const MaterialResult material = backend.shade(shading, query);
 #if PRISM_LIGHT_AOVS
-        if (aovs && path.albedoOpen) resolveAlbedo(material.sample);
+        if (aovs && path.albedoOpen) resolveAlbedo(material.sample, hit.surface.n);
 #endif
         if (!arrive(hit, vertex, material.sample)) return;
         connectLight(hit, vertex, material.light);
@@ -1127,6 +1135,7 @@ struct PathTracer {
         result.aovs.diffuse = (float3)0.0f;
         result.aovs.specular = (float3)0.0f;
         result.aovs.emission = (float3)0.0f;
+        result.aovs.normal = (float3)0.0f;
         if (aovs && result.coverage != 0.0f) {
             // The colour's scale: sample clamp and exposure.
             float scale = sampleSettings.exposureScale;
@@ -1135,6 +1144,7 @@ struct PathTracer {
                 if (peak > sampleSettings.sampleClamp) scale *= sampleSettings.sampleClamp / peak;
             }
             result.aovs.albedo = path.aov.albedo;
+            result.aovs.normal = path.aov.normal;
             result.aovs.diffuse = path.aov.diffuse * scale;
             result.aovs.specular = path.aov.specular * scale;
             result.aovs.emission = path.aov.emission * scale;

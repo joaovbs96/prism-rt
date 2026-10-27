@@ -83,24 +83,24 @@ void gpu_accumulate(uint pixel, float3 value, bool even)
 
 #if PRISM_LIGHT_AOVS
 // Light AOVs (kFrameLightAovs): four entries per slot (albedo, diffuse,
-// specular, emission) after `base` entries, in the output buffer (one sample)
-// or added up in the accumulation buffer (image mode, after its 2 * pixels
-// colour sums).
+// specular, emission; the denoising normal's x, y, z in the w of the first
+// three) after `base` entries, in the output buffer (one sample) or added up
+// in the accumulation buffer (image mode, after its 2 * pixels colour sums).
 void gpu_store_aovs(uint base, uint slot, LightAovSample a)
 {
     RWStructuredBuffer<float4> b = outputBuffer();
-    b[base + 4u * slot] = float4(a.albedo, 0.0f);
-    b[base + 4u * slot + 1u] = float4(a.diffuse, 0.0f);
-    b[base + 4u * slot + 2u] = float4(a.specular, 0.0f);
+    b[base + 4u * slot] = float4(a.albedo, a.normal.x);
+    b[base + 4u * slot + 1u] = float4(a.diffuse, a.normal.y);
+    b[base + 4u * slot + 2u] = float4(a.specular, a.normal.z);
     b[base + 4u * slot + 3u] = float4(a.emission, 0.0f);
 }
 void gpu_accumulate_aovs(uint base, uint pixel, LightAovSample a)
 {
     RWStructuredBuffer<float4> b = accumulationBuffer();
     const uint i = base + 4u * pixel;
-    b[i] = b[i] + float4(a.albedo, 0.0f);
-    b[i + 1u] = b[i + 1u] + float4(a.diffuse, 0.0f);
-    b[i + 2u] = b[i + 2u] + float4(a.specular, 0.0f);
+    b[i] = b[i] + float4(a.albedo, a.normal.x);
+    b[i + 1u] = b[i + 1u] + float4(a.diffuse, a.normal.y);
+    b[i + 2u] = b[i + 2u] + float4(a.specular, a.normal.z);
     b[i + 3u] = b[i + 3u] + float4(a.emission, 0.0f);
 }
 #endif

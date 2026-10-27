@@ -78,7 +78,8 @@ GpuFrame GpuRenderDevice::BaseFrame(prism::CameraRayParameters const& camera, un
 
 namespace {
 // What a failed submission most likely means, for the error message.
-// Light AOVs (kFrameLightAovs, kernel.hlsl): four float4 per slot.
+// Light AOVs (kFrameLightAovs, accessors.hlsl): four float4 per slot, the
+// denoising normal in the w of the first three.
 constexpr size_t kAovEntries = 4;
 
 LightAovPixel ReadLightAovs(float const* entries, float scale)
@@ -86,7 +87,8 @@ LightAovPixel ReadLightAovs(float const* entries, float scale)
     auto read = [&](size_t k) {
         return Color3(entries[4 * k] * scale, entries[4 * k + 1] * scale, entries[4 * k + 2] * scale);
     };
-    return {read(0), read(1), read(2), read(3)};
+    return {read(0), read(1), read(2), read(3),
+            Float3(entries[3] * scale, entries[7] * scale, entries[11] * scale)};
 }
 
 std::string FailureHint(std::string const& error)
@@ -113,7 +115,8 @@ std::vector<float> GpuRenderDevice::RenderImage(SceneManager& scene, ImageReques
     // picture and report success.
     if (!PrepareScene(scene, &error))
         throw std::runtime_error(std::string(LogPrefix()) + "cannot prepare the scene for the GPU: " + error);
-    const bool lightAovs = request.lightAovs != nullptr;
+    // Denoising needs the albedo and normal guides of the light AOVs.
+    const bool lightAovs = request.lightAovs != nullptr || request.denoised != nullptr;
     if (lightAovs && !PrepareLightAovs(&error))
         throw std::runtime_error(std::string(LogPrefix()) + "cannot build the light AOV kernel: " + error);
     // Test hook: fail the dispatch of this sample index.
@@ -220,19 +223,22 @@ std::vector<float> GpuRenderDevice::RenderImage(SceneManager& scene, ImageReques
         }
     }
     auto const* sums = static_cast<const float*>(RenderBuffer(kSlotAccumulation, accumulationBytes));
-    if (lightAovs) request.lightAovs->assign(count, LightAovPixel{});
+    std::vector<LightAovPixel> aovs(lightAovs ? count : 0);
     double total = 0.0;
     size_t atMax = 0;
     for (size_t p = 0; p < count; ++p) {
         const float scale = samples[p] > 0 ? 1.0f / float(samples[p]) : 0.0f;
         for (int c = 0; c < 3; ++c) pixels[3 * p + c] = sums[8 * p + c] * scale;
-        if (lightAovs) (*request.lightAovs)[p] = ReadLightAovs(sums + 8 * size_t(count) + 4 * kAovEntries * p, scale);
+        if (lightAovs) aovs[p] = ReadLightAovs(sums + 8 * size_t(count) + 4 * kAovEntries * p, scale);
         total += samples[p];
         atMax += samples[p] >= request.samples;
     }
     if (request.meanSamples) *request.meanSamples = total / double(count);
     if (request.fractionAtMaxSamples)
         *request.fractionAtMaxSamples = count ? double(atMax) / double(count) : 0.0;
+    // Part 2 denoises on the GPU instead, before the read-back.
+    DenoiseRenderedImage(*this, request, pixels, aovs);
+    if (request.lightAovs) *request.lightAovs = std::move(aovs);
     if (GpuVerbose())
         std::cerr << LogPrefix() << std::format("{} samples, GPU {:.3f} s\n", request.samples, gpuSeconds);
     return pixels;
