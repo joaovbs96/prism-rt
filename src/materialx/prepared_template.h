@@ -128,6 +128,13 @@ inline bool IsCompatibleTemplateValue(const CapturedNode& node,
     if (type.find("LamaDielectric")!=std::string::npos &&
         (name=="reflectionTint" || name=="transmissionTint"))
         return false;
+    // DocumentLoader tints the EON compensation of an open_pbr_surface whose
+    // base_diffuse_roughness is not a constant zero (CompensateOrenNayarEnergy
+    // in loader.cpp): a zero roughness stays structural, so a rough variant
+    // never binds onto the library's graph, nor a smooth one onto the repair.
+    if (type.find("open_pbr_surface")!=std::string::npos && name=="base_diffuse_roughness" &&
+        parameter.data.value.IsHolding<float>() && parameter.data.value.UncheckedGet<float>()==0.0f)
+        return false;
     for (auto const& coupling : couplings) {
         if (type.find(coupling.type)==std::string::npos) continue;
         if (name==coupling.weight) return false;

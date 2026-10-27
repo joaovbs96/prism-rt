@@ -670,8 +670,21 @@ bool IsBlack(const std::string& value)
 //   weighted by its Fresnel term, (1 - F) T the transmission lobe under an
 //   empty Fresnel layer. Exact where s >= t (the last term vanishes); the
 //   last term is exact for smooth lobes.
+//
+// prism_oren_nayar_diffuse_bsdf: oren_nayar_diffuse_bsdf with
+//   energy_compensation, its multiple-scattering lobe tinted as the EON model
+//   (OpenPBR; MaterialX's GLSL mx_oren_nayar_compensated_diffuse) has it:
+//     rho_ms = rho^2 E_avg / (1 - rho (1 - E_avg)),
+//     E_avg = A (1 + C2 r), A = 1 / (1 + C1 r),
+//   C1 = 1/2 - 2/(3 pi), C2 = 2/3 - 28/(15 pi). MaterialX's MDL library
+//   (pbrlib_1_10 mx_oren_nayar_diffuse_bsdf) passes multiscatter_tint
+//   color(1.0), which libbsdf adds untinted (diffuse_sample/_evaluate:
+//   tint * f_ss + multiscatter_tint * f_ms), so only white albedo was right.
+//   libbsdf's lobe is the same fit (eval_oren_nayar: rho_avg = A + C2 B with
+//   B = A r), and it saturates the tint and the roughness, so does rho_ms here.
 const std::string kFresnelLayer = "prism_fresnel_layer";
 const std::string kDielectricSplit = "prism_dielectric_split";
+const std::string kOrenNayarCompensated = "prism_oren_nayar_diffuse_bsdf";
 
 void EnsureHelperBsdf(const MaterialX::DocumentPtr& doc, const std::string& category)
 {
@@ -680,7 +693,18 @@ void EnsureHelperBsdf(const MaterialX::DocumentPtr& doc, const std::string& cate
     auto nodedef = doc->addNodeDef(name, "BSDF", category);
     nodedef->setNodeGroup("pbr");
     std::string code;
-    if (category == kFresnelLayer) {
+    if (category == kOrenNayarCompensated) {
+        nodedef->setInputValue("weight", 1.0f);
+        nodedef->setInputValue("color", MaterialX::Color3(0.18f));
+        nodedef->setInputValue("roughness", 0.0f);
+        const std::string rho = "math::saturate({{color}})";
+        const std::string r = "math::saturate({{roughness}})";
+        const std::string average = "((1.0 + 0.07248831 * " + r + ") / (1.0 + 0.28779340 * " + r + "))";
+        code = "material(surface: material_surface(scattering: df::weighted_layer(weight: {{weight}}, "
+               "layer: df::diffuse_reflection_bsdf(tint: {{color}}, roughness: {{roughness}}, "
+               "multiscatter_tint: " + rho + " * " + rho + " * " + average + " / (color(1.0) - " + rho +
+               " * (1.0 - " + average + "))), normal: {{normal}})))";
+    } else if (category == kFresnelLayer) {
         nodedef->setInputValue("ior", 1.5f);
         nodedef->setInputValue("weight", 1.0f);
         nodedef->addInput("coat", "BSDF");
@@ -1435,6 +1459,74 @@ void RepairLamaGeneralizedSchlick(const MaterialX::DocumentPtr& doc)
     }
 }
 
+bool IsCompensatedOrenNayar(const MaterialX::NodePtr& node)
+{
+    return node->getCategory() == "oren_nayar_diffuse_bsdf" && IsTrueConstant(node->getInput("energy_compensation"));
+}
+
+void UseCompensatedOrenNayar(const MaterialX::NodePtr& node)
+{
+    EnsureHelperBsdf(node->getDocument(), kOrenNayarCompensated);
+    node->removeInput("energy_compensation");
+    node->setCategory(kOrenNayarCompensated);
+    node->setNodeDefString("ND_" + kOrenNayarCompensated);
+}
+
+// EON energy compensation (oren_nayar_diffuse_bsdf's energy_compensation)
+// with its multiple-scattering lobe tinted by the albedo, as MaterialX's GLSL
+// and OpenPBR define it; MaterialX's MDL library leaves that lobe white, so
+// rough coloured diffuse surfaces rendered too bright (by up to 4x in a
+// low-albedo channel at roughness 1). Compensated nodes become
+// prism_oren_nayar_diffuse_bsdf (EnsureHelperBsdf): the document's own
+// (top level or in authored graphs), and those in the genmdl graph of a node
+// the document uses (open_pbr_surface's base, LamaDiffuse), through a private
+// copy of that graph (ClonePrivateGraph). Runs after the other graph repairs,
+// so it rewrites the graph they chose.
+void CompensateOrenNayarEnergy(const MaterialX::DocumentPtr& doc)
+{
+    std::vector<MaterialX::NodePtr> nodes;
+    for (auto element : doc->traverseTree()) {
+        auto node = element->asA<MaterialX::Node>();
+        if (!node) continue;
+        // Nodes in implementation graphs (private copies) belong to the node
+        // that uses the graph.
+        auto parent = node->getParent() ? node->getParent()->asA<MaterialX::NodeGraph>() : nullptr;
+        if (parent && parent->hasNodeDefString()) continue;
+        nodes.push_back(node);
+    }
+    for (auto const& node : nodes) {
+        if (IsCompensatedOrenNayar(node)) {
+            UseCompensatedOrenNayar(node);
+            if (VerboseMdl()) std::cout << "[MaterialX] tinted EON compensation: " << node->getNamePath() << "\n";
+            continue;
+        }
+        // libbsdf adds the compensation lobe only to a rough lobe: an
+        // open_pbr_surface with a constant zero base_diffuse_roughness (the
+        // default) renders the same with the library's graph, and keeps it.
+        if (LibraryCategory(node->getCategory()) == "open_pbr_surface" &&
+            IsZero(ConstantOrDefault(node, "base_diffuse_roughness")))
+            continue;
+        auto implementation = node->getImplementation("genmdl");
+        auto graph = implementation ? implementation->asA<MaterialX::NodeGraph>() : nullptr;
+        if (!graph) continue;
+        const auto inner = graph->getNodes();
+        if (std::none_of(inner.begin(), inner.end(), IsCompensatedOrenNayar)) continue;
+        PrivateGraph clone = ClonePrivateGraph(node);
+        if (!clone) continue;
+        int count = 0;
+        for (auto const& lobe : clone.graph->getNodes())
+            if (IsCompensatedOrenNayar(lobe)) {
+                UseCompensatedOrenNayar(lobe);
+                ++count;
+            }
+        const std::string name = node->getNamePath();
+        PublishPrivateGraph(node, clone);
+        if (VerboseMdl())
+            std::cout << "[MaterialX] tinted EON compensation: " << name << " as " << node->getCategory() << " ("
+                      << count << " lobe)\n";
+    }
+}
+
 void NormalizeColorSpaces(const MaterialX::DocumentPtr& doc)
 {
     const std::string& attribute = MaterialX::Element::COLOR_SPACE_ATTRIBUTE;
@@ -1707,6 +1799,7 @@ MaterialX::DocumentPtr DocumentLoader::load(const std::string& filepath)
         CoupleUsdPreviewTransmission(doc);
         CoupleLamaDielectric(doc);
         RepairLamaGeneralizedSchlick(doc);
+        CompensateOrenNayarEnergy(doc);
         std::string validation_errors;
         if (!doc->validate(&validation_errors)) {
             std::cerr << "[WARN] Document validation issues: " << validation_errors << "\n";
