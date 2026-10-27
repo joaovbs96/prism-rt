@@ -1,0 +1,45 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    upAxis = "Y"
+)
+
+# The CLI's --env FILE follows UsdLux: it must light like this untransformed
+# DomeLight of the same HDR at intensity 1, exposure 0 (CMakeLists.txt renders
+# the scene with the dome and with --env, which replaces the dome).
+def Xform "World"
+{
+    def Sphere "Left"
+    {
+        double radius = 0.6
+        color3f[] primvars:displayColor = [(0.8, 0.8, 0.8)]
+        double3 xformOp:translate = (-0.7, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+
+    def Sphere "Right"
+    {
+        double radius = 0.6
+        color3f[] primvars:displayColor = [(0.7, 0.4, 0.2)]
+        double3 xformOp:translate = (0.7, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+
+    def DomeLight "Dome"
+    {
+        asset inputs:texture:file = @../../gltf/studio_env.hdr@
+        token inputs:texture:format = "latlong"
+        color3f inputs:color = (1, 1, 1)
+        float inputs:intensity = 1
+        float inputs:exposure = 0
+    }
+
+    def Camera "Camera"
+    {
+        float focalLength = 50
+        float horizontalAperture = 36
+        float verticalAperture = 36
+        double3 xformOp:translate = (0, 0, 4)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+}

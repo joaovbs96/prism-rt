@@ -64,8 +64,11 @@ def main():
         print(f"{name}: passed in {result['seconds']:.2f}s", flush=True)
 
     for rerun in (1, 2):
+        # --env replaces the fixture's dome (intensity 2) with the same texture
+        # at intensity 1; one stop more matches it.
         run(f"standalone-{rerun}", [standalone, "--scene", fixture,
             "--camera", "/World/Camera", "--env", fixture.with_name("environment.ppm"),
+            "--env-exposure", "1",
             "--width", "128", "--height", "128", "--spp", args.spp,
             "--seed", "0", "--max-depth", "32", "--rr-min-depth", "4",
             "--max-sample-radiance", "10", "--adaptive-threshold", "0",

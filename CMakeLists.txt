@@ -1064,6 +1064,22 @@ if(TARGET prism_hydra_render AND TARGET prism_compare_images)
     prism_add_parity_fixture(NAME displacement SCENE tests/hydra/fixtures/displacement.usda)
     prism_add_parity_fixture(NAME implicit_surfaces SCENE tests/hydra/fixtures/implicit_surfaces.usda)
     prism_add_parity_fixture(NAME emissive SCENE tests/hydra/fixtures/emissive.usda)
+    # The CLI's --env FILE lights like an untransformed USD dome of FILE at
+    # intensity 1 (no extra factor of two): --env, which replaces the scene's
+    # dome, against Hydra's dome and against the CLI's own dome.
+    prism_add_parity_fixture(NAME env_dome SCENE tests/hydra/fixtures/env_dome.usda
+        CLI_ARGS --env "${CMAKE_CURRENT_SOURCE_DIR}/tests/gltf/studio_env.hdr" --max-sample-radiance 0
+        HYDRA_ARGS --sample-clamp 0)
+    add_test(NAME prism_parity_env_dome_cli_dome
+        COMMAND PrismRT --scene "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/env_dome.usda"
+            --camera /World/Camera --width 64 --height 64 --spp 16 --device cpu ${_prism_fixed_sampling}
+            --max-sample-radiance 0 --output "${prism_parity_env_dome_dir}/cli/dome.exr")
+    set_tests_properties(prism_parity_env_dome_cli_dome PROPERTIES
+        ENVIRONMENT "${_prism_test_environment};PRISM_DEVICE=cpu" FIXTURES_SETUP prism_parity_env_dome)
+    add_test(NAME prism_parity_env_dome_cli_dome_match
+        COMMAND prism_compare_images "${prism_parity_env_dome_dir}/cli/dome.exr"
+            "${prism_parity_env_dome_dir}/cli/image.exr")
+    set_tests_properties(prism_parity_env_dome_cli_dome_match PROPERTIES FIXTURES_REQUIRED prism_parity_env_dome)
     foreach(_settings Default Proxy)
         string(TOLOWER "${_settings}" _name)
         prism_add_parity_fixture(NAME mesh_features_${_name} SCENE tests/hydra/fixtures/mesh_features.usda
