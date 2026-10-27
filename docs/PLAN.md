@@ -69,6 +69,13 @@ The handover for the main (orchestrating) session. Subagents don't read this fil
 - Cone angle/softness, focus/focus tint and IES profiles as an emission factor wherever lights are sampled or hit (`shaders/integrator/lights.h`) and in the light importance; an IES parser (`src/lights/ies.{h,cpp}`) in both loaders; the IES table in the existing light-texture slot. Verified against an analytic cone and a known IES profile, CLI-vs-Hydra and CPU/Vulkan parity.
 - Then the small fixes listed under "Later".
 
+### Next: denoising (decided 2026-10-27)
+- Intel Open Image Denoise (OIDN) on the CPU and Metal devices, nvpro-samples' vk_oidn (OIDN's network as Vulkan compute; Apache-2.0) on the Vulkan device; same network weights everywhere.
+1. A denoiser interface on the render device; OIDN's CPU device behind it; a `denoised` output in Hydra and the CLI (`prism:denoise`, `--denoise`), usdview denoising every few passes / when idle; inputs from the existing `albedo` and normal AOVs. The raw colour stays the default.
+2. vk_oidn on Vulkan: its device features, a resolve pass from our accumulation buffers to RGBA colour/albedo/normal buffers, `cmdDenoise` recorded in our command buffer; measure the NVIDIA cooperative-matrix path and the forced generic path (`VK_OIDN_COOPMAT=0`, what AMD/Intel get). May need a newer Vulkan SDK (vk_oidn was tested with 1.4.363).
+3. OIDN's Metal device sharing our `MTLBuffer`s (written here, verified on João's Mac).
+- Option if the generic Vulkan path is too slow on AMD/Intel: OIDN's own HIP/SYCL backends through Vulkan external memory.
+
 ### Then: renderer SDK and Python API (decided 2026-10-26; motion blur waits for it)
 - (a) Turn the renderer into a library/SDK that the CLI and Hydra both implement: a context object (`prism::Renderer`/`Session`) owning today's process-wide state (colour management, the shared `MDLGenerator`, the texture service, SSS fallback, binding purposes, the MDL SDK); public headers separated from internals (no Embree/MDL/TBB/USD types in the public API); scene building (meshes, instances, lights, cameras, MaterialX materials) with incremental edits (Hydra needs them), rendering (devices, settings, progressive passes, AOVs, cancellation, progress), and loaders (USD, glTF, OBJ) as optional modules so the core doesn't need USD. No ABI promise until a first release.
 - (b) A Python API with nanobind as a thin layer over that API: NumPy/DLPack zero-copy for mesh arrays and images, the GIL released during renders, cancellation through the progress callback, USD stages shared with `pxr` through `UsdUtils.StageCache` ids. Packaging (bundled DLLs, load order — cf. PySide6's old msvcp140) is its own task.
