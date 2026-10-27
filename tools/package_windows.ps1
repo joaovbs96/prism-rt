@@ -303,6 +303,7 @@ foreach ($name in @("usdview.bat", "prism_render.bat", "list_devices.bat", "env_
 # 5. Licenses where the dependencies ship them.
 $lic = Join-Path $pkg "licenses"
 Copy-IfExists (Join-Path $root "LICENSE") $lic "PrismRT-LICENSE.txt"
+Copy-IfExists (Join-Path $root "NOTICE") $lic "PrismRT-NOTICE.txt"
 $usdSource = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $UsdviewScript))))
 foreach ($c in @((Join-Path $usdSource "LICENSE.txt"), (Join-Path $UsdRoot "LICENSE.txt"))) { Copy-IfExists $c $lic "OpenUSD-LICENSE.txt" }
 Copy-IfExists (Join-Path $UsdRoot "NOTICE.txt") $lic "OpenUSD-NOTICE.txt"

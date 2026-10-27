@@ -107,5 +107,5 @@ No arguments display CLI help. USD, glTF/GLB and OBJ scene files are supported; 
 ⚖️ Licensing
 ---------------------------------------
 
-This project is licensed under the MIT License. Please see the file [LICENSE](./LICENSE) for the full license text.
+This project is licensed under the Apache License, Version 2.0. Please see the file [LICENSE](./LICENSE) for the full license text and [NOTICE](./NOTICE) for the copyright notice. Releases up to v0.1.1 were published under the MIT License.
 
