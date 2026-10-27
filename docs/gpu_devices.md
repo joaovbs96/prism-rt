@@ -1021,6 +1021,45 @@ called done there.
     `tests/hydra/fixtures/color_rendering_space.usda` with `prism_hydra_render
     ... /World/Camera out.exr 128 64 4 --max-depth 1` on Metal and
     `prism_color_management_test --check-patches out.exr lin_rec709`.
+- **Dome lat-long orientation follows UsdLux** ([hydra.md](hydra.md#scene-features)):
+  shared shader code `shaders/gpu/gpu_backend.hlsl` (`gpu_latlong_s`, used by
+  `gpu_latlong_radiance` and `gpu_latlong_pdf_local`; the direction of
+  `gpu_latlong_sample_local` is now (sin theta sin phi, cos theta, -sin theta
+  cos phi)) and host code `src/environment.h` (`LatLongS`,
+  `LatLongDirection`). No new binding or buffer. Images with textured domes
+  change (a quarter turn); constant domes and dome-less scenes are
+  bit-identical (checked on Vulkan).
+  - Runs: `ctest -R "dome_orientation|environment_sampling"` (CPU); then
+    `tests/hydra/fixtures/dome_orientation.usda` from `/World/CameraNegZ`
+    with `--device metal --working-space lin_rec709 --adaptive-threshold 0
+    --spp 32 --max-sample-radiance 0` against `--device cpu` (NRMSE below
+    0.01; Vulkan 0.0017), and that render with `prism_scene_features_test
+    dome_orientation` (the `CameraPosZ` image may come from the CPU).
+- **Rect light textures upright** ([hydra.md](hydra.md#scene-features)):
+  shared shader code `shaders/integrator/lights.h` (`rectTexcoord`: t =
+  (1 - b) / 2). No device change.
+  - Runs: `ctest -R rect_light_texture` (CPU); then
+    `tests/hydra/fixtures/rect_light_texture.usda` with `--device metal
+    --working-space lin_rec709 --adaptive-threshold 0 --spp 16` and
+    `prism_scene_features_test rect_light_texture` on it. Not a parity test:
+    the CPU filters rect light textures with `ImageTexture::sampleInterp`,
+    which differs at the quadrants' edges.
+- **MaterialX loader repairs: one output colour transform, EON
+  compensation, declarations** ([materialx_compatibility.md](materialx_compatibility.md)):
+  shared host code only: `src/materialx/loader.cpp`
+  (`KeepOneOutputColorTransform`, `CompensateOrenNayarEnergy` and its helper
+  BSDF `prism_oren_nayar_diffuse_bsdf`, `DeclaredNodeDef`, `EnumValueString`,
+  `ReplaceMatrixPrimvarReaders`, `LibraryCategory`),
+  `src/materialx/prepared_template.h` (a zero `base_diffuse_roughness` stays
+  structural) and `src/materialx/material_service.cpp` (every asset-valued
+  input is materialized). The EON helper is new MDL code the GPU backends
+  compile like any material. Materials that compiled before and have no
+  rough compensated diffuse generate the same MDL.
+  - Runs: `ctest -R "materialx_loader|eon_albedo|triplanar|declaration_repairs"`
+    (CPU); then `tests/hydra/fixtures/triplanar_colorspace.usda` and
+    `declaration_repairs.usda` with `--device metal`: no magenta error
+    material, within noise of `--device cpu`; and the Typhoon suite's
+    `test-suite/eon_diffuse_openpbr_compare.usda` on Metal against the CPU.
 
 ## Diagnostics
 

@@ -78,8 +78,121 @@ networks, do not always type inputs as their node definitions declare:
   and shader inputs hdMtlx typed after the graph output feeding them (the graph
   output then gets the `extract`/`convert` node).
 
+- An integer input written as one of its declared `enum` names gets the
+  name's `enumvalues` entry (or its index): USD authors UsdPreviewSurface's
+  `opacityMode` as a token (`"transparent"`, `"presence"`), MaterialX 1.39.5
+  declares an integer with those names.
+
 Without these repairs validation fails ("doesn't match declaration") and the
 material renders as the magenta error material.
+
+A node that names no definition gets the one `Node::getNodeDef` would pick:
+its category and output type, and its version (the default version when it
+names none). The repairs above used to skip categories with several
+definitions of the same type, which left `standard_surface` (versions 1.0.0
+and 1.0.1) and `UsdPreviewSurface` documents unrepaired: an
+`emission_color` fed by a vector3 graph output (the Typhoon suite's
+tangent/bitangent visualizations) or a token `opacityMode` made MaterialX
+find no definition ("Could not find a nodedef for node 'Surface'").
+
+Such a node with an input its definition does not declare also matches no
+definition (`Node::getNodeDef` compares the inputs; a node naming its
+definition gets it regardless, and is left alone). `open_pbr_surface`
+geometry inputs written under `standard_surface`'s names (`normal`,
+`tangent`, `coat_normal`, `thin_walled`) take OpenPBR's (`geometry_normal`,
+...), unless that input is authored too: the Typhoon suite's
+`openPbr_bump_fractal` connects a bump to `normal`, and Typhoon renders the
+bump. Other undeclared inputs are dropped with a warning.
+
+USD's `UsdPrimvarReader_matrix` has no MaterialX counterpart (1.39.5 leaves
+`ND_UsdPrimvarReader_matrix44` commented out: "Getting primvar of matrix type
+is not supported in MaterialX standard library"). hdMtlx finds no definition
+for `ND_UsdPrimvarReader_matrix` and writes a `surface` node of type
+`surfaceshader` in its place, which fails generation. The loader replaces it
+with a `constant` matrix44 of its `fallback` (the identity unless authored),
+as when the primvar is missing, and warns: matrix primvars are not read.
+
+## One output colour transform per node
+
+MaterialX 1.39.5's shader generator converts the colour output of a node
+whose filename inputs carry a colour space as a whole (not image by image),
+and registers that conversion once per such input
+(`ShaderGraph::applyInputTransforms`). `triplanarprojection` has three
+(`filex`, `filey`, `filez`): `finalize` then inserts three transform nodes
+under one name, adding the second frees the first while the output still
+lists its input, and the next `ShaderInput::breakConnection` reads freed
+memory. Both loaders crashed (0xC0000005) on any document with a
+triplanarprojection whose files are tagged (the Typhoon suite's
+`triplanarprojection_color3` and `texture_image_compare_gallery`). MaterialX's
+main branch now keeps the first request for an output ("An output can carry
+only one transform"). `KeepOneOutputColorTransform` does the same in the
+document: the first tagged filename input keeps its colour space, the others
+are tagged `none`, which the generator skips (a different space on another
+file is logged). Untagged files, single-file nodes and nodes without a
+colour output are left alone.
+
+The same files failed once the crash was gone: the material service
+materialized only inputs named `file` or `filename` into the texture cache,
+so `filex` kept its authored relative path, which MDL's string modules
+reject (C293 "strict relative file paths ... are not supported"). Every
+asset-valued input is now materialized (`IsTextureParameter` in
+`src/materialx/material_service.cpp`).
+
+## EON energy compensation
+
+`oren_nayar_diffuse_bsdf` with `energy_compensation` (OpenPBR's base,
+`LamaDiffuse`) is the EON model: its multiple-scattering lobe is tinted by
+
+    rho_ms = rho^2 E_avg / (1 - rho (1 - E_avg)),   E_avg = A (1 + C2 r),  A = 1 / (1 + C1 r)
+
+with C1 = 1/2 - 2/(3 pi), C2 = 2/3 - 28/(15 pi) (OpenPBR; MaterialX's GLSL
+`mx_oren_nayar_compensated_diffuse` and `_dir_albedo`). MaterialX 1.39.5's
+MDL library (`pbrlib_1_10.mdl` `mx_oren_nayar_diffuse_bsdf`) passes
+`multiscatter_tint: color(1.0)` to `df::diffuse_reflection_bsdf`, and
+libbsdf adds that lobe untinted (`tint * f_ss + multiscatter_tint * f_ms`,
+`diffuse_sample`/`_evaluate`): right for white albedo only, too bright for
+any other (albedo rho E + (1 - E) instead of rho E + rho_ms (1 - E)). Typhoon's
+`eon_diffuse_openpbr_compare`: at roughness 0.5 and 1 the red channel (0.95)
+matched within 2%, green and blue were 1.3-4x too bright.
+
+`CompensateOrenNayarEnergy` points compensated `oren_nayar_diffuse_bsdf`
+nodes at a helper BSDF, `prism_oren_nayar_diffuse_bsdf` (a node definition
+and inline genmdl code added to the document, like the dielectric helpers),
+which passes `rho_ms` (with libbsdf's saturated tint and roughness):
+the document's own nodes directly, and those in the genmdl graph of a node
+the document uses through a [private copy](#private-graphs) of that graph
+(OpenPBR's `diffuse_bsdf`, `LamaDiffuse`'s compensated lobe; OpenPBR's
+uncompensated thin-walled subsurface lobe stays). libbsdf adds the lobe only
+when the roughness is above zero, so an `open_pbr_surface` whose
+`base_diffuse_roughness` is a constant zero (the default) keeps the
+library's graph and its images; material templates keep a zero roughness
+structural for the same reason. A repair that rewrites a copy another repair
+made (OpenPBR glass) names the result after the library node and drops the
+copy it replaced (`LibraryCategory`).
+
+`prism_eon_albedo_test` samples the compiled lobe (rho 0.95/0.5/0.2,
+roughness 0.5 and 1, 0 to 80 degrees): within 0.001 of EON per channel
+(before: blue 0.379 instead of 0.163 at roughness 1, normal incidence), and
+a white one returns 1 (the white furnace). OpenPBR's base gives the same
+numbers.
+
+## Upstream issues (reports held back)
+
+Upstream MaterialX/MDL issues the loader works around, documented here while
+the reports are held back (docs/DECISIONS.md, 2026-10-25):
+
+- **EON's compensation lobe untinted in the MDL library** (above):
+  `mx_oren_nayar_diffuse_bsdf` should pass the EON multiscatter tint
+  instead of `color(1.0)`.
+- **Several output colour transforms on one node crash generation**
+  (above): fixed on MaterialX's main branch after 1.39.5.
+- **`UsdPreviewSurface.opacityMode` is an integer in MaterialX 1.39.5**
+  while USD authors a token; and **`UsdPrimvarReader_matrix`** has no
+  MaterialX definition (hdMtlx writes an invalid node for it).
+- Earlier ones, in their sections: the layered dielectric and opaque
+  layering energy loss, layers over mixes, thin-walled OpenPBR, the uncoated
+  transmission IOR, glTF volume attenuation and the standard_surface
+  conductor clamp.
 
 ## Layers over mixes
 
@@ -453,7 +566,14 @@ coupled transmission graph, `materialx_loader_dielectric` (against MaterialX's
 own library graphs, from the MaterialX install) the split, thin-film, coat,
 thin-walled `standard_surface`, `UsdPreviewSurface` and Lama rewrites, and
 `materialx_loader_uniform_color` the tagged uniform colours (and that the
-library has no other uniform `color3` input). The
+library has no other uniform `color3` input), `materialx_loader_output_color`
+the single output colour transform, `materialx_loader_eon` the EON helper
+in direct nodes and private OpenPBR/Lama graphs, and
+`materialx_loader_declarations` (against MaterialX's library) versions, enum
+names, undeclared inputs and the matrix primvar reader. The
+`prism_parity_triplanar_colorspace_*` and `prism_parity_declaration_repairs_*`
+tests render those networks through both frontends without the error
+material, and `prism_eon_albedo_test` checks EON's albedo. The
 `prism_parity_gltf_uniform_colorspace_*` tests (main build) render
 `tests/hydra/fixtures/gltf_uniform_colorspace.usda` through both frontends
 without a compile failure and compare it with the same colours authored

@@ -481,6 +481,28 @@ parity fixture each and a check in `prism_scene_features_test`:
   the same attribute). Default false, as before; a visible light covers its
   pixels (alpha 1). Domes follow `domeLightCameraVisibility`. Fixture
   `light_camera_visibility.usda`.
+- **Dome orientation.** A lat-long dome texture follows UsdLuxDomeLight's
+  convention, the OpenEXR one (`usdLux/domeLight.h`): the image's top row is
+  +Y, its centre column longitude 0, which points into +Z, its first quarter
+  longitude +pi/2 (+X), its third quarter -X and its left and right edges -Z
+  (pixel (0, 0) is latitude +pi/2, longitude +pi). The dome's transform
+  orients it from there. Lookups and importance sampling share the mapping
+  (`LatLongS` / `LatLongDirection` in `src/environment.h`, `gpu_latlong_s` in
+  `gpu_backend.hlsl`) for USD domes in both loaders, the CLI's `--env` and
+  the default dome. Before 2026-10-27 PrismRT read longitude from +X (u = 0
+  at +X), a quarter turn off: renders of textured domes from before then
+  match with an extra `rotateY 90` on the dome. Not supported: `DomeLight_1`'s
+  `poleAxis` (and a Z-up stage's dome pole): the dome is read as `scene`/Y.
+  Fixture `dome_orientation.usda` (a band per axis seen from two cameras by
+  both loaders and `--env`, MIS against BSDF-only sampling of its sun, and a
+  Vulkan parity check).
+- **Rect light textures** (`inputs:texture:file` on a RectLight): "a texture
+  file's min coordinates" (its first pixel, the top left) sit at the light's
+  local (+X, +Y) and its max coordinates at (-X, -Y), so the image reads
+  upright and unmirrored from the side the light emits to (-Z), as Typhoon
+  renders it (`rectTexcoord` in `shaders/integrator/lights.h`; before
+  2026-10-27 it was upside down). Fixture `rect_light_texture.usda` (camera
+  visible; CPU in both loaders and Vulkan).
 - **Dome colour temperature.** `inputs:enableColorTemperature` and
   `inputs:colorTemperature` tint domes like the other lights (blackbody in linear
   Rec.709, converted to the working space). Fixture `dome_color_temperature.usda`.

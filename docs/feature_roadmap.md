@@ -65,6 +65,8 @@ Scenes: **Eggs** (MaterialEggs), **OpenPBR** (OpenPBRShaderPlayground),
 - **Light filters** and portal lights.
 - **Dome texture formats** other than lat-long (angular, mirrored ball,
   cube maps) are read as lat-long with a warning.
+- **`DomeLight_1`'s `poleAxis`** (and a Z-up stage's dome pole): domes are
+  read with their pole on their local +Y (`scene` on a Y-up stage).
 - **Many-light sampling.** NEE picks lights by power from an alias table,
   then re-picks analytic lights by their estimated irradiance at the shading
   point (up to 64 of them; see [Sampling](gpu_devices.md#sampling)). Emissive
