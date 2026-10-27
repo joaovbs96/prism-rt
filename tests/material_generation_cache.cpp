@@ -1,4 +1,5 @@
 #include "../src/materialx/mdl_generator.h"
+#include "../src/renderer/renderer_options.h"
 #include "../src/materialx/usd_network.h"
 #include <pxr/imaging/hd/materialNetwork2Interface.h>
 #include <MaterialXCore/Material.h>
@@ -48,7 +49,10 @@ int main(int argc,char** argv) {
         auto library = generator.get_stdlib();
         if(argc==5&&std::string(argv[1])=="--probe") {
             const mx::Color3 color(std::stof(argv[2]),std::stof(argv[3]),std::stof(argv[4]));
-            const auto generated=generator.generate(document(library,color), "PrismMaterial", *kColor);
+            // The probe is a front end: the environment's generation cache
+            // switch (PRISM_DISABLE_GENERATION_CACHE) applies.
+            const auto generated=generator.generate(document(library,color), "PrismMaterial", *kColor,
+                prism::RendererOptions::FromEnvironment().materials.generationCache);
             if(!generated.success)throw std::runtime_error(generated.error_message);
             uint64_t hash=14695981039346656037ull;
             for(unsigned char c:generated.mdl_source){hash^=c;hash*=1099511628211ull;}
@@ -98,18 +102,14 @@ int main(int argc,char** argv) {
         const auto changed=generator.generate(changedStructure, "PrismMaterial", *kColor);
         if(!changed.success || changed.generationCacheHit)
             throw std::runtime_error("non-parameterized scalar incorrectly reused color template");
-#ifdef _WIN32
-        _putenv_s("PRISM_DISABLE_GENERATION_CACHE", "1");
-#else
-        setenv("PRISM_DISABLE_GENERATION_CACHE", "1", 1);
-#endif
-        auto reference = generator.generate(bdoc, "PrismMaterial", *kColor);
+        // Without the generation cache (MaterialOptions::generationCache).
+        auto reference = generator.generate(bdoc, "PrismMaterial", *kColor, false);
         if (!reference.success || b.mdl_source != reference.mdl_source) {
             std::ofstream("template-cached.mdl") << b.mdl_source;
             std::ofstream("template-reference.mdl") << reference.mdl_source;
             throw std::runtime_error("template differs from independent MaterialX generation");
         }
-        const auto changedReference=generator.generate(changedStructure, "PrismMaterial", *kColor);
+        const auto changedReference=generator.generate(changedStructure, "PrismMaterial", *kColor, false);
         if(!changedReference.success || changed.mdl_source!=changedReference.mdl_source)
             throw std::runtime_error("scalar edit did not match independent generation");
         std::cout << "Shared libraries and color template generation match independent generation\n";

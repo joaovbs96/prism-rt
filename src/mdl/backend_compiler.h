@@ -162,7 +162,10 @@ struct TargetCode {
 // MDL SDK's LLVM-based native backend.
 class BackendCompiler {
 public:
-    explicit BackendCompiler(Context& ctx);
+    // resourceMode (MaterialOptions::mdlResourceMode): how compiled code
+    // reads textures, auto, custom or builtin; any other value fails every
+    // compile with a message.
+    explicit BackendCompiler(Context& ctx, std::string resourceMode = "auto");
 
     // Full pipeline: CompiledMaterial -> native target code with callable functions
     TargetCode generate_target_code(const CompiledMaterial& compiled);
@@ -174,6 +177,7 @@ private:
     void print_context_messages(mi::neuraylib::IMdl_execution_context* context);
 
     Context& m_ctx;
+    std::string m_resourceMode;
 };
 
 } // namespace mdl

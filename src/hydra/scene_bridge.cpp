@@ -4736,7 +4736,7 @@ public:
             deviceCreation = std::async(std::launch::async, [preference, this] {
                 prism::load_profile::Scope profile("device.create");
                 CreatedDevice created;
-                created.device = prism::device::CreateDevice(preference, renderer->options().devices, &created.note);
+                created.device = prism::device::CreateDevice(preference, renderer->deviceOptions(), &created.note);
                 progress.End(prism::Phase::Device);
                 return created;
             });
@@ -4752,7 +4752,7 @@ public:
             TF_WARN("PrismRT: render device creation failed: %s", e.what());
         }
         if (!created.device) created.device = prism::device::CreateDevice(
-            prism::device::DevicePreference::Cpu, renderer->options().devices, &created.note);
+            prism::device::DevicePreference::Cpu, renderer->deviceOptions(), &created.note);
         if (!created.note.empty()) TF_WARN("PrismRT: %s", created.note.c_str());
         const auto info = created.device->Info();
         progress.SetDevice(DescribeDevice(*created.device, preference, created.note));
@@ -4871,7 +4871,7 @@ public:
         }
         if (AdvanceDevicePreparation(device, prepared)) return PreparationOutcome::Ready;
         if (!previewDevice)
-            previewDevice = prism::device::CreateDevice(prism::device::DevicePreference::Cpu, renderer->options().devices);
+            previewDevice = prism::device::CreateDevice(prism::device::DevicePreference::Cpu, renderer->deviceOptions());
         return PreparationOutcome::Preview;
     }
 
@@ -5107,7 +5107,7 @@ public:
     uint64_t inactiveGeneration = 0;
     std::unique_ptr<MaterialService> materialService;
     MaterialService::MaterialStats materialWorkTotals;
-    std::shared_ptr<prism::TextureService> textureService = prism::TextureService::Acquire();
+    std::shared_ptr<prism::TextureService> textureService = renderer->textures();
     std::shared_ptr<PrototypePool> prototypePool =
         std::make_shared<PrototypePool>();
     uint64_t requestedGeneration = 1;

@@ -114,7 +114,7 @@ std::unique_ptr<RenderDevice> TryCreate(DeviceKind kind, DeviceOptions const& op
             return nullptr;
         }
 #ifdef PRISM_HAS_VULKAN
-        return VulkanDevice::Create(options.initialTextureBudgetMiB, reason);
+        return VulkanDevice::Create(options, reason);
 #else
         if (reason) *reason = "the Vulkan device is not part of this build";
         return nullptr;

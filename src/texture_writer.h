@@ -47,8 +47,9 @@ bool WriteMipmappedExr(std::filesystem::path const &path, OIIO::ImageSpec const 
 bool WriteImageSafely(std::filesystem::path const &path, OIIO::ImageSpec const &spec,
                       void const *pixels, OIIO::TypeDesc format, std::string *error);
 
-// The compression of prepared textures: PRISM_TEXTURE_COMPRESSION, default
+// The compression of prepared textures: configured (the texture service's
+// TextureServiceOptions::compression, PRISM_TEXTURE_COMPRESSION), default
 // "zip:1" (OpenEXR's zip at deflate level 1).
-std::string PreparedCompression();
+std::string PreparedCompression(std::string const &configured = {});
 
 } // namespace prism::texture_writer

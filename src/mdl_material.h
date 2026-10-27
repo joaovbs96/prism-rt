@@ -158,7 +158,7 @@ public:
             mat_name = selectedMaterial->getName();
         }
 
-        GeneratedMDL gen = generator.generate(doc, mat_name, *settings.color);
+        GeneratedMDL gen = generator.generate(doc, mat_name, *settings.color, settings.generationCache);
         m_generated_uniforms = gen.uniforms;
         if (timings) timings->generationSeconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - generationStart).count();
@@ -191,7 +191,7 @@ public:
         }
 
         // Phase 5: Backend compilation to native CPU code
-        mdl::BackendCompiler backend(mdl_context);
+        mdl::BackendCompiler backend(mdl_context, settings.mdlResourceMode);
         m_target = backend.generate_target_code(m_compiled);
         if (timings) timings->nativeJitSeconds = m_target.nativeJitSeconds;
 

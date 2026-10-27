@@ -54,9 +54,12 @@ public:
 
     // Generates in `color`'s working space: tagged colours and textures
     // decode into it (the generator's colour transforms).
+    // useGenerationCache: reuse generated templates from memory and disk
+    // (MaterialOptions::generationCache).
     GeneratedMDL generate(MaterialX::DocumentPtr doc,
                           const std::string& material_name,
-                          prism::color::ColorManagement const& color);
+                          prism::color::ColorManagement const& color,
+                          bool useGenerationCache = true);
     GeneratedMDL generate(MaterialX::OutputPtr output,
                           prism::color::ColorManagement const& color);
 

@@ -1134,7 +1134,7 @@ int runStandaloneCli(int argc, char** argv) {
         }
         progress.Stage("Creating the render device");
         std::string deviceNote;
-        auto renderDevice = prism::device::CreateDevice(o.device, renderer.options().devices, &deviceNote);
+        auto renderDevice = prism::device::CreateDevice(o.device, renderer.deviceOptions(), &deviceNote);
         progress.Stage("");
         if (!deviceNote.empty()) std::cerr << "PrismRT: " << deviceNote << '\n';
         const auto deviceInfo = renderDevice->Info();
@@ -1316,7 +1316,7 @@ int runStandaloneCli(int argc, char** argv) {
             std::cout << " to " << view.output << '\n';
         }
         const double outputSeconds = seconds() - loadSeconds - renderSeconds;
-        const auto textureStats = prism::TextureService::Acquire()->stats();
+        const auto textureStats = renderer.textures()->stats();
         std::cout << "[PrismProfile] {\"stageSeconds\":" << stageSeconds
                   << ",\"loadSeconds\":" << loadSeconds
                   << ",\"renderSeconds\":" << renderSeconds

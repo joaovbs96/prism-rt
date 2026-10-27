@@ -216,14 +216,12 @@ GeneratedMDL openPbrMaterial(std::string const& libraries)
     return generated;
 }
 
+// The resource mode the test's backend compilers use
+// (MaterialOptions::mdlResourceMode); null: auto.
+std::string gResourceMode="auto";
 void setResourceMode(char const* mode)
 {
-#ifdef _WIN32
-    _putenv_s("PRISM_MDL_RESOURCE_MODE",mode ? mode : "");
-#else
-    if(mode)setenv("PRISM_MDL_RESOURCE_MODE",mode,1);
-    else unsetenv("PRISM_MDL_RESOURCE_MODE");
-#endif
+    gResourceMode=mode ? mode : "auto";
 }
 
 struct CompiledTarget {
@@ -265,7 +263,7 @@ CompiledTarget compile(mdl::Context &context, std::filesystem::path const &root,
     result.compiled = compiler.compile(generated, (root / "fixture.mtlx").string(),
                                        specification);
     require(result.compiled.success, "material compile failed: " + result.compiled.error_message);
-    mdl::BackendCompiler backend(context);
+    mdl::BackendCompiler backend(context,gResourceMode);
     result.target = backend.generate_target_code(result.compiled);
     require(result.target.success, "native target failed: " + result.target.error_message);
     result.cacheHit = result.target.cacheHit;
@@ -513,7 +511,7 @@ int main()
             mi::base::Handle<mi::neuraylib::IValue_list> overrides(factory->create_value_list());
             require(texture&&overrides->add_value("image",texture.get())==0,
                     "cannot create texture argument override");
-            mdl::BackendCompiler backend(context);
+            mdl::BackendCompiler backend(context,gResourceMode);
             auto rebound=backend.bind_arguments(red.target,overrides.get(),transaction.get());
             require(rebound.success&&rebound.translationCalls==0&&
                         rebound.program==red.target.program,
@@ -664,7 +662,7 @@ int main()
             mi::base::Handle<mi::neuraylib::IValue_color> color(factory->create_color(.9f,.08f,.03f));
             require(overrides->add_value(parameter->name.c_str(),color.get())==0,
                     "cannot create color argument override");
-            mdl::BackendCompiler backend(context);
+            mdl::BackendCompiler backend(context,gResourceMode);
             mi::base::Handle<mi::neuraylib::IValue_list> invalid(factory->create_value_list());
             mi::base::Handle<mi::neuraylib::IValue_float> wrong(factory->create_float(.5f));
             require(invalid->add_value(parameter->name.c_str(),wrong.get())==0&&

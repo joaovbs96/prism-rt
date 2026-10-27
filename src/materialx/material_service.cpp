@@ -106,7 +106,8 @@ uint64_t gCacheClock = 0;
 uint64_t gCacheEvictions = 0;
 
 void TrimUnusedMaterialsLocked() {
-    const uint64_t limit = prism::ResourceLimit("PRISM_MATERIAL_CACHE_MB", 512, 1048576) * 1024 * 1024;
+    // The runtime's budget: the largest any renderer asked for.
+    const uint64_t limit = prism::Runtime::Instance().settings().materialCacheMiB * 1024 * 1024;
     uint64_t unused = 0;
     std::vector<std::string> candidates;
     for (const auto& [key, entry] : gMaterialCache) {
@@ -146,6 +147,8 @@ std::string ResourcePathKey(const std::filesystem::path& path)
 struct EarlyCacheEntry {
     SdfPath path;
     std::string libraries, mdlPath;
+    // MaterialSettings::Identity of the service that compiled the material.
+    std::string materialIdentity;
     uint64_t resourceRevision = 0;
     ArResolverContext resolverContext;
     NetworkSnapshot network;
@@ -790,13 +793,14 @@ public:
             gEarlyMaterialCache.begin(), gEarlyMaterialCache.end(),
             [&](const EarlyCacheEntry& entry) {
                 return entry.libraries == libraries && entry.mdlPath == mdlPath &&
+                    entry.materialIdentity == materialIdentity &&
                     entry.resourceRevision == prepared.resourceRevision &&
                     entry.resolverContext == prepared.resolverContext &&
                     entry.network == prepared.network;
             }), gEarlyMaterialCache.end());
         if (gEarlyMaterialCache.size() >= kEarlyMaterialCacheLimit)
             gEarlyMaterialCache.erase(gEarlyMaterialCache.begin());
-        gEarlyMaterialCache.push_back({prepared.path, libraries, mdlPath,
+        gEarlyMaterialCache.push_back({prepared.path, libraries, mdlPath, materialIdentity,
             prepared.resourceRevision,
             prepared.resolverContext, prepared.network, prepared.dependencies, material});
     }
@@ -806,7 +810,7 @@ public:
         , materials(std::move(settings))
         , libraries(options.materials.materialxLibraries)
         , mdlPath(options.materials.materialxMdlPath)
-        , cacheDir(options.CacheRoot() / "materials")
+        , cacheDir(prism::Runtime::Instance().settings().CacheRoot() / "materials")
         , associationScope(requestedAssociationScope ? requestedAssociationScope :
               static_cast<uint64_t>(reinterpret_cast<std::uintptr_t>(context)))
         , foldParameters(options.materials.compileMode == prism::MaterialOptions::CompileMode::Auto)
@@ -817,6 +821,7 @@ public:
     {
         if (!materials.color) throw std::invalid_argument("MaterialService needs a colour management");
         materialIdentity = materials.Identity();
+        identityKey = HashText(materialIdentity);
         if (this->mdlPath.empty() && !this->libraries.empty())
             this->mdlPath = (std::filesystem::path(this->libraries) / "mdl").string();
         prewarmKey = PrewarmContextPrefix(context) + this->libraries + "\n" + this->mdlPath;
@@ -913,7 +918,7 @@ public:
             for (auto it = gEarlyMaterialCache.rbegin(); it != gEarlyMaterialCache.rend(); ++it) {
                 auto cachedMaterial = it->material.lock();
                 if (cachedMaterial && it->libraries == libraries &&
-                    it->mdlPath == mdlPath &&
+                    it->mdlPath == mdlPath && it->materialIdentity == materialIdentity &&
                     it->resourceRevision == result.resourceRevision &&
                     it->resolverContext == result.resolverContext &&
                     it->network == result.network &&
@@ -945,7 +950,7 @@ public:
                 result.conversionNetwork = it->network;
                 result.key = std::to_string(
                     reinterpret_cast<std::uintptr_t>(context)) + "-" +
-                    it->artifactKey;
+                    it->artifactKey + "-" + identityKey;
                 result.valid = true;
                 ++earlyCacheHits;
                 return result;
@@ -987,7 +992,7 @@ public:
                 if (PublishImmutableText(cacheDir, artifactKey, result.xml,
                                          &result.mtlxPath)) {
                     result.key = std::to_string(
-                        reinterpret_cast<std::uintptr_t>(context)) + "-" + artifactKey;
+                        reinterpret_cast<std::uintptr_t>(context)) + "-" + artifactKey + "-" + identityKey;
                     result.valid = true;
                     ++earlyCacheHits;
                     return true;
@@ -1100,7 +1105,7 @@ public:
             "PrismHydraMaterial-v2\n" + libraries + "\n" + mdlPath + "\n" +
             resourceFingerprint + "\n" + result.xml);
         const std::string baseKey =
-            std::to_string(reinterpret_cast<std::uintptr_t>(context)) + "-" + artifactKey;
+            std::to_string(reinterpret_cast<std::uintptr_t>(context)) + "-" + artifactKey + "-" + identityKey;
         result.key = baseKey;
         {
             std::unique_lock<std::mutex> cacheLock(gMaterialCacheMutex);
@@ -1430,6 +1435,9 @@ public:
     // shared caches' key).
     prism::MaterialSettings materials;
     std::string materialIdentity;
+    // Its hash: compiled materials are shared by (context, document,
+    // identity) through gMaterialCache.
+    std::string identityKey;
     std::string libraries;
     std::string mdlPath;
     std::filesystem::path cacheDir;

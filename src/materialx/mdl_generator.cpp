@@ -285,12 +285,12 @@ public:
         m_colorIdentity=color->identity();
     }
 
-GeneratedMDL generateCached(MaterialX::DocumentPtr doc, const std::string& material_name) {
+GeneratedMDL generateCached(MaterialX::DocumentPtr doc, const std::string& material_name, bool useCache) {
     std::vector<MaterialX::InputPtr> colors;
     const auto structural=doc ? ColorTemplateKey(doc,colors) : std::string{};
     if(structural.empty() || m_libraryDigest.empty() ||
        doc->getDataLibrary()!=m_stdlib || HasExternalImplementationSources(doc) ||
-       std::getenv("PRISM_DISABLE_GENERATION_CACHE")) return generate(doc,material_name);
+       !useCache) return generate(doc,material_name);
     const auto persistentKey=prism::materialx::GeneratedTemplateKey({
         "prism-generated-mdl-color-template-v1",
         std::to_string(MATERIALX_MAJOR_VERSION)+"."+
@@ -648,10 +648,11 @@ void MDLGenerator::reserveWorkers(const std::string& mx_libraries_path, size_t c
 
 GeneratedMDL MDLGenerator::generate(MaterialX::DocumentPtr doc,
                                     const std::string& material_name,
-                                    prism::color::ColorManagement const& color) {
+                                    prism::color::ColorManagement const& color,
+                                    bool useGenerationCache) {
     std::lock_guard<std::mutex> lock(m_impl->generate_mutex);
     m_impl->syncColorManagement(color);
-    return m_impl->generateCached(doc, material_name);
+    return m_impl->generateCached(doc, material_name, useGenerationCache);
 }
 
 GeneratedMDL MDLGenerator::generate(MaterialX::OutputPtr output,

@@ -3,7 +3,9 @@
 #include "../render_defaults.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
+#include <string>
 #include <iostream>
 #include <string_view>
 #include <thread>
@@ -85,8 +87,32 @@ RendererOptions RendererOptions::FromEnvironment()
             std::cerr << "PrismRT: PRISM_TEXTURE_PREPARE must be parallel or serial; using parallel\n";
     }
 
-    options.limits.materialThreads = unsigned(PositiveLimit("PRISM_MATERIAL_THREADS", 64));
-    options.limits.textureThreads = unsigned(PositiveLimit("PRISM_TEXTURE_THREADS", 64));
+    // Only its presence counts (as before: a measurement switch).
+    if (std::getenv("PRISM_DISABLE_GENERATION_CACHE")) materials.generationCache = false;
+    if (const char* value = std::getenv("PRISM_MDL_RESOURCE_MODE")) materials.mdlResourceMode = value;
+
+    auto& limits = options.limits;
+    limits.materialThreads = unsigned(PositiveLimit("PRISM_MATERIAL_THREADS", 64));
+    limits.textureThreads = unsigned(PositiveLimit("PRISM_TEXTURE_THREADS", 64));
+    limits.materialCacheMiB = PositiveLimit("PRISM_MATERIAL_CACHE_MB", 1048576);
+    limits.preparationMiB = PositiveLimit("PRISM_PREPARATION_MB", 1048576);
+    limits.texturePrepareMiB = PositiveLimit("PRISM_TEXTURE_PREPARE_MB", 1u << 20);
+    limits.textureCacheMiB = PositiveLimit("PRISM_TEXTURE_CACHE_MB", 65536);
+    limits.textureOpenFiles = unsigned(PositiveLimit("PRISM_TEXTURE_OPEN_FILES", 8192));
+    limits.textureWriterThreads = unsigned(PositiveLimit("PRISM_TEXTURE_WRITER_THREADS", 256));
+    if (const char* value = Text("PRISM_DISK_CACHE_GB")) {
+        // Invalid values take the default (silently, as before).
+        try {
+            size_t consumed = 0;
+            const double parsed = std::stod(value, &consumed);
+            if (consumed == std::string_view(value).size() && parsed > 0 && std::isfinite(parsed))
+                limits.diskCacheGiB = std::min(parsed, 1024.0);
+        } catch (...) {}
+    }
+
+    if (const char* value = Text("PRISM_TEXTURE_COMPRESSION")) options.textures.compression = value;
+    if (const char* value = std::getenv("PRISM_TEXTURE_BACKGROUND_WRITES"))
+        options.textures.backgroundWrites = std::string_view(value) != "0";
 
     auto disabled = [](const char* name) {
         const char* value = Text(name);

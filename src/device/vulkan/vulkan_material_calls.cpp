@@ -889,6 +889,8 @@ MaterialCallShaders::MaterialCallShaders(VkDevice device, VkPhysicalDeviceProper
 {
     m_createPipelines = reinterpret_cast<PFN_vkCreateRayTracingPipelinesKHR>(
         vkGetDeviceProcAddr(device, "vkCreateRayTracingPipelinesKHR"));
+    m_groupStackSize = reinterpret_cast<PFN_vkGetRayTracingShaderGroupStackSizeKHR>(
+        vkGetDeviceProcAddr(device, "vkGetRayTracingShaderGroupStackSizeKHR"));
     // Statistics are captured on whole pipelines only.
     m_libraries = support.pipeline && support.library && m_createPipelines && PipelineLibrariesSetting() &&
         !(support.executableStatistics && PipelineStatisticsSetting());
@@ -1103,10 +1105,10 @@ std::shared_ptr<ShaderBuild> MaterialCallShaders::compile(std::string const& sou
     const int64_t commitBytes = commit ? commit->stop() : 0;
     vkDestroyShaderModule(m_device, module, nullptr);
     if (result == VK_SUCCESS) {
-        static auto groupStackSize = reinterpret_cast<PFN_vkGetRayTracingShaderGroupStackSizeKHR>(
-            vkGetDeviceProcAddr(m_device, "vkGetRayTracingShaderGroupStackSizeKHR"));
-        const uint64_t reported = groupStackSize
-            ? groupStackSize(m_device, built->library, 0, VK_SHADER_GROUP_SHADER_GENERAL_KHR) : 0;
+        // This device's entry point (a function-local static held the first
+        // VkDevice's for every later device of the process).
+        const uint64_t reported = m_groupStackSize
+            ? m_groupStackSize(m_device, built->library, 0, VK_SHADER_GROUP_SHADER_GENERAL_KHR) : 0;
         built->stackSize = std::max(reported, recordedStack);
         if (gpu::GpuVerbose() && reported < recordedStack)
             std::cerr << std::format("PrismRT Vulkan: {} library reports a {} B stack, {} B when it was compiled\n",

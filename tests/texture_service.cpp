@@ -1,4 +1,5 @@
 #include "../src/texture_service.h"
+#include "../src/resource_limits.h"
 
 #include <OpenImageIO/imagebuf.h>
 #include <OpenImageIO/imageio.h>
@@ -26,13 +27,14 @@ std::vector<char> bytes(std::filesystem::path const &path)
     return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
 }
 
-void setEnv(char const *name, std::string const &value)
+// A service of its own on `root` with a disk budget of `gib` (the options a
+// renderer's TextureServiceOptions carry).
+std::shared_ptr<prism::TextureService> serviceAt(std::filesystem::path const &root, double gib = 20.0)
 {
-#ifdef _WIN32
-    _putenv_s(name, value.c_str());
-#else
-    setenv(name, value.c_str(), 1);
-#endif
+    prism::TextureServiceOptions options;
+    options.cacheDirectory = root;
+    options.diskBudgetBytes = prism::TextureArtifactBudgetBytes(prism::PersistentDiskBudgetBytes(gib));
+    return prism::TextureService::Create(options);
 }
 
 // Every mip level of a prepared file, as floats.
@@ -58,11 +60,6 @@ int main()
         const auto root = std::filesystem::temp_directory_path() / "prism-texture-service-test";
         std::filesystem::remove_all(root);
         std::filesystem::create_directories(root);
-#ifdef _WIN32
-        _putenv_s("PRISM_CACHE_DIR", root.string().c_str());
-#else
-        setenv("PRISM_CACHE_DIR", root.string().c_str(), 1);
-#endif
         const auto source = root / "source.exr";
         OIIO::ImageSpec spec(2, 2, 3, OIIO::TypeDesc::FLOAT);
         OIIO::ImageBuf image(spec);
@@ -75,7 +72,7 @@ int main()
         require(image.write(source.string()), "cannot write texture fixture");
         const auto original = bytes(source);
 
-        auto service = prism::TextureService::Acquire();
+        auto service = serviceAt(root);
         prism::TexturePrepareOptions prep;
         prep.exposure = 1.0f;
         const auto sourceStampBefore = service->sourceIdentity(source, prep);
@@ -473,10 +470,11 @@ int main()
 
         const auto cacheRootA = root / "root-switch-a";
         const auto cacheRootB = root / "root-switch-b";
-        setEnv("PRISM_CACHE_DIR", cacheRootA.string());
-        auto rootPinned = service->prepare(source);
-        setEnv("PRISM_CACHE_DIR", cacheRootB.string());
-        auto rootSwitched = service->prepare(source);
+        // Services on two cache roots (two renderers' options) keep their
+        // prepared files apart.
+        auto serviceA = serviceAt(cacheRootA), serviceB = serviceAt(cacheRootB);
+        auto rootPinned = serviceA->prepare(source);
+        auto rootSwitched = serviceB->prepare(source);
         require(rootPinned->preparedPath().parent_path() == cacheRootA &&
                 rootSwitched->preparedPath().parent_path() == cacheRootB &&
                 rootPinned->preparedPath() != rootSwitched->preparedPath(),
@@ -485,20 +483,19 @@ int main()
         rootSwitched.reset();
 
         const auto evictionCache = root / "eviction-cache";
-        setEnv("PRISM_CACHE_DIR", evictionCache.string());
-        setEnv("PRISM_DISK_CACHE_GB", "0.00000001");
-        auto pinnedA = service->prepare(source);
-        auto pinnedB = service->prepare(changedPath);
+        auto evictionService = serviceAt(evictionCache, 0.00000001);
+        auto pinnedA = evictionService->prepare(source);
+        auto pinnedB = evictionService->prepare(changedPath);
         const auto pinnedAPath = pinnedA->preparedPath();
         const auto pinnedBPath = pinnedB->preparedPath();
         require(std::filesystem::exists(pinnedAPath) && std::filesystem::exists(pinnedBPath),
                 "prepared files disappeared while their resources were pinned");
-        auto pinnedC = service->prepare(alphaPath);
+        auto pinnedC = evictionService->prepare(alphaPath);
         require(std::filesystem::exists(pinnedAPath) && std::filesystem::exists(pinnedBPath),
                 "disk eviction removed a resource still referenced in this process");
         pinnedA.reset();
         pinnedB.reset();
-        auto trigger = service->prepare(windowPath);
+        auto trigger = evictionService->prepare(windowPath);
         require(!std::filesystem::exists(pinnedAPath) && !std::filesystem::exists(pinnedBPath),
                 "unreferenced old cache files were not evicted under a constrained budget");
         require(std::filesystem::exists(pinnedC->preparedPath()) &&
@@ -507,15 +504,14 @@ int main()
         const auto reloadedPath = pinnedAPath;
         pinnedC.reset();
         trigger.reset();
-        auto reloaded = service->prepare(source);
+        auto reloaded = evictionService->prepare(source);
         require(reloaded->preparedPath() == reloadedPath && std::filesystem::exists(reloadedPath),
                 "evicted texture was not prepared again on reload");
         reloaded.reset();
 
         // OIIO refuses JPEGs whose first APP13 resource is not IPTC; the
         // service must still prepare them from a copy without that segment.
-        setEnv("PRISM_CACHE_DIR", (root / "jpeg-app13-cache").string());
-        setEnv("PRISM_DISK_CACHE_GB", "10");
+        auto jpegService = serviceAt(root / "jpeg-app13-cache", 10.0);
         OIIO::ImageSpec jpegSpec(8, 8, 3, OIIO::TypeDesc::UINT8);
         OIIO::ImageBuf jpegImage(jpegSpec);
         std::array<unsigned char, 8 * 8 * 3> jpegPixels{};
@@ -560,16 +556,16 @@ int main()
         if (OIIO::ImageInput::open(app13Jpeg.string()))
             std::cout << "texture_service: this OIIO reads the APP13 JPEG directly\n";
         (void)OIIO::geterror();
-        auto cleanPrepared = service->prepare(cleanJpeg);
-        auto app13Prepared = service->prepare(app13Jpeg);
+        auto cleanPrepared = jpegService->prepare(cleanJpeg);
+        auto app13Prepared = jpegService->prepare(app13Jpeg);
         require(app13Prepared->width() == cleanPrepared->width() &&
                 app13Prepared->height() == cleanPrepared->height() &&
                 app13Prepared->channels() == cleanPrepared->channels() &&
                 app13Prepared->width() == 8 && app13Prepared->channels() == 3,
                 "APP13 JPEG prepared with different dimensions or channels");
         std::array<float, 8 * 8 * 3> cleanValues{}, app13Values{};
-        require(service->readPixels(*cleanPrepared, 0, 0, 8, 8, 0, 3, cleanValues.data()) &&
-                service->readPixels(*app13Prepared, 0, 0, 8, 8, 0, 3, app13Values.data()),
+        require(jpegService->readPixels(*cleanPrepared, 0, 0, 8, 8, 0, 3, cleanValues.data()) &&
+                jpegService->readPixels(*app13Prepared, 0, 0, 8, 8, 0, 3, app13Values.data()),
                 "cannot read prepared JPEG pixels");
         require(cleanValues == app13Values, "APP13 JPEG pixels differ from the clean JPEG");
         cleanPrepared.reset();
@@ -602,8 +598,8 @@ int main()
             if (i % 4 == 1) options.gamma = 2.2f;
             manyOptions.push_back(options);
         }
-        setEnv("PRISM_CACHE_DIR", (root / "concurrent-many").string());
-        const auto manyBefore = service->stats();
+        auto manyService = serviceAt(root / "concurrent-many");
+        const auto manyBefore = manyService->stats();
         std::array<std::array<std::shared_ptr<const prism::TextureResource>, manyCount>,
                    manyThreads> manyResults;
         std::atomic<bool> manyStart{false};
@@ -614,7 +610,7 @@ int main()
                 while (!manyStart.load(std::memory_order_acquire)) std::this_thread::yield();
                 for (int k = 0; k < manyCount; ++k) {
                     const int i = (k + 2 * t) % manyCount;
-                    try { manyResults[t][i] = service->prepare(manyImages[i], manyOptions[i]); }
+                    try { manyResults[t][i] = manyService->prepare(manyImages[i], manyOptions[i]); }
                     catch (std::exception const &error) {
                         std::cerr << "concurrent preparation failed: " << error.what() << '\n';
                         ++manyFailures;
@@ -623,7 +619,7 @@ int main()
             });
         manyStart.store(true, std::memory_order_release);
         for (auto &worker : manyWorkers) worker.join();
-        const auto manyAfter = service->stats();
+        const auto manyAfter = manyService->stats();
         require(manyFailures == 0, "concurrent preparation of different images failed");
         require(manyAfter.coldPreparations - manyBefore.coldPreparations == manyCount &&
                 manyAfter.diskCacheHits == manyBefore.diskCacheHits &&
@@ -642,27 +638,32 @@ int main()
                     manyResults[0][i]->channels() == sourceSpec.nchannels,
                     "concurrently prepared texture has wrong dimensions or channels");
         }
-        setEnv("PRISM_CACHE_DIR", (root / "serial-many").string());
+        auto serialService = serviceAt(root / "serial-many");
         for (int i = 0; i < manyCount; ++i) {
-            auto serial = service->prepare(manyImages[i], manyOptions[i]);
+            auto serial = serialService->prepare(manyImages[i], manyOptions[i]);
             require(serial->preparedPath().parent_path() == root / "serial-many",
                     "serial reference preparation reused the concurrent cache");
             // prepare() returns before a background writer publishes the
             // .tx.exr; reading a pixel waits for it.
             std::array<float, 4> firstPixel{};
-            require(service->readPixels(*serial, 0, 0, 1, 1, 0, serial->channels(), firstPixel.data()) &&
-                    service->readPixels(*manyResults[0][i], 0, 0, 1, 1, 0,
+            require(serialService->readPixels(*serial, 0, 0, 1, 1, 0, serial->channels(), firstPixel.data()) &&
+                    manyService->readPixels(*manyResults[0][i], 0, 0, 1, 1, 0,
                                         manyResults[0][i]->channels(), firstPixel.data()),
                     "cannot wait for the prepared textures to be written");
             require(mipLevels(serial->preparedPath()) == mipLevels(manyResults[0][i]->preparedPath()),
                     "concurrently prepared texture differs from its serial preparation");
         }
-        require(service->stats().coldPreparations - manyAfter.coldPreparations == manyCount,
+        require(serialService->stats().coldPreparations == manyCount,
                 "serial reference preparation was not cold");
         for (auto &row : manyResults)
             for (auto &item : row) item.reset();
         service.reset();
-        setEnv("PRISM_DISK_CACHE_GB", "10");
+        serviceA.reset();
+        serviceB.reset();
+        evictionService.reset();
+        jpegService.reset();
+        manyService.reset();
+        serialService.reset();
         std::filesystem::remove_all(root);
         return 0;
     } catch (std::exception const &error) {

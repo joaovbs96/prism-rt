@@ -1,4 +1,5 @@
 #include "hlsl_compiler.h"
+#include "../../renderer/runtime.h"
 
 #include <algorithm>
 #include <chrono>
@@ -125,7 +126,10 @@ std::string DxcExecutable()
 std::filesystem::path ShaderCacheDirectory(std::string const& device)
 {
     std::filesystem::path root;
-    if (const char* dir = std::getenv("PRISM_CACHE_DIR"); dir && *dir) root = dir;
+    // The runtime's explicit cache root (RendererOptions::cacheDirectory,
+    // PRISM_CACHE_DIR), else the platform's shader cache directory.
+    if (const auto explicitRoot = prism::Runtime::Instance().settings().cacheDirectory; !explicitRoot.empty())
+        root = explicitRoot;
 #ifdef __APPLE__
     else if (const char* home = std::getenv("HOME")) root = std::filesystem::path(home) / "Library/Caches/PrismRT";
 #else

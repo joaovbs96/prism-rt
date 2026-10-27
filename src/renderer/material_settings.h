@@ -23,12 +23,16 @@ struct MaterialSettings {
     // Subsurface scattering renders its diffuse lobe (DocumentLoader's
     // fallback_sss_to_diffuse; prism:sssFallback, PRISM_SSS_FALLBACK).
     bool sssFallback = false;
+    // MaterialOptions::generationCache and mdlResourceMode.
+    bool generationCache = true;
+    std::string mdlResourceMode = "auto";
 
-    // The colour identity and the SSS fallback: part of every shared cache
-    // key of compiled materials.
+    // The colour identity, the SSS fallback and the resource mode: part of
+    // every shared cache key of compiled materials.
     std::string Identity() const
     {
-        return (color ? color->identity() : std::string()) + (sssFallback ? "|sss-fallback" : "");
+        return (color ? color->identity() : std::string()) + (sssFallback ? "|sss-fallback" : "") +
+            (mdlResourceMode != "auto" ? "|resources=" + mdlResourceMode : std::string());
     }
 };
 

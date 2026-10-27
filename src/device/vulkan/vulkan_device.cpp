@@ -702,6 +702,9 @@ struct VulkanDevice::Impl {
     uint64_t earlyBytes = 0, earlyBudget = 0;
     // DeviceOptions::initialTextureBudgetMiB: the budget of the early uploads.
     int initialTextureBudgetMiB = 0;
+    // The renderer's texture service (DeviceOptions::textures): early
+    // uploads observe it, scenes' images are read through it.
+    std::shared_ptr<prism::TextureService> textures;
     std::vector<gpu::ImageFootprint> earlyFootprints; // every image offered since the last scene
     uint32_t earlyUploaded = 0, earlySkipped = 0;
     double earlySeconds = 0.0;
@@ -893,7 +896,7 @@ VulkanDevice::Impl::~Impl()
         std::lock_guard lock(speculation->mutex);
         speculation->shaders = nullptr;
     }
-    if (textureObserver) prism::TextureService::RemovePreparedObserver(textureObserver);
+    if (textureObserver) textures->removePreparedObserver(textureObserver);
     {
         std::lock_guard lock(earlyMutex);
         earlyStop = true;
@@ -1290,7 +1293,7 @@ bool VulkanDevice::Impl::initialize(std::string* reason)
         vkCreateCommandPool(device, &poolInfo, nullptr, &earlyPool);
         vkCreateFence(device, &fenceInfo, nullptr, &earlyFence);
         if (earlyPool && earlyFence)
-            textureObserver = prism::TextureService::AddPreparedObserver(
+            textureObserver = textures->addPreparedObserver(
                 [this](std::shared_ptr<const prism::TextureResource> const& resource) { earlyPrepared(resource); });
     }
     return true;
@@ -1343,7 +1346,7 @@ void VulkanDevice::Impl::earlyLoop()
 
 bool VulkanDevice::Impl::earlyUpload(prism::TextureResource const& resource)
 {
-    auto service = prism::TextureService::Acquire();
+    auto const& service = textures;
     GpuCopy copy;
     std::string reason;
     copy.path = service->gpuImage(resource, &reason);
@@ -2474,7 +2477,7 @@ bool VulkanDevice::Impl::uploadImages(std::string* error)
         return false;
     }
     std::vector<GpuImage> info(d.images.size());
-    auto service = prism::TextureService::Acquire();
+    auto const& service = textures;
     // Images beyond the memory budget are uploaded at lower resolutions.
     VkPhysicalDeviceMemoryProperties memory;
     vkGetPhysicalDeviceMemoryProperties(physical, &memory);
@@ -3423,7 +3426,7 @@ bool VulkanDevice::Impl::dispatch(GpuFrame const& work, uint32_t threads, double
     return true;
 }
 
-std::unique_ptr<VulkanDevice> VulkanDevice::Create(int initialTextureBudgetMiB, std::string* reason)
+std::unique_ptr<VulkanDevice> VulkanDevice::Create(DeviceOptions const& options, std::string* reason)
 {
     // DeviceOptions::disableVulkan (PRISM_DISABLE_VULKAN) is checked by
     // CreateDevice (device.cpp).
@@ -3433,7 +3436,8 @@ std::unique_ptr<VulkanDevice> VulkanDevice::Create(int initialTextureBudgetMiB, 
         return nullptr;
     }
     auto impl = std::make_unique<Impl>();
-    impl->initialTextureBudgetMiB = initialTextureBudgetMiB;
+    impl->initialTextureBudgetMiB = options.initialTextureBudgetMiB;
+    impl->textures = options.textures ? options.textures : prism::TextureService::Acquire();
     if (!impl->initialize(reason)) return nullptr;
     return std::unique_ptr<VulkanDevice>(new VulkanDevice(std::move(impl)));
 }

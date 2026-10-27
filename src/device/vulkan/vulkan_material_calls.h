@@ -227,6 +227,7 @@ private:
     std::string m_cacheTag;
     bool m_libraries = false;
     PFN_vkCreateRayTracingPipelinesKHR m_createPipelines = nullptr;
+    PFN_vkGetRayTracingShaderGroupStackSizeKHR m_groupStackSize = nullptr;
     std::mutex m_mutex;
     std::unordered_map<std::string, std::shared_future<std::shared_ptr<const ShaderBuild>>> m_shaders;
     std::mutex m_prewarmMutex;

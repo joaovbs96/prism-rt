@@ -18,8 +18,8 @@ namespace prism::device {
 class VulkanDevice final : public gpu::GpuRenderDevice {
 public:
     // Null (with a reason) unless a device supports ray queries.
-    // initialTextureBudgetMiB: DeviceOptions::initialTextureBudgetMiB.
-    static std::unique_ptr<VulkanDevice> Create(int initialTextureBudgetMiB, std::string* reason);
+    // `options`: the initial texture budget and the renderer's texture service.
+    static std::unique_ptr<VulkanDevice> Create(DeviceOptions const& options, std::string* reason);
     ~VulkanDevice() override;
 
     DeviceInfo Info() const override;

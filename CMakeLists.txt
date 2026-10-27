@@ -544,6 +544,13 @@ if(PRISM_BUILD_HYDRA)
         target_link_libraries(prism_hydra_materials_test PRIVATE PrismRT::core ${PXR_LIBRARIES})
         add_test(NAME prism_hydra_materials_test COMMAND prism_hydra_materials_test)
         set_tests_properties(prism_hydra_materials_test PROPERTIES ENVIRONMENT "${_prism_test_environment}")
+        # Renderers in other working spaces or with another SSS fallback get
+        # their own materials from the shared caches (SDK step 1d).
+        add_executable(prism_material_identity_test tests/hydra/material_identity_test.cpp)
+        target_link_libraries(prism_material_identity_test PRIVATE PrismRT::core ${PXR_LIBRARIES})
+        add_test(NAME prism_material_identity_test COMMAND prism_material_identity_test)
+        set_tests_properties(prism_material_identity_test PROPERTIES ENVIRONMENT "${_prism_test_environment}"
+            SKIP_RETURN_CODE 77)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/selection_filter_test.cpp")
         add_executable(prism_hydra_selection_filter_test

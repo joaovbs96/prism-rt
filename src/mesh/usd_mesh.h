@@ -881,8 +881,10 @@ private:
                 // No renderer's settings: those of the options.
                 settings.color = prism::color::ColorManagement::Create(serviceOptions.color);
                 settings.sssFallback = serviceOptions.materials.sssFallback;
+                settings.generationCache = serviceOptions.materials.generationCache;
+                settings.mdlResourceMode = serviceOptions.materials.mdlResourceMode;
             }
-            if (settings.cacheDirectory.empty()) settings.cacheDirectory = serviceOptions.CacheRoot();
+            if (settings.cacheDirectory.empty()) settings.cacheDirectory = prism::PersistentCacheRoot();
             prism::materials::MaterialService service(mdl_context, serviceOptions, settings);
             // Loads the MaterialX and MDL libraries while bindings are read.
             service.Prewarm();

@@ -55,8 +55,9 @@
 namespace prism {
 namespace {
 
-std::mutex singletonMutex;
-std::weak_ptr<TextureService> singleton;
+// The shared services, by options (TextureService::Acquire).
+std::mutex registryMutex;
+auto &registry = *new std::vector<std::pair<TextureServiceOptions, std::weak_ptr<TextureService>>>();
 std::atomic<uint64_t> texturePinSerial{0};
 // Prepared resources released so far; a trim can only evict what was released.
 std::atomic<uint64_t> releasedResources{0};
@@ -102,11 +103,6 @@ std::vector<unsigned char> jpegWithoutApp13(std::filesystem::path const &path)
     return {};
 }
 
-std::filesystem::path cacheRoot()
-{
-    return prism::PersistentCacheRoot();
-}
-
 uint64_t physicalMemoryMB()
 {
 #ifdef _WIN32
@@ -125,10 +121,10 @@ uint64_t physicalMemoryMB()
 // makes render threads wait on tile eviction and rereads: ALab rendered 21x
 // slower with 512 MiB than with 4 GiB. The default is a sixteenth of physical
 // memory, between 512 MiB and 4 GiB.
-size_t memoryBudgetMB()
+size_t memoryBudgetMB(uint64_t configured)
 {
-    const uint64_t fallback = std::clamp<uint64_t>(physicalMemoryMB() / 16, 512, 4096);
-    return static_cast<size_t>(prism::ResourceLimit("PRISM_TEXTURE_CACHE_MB", fallback, 65536));
+    if (configured) return static_cast<size_t>(configured);
+    return static_cast<size_t>(std::clamp<uint64_t>(physicalMemoryMB() / 16, 512, 4096));
 }
 
 // Files the TextureSystem keeps open. OIIO's default of 100 makes a scene
@@ -136,7 +132,7 @@ size_t memoryBudgetMB()
 // and each reopen is serialized inside OIIO. The limit stays well inside the
 // process's file limit: OIIO reads through C stdio, which on Windows allows
 // 512 streams unless raised.
-int openFileLimit()
+int openFileLimit(unsigned configured)
 {
     int available = 0;
 #ifdef _WIN32
@@ -147,9 +143,8 @@ int openFileLimit()
         available = limit.rlim_cur == RLIM_INFINITY ? 8192
             : static_cast<int>(std::min<rlim_t>(limit.rlim_cur, 8192));
 #endif
-    const int fallback = std::clamp(available - 512, 100, 7680);
-    return static_cast<int>(prism::ResourceLimit("PRISM_TEXTURE_OPEN_FILES",
-        static_cast<uint64_t>(fallback), 8192));
+    if (configured) return static_cast<int>(configured);
+    return std::clamp(available - 512, 100, 7680);
 }
 
 // Memory admitted to cold preparations at once. A preparation holds the
@@ -191,9 +186,11 @@ public:
 private:
     PreparationBudget()
     {
+        // Process-wide: the runtime's (the first renderer's
+        // Limits::texturePrepareMiB), else an eighth of memory.
         const uint64_t physical = physicalMemoryMB();
-        const uint64_t fallback = std::clamp<uint64_t>(physical / 8, 2048, 16384);
-        m_limit = prism::ResourceLimit("PRISM_TEXTURE_PREPARE_MB", fallback, 1u << 20) << 20;
+        const uint64_t configured = prism::Runtime::Instance().settings().texturePrepareMiB;
+        m_limit = (configured ? configured : std::clamp<uint64_t>(physical / 8, 2048, 16384)) << 20;
     }
     std::mutex m_mutex;
     std::condition_variable m_changed;
@@ -209,10 +206,9 @@ uint64_t processId()
 #endif
 }
 
-double diskBudgetGB()
+double diskBudgetGB(uint64_t bytes)
 {
-    return static_cast<double>(prism::TextureArtifactBudgetBytes()) /
-        (1024.0 * 1024.0 * 1024.0);
+    return static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0);
 }
 
 std::string contentKey(std::filesystem::path const &path,
@@ -813,11 +809,9 @@ struct PendingTexture {
 // Writers run beside the decodes that feed them and the MDL compiles;
 // fewer than the hardware threads made the budget, held by queued jobs, the
 // bottleneck of cold loads. PRISM_TEXTURE_WRITER_THREADS overrides.
-size_t WriterThreads()
+size_t WriterThreads(unsigned configured)
 {
-    static const size_t count = static_cast<size_t>(prism::ResourceLimit("PRISM_TEXTURE_WRITER_THREADS",
-        std::max(1u, std::thread::hardware_concurrency()), 256));
-    return count;
+    return configured ? configured : std::max(1u, std::thread::hardware_concurrency());
 }
 
 class BackgroundWriters {
@@ -836,7 +830,7 @@ public:
         {
             std::lock_guard lock(m_mutex);
             m_queue.push_back(std::move(job));
-            if (m_idle == 0 && m_threads.size() < WriterThreads())
+            if (m_idle == 0 && m_threads.size() < maxThreads)
                 m_threads.emplace_back([this] { run(); });
         }
         m_work.notify_one();
@@ -864,15 +858,10 @@ private:
     std::vector<std::thread> m_threads;
     size_t m_idle = 0;
     bool m_stopping = false;
+public:
+    // WriterThreads of the service's options; set before the first job.
+    size_t maxThreads = 1;
 };
-
-// PRISM_TEXTURE_BACKGROUND_WRITES=0 writes each .tx.exr before preparation
-// returns, as before GPU-ready copies.
-bool BackgroundWritesEnabled()
-{
-    const char *value = std::getenv("PRISM_TEXTURE_BACKGROUND_WRITES");
-    return !value || std::string_view(value) != "0";
-}
 
 } // namespace
 
@@ -906,7 +895,12 @@ struct TextureResource::Impl {
 };
 
 struct TextureService::Impl {
+    TextureServiceOptions options;
     std::shared_ptr<OIIO::TextureSystem> system;
+    // Observers of prepared resources with a GPU copy (addPreparedObserver).
+    std::mutex observersMutex;
+    std::map<int, std::shared_ptr<const PreparedObserver>> observers;
+    int nextObserver = 1;
     mutable std::mutex mutex;
     std::unordered_map<std::string, std::weak_ptr<const TextureResource>> resources;
     std::unordered_map<std::string, std::weak_ptr<const TextureResource>> resourceAliases;
@@ -962,63 +956,95 @@ std::filesystem::path const &TextureResource::preparedPath() const noexcept
 }
 ResourceVersion const &TextureResource::resourceVersion() const noexcept { return m_impl->version; }
 
-std::shared_ptr<TextureService> TextureService::Acquire()
+TextureServiceOptions TextureServiceOptions::For(RendererOptions const &options)
 {
-    std::lock_guard lock(singletonMutex);
-    if (auto current = singleton.lock()) return current;
-    auto created = std::shared_ptr<TextureService>(new TextureService);
-    singleton = created;
+    const auto runtime = prism::Runtime::Instance().settings();
+    TextureServiceOptions result;
+    result.cacheDirectory = runtime.CacheRoot();
+    result.diskBudgetBytes = prism::TextureArtifactBudgetBytes(prism::PersistentDiskBudgetBytes(runtime.diskCacheGiB));
+    result.memoryMiB = options.limits.textureCacheMiB;
+    result.openFiles = options.limits.textureOpenFiles;
+    result.writerThreads = options.limits.textureWriterThreads;
+    result.backgroundWrites = options.textures.backgroundWrites;
+    result.compression = options.textures.compression;
+    return result;
+}
+
+TextureServiceOptions TextureServiceOptions::FromRuntime()
+{
+    const auto runtime = prism::Runtime::Instance().settings();
+    RendererOptions options;
+    options.limits = runtime.limits;
+    options.textures = runtime.textures;
+    return For(options);
+}
+
+std::shared_ptr<TextureService> TextureService::Acquire(TextureServiceOptions const &options)
+{
+    std::lock_guard lock(registryMutex);
+    std::erase_if(registry, [](auto const &entry) { return entry.second.expired(); });
+    for (auto const &[key, service] : registry)
+        if (key == options)
+            if (auto current = service.lock()) return current;
+    auto created = Create(options);
+    registry.emplace_back(options, created);
     return created;
 }
 
-TextureService::TextureService() : m_impl(std::make_unique<Impl>())
+std::shared_ptr<TextureService> TextureService::Acquire()
 {
+    return Acquire(TextureServiceOptions::FromRuntime());
+}
+
+std::shared_ptr<TextureService> TextureService::Create(TextureServiceOptions const &options)
+{
+    return std::shared_ptr<TextureService>(new TextureService(options));
+}
+
+TextureService::TextureService(TextureServiceOptions options) : m_impl(std::make_unique<Impl>())
+{
+    m_impl->options = std::move(options);
+    m_impl->writers.maxThreads = WriterThreads(m_impl->options.writerThreads);
     m_impl->system = OIIO::TextureSystem::create(false);
     if (!m_impl->system) throw std::runtime_error("cannot create OIIO TextureSystem");
-    if (!m_impl->system->attribute("max_memory_MB", static_cast<int>(memoryBudgetMB())))
+    if (!m_impl->system->attribute("max_memory_MB", static_cast<int>(memoryBudgetMB(m_impl->options.memoryMiB))))
         throw std::runtime_error("cannot configure OIIO texture cache budget");
-    m_impl->system->attribute("max_open_files", openFileLimit());
+    m_impl->system->attribute("max_open_files", openFileLimit(m_impl->options.openFiles));
 }
 TextureService::~TextureService() = default;
 
-namespace {
-std::mutex gPreparedObserversMutex;
-auto &gPreparedObservers =
-    *new std::map<int, std::shared_ptr<const TextureService::PreparedObserver>>();
-int gNextPreparedObserver = 1;
+TextureServiceOptions const &TextureService::options() const noexcept { return m_impl->options; }
 
-// Tells the observers about a prepared resource with a GPU copy.
-std::shared_ptr<const TextureResource> Published(std::shared_ptr<const TextureResource> resource)
+std::shared_ptr<const TextureResource> TextureService::published(std::shared_ptr<const TextureResource> resource)
 {
     if (!resource || resource->gpuCopyPath().empty()) return resource;
-    std::vector<std::shared_ptr<const TextureService::PreparedObserver>> observers;
+    std::vector<std::shared_ptr<const PreparedObserver>> observers;
     {
-        std::lock_guard lock(gPreparedObserversMutex);
-        for (auto const &[token, observer] : gPreparedObservers) observers.push_back(observer);
+        std::lock_guard lock(m_impl->observersMutex);
+        for (auto const &[token, observer] : m_impl->observers) observers.push_back(observer);
     }
     for (auto const &observer : observers) (*observer)(resource);
     return resource;
 }
-} // namespace
 
-int TextureService::AddPreparedObserver(PreparedObserver observer)
+int TextureService::addPreparedObserver(PreparedObserver observer)
 {
-    std::lock_guard lock(gPreparedObserversMutex);
-    const int token = gNextPreparedObserver++;
-    gPreparedObservers.emplace(token, std::make_shared<const PreparedObserver>(std::move(observer)));
+    std::lock_guard lock(m_impl->observersMutex);
+    const int token = m_impl->nextObserver++;
+    m_impl->observers.emplace(token, std::make_shared<const PreparedObserver>(std::move(observer)));
     return token;
 }
 
-void TextureService::RemovePreparedObserver(int token)
+void TextureService::removePreparedObserver(int token)
 {
-    std::lock_guard lock(gPreparedObserversMutex);
-    gPreparedObservers.erase(token);
+    std::lock_guard lock(m_impl->observersMutex);
+    m_impl->observers.erase(token);
 }
 
 std::shared_ptr<const TextureResource> TextureService::prepare(
     std::filesystem::path const &source, TexturePrepareOptions const &options)
 {
-    return Published(prepareImpl(source, options, {}));
+    return published(prepareImpl(source, options, {}));
 }
 
 std::shared_ptr<const TextureResource> TextureService::prepareTrusted(
@@ -1030,13 +1056,13 @@ std::shared_ptr<const TextureResource> TextureService::prepareTrusted(
         throw std::invalid_argument("trusted texture fingerprint requires algorithm, version, and digest");
     registerTrustedSource(source, fingerprint);
     const std::string token = trustedFingerprintToken(fingerprint);
-    return Published(prepareImpl(source, options, token));
+    return published(prepareImpl(source, options, token));
 }
 
 std::shared_ptr<const TextureResource> TextureService::prepareAhead(
     std::filesystem::path const &source, TexturePrepareOptions const &options)
 {
-    return Published(prepareImpl(source, options, {}, true));
+    return published(prepareImpl(source, options, {}, true));
 }
 
 void TextureService::registerTrustedSource(std::filesystem::path const &source,
@@ -1082,7 +1108,7 @@ bool TextureService::invalidate(std::filesystem::path const &source,
     if (!pathError) absolute=canonical;
     else { pathError.clear(); absolute=absolute.lexically_normal(); }
     const std::string pathKey = absolute.generic_string();
-    const auto root = cacheRoot();
+    const auto root = m_impl->options.cacheDirectory;
     std::shared_ptr<std::mutex> sourceGate;
     {
         std::lock_guard lock(m_impl->mutex);
@@ -1281,7 +1307,7 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
                 fingerprint_records::FileChangeStamp(absolute);
             if (rawFingerprint.empty()) {
                 fingerprint_records::Record record;
-                if (fingerprint_records::Read(cacheRoot(), recordIdentity, &record) &&
+                if (fingerprint_records::Read(m_impl->options.cacheDirectory, recordIdentity, &record) &&
                     record.artifactStamp == fingerprint_records::FileStamp(absolute)) {
                     rawFingerprint = record.fingerprint;
                     std::lock_guard lock(m_impl->mutex);
@@ -1307,7 +1333,7 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
                     throw std::runtime_error("texture source changed while fingerprinting: " + absolute.string());
                 rawFingerprint = "sha1:v1:" + hash.digest();
                 m_impl->sourceBytesHashed.fetch_add(bytes, std::memory_order_relaxed);
-                fingerprint_records::Write(cacheRoot(), recordIdentity,
+                fingerprint_records::Write(m_impl->options.cacheDirectory, recordIdentity,
                     {rawFingerprint, absolute.filename().string(), fingerprint_records::FileStamp(absolute)});
                 std::lock_guard lock(m_impl->mutex);
                 m_impl->sourceFingerprints[rawStamp] = rawFingerprint;
@@ -1372,7 +1398,7 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
         std::lock_guard lock(m_impl->mutex);
         if (auto found = m_impl->resources.find(key); found != m_impl->resources.end())
             if (auto resource = found->second.lock(); resource &&
-                resource->m_impl->prepared.parent_path() == cacheRoot()) {
+                resource->m_impl->prepared.parent_path() == m_impl->options.cacheDirectory) {
                 m_impl->memoryCacheHits.fetch_add(1, std::memory_order_relaxed);
                 if (!ahead && m_impl->aheadKeys.contains(key))
                     m_impl->aheadMemoryHits.fetch_add(1, std::memory_order_relaxed);
@@ -1407,7 +1433,7 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
         std::lock_guard lock(m_impl->mutex);
         if (auto found = m_impl->resources.find(key); found != m_impl->resources.end())
             if (auto resource = found->second.lock(); resource &&
-                resource->m_impl->prepared.parent_path() == cacheRoot()) {
+                resource->m_impl->prepared.parent_path() == m_impl->options.cacheDirectory) {
                 m_impl->memoryCacheHits.fetch_add(1, std::memory_order_relaxed);
                 if (!ahead && m_impl->aheadKeys.contains(key))
                     m_impl->aheadMemoryHits.fetch_add(1, std::memory_order_relaxed);
@@ -1416,7 +1442,7 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
     }
     if (cachedResource) return aliasForSource(cachedResource);
 
-    const auto root = cacheRoot();
+    const auto root = m_impl->options.cacheDirectory;
     std::filesystem::create_directories(root);
     auto lockWaitStart = std::chrono::steady_clock::now();
     CrossProcessCacheLock processLock(root, key);
@@ -1512,7 +1538,7 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
         OIIO::ImageSpec textureSpec = decoded.normalizedSpec;
         textureSpec.tile_width = textureSpec.tile_height = 64;
         textureSpec.tile_depth = 1;
-        textureSpec.attribute("compression", texture_writer::PreparedCompression());
+        textureSpec.attribute("compression", texture_writer::PreparedCompression(m_impl->options.compression));
         textureSpec.attribute("planarconfig", "contig");
         textureSpec.attribute("wrapmodes", "black,black");
         textureSpec.attribute("textureformat", "Plain Texture");
@@ -1617,7 +1643,7 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
         m_impl->lockWaitNanoseconds.fetch_add(elapsedNanoseconds(lockWaitStart), std::memory_order_relaxed);
         writePin();
         publicationLock.reset();
-        if (BackgroundWritesEnabled()) {
+        if (m_impl->options.backgroundWrites) {
             m_impl->backgroundWrites.fetch_add(1, std::memory_order_relaxed);
             m_impl->writers.submit(std::move(write));
         } else {
@@ -1678,7 +1704,7 @@ std::shared_ptr<const TextureResource> TextureService::prepareImpl(
     }
     const std::string resourceSourceKey = impl->source.generic_string();
     auto resource = std::shared_ptr<const TextureResource>(new TextureResource(std::move(impl)));
-    const double budgetGB = diskBudgetGB();
+    const double budgetGB = diskBudgetGB(m_impl->options.diskBudgetBytes);
     const auto limit = static_cast<uintmax_t>(budgetGB * 1024.0 * 1024.0 * 1024.0);
     const auto now = std::chrono::steady_clock::now();
     std::unordered_map<std::string, bool> pinned;
@@ -1756,7 +1782,7 @@ std::shared_ptr<const TextureResource> TextureService::prepare(
     OIIO::ImageBuf const &source, TexturePrepareOptions const &options)
 {
     const auto hashStart = std::chrono::steady_clock::now();
-    const auto root = cacheRoot();
+    const auto root = m_impl->options.cacheDirectory;
     std::filesystem::create_directories(root);
     const OIIO::ImageSpec spec = source.spec();
     if (spec.width <= 0 || spec.height <= 0 || spec.nchannels <= 0 ||

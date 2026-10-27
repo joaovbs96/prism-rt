@@ -4,6 +4,7 @@
 #include <OpenImageIO/texture.h>
 
 #include "color/color_management.h"
+#include "renderer/renderer_options.h"
 
 #include <filesystem>
 #include <functional>
@@ -124,9 +125,37 @@ private:
     std::shared_ptr<Impl> m_impl;
 };
 
+// What a texture service is made with: a renderer's options, the cache root
+// and disk budget the runtime's (renderer/runtime.h).
+struct TextureServiceOptions {
+    std::filesystem::path cacheDirectory; // prepared textures and fingerprints
+    uint64_t diskBudgetBytes = 0;         // the prepared textures' share
+    uint64_t memoryMiB = 0;               // OIIO's tile cache; 0: default
+    unsigned openFiles = 0;               // OIIO's open files; 0: default
+    unsigned writerThreads = 0;           // background writers; 0: hardware threads
+    bool backgroundWrites = true;
+    std::string compression;              // prepared files' compression; empty: zip:1
+    bool operator==(TextureServiceOptions const &) const = default;
+
+    // A renderer's: its limits and texture options with the runtime's cache
+    // root and disk budget.
+    static TextureServiceOptions For(RendererOptions const &options);
+    // The runtime's (the first renderer's, else the environment's).
+    static TextureServiceOptions FromRuntime();
+};
+
 class TextureService final : public std::enable_shared_from_this<TextureService> {
 public:
+    // The service for `options`: one instance per distinct options, shared
+    // while someone holds it (renderers with the same options share one).
+    static std::shared_ptr<TextureService> Acquire(TextureServiceOptions const &options);
+    // The service of the runtime's options, for code without a renderer at
+    // hand (MDL texture callbacks, material resources). A renderer whose
+    // options match the runtime's holds the same instance.
     static std::shared_ptr<TextureService> Acquire();
+    // An unshared service (tests).
+    static std::shared_ptr<TextureService> Create(TextureServiceOptions const &options);
+    TextureServiceOptions const &options() const noexcept;
     ~TextureService();
     TextureService(TextureService const &) = delete;
     TextureService &operator=(TextureService const &) = delete;
@@ -178,13 +207,14 @@ public:
     // one from the source on first request. Empty when there is none (an
     // in-memory source, or a failed decode); `error` then says why.
     std::filesystem::path gpuImage(TextureResource const &resource, std::string *error = nullptr) const;
-    // Observers of prepared file textures that have a GPU-ready copy, called
-    // on the preparing thread each time prepare(), prepareTrusted() or
-    // prepareAhead() returns one (again for repeated requests), so a GPU
-    // device can upload it while the scene is still loading. Thread safe.
+    // Observers of this service's prepared file textures that have a
+    // GPU-ready copy, called on the preparing thread each time prepare(),
+    // prepareTrusted() or prepareAhead() returns one (again for repeated
+    // requests), so a GPU device can upload it while the scene is still
+    // loading. Thread safe.
     using PreparedObserver = std::function<void(std::shared_ptr<const TextureResource> const &)>;
-    static int AddPreparedObserver(PreparedObserver observer);
-    static void RemovePreparedObserver(int token);
+    int addPreparedObserver(PreparedObserver observer);
+    void removePreparedObserver(int token);
     // The calling thread's last lookup or readPixels failure.
     static std::string const &lastError() noexcept;
     OIIO::TextureSystem *textureSystem() const noexcept;
@@ -192,7 +222,9 @@ public:
     std::string textureStatistics() const;
 
 private:
-    TextureService();
+    explicit TextureService(TextureServiceOptions options);
+    // Tells the observers about a prepared resource with a GPU copy.
+    std::shared_ptr<const TextureResource> published(std::shared_ptr<const TextureResource> resource);
     struct Impl;
     std::shared_ptr<const TextureResource> prepareImpl(
         std::filesystem::path const &source,

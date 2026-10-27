@@ -185,10 +185,9 @@ bool WriteLevelTiles(OIIO::ImageOutput &out, OIIO::ImageSpec const &spec, Level 
 
 } // namespace
 
-std::string PreparedCompression()
+std::string PreparedCompression(std::string const &configured)
 {
-    const char *value = std::getenv("PRISM_TEXTURE_COMPRESSION");
-    return value && *value ? std::string(value) : std::string("zip:1");
+    return configured.empty() ? std::string("zip:1") : configured;
 }
 
 void BuildMipChain(std::vector<Level> &levels, int channels)

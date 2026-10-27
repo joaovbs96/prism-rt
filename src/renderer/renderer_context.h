@@ -1,13 +1,15 @@
 #pragma once
 
 // The internal renderer context (docs/sdk_design.md, section 3): what used to
-// be process-wide state of one renderer. The front ends create one (the CLI
+// be process-wide state of one renderer. Creating one configures the process
+// runtime (runtime.h) with its options. The front ends create one (the CLI
 // per run, the Hydra delegate per render delegate) and pass it, or what they
 // need of it, to the loaders, services and devices. It becomes the public
 // prism::Renderer's implementation later (migration step 3).
 
 #include "material_settings.h"
 #include "renderer_options.h"
+#include "runtime.h"
 
 #include <memory>
 #include <mutex>
@@ -43,10 +45,18 @@ public:
     // the material service.
     MaterialSettings materialSettings() const;
 
+    // This renderer's texture service (TextureService::Acquire of its
+    // options: renderers with the same options share one), created on first
+    // use and held while the context lives.
+    std::shared_ptr<TextureService> textures() const;
+    // options().devices with the texture service, for CreateDevice.
+    DeviceOptions deviceOptions() const;
+
 private:
     RendererOptions m_options;
     mutable std::mutex m_mutex;
     mutable std::shared_ptr<const color::ColorManagement> m_color;
+    mutable std::shared_ptr<TextureService> m_textures;
     bool m_sssFallback = false;
 };
 

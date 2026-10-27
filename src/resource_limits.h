@@ -12,55 +12,40 @@
 #include <string>
 #include <thread>
 
+#include "renderer/runtime.h"
+
 namespace prism {
 
+// The root of the persistent caches: the runtime's (the first renderer's
+// RendererOptions::cacheDirectory, else the platform's cache directory).
 inline std::filesystem::path PersistentCacheRoot() {
-    if (const char* value = std::getenv("PRISM_CACHE_DIR"); value && *value)
-        return value;
-    if (const char* value = std::getenv("LOCALAPPDATA"); value && *value)
-        return std::filesystem::path(value) / "PrismRT" / "cache";
-    return std::filesystem::temp_directory_path() / "PrismRT" / "cache";
+    return Runtime::Instance().settings().CacheRoot();
 }
 
 // 20 GiB: a prepared texture now has a GPU-ready copy beside its float
 // .tx.exr (about half as large again), and the OpenPBR playground alone
 // needs 13 GiB with both; a budget below a scene's working set evicts, at
 // the start of every warm load, files that load then prepares again.
-inline uint64_t PersistentDiskBudgetBytes() {
-    double gib = 20.0;
-    if (const char* value = std::getenv("PRISM_DISK_CACHE_GB"); value && *value) {
-        try {
-            size_t consumed = 0;
-            const double parsed = std::stod(value, &consumed);
-            if (consumed == std::string(value).size() && parsed > 0 && std::isfinite(parsed))
-                gib = std::min(parsed, 1024.0);
-        } catch (...) { /* Invalid overrides use the documented default. */ }
-    }
+// The runtime's disk budget (Limits::diskCacheGiB).
+inline uint64_t PersistentDiskBudgetBytes(double gib) {
     return std::max<uint64_t>(1, static_cast<uint64_t>(gib * 1024.0 * 1024.0 * 1024.0));
+}
+inline uint64_t PersistentDiskBudgetBytes() {
+    return PersistentDiskBudgetBytes(Runtime::Instance().settings().diskCacheGiB);
 }
 
 // Separate recency queues share one allowance instead of independently claiming
 // the entire disk budget. Live texture pins may temporarily exceed their share.
 // Resolver-materialized source files are reported separately; these functions
 // currently budget prepared textures and generated-source artifacts only.
+inline uint64_t GeneratedArtifactBudgetBytes(uint64_t diskBudget) {
+    return std::min<uint64_t>(256ull * 1024 * 1024, diskBudget / 16);
+}
+inline uint64_t TextureArtifactBudgetBytes(uint64_t diskBudget) {
+    return diskBudget - GeneratedArtifactBudgetBytes(diskBudget);
+}
 inline uint64_t GeneratedArtifactBudgetBytes() {
-    return std::min<uint64_t>(256ull * 1024 * 1024, PersistentDiskBudgetBytes() / 16);
-}
-inline uint64_t TextureArtifactBudgetBytes() {
-    return PersistentDiskBudgetBytes() - GeneratedArtifactBudgetBytes();
-}
-
-inline uint64_t ResourceLimit(const char* name, uint64_t fallback,
-                              uint64_t maximum = UINT64_MAX) {
-    const char* text = std::getenv(name);
-    if (!text || !*text) return fallback;
-    char* end = nullptr;
-    const auto value = std::strtoull(text, &end, 10);
-    if (*text == '-' || end == text || *end || value == 0 || value > maximum) {
-        std::cerr << "PrismRT: ignoring invalid " << name << '\n';
-        return fallback;
-    }
-    return value;
+    return GeneratedArtifactBudgetBytes(PersistentDiskBudgetBytes());
 }
 
 // Admission accounting is deliberately separate from actual resident memory.
@@ -101,13 +86,20 @@ public:
         PreparationAdmission& owner;
         uint64_t bytes = 0;
     };
+    // Process-wide (the runtime's): its budget is the largest any renderer
+    // asked for (Limits::preparationMiB).
     static PreparationAdmission& Shared() { static PreparationAdmission value; return value; }
     uint64_t peakReservedBytes() const { std::lock_guard lock(mutex); return peak; }
     uint64_t admissionWaitNanoseconds() const {
         std::lock_guard lock(mutex); return waitNanoseconds;
     }
+    // Raises the budget to `bytes` if it is lower.
+    void RaiseLimit(uint64_t bytes) {
+        { std::lock_guard lock(mutex); limit = std::max(limit, bytes); }
+        changed.notify_all();
+    }
 private:
-    PreparationAdmission() : limit(ResourceLimit("PRISM_PREPARATION_MB", 2048, 1048576) * 1024 * 1024) {}
+    PreparationAdmission() : limit(Runtime::Instance().settings().preparationMiB * 1024 * 1024) {}
     mutable std::mutex mutex;
     std::condition_variable changed;
     uint64_t limit, used = 0, peak = 0, active = 0, observedEstimate = 0;

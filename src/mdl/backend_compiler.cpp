@@ -420,8 +420,8 @@ void ClearTargetCodeCache(const Context* context)
     }
 }
 
-BackendCompiler::BackendCompiler(Context& ctx)
-    : m_ctx(ctx)
+BackendCompiler::BackendCompiler(Context& ctx, std::string resourceMode)
+    : m_ctx(ctx), m_resourceMode(std::move(resourceMode))
 {}
 
 void BackendCompiler::print_context_messages(mi::neuraylib::IMdl_execution_context* context) {
@@ -632,8 +632,7 @@ TargetCode BackendCompiler::generate_target_code(const CompiledMaterial& compile
         }
     }
     const std::string capabilityKey = materialHash + requirements.capabilities;
-    const char* modeValue = std::getenv("PRISM_MDL_RESOURCE_MODE");
-    const std::string mode = modeValue ? modeValue : "auto";
+    const std::string& mode = m_resourceMode;
     if (mode != "auto" && mode != "custom" && mode != "builtin") {
         result.error_message = "PRISM_MDL_RESOURCE_MODE must be auto, custom, or builtin";
         return result;
