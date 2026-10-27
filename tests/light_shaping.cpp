@@ -242,8 +242,9 @@ void CheckPower()
     params.shaping.active = true;
     params.shaping.coneAngle = 60.0f;
     const std::array<double, 16> identity{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
-    const prism::SceneLight light = prism::MakeSceneLight(params, identity);
-    const double fraction = prism::device::ShapingPowerFraction(light);
+    const auto color = prism::color::ColorManagement::Create({});
+    const prism::SceneLight light = prism::MakeSceneLight(params, identity, *color);
+    const double fraction = prism::device::ShapingPowerFraction(light, *color);
     std::printf("60 degree cone: power fraction %.5f (exact 0.25)\n", fraction);
     Check(std::abs(fraction / 0.25 - 1.0) < 0.01, "power of a 60 degree cone");
 }

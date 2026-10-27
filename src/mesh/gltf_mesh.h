@@ -35,10 +35,14 @@
 // with the magenta error material, after a one-line warning.
 class glTFMesh : public Mesh {
     public:
+        // materialSettings: the renderer's colour management (vertex colours and
+        // material colours convert into its working space) and cache directory.
         glTFMesh(const std::filesystem::path &file_path, mdl::Context* mdl_context,
-                 const std::string& mx_libraries_path, const std::string& mx_mdl_path)
-            : m_path(file_path)
+                 const std::string& mx_libraries_path, const std::string& mx_mdl_path,
+                 prism::MaterialSettings materialSettings)
+            : m_path(file_path), m_materials(std::move(materialSettings))
         {
+            if (!m_materials.color) throw std::invalid_argument("glTFMesh needs a colour management");
             tinygltf::TinyGLTF loader;
             // Materials read the encoded image files (materialized into the
             // cache); pixels are never decoded here.
@@ -88,6 +92,7 @@ class glTFMesh : public Mesh {
 
     private:
         std::filesystem::path m_path;
+        prism::MaterialSettings m_materials;
         tinygltf::Model m_model;
         std::vector<TransformMatrix> nodeTransforms;
         std::vector<std::shared_ptr<MDLMaterial>> m_ownedMdl;
@@ -117,7 +122,7 @@ class glTFMesh : public Mesh {
             }
 
             const auto start = std::chrono::steady_clock::now();
-            const std::filesystem::path cache = prism::PersistentCacheRoot() / "materials";
+            const std::filesystem::path cache = m_materials.cacheDirectory / "materials";
             // Textures resolve beside the cached documents (as for USD).
             mdl_context->add_resource_path(cache.string());
             std::map<std::string, std::shared_ptr<MDLMaterial>> compiled; // by document
@@ -131,9 +136,7 @@ class glTFMesh : public Mesh {
                     prism::gltf::MaterialConversionOptions options;
                     options.vertexColor = vertexColor;
                     options.imageFile = [&](int image) { return imageFile(image, cache); };
-                    options.fromLinearRec709 = [](std::array<float, 3> c) {
-                        auto const colors = prism::color::Active();
-                        if (!colors) return c;
+                    options.fromLinearRec709 = [colors = m_materials.color](std::array<float, 3> c) {
                         const Float3 w = colors->FromRec709(Float3(c[0], c[1], c[2]));
                         return std::array<float, 3>{w.x(), w.y(), w.z()};
                     };
@@ -147,7 +150,7 @@ class glTFMesh : public Mesh {
                     } else {
                         const auto path = prism::materialx::PublishMaterialXDocument(xml, cache, "gltf_");
                         material = std::make_shared<MDLMaterial>(path.string(), *mdl_context, libraries,
-                                                                 mdlLibraries, prism::gltf::kMaterialName);
+                                                                 mdlLibraries, m_materials, prism::gltf::kMaterialName);
                         if (material->is_valid()) compiled.emplace(xml, material);
                         else failure = "MDL compilation failed (" + path.string() + ")";
                     }
@@ -430,7 +433,7 @@ class glTFMesh : public Mesh {
                             data.size() == 4 * vertexCount;
                         const auto accessor = attribute("COLOR_0");
                         const bool rgb = accessor >= 0 && model.accessors[size_t(accessor)].type == TINYGLTF_TYPE_VEC3;
-                        auto const colors = prism::color::Active();
+                        auto const& colors = m_materials.color;
                         for (size_t i = 0; i < vertexCount; ++i) {
                             float* target = values + i * size_t(primvarStride) + size_t(m_color0Offset);
                             if (!authored) { target[0] = target[1] = target[2] = target[3] = 1.0f; continue; }

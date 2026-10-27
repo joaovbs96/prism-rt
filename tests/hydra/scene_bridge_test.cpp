@@ -430,7 +430,7 @@ std::vector<T> ReadBuffer(PrismRenderBuffer *buffer)
 Color3 TraceTriangle(bool instanced, bool mirrored, bool *zeroTangent)
 {
     RTCDevice device = rtcNewDevice(nullptr);
-    SceneManager scene(device);
+    SceneManager scene(device, prism::color::ColorManagement::Create({}));
     ColorTexture albedo(Color3(0.8f, 0.35f, 0.1f));
     Diffuse material(&albedo);
     ColorTexture white(Color3(1.0f));
@@ -512,7 +512,7 @@ struct HitSignature {
 HitSignature HitTransformedTriangle(bool instanced, bool mirrored)
 {
     RTCDevice device = rtcNewDevice(nullptr);
-    SceneManager scene(device);
+    SceneManager scene(device, prism::color::ColorManagement::Create({}));
     auto mesh = std::make_unique<Mesh>();
     const std::array<GfVec3d, 3> local{{{-1, -1, 0}, {1, -1, 0}, {0, 1, 0}}};
     GfMatrix4d scale(1), rotation(1), translation(1);
@@ -591,7 +591,7 @@ HitSignature HitTransformedTriangle(bool instanced, bool mirrored)
 RayHit HitTransformedSphere(bool mirrored)
 {
     RTCDevice device = rtcNewDevice(nullptr);
-    SceneManager scene(device);
+    SceneManager scene(device, prism::color::ColorManagement::Create({}));
     Sphere sphere(Float3(0.0f), 1.0f, nullptr);
     RTCScene prototype = rtcNewScene(device);
     sphere.setupEmbree(device, prototype);

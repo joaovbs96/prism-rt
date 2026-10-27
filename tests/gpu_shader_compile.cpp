@@ -62,7 +62,7 @@ int main(int argc, char** argv)
     check(context.is_valid(), "MDL context");
     RTCDevice device = rtcNewDevice(nullptr);
     {
-        SceneManager scene(device);
+        SceneManager scene(device, prism::color::ColorManagement::Create({}));
         const char* libraries = std::getenv("PRISM_MATERIALX_LIBRARY_PATH");
         const std::string libraryPath = libraries ? libraries : "";
         USDMesh mesh(argv[1], &context, libraryPath, libraryPath + "/mdl");

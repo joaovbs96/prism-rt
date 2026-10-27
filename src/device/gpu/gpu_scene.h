@@ -78,6 +78,9 @@ struct GpuSceneData {
     int rouletteDepth = 4;
     bool environmentMis = true;
     bool filteredTextures = true;
+    // Luminance weights of the scene's working space (light selection;
+    // GpuFrame::color); BuildGpuScene sets them.
+    std::array<float, 3> luminanceWeights{0.2126f, 0.7152f, 0.0722f};
 
     std::vector<std::string> warnings;
     size_t triangleCount() const { return indices.size() / 3; }

@@ -19,6 +19,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include "../src/renderer/renderer_options.h"
 
 namespace {
 int failures = 0;
@@ -71,7 +72,8 @@ int main()
     for (auto const& c : cases) {
         const auto path = dir / (std::string(c.name) + ".mtlx");
         { std::ofstream(path) << Document(c.inputs); }
-        materials.push_back(std::make_unique<MDLMaterial>(path.string(), context, libraries, mdlPath));
+        materials.push_back(std::make_unique<MDLMaterial>(path.string(), context, libraries, mdlPath,
+            prism::MaterialSettings{prism::color::ColorManagement::Create({}), prism::RendererOptions::FromEnvironment().CacheRoot()}));
         check(materials.back()->is_valid(), std::string(c.name) + " compiles");
     }
     if (failures) return 1;

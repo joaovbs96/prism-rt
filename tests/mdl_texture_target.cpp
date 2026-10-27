@@ -24,6 +24,8 @@
 #include <string_view>
 #include <type_traits>
 
+namespace { const auto kColor = prism::color::ColorManagement::Create({}); }
+
 namespace {
 
 // MdlStateFloat4 and MdlStateMatrixRow come from mdl_material.h.
@@ -155,7 +157,7 @@ GeneratedMDL standardSurfaceMaterial(std::string const& libraries,
     surface->setInputValue("coat_roughness",.19f);
     surface->setInputValue("sheen",.27f);
     document->addMaterialNode("StandardSurface",surface);
-    auto generated=generator.generate(document,"StandardSurface");
+    auto generated=generator.generate(document,"StandardSurface",*kColor);
     require(generated.success,"standard_surface generation failed: "+generated.error_message);
     generated.module_name += "_"+std::to_string(int(color[0]*10000.0f))+"_"+
         std::to_string(int(color[1]*10000.0f))+"_"+
@@ -185,7 +187,7 @@ GeneratedMDL foldingParityMaterial(std::string const& libraries,
     surface->setInputValue("emission_color",MaterialX::Color3(.9f,.5f,.2f));
     surface->setInputValue("opacity",MaterialX::Color3(.65f,.65f,.65f));
     document->addMaterialNode("FoldingParity",surface);
-    auto generated=generator.generate(document,"FoldingParity");
+    auto generated=generator.generate(document,"FoldingParity",*kColor);
     require(generated.success,"folding parity generation failed: "+generated.error_message);
     generated.module_name += "_folding_parity";
     return generated;
@@ -208,7 +210,7 @@ GeneratedMDL openPbrMaterial(std::string const& libraries)
     surface->setInputValue("fuzz_color",MaterialX::Color3(.81f,.34f,.17f));
     surface->setInputValue("fuzz_roughness",.38f);
     document->addMaterialNode("OpenPbr",surface);
-    auto generated=generator.generate(document,"OpenPbr");
+    auto generated=generator.generate(document,"OpenPbr",*kColor);
     require(generated.success,"OpenPBR generation failed: "+generated.error_message);
     generated.module_name += "_openpbr_microflake_parity";
     return generated;

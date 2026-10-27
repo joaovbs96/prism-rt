@@ -875,7 +875,7 @@ int runStandaloneCli(int argc, char** argv) {
         const prism::RendererContext renderer(rendererOptions);
         // Before anything loads: materials, lights and textures convert into
         // the working space as they are read.
-        const auto colorManagement = prism::color::Activate(o.color);
+        const auto colorManagement = renderer.colorManagement();
         std::cout << "Color: working space " << colorManagement->workingSpace() << ", view " << colorManagement->view()
                   << " on " << colorManagement->display() << " (" << colorManagement->configName() << ")\n";
         const double stageSeconds = seconds();
@@ -925,7 +925,7 @@ int runStandaloneCli(int argc, char** argv) {
         if (!context.is_valid()) throw std::runtime_error(context.get_error());
         // Before any material loads.
         DocumentLoader::SetSssFallback(o.sssFallback);
-        SceneManager scene(device.value);
+        SceneManager scene(device.value, colorManagement);
         const std::string libraryPath = renderer.options().materials.materialxLibraries;
         const std::string mdlPath = renderer.options().materials.materialxMdlPath;
         std::unique_ptr<Mesh> mesh;
@@ -949,13 +949,15 @@ int runStandaloneCli(int argc, char** argv) {
             load.time = time;
             load.subdivision = subdivision;
             load.renderer = renderer.options();
+            load.materials = renderer.materialSettings();
             mesh = std::make_unique<USDMesh>(stage, &context, libraryPath, mdlPath, std::move(load));
         }
         else if (extension == ".gltf" || extension == ".glb") {
-            mesh = std::make_unique<glTFMesh>(o.scene, &context, libraryPath, mdlPath);
+            mesh = std::make_unique<glTFMesh>(o.scene, &context, libraryPath, mdlPath, renderer.materialSettings());
         }
         else if (extension == ".obj")
-            mesh = std::make_unique<ObjMesh>(o.scene, &context, libraryPath, mdlPath, subdivision);
+            mesh = std::make_unique<ObjMesh>(o.scene, &context, libraryPath, mdlPath, renderer.materialSettings(),
+                                             subdivision);
         else throw std::runtime_error("Unsupported scene format: " + extension);
         const auto usdMesh = dynamic_cast<USDMesh*>(mesh.get());
         if (usdMesh ? usdMesh->renderablePlacementCount() == 0
@@ -983,11 +985,12 @@ int runStandaloneCli(int argc, char** argv) {
             scene.environment = env.get();
         } else if (!o.environment.empty()) {
             if (!std::filesystem::exists(o.environment)) throw std::runtime_error("Environment does not exist: " + o.environment);
-            envImage = std::make_unique<ImageTexture<Color3>>(o.environment, prism::color::kLightColorSpace);
+            envImage = std::make_unique<ImageTexture<Color3>>(o.environment, prism::color::kLightColorSpace,
+                                                              colorManagement);
             envImage->adjustExposure(o.exposure);
             // As an untransformed USD dome of the file at intensity 1: the
             // texels times 2^--env-exposure.
-            env = std::make_unique<EnvironmentMap>(envImage.get(), Color3(1.0f));
+            env = std::make_unique<EnvironmentMap>(envImage.get(), Color3(1.0f), *colorManagement);
             scene.environment = env.get();
         }
         std::vector<std::unique_ptr<Texture<Color3>>> domeTextures;
@@ -1022,12 +1025,14 @@ int runStandaloneCli(int argc, char** argv) {
                         std::cerr << "PrismRT: could not resolve dome texture '" << asset.GetAssetPath()
                                   << "'; the dome is white\n";
                     if (!texturePath.empty())
-                        domeTextures.push_back(std::make_unique<ImageTexture<Color3>>(texturePath, TextureColorSpace(file)));
+                        domeTextures.push_back(std::make_unique<ImageTexture<Color3>>(texturePath, TextureColorSpace(file),
+                                                                                      colorManagement));
                     else domeTextures.push_back(std::make_unique<ColorTexture>(Color3(1)));
                     const auto inverse = world.GetInverse();
                     std::array<float,9> linear;
                     for (int row=0; row<3; ++row) for (int col=0; col<3; ++col) linear[row*3+col] = float(inverse[col][row]);
-                    domes.push_back(std::make_unique<TransformedEnvironmentMap>(domeTextures.back().get(), multiplier, linear));
+                    domes.push_back(std::make_unique<TransformedEnvironmentMap>(domeTextures.back().get(), multiplier, linear,
+                                                                                *colorManagement));
                     light.GetDiffuseAttr().Get(&domes.back()->diffuseFactor, time);
                     light.GetSpecularAttr().Get(&domes.back()->specularFactor, time);
                     continue;
@@ -1069,7 +1074,7 @@ int runStandaloneCli(int argc, char** argv) {
                 std::array<double, 16> matrix{};
                 for (int row = 0; row < 4; ++row)
                     for (int column = 0; column < 4; ++column) matrix[row * 4 + column] = world[row][column];
-                prism::SceneLight sceneLight = prism::MakeSceneLight(params, matrix);
+                prism::SceneLight sceneLight = prism::MakeSceneLight(params, matrix, *colorManagement);
                 sceneLight.lightLinkBit = links.bit(light.GetLightLinkCollectionAPI(), false);
                 sceneLight.shadowLinkBit = links.bit(light.GetShadowLinkCollectionAPI(), true);
                 if (params.shape == prism::LightShape::Rect) {
@@ -1078,7 +1083,7 @@ int runStandaloneCli(int argc, char** argv) {
                     file.Get(&asset, time);
                     if (const std::string texture = ResolvedLightTexture(asset); !texture.empty())
                         sceneLight.texture = std::make_shared<ImageTexture<Color3>>(
-                            texture, TextureColorSpace(file));
+                            texture, TextureColorSpace(file), colorManagement);
                 }
                 scene.lights.push_back(std::move(sceneLight));
             }
@@ -1092,7 +1097,7 @@ int runStandaloneCli(int argc, char** argv) {
             } else if (domes.size() > 1) {
                 std::vector<const Environment*> parts;
                 for (auto const& dome : domes) parts.push_back(dome.get());
-                env = std::make_unique<CompositeEnvironment>(std::move(parts));
+                env = std::make_unique<CompositeEnvironment>(std::move(parts), *colorManagement);
                 scene.environment = env.get();
             }
         }
@@ -1111,9 +1116,11 @@ int runStandaloneCli(int argc, char** argv) {
             } else {
                 // As a USD dome (intensity 1, exposure 0, untransformed), like
                 // usdview's.
-                envImage = std::make_unique<ImageTexture<Color3>>(texture, prism::color::kLightColorSpace);
+                envImage = std::make_unique<ImageTexture<Color3>>(texture, prism::color::kLightColorSpace,
+                                                                  colorManagement);
                 env = std::make_unique<TransformedEnvironmentMap>(envImage.get(), Color3(1.0f),
-                                                                  std::array<float, 9>{1, 0, 0, 0, 1, 0, 0, 0, 1});
+                                                                  std::array<float, 9>{1, 0, 0, 0, 1, 0, 0, 0, 1},
+                                                                  *colorManagement);
                 scene.environment = env.get();
                 std::cerr << "PrismRT: the scene has no lights, emissive geometry or environment; lighting it "
                              "with USD's default dome (" << texture << "). --env, --env-color or "

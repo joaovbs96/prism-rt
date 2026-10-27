@@ -21,6 +21,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include "../src/renderer/renderer_options.h"
 
 namespace {
 void require(bool condition, std::string const& message)
@@ -110,7 +111,8 @@ int main(int argc, char** argv)
         auto compile = [&](std::string const& surface) {
             const auto path = dir / ("eon_" + std::to_string(serial++) + ".mtlx");
             { std::ofstream out(path); out << Document(surface); }
-            auto material = std::make_unique<MDLMaterial>(path.string(), context, libraries, mdlPath);
+            auto material = std::make_unique<MDLMaterial>(path.string(), context, libraries, mdlPath,
+                prism::MaterialSettings{prism::color::ColorManagement::Create({}), prism::RendererOptions::FromEnvironment().CacheRoot()});
             require(material->is_valid(), "compile failed: " + path.string());
             return material;
         };

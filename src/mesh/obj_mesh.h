@@ -43,12 +43,16 @@ class ObjMesh : public Mesh {
     public:
         // Faces whose material displaces them (MTL disp) are diced and
         // displaced at load time with `subdivision`'s displacement level and
-        // face limit, as USD meshes are.
+        // face limit, as USD meshes are. materialSettings: the renderer's colour
+        // management (materials convert into its working space) and cache
+        // directory.
         ObjMesh(const std::filesystem::path &file_path, mdl::Context* mdl_context,
                 const std::string& mx_libraries_path, const std::string& mx_mdl_path,
+                prism::MaterialSettings materialSettings,
                 prism::mesh::SubdivisionSettings subdivision = DefaultSubdivision())
-            : m_path(file_path)
+            : m_path(file_path), m_materials(std::move(materialSettings))
         {
+            if (!m_materials.color) throw std::invalid_argument("ObjMesh needs a colour management");
             // based on: https://github.com/yumcyaWiz/embree-tinyobj-example
             std::cout << "Loading File: " << file_path << std::endl;
             std::ifstream stream(file_path, std::ios::binary);
@@ -244,6 +248,7 @@ class ObjMesh : public Mesh {
         };
 
         std::filesystem::path m_path;
+        prism::MaterialSettings m_materials;
         std::vector<std::shared_ptr<MDLMaterial>> m_ownedMdl;
         std::unique_ptr<Texture<Color3>> m_greyTexture;
         std::unique_ptr<Material> m_grey;
@@ -265,7 +270,7 @@ class ObjMesh : public Mesh {
                 return;
             }
             const auto start = std::chrono::steady_clock::now();
-            const std::filesystem::path cache = prism::PersistentCacheRoot() / "materials";
+            const std::filesystem::path cache = m_materials.cacheDirectory / "materials";
             // Maps resolve beside the cached documents (as for USD and glTF).
             mdl_context->add_resource_path(cache.string());
             std::map<std::string, std::shared_ptr<MDLMaterial>> compiled; // by document
@@ -336,7 +341,8 @@ class ObjMesh : public Mesh {
                     } else {
                         const auto path = prism::materialx::PublishMaterialXDocument(xml, cache, "obj_");
                         compiledMaterial = std::make_shared<MDLMaterial>(path.string(), *mdl_context, libraries,
-                                                                         mdlLibraries, prism::obj::kMaterialName);
+                                                                         mdlLibraries, m_materials,
+                                                                         prism::obj::kMaterialName);
                         if (compiledMaterial->is_valid()) compiled.emplace(xml, compiledMaterial);
                         else failure = "MDL compilation failed (" + path.string() + ")";
                     }

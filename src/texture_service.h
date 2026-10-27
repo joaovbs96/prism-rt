@@ -3,6 +3,8 @@
 #include <OpenImageIO/imagebuf.h>
 #include <OpenImageIO/texture.h>
 
+#include "color/color_management.h"
+
 #include <filesystem>
 #include <functional>
 #include <cstdint>
@@ -40,12 +42,14 @@ struct TexturePrepareOptions {
     // Empty preserves source color-space metadata; nonempty tags the prepared image.
     std::string colorSpace;
     // Nonempty: convert the color channels (not alpha) from colorSpace into
-    // the working space, after gamma and exposure. It names that working
-    // space, prism::color::Active()->identity(), which must be the active
-    // one; the prepared image is tagged with the working space. Empty (and
+    // colorManagement's working space, after gamma and exposure. It names
+    // that working space (colorManagement->identity(), part of the cache
+    // key); the prepared image is tagged with the working space. Empty (and
     // MDL textures, which MaterialX's generated code decodes) leaves texels
     // unconverted.
     std::string workingSpace;
+    // The renderer's colour management, required with workingSpace.
+    std::shared_ptr<const prism::color::ColorManagement> colorManagement;
     // -1 uses source metadata (with gray-alpha inference), -2 disables alpha,
     // otherwise identifies an explicit source alpha channel.
     int alphaChannel = -1;

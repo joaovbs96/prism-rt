@@ -42,18 +42,19 @@ int main() {
         for(size_t i=0;i<pixels.size();++i) pixels[i]=static_cast<unsigned char>((i*17)%256);
         auto texture=std::make_shared<ImageTexture<Color3>>(&pixels,16,8,3);
         auto sameResource=std::make_shared<ImageTexture<Color3>>(*texture);
+        const auto color=prism::color::ColorManagement::Create({});
         prism::hydra::EnvironmentCache cache;
         const Color3 multiplier(.7f,1.2f,2.3f);
-        auto local=cache.Get(texture,multiplier);
-        require(cache.Get(sameResource,multiplier)==local,"Prepared resource identity not reused");
+        auto local=cache.Get(texture,multiplier,*color);
+        require(cache.Get(sameResource,multiplier,*color)==local,"Prepared resource identity not reused");
         const std::array<std::array<float,9>,4> transforms{{
             {1,0,0,0,1,0,0,0,1},
             {0,0,1,0,1,0,-1,0,0},
             {2,0,0,0,.5f,0,0,0,3},
             {1,.2f,0,0,1,.3f,.1f,0,1}}};
         for(auto const& transform:transforms) {
-            prism::hydra::CachedTransformedEnvironment cached(cache.Get(texture,multiplier),transform);
-            TransformedEnvironmentMap reference(texture.get(),multiplier,transform);
+            prism::hydra::CachedTransformedEnvironment cached(cache.Get(texture,multiplier,*color),transform);
+            TransformedEnvironmentMap reference(texture.get(),multiplier,transform,*color);
             compare(cached,reference);
             require(cached.importanceBytes()==local->importanceBytes() && cached.importanceBytes()>0,
                     "Shared distribution memory accounting omitted");
@@ -63,29 +64,33 @@ int main() {
                 "Shared distribution counted once per wrapper instead of once per resource");
         const std::array<float,9> singular{0,0,0,0,0,0,0,0,0};
         prism::hydra::CachedTransformedEnvironment singularCached(local,singular);
-        TransformedEnvironmentMap singularReference(texture.get(),multiplier,singular);
+        TransformedEnvironmentMap singularReference(texture.get(),multiplier,singular,*color);
         compare(singularCached,singularReference);
-        auto changed=cache.Get(texture,Color3(.7f,1.2f,2.300001f));
+        auto changed=cache.Get(texture,Color3(.7f,1.2f,2.300001f),*color);
         require(changed!=local && cache.BuildCount()==2,"Multiplier bits did not invalidate distribution");
+        // The tables weigh texels by the working space's luminance.
+        prism::color::Options rec709; rec709.workingSpace="lin_rec709";
+        auto otherSpace=cache.Get(texture,multiplier,*prism::color::ColorManagement::Create(rec709));
+        require(otherSpace!=local && cache.BuildCount()==3,"Another working space reused the distribution");
         const float edit[3]={100,200,300}; sameResource->buffer.setpixel(0,0,edit);
         sameResource->publishEdits();
-        auto reloaded=cache.Get(sameResource,multiplier);
-        require(reloaded!=local && cache.BuildCount()==3,"Prepared resource edit reused old distribution");
+        auto reloaded=cache.Get(sameResource,multiplier,*color);
+        require(reloaded!=local && cache.BuildCount()==4,"Prepared resource edit reused old distribution");
         prism::hydra::CachedTransformedEnvironment retained(local,transforms[0]);
         ImageTexture<Color3> frozen(*texture);
         texture->buffer.setpixel(0,0,edit); texture->publishEdits();
-        TransformedEnvironmentMap unchanged(&frozen,multiplier,transforms[0]);
+        TransformedEnvironmentMap unchanged(&frozen,multiplier,transforms[0],*color);
         compare(retained,unchanged);
         auto constant=std::make_shared<ColorTexture>(Color3(.4f));
-        auto constantLocal=cache.Get(constant,multiplier);
+        auto constantLocal=cache.Get(constant,multiplier,*color);
         prism::hydra::CachedTransformedEnvironment fallback(constantLocal,transforms[3]);
-        TransformedEnvironmentMap originalFallback(constant.get(),multiplier,transforms[3]);
+        TransformedEnvironmentMap originalFallback(constant.get(),multiplier,transforms[3],*color);
         compare(fallback,originalFallback);
         require(fallback.importanceBytes()==0,"Constant sky accounted nonexistent sampling tables");
         auto unpublished=std::make_shared<ImageTexture<Color3>>(frozen);
         unpublished->resource.reset();
         std::weak_ptr<ImageTexture<Color3>> sourceIdentity=unpublished;
-        auto unpublishedLocal=cache.Get(unpublished,multiplier);
+        auto unpublishedLocal=cache.Get(unpublished,multiplier,*color);
         unpublished.reset();
         require(!sourceIdentity.expired(),"Unprepared image key identity can be recycled");
         {
@@ -99,7 +104,7 @@ int main() {
             double buildMs=0;
             std::thread builder([&] {
                 const auto start=std::chrono::steady_clock::now();
-                (void)busy.Get(large,multiplier);
+                (void)busy.Get(large,multiplier,*color);
                 buildMs=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
                 done=true;
             });

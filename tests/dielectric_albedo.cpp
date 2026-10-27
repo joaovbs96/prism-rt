@@ -7,6 +7,7 @@
 // repairs (docs/materialx_compatibility.md).
 #include "../src/mdl/context.h"
 #include "../src/mdl_material.h"
+#include "../src/renderer/renderer_options.h"
 
 #include <algorithm>
 #include <cmath>
@@ -381,7 +382,7 @@ int main(int argc, char** argv)
             if (only && std::strcmp(only, test.name) != 0) continue;
             const auto path = dir / (std::string(test.name) + ".mtlx");
             { std::ofstream out(path); out << (entry == &fileCase ? fileBody : Document(test.body)); }
-            MDLMaterial material(path.string(), context, libraries, mdlPath);
+            MDLMaterial material(path.string(), context, libraries, mdlPath, prism::MaterialSettings{prism::color::ColorManagement::Create({}), prism::RendererOptions::FromEnvironment().CacheRoot()});
             require(material.is_valid(), std::string("compile failed: ") + test.name);
             if (file) {
                 Material::PreparedShadingContext context;

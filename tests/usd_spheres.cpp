@@ -31,7 +31,7 @@ void run(RTCDevice device) {
     USDMesh imported(path);
     require(imported.vertices.empty() && imported.sphereCount() == 4,
             "USD spheres must remain analytic, including point instances");
-    SceneManager scene(device);
+    SceneManager scene(device, prism::color::ColorManagement::Create({}));
     scene.attachImportedMesh(&imported);
     scene.commitScene();
     struct Release { RTCScene scene; ~Release() { rtcReleaseScene(scene); } } release{scene.scene};

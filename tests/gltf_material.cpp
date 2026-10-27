@@ -267,7 +267,7 @@ void TestEmbedded(const std::filesystem::path& dir)
 // generates MDL; tagged colours convert into the working space.
 void TestGeneration(const std::filesystem::path& dir, const std::string& libraries)
 {
-    prism::color::SetActive(prism::color::ColorManagement::Create({}));
+    const auto color = prism::color::ColorManagement::Create({});
     auto generator = MDLGenerator::shared(libraries);
     for (auto const* name : {"metal_rough_spheres.gltf", "textured.gltf", "features.gltf", "embedded.glb"}) {
         const auto model = Load(dir / name);
@@ -278,7 +278,7 @@ void TestGeneration(const std::filesystem::path& dir, const std::string& librari
             std::string message;
             Check(doc->validate(&message), std::string(name) + " material " + std::to_string(m) +
                                                " validates: " + message);
-            auto generated = generator->generate(doc, prism::gltf::kMaterialName);
+            auto generated = generator->generate(doc, prism::gltf::kMaterialName, *color);
             Check(generated.success, std::string(name) + " material " + std::to_string(m) +
                                          " generates MDL: " + generated.error_message);
             if (std::string(name) == "textured.gltf" && m == 0) {
@@ -376,7 +376,7 @@ void TestVolumeLayer(const std::filesystem::path& dir, const std::string& librar
             if (input->getNodeName() == "tint_image") tint = true;
     Check(tint, "texture inputs stay connected");
     for (auto const* material : {"Absorbing", "Clear"}) {
-        auto generated = generator->generate(doc, material);
+        auto generated = generator->generate(doc, material, *prism::color::ColorManagement::Create({}));
         Check(generated.success, std::string("volume layer fixture ") + material + " generates MDL: " +
                                      generated.error_message);
     }

@@ -38,6 +38,13 @@ prism::RendererOptions ServiceOptions(const std::filesystem::path& libraries)
     return options;
 }
 
+// The colour management materials compile in (the default one) and the
+// cache directory, as the front ends hand them to the service.
+prism::MaterialSettings ServiceMaterials()
+{
+    return {prism::color::ColorManagement::Create({}), prism::RendererOptions::FromEnvironment().CacheRoot()};
+}
+
 HdContainerDataSourceHandle MakeMaterial(bool materialXContext,
                                          const std::string& texturePath,
                                          const std::string& resolvedTexturePath,
@@ -168,7 +175,7 @@ int main()
     // than exposing partially initialized backend state.
     MDLMaterial missingDocument(
         (std::filesystem::temp_directory_path() / "prism_missing_hydra_material.mtlx").string(),
-        context, libraries.string(), (libraries / "mdl").string());
+        context, libraries.string(), (libraries / "mdl").string(), ServiceMaterials());
     if (missingDocument.is_valid()) {
         std::cerr << "Missing MaterialX document unexpectedly compiled\n";
         return 13;
@@ -183,7 +190,7 @@ int main()
         return 14;
     }
 
-    MaterialService service(&context, ServiceOptions(libraries));
+    MaterialService service(&context, ServiceOptions(libraries), ServiceMaterials());
 
     const SdfPath materialPath("/Looks/Test");
     const std::string relativeTexture = texture.filename().string();
@@ -251,10 +258,10 @@ int main()
 
     std::shared_ptr<Material> survivor;
     {
-        MaterialService transient(&context, ServiceOptions(libraries));
+        MaterialService transient(&context, ServiceOptions(libraries), ServiceMaterials());
         survivor = transient.Resolve(universal, materialPath);
     }
-    MaterialService replacement(&context, ServiceOptions(libraries));
+    MaterialService replacement(&context, ServiceOptions(libraries), ServiceMaterials());
     const auto replacementBefore = replacement.GetStats();
     const auto afterReplacement = replacement.Resolve(universal, materialPath);
     const auto replacementAfter = replacement.GetStats();

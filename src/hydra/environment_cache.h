@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 #include <pxr/base/tf/diagnostic.h>
 
@@ -18,8 +19,9 @@ struct LocalEnvironment {
     std::shared_ptr<const Texture<Color3>> sourceIdentity;
     std::shared_ptr<Texture<Color3>> texture;
     EnvironmentMap map;
-    LocalEnvironment(std::shared_ptr<Texture<Color3>> texture, Color3 multiplier)
-        : texture(std::move(texture)), map(this->texture.get(), multiplier) {}
+    LocalEnvironment(std::shared_ptr<Texture<Color3>> texture, Color3 multiplier,
+                     prism::color::ColorManagement const& color)
+        : texture(std::move(texture)), map(this->texture.get(), multiplier, color) {}
     size_t importanceBytes() const {
         return map.texelProbability.capacity()*sizeof(float) +
             map.probability.capacity()*sizeof(float) + map.alias.capacity()*sizeof(size_t);
@@ -28,13 +30,16 @@ struct LocalEnvironment {
 
 class EnvironmentCache {
 public:
+    // The importance tables weigh texels by color's luminance: entries are
+    // per working space.
     std::shared_ptr<const LocalEnvironment> Get(
-        std::shared_ptr<Texture<Color3>> texture, Color3 multiplier) {
+        std::shared_ptr<Texture<Color3>> texture, Color3 multiplier,
+        prism::color::ColorManagement const& color) {
         const auto* image = dynamic_cast<ImageTexture<Color3>*>(texture.get());
         const Key key{image && image->resource ? static_cast<const void*>(image->resource.get())
                                              : static_cast<const void*>(texture.get()),
             {std::bit_cast<uint32_t>(multiplier.x()), std::bit_cast<uint32_t>(multiplier.y()),
-             std::bit_cast<uint32_t>(multiplier.z())}};
+             std::bit_cast<uint32_t>(multiplier.z())}, color.identity()};
         {
             std::lock_guard lock(mutex);
             auto found=entries.find(key);
@@ -50,7 +55,7 @@ public:
         if (image) texture=std::make_shared<ImageTexture<Color3>>(*image);
         else if (const auto* color=dynamic_cast<ColorTexture*>(texture.get()))
             texture=std::make_shared<ColorTexture>(*color);
-        auto result=std::make_shared<LocalEnvironment>(std::move(texture),multiplier);
+        auto result=std::make_shared<LocalEnvironment>(std::move(texture),multiplier,color);
         if (!image || !image->resource) result->sourceIdentity=sourceIdentity;
         std::lock_guard lock(mutex);
         auto& entry=entries[key];
@@ -75,6 +80,7 @@ private:
     struct Key {
         const void* resource;
         std::array<uint32_t,3> multiplier;
+        std::string color; // ColorManagement::identity
         bool operator==(Key const&) const = default;
     };
     struct Hash {
@@ -82,6 +88,7 @@ private:
             size_t value=std::hash<const void*>{}(key.resource);
             for(auto component:key.multiplier)
                 value^=std::hash<uint32_t>{}(component)+0x9e3779b9+(value<<6)+(value>>2);
+            value^=std::hash<std::string>{}(key.color)+0x9e3779b9+(value<<6)+(value>>2);
             return value;
         }
     };
@@ -150,7 +157,9 @@ public:
         return this->local->map.directionPdf(transformed.normalize()) * localPerWorldJacobian(world.normalize());
     }
     // A linear transform of the directions keeps the integral over the sphere.
-    float integratedLuminance() const override { return this->local->map.integratedLuminance(); }
+    float integratedLuminance(prism::color::ColorManagement const& color) const override {
+        return this->local->map.integratedLuminance(color);
+    }
 private:
     static Float3 apply(const std::array<float,9>& a, const Float3& v) {
         return {a[0]*v.x()+a[1]*v.y()+a[2]*v.z(), a[3]*v.x()+a[4]*v.y()+a[5]*v.z(), a[6]*v.x()+a[7]*v.y()+a[8]*v.z()};

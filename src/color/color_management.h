@@ -95,15 +95,9 @@ private:
     std::shared_ptr<Impl> m_impl;
 };
 
-// The process-wide colour management every loader and device reads. Created
-// from default Options on first use. Changing it does not reconvert loaded
-// scene data: callers reload what depends on it (the Hydra delegate rebuilds
-// the scene).
-std::shared_ptr<const ColorManagement> Active();
-void SetActive(std::shared_ptr<const ColorManagement> colorManagement);
-// Makes a colour management for `options` active unless the active one was
-// made from the same options; returns the active one.
-std::shared_ptr<const ColorManagement> Activate(Options const &options);
+// There is no process-wide colour management: each renderer context owns one
+// (renderer/renderer_context.h) and hands it to its loaders, materials,
+// textures and scenes (SceneManager::colorManagement), which devices read.
 
 // The working space that a UsdRenderSettings.renderingColorSpace token asks
 // for in the OpenColorIO config `config` (empty: the default config), as a

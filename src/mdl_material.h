@@ -7,6 +7,7 @@
 #include "mdl/backend_compiler.h"
 #include "mdl/texture_runtime.h"
 #include "color/color_management.h"
+#include "renderer/material_settings.h"
 #include "materialx/loader.h"
 #include "materialx/mdl_generator.h"
 #include "resource_limits.h"
@@ -76,16 +77,20 @@ public:
     //   mdl_context:       initialized MDL SDK context (from main)
     //   mx_libraries_path: path to MaterialX install libraries/
     //   mx_mdl_path:       path to MaterialX install libraries/mdl/
+    //   settings:          the renderer's colour management (the working
+    //                      space colours convert into)
     //   material_name:     name of the material node (empty = use first material found)
     //   select:            which class parameters to fold (empty = none)
     MDLMaterial(const std::string& mtlx_path,
                 mdl::Context& mdl_context,
                 const std::string& mx_libraries_path,
                 const std::string& mx_mdl_path,
+                const prism::MaterialSettings& settings,
                 const std::string& material_name = "",
                 CompilationTimings* timings = nullptr,
                 const CompileSelector& select = {})
     {
+        if (!settings.color) throw std::invalid_argument("MDLMaterial needs a colour management");
         prism::PreparationAdmission::Reservation admission(
             prism::PreparationAdmission::Shared(), prism::kMaterialCompileReservationBytes);
         if (PrismMdlVerbose())
@@ -95,9 +100,10 @@ public:
         // Shared across materials: constructing a generator loads the whole
         // MaterialX standard library.
         const auto generationStart = std::chrono::steady_clock::now();
-        MDLGenerator& generator = *MDLGenerator::workerLocal(mx_libraries_path);
+        MDLGenerator& generator = *MDLGenerator::workerLocal(mx_libraries_path, settings.color.get());
         DocumentLoader doc_loader(generator.get_stdlib(), true);
-        if (auto color = prism::color::Active()) {
+        {
+            const auto color = settings.color;
             doc_loader.setUniformColorConversion({color->materialXSpace(),
                 [color](const std::string& space, std::array<float, 3>& rgb) {
                     // Linear Rec.709 as the glTF converter's attenuation
@@ -152,7 +158,7 @@ public:
             mat_name = selectedMaterial->getName();
         }
 
-        GeneratedMDL gen = generator.generate(doc, mat_name);
+        GeneratedMDL gen = generator.generate(doc, mat_name, *settings.color);
         m_generated_uniforms = gen.uniforms;
         if (timings) timings->generationSeconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - generationStart).count();

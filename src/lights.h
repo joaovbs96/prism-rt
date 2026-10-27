@@ -88,8 +88,9 @@ struct LightParameters {
 };
 
 // localToWorld in GfMatrix4d layout: row-vector convention, m[row * 4 + column],
-// translation in row 3.
-inline SceneLight MakeSceneLight(LightParameters const& params, std::array<double, 16> const& m)
+// translation in row 3. Colours convert into color's working space.
+inline SceneLight MakeSceneLight(LightParameters const& params, std::array<double, 16> const& m,
+                                 color::ColorManagement const& color)
 {
     auto point = [&](float x, float y, float z) {
         return Float3(float(x * m[0] + y * m[4] + z * m[8] + m[12]),
@@ -173,10 +174,10 @@ inline SceneLight MakeSceneLight(LightParameters const& params, std::array<doubl
         // A sphere light shrunk to a point keeps the intensity of its radius.
         scale *= pi * light.radius * light.radius;
     }
-    light.radiance = prism::color::Active()->FromRec709(params.color) * scale;
+    light.radiance = color.FromRec709(params.color) * scale;
     if (params.shaping.active && light.shape != LightShape::Distant) {
         light.shaping = params.shaping;
-        light.shaping.focusTint = prism::color::Active()->FromRec709(params.shaping.focusTint);
+        light.shaping.focusTint = color.FromRec709(params.shaping.focusTint);
         Float3 axis = -z;
         if (!(axis.length() > 0.0f)) axis = Float3(0.0f, 0.0f, -1.0f);
         axis = axis.normalize();
@@ -189,11 +190,12 @@ inline SceneLight MakeSceneLight(LightParameters const& params, std::array<doubl
 }
 
 // Emitted power (watts in Prism's units), for light selection. Distant
-// lights use the radius of the scene's bounds.
-inline float LightPower(SceneLight const& light, float sceneRadius)
+// lights use the radius of the scene's bounds. Luminance in color's working
+// space (the scene's).
+inline float LightPower(SceneLight const& light, float sceneRadius, color::ColorManagement const& color)
 {
     constexpr float pi = 3.14159265358979323846f;
-    const float luminance = std::max(0.0f, prism::color::Active()->Luminance(light.radiance));
+    const float luminance = std::max(0.0f, color.Luminance(light.radiance));
     switch (light.shape) {
     case LightShape::Point: return 4.0f * pi * luminance;
     case LightShape::Distant: {

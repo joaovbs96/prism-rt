@@ -308,7 +308,7 @@ void TestDisplacement()
 
 void TestGeneration(const std::filesystem::path& dir, const std::string& libraries)
 {
-    prism::color::SetActive(prism::color::ColorManagement::Create({}));
+    const auto color = prism::color::ColorManagement::Create({});
     {
         auto generator = MDLGenerator::shared(libraries);
         const auto library = Parse(kDisplacementMtl);
@@ -317,12 +317,11 @@ void TestGeneration(const std::filesystem::path& dir, const std::string& librari
             doc->importLibrary(generator->get_stdlib());
             std::string message;
             Check(doc->validate(&message), std::string("displacement material ") + name + " validates: " + message);
-            auto generated = generator->generate(doc, prism::obj::kMaterialName);
+            auto generated = generator->generate(doc, prism::obj::kMaterialName, *color);
             Check(generated.success, std::string("displacement material ") + name + " generates MDL: " +
                                          generated.error_message);
         }
     }
-    prism::color::SetActive(prism::color::ColorManagement::Create({}));
     auto generator = MDLGenerator::shared(libraries);
     for (auto const* name : {"textured.mtl", "glass.mtl", "emissive.mtl", "pbr.mtl"}) {
         const auto library = Load(dir / name);
@@ -333,7 +332,7 @@ void TestGeneration(const std::filesystem::path& dir, const std::string& librari
             std::string message;
             const std::string label = std::string(name) + " " + material.name;
             Check(doc->validate(&message), label + " validates: " + message);
-            auto generated = generator->generate(doc, prism::obj::kMaterialName);
+            auto generated = generator->generate(doc, prism::obj::kMaterialName, *color);
             Check(generated.success, label + " generates MDL: " + generated.error_message);
             if (material.name == "checker")
                 Check(generated.mdl_source.find("srgb_texture_to_acescg") != std::string::npos,

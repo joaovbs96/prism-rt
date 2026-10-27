@@ -22,7 +22,7 @@ int main(int argc, char** argv)
     if (!context.is_valid()) { std::cerr << context.get_error() << '\n'; return 1; }
     RTCDevice device = rtcNewDevice(nullptr);
     {
-        SceneManager scene(device);
+        SceneManager scene(device, prism::color::ColorManagement::Create({}));
         const char* libraries = std::getenv("PRISM_MATERIALX_LIBRARY_PATH");
         const std::string libraryPath = libraries ? libraries : "";
         USDMesh mesh(argv[1], &context, libraryPath, libraryPath + "/mdl");

@@ -96,9 +96,10 @@ constexpr size_t kEmissionProbeTriangles = 64;
 
 namespace light_table_detail {
 
-inline float Luminance(Color3 const& c)
+// Luminance in the scene's working space (SceneManager::color).
+inline float Luminance(prism::color::ColorManagement const& color, Color3 const& c)
 {
-    const float l = prism::color::Active()->Luminance(c);
+    const float l = color.Luminance(c);
     return std::isfinite(l) ? std::max(0.0f, l) : 0.0f;
 }
 
@@ -346,7 +347,7 @@ inline bool GroupEmits(SceneManager& scene, EmitterTriangle const* triangles, si
     for (size_t i = 0; i < count; i += step) {
         for (int side = 0; side < (backFace ? 2 : 1); ++side) {
             ++*evaluations;
-            if (Luminance(EmittedAlongNormal(scene, triangles[i], 1.0f / 3.0f, 1.0f / 3.0f, side == 1)) > 0.0f)
+            if (Luminance(scene.color(), EmittedAlongNormal(scene, triangles[i], 1.0f / 3.0f, 1.0f / 3.0f, side == 1)) > 0.0f)
                 return true;
         }
     }
@@ -368,7 +369,7 @@ inline bool SceneHasEmitters(SceneManager& scene)
         ForEachPlacementMaterial(scene, id, geometry, [&](Material* material) {
             if (!material || emits) return;
             const auto emission = material->constantEmission();
-            emits = emission && Luminance(emission->radiance) > 0.0f;
+            emits = emission && Luminance(scene.color(), emission->radiance) > 0.0f;
             varying = varying || (geometry->type == RTC_GEOMETRY_TYPE_TRIANGLE && material->variesEmission());
         });
         if (emits) return true;
@@ -453,7 +454,7 @@ inline void AddVaryingEmitters(SceneManager& scene, LightTable& table, std::vect
                         const float b1 = uy * su;
                         const float b2 = su - b1;
                         for (int side = 0; side < (back ? 2 : 1); ++side) {
-                            sum += Luminance(EmittedAlongNormal(scene, t, b1, b2, side == 1));
+                            sum += Luminance(scene.color(), EmittedAlongNormal(scene, t, b1, b2, side == 1));
                             ++local;
                         }
                     }
@@ -544,7 +545,7 @@ inline LightShaping SceneLightShaping(prism::SceneLight const& light)
     return s;
 }
 
-inline double ShapingPowerFraction(prism::SceneLight const& light)
+inline double ShapingPowerFraction(prism::SceneLight const& light, prism::color::ColorManagement const& color)
 {
     if (!light.shaping.active || light.shape == prism::LightShape::Distant) return 1.0;
     const LightShaping s = SceneLightShaping(light);
@@ -568,8 +569,8 @@ inline double ShapingPowerFraction(prism::SceneLight const& light)
                 const float2 angles = iesAngles(s, e);
                 factor = factor * (light.shaping.ies->sample(angles.x, angles.y) * s.iesScale);
             }
-            shaped += double(weight) * light_table_detail::Luminance(Color3(factor.x, factor.y, factor.z));
-            total += double(weight) * light_table_detail::Luminance(Color3(1.0f));
+            shaped += double(weight) * light_table_detail::Luminance(color, Color3(factor.x, factor.y, factor.z));
+            total += double(weight) * light_table_detail::Luminance(color, Color3(1.0f));
         }
     }
     return total > 0.0 ? shaped / total : 0.0;
@@ -667,7 +668,7 @@ inline LightTable BuildLightTable(SceneManager& scene, size_t maxEmitterTriangle
     std::vector<double> weights;
     std::vector<prism::SceneLight const*> shaped; // kLightShaped records, by block
     for (prism::SceneLight const& light : scene.lights) {
-        if (!(Luminance(light.radiance) > 0.0f)) continue;
+        if (!(Luminance(scene.color(), light.radiance) > 0.0f)) continue;
         table.lobes |= light.diffuse != 1.0f || light.specular != 1.0f;
         LightRecord record{};
         record.lobes = float4(light.diffuse, light.specular, 0.0f, 0.0f);
@@ -711,12 +712,12 @@ inline LightTable BuildLightTable(SceneManager& scene, size_t maxEmitterTriangle
             break;
         }
         if (record.info.x != kLightDistant && record.info.x != kLightPoint && !(light.area > 0.0f)) continue;
-        double weight = double(prism::LightPower(light, sceneRadius));
+        double weight = double(prism::LightPower(light, sceneRadius, scene.color()));
         if (light.shaping.active && record.info.x != kLightDistant) {
             record.info.y |= kLightShaped;
             record.lobes.z = asfloat(uint32_t(shaped.size()));
             shaped.push_back(&light);
-            weight *= ShapingPowerFraction(light);
+            weight *= ShapingPowerFraction(light, scene.color());
         }
         table.records.push_back(record);
         weights.push_back(std::max(1e-12, weight));
@@ -796,7 +797,7 @@ inline LightTable BuildLightTable(SceneManager& scene, size_t maxEmitterTriangle
     for (ConstantTriangle const& t : triangles) {
         const Float3 n = cross(t.p[1] - t.p[0], t.p[2] - t.p[0]);
         const float area = 0.5f * n.length();
-        const float luminance = Luminance(t.emission.radiance);
+        const float luminance = Luminance(scene.color(), t.emission.radiance);
         if (!(area > 0.0f) || !(luminance > 0.0f)) continue;
         LightRecord record{};
         record.info.x = kLightTriangle;
@@ -821,7 +822,7 @@ inline LightTable BuildLightTable(SceneManager& scene, size_t maxEmitterTriangle
     // The dome competes by its power through a disk of the scene's size.
     double domeWeight = 0.0;
     if (scene.environment) {
-        const float integral = scene.environment->integratedLuminance();
+        const float integral = scene.environment->integratedLuminance(scene.color());
         if (std::isfinite(integral) && integral > 0.0f)
             domeWeight = double(integral) * pi * sceneRadius * sceneRadius;
     }
@@ -835,7 +836,8 @@ inline LightTable BuildLightTable(SceneManager& scene, size_t maxEmitterTriangle
     for (size_t i = 0; i < table.records.size(); ++i) table.records[i].n.w = float(pmf[i]);
     for (auto& [material, emitter] : table.emitters) {
         const auto emission = material->constantEmission();
-        const double perArea = double(pi) * Luminance(emission->radiance) * (emitter.twoSided ? 2.0 : 1.0);
+        const double perArea = double(pi) * Luminance(scene.color(), emission->radiance) *
+            (emitter.twoSided ? 2.0 : 1.0);
         emitter.pdfArea = total > 0.0 ? float(perArea / total) : 0.0f;
     }
     // Per-primitive densities of the varying emitters (negative: front face only).

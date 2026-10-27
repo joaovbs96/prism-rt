@@ -6,6 +6,8 @@
 #include <stdexcept>
 #include <vector>
 
+namespace { const auto kColor = prism::color::ColorManagement::Create({}); }
+
 namespace {
 void require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
@@ -22,7 +24,7 @@ int main() {
         // despite polar rows covering less of the sphere.
         std::vector<unsigned char> white(8 * 4 * 3, 255);
         auto constantTexture = image(white, 8, 4);
-        EnvironmentMap constant(&constantTexture, Color3(1.0f));
+        EnvironmentMap constant(&constantTexture, Color3(1.0f), *kColor);
         unsigned seed = 17;
         double inversePdfMean = 0.0;
         for (int i=0; i<200000; ++i) {
@@ -42,7 +44,7 @@ int main() {
         const int bright = 2 * 8 + 3;
         pixels[bright*3]=pixels[bright*3+1]=pixels[bright*3+2]=255;
         auto brightTexture = image(pixels, 8, 4);
-        EnvironmentMap brightMap(&brightTexture, Color3(1.0f));
+        EnvironmentMap brightMap(&brightTexture, Color3(1.0f), *kColor);
         for (float p : brightMap.texelProbability)
             require(p > 0, "Filtered HDR sampling must retain full support");
         int observed=0; const int samples=250000;
@@ -86,7 +88,7 @@ int main() {
                     else set(x,y,255,255,0);               // -X: yellow
                 }
             auto bandTexture = image(bands, 8, 4);
-            EnvironmentMap bandMap(&bandTexture, Color3(1.0f));
+            EnvironmentMap bandMap(&bandTexture, Color3(1.0f), *kColor);
             struct Probe { Float3 direction; Color3 colour; const char* what; };
             const Probe probes[] = {
                 {Float3(0,0,-1), Color3(1,0,0), "-Z must read the image's left and right edges"},
@@ -105,7 +107,7 @@ int main() {
         // Non-uniform transforms exercise the solid-angle Jacobian. E[1/pdf]
         // remains the sphere area when sample and PDF transforms agree.
         TransformedEnvironmentMap transformed(&constantTexture, Color3(1),
-            {2,0,0, 0,.5f,0, 0,0,1.5f});
+            {2,0,0, 0,.5f,0, 0,0,1.5f}, *kColor);
         inversePdfMean=0;
         for(int i=0;i<250000;++i) {
             EnvironmentSample s=transformed.sampleDirection(seed);
@@ -117,7 +119,7 @@ int main() {
         require(std::fabs(inversePdfMean-4.0*PI) < 0.08,
                 "transformed PDF is not normalized");
         TransformedEnvironmentMap rotated(&brightTexture, Color3(1),
-            {0,0,1, 0,1,0, -1,0,0});
+            {0,0,1, 0,1,0, -1,0,0}, *kColor);
         // Filtering changes radiance, not sampled directions, PDFs or RNG.
         // Both MIS techniques must evaluate an identical outgoing footprint.
         for (Environment* environment : std::vector<Environment*>{&brightMap, &transformed, &rotated}) {
@@ -149,13 +151,13 @@ int main() {
         }
         std::vector<unsigned char> black(8*4*3,0);
         auto blackTexture=image(black,8,4);
-        EnvironmentMap blackMap(&blackTexture, Color3(1.0f));
+        EnvironmentMap blackMap(&blackTexture, Color3(1.0f), *kColor);
         auto blackSample=blackMap.sampleDirection(seed);
         require(blackSample.radiance.is_zero() && std::isfinite(blackSample.pdf) && blackSample.pdf>0,
                 "Black HDR must fall back to a valid uniform distribution");
         std::vector<unsigned char> tall(2*8192*3,255);
         auto tallTexture=image(tall,2,8192);
-        EnvironmentMap poles(&tallTexture,Color3(1));
+        EnvironmentMap poles(&tallTexture,Color3(1), *kColor);
         require(std::isfinite(poles.directionPdf(Float3(0,1,0))) &&
                 poles.directionPdf(Float3(0,1,0))>0,
                 "High resolution pole density must remain finite");
@@ -163,7 +165,7 @@ int main() {
         for (int row=0;row<3;++row)
             for(int i=0;i<6;++i) polarPixels[row*6+i]=static_cast<unsigned char>(64*(row+1));
         auto polarTexture=image(polarPixels,2,16384);
-        EnvironmentMap polarMap(&polarTexture,Color3(1));
+        EnvironmentMap polarMap(&polarTexture,Color3(1), *kColor);
         for(int i=0;i<20000;++i) {
             const auto s=polarMap.sampleDirection(seed);
             require(std::abs(s.pdf-polarMap.directionPdf(s.wi)) < 1e-3f*s.pdf,

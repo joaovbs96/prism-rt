@@ -11,6 +11,7 @@
 #include <OpenImageIO/imagebuf.h>
 #include "../../src/load_profile.h"
 #include "../../src/color/color_management.h"
+#include "../../src/renderer/renderer_options.h"
 #include "../../src/output/render_products.h"
 #include "../../src/render_defaults.h"
 #include <pxr/usd/usd/editContext.h>
@@ -561,6 +562,9 @@ int main(int argc, char** argv) {
         parameters.rendererPluginId = TfToken("HdPrismRendererPlugin");
         std::optional<prism::load_profile::Scope> engineProfile(std::in_place, "cli.engine_create");
         UsdImagingGLEngine engine(parameters);
+        // The images' colour management: the environment's (as this tool
+        // wrote them before the delegate had its own).
+        const auto outputColor = prism::color::ColorManagement::Create(prism::RendererOptions::FromEnvironment().color);
         engineProfile.reset();
         if (engine.GetCurrentRendererId() != parameters.rendererPluginId)
             throw std::runtime_error("PrismRT plugin not loaded; check PXR_PLUGINPATH_NAME and DLL paths");
@@ -634,7 +638,7 @@ int main(int argc, char** argv) {
                 std::vector<std::string> productWarnings;
                 const auto image = prism::output::BuildProductImage(view, rendered, &productWarnings);
                 if (!image.layers.empty())
-                    prism::output::WriteImage(view.output, image, *prism::color::Active(), &productWarnings);
+                    prism::output::WriteImage(view.output, image, *outputColor, &productWarnings);
                 printWarnings(productWarnings);
                 if (image.layers.empty()) {
                     std::cerr << "prism_hydra_render: nothing to write to " << view.output << '\n';
@@ -737,7 +741,7 @@ int main(int argc, char** argv) {
                 }
             }
             const auto image = prism::output::BuildProductImage(outputView, outputs, &outputWarnings);
-            prism::output::WriteImage(argv[3], image, *prism::color::Active(), &outputWarnings);
+            prism::output::WriteImage(argv[3], image, *outputColor, &outputWarnings);
             printWarnings(outputWarnings);
         }
         if (hideDomeBackground) {

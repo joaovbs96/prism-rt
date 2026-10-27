@@ -640,7 +640,8 @@ std::string PrewarmContextPrefix(const mdl::Context* context)
 // modules, which the first generated module would otherwise load as most of
 // its class compilation. The names come from a minimal generated module, so
 // they follow the installed MaterialX version.
-std::string LoadSupportModules(mdl::Context& context, const std::string& libraries)
+std::string LoadSupportModules(mdl::Context& context, const std::string& libraries,
+                               prism::color::ColorManagement const& color)
 {
     auto generator = MDLGenerator::shared(libraries);
     mx::DocumentPtr doc = mx::createDocument();
@@ -648,7 +649,7 @@ std::string LoadSupportModules(mdl::Context& context, const std::string& librari
     // No authored inputs: generate() bypasses the template caches.
     doc->addMaterialNode("PrismMaterial",
         doc->addNode("standard_surface", "Surface", "surfaceshader"));
-    const GeneratedMDL generated = generator->generate(doc, "PrismMaterial");
+    const GeneratedMDL generated = generator->generate(doc, "PrismMaterial", color);
     if (!generated.success) return "support module discovery: " + generated.error_message;
     std::vector<std::string> modules;
     std::istringstream lines(generated.mdl_source);
@@ -691,7 +692,8 @@ std::string LoadSupportModules(mdl::Context& context, const std::string& librari
 
 PrewarmResult RunPrewarm(mdl::Context* context, const std::string& libraries,
                          const std::string& mdlPath, const std::filesystem::path& cacheDir,
-                         unsigned workers)
+                         unsigned workers,
+                         std::shared_ptr<const prism::color::ColorManagement> const& color)
 {
     const auto start = std::chrono::steady_clock::now();
     prism::load_profile::Scope profile("materials.prewarm");
@@ -701,14 +703,14 @@ PrewarmResult RunPrewarm(mdl::Context* context, const std::string& libraries,
         (void)HdMtlxStdLibraries();
         // Loads the generator's standard library and digest, and leaves a
         // generator for each worker of the first batch.
-        MDLGenerator::reserveWorkers(libraries, workers);
+        MDLGenerator::reserveWorkers(libraries, workers, color.get());
         // As Prefetch registers them; loading modules by name needs the path.
         if (!mdlPath.empty()) {
             context->add_mdl_path(mdlPath);
             context->add_resource_path(mdlPath);
         }
         context->add_resource_path(cacheDir.string());
-        result.error = LoadSupportModules(*context, libraries);
+        result.error = LoadSupportModules(*context, libraries, *color);
     } catch (const std::exception& error) {
         result.error = error.what();
     } catch (...) {
@@ -799,8 +801,9 @@ public:
             prepared.resolverContext, prepared.network, prepared.dependencies, material});
     }
     Impl(mdl::Context* context, prism::RendererOptions const& options,
-         uint64_t requestedAssociationScope)
+         prism::MaterialSettings settings, uint64_t requestedAssociationScope)
         : context(context)
+        , materials(std::move(settings))
         , libraries(options.materials.materialxLibraries)
         , mdlPath(options.materials.materialxMdlPath)
         , cacheDir(options.CacheRoot() / "materials")
@@ -812,6 +815,8 @@ public:
         , materialWorkers(options.limits.MaterialWorkers())
         , textureThreads(options.limits.TexturePreparationThreads())
     {
+        if (!materials.color) throw std::invalid_argument("MaterialService needs a colour management");
+        materialIdentity = materials.Identity();
         if (this->mdlPath.empty() && !this->libraries.empty())
             this->mdlPath = (std::filesystem::path(this->libraries) / "mdl").string();
         prewarmKey = PrewarmContextPrefix(context) + this->libraries + "\n" + this->mdlPath;
@@ -949,7 +954,7 @@ public:
             if (allowTemplate && TemplateStructure(result.network, &structure)) {
                 CompatibleTemplate entry;
                 if (prism::materialx::CompatibleTemplateRegistry::Shared().find(
-                        context, libraries, mdlPath, structure, &entry)) {
+                        context, libraries, mdlPath, structure, materialIdentity, &entry)) {
                     result.templatePrototype = entry.prototype;
                     result.templateBindings = entry.bindings;
                     result.valid = true;
@@ -1277,7 +1282,7 @@ public:
         try {
             candidate = std::make_shared<MDLMaterial>(
                 prepared.mtlxPath.string(), *context, libraries, mdlPath,
-                prepared.materialName, &timings, select);
+                materials, prepared.materialName, &timings, select);
         } catch (const std::exception& error) {
             {
                 std::lock_guard<std::mutex> cacheLock(gMaterialCacheMutex);
@@ -1345,7 +1350,7 @@ public:
             if (compatible && !bindings.empty()) {
                 prism::materialx::CompatibleTemplateRegistry::Shared().publish(
                     {context, libraries, mdlPath, std::move(structure),
-                     candidate, std::move(bindings)});
+                     candidate, std::move(bindings)}, materialIdentity);
                 if (TemplateDebug()) std::cerr << "[MaterialTemplate] published "
                     << prepared.path << " inputs="
                     << candidate->get_generated_uniforms().size() << "\n";
@@ -1421,6 +1426,10 @@ public:
     }
 
     mdl::Context* context = nullptr;
+    // The colour management materials compile in, and its identity (the
+    // shared caches' key).
+    prism::MaterialSettings materials;
+    std::string materialIdentity;
     std::string libraries;
     std::string mdlPath;
     std::filesystem::path cacheDir;
@@ -1471,8 +1480,9 @@ public:
 
 MaterialService::MaterialService(mdl::Context* context,
                                  prism::RendererOptions const& options,
+                                 prism::MaterialSettings materials,
                                  uint64_t associationScope)
-    : m_impl(std::make_unique<Impl>(context, options, associationScope))
+    : m_impl(std::make_unique<Impl>(context, options, std::move(materials), associationScope))
 {}
 
 MaterialService::~MaterialService() {
@@ -1534,8 +1544,8 @@ void MaterialService::Prewarm()
             entry = std::async(std::launch::async,
                 [context = impl.context, libraries = impl.libraries,
                  mdlPath = impl.mdlPath, cacheDir = impl.cacheDir,
-                 workers = impl.materialWorkers] {
-                    return RunPrewarm(context, libraries, mdlPath, cacheDir, workers);
+                 workers = impl.materialWorkers, color = impl.materials.color] {
+                    return RunPrewarm(context, libraries, mdlPath, cacheDir, workers, color);
                 }).share();
             ++gPrewarmJobs;
         } catch (const std::exception& error) {
@@ -1806,7 +1816,7 @@ void MaterialService::Prefetch(const std::vector<Request>& requests,
             } else if (TemplateStructure(variant.network, &structure) &&
                 prism::materialx::CompatibleTemplateRegistry::Shared().find(
                     m_impl->context, m_impl->libraries, m_impl->mdlPath,
-                    structure, &entry)) {
+                    structure, m_impl->materialIdentity, &entry)) {
                 variant.templatePrototype = std::move(entry.prototype);
                 variant.templateBindings = std::move(entry.bindings);
                 variant.valid = true;

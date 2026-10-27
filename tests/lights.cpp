@@ -153,45 +153,46 @@ void CheckLargeTablePicks()
 int main()
 {
     CheckLargeTablePicks();
+    const auto color = prism::color::ColorManagement::Create({});
     prism::LightParameters params;
     params.intensity = 2.0f;
 
     params.shape = prism::LightShape::Sphere;
     params.radius = 0.3f;
-    CheckShape("sphere", Record(prism::MakeSceneLight(params, Transform(0, 1, 0))), float3(0.2f, 0, 0.1f));
+    CheckShape("sphere", Record(prism::MakeSceneLight(params, Transform(0, 1, 0), *color)), float3(0.2f, 0, 0.1f));
 
     params.shape = prism::LightShape::Rect;
     params.width = 1.5f;
     params.height = 0.5f;
-    CheckShape("rect", Record(prism::MakeSceneLight(params, Transform(0, 0, 1.0f))), float3(0.3f, 0.1f, 0));
+    CheckShape("rect", Record(prism::MakeSceneLight(params, Transform(0, 0, 1.0f), *color)), float3(0.3f, 0.1f, 0));
     // Close enough to be sampled by solid angle.
-    CheckShape("rect near", Record(prism::MakeSceneLight(params, Transform(0, 0, 0.2f))), float3(0.3f, 0.1f, 0));
+    CheckShape("rect near", Record(prism::MakeSceneLight(params, Transform(0, 0, 0.2f), *color)), float3(0.3f, 0.1f, 0));
 
     params.shape = prism::LightShape::Disk;
     params.radius = 0.4f;
-    CheckShape("disk", Record(prism::MakeSceneLight(params, Transform(0, 0, 1.0f, 1.5f))),
+    CheckShape("disk", Record(prism::MakeSceneLight(params, Transform(0, 0, 1.0f, 1.5f), *color)),
                float3(0.1f, 0.2f, 0));
 
     params.shape = prism::LightShape::Cylinder;
     params.radius = 0.1f;
     params.length = 2.0f;
-    CheckShape("cylinder", Record(prism::MakeSceneLight(params, Transform(0, 1.0f, 0))), float3(0.3f, 0, 0.2f));
-    CheckShape("cylinder", Record(prism::MakeSceneLight(params, Transform(0, 1.0f, 0, 1.0f, true))),
+    CheckShape("cylinder", Record(prism::MakeSceneLight(params, Transform(0, 1.0f, 0), *color)), float3(0.3f, 0, 0.2f));
+    CheckShape("cylinder", Record(prism::MakeSceneLight(params, Transform(0, 1.0f, 0, 1.0f, true), *color)),
                float3(0.3f, 0, 0.2f));
-    CheckShape("cyl near", Record(prism::MakeSceneLight(params, Transform(0, 1.0f, 0))), float3(0.7f, 0.8f, 0.05f));
+    CheckShape("cyl near", Record(prism::MakeSceneLight(params, Transform(0, 1.0f, 0), *color)), float3(0.7f, 0.8f, 0.05f));
 
     // Normalized lights keep their power when their size changes.
     params.shape = prism::LightShape::Rect;
     params.normalize = true;
-    const auto narrowLight = prism::MakeSceneLight(params, Transform(0, 0, 0));
-    const auto wideLight = prism::MakeSceneLight(params, Transform(0, 0, 0, 3.0f));
-    Check(std::abs(prism::LightPower(narrowLight, 1.0f) / prism::LightPower(wideLight, 1.0f) - 1.0f) < 1e-4f,
+    const auto narrowLight = prism::MakeSceneLight(params, Transform(0, 0, 0), *color);
+    const auto wideLight = prism::MakeSceneLight(params, Transform(0, 0, 0, 3.0f), *color);
+    Check(std::abs(prism::LightPower(narrowLight, 1.0f, *color) / prism::LightPower(wideLight, 1.0f, *color) - 1.0f) < 1e-4f,
           "normalize keeps the power");
 
     // Two constant domes: radiance sums, the mixture density integrates to one.
     ColorTexture a(Color3(1.0f)), b(Color3(3.0f));
     ConstantColorBackground domeA(&a), domeB(&b);
-    CompositeEnvironment composite({&domeA, &domeB});
+    CompositeEnvironment composite({&domeA, &domeB}, *color);
     Check(std::abs(composite.weights[0] - 0.25f) < 1e-3f, "domes are selected by power");
     Check(std::abs(composite.radiance(Float3(0, 1, 0)).x() - 4.0f) < 1e-4f, "dome radiance sums");
     Check(std::abs(composite.directionPdf(Float3(0, 1, 0)) * 4.0f * kPi - 1.0f) < 1e-4f,

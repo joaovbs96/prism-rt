@@ -651,9 +651,10 @@ DecodedImage DecodeSource(std::filesystem::path const &absolute, TexturePrepareO
     // Colour conversion into the working space (TexturePrepareOptions::workingSpace).
     std::shared_ptr<const prism::color::ColorManagement> conversion;
     if (!options.workingSpace.empty() && !options.colorSpace.empty()) {
-        conversion = prism::color::Active();
-        if (conversion->identity() != options.workingSpace)
-            throw std::runtime_error("texture working space is not the active one: " + absolute.string());
+        conversion = options.colorManagement;
+        if (!conversion || conversion->identity() != options.workingSpace)
+            throw std::runtime_error("texture working space has no matching colour management: " +
+                                     absolute.string());
         if (!conversion->NeedsConversion(options.colorSpace)) {
             if (conversion->Resolve(options.colorSpace).empty())
                 throw std::runtime_error("unknown texture colour space '" + options.colorSpace + "': " +

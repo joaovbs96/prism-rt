@@ -71,7 +71,7 @@ int main()
         std::cerr << "cannot create Embree device\n"; return 1;
     }
     {
-        SceneManager scene(device);
+        SceneManager scene(device, prism::color::ColorManagement::Create({}));
         Mesh mesh;
         mesh.type=RTC_GEOMETRY_TYPE_TRIANGLE;
         mesh.vertices={Float3(0,0,0),Float3(1,0,0),Float3(0,1,0)};

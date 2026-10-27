@@ -10,6 +10,8 @@
 #include <stdexcept>
 #include <fstream>
 
+namespace { const auto kColor = prism::color::ColorManagement::Create({}); }
+
 namespace mx = MaterialX;
 struct TestCache {
     std::filesystem::path path=std::filesystem::temp_directory_path()/
@@ -46,7 +48,7 @@ int main(int argc,char** argv) {
         auto library = generator.get_stdlib();
         if(argc==5&&std::string(argv[1])=="--probe") {
             const mx::Color3 color(std::stof(argv[2]),std::stof(argv[3]),std::stof(argv[4]));
-            const auto generated=generator.generate(document(library,color),"PrismMaterial");
+            const auto generated=generator.generate(document(library,color), "PrismMaterial", *kColor);
             if(!generated.success)throw std::runtime_error(generated.error_message);
             uint64_t hash=14695981039346656037ull;
             for(unsigned char c:generated.mdl_source){hash^=c;hash*=1099511628211ull;}
@@ -85,15 +87,15 @@ int main(int argc,char** argv) {
             return worker.get_stdlib();
         }).get();
         if (library != other) throw std::runtime_error("workers duplicated the immutable library");
-        auto a = generator.generate(document(library, mx::Color3(.2f,.3f,.4f)), "PrismMaterial");
+        auto a = generator.generate(document(library, mx::Color3(.2f,.3f,.4f)), "PrismMaterial", *kColor);
         auto bdoc = document(library, mx::Color3(.8f,.15f,.25f));
-        auto b = generator.generate(bdoc, "PrismMaterial");
+        auto b = generator.generate(bdoc, "PrismMaterial", *kColor);
         if (!a.success || !b.success || !b.generationCacheHit)
             throw std::runtime_error("color parameter template was not reused: " + a.error_message + b.error_message);
         if (a.mdl_source == b.mdl_source) throw std::runtime_error("template retained stale color");
         auto changedStructure=document(library, mx::Color3(.8f,.15f,.25f));
         changedStructure->getNode("Surface")->setInputValue("specular_weight", 0.0f);
-        const auto changed=generator.generate(changedStructure,"PrismMaterial");
+        const auto changed=generator.generate(changedStructure, "PrismMaterial", *kColor);
         if(!changed.success || changed.generationCacheHit)
             throw std::runtime_error("non-parameterized scalar incorrectly reused color template");
 #ifdef _WIN32
@@ -101,13 +103,13 @@ int main(int argc,char** argv) {
 #else
         setenv("PRISM_DISABLE_GENERATION_CACHE", "1", 1);
 #endif
-        auto reference = generator.generate(bdoc, "PrismMaterial");
+        auto reference = generator.generate(bdoc, "PrismMaterial", *kColor);
         if (!reference.success || b.mdl_source != reference.mdl_source) {
             std::ofstream("template-cached.mdl") << b.mdl_source;
             std::ofstream("template-reference.mdl") << reference.mdl_source;
             throw std::runtime_error("template differs from independent MaterialX generation");
         }
-        const auto changedReference=generator.generate(changedStructure,"PrismMaterial");
+        const auto changedReference=generator.generate(changedStructure, "PrismMaterial", *kColor);
         if(!changedReference.success || changed.mdl_source!=changedReference.mdl_source)
             throw std::runtime_error("scalar edit did not match independent generation");
         std::cout << "Shared libraries and color template generation match independent generation\n";

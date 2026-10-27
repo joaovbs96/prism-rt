@@ -185,15 +185,14 @@ void TestConversions()
     Check(Near(Float3(rgb[0], rgb[1], rgb[2]), expected, 2e-4f), "sRGB texture to ACEScg " + Text(Float3(rgb[0], rgb[1], rgb[2])));
 
     // Light colours (both loaders build lights with MakeSceneLight).
-    prism::color::SetActive(aces);
     prism::LightParameters params;
     params.shape = prism::LightShape::Distant;
     params.color = Color3(1.0f, 0.0f, 0.0f);
-    const auto light = prism::MakeSceneLight(params, {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1});
+    const auto light = prism::MakeSceneLight(params, {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1}, *aces);
     Check(Near(light.radiance, Float3(kRec709ToAcescg[0], kRec709ToAcescg[3], kRec709ToAcescg[6]), 1e-5f),
           "light colour converts from Rec.709: " + Text(light.radiance));
-    prism::color::SetActive(prism::color::ColorManagement::Create(Legacy()));
-    const auto legacyLight = prism::MakeSceneLight(params, {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1});
+    const auto legacyLight = prism::MakeSceneLight(params, {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1},
+                                                   *prism::color::ColorManagement::Create(Legacy()));
     Check(legacyLight.radiance.x() == 1.0f && legacyLight.radiance.y() == 0.0f, "Rec.709 light colour unchanged");
 }
 
@@ -209,10 +208,9 @@ void TestTextures(std::filesystem::path const& directory)
     auto sample = [](ImageTexture<Color3> const& texture) { return texture.sample(0.5f, 0.5f, Float3(0.0f)); };
 
     auto aces = prism::color::ColorManagement::Create({});
-    prism::color::SetActive(aces);
     ImageTexture<Color3> raw(file);
-    ImageTexture<Color3> converted(file, "srgb_texture");
-    ImageTexture<Color3> data(file, "raw");
+    ImageTexture<Color3> converted(file, "srgb_texture", aces);
+    ImageTexture<Color3> data(file, "raw", aces);
     Check(Near(sample(raw), texel, 1e-5f), "an untagged texture is not converted: " + Text(sample(raw)));
     Check(Near(sample(data), texel, 1e-5f), "a Raw texture is not converted");
     const Float3 expected = prism::color::Apply(kRec709ToAcescg, SrgbDecode(texel));
@@ -220,12 +218,12 @@ void TestTextures(std::filesystem::path const& directory)
           Text(sample(converted)) + " expected " + Text(expected));
     Check(raw.resource->preparedPath() != converted.resource->preparedPath(), "converted textures cache apart");
 
-    prism::color::SetActive(prism::color::ColorManagement::Create(Legacy()));
-    ImageTexture<Color3> legacy(file, "srgb_texture");
+    const auto legacyColor = prism::color::ColorManagement::Create(Legacy());
+    ImageTexture<Color3> legacy(file, "srgb_texture", legacyColor);
     Check(Near(sample(legacy), SrgbDecode(texel), 2e-4f), "an sRGB texture decodes into Rec.709: " + Text(sample(legacy)));
     Check(legacy.resource->preparedPath() != converted.resource->preparedPath(),
           "the working space is part of the texture cache key");
-    ImageTexture<Color3> legacyRaw(file, "lin_rec709");
+    ImageTexture<Color3> legacyRaw(file, "lin_rec709", legacyColor);
     Check(legacyRaw.resource->preparedPath() == raw.resource->preparedPath(),
           "a texture already in the working space shares the unconverted entry");
 }
@@ -250,11 +248,12 @@ void TestMaterialX(std::string const& libraries)
             "</surfacematerial></materialx>");
         return doc;
     };
+    std::shared_ptr<const prism::color::ColorManagement> color;
     auto generate = [&](std::string const& attribute) {
         auto generator = MDLGenerator::shared(libraries);
         auto doc = document(attribute);
         doc->importLibrary(generator->get_stdlib());
-        auto generated = generator->generate(doc, "Patch");
+        auto generated = generator->generate(doc, "Patch", *color);
         Check(generated.success, "MDL generation: " + generated.error_message);
         return generated.mdl_source;
     };
@@ -263,7 +262,7 @@ void TestMaterialX(std::string const& libraries)
         for (size_t at = text.find(word); at != std::string::npos; at = text.find(word, at + 1)) ++n;
         return n;
     };
-    prism::color::SetActive(prism::color::ColorManagement::Create({}));
+    color = prism::color::ColorManagement::Create({});
     const std::string srgb = generate(" colorspace=\"srgb_texture\"");
     Check(count(srgb, "srgb_texture_to_acescg") > 0, "ACEScg: an sRGB-tagged colour converts into ACEScg");
     const std::string acescg = generate(" colorspace=\"acescg\"");
@@ -275,7 +274,7 @@ void TestMaterialX(std::string const& libraries)
     const std::string rec709 = generate(" colorspace=\"lin_rec709\"");
     Check(count(rec709, "lin_rec709_to_acescg") > 0, "ACEScg: a lin_rec709-tagged colour converts");
 
-    prism::color::SetActive(prism::color::ColorManagement::Create(Legacy()));
+    color = prism::color::ColorManagement::Create(Legacy());
     const std::string legacy = generate(" colorspace=\"srgb_texture\"");
     Check(count(legacy, "srgb_texture_to_lin_rec709") > 0 && count(legacy, "acescg") == 0,
           "Rec.709: an sRGB-tagged colour converts into lin_rec709 only");

@@ -692,6 +692,10 @@ public:
         // workers, cache directory); its MaterialX paths are the
         // constructor's. Default: the environment's, as for the subdivision.
         prism::RendererOptions renderer = prism::RendererOptions::FromEnvironment();
+        // The colour management materials convert into and the cache
+        // directory (the renderer's). Without a colour management: one
+        // made from renderer.color.
+        prism::MaterialSettings materials;
     };
 
     static prism::mesh::SubdivisionSettings DefaultSubdivision()
@@ -872,7 +876,10 @@ private:
             prism::RendererOptions serviceOptions = m_options.renderer;
             serviceOptions.materials.materialxLibraries = mx_libraries_path;
             serviceOptions.materials.materialxMdlPath = mx_mdl_path;
-            prism::materials::MaterialService service(mdl_context, serviceOptions);
+            prism::MaterialSettings settings = m_options.materials;
+            if (!settings.color) settings.color = prism::color::ColorManagement::Create(serviceOptions.color);
+            if (settings.cacheDirectory.empty()) settings.cacheDirectory = serviceOptions.CacheRoot();
+            prism::materials::MaterialService service(mdl_context, serviceOptions, settings);
             // Loads the MaterialX and MDL libraries while bindings are read.
             service.Prewarm();
             std::cout << "[USDMesh] Scanning for MaterialX materials...\n";
@@ -896,7 +903,7 @@ private:
                     auto& file = files[{(error ? std::filesystem::path(source.mtlxFilePath) : canonical)
                                             .generic_string(), source.materialName}];
                     if (!file) file = std::make_shared<MDLMaterial>(source.mtlxFilePath, *mdl_context,
-                        mx_libraries_path, mx_mdl_path, source.materialName);
+                        mx_libraries_path, mx_mdl_path, settings, source.materialName);
                     material = file;
                 }
                 // As in the delegate: a material that failed to compile

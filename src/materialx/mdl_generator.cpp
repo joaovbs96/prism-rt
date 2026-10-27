@@ -229,7 +229,7 @@ bool FindColorSpans(const std::string& source,
 
 class MDLGenerator::Impl {
 public:
-    Impl(const std::string& mx_libraries_path)
+    Impl(const std::string& mx_libraries_path, prism::color::ColorManagement const* color)
         : m_generator(MaterialX::MdlShaderGenerator::create())
         , m_context(m_generator)
     {
@@ -244,7 +244,8 @@ public:
         m_stdlib = SharedStandardLibrary(mx_libraries_path);
         m_libraryDigest = SharedLibraryDigest(mx_libraries_path);
 
-        syncColorManagement();
+        // Ready for color (else for the first generation's).
+        if (color) syncColorManagement(*color);
         m_diskCache=std::make_unique<prism::materialx::GeneratedTemplateDiskCache>(
             prism::PersistentCacheRoot(),prism::GeneratedArtifactBudgetBytes());
 
@@ -268,8 +269,8 @@ public:
     // space, leaving scalar/vector data textures (roughness, metallic,
     // normals) and untagged colours as they are. Called with generate_mutex
     // held (or from the constructor), before each generation.
-    void syncColorManagement() {
-        const auto color=prism::color::Active();
+    void syncColorManagement(prism::color::ColorManagement const& colorManagement) {
+        const auto* color=&colorManagement;
         if(color->identity()==m_colorIdentity) return;
         auto color_management = MaterialX::DefaultColorManagementSystem::create(
             m_generator->getTarget());
@@ -557,8 +558,9 @@ private:
     std::unique_ptr<prism::materialx::GeneratedTemplateDiskCache> m_diskCache;
 };
 
-MDLGenerator::MDLGenerator(const std::string& mx_libraries_path)
-    : m_impl(std::make_unique<Impl>(mx_libraries_path))
+MDLGenerator::MDLGenerator(const std::string& mx_libraries_path,
+                           prism::color::ColorManagement const* color)
+    : m_impl(std::make_unique<Impl>(mx_libraries_path, color))
 {}
 
 MDLGenerator::~MDLGenerator() = default;
@@ -609,7 +611,7 @@ struct WorkerGenerators {
 }
 
 std::shared_ptr<MDLGenerator> MDLGenerator::workerLocal(
-    const std::string& mx_libraries_path) {
+    const std::string& mx_libraries_path, prism::color::ColorManagement const* color) {
     thread_local WorkerGenerators generators;
     auto& generator = generators.byPath[mx_libraries_path];
     if (!generator) {
@@ -623,12 +625,13 @@ std::shared_ptr<MDLGenerator> MDLGenerator::workerLocal(
             }
         }
         if (!generator)
-            generator = std::make_shared<MDLGenerator>(mx_libraries_path);
+            generator = std::make_shared<MDLGenerator>(mx_libraries_path, color);
     }
     return generator;
 }
 
-void MDLGenerator::reserveWorkers(const std::string& mx_libraries_path, size_t count) {
+void MDLGenerator::reserveWorkers(const std::string& mx_libraries_path, size_t count,
+                                  prism::color::ColorManagement const* color) {
     auto& idle = Idle();
     count = std::min(count, kIdleGeneratorLimit);
     for (size_t built = 0; built < count; ++built) {
@@ -637,22 +640,24 @@ void MDLGenerator::reserveWorkers(const std::string& mx_libraries_path, size_t c
             if (idle.byPath[mx_libraries_path].size() >= count) return;
         }
         // Constructed unlocked: the first one loads the standard library.
-        auto generator = std::make_shared<MDLGenerator>(mx_libraries_path);
+        auto generator = std::make_shared<MDLGenerator>(mx_libraries_path, color);
         std::lock_guard lock(idle.mutex);
         idle.byPath[mx_libraries_path].push_back(std::move(generator));
     }
 }
 
 GeneratedMDL MDLGenerator::generate(MaterialX::DocumentPtr doc,
-                                    const std::string& material_name) {
+                                    const std::string& material_name,
+                                    prism::color::ColorManagement const& color) {
     std::lock_guard<std::mutex> lock(m_impl->generate_mutex);
-    m_impl->syncColorManagement();
+    m_impl->syncColorManagement(color);
     return m_impl->generateCached(doc, material_name);
 }
 
-GeneratedMDL MDLGenerator::generate(MaterialX::OutputPtr output) {
+GeneratedMDL MDLGenerator::generate(MaterialX::OutputPtr output,
+                                    prism::color::ColorManagement const& color) {
     std::lock_guard<std::mutex> lock(m_impl->generate_mutex);
-    m_impl->syncColorManagement();
+    m_impl->syncColorManagement(color);
     std::string name = output->getName();
     return m_impl->generate_from_output(output, name);
 }

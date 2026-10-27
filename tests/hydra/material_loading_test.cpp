@@ -211,6 +211,13 @@ prism::RendererOptions ServiceOptions(const std::filesystem::path& libraries)
     return options;
 }
 
+// The colour management materials compile in (the default one) and the
+// cache directory, as the front ends hand them to the service.
+prism::MaterialSettings ServiceMaterials()
+{
+    return {prism::color::ColorManagement::Create({}), prism::RendererOptions::FromEnvironment().CacheRoot()};
+}
+
 // The service whose compile mode SetCompileMode switches (auto unless "class").
 MaterialService* gCompileModeService=nullptr;
 void SetCompileMode(const char* mode)
@@ -356,7 +363,7 @@ int PrewarmChild(const std::string& mode, const std::string& run)
         mdl::Context scoped;
         if (!scoped.is_valid()) return 3;
         {
-            MaterialService service(&scoped,ServiceOptions(libraries));
+            MaterialService service(&scoped, ServiceOptions(libraries), ServiceMaterials());
             service.Prewarm();
         }
         std::cout << "teardown finished\n";
@@ -364,7 +371,7 @@ int PrewarmChild(const std::string& mode, const std::string& run)
     }
     mdl::Context& context=SharedMdlContext();
     if (!context.is_valid()) return 3;
-    MaterialService service(&context,ServiceOptions(libraries));
+    MaterialService service(&context, ServiceOptions(libraries), ServiceMaterials());
     const auto batch=MakePrewarmBatch();
     if (mode=="prewarm") {
         std::vector<std::future<void>> calls;
@@ -372,7 +379,7 @@ int PrewarmChild(const std::string& mode, const std::string& run)
             calls.push_back(std::async(std::launch::async,[&] { service.Prewarm(); }));
         for (auto& call : calls) call.get();
         {
-            MaterialService other(&context,ServiceOptions(libraries));
+            MaterialService other(&context, ServiceOptions(libraries), ServiceMaterials());
             other.Prewarm();
         }
         service.WaitForPrewarm();
@@ -563,7 +570,7 @@ int main(int argc, char** argv)
     mdl::Context& context = SharedMdlContext();
     if (!context.is_valid()) return 3;
     const std::filesystem::path libraries(root);
-    MaterialService service(&context, ServiceOptions(libraries));
+    MaterialService service(&context, ServiceOptions(libraries), ServiceMaterials());
     gCompileModeService = &service;
     const SdfPath redPath("/Looks/M0"), bluePath("/Looks/M99");
     std::vector<HdContainerDataSourceHandle> sources;

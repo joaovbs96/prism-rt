@@ -6,9 +6,11 @@
 // need of it, to the loaders, services and devices. It becomes the public
 // prism::Renderer's implementation later (migration step 3).
 
+#include "material_settings.h"
 #include "renderer_options.h"
 
 #include <memory>
+#include <mutex>
 
 namespace prism {
 
@@ -20,8 +22,25 @@ public:
 
     RendererOptions const& options() const noexcept { return m_options; }
 
+    // The colour management everything this renderer loads converts into,
+    // created from options().color on first use. Scenes keep the one they
+    // were loaded with (SceneManager::colorManagement).
+    std::shared_ptr<const color::ColorManagement> colorManagement() const;
+    // Makes the colour management of `options` current, unless the current
+    // one was made from the same options, and returns it. What was loaded
+    // before keeps its colour management: callers reload it (the Hydra
+    // delegate rebuilds its scene). Throws std::runtime_error for unusable
+    // options and keeps the current one.
+    std::shared_ptr<const color::ColorManagement> setColor(color::Options const& options);
+
+    // The current colour management and the material options, for loaders
+    // and the material service.
+    MaterialSettings materialSettings() const;
+
 private:
     RendererOptions m_options;
+    mutable std::mutex m_mutex;
+    mutable std::shared_ptr<const color::ColorManagement> m_color;
 };
 
 } // namespace prism

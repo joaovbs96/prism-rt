@@ -30,7 +30,7 @@ void Load(mdl::Context& context, RTCDevice device, const char* path, uint64_t* n
     using namespace prism;
     using namespace prism::device;
     const uint64_t before = varying_emitters::Notes();
-    SceneManager scene(device);
+    SceneManager scene(device, prism::color::ColorManagement::Create({}));
     const char* libraries = std::getenv("PRISM_MATERIALX_LIBRARY_PATH");
     const std::string libraryPath = libraries ? libraries : "";
     USDMesh mesh(path, &context, libraryPath, libraryPath + "/mdl");

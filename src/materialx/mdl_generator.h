@@ -2,6 +2,7 @@
 
 #include <MaterialXCore/Document.h>
 #include <MaterialXCore/Node.h>
+#include "../color/color_management.h"
 #include <memory>
 #include <string>
 #include <vector>
@@ -28,7 +29,10 @@ struct GeneratedMDL {
 
 class MDLGenerator {
 public:
-    explicit MDLGenerator(const std::string& mx_libraries_path);
+    // `color`, when given, prepares the generator for that colour management
+    // (else the first generation does).
+    explicit MDLGenerator(const std::string& mx_libraries_path,
+                          prism::color::ColorManagement const* color = nullptr);
     ~MDLGenerator();
 
     // Process-wide generator for a libraries path, created on first use.
@@ -39,15 +43,22 @@ public:
     // One generator per worker avoids serializing GenContext while retaining
     // standard-library reuse for all jobs executed by that worker. It is taken
     // from a process-wide idle pool and returned when the thread exits, so
-    // short-lived batch threads do not each build one.
-    static std::shared_ptr<MDLGenerator> workerLocal(const std::string& mx_libraries_path);
+    // short-lived batch threads do not each build one. A new one is prepared
+    // for `color`.
+    static std::shared_ptr<MDLGenerator> workerLocal(const std::string& mx_libraries_path,
+                                                     prism::color::ColorManagement const* color = nullptr);
     // Fills the idle pool up to count generators (bounded), loading the
-    // standard library first if needed.
-    static void reserveWorkers(const std::string& mx_libraries_path, size_t count);
+    // standard library first if needed; new ones are prepared for `color`.
+    static void reserveWorkers(const std::string& mx_libraries_path, size_t count,
+                               prism::color::ColorManagement const* color = nullptr);
 
+    // Generates in `color`'s working space: tagged colours and textures
+    // decode into it (the generator's colour transforms).
     GeneratedMDL generate(MaterialX::DocumentPtr doc,
-                          const std::string& material_name);
-    GeneratedMDL generate(MaterialX::OutputPtr output);
+                          const std::string& material_name,
+                          prism::color::ColorManagement const& color);
+    GeneratedMDL generate(MaterialX::OutputPtr output,
+                          prism::color::ColorManagement const& color);
 
     // Returns the stdlib document loaded by this generator.
     // Pass this to DocumentLoader so both share the same stdlib instance.

@@ -395,6 +395,7 @@ GpuSceneData BuildGpuScene(SceneManager& scene)
     data.rouletteDepth = scene.rr_min_depth;
     data.environmentMis = scene.environmentSampling;
     data.filteredTextures = scene.textureFiltering == prism::TextureFiltering::Filtered;
+    data.luminanceWeights = scene.color().luminanceWeights();
 
     // Deterministic order: by placement id.
     std::vector<int> placements;

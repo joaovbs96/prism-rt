@@ -2484,7 +2484,7 @@ void _SetDomeEnvironment(HdSceneIndexBaseRefPtr const &scene,
     const float exposure = _ContainerValue(light, HdLightTokens->exposure, 0.0f);
     const float scale = intensity * std::exp2(exposure);
     // UsdLux colours are linear Rec.709; the texture converts on preparation.
-    const Color3 multiplier = prism::color::Active()->FromRec709(Color3(color[0], color[1], color[2])) * scale;
+    const Color3 multiplier = snapshot->scene->color().FromRec709(Color3(color[0], color[1], color[2])) * scale;
     const SdfAssetPath asset = _ContainerValue(
         light, HdLightTokens->textureFile, SdfAssetPath());
     std::string resolved = asset.GetResolvedPath();
@@ -2493,7 +2493,8 @@ void _SetDomeEnvironment(HdSceneIndexBaseRefPtr const &scene,
     try {
         if (!resolved.empty() && std::filesystem::exists(resolved)) {
             snapshot->environmentTexture =
-                std::make_unique<ImageTexture<Color3>>(resolved, prism::color::kLightColorSpace);
+                std::make_unique<ImageTexture<Color3>>(resolved, prism::color::kLightColorSpace,
+                                                       snapshot->scene->colorManagement);
         } else {
             snapshot->environmentTexture =
                 std::make_unique<ColorTexture>(Color3(1.0f));
@@ -2509,7 +2510,8 @@ void _SetDomeEnvironment(HdSceneIndexBaseRefPtr const &scene,
         std::shared_ptr<Texture<Color3>> texture = snapshot->prototypePool->whiteEnvironmentTexture;
         if (auto* image = dynamic_cast<ImageTexture<Color3>*>(snapshot->environmentTexture.get()))
             texture = std::make_shared<ImageTexture<Color3>>(*image);
-        auto local = snapshot->prototypePool->environmentCache.Get(std::move(texture), multiplier);
+        auto local = snapshot->prototypePool->environmentCache.Get(std::move(texture), multiplier,
+                                                                   snapshot->scene->color());
         auto dome = std::make_unique<CachedTransformedEnvironment>(std::move(local), linear);
         dome->diffuseFactor = _ContainerValue(light, HdLightTokens->diffuse, 1.0f);
         dome->specularFactor = _ContainerValue(light, HdLightTokens->specular, 1.0f);
@@ -2522,7 +2524,8 @@ void _SetDomeEnvironment(HdSceneIndexBaseRefPtr const &scene,
             snapshot->domeEnvironments.push_back(std::move(dome));
             std::vector<const Environment *> parts;
             for (auto const &part : snapshot->domeEnvironments) parts.push_back(part.get());
-            snapshot->environment = std::make_unique<CompositeEnvironment>(std::move(parts));
+            snapshot->environment = std::make_unique<CompositeEnvironment>(std::move(parts),
+                                                                           snapshot->scene->color());
         }
         snapshot->scene->environment = snapshot->environment.get();
     } catch (std::exception const &e) {
@@ -2635,7 +2638,7 @@ void _AddAnalyticLight(HdSceneIndexBaseRefPtr const &scene,
     std::array<double, 16> matrix{};
     for (int row = 0; row < 4; ++row)
         for (int column = 0; column < 4; ++column) matrix[row * 4 + column] = world[row][column];
-    prism::SceneLight result = prism::MakeSceneLight(params, matrix);
+    prism::SceneLight result = prism::MakeSceneLight(params, matrix, snapshot->scene->color());
     // Light linking (HdsiLightLinkingSceneIndex): a category per non-trivial
     // collection, at most 32 of each kind.
     auto categoryBit = [&](TfToken const &category, auto &bits) -> uint32_t {
@@ -2662,7 +2665,8 @@ void _AddAnalyticLight(HdSceneIndexBaseRefPtr const &scene,
             resolved = ArGetResolver().Resolve(asset.GetAssetPath()).GetPathString();
         if (!resolved.empty() && std::filesystem::exists(resolved)) {
             try {
-                result.texture = std::make_shared<ImageTexture<Color3>>(resolved, prism::color::kLightColorSpace);
+                result.texture = std::make_shared<ImageTexture<Color3>>(resolved, prism::color::kLightColorSpace,
+                                                                        snapshot->scene->colorManagement);
             } catch (std::exception const &e) {
                 TF_WARN("PrismRT: failed to load light texture '%s': %s", resolved.c_str(), e.what());
             }
@@ -3154,6 +3158,7 @@ void _ApplyInstancePrimvars(HdSceneIndexBaseRefPtr const &index, Snapshot *snaps
 std::shared_ptr<Snapshot> _BuildSnapshot(HdSceneIndexBaseRefPtr const &scene,
                                          MaterialService *materials,
                                          RenderSettings const &settings,
+                                         std::shared_ptr<const prism::color::ColorManagement> const &color,
                                          TfTokenVector const &renderTags,
                                          RTCDevice sharedDevice,
                                          std::shared_ptr<PrototypePool> const& pool = {},
@@ -3177,7 +3182,7 @@ std::shared_ptr<Snapshot> _BuildSnapshot(HdSceneIndexBaseRefPtr const &scene,
         result->materialsSeeded = true;
     }
     if (!result->device) return {};
-    result->scene = std::make_unique<SceneManager>(result->device);
+    result->scene = std::make_unique<SceneManager>(result->device, color);
     ++result->prototypePool->topLevelSceneBuilds;
     result->scene->max_depth = settings.maxDepth;
     result->scene->rr_min_depth = settings.rouletteDepth;
@@ -4642,7 +4647,7 @@ public:
             mdl::Context &context = SharedMdlContext();
             if (context.is_valid()) {
                 materialService = std::make_unique<MaterialService>(
-                    &context, renderer->options(),
+                    &context, renderer->options(), renderer->materialSettings(),
                     reinterpret_cast<uint64_t>(sceneIndex.operator->()));
                 // Overlaps scene capture; the build job's services share its
                 // key, so their first Prefetch waits for it instead.
@@ -4901,7 +4906,7 @@ public:
         buildIsSpare = true;
         buildFuture = std::async(std::launch::async,
             [generation, retained = jobScene, tags = jobRenderTags,
-             settings = jobSettings, resolverContext = jobResolverContext,
+             settings = jobSettings, color = jobColor, resolverContext = jobResolverContext,
              device = device, prototypePool = prototypePool,
              canonicalSeed = canonicalPrimIds,
              cancel = std::move(cancel), seed = std::move(seed)]() {
@@ -4914,7 +4919,7 @@ public:
                 try {
                     ArResolverContextBinder binder(resolverContext);
                     result.spareSnapshot = _BuildSnapshot(
-                        retained, nullptr, settings, tags, device,
+                        retained, nullptr, settings, color, tags, device,
                         prototypePool, [cancel] {
                             return cancel->load(std::memory_order_relaxed);
                         }, seed ? &*seed : nullptr);
@@ -5167,6 +5172,7 @@ public:
     HdSceneIndexBaseRefPtr jobScene;
     TfTokenVector jobRenderTags;
     RenderSettings jobSettings;
+    std::shared_ptr<const prism::color::ColorManagement> jobColor;
     ArResolverContext jobResolverContext;
     bool buildIsSpare = false;
     std::chrono::steady_clock::time_point constructionTime =
@@ -5224,10 +5230,9 @@ public:
 SceneBridge::SceneBridge(HdSceneIndexBaseRefPtr sceneIndex, HdRenderThread *thread)
     : _impl(std::make_unique<Impl>(std::move(sceneIndex), thread))
 {
-    // A new delegate starts from the default colour management, whatever an
-    // earlier one in this process selected.
+    // The delegate's colour management (its renderer's): the default settings'.
     try {
-        prism::color::Activate(_impl->ColorOptions(_impl->settings.color));
+        _impl->renderer->setColor(_impl->ColorOptions(_impl->settings.color));
     } catch (std::exception const &error) {
         TF_WARN("PrismRT: %s", error.what());
     }
@@ -5379,12 +5384,12 @@ void SceneBridge::SetSettings(RenderSettings const &requested)
     }
     RenderSettings settings = requested;
     {
-        // Colour management is process-wide (prism::color::Active): an
-        // unusable config, working space or view keeps the previous one.
+        // The renderer's colour management: an unusable config, working space
+        // or view keeps the previous one.
         RenderSettings const previous = GetSettings();
         if (settings.color != previous.color) {
             try {
-                prism::color::Activate(_impl->ColorOptions(settings.color));
+                _impl->renderer->setColor(_impl->ColorOptions(settings.color));
             } catch (std::exception const &error) {
                 TF_WARN("PrismRT: %s; retaining the previous colour management", error.what());
                 settings.color = previous.color;
@@ -6080,6 +6085,10 @@ bool SceneBridge::Prepare(CameraState const &camera,
             HdSceneIndexBaseRefPtr retained = _impl->captureScene;
             TfTokenVector tags = _impl->captureRenderTags;
             RenderSettings jobSettings = _impl->settings;
+            // The colour management the snapshot is built in (the renderer's
+            // current one, which SetSettings changes).
+            const prism::MaterialSettings jobMaterials = _impl->renderer->materialSettings();
+            const auto jobColor = jobMaterials.color;
             unsigned int jobDirtyKinds = _impl->captureDirtyKinds;
             auto jobDirtyPaths = _impl->captureDirtyPaths;
             decltype(jobDirtyPaths) jobPlacementPaths, jobPrototypePaths, jobMaterialPaths;
@@ -6100,6 +6109,8 @@ bool SceneBridge::Prepare(CameraState const &camera,
                 _impl->snapshot ? _impl->snapshot->picking : nullptr;
             const bool pinnedBankFallback = bank && bank.use_count() > 1;
             if (pinnedBankFallback) bank.reset();
+            // A bank loaded in another working space cannot be updated.
+            if (bank && bank->scene && bank->scene->colorManagement != jobColor) bank.reset();
             const uint64_t bankGeneration = _impl->inactiveGeneration;
             {
                 // Even without a bank, each kind must keep its own paths.
@@ -6180,6 +6191,7 @@ bool SceneBridge::Prepare(CameraState const &camera,
             _impl->jobScene = retained;
             _impl->jobRenderTags = tags;
             _impl->jobSettings = jobSettings;
+            _impl->jobColor = jobColor;
             _impl->jobResolverContext = resolverContext;
             _impl->buildIsSpare = false;
             _impl->buildLightingOnly =
@@ -6200,7 +6212,7 @@ bool SceneBridge::Prepare(CameraState const &camera,
                  publishedPicking = std::move(publishedPicking),
                  prototypePool = std::move(prototypePool),
                  cancel = std::move(cancel),
-                 renderer = _impl->renderer]() mutable {
+                 renderer = _impl->renderer, jobMaterials, jobColor]() mutable {
                     SceneBridge::Impl::BuildResult result;
                     result.generation = generation;
                     result.pinnedBankFallback = pinnedBankFallback;
@@ -6216,7 +6228,7 @@ bool SceneBridge::Prepare(CameraState const &camera,
                         if (context.is_valid()) {
                             result.materialService =
                                 std::make_unique<MaterialService>(
-                                    &context, renderer->options(), associationScope);
+                                    &context, renderer->options(), jobMaterials, associationScope);
                             result.materialService->SetResourceRevision(
                                 static_cast<uint64_t>(
                                     jobSettings.resourceRevision));
@@ -6301,7 +6313,7 @@ bool SceneBridge::Prepare(CameraState const &camera,
                                         return cancel->load(std::memory_order_relaxed);
                                     })) {
                                     if (cancel->load(std::memory_order_relaxed)) return result;
-                                    bank = _BuildSnapshot(retained,result.materialService.get(),jobSettings,tags,
+                                    bank = _BuildSnapshot(retained,result.materialService.get(),jobSettings,jobColor,tags,
                                         device,prototypePool,[cancel] { return cancel->load(std::memory_order_relaxed); });
                                     if (!bank) return result;
                                     batchNeedsFullSnapshot = true; placementRebuiltAll = true;
@@ -6333,7 +6345,7 @@ bool SceneBridge::Prepare(CameraState const &camera,
                                     tags, &handledBatchPaths, true)) {
                                 bank = _BuildSnapshot(
                                     retained, result.materialService.get(),
-                                    jobSettings, tags, device, prototypePool,
+                                    jobSettings, jobColor, tags, device, prototypePool,
                                     [cancel] {
                                         return cancel->load(
                                             std::memory_order_relaxed);
@@ -6357,7 +6369,7 @@ bool SceneBridge::Prepare(CameraState const &camera,
                                     retained, jobPrototypePaths, result.materialService.get(),
                                     bank.get(), tags, &displacedStorage)) {
                                     bank = _BuildSnapshot(retained, result.materialService.get(),
-                                        jobSettings, tags, device, prototypePool, [cancel] {
+                                        jobSettings, jobColor, tags, device, prototypePool, [cancel] {
                                             return cancel->load(std::memory_order_relaxed);
                                         });
                                     if (!bank) return result;
@@ -6396,7 +6408,7 @@ bool SceneBridge::Prepare(CameraState const &camera,
                                 placementNeedsFullSnapshot) {
                                 bank = _BuildSnapshot(
                                     retained, result.materialService.get(),
-                                    jobSettings, tags, device, prototypePool,
+                                    jobSettings, jobColor, tags, device, prototypePool,
                                     [cancel] {
                                         return cancel->load(
                                             std::memory_order_relaxed);
@@ -6478,7 +6490,7 @@ bool SceneBridge::Prepare(CameraState const &camera,
                         } else {
                             result.snapshot = _BuildSnapshot(
                                 retained, result.materialService.get(),
-                                jobSettings, tags, device, prototypePool,
+                                jobSettings, jobColor, tags, device, prototypePool,
                                 [cancel] {
                                     return cancel->load(
                                         std::memory_order_relaxed);

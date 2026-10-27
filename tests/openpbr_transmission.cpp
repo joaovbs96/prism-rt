@@ -6,6 +6,7 @@
 //   with no medium, from the front and the back.
 #include "../src/mdl/context.h"
 #include "../src/mdl_material.h"
+#include "../src/renderer/renderer_options.h"
 
 #include <cmath>
 #include <cstdlib>
@@ -110,7 +111,7 @@ int main()
         for (auto const& test : cases) {
             const auto path = dir / (std::string(test.name) + ".mtlx");
             { std::ofstream out(path); out << Document(test.inputs); }
-            MDLMaterial material(path.string(), context, libraries, mdlPath);
+            MDLMaterial material(path.string(), context, libraries, mdlPath, prism::MaterialSettings{prism::color::ColorManagement::Create({}), prism::RendererOptions::FromEnvironment().CacheRoot()});
             require(material.is_valid(), std::string("compile failed: ") + test.name);
             for (bool front : {true, false}) {
                 const std::string where = std::string(test.name) + (front ? " front" : " back");

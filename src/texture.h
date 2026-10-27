@@ -39,9 +39,10 @@ class Texture {
         }
         virtual void gammaCorrect(float gamma) {}
         // Colour textures: their values are in `colorSpace` (an OCIO or
-        // MaterialX name); convert them into the working space. Call at most
-        // once, and not on data (normals, roughness).
-        virtual void convertToWorkingSpace(std::string const& colorSpace) {}
+        // MaterialX name); convert them into `color`'s working space. Call at
+        // most once, and not on data (normals, roughness).
+        virtual void convertToWorkingSpace(std::string const& colorSpace,
+                                           std::shared_ptr<const prism::color::ColorManagement> const& color) {}
 };
 
 template <TextureType T = Float3>
@@ -57,9 +58,9 @@ class ValueTexture : public Texture<T> {
             return value;
         }
 
-        void convertToWorkingSpace(std::string const& colorSpace) override {
+        void convertToWorkingSpace(std::string const& colorSpace,
+                                   std::shared_ptr<const prism::color::ColorManagement> const& color) override {
             if constexpr (!std::same_as<T, float>) {
-                auto color = prism::color::Active();
                 if (!color->NeedsConversion(colorSpace)) return;
                 float rgb[3] = {value[0], value[1], value[2]};
                 color->ToWorkingSpace(colorSpace, rgb, 1, 3);
@@ -104,26 +105,28 @@ class ImageTexture : public Texture<T> {
             publishResource();
         }
 
-        // A colour image whose texels are in `colorSpace`, prepared in the
-        // working space (TexturePrepareOptions::workingSpace).
-        ImageTexture(const std::filesystem::path &file_path, std::string const &colorSpace)
+        // A colour image whose texels are in `colorSpace`, prepared in
+        // `color`'s working space (TexturePrepareOptions::workingSpace).
+        ImageTexture(const std::filesystem::path &file_path, std::string const &colorSpace,
+                     std::shared_ptr<const prism::color::ColorManagement> const& color)
             : service(prism::TextureService::Acquire()), source(file_path) {
             channel_n = sizeof(T) / sizeof(float);
             prepareOptions.channelCount = channel_n;
-            setColorSpace(colorSpace);
+            setColorSpace(colorSpace, color);
             publishResource();
         }
 
-        void convertToWorkingSpace(std::string const& colorSpace) override {
+        void convertToWorkingSpace(std::string const& colorSpace,
+                                   std::shared_ptr<const prism::color::ColorManagement> const& color) override {
             if (!resource) {
                 // Mutable buffers are published by publishEdits.
                 std::vector<float> pixels(size_t(width) * height * channel_n);
                 buffer.get_pixels(ROI(0, width, 0, height, 0, 1, 0, channel_n), TypeDesc::FLOAT, pixels.data());
-                prism::color::Active()->ToWorkingSpace(colorSpace, pixels.data(), size_t(width) * height, channel_n);
+                color->ToWorkingSpace(colorSpace, pixels.data(), size_t(width) * height, channel_n);
                 buffer.set_pixels(ROI(0, width, 0, height, 0, 1, 0, channel_n), TypeDesc::FLOAT, pixels.data());
                 return;
             }
-            if (setColorSpace(colorSpace)) publishResource();
+            if (setColorSpace(colorSpace, color)) publishResource();
         }
 
         // Explicit boundary for callers editing the public ImageBuf (fixtures
@@ -237,9 +240,9 @@ class ImageTexture : public Texture<T> {
             useResource();
         }
         // Whether texels in colorSpace need converting; sets the options.
-        bool setColorSpace(std::string const &colorSpace) {
+        bool setColorSpace(std::string const &colorSpace,
+                           std::shared_ptr<const prism::color::ColorManagement> const& color) {
             if constexpr (std::same_as<T, float>) return false;
-            auto color = prism::color::Active();
             if (!color->NeedsConversion(colorSpace)) {
                 if (!colorSpace.empty() && color->Resolve(colorSpace).empty())
                     throw std::runtime_error("Unknown texture colour space '" + colorSpace + "': " + source.string());
@@ -247,6 +250,7 @@ class ImageTexture : public Texture<T> {
             }
             prepareOptions.colorSpace = colorSpace;
             prepareOptions.workingSpace = color->identity();
+            prepareOptions.colorManagement = color;
             return true;
         }
         T sampleFiltered(float u, float v, const prism::TextureFootprint& footprint) const {
@@ -292,9 +296,10 @@ class ImageMixTexture : public Texture<T> {
         }
         // Image and factor convert separately (exact when either is grey);
         // the GPU devices multiply the converted pair as well.
-        void convertToWorkingSpace(std::string const& colorSpace) override {
-            _image->convertToWorkingSpace(colorSpace);
-            _value->convertToWorkingSpace(colorSpace);
+        void convertToWorkingSpace(std::string const& colorSpace,
+                                   std::shared_ptr<const prism::color::ColorManagement> const& color) override {
+            _image->convertToWorkingSpace(colorSpace, color);
+            _value->convertToWorkingSpace(colorSpace, color);
         }
 
     ImageTexture<T>* _image;

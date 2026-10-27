@@ -401,12 +401,14 @@ public:
         static auto* value = new CompatibleTemplateRegistry;
         return *value;
     }
+    // materialIdentity (MaterialSettings::Identity): compiled code holds the
+    // working space's colour transforms.
     bool find(mdl::Context* context, const std::string& libraries,
               const std::string& mdlPath,
               const CapturedMaterialGraph& structure,
+              const std::string& materialIdentity,
               CompatibleMaterialTemplate* result) const {
-        // Compiled code holds the working space's colour transforms.
-        const std::string color=prism::color::Active()->identity();
+        const std::string& color=materialIdentity;
         std::lock_guard lock(m_mutex);
         for (auto it = m_entries.rbegin(); it != m_entries.rend(); ++it) {
             auto prototype=it->prototype.lock();
@@ -440,9 +442,9 @@ public:
                     [&](const auto& parameter) { return parameter.name==binding.uniform; });
             });
     }
-    void publish(CompatibleMaterialTemplate entry) {
+    void publish(CompatibleMaterialTemplate entry, const std::string& materialIdentity) {
         if (!IsBindable(entry)) return;
-        const std::string color=prism::color::Active()->identity();
+        const std::string& color=materialIdentity;
         std::lock_guard lock(m_mutex);
         std::erase_if(m_entries, [&](const auto& old) {
             return old.context == entry.context && old.libraries == entry.libraries && old.color == color &&

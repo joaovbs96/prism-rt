@@ -43,11 +43,17 @@ public:
         bool flipOrientation = false;
         bool mirrored = false;
     };
-    SceneManager(RTCDevice &device_)
+    // `color`: the colour management the scene was loaded with (its lights,
+    // materials and textures are in its working space); devices read it.
+    SceneManager(RTCDevice &device_, std::shared_ptr<const prism::color::ColorManagement> color)
+        : colorManagement(std::move(color))
     {
+        if (!colorManagement) throw std::invalid_argument("SceneManager needs a colour management");
         device = &device_;
         scene = rtcNewScene(*device);
     }
+
+    prism::color::ColorManagement const& color() const { return *colorManagement; }
 
     // USD imports can contain triangle meshes and analytic sphere placements.
     // The importer owns sphere prototypes and their material lifetimes.
@@ -370,6 +376,7 @@ public:
         rtcCommitScene(scene);
     }
 
+    std::shared_ptr<const prism::color::ColorManagement> colorManagement;
     RTCDevice *device;
     RTCScene scene;
     std::unordered_map<int, Geometry *> geometry;

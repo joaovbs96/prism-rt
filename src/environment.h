@@ -65,9 +65,10 @@ class Environment {
         return s;
     }
 
-    // The integral of the radiance's luminance over the sphere (light
-    // selection). Estimated from a fixed set of directions by default.
-    virtual float integratedLuminance() const {
+    // The integral of the radiance's luminance in color's working space (the
+    // scene's) over the sphere (light selection). Estimated from a fixed set of
+    // directions by default.
+    virtual float integratedLuminance(prism::color::ColorManagement const& color) const {
         constexpr int count = 256;
         double sum = 0.0;
         for (int i = 0; i < count; ++i) {
@@ -76,7 +77,7 @@ class Environment {
             const float r = std::sqrt(std::max(0.0f, 1.0f - y * y));
             const float phi = float(i) * 2.39996322972865332f;
             const Color3 c = radiance(Float3(r * std::cos(phi), y, r * std::sin(phi)));
-            const float lum = prism::color::Active()->Luminance(c);
+            const float lum = color.Luminance(c);
             if (std::isfinite(lum) && lum > 0.0f) sum += lum;
         }
         return float(sum / count * 4.0 * 3.14159265358979323846);
@@ -139,7 +140,10 @@ inline Float3 LatLongDirection(float s, float sinTheta, float cosTheta)
 
 class EnvironmentMap : public Environment {
     public:
-    EnvironmentMap(Texture<Color3>* texture, Color3 multiplier) : texture(texture), multiplier(multiplier) { buildDistribution(); }
+    // Its sampling distribution weighs texels by color's luminance (the
+    // scene's working space).
+    EnvironmentMap(Texture<Color3>* texture, Color3 multiplier, prism::color::ColorManagement const& color)
+        : texture(texture), multiplier(multiplier) { buildDistribution(color); }
 
     Color3 sample(const RayHit& ray_hit) override {
         return radiance(ray_hit.d);
@@ -248,7 +252,7 @@ class EnvironmentMap : public Environment {
         return texelProbability[static_cast<size_t>(y) * width + x] / texelSolidAngle(y);
     }
 
-    void buildDistribution() {
+    void buildDistribution(prism::color::ColorManagement const& color) {
         texelProbability.clear(); probability.clear(); alias.clear();
         auto* image = dynamic_cast<ImageTexture<Color3>*>(texture);
         if (!image || image->width <= 0 || image->height <= 0) return;
@@ -256,7 +260,6 @@ class EnvironmentMap : public Environment {
         const size_t count = static_cast<size_t>(width) * height;
         std::vector<float> weights(count); double total = 0.0;
         std::vector<float> row(static_cast<size_t>(width) * 3);
-        const auto& color = *prism::color::Active();
         for (int y = 0; y < height; ++y) {
             if (!image->readRow(y, row.data(), 3))
                 throw std::runtime_error("Cannot read environment sampling distribution");
@@ -286,8 +289,8 @@ class EnvironmentMap : public Environment {
         for(size_t i:over){probability[i]=1;alias[i]=i;} for(size_t i:under){probability[i]=1;alias[i]=i;}
     }
 
-    float integratedLuminance() const override {
-        return luminanceIntegral > 0.0f ? luminanceIntegral : Environment::integratedLuminance();
+    float integratedLuminance(prism::color::ColorManagement const& color) const override {
+        return luminanceIntegral > 0.0f ? luminanceIntegral : Environment::integratedLuminance(color);
     }
 
     Texture<Color3>* texture;
@@ -310,8 +313,8 @@ private:
 class TransformedEnvironmentMap : public EnvironmentMap {
 public:
     TransformedEnvironmentMap(Texture<Color3>* texture, Color3 multiplier,
-        std::array<float, 9> worldToEnvironment)
-        : EnvironmentMap(texture, multiplier), m(worldToEnvironment) { invert(); }
+        std::array<float, 9> worldToEnvironment, prism::color::ColorManagement const& color)
+        : EnvironmentMap(texture, multiplier, color), m(worldToEnvironment) { invert(); }
 
     // Read-only views for render devices that mirror the environment.
     const std::array<float, 9>& worldToEnvironment() const { return m; }
@@ -414,12 +417,13 @@ class CylindricalEnvironmentMap : public Environment {
 // density is the mixture of theirs.
 class CompositeEnvironment : public Environment {
 public:
-    explicit CompositeEnvironment(std::vector<const Environment*> environments)
+    // Selection weighs the parts by their luminance in color's working space.
+    CompositeEnvironment(std::vector<const Environment*> environments, prism::color::ColorManagement const& color)
         : parts(std::move(environments)) {
         double total = 0.0;
         std::vector<double> power(parts.size());
         for (size_t i = 0; i < parts.size(); ++i) {
-            const float p = parts[i]->integratedLuminance();
+            const float p = parts[i]->integratedLuminance(color);
             power[i] = std::isfinite(p) && p > 0.0f ? p : 0.0;
             total += power[i];
         }
@@ -469,9 +473,9 @@ public:
             if (weights[i] > 0.0f) pdf += weights[i] * parts[i]->directionPdf(direction);
         return pdf;
     }
-    float integratedLuminance() const override {
+    float integratedLuminance(prism::color::ColorManagement const& color) const override {
         float sum = 0.0f;
-        for (auto const* part : parts) sum += part->integratedLuminance();
+        for (auto const* part : parts) sum += part->integratedLuminance(color);
         return sum;
     }
 

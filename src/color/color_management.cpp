@@ -303,34 +303,4 @@ void ColorManagement::ApplyView(float *pixels, size_t count, int channels) const
     });
 }
 
-namespace {
-std::mutex gActiveMutex;
-std::shared_ptr<const ColorManagement> gActive;
-} // namespace
-
-std::shared_ptr<const ColorManagement> Active()
-{
-    std::lock_guard lock(gActiveMutex);
-    if (!gActive) gActive = ColorManagement::Create({});
-    return gActive;
-}
-
-void SetActive(std::shared_ptr<const ColorManagement> colorManagement)
-{
-    std::lock_guard lock(gActiveMutex);
-    gActive = std::move(colorManagement);
-}
-
-std::shared_ptr<const ColorManagement> Activate(Options const &options)
-{
-    {
-        std::lock_guard lock(gActiveMutex);
-        if (gActive && gActive->requested() == options) return gActive;
-    }
-    auto created = ColorManagement::Create(options);
-    std::lock_guard lock(gActiveMutex);
-    gActive = created;
-    return gActive;
-}
-
 } // namespace prism::color

@@ -10,6 +10,7 @@
 #include <pxr/usd/sdf/path.h>
 #include <pxr/imaging/hd/dataSourceTypeDefs.h>
 
+#include "../renderer/material_settings.h"
 #include "../renderer/renderer_options.h"
 
 class Material;
@@ -78,9 +79,11 @@ public:
     };
     // The MaterialX library and MDL paths, the cache directory, the compile
     // policy and the worker counts come from `options` (the renderer's;
-    // an empty MDL path is <libraries>/mdl).
+    // an empty MDL path is <libraries>/mdl); `materials` holds the colour
+    // management every material compiles in (the renderer's current one).
     MaterialService(mdl::Context* context,
                     prism::RendererOptions const& options,
+                    prism::MaterialSettings materials,
                     uint64_t associationScope = 0);
     ~MaterialService();
 
