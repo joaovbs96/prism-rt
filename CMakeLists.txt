@@ -772,6 +772,12 @@ if(PRISM_BUILD_HYDRA)
         add_test(NAME prism_dielectric_albedo_test COMMAND prism_dielectric_albedo_test)
         set_tests_properties(prism_dielectric_albedo_test PROPERTIES
             ENVIRONMENT "${_prism_test_environment}" SKIP_RETURN_CODE 77)
+        # EON (energy-compensated Oren-Nayar) albedo per channel, and its white furnace.
+        add_executable(prism_eon_albedo_test tests/eon_albedo.cpp)
+        target_link_libraries(prism_eon_albedo_test PRIVATE PrismRT::core)
+        add_test(NAME prism_eon_albedo_test COMMAND prism_eon_albedo_test)
+        set_tests_properties(prism_eon_albedo_test PROPERTIES
+            ENVIRONMENT "${_prism_test_environment}" SKIP_RETURN_CODE 77)
         # Repaired dielectrics keep the library's class parameters and code size (CPU, no device).
         add_executable(prism_dielectric_program_size_test tests/dielectric_program_size.cpp)
         target_link_libraries(prism_dielectric_program_size_test PRIVATE PrismRT::core)
