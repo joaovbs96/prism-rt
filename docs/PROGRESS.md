@@ -2,6 +2,10 @@
 
 Phase reports, newest first. Detailed reports live in `local/reports/` (git-ignored).
 
+## 2026-10-28 — SDK steps 1a–1e: per-renderer state
+- `RendererContext` with `RendererOptions::FromEnvironment()` (only the CLI and Hydra read the API-level env vars); colour management, SSS fallback, binding purposes, logger, progress and the varying-emission note belong to the renderer; process runtime for the cache root and budgets (first renderer wins); texture services per option set; Vulkan stack-size entry point per device.
+- Fixed: compiled-material, early-association and template cache keys lacked the working space and SSS fallback (`prism_material_identity_test`).
+- Images bit-identical at every step (8 CPU scenes, 1 Vulkan); load times ~1.00 (teapot cold cache 1.35, within its 12–25 s run-to-run swing; unverified). Metal unbuilt (checklist in `docs/gpu_devices.md`). 471/471 tests on merged `main`. Report: `local/reports/sdk_step1.md`.
 ## 2026-10-27 — Typhoon suite fixes: dome orientation, triplanarprojection, EON, declarations
 - Domes follow UsdLux's lat-long orientation (longitude 0 = +Z at the image's centre); PrismRT was a quarter turn off (`usdlux/dome` FLIP 0.883 -> 0.014). Lookups and sampling, CPU and GPU, every dome source; textured-dome images change. Rect light textures now read upright, as UsdLux and Typhoon have them.
 - triplanarprojection with tagged files crashed both loaders (MaterialX 1.39.5 use after free with several output colour transforms, fixed upstream since): one transform kept in `DocumentLoader`; asset inputs other than `file` are now materialized.
