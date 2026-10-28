@@ -674,6 +674,9 @@ int main(int argc, char **argv)
     // `adaptive-publication cpu|vulkan` runs only that check (one CTest each).
     if (argc == 3 && std::string(argv[1]) == "adaptive-publication")
         return RunAdaptivePublicationTests(argv[2]);
+    // `progress-status` runs only the progress statistics check.
+    if (argc == 2 && std::string(argv[1]) == "progress-status")
+        return RunProgressStatusTests();
     if (RunAuthoredSettingsTests() != 0) return 1;
     if (RunB2DoublePrimvarIntegrationTests() != 0) return 1;
     if (RunB3FallbackOpacityIntegrationTests() != 0) return 1;

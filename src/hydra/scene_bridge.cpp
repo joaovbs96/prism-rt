@@ -3216,7 +3216,13 @@ std::shared_ptr<Snapshot> _BuildSnapshot(HdSceneIndexBaseRefPtr const &scene,
     } joinMeshJob{meshJob};
     MeshPreparation preparation;
     const auto traversalStart = std::chrono::steady_clock::now();
-    auto prepareMeshes = [&, resolverContext = ArGetResolver().GetCurrentContext()] {
+    // The task runs on whichever TBB thread picks it up, and the progress
+    // model and logger are bound per thread: carry the build thread's over.
+    auto prepareMeshes = [&, resolverContext = ArGetResolver().GetCurrentContext(),
+                          progressModel = prism::Progress::Current(),
+                          logger = &prism::logging::Current()] {
+        prism::progress::Bind progressBinding(progressModel);
+        prism::logging::Bind logBinding(logger);
         ArResolverContextBinder binder(resolverContext);
         prism::load_profile::Scope meshProfile("snapshot.meshes");
         std::function<bool()> awaitMaterials;

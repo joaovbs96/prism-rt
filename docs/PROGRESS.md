@@ -2,6 +2,10 @@
 
 Phase reports, newest first. Detailed reports live in `local/reports/` (git-ignored).
 
+## 2026-10-28 - Fix: loading counters missed by the mesh task
+- `prism_hydra_scene_bridge_test` failed about 1 run in 5-10 with "Mesh conversion counters did not complete": the snapshot build ran mesh preparation as a `tbb::task_group` task, and the progress model and logger are bound per thread. When a TBB worker (not the build thread) took the task, `Progress::Current()` was null there: `prismMeshesTotal`/`prismMeshesDone` stayed 0 and the subdivision-budget warning went to the process logger. The task now binds the build thread's progress model and logger.
+- New CTest `prism_hydra_progress_status` (`prism_hydra_scene_bridge_test progress-status`) runs the progress check alone, in seconds. Details in `local/reports/flaky_progress_counters.md`.
+
 ## 2026-10-28 — SDK step 5a: progressive session
 - The Hydra delegate's progressive loop (device preparation with the GPU preparation preview, adaptive preview, refinement passes over tiles, adaptive publication, time limit, texture-streaming restarts, denoise interval) moved unchanged into the core `prism::session::ProgressiveEngine`; `SceneBridge::Render` drives it over its render buffers. Hydra still builds its own `SceneManager` (incremental commit is step 5b).
 - Public progressive `Session`: `start/pause/resume/cancel/restart/wait/status/aov/pick`, `ProgressiveOptions`, `SessionStatus`, `Pick`; host films on the session's own thread; new commits and setting changes restart the accumulation. Sessions of one scene share a counted render lock: a progressive session yields to other renders and to `commit()` at pass boundaries (commit now swaps a shared revision under it).

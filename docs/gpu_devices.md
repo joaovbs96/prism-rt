@@ -1165,6 +1165,8 @@ called done there.
     (`gpuPreviewHandovers` 1); a `prism::Session` with `device = Metal`
     started, paused, resumed and cancelled (the progressive session test
     with Metal).
+- **Mesh preparation counts loading progress on its TBB worker** (`src/hydra/scene_bridge.cpp`): shared host
+  code only; run `prism_hydra_scene_bridge_test progress-status` on the Mac.
 
 ## Diagnostics
 

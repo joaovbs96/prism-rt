@@ -649,6 +649,12 @@ if(PRISM_BUILD_HYDRA)
         set_tests_properties(prism_hydra_scene_bridge_test PROPERTIES ENVIRONMENT "${_prism_test_environment}")
         # Converged pixels keep their values in every published buffer while a
         # host maps the buffers (usdview), on the CPU and on Vulkan.
+        # The progress statistics check alone: it is the quick way to repeat
+        # the load counters and phase reports.
+        add_test(NAME prism_hydra_progress_status
+            COMMAND prism_hydra_scene_bridge_test progress-status)
+        set_tests_properties(prism_hydra_progress_status PROPERTIES
+            ENVIRONMENT "${_prism_test_environment}")
         foreach(_device cpu vulkan)
             add_test(NAME prism_hydra_adaptive_publication_${_device}
                 COMMAND prism_hydra_scene_bridge_test adaptive-publication ${_device})
