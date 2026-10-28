@@ -154,6 +154,11 @@ struct CameraState {
     float linearExposureScale = 1.0f;
 };
 
+// True when both states hold exactly the same bits. The host's camera counts
+// as changed only when its input changed, so a NaN or infinity (which never
+// compares equal to itself) must not read as a new camera on every frame.
+bool CameraStatesIdentical(CameraState const &a, CameraState const &b);
+
 struct PickingTable {
     struct InstanceLevel {
         pxr::SdfPath instancerPath;

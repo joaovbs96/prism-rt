@@ -584,6 +584,11 @@ called done there.
     (`--layer Normal --exact` for the geometric layer); and in usdview,
     `render_settings_binding.usda` turns from green to red when the render
     settings menu picks `/Render/AllPurpose`.
+- **Free cameras with an unbounded far clip** (`src/hydra/pass_camera.h`,
+  `src/hydra/scene_bridge.cpp`): host-side camera handling only, no shader or
+  device change. On the Mac, `prism_hydra_pass_camera_test` (CPU) and a
+  `SetCameraState` render with a far clip of 1e30 on `PRISM_DEVICE=metal`
+  converging without restarting.
 - **Scene features** ([hydra.md](hydra.md#scene-features)):
   - Shared shader code:
     - `shaders/integrator/path_tracer.h`: a camera ray that sees a

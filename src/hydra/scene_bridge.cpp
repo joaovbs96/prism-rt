@@ -4743,6 +4743,21 @@ public:
     std::string lastRebuildReason = "initial population";
 };
 
+bool CameraStatesIdentical(CameraState const &a, CameraState const &b)
+{
+    auto const sameBits = [](auto const &x, auto const &y) {
+        static_assert(std::is_trivially_copyable_v<std::remove_cvref_t<decltype(x)>>);
+        return std::memcmp(&x, &y, sizeof(x)) == 0;
+    };
+    return sameBits(a.worldToView, b.worldToView) &&
+        sameBits(a.projection, b.projection) &&
+        sameBits(a.nearClip, b.nearClip) && sameBits(a.farClip, b.farClip) &&
+        sameBits(a.fStop, b.fStop) && sameBits(a.focalLength, b.focalLength) &&
+        sameBits(a.focusDistance, b.focusDistance) &&
+        a.orthographic == b.orthographic &&
+        sameBits(a.linearExposureScale, b.linearExposureScale);
+}
+
 SceneBridge::SceneBridge(HdSceneIndexBaseRefPtr sceneIndex, HdRenderThread *thread)
     : _impl(std::make_unique<Impl>(std::move(sceneIndex), thread))
 {
@@ -5175,15 +5190,7 @@ bool SceneBridge::Prepare(CameraState const &camera,
     {
         std::lock_guard lock(_impl->mutex);
         _impl->MaintainHiddenGeometryLocked();
-        cameraChanged = _impl->camera.worldToView != camera.worldToView ||
-            _impl->camera.projection != camera.projection ||
-            _impl->camera.nearClip != camera.nearClip ||
-            _impl->camera.farClip != camera.farClip ||
-            _impl->camera.fStop != camera.fStop ||
-            _impl->camera.focalLength != camera.focalLength ||
-            _impl->camera.focusDistance != camera.focusDistance ||
-            _impl->camera.orthographic != camera.orthographic ||
-            _impl->camera.linearExposureScale != camera.linearExposureScale ||
+        cameraChanged = !CameraStatesIdentical(_impl->camera, camera) ||
             _impl->width != width || _impl->height != height;
         auto renderBindings = bindings;
         auto previousBindings = _impl->bindings;

@@ -6,9 +6,36 @@
 #include <pxr/imaging/hd/camera.h>
 #include <pxr/imaging/hd/renderPassState.h>
 #include <algorithm>
+#include <cmath>
 #include <vector>
 
 namespace prism::hydra {
+
+// A host that sets its camera from a view and projection matrix (usdview's
+// free camera, UsdImagingGLEngine::SetCameraState) gets a GfCamera derived
+// from them. With a huge far clip such as 1e30 the matrix's depth terms
+// (-1 and -2 * near) no longer determine the far plane, and the derived
+// clipping range comes back with a far of -inf. Hydra then builds a
+// projection whose depth entries are NaN, which would also be a different
+// camera on every frame. The far plane is then infinite for our purposes:
+// repair the depth entries with the largest far plane the rays support.
+// Only the depth terms depend on the clipping range, so the image plane
+// stays as the host gave it.
+inline void RepairUnboundedFarClip(CameraState &camera)
+{
+    if (std::isfinite(camera.farClip) && camera.farClip > camera.nearClip)
+        return;
+    constexpr float kUnboundedFar = 1.0e30f;
+    camera.farClip = kUnboundedFar;
+    double const n = camera.nearClip, f = kUnboundedFar;
+    if (camera.orthographic) {
+        camera.projection[2][2] = -2.0 / (f - n);
+        camera.projection[3][2] = -(f + n) / (f - n);
+    } else {
+        camera.projection[2][2] = -(f + n) / (f - n);
+        camera.projection[3][2] = -2.0 * f * n / (f - n);
+    }
+}
 
 inline CameraState CameraFromPass(PXR_NS::HdRenderPassState const &state)
 {
@@ -27,6 +54,7 @@ inline CameraState CameraFromPass(PXR_NS::HdRenderPassState const &state)
         if (state.GetEnableExposureCompensation())
             camera.linearExposureScale = source->GetLinearExposureScale();
     }
+    RepairUnboundedFarClip(camera);
     return camera;
 }
 
