@@ -17,12 +17,8 @@
 #include "sampling.h"
 #include "material.h"
 #include "geometry.h"
-#include "mesh/obj_mesh.h"
-#include "mesh/gltf_mesh.h"
-#include "mesh/usd_mesh.h"
 #include "environment.h"
 #include "lights.h"
-#include "system_utils.h"
 #include "render_profile.h"
 #include "render_defaults.h"
 
@@ -55,53 +51,13 @@ public:
 
     prism::color::ColorManagement const& color() const { return *colorManagement; }
 
-    // USD imports can contain triangle meshes and analytic sphere placements.
-    // The importer owns sphere prototypes and their material lifetimes.
-    void attachImportedMesh(Mesh* mesh) {
+    // Attaches a loaded mesh's triangles (when it has any) as one placement.
+    // Loaders with placements of their own (USD: prism::usd::AttachImportedMesh,
+    // src/mesh/usd_mesh.h) add them after this.
+    void attachMesh(Mesh* mesh) {
         if (!mesh->vertices.empty() && !mesh->indices.empty()) {
             const unsigned id = mesh->setupEmbree(*device, scene);
             geometry.emplace(id, mesh);
-        }
-        if (auto usd = dynamic_cast<USDMesh*>(mesh)) {
-            // A placement per gprim, as in the Hydra delegate: world-space
-            // meshes, and prototypes placed by Embree instances.
-            for (const auto& placed : usd->attachMeshPlacements(*device, scene)) {
-                geometry.emplace(placed.id, placed.mesh);
-                if (placed.instanced) {
-                    intersection_geometry.emplace(placed.id, placed.mesh->geom);
-                    PlacementTransform placement;
-                    const auto normal = placed.world.GetInverse().GetTranspose();
-                    for (int r = 0; r < 3; ++r) for (int c = 0; c < 3; ++c) {
-                        placement.normal[r * 3 + c] = float(normal[r][c]);
-                        placement.tangent[r * 3 + c] = float(placed.world[r][c]);
-                    }
-                    placement.mirrored = placed.world.GetDeterminant() < 0.0;
-                    placement.flipOrientation = placement.mirrored;
-                    placement_transforms.emplace(placed.id, placement);
-                }
-                auto& binding = placement_materials[placed.id];
-                binding.fallback = placed.material;
-                if (placed.triangleMaterials) binding.triangles = *placed.triangleMaterials;
-                if (placed.instancePrimvars) placement_primvars[int(placed.id)] = placed.instancePrimvars;
-                usd->attachedIds[placed.id] = placed.ids;
-            }
-            for (const auto& sphere : usd->attachSphereInstances(*device, scene)) {
-                geometry.emplace(sphere.id, sphere.geometry);
-                intersection_geometry.emplace(sphere.id, sphere.geometry->geom);
-                PlacementTransform placement;
-                const auto normal = sphere.world.GetInverse().GetTranspose();
-                for (int r=0; r<3; ++r) for (int c=0; c<3; ++c) {
-                    placement.normal[r*3+c] = float(normal[r][c]);
-                    placement.tangent[r*3+c] = float(sphere.world[r][c]);
-                }
-                // Reflection changes UV-frame handedness, not sphere winding.
-                placement.mirrored = sphere.world.GetDeterminant() < 0;
-                placement.flipOrientation = false;
-                placement_transforms.emplace(sphere.id, placement);
-                placement_materials[sphere.id].fallback = sphere.material;
-                if (sphere.instancePrimvars) placement_primvars[int(sphere.id)] = sphere.instancePrimvars;
-                usd->attachedIds[sphere.id] = sphere.ids;
-            }
         }
     }
 

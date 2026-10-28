@@ -110,6 +110,7 @@ namespace mx = MaterialX;
 #include "../materialx/preview_surface.h"
 #include "../render_defaults.h"
 #include "mesh_conversion.h"
+#include "../scene.h"
 #include "../usd/usd_mesh_source.h"
 
 // ============================================================================
@@ -1601,3 +1602,54 @@ private:
     std::map<std::pair<pxr::SdfPath, pxr::SdfPath>, int> m_primIds;
     std::unordered_map<pxr::SdfPath, pxr::VtVec3fArray, pxr::SdfPath::Hash> m_skinnedPoints;
 };
+
+namespace prism::usd {
+
+// Attaches a loaded USD scene: its merged triangles (SceneManager::attachMesh)
+// and a placement per gprim, as in the Hydra delegate: world-space meshes,
+// and prototypes placed by Embree instances. The importer owns sphere
+// prototypes and their material lifetimes.
+inline void AttachImportedMesh(SceneManager& scene, USDMesh& usd)
+{
+    scene.attachMesh(&usd);
+    RTCDevice& device = *scene.device;
+    for (const auto& placed : usd.attachMeshPlacements(device, scene.scene)) {
+        scene.geometry.emplace(placed.id, placed.mesh);
+        if (placed.instanced) {
+            scene.intersection_geometry.emplace(placed.id, placed.mesh->geom);
+            SceneManager::PlacementTransform placement;
+            const auto normal = placed.world.GetInverse().GetTranspose();
+            for (int r = 0; r < 3; ++r) for (int c = 0; c < 3; ++c) {
+                placement.normal[r * 3 + c] = float(normal[r][c]);
+                placement.tangent[r * 3 + c] = float(placed.world[r][c]);
+            }
+            placement.mirrored = placed.world.GetDeterminant() < 0.0;
+            placement.flipOrientation = placement.mirrored;
+            scene.placement_transforms.emplace(placed.id, placement);
+        }
+        auto& binding = scene.placement_materials[placed.id];
+        binding.fallback = placed.material;
+        if (placed.triangleMaterials) binding.triangles = *placed.triangleMaterials;
+        if (placed.instancePrimvars) scene.placement_primvars[int(placed.id)] = placed.instancePrimvars;
+        usd.attachedIds[placed.id] = placed.ids;
+    }
+    for (const auto& sphere : usd.attachSphereInstances(device, scene.scene)) {
+        scene.geometry.emplace(sphere.id, sphere.geometry);
+        scene.intersection_geometry.emplace(sphere.id, sphere.geometry->geom);
+        SceneManager::PlacementTransform placement;
+        const auto normal = sphere.world.GetInverse().GetTranspose();
+        for (int r=0; r<3; ++r) for (int c=0; c<3; ++c) {
+            placement.normal[r*3+c] = float(normal[r][c]);
+            placement.tangent[r*3+c] = float(sphere.world[r][c]);
+        }
+        // Reflection changes UV-frame handedness, not sphere winding.
+        placement.mirrored = sphere.world.GetDeterminant() < 0;
+        placement.flipOrientation = false;
+        scene.placement_transforms.emplace(sphere.id, placement);
+        scene.placement_materials[sphere.id].fallback = sphere.material;
+        if (sphere.instancePrimvars) scene.placement_primvars[int(sphere.id)] = sphere.instancePrimvars;
+        usd.attachedIds[sphere.id] = sphere.ids;
+    }
+}
+
+} // namespace prism::usd

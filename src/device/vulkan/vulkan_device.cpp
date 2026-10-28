@@ -24,6 +24,7 @@
 #include "../../texture_gpu_file.h"
 #include "../../varying_emitter_signal.h"
 #include "../../load_profile.h"
+#include "../../mdl_material.h"
 
 #include <OpenImageIO/imageio.h>
 #include <tbb/parallel_for.h>

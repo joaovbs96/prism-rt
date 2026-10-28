@@ -26,7 +26,7 @@ int main(int argc, char** argv)
         const char* libraries = std::getenv("PRISM_MATERIALX_LIBRARY_PATH");
         const std::string libraryPath = libraries ? libraries : "";
         USDMesh mesh(argv[1], &context, libraryPath, libraryPath + "/mdl");
-        scene.attachImportedMesh(&mesh);
+        prism::usd::AttachImportedMesh(scene, mesh);
         ColorTexture black(Color3(0.0f));
         ConstantColorBackground background(&black);
         scene.environment = &background;

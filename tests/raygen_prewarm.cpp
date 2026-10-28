@@ -39,7 +39,7 @@ void Load(mdl::Context& context, RTCDevice device, const char* path, uint64_t* n
     load.materials.color = prism::color::ColorManagement::Create({});
     load.materials.varyingEmitters = gSignal;
     USDMesh mesh(path, &context, libraryPath, libraryPath + "/mdl", std::move(load));
-    scene.attachImportedMesh(&mesh);
+    prism::usd::AttachImportedMesh(scene, mesh);
     ColorTexture black(Color3(0.0f));
     ConstantColorBackground background(&black);
     scene.environment = &background;

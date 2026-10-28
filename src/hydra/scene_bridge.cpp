@@ -24,6 +24,7 @@
 #include "../materialx/resolved_resource.h"
 #include "../mdl/context.h"
 #include "../progress.h"
+#include "../resource_limits.h"
 #include "../renderer/renderer_context.h"
 #include "../rng.h"
 #include "../scene.h"

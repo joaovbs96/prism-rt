@@ -1,5 +1,8 @@
 #include "standalone_cli.h"
 #include "scene.h"
+#include "mesh/gltf_mesh.h"
+#include "mesh/obj_mesh.h"
+#include "mesh/usd_mesh.h"
 #include "render_defaults.h"
 #include "materialx/loader.h"
 #include "materialx/material_service.h"
@@ -981,7 +984,8 @@ int runStandaloneCli(int argc, char** argv) {
             throw std::runtime_error("Scene contains no renderable geometry");
         SceneRelease release{scene};
         release.mesh = mesh.get();
-        scene.attachImportedMesh(mesh.get());
+        if (usdMesh) prism::usd::AttachImportedMesh(scene, *usdMesh);
+        else scene.attachMesh(mesh.get());
         scene.max_depth = o.depth;
         scene.rr_min_depth = o.roulette;
         scene.environmentSampling = o.environmentSampling == "mis";

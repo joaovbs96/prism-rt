@@ -1,4 +1,5 @@
 #include "../src/scene.h"
+#include "../src/mesh/usd_mesh.h"
 #include <pxr/usd/usdGeom/sphere.h>
 #include <pxr/usd/usdGeom/pointInstancer.h>
 #include <fstream>
@@ -32,7 +33,7 @@ void run(RTCDevice device) {
     require(imported.vertices.empty() && imported.sphereCount() == 4,
             "USD spheres must remain analytic, including point instances");
     SceneManager scene(device, prism::color::ColorManagement::Create({}));
-    scene.attachImportedMesh(&imported);
+    prism::usd::AttachImportedMesh(scene, imported);
     scene.commitScene();
     struct Release { RTCScene scene; ~Release() { rtcReleaseScene(scene); } } release{scene.scene};
     const auto hit = scene.cast_ray(initialize_ray(Float3(0,2,0), Float3(0,-1,0)));
