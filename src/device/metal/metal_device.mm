@@ -11,6 +11,7 @@
 #include <metal_irconverter_runtime/metal_irconverter_runtime.h>
 
 #include "metal_device.h"
+#include "../../renderer/logger.h"
 #if PRISM_HAS_METAL_OIDN
 #include "metal_denoiser.h"
 #endif
@@ -58,8 +59,8 @@ double SecondsSince(Clock::time_point start)
 
 bool Verbose()
 {
-    const char* value = std::getenv("PRISM_GPU_VERBOSE");
-    return value && *value && std::string_view(value) != "0";
+    // The calling thread's logger shows "gpu" debug output (PRISM_GPU_VERBOSE).
+    return prism::logging::Debug("gpu");
 }
 
 bool ConvertToMetallib(std::vector<char> const& dxil, std::vector<char>* metallib, std::string* error)

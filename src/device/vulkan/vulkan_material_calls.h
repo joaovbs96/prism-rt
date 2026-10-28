@@ -14,6 +14,9 @@
 // scene and compiles in the background from device creation, a scene compiles
 // only the callables no earlier scene had, and its pipeline links them.
 
+#include "../../progress.h"
+#include "../../renderer/logger.h"
+
 #include <vulkan/vulkan.h>
 
 #include <atomic>
@@ -200,6 +203,12 @@ public:
 
     // Whether shaders become pipeline libraries (supported and not disabled).
     bool libraries() const { return m_libraries; }
+    // The renderer's progress model and logger for the compile threads.
+    void setReporting(prism::Progress* progress, prism::Logger const* logger)
+    {
+        m_progress = progress;
+        m_logger = logger;
+    }
     // Starts compiling the scene-independent raygen shader on a background
     // thread: with varyingEmitters the variant for scenes of textured
     // emitters (PRISM_VARYING_EMITTERS). Once per variant.
@@ -228,6 +237,8 @@ private:
     bool m_libraries = false;
     PFN_vkCreateRayTracingPipelinesKHR m_createPipelines = nullptr;
     PFN_vkGetRayTracingShaderGroupStackSizeKHR m_groupStackSize = nullptr;
+    prism::Progress* m_progress = nullptr;
+    prism::Logger const* m_logger = nullptr;
     std::mutex m_mutex;
     std::unordered_map<std::string, std::shared_future<std::shared_ptr<const ShaderBuild>>> m_shaders;
     std::mutex m_prewarmMutex;

@@ -1,4 +1,5 @@
 #include "context.h"
+#include "../renderer/logger.h"
 #include "backend_compiler.h"
 
 #include <format>
@@ -13,10 +14,10 @@
 namespace mdl {
 
 namespace {
+// The calling thread's logger shows "mdl" debug output (PRISM_MDL_VERBOSE).
 bool VerboseMdl()
 {
-    const char* value = std::getenv("PRISM_MDL_VERBOSE");
-    return value && *value && std::string_view(value) != "0";
+    return prism::logging::Debug("mdl");
 }
 
 class PrismReceivingLogger final

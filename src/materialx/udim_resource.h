@@ -1,6 +1,7 @@
 #pragma once
 
 #include "resolved_resource.h"
+#include "../renderer/logger.h"
 #include <pxr/usd/usdShade/udimUtils.h>
 #include <tbb/parallel_for.h>
 #include <atomic>
@@ -62,11 +63,10 @@ inline std::vector<UdimSourceTile> ResolveUdimSourceTiles(
             if (parsed.ec == std::errc{}) append(tile, path);
         }
         if (!result.empty()) {
-            static std::atomic<bool> reported{false};
-            if (!reported.exchange(true))
-                std::cerr << "[MaterialX] UDIM custom-resolver enumeration is "
-                    "limited by stock USD to tiles 1001-1100; keeping this "
-                    "resource out of compatible-template reuse.\n";
+            // Once per renderer (the calling thread's logger).
+            prism::logging::Current().warnOnce("materials", "udim enumeration",
+                "[MaterialX] UDIM custom-resolver enumeration is limited by stock USD to tiles "
+                "1001-1100; keeping this resource out of compatible-template reuse.");
             // A partial family would silently discard higher tiles supported
             // by the MDL SDK. Preserve the authored pattern for stock fallback.
             return {};

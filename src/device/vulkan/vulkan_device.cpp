@@ -464,7 +464,8 @@ static size_t KernelBaseBytes()
 // Closer to the threshold, the link unit decides as before.
 constexpr double kEstimateMargin = 1.15;
 
-void ReportVulkanPrograms(SceneManager& scene, std::ostream& out)
+void ReportVulkanPrograms(SceneManager& scene, std::ostream& out,
+                          prism::VaryingEmitterSignal const* varyingEmitters)
 {
     using namespace std::chrono;
     const GpuSceneData data = gpu::BuildGpuScene(scene);
@@ -484,7 +485,7 @@ void ReportVulkanPrograms(SceneManager& scene, std::ostream& out)
     // The raygen variants a device prewarms while the materials load (a note
     // of varying emission selects PRISM_VARYING_EMITTERS), and whether one
     // of them is the scene's raygen shader.
-    const bool prewarmsEmitters = prism::varying_emitters::Notes() > 0;
+    const bool prewarmsEmitters = varyingEmitters && varyingEmitters->Notes() > 0;
     out << std::format("raygen_prewarm {} covers_scene {}\n", prewarmsEmitters ? "plain+emitters" : "plain",
                        prewarmsEmitters || !code.varyingEmitters);
     const auto cache = gpu::ShaderCacheDirectory("report");
@@ -705,6 +706,11 @@ struct VulkanDevice::Impl {
     // The renderer's texture service (DeviceOptions::textures): early
     // uploads observe it, scenes' images are read through it.
     std::shared_ptr<prism::TextureService> textures;
+    // The renderer's progress model and logger, bound on the device's own
+    // threads, and its note of varying emission (DeviceOptions).
+    prism::Progress* progressModel = nullptr;
+    prism::Logger const* logger = &prism::logging::Default();
+    std::shared_ptr<prism::VaryingEmitterSignal> varyingEmitters;
     std::vector<gpu::ImageFootprint> earlyFootprints; // every image offered since the last scene
     uint32_t earlyUploaded = 0, earlySkipped = 0;
     double earlySeconds = 0.0;
@@ -891,7 +897,7 @@ VulkanDevice::Impl::~Impl()
         return;
     }
     if (programListener) gpu::RemoveProgramListener(programListener);
-    if (emitterListener) prism::varying_emitters::Unsubscribe(emitterListener);
+    if (emitterListener && varyingEmitters) varyingEmitters->Unsubscribe(emitterListener);
     {
         std::lock_guard lock(speculation->mutex);
         speculation->shaders = nullptr;
@@ -1246,6 +1252,7 @@ bool VulkanDevice::Impl::initialize(std::string* reason)
     if (rayTracing.pipeline) {
         callableShaders = std::make_unique<vulkan::MaterialCallShaders>(device, deviceProperties, rayTracing,
                                                                          pipelineLayout, pipelineCacheTag);
+        callableShaders->setReporting(progressModel, logger);
         // The raygen shader depends on no scene: compile it while the scene loads.
         if (vulkan::CallableModeSetting() != vulkan::CallableMode::Never) callableShaders->prewarmRaygen();
     }
@@ -1257,8 +1264,10 @@ bool VulkanDevice::Impl::initialize(std::string* reason)
         speculation->mode = rayTracing.pipeline ? vulkan::CallableModeSetting() : vulkan::CallableMode::Never;
     }
     // Materials of varying emission seen before this device (or from now on).
-    emitterListener = prism::varying_emitters::Subscribe([speculation = speculation] { speculation->varyingEmitter(); });
-    if (prism::varying_emitters::Notes() > 0) speculation->varyingEmitter();
+    if (varyingEmitters) {
+        emitterListener = varyingEmitters->Subscribe([speculation = speculation] { speculation->varyingEmitter(); });
+        if (varyingEmitters->Notes() > 0) speculation->varyingEmitter();
+    }
     programListener = gpu::AddProgramListener(
         [speculation = speculation](std::shared_ptr<const gpu::MdlProgramCode> const& code) {
             speculation->program(code);
@@ -1313,6 +1322,8 @@ void VulkanDevice::Impl::earlyPrepared(std::shared_ptr<const prism::TextureResou
 
 void VulkanDevice::Impl::earlyLoop()
 {
+    prism::progress::Bind progressBinding(progressModel);
+    prism::logging::Bind logBinding(logger);
     for (;;) {
         std::shared_ptr<const prism::TextureResource> resource;
         {
@@ -1630,6 +1641,8 @@ bool VulkanDevice::Impl::createStreamedImages(std::vector<StreamJob> const& jobs
 
 void VulkanDevice::Impl::streamLoop()
 {
+    prism::progress::Bind progressBinding(progressModel);
+    prism::logging::Bind logBinding(logger);
     Streaming& s = streaming;
     std::vector<uint32_t> histograms;
     std::vector<uint8_t> failed;
@@ -2673,6 +2686,8 @@ bool VulkanDevice::Impl::uploadImages(std::string* error)
             (copies[i].valid && UsesStoredMips(copies[i].header) ? storedMissing : rest).push_back(i);
         missing.swap(rest);
     }
+    // The calling thread's model, also for the image workers.
+    prism::Progress* const uploadProgress = prism::Progress::Current();
     progress::SetTotal(Phase::Upload, missing.size() + storedMissing.size());
     progress::Detail(Phase::Upload, missing.empty() ? "images (cached)" : "images");
 
@@ -2706,7 +2721,7 @@ bool VulkanDevice::Impl::uploadImages(std::string* error)
     };
     auto prepare = [&](size_t i, Prepared& out) {
         if (copies[i].valid && prepareFromCopy(i, out)) {
-            progress::Add(Phase::Upload);
+            if (uploadProgress) uploadProgress->Add(Phase::Upload);
             return;
         }
         auto const& resource = d.images[i];
@@ -2754,7 +2769,7 @@ bool VulkanDevice::Impl::uploadImages(std::string* error)
                                     out.staging.data.get() + (p * stored + c) * componentBytes);
             });
         profileImage(*resource, out, channels, shift[i], readTime, nanosecondsSince(convertStart));
-        progress::Add(Phase::Upload);
+        if (uploadProgress) uploadProgress->Add(Phase::Upload);
     };
 
     auto record = [&](VkCommandBuffer commands, Prepared const& prepared, Buffer const& staging, Image* image) {
@@ -2835,7 +2850,7 @@ bool VulkanDevice::Impl::uploadImages(std::string* error)
             cached.storage = copies[i].storage;
             imageCache[d.images[i].get()] = cached;
             imageViews[i] = images[k].view;
-            progress::Add(Phase::Upload);
+            if (uploadProgress) uploadProgress->Add(Phase::Upload);
         }
         first = last;
     }
@@ -3181,7 +3196,11 @@ bool VulkanDevice::Impl::ensureScene(SceneManager& scene, std::string* error)
     if (!prepareMaterials(&code, &compile, error)) return fail();
     auto const piped = Clock::now();
     if (compile)
-        compiled = std::async(std::launch::async, [this, code, &compileError] {
+        compiled = std::async(std::launch::async, [this, code, &compileError,
+                                                   model = prism::Progress::Current(),
+                                                   log = &prism::logging::Current()] {
+            prism::progress::Bind progressBinding(model);
+            prism::logging::Bind logBinding(log);
             return compilePipeline(code, &compileError);
         });
     struct Join {
@@ -3438,6 +3457,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::Create(DeviceOptions const& options,
     auto impl = std::make_unique<Impl>();
     impl->initialTextureBudgetMiB = options.initialTextureBudgetMiB;
     impl->textures = options.textures ? options.textures : prism::TextureService::Acquire();
+    impl->progressModel = options.progress;
+    if (options.logger) impl->logger = options.logger;
+    impl->varyingEmitters = options.varyingEmitters;
     if (!impl->initialize(reason)) return nullptr;
     return std::unique_ptr<VulkanDevice>(new VulkanDevice(std::move(impl)));
 }

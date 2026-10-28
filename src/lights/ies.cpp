@@ -1,4 +1,5 @@
 #include "ies.h"
+#include "../renderer/logger.h"
 
 #include "../device/hlsl_math.h"
 #include "../../shaders/integrator/lights.h"
@@ -116,12 +117,14 @@ std::string Trimmed(std::string s)
     return s.substr(start);
 }
 
+// Once per renderer (the calling thread's logger: the CLI's standard error,
+// the Hydra delegate's TF_WARN).
 void WarnOnce(std::string const& key, std::string const& message)
 {
-    static std::mutex mutex;
-    static std::set<std::string> warned;
-    std::lock_guard lock(mutex);
-    if (warned.insert(key).second) std::cerr << message << '\n';
+    const std::string_view prefix = "PrismRT: ";
+    const std::string_view text = std::string_view(message).starts_with(prefix)
+        ? std::string_view(message).substr(prefix.size()) : std::string_view(message);
+    prism::logging::Current().warnOnce("lights", key, text);
 }
 
 } // namespace

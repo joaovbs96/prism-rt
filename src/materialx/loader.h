@@ -34,6 +34,9 @@ public:
         std::function<bool(const std::string& space, std::array<float, 3>& rgb)> convert;
     };
     void setUniformColorConversion(UniformColorConversion conversion) { m_uniformColors = std::move(conversion); }
+    // Prints what load() repairs (the renderer's "mdl" debug output,
+    // PRISM_MDL_VERBOSE). Off by default.
+    void setVerbose(bool verbose) { m_verbose = verbose; }
 
     MaterialX::DocumentPtr load(const std::string& filepath);
     MaterialX::DocumentPtr create_empty();
@@ -43,5 +46,6 @@ private:
     MaterialX::DocumentPtr m_stdlib;
     bool m_clamp;
     bool m_fallback_sss_to_diffuse;
+    bool m_verbose = false;
     UniformColorConversion m_uniformColors;
 };

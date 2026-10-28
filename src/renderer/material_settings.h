@@ -8,12 +8,16 @@
 // compile; shared caches of compiled materials key by Identity().
 
 #include "../color/color_management.h"
+#include "logger.h"
 
 #include <filesystem>
 #include <memory>
 #include <string>
 
 namespace prism {
+
+class Progress;
+class VaryingEmitterSignal;
 
 struct MaterialSettings {
     std::shared_ptr<const color::ColorManagement> color;
@@ -26,6 +30,14 @@ struct MaterialSettings {
     // MaterialOptions::generationCache and mdlResourceMode.
     bool generationCache = true;
     std::string mdlResourceMode = "auto";
+
+    // Where the renderer hears about its materials (not part of Identity):
+    // its progress model (phases materials and textures), its logger (bound
+    // to the threads that compile), and its note of varying emission.
+    // Null: none, and the calling thread's logger.
+    Progress* progress = nullptr;
+    Logger const* logger = nullptr;
+    std::shared_ptr<VaryingEmitterSignal> varyingEmitters;
 
     // The colour identity, the SSS fallback and the resource mode: part of
     // every shared cache key of compiled materials.

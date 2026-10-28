@@ -1,4 +1,5 @@
 #include "mdl_generator.h"
+#include "../renderer/logger.h"
 #include "generated_cache.h"
 #include "../color/color_management.h"
 #include "../resource_limits.h"
@@ -23,10 +24,8 @@
 #include <MaterialXGenShader/Syntax.h>
 
 namespace {
-bool VerboseMdl() {
-    const char* value = std::getenv("PRISM_MDL_VERBOSE");
-    return value && *value && std::string(value) != "0";
-}
+// The calling thread's logger shows "mdl" debug output (PRISM_MDL_VERBOSE).
+bool VerboseMdl() { return prism::logging::Debug("mdl"); }
 
 MaterialX::DocumentPtr SharedStandardLibrary(const std::string& path) {
     static std::mutex mutex;

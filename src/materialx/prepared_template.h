@@ -265,7 +265,8 @@ inline CompatibleBindResult BindCompatibleTemplate(
     const CompatibleMaterialTemplate& prepared,
     const CapturedMaterialGraph& graph, mdl::Context& context,
     const PXR_NS::ArResolverContext& resolverContext,
-    const std::string& sourceVersion, const std::filesystem::path& cacheDir) {
+    const std::string& sourceVersion, const std::filesystem::path& cacheDir,
+    prism::VaryingEmitterSignal* varyingEmitters = nullptr) {
     CompatibleBindResult result;
     if (!prepared.prototype || !prepared.prototype->is_valid()) {
         result.error="template prototype expired"; return result;
@@ -391,7 +392,7 @@ inline CompatibleBindResult BindCompatibleTemplate(
                                       overrides.get(),transaction.get());
     transaction->commit(); transaction.reset();
     if (!bound.success) { result.error=bound.error_message; return result; }
-    result.material=std::make_shared<MDLMaterial>(std::move(bound));
+    result.material=std::make_shared<MDLMaterial>(std::move(bound), varyingEmitters);
     return result;
 }
 

@@ -16,6 +16,7 @@
 // (LightTable::varyingEmitters).
 
 #include "hlsl_math.h"
+#include "../renderer/logger.h"
 #include "../../shaders/integrator/lights.h"
 #include "../scene.h"
 #include "../color/color_management.h"
@@ -465,10 +466,9 @@ inline void AddVaryingEmitters(SceneManager& scene, LightTable& table, std::vect
         });
         table.emissionEvaluations += evaluations.load();
 
-        static const bool verbose = [] {
-            const char* value = std::getenv("PRISM_VERBOSE_LIGHTS");
-            return value && *value && std::string_view(value) != "0";
-        }();
+        // The calling thread's logger shows "lights" debug output
+        // (PRISM_VERBOSE_LIGHTS).
+        const bool verbose = prism::logging::Debug("lights");
         for (size_t g = 0; g < groups; ++g) {
             if (!emitting[g]) continue;
             double power = 0.0;

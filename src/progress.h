@@ -11,9 +11,11 @@
 // Several phases can be active at once (textures prepare while materials
 // compile; a kernel compile nests inside the GPU upload). Read() reports them
 // all and names the primary one, the latest stage of the pipeline that is
-// still running. Updates are atomic increments and cost nothing when no
-// Progress is installed: instrumented code uses the free functions in
-// prism::progress, which ignore the call without a current model.
+// still running. Updates are atomic increments. Each renderer owns its model
+// (RendererContext::progress) and hands it to its services and devices;
+// instrumented code without one at hand uses the free functions in
+// prism::progress, which report to the model bound to the calling thread
+// (progress::Bind) and do nothing without one.
 
 #include <array>
 #include <atomic>
@@ -72,19 +74,12 @@ public:
         std::array<PhaseState, kPhases> phases;
     };
 
-    Progress() { Install(); }
-    ~Progress()
-    {
-        Progress* self = this;
-        s_current.compare_exchange_strong(self, nullptr);
-    }
+    Progress() = default;
     Progress(const Progress&) = delete;
     Progress& operator=(const Progress&) = delete;
 
-    // The model that instrumented code reports to: the most recently created
-    // one that is still alive (a process normally has one renderer).
-    static Progress* Current() { return s_current.load(std::memory_order_acquire); }
-    void Install() { s_current.store(this, std::memory_order_release); }
+    // The model bound to the calling thread (progress::Bind), or null.
+    static Progress* Current() { return s_current; }
 
     // Starts a phase with fresh counters. Beginning an active phase keeps it.
     void Begin(Phase phase)
@@ -199,12 +194,26 @@ private:
     mutable std::mutex m_mutex;
     std::string m_device;
     std::string m_error;
-    inline static std::atomic<Progress*> s_current{nullptr};
+    inline static thread_local Progress* s_current = nullptr;
+    friend class ProgressBinding;
 };
 
-// One-line hooks for instrumented code. They do nothing without a current
-// model (the standalone renderer) and never allocate, except for detail text.
+// Binds a model to the calling thread for a scope (progress::Bind).
+class ProgressBinding {
+public:
+    explicit ProgressBinding(Progress* model) : m_previous(Progress::s_current) { Progress::s_current = model; }
+    ~ProgressBinding() { Progress::s_current = m_previous; }
+    ProgressBinding(const ProgressBinding&) = delete;
+    ProgressBinding& operator=(const ProgressBinding&) = delete;
+private:
+    Progress* m_previous;
+};
+
+// One-line hooks for instrumented code. They do nothing without a model bound
+// to the calling thread and never allocate, except for detail text.
 namespace progress {
+
+using Bind = ProgressBinding;
 
 inline void Begin(Phase p) { if (auto* m = Progress::Current()) m->Begin(p); }
 inline void End(Phase p) { if (auto* m = Progress::Current()) m->End(p); }
@@ -215,10 +224,11 @@ inline void Detail(Phase p, std::string_view text) { if (auto* m = Progress::Cur
 inline void Device(std::string_view text) { if (auto* m = Progress::Current()) m->SetDevice(text); }
 
 // Keeps a phase active for a scope (counted: overlapping scopes of one phase
-// end it with the last). Holds the model that was current when it began.
+// end it with the last), of `model` or of the model bound to the thread.
 class Scope {
 public:
-    explicit Scope(Phase p) : m_phase(p), m_model(Progress::Current()) { if (m_model) m_model->Hold(p); }
+    explicit Scope(Phase p) : Scope(Progress::Current(), p) {}
+    Scope(Progress* model, Phase p) : m_phase(p), m_model(model) { if (m_model) m_model->Hold(p); }
     ~Scope() { if (m_model) m_model->Release(m_phase); }
     Scope(const Scope&) = delete;
     Scope& operator=(const Scope&) = delete;

@@ -11,6 +11,8 @@
 #include <memory>
 #include <optional>
 
+namespace prism { class VaryingEmitterSignal; }
+
 namespace mdl {
 class NativeTextureRuntime;
 
@@ -165,7 +167,10 @@ public:
     // resourceMode (MaterialOptions::mdlResourceMode): how compiled code
     // reads textures, auto, custom or builtin; any other value fails every
     // compile with a message.
-    explicit BackendCompiler(Context& ctx, std::string resourceMode = "auto");
+    // varyingEmitters: the renderer's note of varying emission, made as soon
+    // as a program is classified (null: none).
+    explicit BackendCompiler(Context& ctx, std::string resourceMode = "auto",
+                             prism::VaryingEmitterSignal* varyingEmitters = nullptr);
 
     // Full pipeline: CompiledMaterial -> native target code with callable functions
     TargetCode generate_target_code(const CompiledMaterial& compiled);
@@ -178,6 +183,7 @@ private:
 
     Context& m_ctx;
     std::string m_resourceMode;
+    prism::VaryingEmitterSignal* m_varyingEmitters = nullptr;
 };
 
 } // namespace mdl

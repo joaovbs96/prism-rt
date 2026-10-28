@@ -70,6 +70,7 @@ bool CompileVulkanKernel(std::string const& mdlCode, std::vector<uint32_t>* spir
                          uint32_t programCount = 0, bool lightAovs = false);
 
 // Diagnostics without a Vulkan device: the GPU programs of the scene's materials and their SPIR-V sizes.
-void ReportVulkanPrograms(SceneManager& scene, std::ostream& out);
+void ReportVulkanPrograms(SceneManager& scene, std::ostream& out,
+                          prism::VaryingEmitterSignal const* varyingEmitters = nullptr);
 
 } // namespace prism::device

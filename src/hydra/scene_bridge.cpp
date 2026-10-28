@@ -101,13 +101,11 @@ using prism::materials::MaterialService;
 using prism::materials::SharedMdlContext;
 namespace {
 
+// Once per renderer (the calling thread's logger: the delegate binds its own).
 void _WarnUnsupportedAov(TfToken const &name)
 {
-    static std::mutex mutex;
-    static std::unordered_set<std::string> warned;
-    std::lock_guard lock(mutex);
-    if (warned.insert(name.GetString()).second)
-        TF_WARN("PrismRT: AOV '%s' is not supported", name.GetText());
+    prism::logging::Current().warnOnce("hydra", "aov:" + name.GetString(),
+        "AOV '" + name.GetString() + "' is not supported");
 }
 
 // Nothing is displayed before the first snapshot, so the host has no
@@ -2834,14 +2832,16 @@ MeshPreparation _PrepareMeshes(HdSceneIndexBaseRefPtr const &scene,
         snapshot->subdivision.budgetFaces, &plannedFaces, &requestedFaces);
 
     std::vector<MeshConversion> conversions(misses.size());
+    // The job thread's model (the delegate binds it), also for the workers.
+    prism::Progress *const progressModel = prism::Progress::Current();
     auto convert = [&](std::vector<size_t> const &indices, std::vector<MeshConversion> &out) {
-        prism::progress::AddTotal(prism::Phase::Loading, indices.size());
+        if (progressModel) progressModel->AddTotal(prism::Phase::Loading, indices.size());
         const auto conversionStart = std::chrono::steady_clock::now();
         tbb::parallel_for(size_t(0), indices.size(), [&](size_t i) {
             if (cancelled && cancelled()) return;
             out[i] = _ConvertMesh(candidates[indices[i]].second, snapshot->subdivision, displacers[indices[i]],
                                   levelCaps[indices[i]]);
-            prism::progress::Add(prism::Phase::Loading);
+            if (progressModel) progressModel->Add(prism::Phase::Loading);
         });
         // Wall time of the parallel phase, covering the whole pure conversion
         // including tangents, vertex de-duplication and hashing.
@@ -2901,12 +2901,11 @@ MeshPreparation _PrepareMeshes(HdSceneIndexBaseRefPtr const &scene,
     snapshot->prototypeConversions = misses.size();
     snapshot->prototypeConversionCacheHits = candidates.size() - misses.size();
     if (plannedFaces < requestedFaces) {
-        static std::once_flag warned;
-        std::call_once(warned, [&] {
-            TF_WARN("PrismRT: subdivision refines to %zu faces, over the %zu-face budget "
-                    "(prism:subdivisionBudgetFaces); the densest meshes use lower levels (%zu faces)",
-                    requestedFaces, snapshot->subdivision.budgetFaces, plannedFaces);
-        });
+        // Once per renderer (the build job binds the delegate's logger).
+        prism::logging::Current().warnOnce("hydra", "subdivision budget",
+            "subdivision refines to " + std::to_string(requestedFaces) + " faces, over the " +
+            std::to_string(snapshot->subdivision.budgetFaces) + "-face budget (prism:subdivisionBudgetFaces); "
+            "the densest meshes use lower levels (" + std::to_string(plannedFaces) + " faces)");
     }
 
     // Identical geometry shares one storage, first within this batch (cache
@@ -4616,6 +4615,22 @@ public:
         bool spareComplete = false;
     };
 
+    // The environment's options with the delegate's log sink: warnings and
+    // errors through TF_WARN, debug output to standard output.
+    static prism::RendererOptions HydraRendererOptions()
+    {
+        auto options = prism::RendererOptions::FromEnvironment();
+        options.log = [](prism::LogLevel level, std::string_view, std::string_view message) {
+            if (level == prism::LogLevel::Debug || level == prism::LogLevel::Info) {
+                std::cout << message << std::flush;
+                return;
+            }
+            const std::string text(message);
+            TF_WARN("PrismRT: %s", text.c_str());
+        };
+        return options;
+    }
+
     Impl(HdSceneIndexBaseRefPtr index, HdRenderThread *thread)
         : sceneIndex(std::move(index)), renderThread(thread), device(rtcNewDevice(nullptr))
     {
@@ -4734,6 +4749,8 @@ public:
             deviceCreationPreference = preference;
             progress.Begin(prism::Phase::Device);
             deviceCreation = std::async(std::launch::async, [preference, this] {
+                prism::logging::Bind logBinding(&renderer->logger());
+                prism::progress::Bind progressBinding(&progress);
                 prism::load_profile::Scope profile("device.create");
                 CreatedDevice created;
                 created.device = prism::device::CreateDevice(preference, renderer->deviceOptions(), &created.note);
@@ -4802,12 +4819,15 @@ public:
         // free or (as an inactive bank) edit the scene it is reading.
         devicePreparation = std::async(std::launch::async,
             [this, device, prepared] {
+                prism::logging::Bind logBinding(&renderer->logger());
+                prism::progress::Bind progressBinding(&progress);
                 const auto start = std::chrono::steady_clock::now();
                 prism::load_profile::Scope profile("device.prepare");
                 // Diagnostics, as in the CLI: print the scene's GPU programs
                 // (DXC only, no GPU work; run with PRISM_DEVICE=cpu) and exit.
                 if (const char *report = std::getenv("PRISM_GPU_PROGRAM_REPORT"); report && *report == '1') {
-                    if (!prism::device::ReportGpuPrograms(*prepared->scene, std::cout))
+                    if (!prism::device::ReportGpuPrograms(*prepared->scene, std::cout,
+                                                          renderer->varyingEmitters().get()))
                         std::cerr << "PrismRT: this build has no Vulkan device\n";
                     std::cout.flush();
                     std::_Exit(0);
@@ -4910,7 +4930,10 @@ public:
              settings = jobSettings, materials = jobMaterials, resolverContext = jobResolverContext,
              device = device, prototypePool = prototypePool,
              canonicalSeed = canonicalPrimIds,
-             cancel = std::move(cancel), seed = std::move(seed)]() {
+             cancel = std::move(cancel), seed = std::move(seed), renderer = renderer]() {
+                // The delegate's diagnostics and progress on this thread.
+                prism::logging::Bind logBinding(&renderer->logger());
+                prism::progress::Bind progressBinding(&renderer->progress());
                 BuildResult result;
                 result.generation = generation;
                 result.spare = true;
@@ -4988,12 +5011,13 @@ public:
         if (device) rtcReleaseDevice(device);
     }
 
-    // Declared first so it outlives every worker that reports to it.
-    prism::Progress progress;
     // This delegate's renderer context (its options from the environment;
-    // render settings override some per render).
+    // render settings override some per render; its diagnostics go to
+    // TF_WARN). Declared first: its progress model must outlive every worker
+    // that reports to it, and jobs hold the context.
     std::shared_ptr<prism::RendererContext> renderer =
-        std::make_shared<prism::RendererContext>(prism::RendererOptions::FromEnvironment());
+        std::make_shared<prism::RendererContext>(HydraRendererOptions());
+    prism::Progress &progress = renderer->progress();
     HdSceneIndexBaseRefPtr sceneIndex;
     HdRenderThread *renderThread;
     RTCDevice device = nullptr;
@@ -6214,6 +6238,9 @@ bool SceneBridge::Prepare(CameraState const &camera,
                  prototypePool = std::move(prototypePool),
                  cancel = std::move(cancel),
                  renderer = _impl->renderer, jobMaterials]() mutable {
+                    // The delegate's diagnostics and progress on this thread.
+                    prism::logging::Bind logBinding(&renderer->logger());
+                    prism::progress::Bind progressBinding(&renderer->progress());
                     SceneBridge::Impl::BuildResult result;
                     result.generation = generation;
                     result.pinnedBankFallback = pinnedBankFallback;
@@ -6632,6 +6659,9 @@ bool SceneBridge::Prepare(CameraState const &camera,
 
 void SceneBridge::Render()
 {
+    // The delegate's diagnostics and progress on the render thread.
+    prism::logging::Bind logBinding(&_impl->renderer->logger());
+    prism::progress::Bind progressBinding(&_impl->progress);
     std::shared_ptr<Snapshot> snapshot;
     CameraState camera;
     HdRenderPassAovBindingVector bindings;
@@ -7212,6 +7242,8 @@ void SceneBridge::Render()
         // completion flags make only fully written tiles visible to it.
         prism::device::RenderDevice *const device = activeDevice;
         auto worker = std::async(std::launch::async, [&] {
+            prism::logging::Bind logBinding(&_impl->renderer->logger());
+            prism::progress::Bind progressBinding(&_impl->progress);
             auto finish = [&] {
                 { std::lock_guard lock(completionMutex); finished = true; }
                 completion.notify_one();

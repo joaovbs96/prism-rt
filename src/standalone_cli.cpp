@@ -571,7 +571,7 @@ struct UsdCameraRays {
 
 // The progress line on stderr: the loading stage, then a bar per colour
 // render. A monitor thread polls the device's ImageProgress (relaxed atomics)
-// and the process's prism::Progress model four times a second, so nothing in
+// and the renderer's prism::Progress model four times a second, so nothing in
 // the render path waits on it. On a terminal it rewrites one line with \r;
 // otherwise (logs, CTest) it prints a plain line per stage and per 10%.
 class ProgressPrinter {
@@ -588,6 +588,12 @@ public:
     }
     ~ProgressPrinter() { Stop(); }
 
+    // The renderer's progress model (its material and texture counts).
+    void SetModel(prism::Progress* model)
+    {
+        std::lock_guard lock(m_mutex);
+        m_model = model;
+    }
     // An empty stage clears the line (before other output).
     void Stage(std::string text)
     {
@@ -710,7 +716,7 @@ private:
                 // Loading: the CLI's stage, with the material count while the
                 // materials compile (prism::Progress, reported by the loaders).
                 std::string text = m_stage;
-                if (auto* model = prism::Progress::Current()) {
+                if (auto* model = m_model) {
                     const auto snapshot = model->Read();
                     auto const& materials = snapshot.phases[size_t(prism::Phase::Materials)];
                     auto const& textures = snapshot.phases[size_t(prism::Phase::Textures)];
@@ -736,6 +742,7 @@ private:
     std::thread m_thread;
     std::string m_stage;
     prism::device::ImageProgress* m_render = nullptr;
+    prism::Progress* m_model = nullptr;
     std::chrono::steady_clock::time_point m_renderStart;
     int m_lastDecile = -1;
     size_t m_width = 0;
@@ -775,8 +782,6 @@ int runStandaloneCli(int argc, char** argv) {
             return 0;
         }
         Options o = parse(argc, argv);
-        // Loading phases (materials, textures) report to this model.
-        prism::Progress progressModel;
         // Outlives the printer, whose thread reads it (also while an error
         // unwinds).
         prism::device::ImageProgress imageProgress;
@@ -874,7 +879,17 @@ int runStandaloneCli(int argc, char** argv) {
         rendererOptions.materials.materialxMdlPath = rendererOptions.materials.materialxLibraries + "/mdl";
         // --sss-fallback and prism:sssFallback (default PRISM_SSS_FALLBACK).
         rendererOptions.materials.sssFallback = o.sssFallback;
-        const prism::RendererContext renderer(rendererOptions);
+        prism::RendererContext renderer(rendererOptions);
+        // Loading phases (materials, textures) report to the renderer's model,
+        // and its diagnostics go to standard error, also from this thread.
+        progress.SetModel(&renderer.progress());
+        // The printer outlives the renderer: it stops reading the model first.
+        struct ModelRelease {
+            ProgressPrinter& printer;
+            ~ModelRelease() { printer.SetModel(nullptr); }
+        } modelRelease{progress};
+        prism::progress::Bind progressBinding(&renderer.progress());
+        prism::logging::Bind logBinding(&renderer.logger());
         // Before anything loads: materials, lights and textures convert into
         // the working space as they are read.
         const auto colorManagement = renderer.colorManagement();
@@ -1128,7 +1143,7 @@ int runStandaloneCli(int argc, char** argv) {
             }
         }
         if (const char* report = std::getenv("PRISM_GPU_PROGRAM_REPORT"); report && *report == '1') {
-            if (!prism::device::ReportGpuPrograms(scene, std::cout))
+            if (!prism::device::ReportGpuPrograms(scene, std::cout, renderer.varyingEmitters().get()))
                 std::cerr << "PrismRT: this build has no Vulkan device\n";
             return 0;
         }

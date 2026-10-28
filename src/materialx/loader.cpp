@@ -16,10 +16,16 @@
 #include <string_view>
 
 namespace {
-bool VerboseMdl() {
-    const char* value = std::getenv("PRISM_MDL_VERBOSE");
-    return value && *value && std::string_view(value) != "0";
-}
+// The verbosity of the DocumentLoader::load running on this thread
+// (DocumentLoader::setVerbose: the renderer's "mdl" debug output).
+thread_local bool tVerbose = false;
+bool VerboseMdl() { return tVerbose; }
+
+struct VerboseScope {
+    bool previous;
+    explicit VerboseScope(bool verbose) : previous(tVerbose) { tVerbose = verbose; }
+    ~VerboseScope() { tVerbose = previous; }
+};
 
 void AttachLibrary(const MaterialX::DocumentPtr& doc,
                    const MaterialX::DocumentPtr& library)
@@ -1739,6 +1745,7 @@ DocumentLoader::DocumentLoader(MaterialX::DocumentPtr stdlib, bool clamp,
 
 MaterialX::DocumentPtr DocumentLoader::load(const std::string& filepath)
 {
+    VerboseScope verbose(m_verbose);
     MaterialX::DocumentPtr doc = MaterialX::createDocument();
 
     try {

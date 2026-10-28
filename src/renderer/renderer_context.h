@@ -7,6 +7,9 @@
 // need of it, to the loaders, services and devices. It becomes the public
 // prism::Renderer's implementation later (migration step 3).
 
+#include "../progress.h"
+#include "../varying_emitter_signal.h"
+#include "logger.h"
 #include "material_settings.h"
 #include "renderer_options.h"
 #include "runtime.h"
@@ -49,8 +52,19 @@ public:
     // options: renderers with the same options share one), created on first
     // use and held while the context lives.
     std::shared_ptr<TextureService> textures() const;
-    // options().devices with the texture service, for CreateDevice.
+    // options().devices with the texture service, the progress model, the
+    // logger and the varying-emission note, for CreateDevice.
     DeviceOptions deviceOptions() const;
+
+    // The renderer's diagnostics (options().log, logLevel, debugCategories):
+    // its warnings deduplicate per renderer. Bind it (logging::Bind) on the
+    // threads that work for the renderer.
+    Logger const& logger() const noexcept { return m_logger; }
+    // The renderer's load and preparation progress (services and devices
+    // report to it; hosts poll it).
+    Progress& progress() noexcept { return m_progress; }
+    // Notes of materials of varying emission (MaterialSettings, DeviceOptions).
+    std::shared_ptr<VaryingEmitterSignal> const& varyingEmitters() const noexcept { return m_varyingEmitters; }
 
 private:
     RendererOptions m_options;
@@ -58,6 +72,9 @@ private:
     mutable std::shared_ptr<const color::ColorManagement> m_color;
     mutable std::shared_ptr<TextureService> m_textures;
     bool m_sssFallback = false;
+    Logger m_logger;
+    mutable Progress m_progress;
+    std::shared_ptr<VaryingEmitterSignal> m_varyingEmitters = std::make_shared<VaryingEmitterSignal>();
 };
 
 } // namespace prism

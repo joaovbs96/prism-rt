@@ -923,6 +923,8 @@ void MaterialCallShaders::prewarmRaygen(bool varyingEmitters)
     if (prewarm.valid()) return;
     m_prewarmed |= varyingEmitters ? 2u : 1u;
     prewarm = std::async(std::launch::async, [this, varyingEmitters] {
+        prism::progress::Bind progressBinding(m_progress);
+        prism::logging::Bind logBinding(m_logger ? m_logger : &prism::logging::Default());
 #ifdef _WIN32
         // The raygen shader is usually the last shader a first scene waits
         // for: ahead of the scene loading that runs meanwhile (DXC inherits it).
@@ -955,6 +957,8 @@ void MaterialCallShaders::prefetch(std::string source)
 
 void MaterialCallShaders::prefetchWorker()
 {
+    prism::progress::Bind progressBinding(m_progress);
+    prism::logging::Bind logBinding(m_logger ? m_logger : &prism::logging::Default());
     for (;;) {
         std::string source;
         {

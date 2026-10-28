@@ -1,4 +1,5 @@
 #include "material_compiler.h"
+#include "../renderer/logger.h"
 
 #include <cstdint>
 #include <cstdlib>
@@ -15,10 +16,8 @@ namespace mdl {
 
 namespace {
 
-bool verbose_mdl() {
-    const char* value = std::getenv("PRISM_MDL_VERBOSE");
-    return value && *value && std::string(value) != "0";
-}
+// The calling thread's logger shows "mdl" debug output (PRISM_MDL_VERBOSE).
+bool verbose_mdl() { return prism::logging::Debug("mdl"); }
 
 // Stable 64-bit FNV-1a, so module names (and MDL dump filenames) do not change
 // between runs or standard-library implementations the way std::hash may.

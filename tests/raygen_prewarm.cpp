@@ -15,6 +15,8 @@
 
 namespace {
 int failures = 0;
+// The renderer's note of varying emission (RendererContext::varyingEmitters).
+const auto gSignal = std::make_shared<prism::VaryingEmitterSignal>();
 void check(bool condition, std::string const& message)
 {
     if (!condition) {
@@ -29,11 +31,14 @@ void Load(mdl::Context& context, RTCDevice device, const char* path, uint64_t* n
 {
     using namespace prism;
     using namespace prism::device;
-    const uint64_t before = varying_emitters::Notes();
+    const uint64_t before = gSignal->Notes();
     SceneManager scene(device, prism::color::ColorManagement::Create({}));
     const char* libraries = std::getenv("PRISM_MATERIALX_LIBRARY_PATH");
     const std::string libraryPath = libraries ? libraries : "";
-    USDMesh mesh(path, &context, libraryPath, libraryPath + "/mdl");
+    USDMesh::LoadOptions load;
+    load.materials.color = prism::color::ColorManagement::Create({});
+    load.materials.varyingEmitters = gSignal;
+    USDMesh mesh(path, &context, libraryPath, libraryPath + "/mdl", std::move(load));
     scene.attachImportedMesh(&mesh);
     ColorTexture black(Color3(0.0f));
     ConstantColorBackground background(&black);
@@ -43,7 +48,7 @@ void Load(mdl::Context& context, RTCDevice device, const char* path, uint64_t* n
     *materials = data.mdlMaterials.size();
     *varying = 0;
     for (auto const* material : data.mdlMaterials) *varying += material->variesEmission() ? 1 : 0;
-    *notes = varying_emitters::Notes() - before;
+    *notes = gSignal->Notes() - before;
 }
 } // namespace
 
@@ -59,7 +64,7 @@ int main(int argc, char** argv)
 
     // A subscriber hears each note.
     int heard = 0;
-    const int token = prism::varying_emitters::Subscribe([&] { ++heard; });
+    const int token = gSignal->Subscribe([&] { ++heard; });
 
     uint64_t notes = 0;
     size_t varying = 0, materials = 0;
@@ -76,7 +81,7 @@ int main(int argc, char** argv)
     check(varying == 0, "the control scene has no material of varying emission");
     check(notes == 0 && heard == 0, "no note without varying emitters (only the plain raygen is prewarmed)");
 
-    prism::varying_emitters::Unsubscribe(token);
+    gSignal->Unsubscribe(token);
     rtcReleaseDevice(device);
     if (failures) return 1;
     std::cout << "raygen prewarm: all checks passed\n";

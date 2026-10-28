@@ -5,7 +5,8 @@
 namespace prism {
 
 RendererContext::RendererContext(RendererOptions options)
-    : m_options(std::move(options)), m_sssFallback(m_options.materials.sssFallback)
+    : m_options(std::move(options)), m_sssFallback(m_options.materials.sssFallback),
+      m_logger(m_options.log, m_options.logLevel, m_options.debugCategories)
 {
     Runtime::Instance().Configure(m_options);
 }
@@ -52,6 +53,9 @@ DeviceOptions RendererContext::deviceOptions() const
 {
     DeviceOptions devices = m_options.devices;
     devices.textures = textures();
+    devices.progress = &m_progress;
+    devices.logger = &m_logger;
+    devices.varyingEmitters = m_varyingEmitters;
     return devices;
 }
 
@@ -63,6 +67,9 @@ MaterialSettings RendererContext::materialSettings() const
     settings.sssFallback = sssFallback();
     settings.generationCache = m_options.materials.generationCache;
     settings.mdlResourceMode = m_options.materials.mdlResourceMode;
+    settings.progress = &m_progress;
+    settings.logger = &m_logger;
+    settings.varyingEmitters = m_varyingEmitters;
     return settings;
 }
 

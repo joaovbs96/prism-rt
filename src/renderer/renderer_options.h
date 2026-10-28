@@ -7,15 +7,19 @@
 // ends reads these environment variables.
 
 #include "../color/color_management.h"
+#include "logger.h"
 
 #include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace prism {
 
+class Progress;
 class TextureService;
+class VaryingEmitterSignal;
 
 struct MaterialOptions {
     std::string materialxLibraries;   // PRISM_MATERIALX_LIBRARY_PATH
@@ -95,6 +99,12 @@ struct DeviceOptions {
     // The renderer's texture service (RendererContext::deviceOptions); null:
     // the runtime's (TextureService::Acquire()).
     std::shared_ptr<TextureService> textures;
+    // The renderer's progress model and logger, and its note of materials of
+    // varying emission (the Vulkan device prewarms their raygen variant);
+    // null: none, and the calling thread's logger.
+    Progress* progress = nullptr;
+    Logger const* logger = nullptr;
+    std::shared_ptr<VaryingEmitterSignal> varyingEmitters;
 };
 
 struct RendererOptions {
@@ -105,6 +115,12 @@ struct RendererOptions {
     Limits limits;
     TextureOptions textures;
     DeviceOptions devices;
+    // Diagnostics: the sink (empty: standard error), the level, and the
+    // categories whose debug output is on (PRISM_MDL_VERBOSE: "mdl",
+    // PRISM_GPU_VERBOSE: "gpu", PRISM_VERBOSE_LIGHTS: "lights").
+    LogSink log;
+    LogLevel logLevel = LogLevel::Warning;
+    std::vector<std::string> debugCategories;
     // The root of the persistent caches (PRISM_CACHE_DIR); empty: the
     // platform's cache directory (DefaultCacheDirectory). Process-wide: the
     // first renderer's (renderer/runtime.h).

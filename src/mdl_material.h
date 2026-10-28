@@ -12,6 +12,7 @@
 #include "materialx/mdl_generator.h"
 #include "resource_limits.h"
 #include "varying_emitter_signal.h"
+#include "renderer/logger.h"
 
 #include <mi/mdl_sdk.h>
 #include <memory>
@@ -34,10 +35,10 @@ using MdlStateMatrixRow = std::remove_const_t<std::remove_pointer_t<
 #include <string_view>
 #include <new>
 
+// The calling thread's logger shows "mdl" debug output (PRISM_MDL_VERBOSE).
 inline bool PrismMdlVerbose()
 {
-    const char* value = std::getenv("PRISM_MDL_VERBOSE");
-    return value && *value && std::string_view(value) != "0";
+    return prism::logging::Debug("mdl");
 }
 
 // Self-contained MDL material that takes a .mtlx file path, compiles
@@ -64,12 +65,13 @@ public:
     // Construct a material from an already validated immutable native program
     // and a freshly bound argument/resource block. The binding retains its
     // program and runtime, so no generator or SDK transaction is needed here.
-    explicit MDLMaterial(mdl::TargetCode boundTarget)
+    // `varyingEmitters`: the renderer's note of varying emission (null: none).
+    explicit MDLMaterial(mdl::TargetCode boundTarget, prism::VaryingEmitterSignal* varyingEmitters = nullptr)
         : m_target(std::move(boundTarget)), m_valid(m_target.success)
     {
         evaluateUniformCutout();
         evaluateUniformEmission();
-        if (m_varyingEmission) prism::varying_emitters::Note();
+        if (m_varyingEmission && varyingEmitters) varyingEmitters->Note();
         evaluateTransmission();
     }
     // Compiles a .mtlx file into a callable MDL material.
@@ -91,6 +93,9 @@ public:
                 const CompileSelector& select = {})
     {
         if (!settings.color) throw std::invalid_argument("MDLMaterial needs a colour management");
+        // The compile reports to the renderer's logger (the calling thread's
+        // if the settings carry none).
+        prism::logging::Bind logBinding(settings.logger ? settings.logger : &prism::logging::Current());
         prism::PreparationAdmission::Reservation admission(
             prism::PreparationAdmission::Shared(), prism::kMaterialCompileReservationBytes);
         if (PrismMdlVerbose())
@@ -102,6 +107,7 @@ public:
         const auto generationStart = std::chrono::steady_clock::now();
         MDLGenerator& generator = *MDLGenerator::workerLocal(mx_libraries_path, settings.color.get());
         DocumentLoader doc_loader(generator.get_stdlib(), true, settings.sssFallback);
+        doc_loader.setVerbose(PrismMdlVerbose());
         {
             const auto color = settings.color;
             doc_loader.setUniformColorConversion({color->materialXSpace(),
@@ -191,7 +197,7 @@ public:
         }
 
         // Phase 5: Backend compilation to native CPU code
-        mdl::BackendCompiler backend(mdl_context, settings.mdlResourceMode);
+        mdl::BackendCompiler backend(mdl_context, settings.mdlResourceMode, settings.varyingEmitters.get());
         m_target = backend.generate_target_code(m_compiled);
         if (timings) timings->nativeJitSeconds = m_target.nativeJitSeconds;
 
@@ -209,7 +215,7 @@ public:
         m_valid = true;
         evaluateUniformCutout();
         evaluateUniformEmission();
-        if (m_varyingEmission) prism::varying_emitters::Note();
+        if (m_varyingEmission && settings.varyingEmitters) settings.varyingEmitters->Note();
         evaluateTransmission();
         // NOTE: prints the *resolved* name (material_name may be empty)
         if (PrismMdlVerbose())

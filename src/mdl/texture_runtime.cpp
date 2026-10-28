@@ -1,4 +1,5 @@
 #include "texture_runtime.h"
+#include "../renderer/logger.h"
 
 #include <mi/neuraylib/iimage.h>
 #include <mi/neuraylib/itexture.h>
@@ -472,7 +473,7 @@ std::shared_ptr<NativeTextureRuntime> NativeTextureRuntime::Create(
         if(shape==mi::neuraylib::ITarget_code::Texture_shape_bsdf_data) {
             mi::Size width=0,height=0,depth=0;const char* pixelType=nullptr;
             const float* data=code->get_texture_df_data(i,width,height,depth,pixelType);
-            if(std::getenv("PRISM_MDL_VERBOSE"))
+            if(prism::logging::Debug("mdl"))
                 std::cerr<<"MDL BSDF table "<<i<<" name="
                     <<(code->get_texture(i)?code->get_texture(i):"<null>")
                     <<" kind="<<unsigned(code->get_texture_df_data_kind(i))

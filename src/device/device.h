@@ -296,7 +296,10 @@ std::vector<DeviceInfo> AvailableDevices(DeviceOptions const& options);
 
 // Diagnostics without a GPU device (PRISM_GPU_PROGRAM_REPORT): the scene's GPU programs and their sizes.
 // False if this build has no Vulkan device.
-bool ReportGpuPrograms(SceneManager& scene, std::ostream& out);
+// `varyingEmitters`: the renderer's note of varying emission (which raygen
+// variants a device would prewarm); null: none.
+bool ReportGpuPrograms(SceneManager& scene, std::ostream& out,
+                       prism::VaryingEmitterSignal const* varyingEmitters = nullptr);
 
 // Creates the preferred device. If it is unavailable, falls back to the CPU
 // device and explains why in *note (when non-null). `options` disable

@@ -1,4 +1,5 @@
 #include "gpu_device.h"
+#include "../../renderer/logger.h"
 
 #include "../../scene.h"
 #include "../../color/color_management.h"
@@ -40,10 +41,10 @@ static RayHit PrimaryHit(float const* hits, size_t index, size_t count)
     return hit;
 }
 
+// The calling thread's logger shows "gpu" debug output (PRISM_GPU_VERBOSE).
 bool GpuVerbose()
 {
-    const char* value = std::getenv("PRISM_GPU_VERBOSE");
-    return value && *value && std::string_view(value) != "0";
+    return prism::logging::Debug("gpu");
 }
 
 GpuFrame GpuRenderDevice::BaseFrame(prism::CameraRayParameters const& camera, unsigned width,
@@ -313,8 +314,7 @@ void GpuRenderDevice::RenderPass(SceneManager& scene, PassRequest const& request
     struct PassLog {
         double& gpu; double& dispatch; double& readback; size_t& pixels; Clock::time_point start;
         ~PassLog() {
-            static const bool verbose = GpuVerbose();
-            if (verbose)
+            if (GpuVerbose())
                 std::cerr << std::format("PrismRT GPU pass: wall {:.2f} ms, dispatch {:.2f} ms (GPU {:.2f} ms), "
                                          "readback {:.2f} ms, {} pixels\n",
                                          std::chrono::duration<double, std::milli>(Clock::now() - start).count(),

@@ -1,4 +1,5 @@
 #include "backend_compiler.h"
+#include "../renderer/logger.h"
 #include "texture_runtime.h"
 #include "../varying_emitter_signal.h"
 
@@ -128,10 +129,10 @@ std::shared_ptr<const ClassObserver> CurrentClassObserver()
     return gClassObserver;
 }
 
+// The calling thread's logger shows "mdl" debug output (PRISM_MDL_VERBOSE).
 bool VerboseMdl()
 {
-    const char* value = std::getenv("PRISM_MDL_VERBOSE");
-    return value && *value && std::string_view(value) != "0";
+    return prism::logging::Debug("mdl");
 }
 
 std::string UuidText(const mi::base::Uuid& hash)
@@ -420,8 +421,9 @@ void ClearTargetCodeCache(const Context* context)
     }
 }
 
-BackendCompiler::BackendCompiler(Context& ctx, std::string resourceMode)
-    : m_ctx(ctx), m_resourceMode(std::move(resourceMode))
+BackendCompiler::BackendCompiler(Context& ctx, std::string resourceMode,
+                                 prism::VaryingEmitterSignal* varyingEmitters)
+    : m_ctx(ctx), m_resourceMode(std::move(resourceMode)), m_varyingEmitters(varyingEmitters)
 {}
 
 void BackendCompiler::print_context_messages(mi::neuraylib::IMdl_execution_context* context) {
@@ -1025,8 +1027,8 @@ TargetCode BackendCompiler::generate_target_code(const CompiledMaterial& compile
         auto const& f = program->functions;
         const bool surfaceEmits = !emissionZero && f.surface_edf_function_index != ~mi::Size(0);
         const bool backEmits = backfaceEmission && f.backface_edf_function_index != ~mi::Size(0);
-        if ((surfaceEmits && !uniformEmission) || (!surfaceEmits && backEmits))
-            prism::varying_emitters::Note();
+        if (m_varyingEmitters && ((surfaceEmits && !uniformEmission) || (!surfaceEmits && backEmits)))
+            m_varyingEmitters->Note();
     }
     program->builtin_resources = !binding->texture_runtime;
     program->identity = cacheKey;

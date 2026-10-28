@@ -89,13 +89,14 @@ void DenoiseRenderedImage(RenderDevice& device, ImageRequest const& request,
             std::chrono::steady_clock::now() - start).count();
 }
 
-bool ReportGpuPrograms(SceneManager& scene, std::ostream& out)
+bool ReportGpuPrograms(SceneManager& scene, std::ostream& out,
+                       prism::VaryingEmitterSignal const* varyingEmitters)
 {
 #ifdef PRISM_HAS_VULKAN
-    ReportVulkanPrograms(scene, out);
+    ReportVulkanPrograms(scene, out, varyingEmitters);
     return true;
 #else
-    (void)scene; (void)out;
+    (void)scene; (void)out; (void)varyingEmitters;
     return false;
 #endif
 }

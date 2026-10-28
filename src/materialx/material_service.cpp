@@ -426,14 +426,10 @@ std::string ResolveTextureAssets(HdMaterialNetworkInterface& net,
                 // patterns keep the authored token for the stock SDK path
                 // when a custom resolver cannot enumerate a tile family.
                 if (preResolved.empty() || std::filesystem::path(preResolved).is_absolute()) {
-                    static std::mutex warnedMutex;
-                    static std::unordered_set<std::string> warned;
-                    {
-                        std::lock_guard lock(warnedMutex);
-                        if (warned.insert(authored).second)
-                            TF_WARN("[Hydra Material] No UDIM tiles found for '%s'; the texture is skipped",
-                                    authored.c_str());
-                    }
+                    // Once per renderer (the calling thread's logger).
+                    if (prism::logging::Current().once("udim tiles\n" + authored))
+                        TF_WARN("[Hydra Material] No UDIM tiles found for '%s'; the texture is skipped",
+                                authored.c_str());
                     data.value = std::string();
                     data.typeName = TfToken("asset");
                     net.SetNodeParameterData(node, param, data);
@@ -535,8 +531,8 @@ class TexturePrefetch {
 public:
     TexturePrefetch(std::vector<TextureWork> work, std::filesystem::path cacheDir,
                     std::function<bool()> cancelled, std::atomic<uint64_t>* bytesRead,
-                    unsigned threads)
-        : m_work(std::move(work)), m_cacheDir(std::move(cacheDir)),
+                    unsigned threads, prism::Progress* progress)
+        : m_progress(progress), m_work(std::move(work)), m_cacheDir(std::move(cacheDir)),
           m_cancelled(std::move(cancelled)), m_bytesRead(bytesRead),
           m_results(m_work.size()),
           // No slot is reserved for the calling thread: it goes on to
@@ -548,8 +544,10 @@ public:
             m_profile->detail("items=" + std::to_string(m_work.size()));
         }
         m_running = m_arena.max_concurrency();
-        prism::progress::Begin(prism::Phase::Textures);
-        prism::progress::SetTotal(prism::Phase::Textures, m_work.size());
+        if (m_progress) {
+            m_progress->Begin(prism::Phase::Textures);
+            m_progress->SetTotal(prism::Phase::Textures, m_work.size());
+        }
         m_arena.execute([this] {
             for (int i = 0; i < m_arena.max_concurrency(); ++i)
                 m_group.run([this] {
@@ -563,7 +561,7 @@ public:
     ~TexturePrefetch()
     {
         m_arena.execute([this] { m_group.wait(); });
-        prism::progress::End(prism::Phase::Textures);
+        if (m_progress) m_progress->End(prism::Phase::Textures);
     }
     TexturePrefetch(const TexturePrefetch&) = delete;
     TexturePrefetch& operator=(const TexturePrefetch&) = delete;
@@ -583,7 +581,7 @@ private:
             if (index >= m_work.size()) return;
             try { m_results[index] = Prepare(m_work[index]); }
             catch (...) {}
-            prism::progress::Add(prism::Phase::Textures);
+            if (m_progress) m_progress->Add(prism::Phase::Textures);
         }
     }
     Result Prepare(const TextureWork& work)
@@ -611,6 +609,7 @@ private:
         return result;
     }
 
+    prism::Progress* m_progress;
     std::vector<TextureWork> m_work;
     std::filesystem::path m_cacheDir;
     std::function<bool()> m_cancelled;
@@ -1205,7 +1204,8 @@ public:
                 bound = prism::materialx::BindCompatibleTemplate(
                     templateValue, prepared.network, *context,
                     prepared.resolverContext,
-                    std::to_string(prepared.resourceRevision), cacheDir);
+                    std::to_string(prepared.resourceRevision), cacheDir,
+                    materials.varyingEmitters.get());
             } catch (const std::exception& error) {
                 bound.error = error.what();
             }
@@ -1610,6 +1610,14 @@ void MaterialService::Prefetch(const std::vector<Request>& requests,
     if (unique.empty()) return;
     prism::load_profile::Scope profile("materials.prefetch");
     profile.detail("requests=" + std::to_string(unique.size()));
+    // The renderer's progress model and logger on this thread and the
+    // compile pool's (the calling thread's if the settings carry none).
+    prism::Progress* const progressModel =
+        m_impl->materials.progress ? m_impl->materials.progress : prism::Progress::Current();
+    prism::Logger const* const logger =
+        m_impl->materials.logger ? m_impl->materials.logger : &prism::logging::Current();
+    prism::progress::Bind progressBinding(progressModel);
+    prism::logging::Bind logBinding(logger);
     m_impl->jobs += unique.size();
     prism::progress::Scope progressScope(prism::Phase::Materials);
     prism::progress::AddTotal(prism::Phase::Materials, unique.size());
@@ -1641,7 +1649,7 @@ void MaterialService::Prefetch(const std::vector<Request>& requests,
         if (!work.empty())
             texturePrefetch = std::make_unique<TexturePrefetch>(
                 std::move(work), m_impl->cacheDir, cancelled, &m_impl->textureBytes,
-                m_impl->textureThreads);
+                m_impl->textureThreads, prism::Progress::Current());
     }
     struct Group { NetworkSnapshot structure; std::vector<size_t> indices; };
     std::vector<Group> groups;
@@ -1705,6 +1713,8 @@ void MaterialService::Prefetch(const std::vector<Request>& requests,
         pool.reserve(workers);
         for (unsigned i = 0; i < workers; ++i) {
             pool.emplace_back([&] {
+                prism::progress::Bind workerProgress(progressModel);
+                prism::logging::Bind workerLog(logger);
                 const double cpuStart = CurrentThreadCpuSeconds();
                 for (;;) {
                     if (cancelled && cancelled()) break;

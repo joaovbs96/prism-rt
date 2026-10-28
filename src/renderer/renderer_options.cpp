@@ -122,6 +122,14 @@ RendererOptions RendererOptions::FromEnvironment()
     options.devices.disableMetal = disabled("PRISM_DISABLE_METAL");
     options.devices.initialTextureBudgetMiB = defaults::FromEnvironment().gpuTextureBudgetMiB;
 
+    auto on = [](const char* name) {
+        const char* value = Text(name);
+        return value && std::string_view(value) != "0";
+    };
+    if (on("PRISM_MDL_VERBOSE")) options.debugCategories.push_back("mdl");
+    if (on("PRISM_GPU_VERBOSE")) options.debugCategories.push_back("gpu");
+    if (on("PRISM_VERBOSE_LIGHTS")) options.debugCategories.push_back("lights");
+
     if (const char* value = Text("PRISM_CACHE_DIR")) options.cacheDirectory = value;
     return options;
 }

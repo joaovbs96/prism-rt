@@ -139,10 +139,8 @@ inline UsdShadeMaterial ComputeBoundMaterialFor(UsdPrim const& prim,
     return UsdShadeMaterial(UsdPrim());
 }
 
-inline bool UsdMaterialVerbose() {
-    const char* value = std::getenv("PRISM_MDL_VERBOSE");
-    return value && *value && std::string_view(value) != "0";
-}
+// The calling thread's logger shows "mdl" debug output (PRISM_MDL_VERBOSE).
+inline bool UsdMaterialVerbose() { return prism::logging::Debug("mdl"); }
 
 /// A bound material prim as the loader compiles it: its composed UsdShade
 /// network as a Hydra material data source (which the material service of
