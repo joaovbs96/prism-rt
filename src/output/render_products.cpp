@@ -1,5 +1,7 @@
 #include "render_products.h"
 
+#include <prism/io.h>
+
 #include <pxr/base/tf/stringUtils.h>
 #include <pxr/usd/sdf/assetPath.h>
 #include <pxr/usd/usdGeom/camera.h>
@@ -90,6 +92,41 @@ CameraUtilConformWindowPolicy ConformPolicy(TfToken const &policy)
     if (policy == UsdRenderTokens->adjustApertureHeight) return CameraUtilMatchHorizontally;
     if (policy == UsdRenderTokens->adjustPixelAspectRatio) return CameraUtilDontConform;
     return CameraUtilFit; // expandAperture
+}
+
+std::optional<prism::Aov> PublicAov(AovKind kind)
+{
+    auto const *info = FindAov(kind);
+    return info ? prism::AovFromName(info->name) : std::nullopt;
+}
+
+prism::ConformPolicy PublicConformPolicy(TfToken const &policy)
+{
+    switch (ConformPolicy(policy)) {
+    case CameraUtilCrop: return prism::ConformPolicy::CropAperture;
+    case CameraUtilMatchVertically: return prism::ConformPolicy::AdjustApertureWidth;
+    case CameraUtilMatchHorizontally: return prism::ConformPolicy::AdjustApertureHeight;
+    case CameraUtilDontConform: return prism::ConformPolicy::AdjustPixelAspectRatio;
+    default: return prism::ConformPolicy::ExpandAperture;
+    }
+}
+
+bool WriteProduct(RenderProductRequest const &product, prism::RenderResult const &result,
+                  prism::Renderer const &renderer, std::vector<std::string> *warnings)
+{
+    prism::io::WriteOptions options;
+    options.multiPart = product.multiPart;
+    for (auto const &var : product.vars) {
+        const auto aov = PublicAov(var.kind);
+        if (!aov || !result.has(*aov)) {
+            Warn(warnings, "Render var <" + var.path.GetString() + "> was not rendered; skipped");
+            continue;
+        }
+        options.layers.push_back({*aov, var.name, unsigned(var.components)});
+    }
+    if (options.layers.empty()) return false;
+    prism::io::Write(product.output, result, renderer, options, warnings);
+    return true;
 }
 
 std::string SettingText(VtDictionary const &settings, std::string const &name)

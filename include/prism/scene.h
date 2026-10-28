@@ -247,8 +247,10 @@ public:
     // meshes (subdivision, displacement), loads light and environment
     // textures and builds the acceleration structure. Blocking. Material
     // failures are diagnostics (the material renders magenta); invalid
-    // references throw.
-    CommitResult commit();
+    // references throw. The callback hears each phase and material on this
+    // thread; returning false stops the commit (Error(Cancelled); the last
+    // committed revision stays).
+    CommitResult commit(ProgressCallback const& progress = {});
     // Revisions committed so far (0: none).
     uint64_t revision() const;
     // Diagnostics of the last commit.

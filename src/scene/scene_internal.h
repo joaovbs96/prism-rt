@@ -30,12 +30,15 @@ struct PlacementInfo {
     int primId = -1;
     int instanceId = -1;
     uint64_t userData = 0;
-    // The mesh's coarse face per triangle (elementId); empty: the triangle.
+    // The mesh's coarse face per triangle (elementId); empty: the triangle
+    // for triangle lists, none (-1) otherwise.
     prism::mesh::SharedFaceTable coarseFaces;
+    bool triangleList = false;  // a mesh taken as given (glTF, OBJ)
 };
 
 // SceneManager's render settings (section 2.7 of the design), applied to
-// each committed SceneManager until sessions take them.
+// each committed SceneManager; sessions set them from their RenderSettings
+// before they render.
 struct SceneRenderSettings {
     int maxDepth = 32;
     int rouletteDepth = 4;
@@ -44,6 +47,7 @@ struct SceneRenderSettings {
     bool honorDoubleSided = false;
     bool textureStreaming = true;
     int gpuTextureBudgetMiB = 0;
+    bool operator==(SceneRenderSettings const&) const = default;
 };
 
 struct SceneAccess {

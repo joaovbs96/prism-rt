@@ -623,7 +623,7 @@ struct Scene::Impl {
     }
 
     std::shared_ptr<Material> compile(MaterialEntry& entry);
-    CommitResult commit();
+    CommitResult commit(ProgressCallback const& progress);
 };
 
 std::shared_ptr<Material> Scene::Impl::compile(MaterialEntry& entry)
@@ -694,9 +694,20 @@ std::shared_ptr<Material> Scene::Impl::compile(MaterialEntry& entry)
     return std::shared_ptr<Material>(std::shared_ptr<Material>(), ErrorMaterial::Shared());
 }
 
-CommitResult Scene::Impl::commit()
+CommitResult Scene::Impl::commit(ProgressCallback const& progress)
 {
     const auto start = std::chrono::steady_clock::now();
+    // Progress per phase (and material); a false return stops the commit.
+    auto report = [&](const char* phase, size_t done, size_t total) {
+        if (!progress) return;
+        ProgressInfo info;
+        info.phase = phase;
+        info.done = done;
+        info.total = total;
+        info.fraction = total ? double(done) / double(total) : 0.0;
+        info.elapsedSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        if (!progress(info)) Throw(ErrorCode::Cancelled, "the commit was cancelled");
+    };
     diagnostics.clear();
     auto revision = std::make_unique<Revision>();
     auto colorManagement = context->colorManagement();
@@ -706,9 +717,13 @@ CommitResult Scene::Impl::commit()
     CommitResult result;
 
     // ── Materials: compiled once per description (load time only).
+    size_t materialCount = 0, materialsDone = 0;
+    materials.forEach([&](uint64_t, MaterialEntry&) { ++materialCount; });
+    report("materials", 0, materialCount);
     materials.forEach([&](uint64_t, MaterialEntry& entry) {
         if (!entry.compiled) entry.compiled = compile(entry);
         revision->materials.push_back(entry.compiled);
+        report("materials", ++materialsDone, materialCount);
     });
     result.materials = revision->materials.size();
     // Geometry without a material: the delegate's fallback grey.
@@ -813,6 +828,7 @@ CommitResult Scene::Impl::commit()
         placements.push_back(std::move(placement));
     });
 
+    report("geometry", 0, shapes.size());
     // Refinement levels within the scene's budget, then the conversions:
     // meshes that refine or displace by the shared conversion (as
     // prototypes), the others by the polygon conversion.
@@ -952,6 +968,7 @@ CommitResult Scene::Impl::commit()
         info.instanceId = placement.desc->instanceId;
         info.userData = placement.desc->userData;
         info.coarseFaces = shape.coarseFaces;
+        info.triangleList = shape.verbatim;
         revision->placements[id] = std::move(info);
         attached.emplace_back(id, placement.desc);
         result.triangles += mesh->indices.size() / 3;
@@ -1017,6 +1034,7 @@ CommitResult Scene::Impl::commit()
     manager.textureStreaming = renderSettings.textureStreaming;
     manager.gpuTextureBudgetMiB = renderSettings.gpuTextureBudgetMiB;
 
+    report("lights", 0, 0);
     // ── Environments, in order; several add up.
     auto toWorking = [&](Color3 const& color, std::string const& space) {
         if (space.empty()) return color;
@@ -1139,6 +1157,7 @@ CommitResult Scene::Impl::commit()
                                                      mask(shadowCategories, instance->shadowLinkCategories)};
     }
 
+    report("acceleration", 0, 0);
     manager.commitScene();
 
     // A scene with no lights, emissive geometry or environment would render
@@ -1282,7 +1301,7 @@ void Scene::remove(LightId id) { m_impl->lights.remove(id.v, "light"); }
 void Scene::remove(EnvironmentId id) { m_impl->environments.remove(id.v, "environment"); }
 void Scene::remove(CameraId id) { m_impl->cameras.remove(id.v, "camera"); }
 
-CommitResult Scene::commit() { return m_impl->commit(); }
+CommitResult Scene::commit(ProgressCallback const& progress) { return m_impl->commit(progress); }
 uint64_t Scene::revision() const { return m_impl->revision; }
 std::vector<Diagnostic> Scene::diagnostics() const { return m_impl->diagnostics; }
 SceneOptions const& Scene::options() const { return m_impl->options; }

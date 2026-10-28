@@ -7,6 +7,9 @@
 #include "aov.h"
 #include "image_writer.h"
 
+#include <prism/renderer.h>
+#include <prism/session.h>
+
 #include <pxr/base/gf/range2f.h>
 #include <pxr/base/vt/array.h>
 #include <pxr/base/vt/dictionary.h>
@@ -104,6 +107,17 @@ struct RenderedAov {
 Image BuildProductImage(RenderProductRequest const &product,
                         std::vector<RenderedAov> const &aovs,
                         std::vector<std::string> *warnings);
+
+// The public AOV of a kind (nullopt for Unknown).
+std::optional<prism::Aov> PublicAov(AovKind kind);
+// The public conform policy of an aspectRatioConformPolicy token.
+prism::ConformPolicy PublicConformPolicy(pxr::TfToken const &policy);
+
+// Writes the product from a session's render (prism_io): a layer per var, as
+// BuildProductImage. Returns false, with messages in *warnings, when none of
+// its vars was rendered (nothing is written).
+bool WriteProduct(RenderProductRequest const &product, prism::RenderResult const &result,
+                  prism::Renderer const &renderer, std::vector<std::string> *warnings);
 
 // The value of a prism:* setting as text (string, token or asset path), or
 // empty.

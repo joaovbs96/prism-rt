@@ -191,7 +191,9 @@ std::vector<float> CpuDevice::RenderImage(SceneManager& scene, ImageRequest cons
     const auto start = std::chrono::steady_clock::now();
     if (request.timeLimitReached) *request.timeLimitReached = false;
     int done = 0;
+    auto cancelled = [&] { return request.cancel && request.cancel->load(std::memory_order_relaxed); };
     while (done < request.samples) {
+        if (cancelled()) return {};
         if (timed && done > 0 &&
             std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() >=
                 request.timeLimitSeconds) {
@@ -206,6 +208,7 @@ std::vector<float> CpuDevice::RenderImage(SceneManager& scene, ImageRequest cons
         const uint64_t roundWork = uint64_t(active.Count()) * uint64_t(next - done);
         std::atomic<uint64_t> roundDone{0};
         tbb::parallel_for(0, height, [&](int y) {
+            if (cancelled()) return;
             uint64_t rowWork = 0;
             for (int x = 0; x < width; ++x) {
                 const size_t pixel = size_t(y) * width + x;
@@ -214,6 +217,9 @@ std::vector<float> CpuDevice::RenderImage(SceneManager& scene, ImageRequest cons
                 unsigned& seed = seeds[pixel];
                 if (done == 0) seed = tea<64>(unsigned(y*width) ^ request.seed, unsigned(x));
                 for (int sample = done; sample < next; ++sample) {
+                    // A cancelled render's pixels are dropped: stop within
+                    // a pixel's samples too (one round may be all of them).
+                    if ((sample & 15) == 15 && cancelled()) return;
                     const auto result = TraceSample(scene, *state, camera, settings, unsigned(x),
                         unsigned(y), unsigned(width), unsigned(height), seed, unsigned(sample),
                         seedImage(unsigned(x), unsigned(y), unsigned(width), request.seed), lightAovs);
@@ -229,6 +235,7 @@ std::vector<float> CpuDevice::RenderImage(SceneManager& scene, ImageRequest cons
                                         std::memory_order_relaxed);
             }
         });
+        if (cancelled()) return {};
         done = next;
         if (progress) progress->samples.store(double(done), std::memory_order_relaxed);
         if (done < request.samples && adaptive.CheckAfter(done)) {

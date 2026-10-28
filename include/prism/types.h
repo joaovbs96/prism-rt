@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -104,5 +105,30 @@ Sampled<T> Constant(T value)
 {
     return Sampled<T>{TimeSample<T>{0.0, std::move(value)}};
 }
+
+// Progress of a commit or a render, passed to a ProgressCallback.
+struct ProgressInfo {
+    // "materials", "geometry", "lights", "acceleration" (commit);
+    // "device", "rendering", "denoising", "aovs", "done" (render).
+    std::string phase;
+    std::string detail;
+    // Overall progress of the phase in [0, 1].
+    double fraction = 0.0;
+    // Commit phases: items done of total (0 total: not counted).
+    size_t done = 0, total = 0;
+    // Rendering: samples traced per still-active pixel (0 while the device
+    // prepares), the per-pixel target, and the fraction of pixels adaptive
+    // sampling still traces.
+    double samples = 0.0;
+    int targetSamples = 0;
+    double activeFraction = 1.0;
+    double elapsedSeconds = 0.0;
+};
+
+// Called with progress; returning false cancels (the blocking call then
+// throws Error(Cancelled)). Renders call it on an internal thread about ten
+// times a second and once at the end; commits on the committing thread at
+// each phase and material.
+using ProgressCallback = std::function<bool(ProgressInfo const&)>;
 
 } // namespace prism

@@ -161,6 +161,8 @@ std::vector<float> GpuRenderDevice::RenderImage(SceneManager& scene, ImageReques
     // parallel, so the dispatch still fills the GPU.
     constexpr int maxReplicas = 16;
     for (int sample = 0; sample < request.samples && !list.empty();) {
+        // Cancelled (ImageRequest::cancel): stop at this sample boundary.
+        if (request.cancel && request.cancel->load(std::memory_order_relaxed)) return {};
         if (request.timeLimitSeconds > 0.0 && sample > 0 &&
             std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() >=
                 request.timeLimitSeconds) {
