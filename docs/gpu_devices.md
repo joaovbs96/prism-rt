@@ -1060,6 +1060,32 @@ called done there.
     `declaration_repairs.usda` with `--device metal`: no magenta error
     material, within noise of `--device cpu`; and the Typhoon suite's
     `test-suite/eon_diffuse_openpbr_compare.usda` on Metal against the CPU.
+- **SDK step 1: per-renderer state** ([sdk_design.md](sdk_design.md), section 7,
+  steps 1a-1e; written on Windows, the Metal device unbuilt):
+  - Metal device code (`src/device/metal/metal_device.mm`): `PRISM_DISABLE_METAL`
+    is no longer read there; `CreateDevice`/`AvailableDevices` check
+    `DeviceOptions::disableMetal` (`src/device/device.cpp`). `Verbose()` is
+    `prism::logging::Debug("gpu")` (new include `../../renderer/logger.h`).
+    It still takes textures from `TextureService::Acquire()` (the runtime's
+    service, the renderer's for a single renderer) and does not subscribe to
+    the renderer's varying-emission note (it never did).
+  - Shared host code: `CreateDevice(preference, DeviceOptions, note)` and
+    `AvailableDevices(DeviceOptions)` take the renderer's options;
+    `GpuSceneData::luminanceWeights` (from the scene's colour management)
+    feeds `GpuFrame::color` in `GpuRenderDevice::BaseFrame` instead of a
+    process-wide colour management; `GpuVerbose()` reads the calling thread's
+    logger; `ShaderCacheDirectory("metal")` uses the runtime's explicit cache
+    root (`RendererOptions::cacheDirectory`, PRISM_CACHE_DIR) else
+    `~/Library/Caches/PrismRT` as before; `src/hydra/scene_bridge.cpp`
+    creates devices with `RendererContext::deviceOptions()` and binds the
+    delegate's progress model and logger on its threads; light tables and
+    environments take the scene's colour management.
+  - No shader change: `shaders/` is untouched.
+  - Runs: build; `ctest -R "renderer_options|color|material_identity"` (CPU);
+    `PRISM_DISABLE_METAL=1 PrismRT --list-devices` lists only the CPU; an egg
+    and the chess set with `--device metal` against `--device cpu`
+    (`prism_compare_images`, noise floor), and `prism_hydra_render` of
+    `tests/hydra/fixtures/parity.usda` on Metal.
 
 ## Diagnostics
 
