@@ -2510,6 +2510,8 @@ void _SetDomeEnvironment(HdSceneIndexBaseRefPtr const &scene,
         auto local = snapshot->prototypePool->environmentCache.Get(std::move(texture), multiplier,
                                                                    snapshot->scene->color());
         auto dome = std::make_unique<CachedTransformedEnvironment>(std::move(local), linear);
+        if (dome->singularTransform())
+            TF_WARN("PrismRT: invalid or singular dome transform; using identity");
         dome->diffuseFactor = _ContainerValue(light, HdLightTokens->diffuse, 1.0f);
         dome->specularFactor = _ContainerValue(light, HdLightTokens->specular, 1.0f);
         // Several domes light the scene together (CompositeEnvironment).

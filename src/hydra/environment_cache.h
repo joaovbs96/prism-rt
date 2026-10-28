@@ -7,7 +7,6 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
-#include <pxr/base/tf/diagnostic.h>
 
 namespace prism::hydra {
 
@@ -110,6 +109,9 @@ public:
     const std::array<float, 9>& worldToEnvironment() const { return m; }
     const std::array<float, 9>& environmentToWorld() const { return inv; }
     float transformDeterminant() const { return det; }
+    // The authored transform was invalid or singular and identity is used;
+    // the owner warns (the render devices that mirror it only read it).
+    bool singularTransform() const { return singular; }
 
     Color3 radiance(const Float3& world) const override {
         return this->local->map.radiance(apply(m, world).normalize());
@@ -171,8 +173,7 @@ private:
     void invert() {
         det=m[0]*(m[4]*m[8]-m[5]*m[7])-m[1]*(m[3]*m[8]-m[5]*m[6])+m[2]*(m[3]*m[7]-m[4]*m[6]);
         if (!std::isfinite(det) || std::fabs(det)<1e-12f) {
-            PXR_NAMESPACE_USING_DIRECTIVE
-            TF_WARN("PrismRT: invalid or singular dome transform; using identity");
+            singular=true;
             m={1,0,0,0,1,0,0,0,1}; det=1;
         }
         const float q=1/det;
@@ -183,6 +184,7 @@ private:
     std::shared_ptr<const LocalEnvironment> local;
     std::array<float,9> m, inv{};
     float det=1.0f;
+    bool singular=false;
 };
 
 } // namespace prism::hydra

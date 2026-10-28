@@ -64,6 +64,7 @@ int main() {
                 "Shared distribution counted once per wrapper instead of once per resource");
         const std::array<float,9> singular{0,0,0,0,0,0,0,0,0};
         prism::hydra::CachedTransformedEnvironment singularCached(local,singular);
+        require(singularCached.singularTransform(),"Singular dome transform not reported");
         TransformedEnvironmentMap singularReference(texture.get(),multiplier,singular,*color);
         compare(singularCached,singularReference);
         auto changed=cache.Get(texture,Color3(.7f,1.2f,2.300001f),*color);
