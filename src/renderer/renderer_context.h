@@ -57,7 +57,7 @@ public:
     std::shared_ptr<TextureService> textures() const;
     // options().devices with the texture service, the progress model, the
     // logger and the varying-emission note, for CreateDevice.
-    DeviceOptions deviceOptions() const;
+    DeviceResources deviceOptions() const;
 
     // The renderer's diagnostics (options().log, logLevel, debugCategories):
     // its warnings deduplicate per renderer. Bind it (logging::Bind) on the

@@ -11,6 +11,7 @@
 // go through the configured display and view (ACES 2.0 SDR on sRGB).
 
 #include "../float3.h"
+#include "../../include/prism/options.h"
 
 #include <array>
 #include <cstddef>
@@ -35,17 +36,10 @@ inline Float3 Apply(Matrix3 const &m, Float3 const &c)
                   m[6] * c.x() + m[7] * c.y() + m[8] * c.z());
 }
 
-struct Options {
-    std::string config;       // empty: kDefaultConfig (front ends fill in $OCIO)
-    std::string workingSpace; // empty: ACEScg (the config's scene_linear role if it has none)
-    std::string display;      // empty: the config's default display
-    std::string view;         // empty: the display's default view
-    // UsdRenderSettings.renderingColorSpace (lin_rec709_scene, lin_ap1_scene,
-    // data, ...): the working space when workingSpace is empty
-    // (RenderingColorSpaceWorkingSpace).
-    std::string renderingColorSpace;
-    bool operator==(Options const &) const = default;
-};
+// The public colour options (include/prism/options.h); an empty config is
+// kDefaultConfig, an empty working space the renderingColorSpace's
+// (RenderingColorSpaceWorkingSpace), else ACEScg.
+using Options = prism::ColorOptions;
 
 class ColorManagement {
 public:

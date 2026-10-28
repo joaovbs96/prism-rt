@@ -68,9 +68,9 @@ std::shared_ptr<TextureService> RendererContext::textures() const
     return m_textures;
 }
 
-DeviceOptions RendererContext::deviceOptions() const
+DeviceResources RendererContext::deviceOptions() const
 {
-    DeviceOptions devices = m_options.devices;
+    DeviceResources devices(m_options.devices);
     devices.textures = textures();
     devices.progress = &m_progress;
     devices.logger = &m_logger;

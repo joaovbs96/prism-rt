@@ -30,17 +30,14 @@ class SceneManager;
 namespace prism::device {
 
 using prism::DeviceOptions;
+using prism::DeviceResources;
 
-enum class DeviceKind { Cpu, Vulkan, Metal };
-
+// Public types (include/prism/settings.h).
+using prism::DeviceKind;
 // Auto prefers the platform GPU device and falls back to the CPU device.
-enum class DevicePreference { Auto, Cpu, Vulkan, Metal };
-
-struct DeviceInfo {
-    DeviceKind kind = DeviceKind::Cpu;
-    std::string name;
-    bool hardwareRayTracing = false;
-};
+using prism::DevicePreference;
+using prism::DeviceInfo;
+using prism::NeeSettings;
 
 const char* ToString(DeviceKind kind);
 const char* ToString(DevicePreference preference);
@@ -53,18 +50,6 @@ std::string RemovedDeviceMessage(std::string_view text);
 struct PixelTile {
     unsigned x = 0, y = 0, width = 0, height = 0;
     size_t index = 0;
-};
-
-// Probabilistic next-event estimation: from fromDepth on, lights are sampled
-// with probability clamp(path weight, probabilityMin, 1), which saves NEE
-// work on dim deep paths at a noise cost. A probabilityMin of 0 (the default)
-// always samples them: skipping NEE raised the MSE of CornellBox by 40% for 1%
-// of time, and was about neutral on dome-lit and subsurface scenes.
-struct NeeSettings {
-    float probabilityMin = 0.0f;
-    int fromDepth = 2;
-    // Spatial light selection among analytic lights (PathTracer::pickLight).
-    bool spatialLights = true;
 };
 
 // The light AOVs of a sample, or their mean over a pixel's samples
@@ -134,6 +119,10 @@ struct ImageRequest {
     bool* timeLimitReached = nullptr;
     // Updated while the render runs (when non-null).
     ImageProgress* progress = nullptr;
+    // When non-null and set (from any thread), the render stops at its next
+    // sample boundary (the CPU device also skips the remaining rows) and
+    // returns an empty image; nothing else is written.
+    std::atomic<bool> const* cancel = nullptr;
     // Light contributions to keep (kContribution* mask; noise analysis).
     unsigned contributions = 7;
     NeeSettings nee;
@@ -292,7 +281,7 @@ void DenoiseRenderedImage(RenderDevice& device, ImageRequest const& request,
 
 // Devices compiled into this build with a usable adapter and not disabled by
 // `options`, CPU always last.
-std::vector<DeviceInfo> AvailableDevices(DeviceOptions const& options);
+std::vector<DeviceInfo> AvailableDevices(DeviceResources const& options);
 
 // Diagnostics without a GPU device (PRISM_GPU_PROGRAM_REPORT): the scene's GPU programs and their sizes.
 // False if this build has no Vulkan device.
@@ -304,7 +293,7 @@ bool ReportGpuPrograms(SceneManager& scene, std::ostream& out,
 // Creates the preferred device. If it is unavailable, falls back to the CPU
 // device and explains why in *note (when non-null). `options` disable
 // devices and set their initial texture budget (the renderer's).
-std::unique_ptr<RenderDevice> CreateDevice(DevicePreference preference, DeviceOptions const& options,
+std::unique_ptr<RenderDevice> CreateDevice(DevicePreference preference, DeviceResources const& options,
                                            std::string* note = nullptr);
 
 } // namespace prism::device

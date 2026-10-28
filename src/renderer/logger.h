@@ -19,13 +19,10 @@
 #include <string_view>
 #include <vector>
 
+// LogLevel and LogSink are public (the renderer's options).
+#include "../../include/prism/options.h"
+
 namespace prism {
-
-enum class LogLevel { Debug, Info, Warning, Error };
-
-// Called for each message the logger's level and categories let through,
-// possibly on several threads at once.
-using LogSink = std::function<void(LogLevel level, std::string_view category, std::string_view message)>;
 
 class Logger {
 public:

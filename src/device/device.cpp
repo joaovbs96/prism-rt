@@ -104,7 +104,7 @@ bool ReportGpuPrograms(SceneManager& scene, std::ostream& out,
 namespace {
 
 // Returns null (with a reason) if the device is unavailable.
-std::unique_ptr<RenderDevice> TryCreate(DeviceKind kind, DeviceOptions const& options, std::string* reason)
+std::unique_ptr<RenderDevice> TryCreate(DeviceKind kind, DeviceResources const& options, std::string* reason)
 {
     switch (kind) {
     case DeviceKind::Cpu:
@@ -147,7 +147,7 @@ std::vector<DeviceKind> AutoOrder()
 
 } // namespace
 
-std::vector<DeviceInfo> AvailableDevices(DeviceOptions const& options)
+std::vector<DeviceInfo> AvailableDevices(DeviceResources const& options)
 {
     std::vector<DeviceInfo> devices;
     for (DeviceKind kind : {DeviceKind::Metal, DeviceKind::Vulkan}) {
@@ -157,7 +157,7 @@ std::vector<DeviceInfo> AvailableDevices(DeviceOptions const& options)
     return devices;
 }
 
-std::unique_ptr<RenderDevice> CreateDevice(DevicePreference preference, DeviceOptions const& options,
+std::unique_ptr<RenderDevice> CreateDevice(DevicePreference preference, DeviceResources const& options,
                                            std::string* note)
 {
     std::vector<DeviceKind> order;

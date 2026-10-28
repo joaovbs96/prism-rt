@@ -704,7 +704,7 @@ struct VulkanDevice::Impl {
     uint64_t earlyBytes = 0, earlyBudget = 0;
     // DeviceOptions::initialTextureBudgetMiB: the budget of the early uploads.
     int initialTextureBudgetMiB = 0;
-    // The renderer's texture service (DeviceOptions::textures): early
+    // The renderer's texture service (DeviceResources::textures): early
     // uploads observe it, scenes' images are read through it.
     std::shared_ptr<prism::TextureService> textures;
     // The renderer's progress model and logger, bound on the device's own
@@ -3446,7 +3446,7 @@ bool VulkanDevice::Impl::dispatch(GpuFrame const& work, uint32_t threads, double
     return true;
 }
 
-std::unique_ptr<VulkanDevice> VulkanDevice::Create(DeviceOptions const& options, std::string* reason)
+std::unique_ptr<VulkanDevice> VulkanDevice::Create(DeviceResources const& options, std::string* reason)
 {
     // DeviceOptions::disableVulkan (PRISM_DISABLE_VULKAN) is checked by
     // CreateDevice (device.cpp).

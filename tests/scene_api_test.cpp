@@ -142,7 +142,7 @@ void buildAndRender(prism::Renderer const& renderer)
     prism::Matrix4d projection(1.0 / t, 0, 0, 0, 0, 1.0 / t, 0, 0, 0, 0, (f + n) / (n - f), -1, 0, 0,
                                2 * f * n / (n - f), 0);
     request.camera.inverseProjection = projection.inverse();
-    prism::DeviceOptions deviceOptions = renderer.context()->deviceOptions();
+    auto deviceOptions = renderer.context()->deviceOptions();
     auto device = prism::device::CreateDevice(prism::device::DevicePreference::Cpu, deviceOptions);
     device->SceneChanged(manager);
     const std::vector<float> pixels = device->RenderImage(manager, request);

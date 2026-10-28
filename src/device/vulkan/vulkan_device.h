@@ -19,7 +19,7 @@ class VulkanDevice final : public gpu::GpuRenderDevice {
 public:
     // Null (with a reason) unless a device supports ray queries.
     // `options`: the initial texture budget and the renderer's texture service.
-    static std::unique_ptr<VulkanDevice> Create(DeviceOptions const& options, std::string* reason);
+    static std::unique_ptr<VulkanDevice> Create(DeviceResources const& options, std::string* reason);
     ~VulkanDevice() override;
 
     DeviceInfo Info() const override;

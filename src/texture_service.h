@@ -5,6 +5,7 @@
 
 #include "color/color_management.h"
 #include "renderer/renderer_options.h"
+#include "../include/prism/settings.h"
 
 #include <filesystem>
 #include <functional>
@@ -14,7 +15,7 @@
 
 namespace prism {
 
-enum class TextureFiltering { Filtered, Bilinear };
+// TextureFiltering is public (include/prism/settings.h).
 enum class TextureWrap { Default, Black, Clamp, Periodic, Mirror, PeriodicPow2, Shadow };
 
 struct TextureLookup {

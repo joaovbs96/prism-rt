@@ -17,32 +17,20 @@
 //                  CPU denoiser on host copies when OIDN has no Metal device.
 // Every backend runs the same network weights (OIDN 2.5.1's).
 
+#include "../../include/prism/settings.h"
+
 #include <memory>
 #include <string>
 #include <string_view>
 
 namespace prism::device {
 
-// OIDN's quality modes: fast and balanced for interactive previews, high for
-// final frames.
-enum class DenoiseQuality { Fast, Balanced, High };
+// The quality modes and settings are public (include/prism/settings.h).
+using prism::DenoiseQuality;
+using prism::DenoiseSettings;
 
 const char* ToString(DenoiseQuality quality);
 bool ParseDenoiseQuality(std::string_view text, DenoiseQuality* quality);
-
-struct DenoiseSettings {
-    DenoiseQuality quality = DenoiseQuality::High;
-    // The colour is high dynamic range linear radiance (path-traced colour
-    // always is; false: values in [0, 1]).
-    bool hdr = true;
-    // Denoise the albedo and normal first and then treat them as noise-free
-    // (OIDN's prefiltering and cleanAux): sharper textures for final frames,
-    // at about three times the cost. Off: they are passed as they are, with
-    // cleanAux off (OIDN's choice for noisy guides and previews).
-    bool prefilter = true;
-
-    bool operator==(DenoiseSettings const&) const = default;
-};
 
 // The images of one denoise on the host: width x height pixels, top row
 // first, `stride` floats per pixel of which the first three are used (RGB,
