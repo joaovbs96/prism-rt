@@ -4,7 +4,7 @@
 #include "../materialx/material_service.h"
 #include "environment_cache.h"
 #include "render_buffer.h"
-#include "refinement_tiles.h"
+#include "../session/progressive_engine.h"
 #include "../mesh/mesh_conversion.h"
 #include "../usd/usd_mesh_source.h"
 #include "../mesh/subdivision.h"
@@ -4255,19 +4255,6 @@ private:
     std::shared_ptr<prism::device::RenderDevice> renderDevice;
 };
 
-struct PreviewResult {
-    unsigned int width = 0;
-    unsigned int height = 0;
-    bool published = false;
-    double publicationMilliseconds = 0.0;
-    // Tracing time without scene preparation (GPU devices upload the scene
-    // on their first render).
-    double traceMilliseconds = 0.0;
-    uint64_t publishedBytes = 0;
-    uint64_t tracedPixels = 0;
-    uint64_t boundAovCount = 0;
-};
-
 using prism::output::AovKind;
 
 AovKind _AovKind(TfToken const &name)
@@ -4286,17 +4273,6 @@ bool _LightAov(AovKind kind) { return prism::output::LightAov(kind); }
 bool _TracedAov(AovKind kind)
 {
     return kind == AovKind::Color || _LightAov(kind) || kind == AovKind::Denoised;
-}
-
-Color3 const &_LightAovValue(prism::device::LightAovPixel const &pixel, AovKind kind)
-{
-    return kind == AovKind::Albedo ? pixel.albedo : kind == AovKind::Diffuse ? pixel.diffuse
-        : kind == AovKind::Specular ? pixel.specular : pixel.emission;
-}
-
-size_t _AovComponents(AovKind kind)
-{
-    return static_cast<size_t>(prism::output::AovComponents(kind));
 }
 
 // Convert while the center-ray hit is local; only requested final outputs are
@@ -4321,245 +4297,6 @@ void _ResolvePrimaryAov(AovKind kind, RayHit const &hit, CameraState const &came
         prism::output::ResolveGeometricAov(kind, hit, prism::usd::ToMatrix4d(camera.worldToView),
                                            prism::usd::ToMatrix4d(camera.projection), values);
     }
-}
-
-// One denoise of the accumulation (docs/denoising.md): its means, copied
-// when it starts, and the denoised colour, top row first.
-struct DenoiseJob {
-    unsigned int width = 0, height = 0;
-    uint64_t samples = 0;
-    std::shared_ptr<const PublishedFrame> frame;
-    prism::device::DenoiseSettings settings;
-    // Null: the build has no denoiser and the output is the raw colour.
-    std::shared_ptr<prism::device::Denoiser> denoiser;
-    // RGBA colour, then albedo and normal (kDenoiseFloats per pixel).
-    std::vector<float> input;
-    std::vector<float> output; // RGBA
-    std::string error;
-    double milliseconds = 0.0;
-    std::atomic<bool> done{false};
-    bool published = false; // render worker only
-};
-
-// Per pixel: the colour's RGBA sums, then the albedo's and the normal's.
-constexpr size_t kDenoiseFloats = 10;
-
-void _ExecuteDenoise(DenoiseJob &job)
-{
-    const size_t pixels = static_cast<size_t>(job.width) * job.height;
-    job.output.resize(pixels * 4);
-    for (size_t p = 0; p < pixels; ++p)
-        std::copy_n(job.input.data() + p * kDenoiseFloats, 4, job.output.data() + 4 * p);
-    if (!job.denoiser) return;
-    const auto start = std::chrono::steady_clock::now();
-    prism::device::DenoiseRequest request;
-    request.width = job.width;
-    request.height = job.height;
-    request.color = {job.input.data(), unsigned(kDenoiseFloats)};
-    request.albedo = {job.input.data() + 4, unsigned(kDenoiseFloats)};
-    request.normal = {job.input.data() + 7, unsigned(kDenoiseFloats)};
-    // In the RGB of the RGBA output; alpha stays the coverage.
-    request.output = job.output.data();
-    request.outputStride = 4;
-    request.settings = job.settings;
-    try {
-        job.denoiser->Denoise(request);
-    } catch (std::exception const &error) {
-        job.error = error.what();
-        for (size_t p = 0; p < pixels; ++p)
-            std::copy_n(job.input.data() + p * kDenoiseFloats, 4, job.output.data() + 4 * p);
-    }
-    job.milliseconds = std::chrono::duration<double, std::milli>(
-        std::chrono::steady_clock::now() - start).count();
-}
-
-// Runs denoise jobs off the render worker, the latest submitted first: the
-// worker never waits for a denoise (it publishes finished jobs at pass
-// boundaries). The thread starts with the first job and coordinates only;
-// OIDN's CPU device runs on the process's oneTBB.
-class DenoiseWorker {
-public:
-    ~DenoiseWorker()
-    {
-        {
-            std::lock_guard lock(m_mutex);
-            m_stop = true;
-        }
-        m_wake.notify_all();
-        if (m_thread.joinable()) m_thread.join();
-    }
-    void Submit(std::shared_ptr<DenoiseJob> job)
-    {
-        std::lock_guard lock(m_mutex);
-        if (!m_thread.joinable()) m_thread = std::thread([this] { Run(); });
-        // A job not started yet is replaced (its accumulation moved on).
-        if (m_pending) m_pending->done.store(true, std::memory_order_release);
-        m_pending = std::move(job);
-        m_wake.notify_all();
-    }
-
-private:
-    void Run()
-    {
-        for (;;) {
-            std::shared_ptr<DenoiseJob> job;
-            {
-                std::unique_lock lock(m_mutex);
-                m_wake.wait(lock, [&] { return m_stop || m_pending; });
-                if (m_stop) return;
-                job = std::move(m_pending);
-            }
-            _ExecuteDenoise(*job);
-            job->done.store(true, std::memory_order_release);
-        }
-    }
-    std::mutex m_mutex;
-    std::condition_variable m_wake;
-    std::shared_ptr<DenoiseJob> m_pending;
-    bool m_stop = false;
-    std::thread m_thread;
-};
-
-PreviewResult _RenderPreview(std::shared_ptr<Snapshot> const &snapshot,
-    CameraState const &camera, RenderSettings const &settings,
-    HdRenderPassAovBindingVector const &bindings,
-    unsigned int width, unsigned int height, HdRenderThread *renderThread,
-    std::shared_ptr<const PublishedFrame> const &frame,
-    std::atomic<uint64_t> &colorTracedPixels,
-    prism::device::RenderDevice &renderDevice)
-{
-    PreviewResult result;
-    if (!snapshot || !snapshot->scene || width == 0 || height == 0)
-        return result;
-
-    const unsigned int maxPreviewEdge = static_cast<unsigned int>(
-        std::clamp(settings.previewMaxDimension, 16, 1024));
-    if (width >= height) {
-        result.width = std::min(width, maxPreviewEdge);
-        result.height = std::max(1u, static_cast<unsigned int>(
-            (static_cast<uint64_t>(height) * result.width + width / 2) / width));
-    } else {
-        result.height = std::min(height, maxPreviewEdge);
-        result.width = std::max(1u, static_cast<unsigned int>(
-            (static_cast<uint64_t>(width) * result.height + height / 2) / height));
-    }
-
-    struct Target {
-        PrismRenderBuffer *buffer = nullptr;
-        TfToken name;
-        AovKind kind = AovKind::Unknown;
-        size_t components = 0;
-        std::vector<float> floats;
-        std::vector<int> ints;
-    };
-    std::vector<Target> targets;
-    bool needPrimary = false, needLight = false;
-    const size_t pixels = static_cast<size_t>(result.width) * result.height;
-    for (HdRenderPassAovBinding const &binding : bindings) {
-        auto *buffer = dynamic_cast<PrismRenderBuffer *>(binding.renderBuffer);
-        if (!buffer) continue;
-        Target target;
-        target.buffer = buffer;
-        target.name = binding.aovName;
-        target.kind = _AovKind(binding.aovName);
-        // The denoised AOV shows the raw preview until the first denoise.
-        if (prism::output::ColorAov(target.kind)) {
-            target.components = 4; target.floats.resize(pixels * 4);
-        } else if (_LightAov(target.kind)) {
-            target.components = 3; target.floats.resize(pixels * 3);
-            needLight = true;
-        } else if (binding.aovName == HdAovTokens->normal ||
-                   binding.aovName == HdAovTokens->Neye ||
-                   binding.aovName == HdAovTokens->Peye ||
-                   target.kind == AovKind::Pworld ||
-                   binding.aovName == TfToken("primvars:st")) {
-            target.components = binding.aovName == TfToken("primvars:st") ? 2 : 3;
-            target.floats.resize(pixels * target.components);
-            needPrimary = true;
-        } else if (binding.aovName == HdAovTokens->depth ||
-                   binding.aovName == HdAovTokens->cameraDepth) {
-            target.components = 1; target.floats.resize(pixels);
-            needPrimary = true;
-        } else if (binding.aovName == HdAovTokens->primId ||
-                   binding.aovName == HdAovTokens->elementId ||
-                   binding.aovName == HdAovTokens->instanceId) {
-            target.components = 1; target.ints.assign(pixels, -1);
-            needPrimary = true;
-        } else {
-            _WarnUnsupportedAov(binding.aovName);
-            continue;
-        }
-        targets.push_back(std::move(target));
-    }
-    if (targets.empty()) return result;
-    result.tracedPixels = pixels;
-    result.boundAovCount = targets.size();
-    for (Target const &target : targets)
-        result.publishedBytes += static_cast<uint64_t>(width) * height *
-            HdDataSizeOfFormat(target.buffer->GetFormat());
-
-    prism::device::PreviewRequest request;
-    request.camera = _CameraParameters(camera);
-    request.width = width;
-    request.height = height;
-    request.previewWidth = result.width;
-    request.previewHeight = result.height;
-    request.seed = static_cast<unsigned int>(settings.seed);
-    request.shading.sampleClamp = settings.sampleClamp;
-    request.shading.nee = {settings.neeProbabilityMin, settings.neeFromDepth, settings.spatialLights};
-    request.shading.exposureScale = camera.linearExposureScale;
-    request.shading.transparentEscapes =
-        snapshot->domeCount == 0 || !settings.domeLightCameraVisibility;
-    request.tracePrimary = needPrimary;
-    request.colorPixels = &colorTracedPixels;
-    request.stopRequested = [renderThread] {
-        return renderThread && renderThread->IsStopRequested();
-    };
-    request.traceMilliseconds = &result.traceMilliseconds;
-    request.writePixel = [&](unsigned int px, unsigned int py, Color3 const &color,
-                             float coverage, RayHit const *primary) {
-        const size_t pixel =
-            (static_cast<size_t>(result.height - 1 - py) * result.width + px);
-        for (Target &target : targets) {
-            if (prism::output::ColorAov(target.kind)) {
-                float *dst = target.floats.data() + pixel * 4;
-                dst[0] = color.x(); dst[1] = color.y();
-                dst[2] = color.z(); dst[3] = coverage;
-                continue;
-            }
-            if (!primary || _LightAov(target.kind)) continue;
-            _ResolvePrimaryAov(target.kind, *primary, camera, snapshot.get(),
-                target.floats.empty() ? nullptr : target.floats.data() + pixel * target.components,
-                target.ints.empty() ? nullptr : target.ints.data() + pixel);
-        }
-    };
-    if (needLight)
-        request.writeLightAovs = [&](unsigned int px, unsigned int py,
-                                     prism::device::LightAovPixel const &aovs) {
-            const size_t pixel =
-                (static_cast<size_t>(result.height - 1 - py) * result.width + px);
-            for (Target &target : targets) {
-                if (!_LightAov(target.kind)) continue;
-                Color3 const &value = _LightAovValue(aovs, target.kind);
-                float *dst = target.floats.data() + pixel * 3;
-                dst[0] = value.x(); dst[1] = value.y(); dst[2] = value.z();
-            }
-        };
-    if (!renderDevice.RenderPreview(*snapshot->scene, request)) return result;
-    auto const publicationStart = std::chrono::steady_clock::now();
-    for (Target const &target : targets) {
-        if (!target.ints.empty())
-            target.buffer->PublishPreviewInt(result.width, result.height,
-                                              target.ints, target.components, frame);
-        else
-            target.buffer->PublishPreviewFloat(result.width, result.height,
-                                                target.floats, target.components, frame,
-                                                prism::output::ColorAov(target.kind));
-    }
-    result.publicationMilliseconds = 1000.0 * std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - publicationStart).count();
-    result.published = true;
-    return result;
 }
 
 } // namespace
@@ -4658,12 +4395,7 @@ public:
             settings.gpuPreparationPreview = std::strcmp(value, "0") != 0;
         if (const char *value = std::getenv("PRISM_GPU_PREPARATION_PREVIEW_MAX_MIB"); value && *value)
             settings.gpuPreparationPreviewMaxMiB = std::max(0, std::atoi(value));
-        if (const char *value = std::getenv("PRISM_GPU_PREPARATION_PREVIEW_DELAY_MS"); value && *value)
-            gpuPreviewDelayMs = std::max(0, std::atoi(value));
-        if (const char *value = std::getenv("PRISM_GPU_PREPARATION_PREVIEW_THREADS"); value && *value)
-            gpuPreviewThreads = std::max(0, std::atoi(value));
-        if (const char *value = std::getenv("PRISM_PROFILE_BUFFERS"))
-            profileBufferWrites = value[0] != '\0' && std::strcmp(value, "0") != 0;
+        engine->embreeLiveBytes = &embreeLiveBytes;
         try {
             mdl::Context &context = SharedMdlContext();
             if (context.is_valid()) {
@@ -4705,33 +4437,6 @@ public:
             (buildFuture.valid() && !buildIsSpare));
     }
 
-    // Describes a created device for the host; `note` is CreateDevice's
-    // explanation when it fell back to the CPU.
-    static std::string DescribeDevice(prism::device::RenderDevice const &device,
-        prism::device::DevicePreference preference, std::string const &note)
-    {
-        const auto info = device.Info();
-        std::string name = info.name;
-        for (std::string_view suffix : {" (Vulkan)", " (Metal)"})
-            if (name.size() > suffix.size() &&
-                name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0)
-                name.resize(name.size() - suffix.size());
-        if (info.kind != prism::device::DeviceKind::Cpu)
-            return std::string(prism::device::ToString(info.kind)) + ": " + name;
-        if (note.empty()) return "cpu";
-        // "no GPU device available (vulkan: reason); using the CPU device"
-        std::string reason = note;
-        const auto open = note.find('('), close = note.rfind(");");
-        if (open != std::string::npos && close != std::string::npos && close > open)
-            reason = note.substr(open + 1, close - open - 1);
-        std::string kind = prism::device::ToString(preference);
-        if (reason.compare(0, kind.size() + 2, kind + ": ") == 0) reason.erase(0, kind.size() + 2);
-        if (kind == "auto") kind = "GPU";
-        else if (!kind.empty()) kind[0] = char(std::toupper(static_cast<unsigned char>(kind[0])));
-        if (reason.size() > 60) reason = reason.substr(0, 57) + "...";
-        return "cpu (" + kind + " fallback: " + reason + ")";
-    }
-
     // Returns the render device for the requested preference, creating it
     // on first use or when the preference changed. Render worker only;
     // returns null if a stop was requested before the device was ready.
@@ -4744,7 +4449,7 @@ public:
         }
         if (deviceCreation.valid() && deviceCreationPreference != preference) {
             if (!WaitForDeviceJob(deviceCreation)) {
-                ++devicePreparationsInterrupted;
+                ++engine->devicePreparationsInterrupted;
                 return nullptr;
             }
             try { (void)deviceCreation.get(); }
@@ -4764,7 +4469,7 @@ public:
             });
         }
         if (!WaitForDeviceJob(deviceCreation)) {
-            ++devicePreparationsInterrupted;
+            ++engine->devicePreparationsInterrupted;
             return nullptr;
         }
         CreatedDevice created;
@@ -4777,145 +4482,15 @@ public:
             prism::device::DevicePreference::Cpu, renderer->deviceOptions(), &created.note);
         if (!created.note.empty()) TF_WARN("PrismRT: %s", created.note.c_str());
         const auto info = created.device->Info();
-        progress.SetDevice(DescribeDevice(*created.device, preference, created.note));
+        progress.SetDevice(prism::session::ProgressiveEngine::DescribeDevice(
+            *created.device, preference, created.note));
         TF_STATUS("PrismRT: rendering on %s device: %s",
             prism::device::ToString(info.kind), info.name.c_str());
         std::lock_guard lock(mutex);
         renderDevice = created.device;
         renderDevicePreference = preference;
-        renderDeviceScene = nullptr;
-        ++deviceSceneEpoch;
+        engine->DeviceReplaced();
         return renderDevice;
-    }
-
-    // Advances the device's per-scene preparation for the displayed snapshot
-    // without blocking: finishes a completed job and, once no job is running,
-    // starts the one for the current epoch. Render worker only. True when the
-    // device is prepared for the snapshot.
-    bool AdvanceDevicePreparation(std::shared_ptr<prism::device::RenderDevice> const &device,
-                                  std::shared_ptr<Snapshot> const &prepared)
-    {
-        uint64_t epoch;
-        {
-            std::lock_guard lock(mutex);
-            epoch = deviceSceneEpoch;
-            if (devicePreparedEpoch == epoch) return true;
-        }
-        if (devicePreparation.valid()) {
-            // A superseded job still owns the device; it cannot be cancelled.
-            if (devicePreparation.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
-                return false;
-            try {
-                devicePreparation.get();
-            } catch (std::exception const &e) {
-                TF_WARN("PrismRT: render device preparation failed: %s", e.what());
-            } catch (...) {}
-            ++devicePreparations;
-            std::lock_guard lock(mutex);
-            epoch = deviceSceneEpoch;
-            if (deviceSceneEpoch == devicePreparationEpoch) {
-                devicePreparedEpoch = devicePreparationEpoch;
-                return true;
-            }
-        }
-        devicePreparationEpoch = epoch;
-        devicePreparationStart = std::chrono::steady_clock::now();
-        // The job owns the snapshot, so a published replacement cannot
-        // free or (as an inactive bank) edit the scene it is reading.
-        devicePreparation = std::async(std::launch::async,
-            [this, device, prepared] {
-                prism::logging::Bind logBinding(&renderer->logger());
-                prism::progress::Bind progressBinding(&progress);
-                const auto start = std::chrono::steady_clock::now();
-                prism::load_profile::Scope profile("device.prepare");
-                // Diagnostics, as in the CLI: print the scene's GPU programs
-                // (DXC only, no GPU work; run with PRISM_DEVICE=cpu) and exit.
-                if (const char *report = std::getenv("PRISM_GPU_PROGRAM_REPORT"); report && *report == '1') {
-                    if (!prism::device::ReportGpuPrograms(*prepared->scene, std::cout,
-                                                          renderer->varyingEmitters().get()))
-                        std::cerr << "PrismRT: this build has no Vulkan device\n";
-                    std::cout.flush();
-                    std::_Exit(0);
-                }
-                // Test hook: stretches the preparation to exercise the CPU
-                // preview that covers it.
-                if (const char *delay = std::getenv("PRISM_TEST_GPU_PREPARATION_DELAY_MS");
-                    delay && *delay)
-                    std::this_thread::sleep_for(std::chrono::milliseconds(std::atoi(delay)));
-                device->Prepare(*prepared->scene);
-                const double seconds = std::chrono::duration<double>(
-                    std::chrono::steady_clock::now() - start).count();
-                std::lock_guard lock(mutex);
-                devicePreparationSeconds = seconds;
-            });
-        return false;
-    }
-
-    // Runs the device's per-scene preparation for the displayed snapshot as
-    // a job and waits for it. Render worker only; false if a stop was
-    // requested first.
-    bool PrepareRenderDevice(std::shared_ptr<prism::device::RenderDevice> const &device,
-                             std::shared_ptr<Snapshot> const &prepared)
-    {
-        while (!AdvanceDevicePreparation(device, prepared)) {
-            if (devicePreparation.valid() && !WaitForDeviceJob(devicePreparation)) {
-                ++devicePreparationsInterrupted;
-                return false;
-            }
-        }
-        return true;
-    }
-
-    enum class PreparationOutcome { Stopped, Ready, Preview };
-
-    // Like PrepareRenderDevice, but a GPU device that is still preparing
-    // after gpuPreviewDelayMs yields Preview: the caller renders on
-    // previewDevice and polls AdvanceDevicePreparation to hand over.
-    PreparationOutcome PrepareOrPreview(std::shared_ptr<prism::device::RenderDevice> const &device,
-                                        std::shared_ptr<Snapshot> const &prepared,
-                                        RenderSettings const &renderSettings)
-    {
-        if (AdvanceDevicePreparation(device, prepared)) return PreparationOutcome::Ready;
-        const auto kind = device->Info().kind;
-        const int64_t limit = int64_t(renderSettings.gpuPreparationPreviewMaxMiB) << 20;
-        const bool eligible = renderSettings.gpuPreparationPreview &&
-            (kind == prism::device::DeviceKind::Vulkan || kind == prism::device::DeviceKind::Metal) &&
-            (limit <= 0 || embreeLiveBytes.load(std::memory_order_relaxed) <= limit);
-        if (!eligible)
-            return PrepareRenderDevice(device, prepared) ? PreparationOutcome::Ready
-                                                         : PreparationOutcome::Stopped;
-        // Fast (cached) preparations never start the CPU preview.
-        const auto deadline = devicePreparationStart + std::chrono::milliseconds(gpuPreviewDelayMs);
-        while (std::chrono::steady_clock::now() < deadline) {
-            if (renderThread->IsStopRequested()) {
-                ++devicePreparationsInterrupted;
-                return PreparationOutcome::Stopped;
-            }
-            if (AdvanceDevicePreparation(device, prepared)) return PreparationOutcome::Ready;
-            std::this_thread::sleep_for(std::chrono::milliseconds(2));
-        }
-        if (AdvanceDevicePreparation(device, prepared)) return PreparationOutcome::Ready;
-        if (!previewDevice)
-            previewDevice = prism::device::CreateDevice(prism::device::DevicePreference::Cpu, renderer->deviceOptions());
-        return PreparationOutcome::Preview;
-    }
-
-    static constexpr const char *kGpuPreviewDevice = "cpu (preview while the GPU prepares)";
-
-    // Marks the CPU preview as the displayed device.
-    void BeginGpuPreview()
-    {
-        if (gpuPreviewActive.exchange(true)) return;
-        progress.SetDevice(kGpuPreviewDevice);
-    }
-
-    // Restores the GPU's device line after a handover (unless the device
-    // reported something more specific, such as a CPU fallback).
-    void EndGpuPreview(prism::device::RenderDevice const &gpu, prism::device::DevicePreference preference)
-    {
-        if (!gpuPreviewActive.exchange(false)) return;
-        if (progress.Read().device == kGpuPreviewDevice)
-            progress.SetDevice(DescribeDevice(gpu, preference, {}));
     }
 
     // Builds the second bank for the snapshot just published, from the same
@@ -4996,10 +4571,7 @@ public:
             try { (void)deviceCreation.get(); }
             catch (...) {}
         }
-        if (devicePreparation.valid()) {
-            try { devicePreparation.get(); }
-            catch (...) {}
-        }
+        engine->WaitForJobs();
         if (buildCancel) buildCancel->store(true, std::memory_order_relaxed);
         if (buildFuture.valid()) {
             try { (void)buildFuture.get(); }
@@ -5023,50 +4595,30 @@ public:
     std::shared_ptr<prism::RendererContext> renderer =
         std::make_shared<prism::RendererContext>(HydraRendererOptions());
     prism::Progress &progress = renderer->progress();
+    // The progressive render loop (src/session/progressive_engine.h): device
+    // preparation with the GPU preparation preview, previews, passes,
+    // adaptive sampling, the denoise interval. Its accumulation persists
+    // across Render calls.
+    std::unique_ptr<prism::session::ProgressiveEngine> engine =
+        std::make_unique<prism::session::ProgressiveEngine>(renderer);
     HdSceneIndexBaseRefPtr sceneIndex;
     HdRenderThread *renderThread;
     RTCDevice device = nullptr;
     // Executes the per-pixel work; recreated when the device setting changes.
     std::shared_ptr<prism::device::RenderDevice> renderDevice;
     prism::device::DevicePreference renderDevicePreference = prism::device::DevicePreference::Auto;
-    SceneManager const *renderDeviceScene = nullptr;
-    uint64_t renderDeviceGeneration = 0;
-    // Integrator settings the render device last saw: GPU devices copy them
-    // into their scene data, so a change must reach them like an edit.
-    std::tuple<int, int, bool, int, bool, int> renderDeviceSettings{};
-    // Device creation and per-scene device preparation (GPU kernel
-    // compilation, scene and texture upload) can take tens of seconds. They
-    // run as jobs the render worker waits on while polling for a stop, so a
-    // host StopRender never waits for them; an interrupted job keeps running
-    // and the next Render resumes waiting on it. Only the render worker
-    // touches these futures (and ~Impl, after the worker has stopped).
+    // Device creation can take seconds. It runs as a job the render worker
+    // waits on while polling for a stop, so a host StopRender never waits
+    // for it; an interrupted job keeps running and the next Render resumes
+    // waiting on it. Only the render worker touches this future (and ~Impl,
+    // after the worker has stopped). Per-scene device preparation is the
+    // engine's.
     struct CreatedDevice {
         std::shared_ptr<prism::device::RenderDevice> device;
         std::string note;
     };
     std::future<CreatedDevice> deviceCreation;
     prism::device::DevicePreference deviceCreationPreference = prism::device::DevicePreference::Auto;
-    std::future<void> devicePreparation;
-    uint64_t devicePreparationEpoch = 0;
-    std::chrono::steady_clock::time_point devicePreparationStart;
-    // CPU preview while a GPU device prepares (render worker, except the
-    // atomics, which statistics read).
-    std::shared_ptr<prism::device::RenderDevice> previewDevice;
-    int gpuPreviewDelayMs = 1000;
-    int gpuPreviewThreads = 0; // 0: a fraction of the cores
-    std::atomic<bool> gpuPreviewActive{false};
-    std::atomic<uint64_t> gpuPreviewSamples{0};
-    std::atomic<uint64_t> gpuPreviewHandovers{0};
-    std::atomic<uint64_t> gpuPreviewHandoverSample{0};
-    // Accumulation restarts after texture streaming made textures finer.
-    std::atomic<uint64_t> textureStreamingRestarts{0};
-    // Advanced (under mutex) whenever the device or its view of the scene
-    // changes; devicePreparedEpoch records the last epoch fully prepared.
-    uint64_t deviceSceneEpoch = 1;
-    uint64_t devicePreparedEpoch = 0;
-    std::atomic<uint64_t> devicePreparationsInterrupted{0};
-    std::atomic<uint64_t> devicePreparations{0};
-    double devicePreparationSeconds = 0.0;
     std::atomic<int64_t> embreeLiveBytes{0};
     std::atomic<int64_t> embreePeakBytes{0};
     mutable std::mutex mutex;
@@ -5079,51 +4631,6 @@ public:
     CameraState camera;
     HdRenderPassAovBindingVector bindings;
     std::vector<uint64_t> bindingAllocationRevisions;
-    std::vector<unsigned int> committedRngStates;
-    // Adaptive sampling: per-pixel RGB sums of all and of even-numbered
-    // samples and the sample count (7 floats per pixel), and the pixels
-    // still sampled.
-    std::vector<float> adaptiveSums;
-    prism::device::ActivePixels adaptiveActive;
-    // Denoising (docs/denoising.md; render worker): the accumulation's sums
-    // as the denoiser takes them (kDenoiseFloats per pixel) and their sample
-    // counts, kept while it resumes; the latest denoise (in flight, or done
-    // and maybe not yet published) and what it denoised.
-    std::vector<float> denoiseSums;
-    std::vector<uint32_t> denoiseCounts;
-    std::shared_ptr<DenoiseJob> denoiseJob;
-    uint64_t denoisedSamples = 0;
-    prism::device::DenoiseSettings denoisedSettings;
-    bool denoiserWarned = false;
-    std::atomic<uint64_t> denoisesPublished{0};
-    std::atomic<double> lastDenoiseMilliseconds{0.0};
-    std::string denoiserName; // under mutex
-    std::unique_ptr<DenoiseWorker> denoiseWorker;
-    // A new accumulation of `pixels` pixels (0: not denoised). A denoise in
-    // flight finishes on the worker unseen.
-    void ResetDenoise(size_t pixels)
-    {
-        if (pixels) {
-            denoiseSums.assign(pixels * kDenoiseFloats, 0.0f);
-            denoiseCounts.assign(pixels, 0u);
-        } else {
-            std::vector<float>().swap(denoiseSums);
-            std::vector<uint32_t>().swap(denoiseCounts);
-        }
-        denoiseJob.reset();
-        denoisedSamples = 0;
-    }
-    // Progress of the accumulation (percentDone): the fraction of pixels
-    // adaptive sampling still traces, and the elapsed fraction of the time
-    // limit. Written by the render worker.
-    std::atomic<double> activePixelFraction{1.0};
-    std::atomic<double> timeLimitFraction{0.0};
-    std::atomic<bool> timeLimitReached{false};
-    // Time the render worker spent on the accumulation's full-resolution
-    // passes (prism:timeLimitSeconds); kept while it resumes.
-    double accumulationSeconds = 0.0;
-    unsigned tileWidth = 0, tileHeight = 0;
-    std::vector<RefinementTile> refinementTiles;
     TfTokenVector renderTags;
     unsigned int width = 0, height = 0;
     std::shared_ptr<Snapshot> snapshot;
@@ -5195,7 +4702,6 @@ public:
     double captureMilliseconds = 0.0;
     double captureBudgetMilliseconds = 0.0;
     std::chrono::steady_clock::time_point startTime;
-    std::atomic<uint64_t> samples{0};
     uint64_t snapshotBuilds = 0;
     double snapshotBuildSeconds = 0.0;
     // Inputs of the last launched job, reused by its follow-up spare job.
@@ -5214,33 +4720,8 @@ public:
     uint64_t sparePrototypeConversions = 0;
     uint64_t sparePrototypeConversionCacheHits = 0;
     double renderSeconds = 0.0;
-    uint64_t previewPublishes = 0;
-    uint64_t refinementPublishes = 0;
-    uint64_t firstPassPrimaryScratchBytes = 0;
-    std::atomic<uint64_t> colorTracedPixels{0};
-    std::atomic<uint64_t> geometricOnlyPixels{0};
-    uint64_t colorPassScratchBytes = 0;
-    uint64_t colorRngStorageBytes = 0;
-    double lastPassTraceMilliseconds = 0;
-    double lastPassCommitMilliseconds = 0;
-    double lastPassRayWorkerMilliseconds = 0;
-    double lastPassAovWorkerMilliseconds = 0;
-    double lastPassWaitMilliseconds = 0;
-    double lastPassPayloadMilliseconds = 0;
-    double lastPassPublicationMilliseconds = 0;
-    double previewMilliseconds = 0.0;
-    // Tracing plus publication of the last preview: what adaptive preview
-    // sizes against.
-    double previewCostMilliseconds = 0.0;
-    double previewRayWorkMilliseconds = 0.0;
-    double previewPublicationMilliseconds = 0.0;
-    uint64_t previewPublishedBytes = 0;
-    uint64_t previewTracedPixels = 0;
-    uint64_t previewBoundAovCount = 0;
     double prepareMilliseconds = 0.0;
     double stopRenderMilliseconds = 0.0;
-    unsigned int previewWidth = 0;
-    unsigned int previewHeight = 0;
     uint64_t placementInvalidations = 0;
     uint64_t prototypeInvalidations = 0;
     uint64_t materialInvalidations = 0;
@@ -5253,7 +4734,6 @@ public:
     uint64_t structuralFallbacks = 0;
     uint64_t prototypeUpdateFallbacks = 0;
     uint64_t placementTopologyFallbacks = 0;
-    bool profileBufferWrites = false;
     std::string lastRebuildReason = "initial population";
 };
 
@@ -5396,7 +4876,7 @@ void SceneBridge::RestartAccumulation()
 {
     _impl->renderThread->StopRender();
     std::lock_guard lock(_impl->mutex);
-    _impl->samples.store(0);
+    _impl->engine->samples.store(0);
     _impl->stateDirty = true;
     for (HdRenderPassAovBinding const &binding : _impl->bindings)
         if (auto *buffer = dynamic_cast<PrismRenderBuffer *>(binding.renderBuffer))
@@ -5509,7 +4989,7 @@ void SceneBridge::SetSettings(RenderSettings const &requested)
             current.denoiseInterval != settings.denoiseInterval ||
             current.denoiseSettings != settings.denoiseSettings;
         if (budgetChanged && !imageChanged && _converged.load() &&
-            _impl->samples.load() != 0 &&
+            _impl->engine->samples.load() != 0 &&
             std::none_of(_impl->bindings.begin(), _impl->bindings.end(),
                 [](auto const &binding) {
                     return _TracedAov(_AovKind(binding.aovName)) &&
@@ -6645,7 +6125,7 @@ bool SceneBridge::Prepare(CameraState const &camera,
     }
     if (stateChanged || cameraChanged || bindingsChanged ||
         renderTagsChanged || published) {
-        _impl->samples.store(0);
+        _impl->engine->samples.store(0);
         for (HdRenderPassAovBinding const &binding : _impl->bindings) {
             if (auto *buffer = dynamic_cast<PrismRenderBuffer *>(binding.renderBuffer)) {
                 buffer->SetConverged(false);
@@ -6690,22 +6170,8 @@ void SceneBridge::Render()
         bindings = _impl->bindings; settings = _impl->settings;
         // Published edits replace the snapshot or advance its generation;
         // camera changes do neither.
-        const auto deviceSettings = snapshot && snapshot->scene
-            ? std::make_tuple(snapshot->scene->max_depth, snapshot->scene->rr_min_depth,
-                  snapshot->scene->environmentSampling, int(snapshot->scene->textureFiltering),
-                  snapshot->scene->textureStreaming, snapshot->scene->gpuTextureBudgetMiB)
-            : std::tuple<int, int, bool, int, bool, int>{};
-        if (snapshot && snapshot->scene &&
-            (_impl->renderDeviceScene != snapshot->scene.get() ||
-             _impl->renderDeviceGeneration != _impl->activeGeneration ||
-             _impl->renderDeviceSettings != deviceSettings)) {
-            renderDevice->SceneChanged(*snapshot->scene);
-            _impl->progress.End(prism::Phase::Rendering);
-            _impl->renderDeviceScene = snapshot->scene.get();
-            _impl->renderDeviceGeneration = _impl->activeGeneration;
-            _impl->renderDeviceSettings = deviceSettings;
-            ++_impl->deviceSceneEpoch;
-        }
+        if (snapshot && snapshot->scene)
+            _impl->engine->NoteScene(*renderDevice, *snapshot->scene, _impl->activeGeneration);
         width = _impl->width; height = _impl->height;
         generation = _impl->activeGeneration;
         cameraRevision = _impl->cameraRevision;
@@ -6726,22 +6192,6 @@ void SceneBridge::Render()
         uniqueBindings.push_back(binding);
     }
     bindings = std::move(uniqueBindings);
-    // hasColor: some bound output is path traced (the colour or a light AOV).
-    bool hasColor = false, hasGeometric = false, hasLight = false, hasDenoised = false;
-    for (auto const &binding : bindings) {
-        if (!dynamic_cast<PrismRenderBuffer *>(binding.renderBuffer)) continue;
-        const AovKind kind = _AovKind(binding.aovName);
-        hasColor |= _TracedAov(kind);
-        hasLight |= _LightAov(kind);
-        hasDenoised |= kind == AovKind::Denoised;
-        hasGeometric |= !_TracedAov(kind) && kind != AovKind::Unknown;
-    }
-    // Denoising (docs/denoising.md): the displayed colour (prism:denoise) or
-    // a bound denoised AOV. Its albedo and normal guides come with the light
-    // AOVs; without it nothing below changes.
-    const bool denoising = hasColor && (settings.denoise || hasDenoised);
-    hasLight |= denoising;
-    const int sampleCount = hasColor ? std::max(1, settings.samples) : 1;
     if (!snapshot || !snapshot->scene || width == 0 || height == 0) {
         for (HdRenderPassAovBinding const &binding : bindings)
             if (auto *buffer = dynamic_cast<PrismRenderBuffer *>(binding.renderBuffer))
@@ -6753,753 +6203,250 @@ void SceneBridge::Render()
         }
         _converged.store(!preparing); return;
     }
-    // Kernel compilation and scene upload happen here, not inside the
-    // preview or pass, so a host stop never waits for them.
-    // While a GPU device is still preparing, the CPU device renders instead
-    // (activeDevice) and the loop below hands over once the GPU is ready.
-    prism::device::RenderDevice *activeDevice = renderDevice.get();
-    bool previewingGpu = false;
-    if (hasColor || hasGeometric) {
-        using Outcome = Impl::PreparationOutcome;
-        const Outcome outcome = _impl->PrepareOrPreview(renderDevice, snapshot, settings);
-        if (outcome == Outcome::Stopped) return;
-        if (outcome == Outcome::Preview) {
-            previewingGpu = true;
-            activeDevice = _impl->previewDevice.get();
-            _impl->BeginGpuPreview();
-        }
-    }
-    if (!previewingGpu) _impl->EndGpuPreview(*renderDevice, settings.device);
-    _impl->progress.Begin(prism::Phase::Rendering);
-    for (HdRenderPassAovBinding const &binding : bindings) {
-        TfToken const &name = binding.aovName;
-        if (_AovKind(name) == AovKind::Unknown) _WarnUnsupportedAov(name);
-    }
-    const int firstSample = static_cast<int>(_impl->samples.load());
-    std::shared_ptr<const PublishedFrame> frame;
-    if (firstSample != 0) {
-        std::lock_guard lock(_impl->mutex);
-        frame = _impl->lastPublishedFrame;
-    }
-    if (!frame) {
-        auto initialFrame = std::make_shared<PublishedFrame>();
-        initialFrame->generation = generation;
-        initialFrame->cameraRevision = cameraRevision;
-        initialFrame->picking = snapshot->picking;
-        initialFrame->pickScene = std::make_shared<PublishedSnapshotPickScene>(
-            snapshot, camera, width, height, renderDevice);
-        initialFrame->camera = camera;
-        initialFrame->width = width;
-        initialFrame->height = height;
-        frame = std::move(initialFrame);
-    }
-    if (firstSample == 0 && hasColor) {
-        // Preview rendering runs on Hydra's render worker.  Prepare only captures
-        // the raw AOV bindings after StopRender has quiesced their previous user;
-        // buffer destruction and resize also stop this worker before changing
-        // storage, so no preparation worker ever dereferences a render buffer.
-        RenderSettings previewSettings = settings;
-        const auto deviceKind = activeDevice->Info().kind;
-        const bool gpuPreview = deviceKind == prism::device::DeviceKind::Metal ||
-            deviceKind == prism::device::DeviceKind::Vulkan;
-        // The automatic maximum keeps CPU previews coarse; GPU devices afford
-        // far more pixels within the target.
-        const int maxDimension = settings.previewMaxDimension > 0
-            ? std::clamp(settings.previewMaxDimension, 16, 1024) : (gpuPreview ? 512 : 96);
-        previewSettings.previewMaxDimension = maxDimension;
-        if (settings.adaptivePreview) {
-            std::lock_guard lock(_impl->mutex);
-            if (_impl->previewCostMilliseconds <= 0.0) {
-                // Without a measurement, start below the maximum.
-                previewSettings.previewMaxDimension = std::min(maxDimension, gpuPreview ? 256 : 96);
-            } else {
-                const double ratio = std::sqrt(
-                    static_cast<double>(std::clamp(settings.previewTargetMs, 1, 1000)) /
-                    _impl->previewCostMilliseconds);
-                previewSettings.previewMaxDimension = std::clamp(
-                    static_cast<int>(std::lround(std::max(
-                        _impl->previewWidth, _impl->previewHeight) *
-                        std::clamp(ratio, 0.5, 2.0))),
-                    16, maxDimension);
-            }
-        }
-        auto const previewStart = std::chrono::steady_clock::now();
-        PreviewResult const preview = _RenderPreview(
-            snapshot, camera, previewSettings, bindings, width, height,
-            _impl->renderThread, frame, _impl->colorTracedPixels, *activeDevice);
-        if (_impl->renderThread->IsStopRequested()) return;
+
+    // The render buffers as the progressive loop's outputs
+    // (src/session/progressive_engine.h).
+    struct BufferTarget final : prism::session::ProgressiveTarget {
+        using Frame = prism::session::Frame;
+        Impl &impl;
+        HdRenderPassAovBindingVector const &bindings;
+        std::vector<PrismRenderBuffer *> buffers;
+        std::shared_ptr<Snapshot> snapshot;
+        CameraState camera;
+        unsigned int width, height;
+        uint64_t generation, cameraRevision;
+        struct DisplayTarget {
+            PrismRenderBuffer *buffer;
+            PrismRenderBuffer::ReadView base;
+            std::vector<std::shared_ptr<const PrismRenderBuffer::PresentationTile>> tiles;
+        };
+        std::vector<DisplayTarget> displays;
+        uint64_t presentationRevision = 0;
+
+        BufferTarget(Impl &impl, HdRenderPassAovBindingVector const &bindings, std::shared_ptr<Snapshot> snapshot,
+                     CameraState const &camera, unsigned int width, unsigned int height, uint64_t generation,
+                     uint64_t cameraRevision)
+            : impl(impl), bindings(bindings), snapshot(std::move(snapshot)), camera(camera), width(width),
+              height(height), generation(generation), cameraRevision(cameraRevision)
         {
-            std::lock_guard lock(_impl->mutex);
-            _impl->previewMilliseconds = 1000.0 * std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - previewStart).count();
-            _impl->previewPublicationMilliseconds =
-                preview.publicationMilliseconds;
-            _impl->previewRayWorkMilliseconds = std::max(
-                0.0, _impl->previewMilliseconds -
-                    preview.publicationMilliseconds);
-            _impl->previewPublishedBytes = preview.publishedBytes;
-            _impl->previewTracedPixels = preview.tracedPixels;
-            _impl->previewBoundAovCount = preview.boundAovCount;
-            _impl->previewWidth = preview.width;
-            _impl->previewHeight = preview.height;
-            if (preview.published)
-                _impl->previewCostMilliseconds = preview.traceMilliseconds + preview.publicationMilliseconds;
-            if (preview.published) {
-                if (_impl->previewPublishes++ == 0)
-                    prism::load_profile::Mark("frame.first_preview",
-                                              "generation=" + std::to_string(generation));
-                _impl->lastPublishedFrame = frame;
+            for (auto const &binding : bindings)
+                buffers.push_back(dynamic_cast<PrismRenderBuffer *>(binding.renderBuffer));
+        }
+        static PrismRenderBuffer::Frame Published(Frame const &frame)
+        {
+            return std::static_pointer_cast<const PublishedFrame>(frame);
+        }
+
+        bool StopRequested() const override { return impl.renderThread->IsStopRequested(); }
+        bool PauseRequested() const override { return impl.renderThread->IsPauseRequested(); }
+        Frame CurrentFrame(bool resumed, std::shared_ptr<prism::device::RenderDevice> const &device) override
+        {
+            std::shared_ptr<const PublishedFrame> frame;
+            if (resumed) {
+                std::lock_guard lock(impl.mutex);
+                frame = impl.lastPublishedFrame;
             }
-        }
-        // Do not let full-resolution work contend with camera interaction.  Each
-        // new camera state cancels this wait in at most two milliseconds and starts
-        // a fresh quiet period; refinement begins automatically after input stops.
-        auto const quietStart = std::chrono::steady_clock::now();
-        for (;;) {
-            if (_impl->renderThread->IsStopRequested()) return;
-            int delay;
-            auto start = quietStart;
-            {
-                std::lock_guard lock(_impl->mutex);
-                delay = _impl->settings.refinementDelayMs;
-                // Lighting held back during camera motion was published after
-                // the camera came to rest: the quiet interval started then.
-                if (_impl->refineFromCameraChange)
-                    start = std::min(quietStart, _impl->lastCameraChange);
+            if (!frame) {
+                auto initialFrame = std::make_shared<PublishedFrame>();
+                initialFrame->generation = generation;
+                initialFrame->cameraRevision = cameraRevision;
+                initialFrame->picking = snapshot->picking;
+                initialFrame->pickScene = std::make_shared<PublishedSnapshotPickScene>(
+                    snapshot, camera, width, height, device);
+                initialFrame->camera = camera;
+                initialFrame->width = width;
+                initialFrame->height = height;
+                frame = std::move(initialFrame);
             }
-            if (std::chrono::steady_clock::now() >= start +
-                std::chrono::milliseconds(std::clamp(delay, 0, 2000))) break;
-            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            return frame;
         }
-        if (_impl->renderThread->IsStopRequested()) return;
-    }
-    if (firstSample == 0) {
-        for (HdRenderPassAovBinding const &binding : bindings)
-            if (auto *buffer = dynamic_cast<PrismRenderBuffer *>(binding.renderBuffer))
-                buffer->BeginFrame(binding.clearValue, _AovKind(binding.aovName) == AovKind::Unknown);
-        // Full-resolution RNG setup belongs to the render worker.  Camera motion
-        // only pays for the bounded preview above on the UI/Execute thread.
-        if (hasColor)
-            _impl->committedRngStates.resize(static_cast<size_t>(width) * height);
-        else
-            std::vector<unsigned int>().swap(_impl->committedRngStates);
-        if (hasColor && settings.adaptiveThreshold > 0.0f) {
-            _impl->adaptiveSums.assign(static_cast<size_t>(width) * height * 7, 0.0f);
-            _impl->adaptiveActive.Reset(width, height);
-        } else {
-            std::vector<float>().swap(_impl->adaptiveSums);
-            _impl->adaptiveActive = {};
+        void FramePublished(Frame const &frame) override
+        {
+            std::lock_guard lock(impl.mutex);
+            impl.lastPublishedFrame = Published(frame);
         }
-        _impl->activePixelFraction.store(1.0);
-        _impl->timeLimitFraction.store(0.0);
-        _impl->timeLimitReached.store(false);
-        _impl->ResetDenoise(denoising ? static_cast<size_t>(width) * height : 0);
-    }
-    // A resumed accumulation keeps its sums (they always match its size).
-    if (denoising && _impl->denoiseCounts.size() != static_cast<size_t>(width) * height)
-        _impl->ResetDenoise(static_cast<size_t>(width) * height);
-    prism::CameraRayParameters const cameraParameters =
-        _CameraParameters(camera);
-    prism::DumpCameraRayDiagnostics(
-        cameraParameters, width, height, settings.seed, "hydra");
-    // Offline renders: a device that streams textures loads the levels this
-    // view asks for before the first sample, and keeps them for the whole
-    // accumulation (deterministic images).
-    if (firstSample == 0 && firstSample < sampleCount && hasColor && !previewingGpu &&
-        settings.textureStreamingPrepass) {
-        prism::device::PassRequest settle;
-        settle.camera = cameraParameters;
-        settle.width = width;
-        settle.height = height;
-        settle.seed = static_cast<unsigned int>(settings.seed);
-        settle.shading.sampleClamp = settings.sampleClamp;
-        settle.shading.nee = {settings.neeProbabilityMin, settings.neeFromDepth, settings.spatialLights};
-        settle.shading.exposureScale = camera.linearExposureScale;
-        settle.shading.transparentEscapes =
-            snapshot->domeCount == 0 || !settings.domeLightCameraVisibility;
-        prism::load_profile::Scope settleProfile("frame.texture_settle");
-        activeDevice->SettleTextures(*snapshot->scene, settle);
-        if (_impl->renderThread->IsStopRequested()) return;
-    }
-    struct ResolvedBinding { PrismRenderBuffer *buffer; AovKind kind; size_t plane; };
-    struct AovPlane {
-        AovKind kind;
-        size_t components;
-        std::vector<float> floats;
-        std::vector<int> ints;
-    };
-    std::vector<ResolvedBinding> resolvedBindings;
-    std::vector<AovPlane> primaryPlanes;
-    const size_t scratchPixels = firstSample < sampleCount && (hasColor || hasGeometric)
-        ? static_cast<size_t>(width) * height : 0;
-    for (auto const &binding : bindings) {
-        auto *buffer = dynamic_cast<PrismRenderBuffer *>(binding.renderBuffer);
-        const AovKind kind = _AovKind(binding.aovName);
-        size_t plane = 0;
-        if (firstSample == 0 && buffer && !_TracedAov(kind) && kind != AovKind::Unknown) {
-            auto found = std::find_if(primaryPlanes.begin(), primaryPlanes.end(),
-                [kind](auto const &p) { return p.kind == kind; });
-            plane = static_cast<size_t>(found - primaryPlanes.begin());
-            if (found == primaryPlanes.end()) {
-                AovPlane staging{kind, _AovComponents(kind), {}, {}};
-                if (_IntegerAov(kind)) staging.ints.resize(scratchPixels);
-                else staging.floats.resize(scratchPixels * staging.components);
-                primaryPlanes.push_back(std::move(staging));
-            }
+        int RefinementDelay(std::chrono::steady_clock::time_point &start) override
+        {
+            std::lock_guard lock(impl.mutex);
+            // Lighting held back during camera motion was published after
+            // the camera came to rest: the quiet interval started then.
+            if (impl.refineFromCameraChange) start = std::min(start, impl.lastCameraChange);
+            return impl.settings.refinementDelayMs;
         }
-        resolvedBindings.push_back({buffer, kind, plane});
-    }
-    // Starts a denoise of the accumulation so far on the denoise worker.
-    auto launchDenoise = [&] {
-        const size_t count = static_cast<size_t>(width) * height;
-        auto job = std::make_shared<DenoiseJob>();
-        job->width = width;
-        job->height = height;
-        job->samples = _impl->samples.load();
-        job->frame = frame;
-        job->settings = settings.denoiseSettings;
-        std::string error;
-        job->denoiser = renderDevice->CreateDenoiser(&error);
-        if (!job->denoiser && !_impl->denoiserWarned) {
-            _impl->denoiserWarned = true;
-            TF_WARN("PrismRT: cannot denoise (%s); the denoised colour is the raw colour", error.c_str());
+        void WarnUnsupported(size_t output) override { _WarnUnsupportedAov(bindings[output].aovName); }
+        void BeginFrame(size_t output, bool clearWorking) override
+        {
+            buffers[output]->BeginFrame(bindings[output].clearValue, clearWorking);
         }
-        job->input.resize(count * kDenoiseFloats);
-        float const *sums = _impl->denoiseSums.data();
-        uint32_t const *counts = _impl->denoiseCounts.data();
-        tbb::parallel_for(size_t(0), count, [&](size_t pixel) {
-            const float scale = counts[pixel] ? 1.0f / float(counts[pixel]) : 0.0f;
-            for (size_t i = 0; i < kDenoiseFloats; ++i)
-                job->input[pixel * kDenoiseFloats + i] = sums[pixel * kDenoiseFloats + i] * scale;
-        });
-        if (!_impl->denoiseWorker) _impl->denoiseWorker = std::make_unique<DenoiseWorker>();
-        _impl->denoiseWorker->Submit(job);
-        _impl->denoiseJob = std::move(job);
-        _impl->denoisedSamples = _impl->samples.load();
-        _impl->denoisedSettings = settings.denoiseSettings;
-    };
-    // Publishes a finished denoise of this accumulation: the denoised AOVs,
-    // and with prism:denoise the colour's display. True when one was.
-    auto publishDenoise = [&]() -> bool {
-        auto const job = _impl->denoiseJob;
-        if (!job || job->published || !job->done.load(std::memory_order_acquire)) return false;
-        job->published = true;
-        if (job->frame != frame || job->output.size() != static_cast<size_t>(width) * height * 4)
-            return false;
-        if (!job->error.empty()) TF_WARN("PrismRT: denoising failed: %s", job->error.c_str());
-        for (auto const &resolved : resolvedBindings) {
-            if (resolved.kind != AovKind::Denoised || !resolved.buffer) continue;
+        void WriteFloat(size_t output, unsigned x, unsigned y, const float *values, size_t count,
+                        bool accumulate) override
+        {
+            buffers[output]->WriteFloat(x, y, values, count, accumulate);
+        }
+        void WriteInt(size_t output, unsigned x, unsigned y, const int *values, size_t count) override
+        {
+            buffers[output]->WriteInt(x, y, values, count);
+        }
+        void KeepAccumulated(size_t output, unsigned x, unsigned y) override
+        {
+            buffers[output]->KeepAccumulated(x, y);
+        }
+        void RecordWriteNanoseconds(size_t output, uint64_t value) override
+        {
+            buffers[output]->RecordWriteNanoseconds(value);
+        }
+        void Publish(size_t output, Frame const &frame) override { buffers[output]->Publish(Published(frame)); }
+        void SetConverged(size_t output, bool converged) override { buffers[output]->SetConverged(converged); }
+        uint64_t PublishedBytes(size_t output) const override
+        {
+            return static_cast<uint64_t>(width) * height * HdDataSizeOfFormat(buffers[output]->GetFormat());
+        }
+        void PublishPreviewFloat(size_t output, unsigned previewWidth, unsigned previewHeight,
+                                 std::vector<float> const &values, size_t components, Frame const &frame,
+                                 bool smooth) override
+        {
+            buffers[output]->PublishPreviewFloat(previewWidth, previewHeight, values, components,
+                                                 Published(frame), smooth);
+        }
+        void PublishPreviewInt(size_t output, unsigned previewWidth, unsigned previewHeight,
+                               std::vector<int> const &values, size_t components, Frame const &frame) override
+        {
+            buffers[output]->PublishPreviewInt(previewWidth, previewHeight, values, components, Published(frame));
+        }
+        void PublishDenoised(size_t output, std::vector<float> const &rgba, unsigned width, unsigned height,
+                             Frame const &frame) override
+        {
+            PrismRenderBuffer *buffer = buffers[output];
             tbb::parallel_for(0u, height, [&](unsigned int y) {
                 for (unsigned int x = 0; x < width; ++x)
-                    resolved.buffer->WriteFloat(x, height - 1 - y,
-                        job->output.data() + (static_cast<size_t>(y) * width + x) * 4, 4, false);
+                    buffer->WriteFloat(x, height - 1 - y,
+                        rgba.data() + (static_cast<size_t>(y) * width + x) * 4, 4, false);
             });
-            resolved.buffer->Publish(frame);
+            buffer->Publish(Published(frame));
         }
-        if (settings.denoise) {
+        void PresentDenoisedColor(std::vector<float> const &rgba, unsigned width, unsigned height,
+                                  Frame const &frame) override
+        {
             // Render-buffer rows are bottom-up float4, as the colour's.
-            auto bytes = std::make_shared<std::vector<uint8_t>>(job->output.size() * sizeof(float));
+            auto bytes = std::make_shared<std::vector<uint8_t>>(rgba.size() * sizeof(float));
             const size_t rowBytes = static_cast<size_t>(width) * 4 * sizeof(float);
             for (unsigned int y = 0; y < height; ++y)
                 std::memcpy(bytes->data() + static_cast<size_t>(height - 1 - y) * rowBytes,
-                            job->output.data() + static_cast<size_t>(y) * width * 4, rowBytes);
+                            rgba.data() + static_cast<size_t>(y) * width * 4, rowBytes);
             std::shared_ptr<const std::vector<uint8_t>> shown = std::move(bytes);
-            for (auto const &resolved : resolvedBindings)
-                if (resolved.kind == AovKind::Color && resolved.buffer &&
-                    resolved.buffer->GetFormat() == HdFormatFloat32Vec4)
-                    resolved.buffer->SetDenoisedPresentation(shown, frame);
+            for (size_t i = 0; i < bindings.size(); ++i)
+                if (_AovKind(bindings[i].aovName) == AovKind::Color && buffers[i] &&
+                    buffers[i]->GetFormat() == HdFormatFloat32Vec4)
+                    buffers[i]->SetDenoisedPresentation(shown, Published(frame));
         }
-        _impl->denoisesPublished.fetch_add(1);
-        _impl->lastDenoiseMilliseconds.store(job->milliseconds);
+        void ResolvePrimary(AovKind kind, RayHit const &hit, float *values, int *id) const override
         {
-            std::lock_guard lock(_impl->mutex);
-            _impl->denoiserName = job->denoiser ? job->denoiser->Name() : std::string("none (raw colour)");
+            _ResolvePrimaryAov(kind, hit, camera, snapshot.get(), values, id);
         }
-        return true;
-    };
-    auto denoiseInFlight = [&] {
-        return _impl->denoiseJob && !_impl->denoiseJob->done.load(std::memory_order_acquire);
-    };
-    std::vector<Color3> passColors(hasColor ? scratchPixels : 0);
-    std::vector<float> passCoverage(hasColor ? scratchPixels : 0);
-    std::vector<prism::device::LightAovPixel> passLightAovs(hasLight ? scratchPixels : 0);
-    std::vector<unsigned int> rngStates(hasColor ? scratchPixels : 0);
-    {
-        std::lock_guard lock(_impl->mutex);
-        _impl->firstPassPrimaryScratchBytes = 0;
-        for (auto const &plane : primaryPlanes)
-            _impl->firstPassPrimaryScratchBytes += plane.floats.capacity() * sizeof(float) +
-                plane.ints.capacity() * sizeof(int);
-        _impl->colorPassScratchBytes = passColors.capacity() * sizeof(Color3) +
-            passCoverage.capacity() * sizeof(float) +
-            passLightAovs.capacity() * sizeof(prism::device::LightAovPixel);
-        _impl->colorRngStorageBytes = (rngStates.capacity() +
-            _impl->committedRngStates.capacity()) * sizeof(unsigned int);
-    }
-    if (!hasColor && !hasGeometric) {
-        if (_impl->renderThread->IsStopRequested()) return;
-        if (firstSample == 0) {
-            for (auto const &binding : resolvedBindings)
-                if (binding.buffer) binding.buffer->Publish(frame);
-            _impl->samples.store(1);
-        }
-        if (_impl->renderThread->IsStopRequested()) return;
-        for (auto const &binding : resolvedBindings)
-            if (binding.buffer) binding.buffer->SetConverged(!preparing);
+        bool BeginPresentation(Frame const &frame, size_t tileCount) override
         {
-            std::lock_guard lock(_impl->mutex);
-            _impl->lastPublishedFrame = frame;
-            _impl->renderSeconds = std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - _impl->startTime).count();
+            displays.clear();
+            for (auto const &binding : bindings) {
+                if (binding.aovName != HdAovTokens->color) continue;
+                auto *buffer = dynamic_cast<PrismRenderBuffer *>(binding.renderBuffer);
+                if (!buffer || std::any_of(displays.begin(), displays.end(),
+                        [buffer](auto const &t) { return t.buffer == buffer; })) continue;
+                auto base = buffer->CapturePublished();
+                if (base.format != HdFormatFloat32Vec4 || base.frame != Published(frame) || !base.pixels) continue;
+                if (buffer->HasDenoisedPresentation(Published(frame))) continue;
+                displays.push_back({buffer, base, {}});
+                displays.back().tiles.resize(tileCount);
+            }
+            return !displays.empty();
         }
-        _converged.store(!preparing);
-        return;
-    }
-    struct DisplayTarget {
-        PrismRenderBuffer *buffer;
-        PrismRenderBuffer::ReadView base;
-        std::vector<std::shared_ptr<const PrismRenderBuffer::PresentationTile>> tiles;
-    };
-    std::vector<DisplayTarget> displays;
-    struct DisplayCleanup {
-        std::vector<ResolvedBinding> const &targets;
-        ~DisplayCleanup() { for (auto &t : targets) if (t.buffer) t.buffer->ClearPresentationPixels(); }
-    } displayCleanup{resolvedBindings};
-    if (_impl->tileWidth != width || _impl->tileHeight != height) {
-        _impl->refinementTiles = MakeRefinementTiles(width, height);
-        _impl->tileWidth = width; _impl->tileHeight = height;
-    }
-    auto const &tiles = _impl->refinementTiles;
-    std::vector<prism::device::PixelTile> deviceTiles;
-    deviceTiles.reserve(tiles.size());
-    for (auto const &tile : tiles)
-        deviceTiles.push_back({tile.x, tile.y, tile.width, tile.height, tile.index});
-    uint64_t presentationRevision = 0;
-    prism::device::AdaptiveSettings adaptive;
-    adaptive.threshold = _impl->adaptiveSums.empty() ? 0.0f : settings.adaptiveThreshold;
-    adaptive.minSamples = settings.adaptiveMinSamples;
-    // Pixels traced by the current pass; converged pixels keep their value.
-    auto traced = [&](size_t pixel) {
-        return !adaptive.Enabled() || _impl->adaptiveActive.Active(pixel);
-    };
-    // Set once texture streaming restarted the accumulation: the geometric
-    // outputs of the first pass are already published.
-    bool restarted = false;
-    // prism:timeLimitSeconds: the wall-clock time the render worker spends
-    // on the accumulation's full-resolution passes (preview, refinement
-    // delay, texture settling and time between render calls excluded;
-    // pauses included). Checked at pass boundaries, so every pixel has at
-    // least one sample; a resumed accumulation keeps the time it spent.
-    if (firstSample == 0) _impl->accumulationSeconds = 0.0;
-    const double timeLimit = hasColor ? settings.timeLimitSeconds : 0.0;
-    auto timeMark = std::chrono::steady_clock::now();
-    auto elapsedFraction = [&] {
-        const auto now = std::chrono::steady_clock::now();
-        _impl->accumulationSeconds += std::chrono::duration<double>(now - timeMark).count();
-        timeMark = now;
-        return timeLimit > 0.0 ? _impl->accumulationSeconds / timeLimit : 0.0;
-    };
-    for (int sample = firstSample; sample < sampleCount; ++sample) {
-        if (adaptive.Enabled() && _impl->adaptiveActive.Count() == 0) break;
-        if (timeLimit > 0.0 && sample > 0) {
-            const double fraction = elapsedFraction();
-            _impl->timeLimitFraction.store(std::min(fraction, 1.0));
-            if (fraction >= 1.0) {
-                _impl->timeLimitReached.store(true);
-                break;
-            }
-        }
-        if (_impl->renderThread->IsStopRequested()) return;
-        while (_impl->renderThread->IsPauseRequested()) {
-            if (_impl->renderThread->IsStopRequested()) return;
-            // Paused: show the accumulation so far denoised.
-            if (denoising) {
-                publishDenoise();
-                if (!denoiseInFlight() && _impl->samples.load() > _impl->denoisedSamples &&
-                    _impl->samples.load() > 0)
-                    launchDenoise();
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(2));
-        }
-        // Pass boundary: continue on the GPU from this sample index. The
-        // per-pixel RNG state and the accumulated average carry over, so the
-        // image keeps converging instead of restarting.
-        if (previewingGpu) {
-            // Test hook: the CPU preview renders at most this many samples
-            // and then waits here for the GPU, so the handover happens
-            // however long the GPU's preparation takes.
-            if (const char *limit = std::getenv("PRISM_TEST_GPU_PREVIEW_MAX_SAMPLES");
-                limit && *limit && std::atoi(limit) > 0 && sample >= std::atoi(limit)) {
-                while (!_impl->AdvanceDevicePreparation(renderDevice, snapshot)) {
-                    if (_impl->renderThread->IsStopRequested()) return;
-                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
-                }
-            }
-            if (_impl->AdvanceDevicePreparation(renderDevice, snapshot)) {
-                previewingGpu = false;
-                activeDevice = renderDevice.get();
-                _impl->gpuPreviewHandoverSample.store(static_cast<uint64_t>(sample));
-                _impl->gpuPreviewHandovers.fetch_add(1);
-                _impl->EndGpuPreview(*renderDevice, settings.device);
-            } else {
-                _impl->gpuPreviewSamples.fetch_add(1);
-            }
-        }
-        // Texture streaming: once the levels the first samples asked for are
-        // resident, the accumulation starts again (the device bounds how
-        // often). Geometric outputs are kept: they do not sample textures.
-        if (!previewingGpu && sample > 0 && hasColor &&
-            activeDevice->AccumulationOutdated(*snapshot->scene)) {
-            for (HdRenderPassAovBinding const &binding : bindings)
-                if (_TracedAov(_AovKind(binding.aovName)))
-                    if (auto *buffer = dynamic_cast<PrismRenderBuffer *>(binding.renderBuffer))
-                        buffer->BeginFrame(binding.clearValue, false);
-            if (!_impl->adaptiveSums.empty()) {
-                std::fill(_impl->adaptiveSums.begin(), _impl->adaptiveSums.end(), 0.0f);
-                _impl->adaptiveActive.Reset(width, height);
-            }
-            _impl->samples.store(0);
-            if (denoising) _impl->ResetDenoise(static_cast<size_t>(width) * height);
-            _impl->textureStreamingRestarts.fetch_add(1);
-            prism::load_profile::Mark("frame.texture_restart", "sample=" + std::to_string(sample));
-            restarted = true;
-            sample = 0;
-        }
-        if (sample != 0)
-            std::copy(_impl->committedRngStates.begin(),
-                      _impl->committedRngStates.end(), rngStates.begin());
-        displays.clear();
-        for (auto const &binding : bindings) {
-            if (binding.aovName != HdAovTokens->color) continue;
-            auto *buffer = dynamic_cast<PrismRenderBuffer *>(binding.renderBuffer);
-            if (!buffer || std::any_of(displays.begin(), displays.end(),
-                    [buffer](auto const &t) { return t.buffer == buffer; })) continue;
-            auto base = buffer->CapturePublished();
-            if (base.format != HdFormatFloat32Vec4 || base.frame != frame || !base.pixels) continue;
-            if (buffer->HasDenoisedPresentation(frame)) continue;
-            displays.push_back({buffer, base, {}});
-            displays.back().tiles.resize(tiles.size());
-        }
-        const auto traceStart = std::chrono::steady_clock::now();
-        using Clock = std::chrono::steady_clock;
-        const auto milliseconds = [](auto duration) {
-            return std::chrono::duration<double, std::milli>(duration).count();
-        };
-        std::vector<std::atomic<bool>> ready(tiles.size());
-        for (auto &flag : ready) flag.store(false, std::memory_order_relaxed);
-        std::vector<bool> emitted(tiles.size(), false);
-        std::atomic<uint64_t> rayNanoseconds{0}, aovNanoseconds{0};
-        std::atomic<bool> abandonPass{false};
-        std::mutex completionMutex;
-        std::condition_variable completion;
-        bool finished = false;
-        double waitMilliseconds = 0, payloadMilliseconds = 0, publicationMilliseconds = 0;
-        prism::device::PassRequest passRequest;
-        passRequest.camera = cameraParameters;
-        passRequest.width = width;
-        passRequest.height = height;
-        passRequest.seed = static_cast<unsigned int>(settings.seed);
-        passRequest.sample = sample;
-        passRequest.shading.sampleClamp = settings.sampleClamp;
-        passRequest.shading.nee = {settings.neeProbabilityMin, settings.neeFromDepth, settings.spatialLights};
-        passRequest.shading.exposureScale = camera.linearExposureScale;
-        passRequest.shading.transparentEscapes =
-            snapshot->domeCount == 0 || !settings.domeLightCameraVisibility;
-        passRequest.tiles = deviceTiles;
-        passRequest.activePixels = adaptive.Enabled() ? _impl->adaptiveActive.Mask() : nullptr;
-        passRequest.traceColor = hasColor;
-        passRequest.tracePrimary = sample == 0 && !primaryPlanes.empty();
-        passRequest.rngStates = rngStates.data();
-        passRequest.colors = passColors.data();
-        passRequest.coverage = passCoverage.data();
-        passRequest.lightAovs = hasLight ? passLightAovs.data() : nullptr;
-        passRequest.abandoned = [&] {
-            return abandonPass.load(std::memory_order_relaxed) ||
-                _impl->renderThread->IsStopRequested();
-        };
-        passRequest.paused = [&] { return _impl->renderThread->IsPauseRequested(); };
-        passRequest.resolvePrimary = [&](unsigned x, unsigned y, RayHit const &hit) {
-            const size_t pixel = static_cast<size_t>(y)*width+x;
-            for (auto &plane : primaryPlanes)
-                _ResolvePrimaryAov(plane.kind, hit, camera, snapshot.get(),
-                    plane.floats.empty() ? nullptr : plane.floats.data()+pixel*plane.components,
-                    plane.ints.empty() ? nullptr : plane.ints.data()+pixel);
-        };
-        passRequest.tileFinished = [&](size_t position) {
-            ready[position].store(true, std::memory_order_release);
-        };
-        // Reserve execution capacity for the host and coordinator.
-        passRequest.concurrency = std::max(1, tbb::this_task_arena::max_concurrency() - 2);
-        // The CPU preview shares the machine with the GPU preparation (DXC and
-        // driver compiles). Measured on 28 threads, 7 or more preview threads
-        // slowed a 35 s preparation by 20-60%, 4 or fewer did not: keep an
-        // eighth of the threads.
-        if (previewingGpu)
-            passRequest.concurrency = std::max(1, std::min(passRequest.concurrency,
-                _impl->gpuPreviewThreads > 0 ? _impl->gpuPreviewThreads
-                    : std::max(2, tbb::this_task_arena::max_concurrency() / 8)));
-        passRequest.colorPixels = &_impl->colorTracedPixels;
-        passRequest.geometricOnlyPixels = &_impl->geometricOnlyPixels;
-        passRequest.rayNanoseconds = &rayNanoseconds;
-        passRequest.primaryNanoseconds = &aovNanoseconds;
-        // One pass-wide device job replaces the barrier after each 64 tiles.
-        // The coordinator alone owns presentation packets. Acquire/release
-        // completion flags make only fully written tiles visible to it.
-        prism::device::RenderDevice *const device = activeDevice;
-        auto worker = std::async(std::launch::async, [&] {
-            prism::logging::Bind logBinding(&_impl->renderer->logger());
-            prism::progress::Bind progressBinding(&_impl->progress);
-            auto finish = [&] {
-                { std::lock_guard lock(completionMutex); finished = true; }
-                completion.notify_one();
-            };
-            try {
-                device->RenderPass(*snapshot->scene, passRequest);
-            } catch (...) { finish(); throw; }
-            finish();
-        });
-        struct DrainPass {
-            std::atomic<bool> &abandon;
-            std::future<void> &worker;
-            ~DrainPass() {
-                // Packing/allocation can throw while workers are paused.
-                // Unblock them before the future's destructor waits, and
-                // before any of the captured pass storage is destroyed.
-                abandon.store(true, std::memory_order_relaxed);
-                if (worker.valid()) worker.wait();
-            }
-        } drainPass{abandonPass, worker};
-        auto nextDisplay = traceStart + std::chrono::milliseconds(100);
-        for (;;) {
-            const auto waitStart = Clock::now();
-            bool done;
-            {
-                std::unique_lock lock(completionMutex);
-                completion.wait_until(lock, nextDisplay, [&] { return finished; });
-                done = finished;
-            }
-            waitMilliseconds += milliseconds(Clock::now()-waitStart);
-            if (done) break;
-            if (denoising && !_impl->renderThread->IsStopRequested()) publishDenoise();
-            if (!_impl->renderThread->IsStopRequested() && !displays.empty()) {
-                const auto payloadStart = Clock::now();
-                std::vector<size_t> completed;
-                for (size_t i = 0; i < tiles.size(); ++i)
-                    if (!emitted[i] && ready[i].load(std::memory_order_acquire)) {
-                        completed.push_back(i); emitted[i] = true;
-                    }
-                // Packing a publication is bounded memory work. Running it
-                // here avoids entering the render scheduler while the host
-                // is waiting for the next immutable display packet.
-                for (size_t j = 0; j != completed.size(); ++j) {
-                    auto const &tile = tiles[completed[j]];
-                    for (auto &target : displays) {
-                        auto payload = std::make_shared<PrismRenderBuffer::PresentationTile>();
-                        payload->x = tile.x; payload->y = height - tile.y - tile.height;
-                        payload->width = tile.width; payload->height = tile.height;
-                        payload->rgba.resize(static_cast<size_t>(tile.width) * tile.height * 4);
-                        auto const *previous = reinterpret_cast<float const *>(target.base.pixels->data());
-                        for (unsigned y = 0; y < tile.height; ++y) {
-                            for (unsigned x = 0; x < tile.width; ++x) {
-                                const size_t pixel = static_cast<size_t>(tile.y + y) * width + tile.x + x;
-                                const size_t offset = (static_cast<size_t>(height - 1 - tile.y - y) * width + tile.x + x) * 4;
-                                float *dst = payload->rgba.data() + (static_cast<size_t>(tile.height - 1 - y) * tile.width + x) * 4;
-                                auto const &c = passColors[pixel];
-                                const float values[4] = {c.x(), c.y(), c.z(), passCoverage[pixel]};
-                                const bool fresh = traced(pixel);
-                                for (size_t component = 0; component < 4; ++component)
-                                    dst[component] = !fresh ? previous[offset + component] :
-                                        sample == 0 ? values[component] :
-                                        (previous[offset + component] * sample + values[component]) / (sample + 1);
-                            }
-                        }
-                        target.tiles[tile.index] = std::move(payload);
-                    }
-                }
-                payloadMilliseconds += milliseconds(Clock::now()-payloadStart);
-                if (!completed.empty() && !_impl->renderThread->IsStopRequested()) {
-                    const auto publicationStart = Clock::now();
-                    ++presentationRevision;
-                    for (auto &target : displays) {
-                        auto packet = std::make_shared<PrismRenderBuffer::PresentationSnapshot>();
-                        packet->base = target.base;
-                        packet->pass = static_cast<uint64_t>(sample);
-                        packet->revision = presentationRevision;
-                        packet->tiles = target.tiles;
-                        target.buffer->SetPresentationSnapshot(std::move(packet));
-                    }
-                    { std::lock_guard lock(_impl->mutex); ++_impl->refinementPublishes; }
-                    publicationMilliseconds += milliseconds(Clock::now()-publicationStart);
-                }
-            }
-            // Keep cadence anchored to the pass, rather than adding payload
-            // construction time to every interval. If packing overran an
-            // interval, consume new completions immediately instead of queuing
-            // a backlog of timer events.
-            nextDisplay = std::max(nextDisplay + std::chrono::milliseconds(100), Clock::now());
-        }
-        // Also propagates worker errors; never release worker-owned memory
-        // while cancellation or an exception is still draining the TBB job.
-        worker.get();
-        if (_impl->renderThread->IsStopRequested()) return;
-        const auto commitStart = std::chrono::steady_clock::now();
-        // Release previous raw image references so publication can recycle its storage.
-        // The buffer keeps the immutable display override alive until Publish.
-        displays.clear();
-        // Commit is bounded buffer work: finish it even if a stop arrives.
-        // The next RNG state and sample count advance only with publication.
-        tbb::parallel_for(tbb::blocked_range2d<unsigned int>(0, height, 8, 0, width, 8),
-            [&](tbb::blocked_range2d<unsigned int> const &range) {
-                std::vector<uint64_t> tileWriteNanoseconds(
-                    _impl->profileBufferWrites ? bindings.size() : 0, 0);
-                for (unsigned int y = range.rows().begin(); y != range.rows().end(); ++y) {
-                    for (unsigned int x = range.cols().begin(); x != range.cols().end(); ++x) {
-                        const size_t pixel = static_cast<size_t>(y) * width + x;
-                        // Hydra's render buffers are addressed bottom-up. Camera sampling
-                        // remains top-down so the generated rays match standalone PrismRT.
-                        const unsigned int bufferY = height - 1 - y;
-                        for (size_t bindingIndex = 0;
-                             bindingIndex < bindings.size(); ++bindingIndex) {
-                            auto const &resolved = resolvedBindings[bindingIndex];
-                            const AovKind kind = resolved.kind;
-                            if ((sample != 0 || restarted) && !_TracedAov(kind))
-                                continue;
-                            // Written by the denoise publication.
-                            if (kind == AovKind::Denoised) continue;
-                            auto *buffer = resolved.buffer;
-                            if (!buffer) continue;
-                            const auto writeStart = _impl->profileBufferWrites
-                                ? std::chrono::steady_clock::now()
-                                : std::chrono::steady_clock::time_point{};
-                            // Converged pixels keep their accumulated value
-                            // in the storage this pass publishes.
-                            if (_TracedAov(kind) && !traced(pixel)) {
-                                buffer->KeepAccumulated(x, bufferY);
-                                continue;
-                            }
-                            if (kind == AovKind::Color) {
-                                Color3 const &c = passColors[pixel];
-                                float v[4] = {c.x(), c.y(), c.z(), passCoverage[pixel]};
-                                buffer->WriteFloat(x, bufferY, v, 4, true);
-                            } else if (_LightAov(kind)) {
-                                Color3 const &c = _LightAovValue(passLightAovs[pixel], kind);
-                                const float v[3] = {c.x(), c.y(), c.z()};
-                                buffer->WriteFloat(x, bufferY, v, 3, true);
-                            } else if (kind != AovKind::Unknown && sample == 0) {
-                                auto const &plane = primaryPlanes[resolved.plane];
-                                if (_IntegerAov(kind))
-                                    buffer->WriteInt(x, bufferY, plane.ints.data() + pixel, 1);
-                                else
-                                    buffer->WriteFloat(x, bufferY,
-                                        plane.floats.data() + pixel * plane.components, plane.components, false);
-                            }
-                            if (_impl->profileBufferWrites) {
-                                tileWriteNanoseconds[bindingIndex] +=
-                                    static_cast<uint64_t>(std::chrono::duration_cast<
-                                        std::chrono::nanoseconds>(
-                                            std::chrono::steady_clock::now() - writeStart).count());
-                            }
+        bool PresentTiles(prism::session::PassTiles const &pass, double &publicationMilliseconds) override
+        {
+            for (size_t j = 0; j != pass.completed.size(); ++j) {
+                auto const &tile = pass.tiles[pass.completed[j]];
+                for (auto &target : displays) {
+                    auto payload = std::make_shared<PrismRenderBuffer::PresentationTile>();
+                    payload->x = tile.x; payload->y = height - tile.y - tile.height;
+                    payload->width = tile.width; payload->height = tile.height;
+                    payload->rgba.resize(static_cast<size_t>(tile.width) * tile.height * 4);
+                    auto const *previous = reinterpret_cast<float const *>(target.base.pixels->data());
+                    const int sample = pass.sample;
+                    for (unsigned y = 0; y < tile.height; ++y) {
+                        for (unsigned x = 0; x < tile.width; ++x) {
+                            const size_t pixel = static_cast<size_t>(tile.y + y) * width + tile.x + x;
+                            const size_t offset = (static_cast<size_t>(height - 1 - tile.y - y) * width + tile.x + x) * 4;
+                            float *dst = payload->rgba.data() + (static_cast<size_t>(tile.height - 1 - y) * tile.width + x) * 4;
+                            auto const &c = pass.colors[pixel];
+                            const float values[4] = {c.x(), c.y(), c.z(), pass.coverage[pixel]};
+                            const bool fresh = pass.traced(pixel);
+                            for (size_t component = 0; component < 4; ++component)
+                                dst[component] = !fresh ? previous[offset + component] :
+                                    sample == 0 ? values[component] :
+                                    (previous[offset + component] * sample + values[component]) / (sample + 1);
                         }
                     }
+                    target.tiles[tile.index] = std::move(payload);
                 }
-                if (_impl->profileBufferWrites) {
-                    for (size_t i = 0; i < bindings.size(); ++i) {
-                        if (tileWriteNanoseconds[i] == 0) continue;
-                        if (auto *buffer = resolvedBindings[i].buffer)
-                            buffer->RecordWriteNanoseconds(tileWriteNanoseconds[i]);
-                    }
-                }
-            });
-        for (HdRenderPassAovBinding const &binding : bindings) {
-            // Geometric AOVs are deterministic and only written on sample 0.
-            // Color changes every pass as accumulation progresses.
-            if ((sample != 0 || restarted) && !_TracedAov(_AovKind(binding.aovName))) continue;
-            if (_AovKind(binding.aovName) == AovKind::Denoised) continue;
-            if (auto *buffer = dynamic_cast<PrismRenderBuffer *>(binding.renderBuffer))
-                buffer->Publish(frame);
+            }
+            if (pass.completed.empty() || StopRequested()) return false;
+            const auto publicationStart = std::chrono::steady_clock::now();
+            ++presentationRevision;
+            for (auto &target : displays) {
+                auto packet = std::make_shared<PrismRenderBuffer::PresentationSnapshot>();
+                packet->base = target.base;
+                packet->pass = static_cast<uint64_t>(pass.sample);
+                packet->revision = presentationRevision;
+                packet->tiles = target.tiles;
+                target.buffer->SetPresentationSnapshot(std::move(packet));
+            }
+            publicationMilliseconds = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - publicationStart).count();
+            return true;
         }
+        // Release previous raw image references so publication can recycle
+        // their storage. The buffer keeps the immutable display override
+        // alive until Publish.
+        void EndPresentation() override { displays.clear(); }
+        void ClearPresentation() override
         {
-            std::lock_guard lock(_impl->mutex);
-            _impl->lastPublishedFrame = frame;
-            _impl->lastPassTraceMilliseconds = std::chrono::duration<double,std::milli>(commitStart-traceStart).count();
-            _impl->lastPassCommitMilliseconds = std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-commitStart).count();
-            _impl->lastPassRayWorkerMilliseconds = rayNanoseconds.load()*1e-6;
-            _impl->lastPassAovWorkerMilliseconds = aovNanoseconds.load()*1e-6;
-            _impl->lastPassWaitMilliseconds = waitMilliseconds;
-            _impl->lastPassPayloadMilliseconds = payloadMilliseconds;
-            _impl->lastPassPublicationMilliseconds = publicationMilliseconds;
+            for (auto *buffer : buffers)
+                if (buffer) buffer->ClearPresentationPixels();
+            displays.clear();
         }
-        if (denoising) {
-            float *sums = _impl->denoiseSums.data();
-            uint32_t *counts = _impl->denoiseCounts.data();
-            tbb::parallel_for(size_t(0), passColors.size(), [&](size_t pixel) {
-                if (!traced(pixel)) return;
-                float *s = sums + kDenoiseFloats * pixel;
-                Color3 const &c = passColors[pixel];
-                auto const &a = passLightAovs[pixel];
-                for (int i = 0; i < 3; ++i) {
-                    s[i] += c[i];
-                    s[4 + i] += a.albedo[i];
-                    s[7 + i] += a.normal[i];
-                }
-                s[3] += passCoverage[pixel];
-                ++counts[pixel];
-            });
-        }
-        if (adaptive.Enabled()) {
-            float *sums = _impl->adaptiveSums.data();
-            tbb::parallel_for(size_t(0), passColors.size(), [&](size_t pixel) {
-                if (!traced(pixel)) return;
-                Color3 const &c = passColors[pixel];
-                for (int channel = 0; channel < 3; ++channel) {
-                    sums[7 * pixel + channel] += c[channel];
-                    if (sample % 2 == 0) sums[7 * pixel + 3 + channel] += c[channel];
-                }
-                sums[7 * pixel + 6] += 1.0f;
-            });
-            if (sample + 1 < sampleCount && adaptive.CheckAfter(sample + 1)) {
-                const float scale = prism::device::ImageScale(passColors.size(), [&](size_t pixel) {
-                    const float* p = sums + 7 * pixel;
-                    return p[6] > 0.0f ? (p[0] + p[1] + p[2]) / p[6] : 0.0f;
-                });
-                const size_t active = _impl->adaptiveActive.Update(adaptive.threshold, [&](size_t pixel) {
-                    return prism::device::AdaptiveError(sums + 7 * pixel, sums + 7 * pixel + 3, sample + 1, scale);
-                });
-                _impl->activePixelFraction.store(passColors.empty() ? 0.0 :
-                    static_cast<double>(active) / static_cast<double>(passColors.size()));
-            }
-        }
-        _impl->committedRngStates.swap(rngStates);
-        _impl->samples.store(static_cast<uint64_t>(sample + 1));
-        if (denoising) {
-            publishDenoise();
-            // Every denoiseInterval passes (the last pass denoises below).
-            if (!denoiseInFlight() && sample + 1 < sampleCount &&
-                static_cast<uint64_t>(sample + 1) >=
-                    _impl->denoisedSamples + static_cast<uint64_t>(std::max(1, settings.denoiseInterval)))
-                launchDenoise();
-        }
-        if (sample == 0 && !restarted) {
-            std::vector<AovPlane>().swap(primaryPlanes);
-            prism::load_profile::Mark("frame.full_sample", "generation=" + std::to_string(generation));
-        }
-    }
-    if (_impl->renderThread->IsStopRequested()) return;
-    // The final denoise: the last samples with the current settings. The
-    // worker waits for it here, still answering a stop at once.
-    if (denoising && _impl->samples.load() > 0) {
-        for (;;) {
-            if (_impl->renderThread->IsStopRequested()) return;
-            publishDenoise();
-            if (!denoiseInFlight()) {
-                const bool current = _impl->denoiseJob && _impl->denoisedSamples == _impl->samples.load() &&
-                    _impl->denoisedSettings == settings.denoiseSettings;
-                if (!current) launchDenoise();
-                else if (_impl->denoiseJob->published) break;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(2));
-        }
-    }
+    } target(*_impl, bindings, snapshot, camera, width, height, generation, cameraRevision);
+
+    prism::session::ProgressiveRun run;
+    run.device = renderDevice;
+    run.preference = settings.device;
+    // The job and the passes own the snapshot, so a published replacement
+    // cannot free or (as an inactive bank) edit the scene they read.
+    run.scene = std::shared_ptr<SceneManager>(snapshot, snapshot->scene.get());
+    for (std::size_t i = 0; i < bindings.size(); ++i)
+        run.outputs.push_back({_AovKind(bindings[i].aovName), target.buffers[i] != nullptr});
+    prism::session::ProgressiveSettings &progressive = run.settings;
+    progressive.samples = settings.samples;
+    progressive.seed = settings.seed;
+    progressive.sampleClamp = settings.sampleClamp;
+    progressive.adaptiveThreshold = settings.adaptiveThreshold;
+    progressive.adaptiveMinSamples = settings.adaptiveMinSamples;
+    progressive.timeLimitSeconds = settings.timeLimitSeconds;
+    progressive.nee = {settings.neeProbabilityMin, settings.neeFromDepth, settings.spatialLights};
+    progressive.transparentEscapes = snapshot->domeCount == 0 || !settings.domeLightCameraVisibility;
+    progressive.adaptivePreview = settings.adaptivePreview;
+    progressive.previewTargetMs = settings.previewTargetMs;
+    progressive.previewMaxDimension = settings.previewMaxDimension;
+    progressive.textureStreamingPrepass = settings.textureStreamingPrepass;
+    progressive.denoise = settings.denoise;
+    progressive.denoiseInterval = settings.denoiseInterval;
+    progressive.denoiseSettings = settings.denoiseSettings;
+    progressive.gpuPreparationPreview = settings.gpuPreparationPreview;
+    progressive.gpuPreparationPreviewMaxMiB = settings.gpuPreparationPreviewMaxMiB;
+    run.view.rays = _CameraParameters(camera);
+    run.view.exposureScale = camera.linearExposureScale;
+    run.view.width = width;
+    run.view.height = height;
+    run.generation = generation;
+    run.diagnosticsLabel = "hydra";
+    if (_impl->engine->Run(run, target) == prism::session::ProgressiveEngine::Outcome::Stopped) return;
     for (HdRenderPassAovBinding const &binding : bindings)
         if (auto *buffer = dynamic_cast<PrismRenderBuffer *>(binding.renderBuffer))
             buffer->SetConverged(!preparing);
@@ -7577,7 +6524,7 @@ VtDictionary SceneBridge::GetProgressStats() const
     result["prismDevice"] = VtValue(progress.device);
     result["prismError"] = VtValue(progress.error);
     // True while the CPU device renders a preview for a GPU that is preparing.
-    result["prismGpuPreview"] = VtValue(_impl->gpuPreviewActive.load(std::memory_order_relaxed));
+    result["prismGpuPreview"] = VtValue(_impl->engine->gpuPreviewActive.load(std::memory_order_relaxed));
     std::string active;
     for (size_t i = 0; i < progress.phases.size(); ++i) {
         if (!progress.phases[i].active) continue;
@@ -7601,10 +6548,13 @@ VtDictionary SceneBridge::GetStats() const
     // Progress first and lock-free: it must stay current while the bridge
     // mutex below is busy.
     VtDictionary result = GetProgressStats();
-    const int64_t completed = static_cast<int64_t>(_impl->samples.load());
+    const int64_t completed = static_cast<int64_t>(_impl->engine->samples.load());
     const bool converged = _converged.load();
     result["completedSamples"] = VtValue(completed);
     result["converged"] = VtValue(converged);
+    // The progressive loop's statistics (under its own mutex, which may be
+    // taken inside the bridge mutex but never around it).
+    const prism::session::ProgressiveStats engineStats = _impl->engine->Stats();
     std::lock_guard lock(_impl->mutex);
     // Standard Hydra progress keys that hosts such as usdview read:
     // numCompletedSamples (int) and percentDone (double, 0-100). A converged
@@ -7618,29 +6568,29 @@ VtDictionary SceneBridge::GetStats() const
     result["targetSamples"] = VtValue(targetSamples);
     const double sampleFraction = std::clamp(
         static_cast<double>(completed) / targetSamples, 0.0, 1.0);
-    const double active = completed > 0 ? _impl->activePixelFraction.load() : 1.0;
+    const double active = completed > 0 ? _impl->engine->activePixelFraction.load() : 1.0;
     double progress = (1.0 - active) + active * sampleFraction;
     if (completed > 0 && _impl->settings.timeLimitSeconds > 0.0)
-        progress = std::max(progress, _impl->timeLimitFraction.load());
+        progress = std::max(progress, _impl->engine->timeLimitFraction.load());
     result["percentDone"] = VtValue(converged ? 100.0 :
         std::clamp(100.0 * progress, 0.0, std::nextafter(100.0, 0.0)));
     result["activePixelFraction"] = VtValue(active);
-    result["timeLimitReached"] = VtValue(_impl->timeLimitReached.load());
+    result["timeLimitReached"] = VtValue(_impl->engine->timeLimitReached.load());
     // Denoising (docs/denoising.md): denoises shown and the last one's time.
-    result["denoises"] = VtValue(static_cast<int64_t>(_impl->denoisesPublished.load()));
-    result["denoiseMilliseconds"] = VtValue(_impl->lastDenoiseMilliseconds.load());
-    result["denoiser"] = VtValue(_impl->denoiserName);
-    result["refinementPublishes"] = VtValue(static_cast<int64_t>(_impl->refinementPublishes));
-    result["devicePreparing"] = VtValue(_impl->devicePreparedEpoch != _impl->deviceSceneEpoch);
-    result["devicePreparations"] = VtValue(static_cast<int64_t>(_impl->devicePreparations.load()));
+    result["denoises"] = VtValue(static_cast<int64_t>(_impl->engine->denoisesPublished.load()));
+    result["denoiseMilliseconds"] = VtValue(_impl->engine->lastDenoiseMilliseconds.load());
+    result["denoiser"] = VtValue(engineStats.denoiserName);
+    result["refinementPublishes"] = VtValue(static_cast<int64_t>(engineStats.refinementPublishes));
+    result["devicePreparing"] = VtValue(engineStats.devicePreparing);
+    result["devicePreparations"] = VtValue(static_cast<int64_t>(_impl->engine->devicePreparations.load()));
     result["devicePreparationsInterrupted"] = VtValue(
-        static_cast<int64_t>(_impl->devicePreparationsInterrupted.load()));
-    result["devicePreparationSeconds"] = VtValue(_impl->devicePreparationSeconds);
+        static_cast<int64_t>(_impl->engine->devicePreparationsInterrupted.load()));
+    result["devicePreparationSeconds"] = VtValue(engineStats.devicePreparationSeconds);
     result["deferredEnvironmentCaptures"] = VtValue(
         static_cast<int64_t>(_impl->deferredEnvironmentCaptures));
-    result["gpuPreviewPasses"] = VtValue(static_cast<int64_t>(_impl->gpuPreviewSamples.load()));
-    result["gpuPreviewHandovers"] = VtValue(static_cast<int64_t>(_impl->gpuPreviewHandovers.load()));
-    result["gpuPreviewHandoverSample"] = VtValue(static_cast<int64_t>(_impl->gpuPreviewHandoverSample.load()));
+    result["gpuPreviewPasses"] = VtValue(static_cast<int64_t>(_impl->engine->gpuPreviewSamples.load()));
+    result["gpuPreviewHandovers"] = VtValue(static_cast<int64_t>(_impl->engine->gpuPreviewHandovers.load()));
+    result["gpuPreviewHandoverSample"] = VtValue(static_cast<int64_t>(_impl->engine->gpuPreviewHandoverSample.load()));
     // GPU texture streaming (see docs/texture_service.md#gpu-texture-streaming).
     if (_impl->renderDevice) {
         const prism::device::TextureStreamingStats streaming = _impl->renderDevice->TextureStreaming();
@@ -7658,19 +6608,19 @@ VtDictionary SceneBridge::GetStats() const
         result["textureStreamingUploadedMiB"] = VtValue(double(streaming.uploadedBytes) * mib);
         result["textureStreamingFeedbackRounds"] = VtValue(static_cast<int64_t>(streaming.feedbackRounds));
     }
-    result["textureStreamingRestarts"] = VtValue(static_cast<int64_t>(_impl->textureStreamingRestarts.load()));
-    result["firstPassPrimaryScratchBytes"] = VtValue(static_cast<int64_t>(_impl->firstPassPrimaryScratchBytes));
-    result["colorTracedPixels"] = VtValue(static_cast<int64_t>(_impl->colorTracedPixels.load()));
-    result["geometricOnlyPixels"] = VtValue(static_cast<int64_t>(_impl->geometricOnlyPixels.load()));
-    result["colorPassScratchBytes"] = VtValue(static_cast<int64_t>(_impl->colorPassScratchBytes));
-    result["colorRngStorageBytes"] = VtValue(static_cast<int64_t>(_impl->colorRngStorageBytes));
-    result["lastPassTraceMilliseconds"] = VtValue(_impl->lastPassTraceMilliseconds);
-    result["lastPassCommitMilliseconds"] = VtValue(_impl->lastPassCommitMilliseconds);
-    result["lastPassPublicationMilliseconds"] = VtValue(_impl->lastPassPublicationMilliseconds);
-    result["lastPassPayloadMilliseconds"] = VtValue(_impl->lastPassPayloadMilliseconds);
-    result["lastPassWaitMilliseconds"] = VtValue(_impl->lastPassWaitMilliseconds);
-    result["lastPassAovWorkerMilliseconds"] = VtValue(_impl->lastPassAovWorkerMilliseconds);
-    result["lastPassRayWorkerMilliseconds"] = VtValue(_impl->lastPassRayWorkerMilliseconds);
+    result["textureStreamingRestarts"] = VtValue(static_cast<int64_t>(_impl->engine->textureStreamingRestarts.load()));
+    result["firstPassPrimaryScratchBytes"] = VtValue(static_cast<int64_t>(engineStats.firstPassPrimaryScratchBytes));
+    result["colorTracedPixels"] = VtValue(static_cast<int64_t>(_impl->engine->colorTracedPixels.load()));
+    result["geometricOnlyPixels"] = VtValue(static_cast<int64_t>(_impl->engine->geometricOnlyPixels.load()));
+    result["colorPassScratchBytes"] = VtValue(static_cast<int64_t>(engineStats.colorPassScratchBytes));
+    result["colorRngStorageBytes"] = VtValue(static_cast<int64_t>(engineStats.colorRngStorageBytes));
+    result["lastPassTraceMilliseconds"] = VtValue(engineStats.lastPassTraceMilliseconds);
+    result["lastPassCommitMilliseconds"] = VtValue(engineStats.lastPassCommitMilliseconds);
+    result["lastPassPublicationMilliseconds"] = VtValue(engineStats.lastPassPublicationMilliseconds);
+    result["lastPassPayloadMilliseconds"] = VtValue(engineStats.lastPassPayloadMilliseconds);
+    result["lastPassWaitMilliseconds"] = VtValue(engineStats.lastPassWaitMilliseconds);
+    result["lastPassAovWorkerMilliseconds"] = VtValue(engineStats.lastPassAovWorkerMilliseconds);
+    result["lastPassRayWorkerMilliseconds"] = VtValue(engineStats.lastPassRayWorkerMilliseconds);
     result["meshCount"] = VtValue(static_cast<int64_t>(
         _impl->snapshot ? _impl->snapshot->meshCount : 0));
     result["triangleCount"] = VtValue(
@@ -7816,24 +6766,24 @@ VtDictionary SceneBridge::GetStats() const
         _impl->reusedSnapshotBuilds));
     result["renderSeconds"] = VtValue(_impl->renderSeconds);
     result["previewPublishes"] = VtValue(static_cast<int64_t>(
-        _impl->previewPublishes));
-    result["previewMilliseconds"] = VtValue(_impl->previewMilliseconds);
-    result["previewCostMilliseconds"] = VtValue(_impl->previewCostMilliseconds);
+        engineStats.previewPublishes));
+    result["previewMilliseconds"] = VtValue(engineStats.previewMilliseconds);
+    result["previewCostMilliseconds"] = VtValue(engineStats.previewCostMilliseconds);
     result["previewRayWorkMilliseconds"] = VtValue(
-        _impl->previewRayWorkMilliseconds);
+        engineStats.previewRayWorkMilliseconds);
     result["previewPublicationMilliseconds"] = VtValue(
-        _impl->previewPublicationMilliseconds);
+        engineStats.previewPublicationMilliseconds);
     result["previewPublishedBytes"] = VtValue(static_cast<int64_t>(
-        _impl->previewPublishedBytes));
+        engineStats.previewPublishedBytes));
     result["previewTracedPixels"] = VtValue(static_cast<int64_t>(
-        _impl->previewTracedPixels));
+        engineStats.previewTracedPixels));
     result["previewBoundAovCount"] = VtValue(static_cast<int64_t>(
-        _impl->previewBoundAovCount));
+        engineStats.previewBoundAovCount));
     result["prepareMilliseconds"] = VtValue(_impl->prepareMilliseconds);
     result["stopRenderMilliseconds"] = VtValue(
         _impl->stopRenderMilliseconds);
-    result["previewWidth"] = VtValue(static_cast<int64_t>(_impl->previewWidth));
-    result["previewHeight"] = VtValue(static_cast<int64_t>(_impl->previewHeight));
+    result["previewWidth"] = VtValue(static_cast<int64_t>(engineStats.previewWidth));
+    result["previewHeight"] = VtValue(static_cast<int64_t>(engineStats.previewHeight));
     result["instanceCount"] = VtValue(static_cast<int64_t>(
         _impl->snapshot ? _impl->snapshot->instanceCount : 0));
     result["prototypeCount"] = VtValue(static_cast<int64_t>(
@@ -7949,7 +6899,7 @@ VtDictionary SceneBridge::GetStats() const
         }
     }
     result["bufferWriteProfilingEnabled"] = VtValue(
-        _impl->profileBufferWrites);
+        _impl->engine->profileBufferWrites);
     result["presentationCopyBytes"] = VtValue(static_cast<int64_t>(presentationCopyBytes));
     result["bufferWriteMilliseconds"] = VtValue(writeNs / 1.0e6);
     result["bufferPublicationMilliseconds"] = VtValue(publishNs / 1.0e6);
