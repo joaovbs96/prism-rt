@@ -162,7 +162,6 @@ std::unordered_map<uint64_t, uint64_t> gAssociationReloadGenerations;
 std::unordered_map<uint64_t,
     std::unordered_map<SdfPath, uint64_t, SdfPath::Hash>> gAssociationGenerations;
 std::unordered_map<uint64_t, uint64_t> gAssociationScopeUsers;
-std::atomic<mdl::Context*> gSharedMdlContext{nullptr};
 
 struct ConversionArtifact {
     std::string libraries, mdlPath;
@@ -729,18 +728,6 @@ PrewarmResult RunPrewarm(mdl::Context* context, const std::string& libraries,
 
 } // namespace
 
-mdl::Context& SharedMdlContext()
-{
-    // Intentionally process-lifetime: MDL target code and backend objects use
-    // interfaces owned by INeuray, including across renderer replacement.
-    static mdl::Context* context = [] {
-        mdl::Context* result = new mdl::Context();
-        gSharedMdlContext.store(result, std::memory_order_release);
-        return result;
-    }();
-    return *context;
-}
-
 class MaterialService::Impl {
 public:
     struct Prepared {
@@ -891,7 +878,7 @@ public:
             result.network, &result.dependencies,
             result.resolverContext, result.resourceRevision);
         result.earlyCacheEligible = context ==
-                gSharedMdlContext.load(std::memory_order_acquire) && capturedDependencies;
+                SharedMdlContextIfCreated() && capturedDependencies;
         {
             std::lock_guard lock(mutex);
             auto& previous = pathDependencies[materialPath];
@@ -1496,7 +1483,7 @@ MaterialService::MaterialService(mdl::Context* context,
 MaterialService::~MaterialService() {
     const auto context = m_impl->context;
     if (m_impl->prewarm.valid()) m_impl->prewarm.wait();
-    if (context != gSharedMdlContext.load(std::memory_order_acquire)) {
+    if (context != SharedMdlContextIfCreated()) {
         // A later Context may reuse this address; its key must pre-warm anew.
         // Running entries belong to live services, which wait for them.
         std::lock_guard lock(gPrewarmMutex);
@@ -1513,7 +1500,7 @@ MaterialService::~MaterialService() {
     // Only the explicitly process-lived runtime may retain SDK handles after
     // its service dies. Scoped test/client contexts must not leave warm entries
     // behind for a subsequent Context allocated at the same address.
-    if (context != gSharedMdlContext.load(std::memory_order_acquire)) {
+    if (context != SharedMdlContextIfCreated()) {
         const auto prefix = std::to_string(reinterpret_cast<std::uintptr_t>(context)) + "-";
         for (auto it = gMaterialCache.begin(); it != gMaterialCache.end();) {
             if (it->first.starts_with(prefix)) it = gMaterialCache.erase(it);

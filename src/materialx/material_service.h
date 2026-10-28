@@ -12,16 +12,15 @@
 
 #include "../renderer/material_settings.h"
 #include "../renderer/renderer_options.h"
+#include "shared_mdl_context.h"
 
 class Material;
 namespace mdl { class Context; }
 
 namespace prism::materials {
 
-// Process-lifetime MDL runtime shared by renderer instances. Hydra renderer
-// objects may be created/destroyed repeatedly while compiled materials still
-// reference SDK state, so the runtime intentionally outlives plugin instances.
-mdl::Context& SharedMdlContext();
+// SharedMdlContext(), the process-lifetime MDL runtime, is the core's
+// (shared_mdl_context.h).
 
 // Converts scene-index material data sources to PrismRT MDL materials. The
 // service owns the resulting materials. Prefetch captures Hydra data on the
