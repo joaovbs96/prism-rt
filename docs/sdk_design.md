@@ -1206,7 +1206,9 @@ landed:
 - Deviations (`docs/DECISIONS.md`, 2026-10-28): the progress struct is
   `ProgressInfo` (the internal `prism::Progress` model keeps its name); the
   session's render settings still reach the devices through the committed
-  `SceneManager` (so the sessions of one scene render one at a time);
+  `SceneManager`, tracked by a settings generation of the scene (so the
+  sessions of one scene render one at a time, enforced by a mutex of the
+  scene);
   `SessionOptions::denoise` + `denoisedColor` instead of a `Denoised`-only
   switch; no `prepare(ProgressCallback)`, `pick`, `start`/`wait`
   (progressive, step 5a); `RenderSettings::advanced`, `sampleClamp`'s Hydra

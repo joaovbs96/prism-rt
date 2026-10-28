@@ -279,6 +279,50 @@ void cancellation(prism::Renderer const& renderer)
     check(session.render().aov(prism::Aov::Color).width() == 16, "a cancelled session renders again");
 }
 
+bool Same(prism::RenderResult const& a, prism::RenderResult const& b)
+{
+    prism::Image const& x = a.aov(prism::Aov::Color);
+    prism::Image const& y = b.aov(prism::Aov::Color);
+    return x.valueCount() == y.valueCount() && std::memcmp(x.data(), y.data(), x.valueCount() * 4) == 0;
+}
+
+// Two sessions on one scene with different values of a setting the scene
+// holds (maxDepth): each renders with its own, also after the other, and
+// concurrent renders serialize on the scene.
+void sharedScene(prism::Renderer const& renderer)
+{
+    TestScene test = build(renderer);
+    test.scene.commit();
+    prism::SessionOptions shallow = sessionOptions(test.camera);
+    shallow.aovs = {prism::Aov::Color};
+    shallow.settings.maxDepth = 1;
+    prism::SessionOptions deep = shallow;
+    deep.settings.maxDepth = 8;
+    prism::Session a = renderer.createSession(test.scene, shallow);
+    prism::Session b = renderer.createSession(test.scene, deep);
+    const prism::RenderResult first = a.render();
+    const prism::RenderResult other = b.render();
+    const prism::RenderResult again = a.render();
+    check(!Same(first, other), "sessions with different depths render different images");
+    check(Same(first, again), "a session renders with its own settings after another session's render");
+    check(Same(other, b.render()), "and so does the other");
+
+    // Concurrent renders of both sessions: serialized, each with its settings.
+    bool ok[2] = {true, true};
+    std::thread threads[2];
+    for (int t = 0; t < 2; ++t)
+        threads[t] = std::thread([&, t] {
+            try {
+                for (int i = 0; i < 3; ++i)
+                    ok[t] = ok[t] && Same(t == 0 ? a.render() : b.render(), t == 0 ? first : other);
+            } catch (...) {
+                ok[t] = false;
+            }
+        });
+    for (auto& thread : threads) thread.join();
+    check(ok[0] && ok[1], "concurrent renders of one scene's sessions keep their settings");
+}
+
 void misuse(prism::Renderer const& renderer)
 {
     TestScene test = build(renderer);
@@ -319,6 +363,7 @@ int main(int argc, char** argv)
         const prism::Renderer renderer(options());
         renderAndAovs(renderer, output);
         cancellation(renderer);
+        sharedScene(renderer);
         misuse(renderer);
         // Several renderers in one process, in other working spaces.
         const prism::Renderer acescg(options("ACEScg"));

@@ -13,6 +13,7 @@
 #include "../texture.h"
 
 #include <memory>
+#include <mutex>
 #include <string>
 
 class Material;
@@ -56,6 +57,13 @@ struct SceneAccess {
     // it while any revision uses it. A null material is rejected.
     static MaterialId addCompiledMaterial(Scene& scene, std::shared_ptr<Material> material, std::string name);
     static void setRenderSettings(Scene& scene, SceneRenderSettings const& settings);
+    // The settings last set and a counter of their changes (each
+    // setRenderSettings), so sessions see another session's change.
+    static SceneRenderSettings const& renderSettings(Scene const& scene);
+    static uint64_t renderSettingsGeneration(Scene const& scene);
+    // Held by the scene's sessions while they render: one at a time per
+    // scene (the render settings above live on the committed revision).
+    static std::mutex& renderMutex(Scene const& scene);
     // The last committed revision's scene; throws when nothing is committed.
     static SceneManager& committed(Scene& scene);
     // The placement of an Embree geometry id of the committed scene, or null.

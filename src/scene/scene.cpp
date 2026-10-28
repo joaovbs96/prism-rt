@@ -612,6 +612,8 @@ struct Scene::Impl {
     Slots<EnvironmentDesc> environments;
     Slots<CameraDesc> cameras;
     detail::SceneRenderSettings renderSettings;
+    uint64_t renderSettingsGeneration = 0;
+    std::mutex renderMutex;  // the scene's sessions render one at a time
     std::unique_ptr<Revision> committed;
     uint64_t revision = 0;
     std::vector<Diagnostic> diagnostics;
@@ -1342,6 +1344,7 @@ MaterialId SceneAccess::addCompiledMaterial(Scene& scene, std::shared_ptr<Materi
 void SceneAccess::setRenderSettings(Scene& scene, SceneRenderSettings const& settings)
 {
     scene.m_impl->renderSettings = settings;
+    ++scene.m_impl->renderSettingsGeneration;
     if (auto& revision = scene.m_impl->committed) {
         SceneManager& manager = *revision->manager;
         manager.max_depth = settings.maxDepth;
@@ -1353,6 +1356,10 @@ void SceneAccess::setRenderSettings(Scene& scene, SceneRenderSettings const& set
         manager.gpuTextureBudgetMiB = settings.gpuTextureBudgetMiB;
     }
 }
+
+SceneRenderSettings const& SceneAccess::renderSettings(Scene const& scene) { return scene.m_impl->renderSettings; }
+uint64_t SceneAccess::renderSettingsGeneration(Scene const& scene) { return scene.m_impl->renderSettingsGeneration; }
+std::mutex& SceneAccess::renderMutex(Scene const& scene) { return scene.m_impl->renderMutex; }
 
 SceneManager& SceneAccess::committed(Scene& scene)
 {

@@ -209,7 +209,10 @@ public:
     void prepare();
 
     // Renders the scene's last committed revision to completion. Blocking;
-    // the callback runs on an internal thread. Throws Error(Cancelled) when
+    // the callback runs on an internal thread. The sessions of one scene
+    // render one at a time: a render (or prepare()) waits for another
+    // session's on the same scene to finish (the render settings still live
+    // on the scene's revision). Throws Error(Cancelled) when
     // the callback returned false or cancel() was called.
     RenderResult render(ProgressCallback const& progress = {});
 

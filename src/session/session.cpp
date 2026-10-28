@@ -164,9 +164,10 @@ struct Session::Impl {
     std::unique_ptr<device::RenderDevice> device;
     DeviceInfo info;
     std::string note;
-    // What the device last saw: the scene revision and its render settings.
+    // What the device last saw: the scene revision and the generation of the
+    // scene's render settings (another session may have changed them since).
     uint64_t preparedRevision = 0;
-    detail::SceneRenderSettings applied;
+    uint64_t preparedSettings = ~uint64_t(0);
     std::mutex renderMutex;
     std::atomic<bool> cancelRequested{false};
 
@@ -175,17 +176,21 @@ struct Session::Impl {
     RenderResult render(ProgressCallback const& progress);
 };
 
+// Called with the scene's render mutex held (SceneAccess::renderMutex).
 SceneManager& Session::Impl::sceneForDevice()
 {
     SceneManager& manager = detail::SceneAccess::committed(scene);
+    // The render settings still live on the committed scene, shared by its
+    // sessions (docs/DECISIONS.md): set this session's when the scene holds
+    // others, and tell the device whenever the scene's revision or settings
+    // changed since it last saw them (also by another session).
     const detail::SceneRenderSettings wanted = SceneSettings(options.settings);
-    if (scene.revision() != preparedRevision || !(wanted == applied)) {
-        // The render settings that still live on the committed scene
-        // (docs/DECISIONS.md): set before the device sees it.
-        detail::SceneAccess::setRenderSettings(scene, wanted);
+    if (!(detail::SceneAccess::renderSettings(scene) == wanted)) detail::SceneAccess::setRenderSettings(scene, wanted);
+    const uint64_t generation = detail::SceneAccess::renderSettingsGeneration(scene);
+    if (scene.revision() != preparedRevision || generation != preparedSettings) {
         device->SceneChanged(manager);
         preparedRevision = scene.revision();
-        applied = wanted;
+        preparedSettings = generation;
     }
     return manager;
 }
@@ -202,6 +207,9 @@ RenderResult Session::Impl::render(ProgressCallback const& progressCallback)
     using Clock = std::chrono::steady_clock;
     std::lock_guard lock(renderMutex);
     cancelRequested.store(false);
+    // The scene's sessions render one at a time (their render settings live
+    // on the scene's committed revision); a cancel() while waiting holds.
+    std::lock_guard sceneLock(detail::SceneAccess::renderMutex(scene));
     const auto start = Clock::now();
     auto seconds = [&] { return std::chrono::duration<double>(Clock::now() - start).count(); };
 
@@ -527,6 +535,7 @@ void Session::setDenoise(std::optional<DenoiseSettings> const& denoise, bool den
 void Session::prepare()
 {
     std::lock_guard lock(m_impl->renderMutex);
+    std::lock_guard sceneLock(detail::SceneAccess::renderMutex(m_impl->scene));
     Validate(m_impl->options.settings);
     progress::Bind progressBinding(&m_impl->context->progress());
     logging::Bind logBinding(&m_impl->context->logger());
