@@ -1124,6 +1124,25 @@ called done there.
   - Runs: build; `ctest -R "scene_api|usd_spheres|gltf_|obj_|parity_cornell"`
     (CPU); the glTF spheres and an OBJ with `--device metal` against
     `--device cpu`.
+- **SDK step 4: batch session** ([sdk_design.md](sdk_design.md), section 7;
+  written on Windows, the Metal device unbuilt):
+  - Build: `prism` gains `src/session/` and `src/camera/`; `prism_io` gains
+    `src/io/`. Public headers `options.h`, `settings.h`, `session.h`, `io.h`.
+  - Device interface: `DeviceKind`, `DevicePreference`, `DeviceInfo`,
+    `NeeSettings`, `DenoiseQuality`/`DenoiseSettings` and `TextureFiltering`
+    are the public types of `include/prism/settings.h` (the old names are
+    `using` declarations, same layout). `CreateDevice`/`AvailableDevices`
+    take `DeviceResources` (the public `DeviceOptions` plus the renderer's
+    services; implicit from `DeviceOptions`); `MetalDevice::Create` is
+    unchanged. `ImageRequest::cancel` (an atomic flag):
+    `GpuRenderDevice::RenderImage` (shared by Vulkan and Metal) returns an
+    empty image at the next sample boundary when it is set.
+  - No shader change: `shaders/` and `src/hydra/` are untouched.
+  - Runs: build; `ctest -R "session|camera_projection|scene_api"` (CPU); a
+    CLI render with `--device metal` against `--device cpu`; a
+    `prism::Session` on Metal cancelled from its progress callback (the
+    session test with `options.device = Metal`) returns `Error(Cancelled)`
+    and renders again afterwards.
 
 ## Diagnostics
 

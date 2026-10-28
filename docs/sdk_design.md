@@ -1,7 +1,7 @@
 # PrismRT SDK and Python API: design
 
-Status: migration steps 1a-1e, most of step 2 and step 3 (section 7) are
-implemented; the rest is design. Plan context: `docs/PLAN.md`, "Then:
+Status: migration steps 1a-1e, most of step 2, step 3 and the batch session
+of step 4 (section 7) are implemented; the rest is design. Plan context: `docs/PLAN.md`, "Then:
 renderer SDK and Python API". Line numbers refer to commit `c0e44c1`; the
 **Status** notes in the inventory (section 2) describe the code after step 1,
 the step 2 and step 3 notes in section 7 what moved where and how the landed
@@ -1159,6 +1159,64 @@ is unchanged. What landed:
   (USD, instancing, linking, lights, IES, domes, displacement, subdivision,
   skinning, GeomSubsets, glTF, OBJ with displacement, `--env`,
   `--env-color`, the default dome, id AOVs); `prism_scene_api_test` covers
+  the API itself.
+
+**Step 4 status (2026-10-28)**: done (batch path). The public session and
+`prism_io` exist, the CLI renders through them, Hydra is unchanged. What
+landed:
+- Public headers: `options.h` (`RendererOptions` with `FromEnvironment()`,
+  `ColorOptions`, `MaterialOptions`, `Limits`, `TextureOptions`,
+  `DeviceOptions`, `LogLevel`/`LogSink`; the internal headers alias them),
+  `settings.h` (`DeviceKind`, `DevicePreference`, `DeviceInfo`,
+  `ConformPolicy`, `TextureFiltering`, `NeeSettings`, `DenoiseQuality`,
+  `DenoiseSettings`, used by the devices as they are), `session.h` (`Aov`
+  with `AovName`/`AovFromName` on the Hydra tokens, `Shutter`,
+  `RenderSettings`, `Window`, `SessionOptions`, `Image`, `RenderResult`,
+  `Session`), `io.h` (`prism::io::Write`, `WriteOptions`, `Layer`), and in
+  `types.h` `ProgressInfo`/`ProgressCallback` (commits and renders).
+  `Renderer` gained `options()`, `color()` (`ColorInfo`), `devices()`,
+  `capabilities()`, `stats()` and `createSession()`.
+- `Session::render()` (`src/session/session.cpp`) is the CLI's former render
+  path: camera rays from the `CameraDesc` (`src/camera/camera_projection.*`:
+  GfCamera's frustum, CameraUtil's conform and framing repeated in std-only
+  code, `prism_camera_projection_test` compares 20000 cameras with Gf bit for
+  bit), `RenderDevice::RenderImage` with the light AOVs and denoising, the
+  camera's exposure (and `RenderSettings::exposure` in stops), the geometric
+  and id AOVs from pixel-centre hits. Ids are `Int32` images; the id rule is
+  the CLI's (triangle lists report the triangle, polygon meshes their coarse
+  face, spheres -1). Progress: a monitor thread polls the device about ten
+  times a second and calls the callback; `false` or `cancel()` set
+  `ImageRequest::cancel`, which the CPU device checks between rows and every
+  16 samples, the GPU devices at sample boundaries; `render()` throws
+  `Error(Cancelled)`.
+- `Scene::commit(ProgressCallback)`: phases materials (counted), geometry,
+  lights, acceleration; `false` throws `Error(Cancelled)` and keeps the last
+  revision.
+- `prism_io` (`src/io/io.cpp`): a `RenderResult` as EXR layers (the first
+  Color layer the beauty) or display-encoded 8-bit, through the existing
+  image writer; `prism::output::WriteProduct` (prism_usd) writes a render
+  product's vars through it. `prism::usd::CameraFromGf` and `LoadCamera`
+  give the CLI its cameras.
+- The CLI (`src/standalone_cli.cpp`) is argument parsing, UsdRender jobs,
+  loading through the scene API, one `Session` (one device) for all views,
+  `setCamera`/`resize`/`setAovs`/`setDenoise`/`setSettings` per distinct
+  view, and `WriteProduct`. It still includes internal headers for its
+  option parsing helpers (device and denoise names), the loading progress
+  model (the loaders' material counts) and the GPU program report.
+- Deviations (`docs/DECISIONS.md`, 2026-10-28): the progress struct is
+  `ProgressInfo` (the internal `prism::Progress` model keeps its name); the
+  session's render settings still reach the devices through the committed
+  `SceneManager` (so the sessions of one scene render one at a time);
+  `SessionOptions::denoise` + `denoisedColor` instead of a `Denoised`-only
+  switch; no `prepare(ProgressCallback)`, `pick`, `start`/`wait`
+  (progressive, step 5a); `RenderSettings::advanced`, `sampleClamp`'s Hydra
+  default and `transparentBackground` are not there yet; USD render jobs and
+  products stay internal to prism_usd (`src/output/render_products.h`).
+- Images: CLI outputs bit-identical to the previous build on 12 CPU cases
+  (multi-product EXRs with AOVs and multi-part, 8-bit PNG, crops with pixel
+  aspect ratios, denoise `aov` and `replace`, camera exposure,
+  `--env-color`/`--env` with `--env-exposure`, glTF and OBJ with explicit
+  cameras and depth of field, adaptive sampling); `prism_session_test` covers
   the API itself.
 
 Notes:

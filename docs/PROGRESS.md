@@ -2,6 +2,11 @@
 
 Phase reports, newest first. Detailed reports live in `local/reports/` (git-ignored).
 
+## 2026-10-28 — SDK step 4: batch session and prism_io
+- `include/prism/`: public `RendererOptions` (`options.h`), shared setting types (`settings.h`), `Session` with `render()` → `RenderResult` (colour and AOVs by Hydra token, `Int32` ids), render settings, crop and pixel aspect ratio, exposure, denoising, time limit, a progress callback and `cancel()` (`session.h`); `prism::io::Write` for EXR layers and 8-bit through the view (`io.h`); `Scene::commit` takes a progress callback. Camera rays come from `CameraDesc` (Gf's and CameraUtil's arithmetic, 20000 cameras bit-identical in `prism_camera_projection_test`).
+- The CLI is parsing → scene → one session → `prism_io` (render products through it); Hydra unchanged; the core still builds without USD (`prism_session_test` links the core and `prism_io` only).
+- CLI outputs bit-identical to main (1be9f0d) on 12 CPU cases (products, multi-part EXR, PNG, crops, denoise aov/replace, camera exposure, env exposure, glTF, OBJ, adaptive); end-to-end time ratios 1.00, 1.00 (and a 2 s case within the timer's granularity). Focused CPU suites 234/234; full serial ctest 480/480 (GPU tests included). Render settings still pass through the committed `SceneManager` (sessions of one scene render one at a time). Metal unbuilt (checklist in `docs/gpu_devices.md`). Report: `local/reports/sdk_session_batch.md`.
+
 ## 2026-10-28 — SDK step 3: public scene API
 - `include/prism/`: `Scene` with handles for meshes, spheres, instances, materials, lights, environments and cameras; `commit()` rebuilds the internal `SceneManager` with the loaders' conversions moved into the core (USD shapes and subdivision budget, OBJ displacement, lights, domes, default dome); a minimal `Renderer`. Errors are `prism::Error`; mesh data is copied at commit.
 - glTF, OBJ and USD load through `prism::gltf::Load`, `prism::obj::Load`, `prism::usd::Load`; the CLI builds its scene through the API; Hydra unchanged; the core still builds without USD (`prism_scene_api_test` links the core alone).
