@@ -1138,8 +1138,10 @@ is unchanged. What landed:
   of the published MaterialX documents, compiled at commit;
   `prism::usd::Load` (`src/usd/usd_loader.cpp`) compiles UsdShade materials
   through the material service, adds a mesh per prim (shared by instanced
-  placements), an instance per placement, sphere prototypes per radius, and
-  the lights, link categories and domes that the CLI read before.
+  placements; GeomSubsets as material slots, one per set of subsets covering
+  a face, so overlapping subsets resolve as in Hydra), an instance per
+  placement, sphere prototypes per radius, and the lights, link categories
+  and domes that the CLI read before.
 - `SharedMdlContext()` moved into the core (`src/materialx/shared_mdl_context.*`):
   commit compiles MaterialX without the USD module. The renderer context
   owns an Embree device.

@@ -1317,6 +1317,10 @@ if(TARGET prism_hydra_render AND TARGET prism_compare_images)
         prism_add_parity_fixture(NAME mesh_features_${_name} SCENE tests/hydra/fixtures/mesh_features.usda
             WIDTH 96 HEIGHT 64 ARGS --render-settings /Render/${_settings})
     endforeach()
+    # ... overlapping GeomSubsets: a later subset without a (resolvable)
+    # material leaves the faces of an earlier one as they were, ...
+    prism_add_parity_fixture(NAME overlapping_subsets SCENE tests/hydra/fixtures/overlapping_subsets.usda
+        WIDTH 96 HEIGHT 48)
     # ... PointInstancers (nested, invisibleIds) of implicit cubes, native
     # instances with their own bindings, per-instance primvars for MDL scene
     # data lookups (geompropvalue), ...

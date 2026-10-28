@@ -587,7 +587,14 @@ public:
             instance.prototype = meshes[placement.shape];
             instance.materials.push_back(idOf(material_override ? material_override : placement.material));
             if (!material_override)
-                for (Material* subset : placement.subsetMaterials) instance.materials.push_back(idOf(subset));
+                for (auto const& cover : m_shapes[placement.shape]->coverSets) {
+                    // The last subset of the cover with a material (none: the
+                    // mesh's, slot 0's fallback).
+                    Material* material = nullptr;
+                    for (auto k = cover.rbegin(); k != cover.rend() && !material; ++k)
+                        if (size_t(*k) < placement.subsetMaterials.size()) material = placement.subsetMaterials[size_t(*k)];
+                    instance.materials.push_back(idOf(material));
+                }
             scene.addInstance(instance);
         }
         std::map<float, prism::SpheresId> spheres;
@@ -751,9 +758,14 @@ private:
         pxr::UsdPrim prim;
         std::shared_ptr<const prism::usd::UsdMeshSource> source;
         bool instanced = false;             // placed by Embree instances even with one placement
-        // GeomSubset slots by coarse face (0: the mesh's material; k: the k-th
-        // face subset, later subsets over earlier ones); empty: no subsets.
+        // GeomSubset material slots by coarse face (0: the mesh's material;
+        // s > 0: the faces covered by the face subsets coverSets[s - 1], in
+        // subset order); empty: no subsets. A placement's material for a slot
+        // is that of the last of its subsets with a material: a subset without
+        // one leaves the faces as the earlier subsets assigned them, as in the
+        // Hydra delegate.
         std::vector<int32_t> faceSlots;
+        std::vector<std::vector<int>> coverSets;
     };
     struct MeshPlacement {
         size_t shape = 0;
@@ -1144,12 +1156,23 @@ private:
         if (source) {
             const std::vector<pxr::UsdGeomSubset> subsets = faceSubsets(prim);
             if (!subsets.empty()) {
-                shape->faceSlots.assign(source->faceVertexCounts.size(), 0);
+                // The subsets covering each face, then a slot per distinct cover.
+                std::vector<std::vector<int>> covers(source->faceVertexCounts.size());
                 for (size_t k = 0; k < subsets.size(); ++k) {
                     pxr::VtIntArray indices;
                     subsets[k].GetIndicesAttr().Get(&indices, m_options.time);
                     for (int face : indices)
-                        if (face >= 0 && size_t(face) < shape->faceSlots.size()) shape->faceSlots[size_t(face)] = int32_t(k + 1);
+                        if (face >= 0 && size_t(face) < covers.size() &&
+                            (covers[size_t(face)].empty() || covers[size_t(face)].back() != int(k)))
+                            covers[size_t(face)].push_back(int(k));
+                }
+                std::map<std::vector<int>, int32_t> slots;
+                shape->faceSlots.assign(covers.size(), 0);
+                for (size_t face = 0; face < covers.size(); ++face) {
+                    if (covers[face].empty()) continue;
+                    auto [slot, added] = slots.try_emplace(covers[face], int32_t(shape->coverSets.size() + 1));
+                    if (added) shape->coverSets.push_back(covers[face]);
+                    shape->faceSlots[face] = slot->second;
                 }
             }
             shape->source = std::make_shared<const prism::usd::UsdMeshSource>(std::move(*source));
