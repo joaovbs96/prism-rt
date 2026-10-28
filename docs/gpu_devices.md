@@ -1108,6 +1108,22 @@ called done there.
     (CPU); an egg and the chess set with `--device metal` against
     `--device cpu`, and `prism_hydra_render` of `tests/hydra/fixtures/parity.usda`
     on Metal.
+- **SDK step 3: public scene API** ([sdk_design.md](sdk_design.md), section 7;
+  written on Windows, the Metal device unbuilt):
+  - Build: `prism` gains `include/` as a public include directory and
+    `src/scene/`; `prism_gltf`/`prism_obj` gain `src/gltf/`, `src/obj/`.
+  - Shared host code: `SharedMdlContext()` moved from
+    `src/materialx/material_service.cpp` into the core
+    (`src/materialx/shared_mdl_context.*`); the material service compares
+    contexts with `SharedMdlContextIfCreated()`. The CLI's scenes are built by
+    `Scene::commit` (`src/scene/scene.cpp`), which fills `SceneManager` the
+    way the loaders did (same placements, prototypes, material bindings,
+    lights, environments), so the device sees the same scene. `src/hydra/` is
+    untouched.
+  - No shader or device change: `shaders/` and `src/device/` are untouched.
+  - Runs: build; `ctest -R "scene_api|usd_spheres|gltf_|obj_|parity_cornell"`
+    (CPU); the glTF spheres and an OBJ with `--device metal` against
+    `--device cpu`.
 
 ## Diagnostics
 

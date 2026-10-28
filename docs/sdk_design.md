@@ -1,10 +1,11 @@
 # PrismRT SDK and Python API: design
 
-Status: migration steps 1a-1e and most of step 2 (section 7) are implemented;
-the rest is design. Plan context: `docs/PLAN.md`, "Then: renderer SDK and
-Python API". Line numbers refer to commit `c0e44c1`; the **Status** notes in
-the inventory (section 2) describe the code after step 1, the step 2 note in
-section 7 what moved where.
+Status: migration steps 1a-1e, most of step 2 and step 3 (section 7) are
+implemented; the rest is design. Plan context: `docs/PLAN.md`, "Then:
+renderer SDK and Python API". Line numbers refer to commit `c0e44c1`; the
+**Status** notes in the inventory (section 2) describe the code after step 1,
+the step 2 and step 3 notes in section 7 what moved where and how the landed
+API differs from the sketches of section 3.
 
 Contents:
 1. Goals and non-goals
@@ -1104,6 +1105,59 @@ Rules for every step:
 - Still under `src/hydra/` but std-only and compiled into the core:
   `fallback_material.h`, `environment_cache.h` (the devices mirror them); they
   move with the public `Scene` (step 3).
+
+**Step 3 status (2026-10-28)**: done. The public scene API exists, the glTF,
+OBJ and USD loaders emit into it, the CLI builds its scene through it, Hydra
+is unchanged. What landed:
+- Public headers in `include/prism/` (std and PrismRT types only; `prism`
+  puts `include/` on its public include path): `types.h` (`Error`/`ErrorCode`,
+  `BufferView`, `TimeSample`/`Sampled`; `Float2/3/4` and `Matrix4d` from
+  `src/`, since the shaders include them), `material.h` (`MaterialDesc`),
+  `scene.h` (handles, the `*Desc` structs, `SceneOptions`, `Scene`),
+  `renderer.h` (a minimal `Renderer`: the context and `createScene`), and the
+  modules' entry points `gltf.h`, `obj.h`, `usd.h` (pxr types only there).
+- `src/scene/scene.cpp`: `Scene::Impl` (descriptions in slot tables, handles
+  of a 32-bit slot and generation) and `commit()`, a full rebuild of a new
+  `SceneManager` (a `Revision` owning meshes, prototypes, materials,
+  textures, environments). The conversions moved there from the loaders
+  unchanged: USD's shape conversion (refinement budget, `ConvertMesh` for
+  refined/displaced meshes, the polygon conversion baked into world space
+  for single non-instanced meshes, Embree instances otherwise), the OBJ
+  loader's displacement of faces (now for any triangle list whose slots
+  displace), sphere prototypes, UsdLux lights (`MakeSceneLight`), light-link
+  bits from category names, domes and the CLI's environments, the default
+  dome. The polygon conversion is std-only now (`src/mesh/polygon_mesh.*`,
+  Gf's arithmetic repeated).
+- `src/scene/scene_internal.h` (`prism::detail::SceneAccess`, not public):
+  materials a module compiled itself (USD's material service, the error
+  material), the committed `SceneManager` the CLI renders until the session
+  exists, the render settings still on `SceneManager`, the placement table of
+  the id AOVs.
+- Loaders: `prism::gltf::Load` (`src/gltf/`) and `prism::obj::Load`
+  (`src/obj/`) add one triangle-list mesh, one instance and `MaterialDesc`s
+  of the published MaterialX documents, compiled at commit;
+  `prism::usd::Load` (`src/usd/usd_loader.cpp`) compiles UsdShade materials
+  through the material service, adds a mesh per prim (shared by instanced
+  placements), an instance per placement, sphere prototypes per radius, and
+  the lights, link categories and domes that the CLI read before.
+- `SharedMdlContext()` moved into the core (`src/materialx/shared_mdl_context.*`):
+  commit compiles MaterialX without the USD module. The renderer context
+  owns an Embree device.
+- Deviations from section 3 (`docs/DECISIONS.md`, 2026-10-28): a mesh is a
+  triangle list (attributes used as given) or a polygon mesh (USD's
+  conversion); `EnvironmentDesc::Kind` (Dome, LatLong, Constant);
+  `LightDesc` without colour temperature or colour space (linear Rec.709,
+  temperature applied by the front end); handles detect removal but not
+  another scene's handles; `commit()` takes no progress callback and returns
+  counts, not `SceneStats`; `MaterialDesc` has no parameter overrides yet;
+  cameras are stored but the CLI still builds its own camera rays (the
+  session consumes `CameraDesc` in step 4); `Renderer` takes the internal
+  `RendererOptions` until its options header is public (step 4).
+- Images: CLI renders bit-identical to the previous build on 29 CPU scenes
+  (USD, instancing, linking, lights, IES, domes, displacement, subdivision,
+  skinning, GeomSubsets, glTF, OBJ with displacement, `--env`,
+  `--env-color`, the default dome, id AOVs); `prism_scene_api_test` covers
+  the API itself.
 
 Notes:
 - Step 6 is mechanical and can move earlier if the CLI/Hydra double copy of
