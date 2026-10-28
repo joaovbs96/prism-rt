@@ -50,6 +50,18 @@ Scenes: **Eggs** (MaterialEggs), **OpenPBR** (OpenPBRShaderPlayground),
   emits through Hydra); not investigated.
 - **Material edits of displacing materials** rebuild bindings but not the
   displaced geometry until the next full snapshot.
+- **Multiple UV sets.** Today each mesh feeds one UV set (USD `st`, else
+  `uv`; Hydra warns when a mesh has both) to MDL texture space 0, and MDL is
+  compiled with `num_texture_spaces = 1` (`src/mdl/backend_compiler.cpp`,
+  `src/device/gpu/gpu_materials.cpp`). Further sets can only be read by
+  primvar name (`geompropvalue` / `UsdPrimvarReader_float2` through the MDL
+  scene-data lookup), as glTF `TEXCOORD_1` is; MaterialX `texcoord` with
+  `index` >= 1 and MDL `texture_coordinate(1)` have no data, and tangent
+  frames come from the primary set only, so normal maps on another set shade
+  wrong. To do: raise `num_texture_spaces`, carry the extra sets and their
+  tangents through the CPU and GPU shading state, map `texcoord index=N` (and
+  USD's named sets) to them in both loaders, with a CLI-vs-Hydra parity
+  fixture and CPU/Vulkan parity (Metal checklist entry).
 
 ## Lights
 
