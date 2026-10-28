@@ -3,9 +3,7 @@
 #include "ray.h"
 #include "sampling.h"
 
-#include "pxr/base/gf/matrix4d.h"
-#include "pxr/base/gf/vec3d.h"
-#include "pxr/base/gf/vec4d.h"
+#include "matrix4d.h"
 
 #include <algorithm>
 #include <cmath>
@@ -13,8 +11,8 @@
 namespace prism {
 
 struct CameraRayParameters {
-    pxr::GfMatrix4d inverseProjection{1.0};
-    pxr::GfMatrix4d cameraToWorld{1.0};
+    prism::Matrix4d inverseProjection{1.0};
+    prism::Matrix4d cameraToWorld{1.0};
     float nearClip = 0.001f;
     float farClip = 1.0e30f;
     double apertureRadius = 0.0;
@@ -45,33 +43,33 @@ inline RTCRay MakeCameraRayWithLens(CameraRayParameters const &camera,
         static_cast<double>(width) - 1.0;
     const double ny = 1.0 - 2.0 * static_cast<double>(sy) /
         static_cast<double>(height);
-    pxr::GfVec4d p(nx, ny, -1.0, 1.0);
+    prism::Vec4d p(nx, ny, -1.0, 1.0);
     p = p * camera.inverseProjection;
     if (std::abs(p[3]) > 1e-12) p /= p[3];
 
-    pxr::GfVec3d originCamera(0.0);
-    pxr::GfVec3d directionCamera;
+    prism::Vec3d originCamera(0.0);
+    prism::Vec3d directionCamera;
     if (camera.orthographic) {
-        originCamera = pxr::GfVec3d(p[0], p[1], 0.0);
-        directionCamera = pxr::GfVec3d(0.0, 0.0, -1.0);
+        originCamera = prism::Vec3d(p[0], p[1], 0.0);
+        directionCamera = prism::Vec3d(0.0, 0.0, -1.0);
     } else {
-        directionCamera = pxr::GfVec3d(p[0], p[1], p[2]).GetNormalized();
+        directionCamera = prism::Vec3d(p[0], p[1], p[2]).normalized();
     }
 
     if (lensPoint && !camera.orthographic && camera.apertureRadius > 0.0 &&
         camera.focusDistance > 0.0) {
         const double focusT = camera.focusDistance /
             std::max(1e-8, -directionCamera[2]);
-        const pxr::GfVec3d focus = directionCamera * focusT;
-        originCamera = pxr::GfVec3d(
+        const prism::Vec3d focus = directionCamera * focusT;
+        originCamera = prism::Vec3d(
             lensPoint->x() * camera.apertureRadius,
             lensPoint->y() * camera.apertureRadius, 0.0);
-        directionCamera = (focus - originCamera).GetNormalized();
+        directionCamera = (focus - originCamera).normalized();
     }
 
-    const pxr::GfVec3d origin = camera.cameraToWorld.Transform(originCamera);
-    const pxr::GfVec3d direction = camera.cameraToWorld
-        .TransformDir(directionCamera).GetNormalized();
+    const prism::Vec3d origin = camera.cameraToWorld.transform(originCamera);
+    const prism::Vec3d direction = camera.cameraToWorld
+        .transformDir(directionCamera).normalized();
     RTCRay ray = initialize_ray(
         Float3(static_cast<float>(origin[0]), static_cast<float>(origin[1]),
                static_cast<float>(origin[2])),

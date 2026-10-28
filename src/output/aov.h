@@ -10,9 +10,7 @@
 
 #include "../ray.h"
 
-#include <pxr/base/gf/matrix4d.h>
-#include <pxr/base/gf/vec3d.h>
-#include <pxr/base/gf/vec4d.h>
+#include "../matrix4d.h"
 
 #include <array>
 #include <cmath>
@@ -112,24 +110,24 @@ inline bool IntegerAov(AovKind kind)
 // positions (0 on a miss) and the hit's barycentric st. `values` holds
 // AovComponents(kind) floats.
 inline void ResolveGeometricAov(AovKind kind, RayHit const &hit,
-                                pxr::GfMatrix4d const &worldToView,
-                                pxr::GfMatrix4d const &projection, float *values)
+                                prism::Matrix4d const &worldToView,
+                                prism::Matrix4d const &projection, float *values)
 {
     const bool valid = hit.geomid != RTC_INVALID_GEOMETRY_ID;
     if (kind == AovKind::Depth || kind == AovKind::CameraDepth) {
         values[0] = kind == AovKind::Depth ? 1.0f : std::numeric_limits<float>::infinity();
         if (!valid) return;
-        pxr::GfVec4d view(hit.p.x(), hit.p.y(), hit.p.z(), 1.0);
+        prism::Vec4d view(hit.p.x(), hit.p.y(), hit.p.z(), 1.0);
         view = view * worldToView;
         if (kind == AovKind::CameraDepth) values[0] = static_cast<float>(-view[2]);
         else {
-            const pxr::GfVec4d clip = view * projection;
+            const prism::Vec4d clip = view * projection;
             if (std::abs(clip[3]) > 1e-12) values[0] = static_cast<float>(.5 * clip[2] / clip[3] + .5);
         }
     } else if (kind == AovKind::Peye) {
         values[0] = values[1] = values[2] = 0;
         if (valid) {
-            const pxr::GfVec3d eye = worldToView.Transform(pxr::GfVec3d(hit.p.x(), hit.p.y(), hit.p.z()));
+            const prism::Vec3d eye = worldToView.transform(prism::Vec3d(hit.p.x(), hit.p.y(), hit.p.z()));
             for (size_t i = 0; i < 3; ++i) values[i] = static_cast<float>(eye[i]);
         }
     } else if (kind == AovKind::Pworld) {
@@ -141,8 +139,8 @@ inline void ResolveGeometricAov(AovKind kind, RayHit const &hit,
     } else if (kind == AovKind::Normal || kind == AovKind::Neye) {
         Float3 normal = hit.n;
         if (kind == AovKind::Neye && valid) {
-            const pxr::GfVec3d eye = worldToView.TransformDir(
-                pxr::GfVec3d(normal.x(), normal.y(), normal.z())).GetNormalized();
+            const prism::Vec3d eye = worldToView.transformDir(
+                prism::Vec3d(normal.x(), normal.y(), normal.z())).normalized();
             normal = Float3(static_cast<float>(eye[0]), static_cast<float>(eye[1]), static_cast<float>(eye[2]));
         }
         values[0] = normal.x(); values[1] = normal.y(); values[2] = normal.z();

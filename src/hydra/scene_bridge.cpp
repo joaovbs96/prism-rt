@@ -16,6 +16,7 @@
 #include "../batched_spheres.h"
 #include "../camera_rays.h"
 #include "../camera_ray_diagnostics.h"
+#include "../usd/gf_convert.h"
 #include "../device/light_table.h"
 #include "../geometry.h"
 #include "../material.h"
@@ -4156,8 +4157,8 @@ void _RefreshMaterials(HdSceneIndexBaseRefPtr const &index,
 prism::CameraRayParameters _CameraParameters(CameraState const &camera)
 {
     prism::CameraRayParameters parameters;
-    parameters.cameraToWorld = camera.worldToView.GetInverse();
-    parameters.inverseProjection = camera.projection.GetInverse();
+    parameters.cameraToWorld = prism::usd::ToMatrix4d(camera.worldToView.GetInverse());
+    parameters.inverseProjection = prism::usd::ToMatrix4d(camera.projection.GetInverse());
     parameters.nearClip = camera.nearClip;
     parameters.farClip = camera.farClip;
     // HdCamera reports focal length in world units. UsdImaging has already
@@ -4314,7 +4315,8 @@ void _ResolvePrimaryAov(AovKind kind, RayHit const &hit, CameraState const &came
                 static_cast<size_t>(hit.primid) < it->second.size()) *id = it->second[hit.primid];
         }
     } else {
-        prism::output::ResolveGeometricAov(kind, hit, camera.worldToView, camera.projection, values);
+        prism::output::ResolveGeometricAov(kind, hit, prism::usd::ToMatrix4d(camera.worldToView),
+                                           prism::usd::ToMatrix4d(camera.projection), values);
     }
 }
 

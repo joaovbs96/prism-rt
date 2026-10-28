@@ -1,5 +1,6 @@
 #include "../../src/hydra/pass_camera.h"
 #include "../../src/camera_rays.h"
+#include "../../src/usd/gf_convert.h"
 #include <pxr/usd/usd/stage.h>
 #include <pxr/usd/usdGeom/camera.h>
 #include <pxr/usdImaging/usdImagingGL/engine.h>
@@ -32,8 +33,8 @@ bool Check(bool value, char const *message) {
 }
 prism::CameraRayParameters Rays(prism::hydra::CameraState const &camera) {
     prism::CameraRayParameters parameters;
-    parameters.cameraToWorld = camera.worldToView.GetInverse();
-    parameters.inverseProjection = camera.projection.GetInverse();
+    parameters.cameraToWorld = prism::usd::ToMatrix4d(camera.worldToView.GetInverse());
+    parameters.inverseProjection = prism::usd::ToMatrix4d(camera.projection.GetInverse());
     parameters.nearClip = camera.nearClip;
     parameters.farClip = camera.farClip;
     return parameters;

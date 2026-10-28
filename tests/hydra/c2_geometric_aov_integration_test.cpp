@@ -1,6 +1,7 @@
 #include "integration_fixture.h"
 #include "../../src/hydra/task_delegate.h"
 #include "../../src/camera_rays.h"
+#include "../../src/usd/gf_convert.h"
 #include <pxr/base/gf/vec2d.h>
 #include <pxr/base/gf/vec3d.h>
 #include <cmath>
@@ -53,8 +54,8 @@ std::pair<pxr::GfVec3d,pxr::GfVec2d> ExpectedAt(
 {
     using namespace pxr;
     prism::CameraRayParameters params;
-    params.inverseProjection=fixture.camera.projection.GetInverse();
-    params.cameraToWorld=fixture.camera.worldToView.GetInverse();
+    params.inverseProjection=prism::usd::ToMatrix4d(fixture.camera.projection.GetInverse());
+    params.cameraToWorld=prism::usd::ToMatrix4d(fixture.camera.worldToView.GetInverse());
     params.nearClip=fixture.camera.nearClip; params.farClip=fixture.camera.farClip;
     params.orthographic=fixture.camera.orthographic;
     unsigned int seed=0;

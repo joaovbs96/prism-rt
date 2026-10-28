@@ -4,6 +4,7 @@
 #include "materialx/loader.h"
 #include "materialx/material_service.h"
 #include "camera_rays.h"
+#include "usd/gf_convert.h"
 #include "camera_ray_diagnostics.h"
 #include "device/device.h"
 #include "device/light_table.h"
@@ -547,17 +548,17 @@ struct UsdCameraRays {
         const GfMatrix4d projection = c.GetFrustum().ComputeProjectionMatrix();
         if (view.FullDataWindow() && view.pixelAspectRatio == 1.0f &&
             prism::output::ConformPolicy(view.aspectRatioConformPolicy) == CameraUtilFit) {
-            parameters.inverseProjection = CameraUtilConformedWindow(
-                projection, CameraUtilFit, double(view.width) / view.height).GetInverse();
+            parameters.inverseProjection = prism::usd::ToMatrix4d(CameraUtilConformedWindow(
+                projection, CameraUtilFit, double(view.width) / view.height).GetInverse());
         } else {
             const CameraUtilFraming framing(
                 GfRange2f(GfVec2f(0.0f), GfVec2f(float(view.width), float(view.height))),
                 GfRect2i(GfVec2i(view.dataX, view.dataY), view.dataWidth, view.dataHeight),
                 view.pixelAspectRatio);
-            parameters.inverseProjection = framing.ApplyToProjectionMatrix(
-                projection, prism::output::ConformPolicy(view.aspectRatioConformPolicy)).GetInverse();
+            parameters.inverseProjection = prism::usd::ToMatrix4d(framing.ApplyToProjectionMatrix(
+                projection, prism::output::ConformPolicy(view.aspectRatioConformPolicy)).GetInverse());
         }
-        parameters.cameraToWorld = c.GetTransform();
+        parameters.cameraToWorld = prism::usd::ToMatrix4d(c.GetTransform());
         const GfRange1f clipping = c.GetClippingRange();
         parameters.nearClip = static_cast<float>(clipping.GetMin());
         parameters.farClip = static_cast<float>(clipping.GetMax());
@@ -1273,8 +1274,8 @@ int runStandaloneCli(int argc, char** argv) {
             if (!geometric.empty()) {
                 // Pixel-centre primary hits, as the Hydra delegate resolves
                 // its geometric AOVs.
-                const GfMatrix4d worldToView = rays.parameters.cameraToWorld.GetInverse();
-                const GfMatrix4d projection = rays.parameters.inverseProjection.GetInverse();
+                const prism::Matrix4d worldToView = rays.parameters.cameraToWorld.inverse();
+                const prism::Matrix4d projection = rays.parameters.inverseProjection.inverse();
                 std::vector<prism::output::RenderedAov> planes;
                 for (AovKind kind : geometric)
                     planes.push_back({kind, prism::output::AovComponents(kind),

@@ -13,8 +13,8 @@
 int main()
 {
     prism::CameraRayParameters camera;
-    camera.inverseProjection = pxr::GfMatrix4d(1.0);
-    camera.cameraToWorld = pxr::GfMatrix4d(1.0);
+    camera.inverseProjection = prism::Matrix4d(1.0);
+    camera.cameraToWorld = prism::Matrix4d(1.0);
     unsigned seedA=17,seedB=17;
     const auto rays=prism::GenerateCameraRays(camera,31,11,127,53,seedA);
     // Footprint construction must not consume random numbers beyond the main

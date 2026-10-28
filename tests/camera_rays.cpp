@@ -1,4 +1,5 @@
 #include "../src/camera_rays.h"
+#include "../src/usd/gf_convert.h"
 
 #include <pxr/base/gf/frustum.h>
 #include <pxr/base/gf/camera.h>
@@ -48,8 +49,8 @@ prism::CameraRayParameters Perspective(unsigned width, unsigned height,
     translation.SetTranslate(GfVec3d(3.25, -1.5, 7.75));
 
     prism::CameraRayParameters result;
-    result.inverseProjection = projection.GetInverse();
-    result.cameraToWorld = rotation * translation;
+    result.inverseProjection = prism::usd::ToMatrix4d(projection.GetInverse());
+    result.cameraToWorld = prism::usd::ToMatrix4d(rotation * translation);
     result.nearClip = 0.07;
     result.farClip = 321.0;
     result.apertureRadius = lens ? 0.035 : 0.0;
@@ -65,10 +66,12 @@ prism::CameraRayParameters Orthographic(unsigned width, unsigned height)
         frustum.ComputeProjectionMatrix(), CameraUtilFit,
         static_cast<double>(width) / height);
     prism::CameraRayParameters result;
-    result.inverseProjection = projection.GetInverse();
-    result.cameraToWorld.SetRotate(
+    result.inverseProjection = prism::usd::ToMatrix4d(projection.GetInverse());
+    GfMatrix4d cameraToWorld(1.0);
+    cameraToWorld.SetRotate(
         GfRotation(GfVec3d(0.0, 1.0, 0.0), -23.0));
-    result.cameraToWorld.SetTranslateOnly(GfVec3d(-4.0, 2.0, 6.0));
+    cameraToWorld.SetTranslateOnly(GfVec3d(-4.0, 2.0, 6.0));
+    result.cameraToWorld = prism::usd::ToMatrix4d(cameraToWorld);
     result.nearClip = 0.25;
     result.farClip = 90.0;
     result.orthographic = true;
@@ -161,7 +164,7 @@ int main()
     unsigned orthoSeed = 7u;
     const prism::CameraRayPair ortho = prism::GenerateCameraRays(
         orthoA, 421, 73, width, height, orthoSeed);
-    const GfVec3d expectedDirection = orthoA.cameraToWorld.TransformDir(
+    const GfVec3d expectedDirection = prism::usd::ToGf(orthoA.cameraToWorld).TransformDir(
         GfVec3d(0, 0, -1)).GetNormalized();
     ok &= Check(std::abs(ortho.sampled.dir_x - expectedDirection[0]) < 1e-7 &&
                     std::abs(ortho.sampled.dir_y - expectedDirection[1]) < 1e-7 &&

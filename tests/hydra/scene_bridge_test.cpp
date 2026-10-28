@@ -11,6 +11,7 @@
 #include "../../src/hydra/native_tasks.h"
 #include "../../src/hydra/task_delegate.h"
 #include "../../src/hydra/triangulation.h"
+#include "../../src/usd/gf_convert.h"
 #include "../../src/scene.h"
 #include "../../src/device/cpu_device.h"
 
@@ -485,8 +486,8 @@ Color3 TraceTriangle(bool instanced, bool mirrored, bool *zeroTangent)
     prism::device::CpuDevice cpu;
     prism::device::ImageRequest request;
     request.camera.orthographic = true;
-    request.camera.inverseProjection.SetScale(GfVec3d(0.01, 0.01, 1.0));
-    request.camera.cameraToWorld.SetTranslate(GfVec3d(0.0, 0.0, 1.0));
+    request.camera.inverseProjection = prism::usd::ToMatrix4d(GfMatrix4d().SetScale(GfVec3d(0.01, 0.01, 1.0)));
+    request.camera.cameraToWorld = prism::usd::ToMatrix4d(GfMatrix4d().SetTranslate(GfVec3d(0.0, 0.0, 1.0)));
     request.width = request.height = 1;
     request.samples = 16;
     request.seed = 17;
