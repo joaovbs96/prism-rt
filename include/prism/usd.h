@@ -5,7 +5,9 @@
 
 #include "scene.h"
 
+#include <pxr/base/gf/camera.h>
 #include <pxr/base/tf/token.h>
+#include <pxr/usd/sdf/path.h>
 #include <pxr/usd/usd/stage.h>
 #include <pxr/usd/usd/timeCode.h>
 
@@ -42,5 +44,14 @@ struct LoadResult {
 // shadow linking, and its domes. Meshes convert at the scene's commit
 // (subdivision and displacement by the scene's options).
 LoadResult Load(Scene& scene, pxr::UsdStageRefPtr const& stage, LoadOptions const& options = {});
+
+// A GfCamera as a CameraDesc (the same float lens values; sessions frame it
+// as CameraUtil does). exposureScale stays 1.
+CameraDesc CameraFromGf(pxr::GfCamera const& camera);
+// A USD camera at `time`, with its exposure (UsdGeomCamera::
+// ComputeLinearExposureScale; 1 when not finite). Throws Error(NotFound)
+// when `path` is not a camera.
+CameraDesc LoadCamera(pxr::UsdStageRefPtr const& stage, pxr::SdfPath const& path,
+                      pxr::UsdTimeCode time = pxr::UsdTimeCode::Default());
 
 } // namespace prism::usd
