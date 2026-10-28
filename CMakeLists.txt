@@ -224,16 +224,18 @@ list(FILTER PRISM_CORE_SOURCES EXCLUDE REGEX "/device/(vulkan|metal)/")
 # The front-end modules around the core (docs/sdk_design.md, section 4.1):
 # USD (stage loading, the material service, render products), glTF, OBJ and
 # image writing. The core library itself has no USD.
-set(_prism_module_regex "/src/(usd/|materialx/(material_service|gltf_material|obj_material)\\.cpp$|output/(render_products|image_writer)\\.cpp$|tiny(gltf|obj)_impl\\.cpp$)")
+set(_prism_module_regex "/src/(usd/|gltf/|obj/|materialx/(material_service|gltf_material|obj_material)\\.cpp$|output/(render_products|image_writer)\\.cpp$|tiny(gltf|obj)_impl\\.cpp$)")
 list(FILTER PRISM_CORE_SOURCES EXCLUDE REGEX "${_prism_module_regex}")
 file(GLOB_RECURSE PRISM_USD_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/usd/*.cpp")
 list(APPEND PRISM_USD_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/src/materialx/material_service.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/output/render_products.cpp")
-set(PRISM_GLTF_SOURCES
+file(GLOB PRISM_GLTF_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/gltf/*.cpp")
+list(APPEND PRISM_GLTF_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/src/tinygltf_impl.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/materialx/gltf_material.cpp")
-set(PRISM_OBJ_SOURCES
+file(GLOB PRISM_OBJ_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/obj/*.cpp")
+list(APPEND PRISM_OBJ_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/src/tinyobj_impl.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/materialx/obj_material.cpp")
 set(PRISM_IO_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/output/image_writer.cpp")
@@ -252,6 +254,9 @@ add_custom_command(
 # The core: renderer, scene, materials (MaterialX -> MDL), devices,
 # integrator, colour, textures, denoisers. No USD (prism_core_without_usd_test).
 add_library(prism STATIC ${PRISM_CORE_SOURCES} "${PRISM_EMBEDDED_SHADERS}")
+# The public headers (include/prism: Renderer, Scene, the loader modules'
+# entry points); std and PrismRT types only, except prism/usd.h.
+target_include_directories(prism PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
 
 # GPU devices compile their HLSL kernel with DXC at run time.
 find_program(PRISM_DXC_EXECUTABLE dxc HINTS "$ENV{VULKAN_SDK}/bin" DOC "DXC compiler for the GPU devices")
@@ -815,6 +820,13 @@ if(PRISM_BUILD_HYDRA)
     add_executable(prism_mesh_source_test tests/mesh_source_test.cpp)
     target_link_libraries(prism_mesh_source_test PRIVATE PrismRT::core ${PXR_LIBRARIES})
     add_test(NAME prism_mesh_source_test COMMAND prism_mesh_source_test)
+    # The public scene API: scenes from arrays, commit, a CPU render, handles
+    # and errors. It links the core alone (no USD, glTF or OBJ module).
+    add_executable(prism_scene_api_test tests/scene_api_test.cpp)
+    target_link_libraries(prism_scene_api_test PRIVATE prism)
+    add_test(NAME prism_scene_api_test COMMAND prism_scene_api_test
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/gltf/studio_env.hdr")
+    set_tests_properties(prism_scene_api_test PROPERTIES ENVIRONMENT "${_prism_test_environment}")
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/usd_spheres.cpp")
         add_executable(prism_usd_spheres_test tests/usd_spheres.cpp)
         target_link_libraries(prism_usd_spheres_test PRIVATE PrismRT::core ${PXR_LIBRARIES})
