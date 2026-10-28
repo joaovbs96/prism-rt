@@ -2,6 +2,10 @@
 
 #include "../texture_service.h"
 
+#include <embree4/rtcore.h>
+
+#include <stdexcept>
+
 namespace prism {
 
 RendererContext::RendererContext(RendererOptions options)
@@ -9,6 +13,21 @@ RendererContext::RendererContext(RendererOptions options)
       m_logger(m_options.log, m_options.logLevel, m_options.debugCategories)
 {
     Runtime::Instance().Configure(m_options);
+}
+
+RendererContext::~RendererContext()
+{
+    if (m_embree) rtcReleaseDevice(m_embree);
+}
+
+RTCDevice& RendererContext::embreeDevice() const
+{
+    std::lock_guard lock(m_mutex);
+    if (!m_embree) {
+        m_embree = rtcNewDevice(nullptr);
+        if (!m_embree) throw std::runtime_error("Cannot create Embree device");
+    }
+    return m_embree;
 }
 
 std::shared_ptr<const color::ColorManagement> RendererContext::colorManagement() const

@@ -14,6 +14,8 @@
 #include "renderer_options.h"
 #include "runtime.h"
 
+#include <embree4/rtcore_device.h>
+
 #include <memory>
 #include <mutex>
 
@@ -22,6 +24,7 @@ namespace prism {
 class RendererContext {
 public:
     explicit RendererContext(RendererOptions options);
+    ~RendererContext();
     RendererContext(RendererContext const&) = delete;
     RendererContext& operator=(RendererContext const&) = delete;
 
@@ -65,6 +68,9 @@ public:
     Progress& progress() noexcept { return m_progress; }
     // Notes of materials of varying emission (MaterialSettings, DeviceOptions).
     std::shared_ptr<VaryingEmitterSignal> const& varyingEmitters() const noexcept { return m_varyingEmitters; }
+    // The renderer's Embree device, created on first use (its scenes'
+    // acceleration structures). Throws std::runtime_error if Embree fails.
+    RTCDevice& embreeDevice() const;
 
 private:
     RendererOptions m_options;
@@ -75,6 +81,7 @@ private:
     Logger m_logger;
     mutable Progress m_progress;
     std::shared_ptr<VaryingEmitterSignal> m_varyingEmitters = std::make_shared<VaryingEmitterSignal>();
+    mutable RTCDevice m_embree = nullptr;
 };
 
 } // namespace prism
