@@ -546,7 +546,7 @@ called done there.
 
 - **Colour management** ([color_management.md](color_management.md)):
   - Build: OpenColorIO 2.6 must be found (`find_package(OpenColorIO CONFIG)`;
-    Homebrew's `opencolorio` or vcpkg), and `prism_core` links it.
+    Homebrew's `opencolorio` or vcpkg), and `prism` (formerly `prism_core`) links it.
   - Shared shader code: `SampleSettings::luminance` (a `float3`) and
     `lightImportance(light, p, luminance)` in `shaders/integrator/`,
     `GpuFrame::color` (a `float4` appended to `shaders/shared/prism_gpu_types.h`,
@@ -1086,6 +1086,28 @@ called done there.
     and the chess set with `--device metal` against `--device cpu`
     (`prism_compare_images`, noise floor), and `prism_hydra_render` of
     `tests/hydra/fixtures/parity.usda` on Metal.
+- **SDK step 2: core without USD** ([sdk_design.md](sdk_design.md), section 7;
+  written on Windows, the Metal device unbuilt):
+  - Build: the core library target is `prism` (was `prism_core`); the Metal
+    sources, `PRISM_HAS_METAL*` and the Metal frameworks are added to it as
+    before. `prism` has no USD include directory or library (configure check,
+    `prism_core_without_usd_test`); USD, glTF, OBJ and image writing are the
+    static `prism_usd`, `prism_gltf`, `prism_obj`, `prism_io`. If the macOS
+    link picks MaterialXRender's older tinyobjloader, `prism_obj_material_test`
+    fails: `prism_gltf`/`prism_obj` must stay first on the link line.
+  - Shared host code: `CameraRayParameters` holds `prism::Matrix4d`
+    (`src/matrix4d.h`; same `[row][column]` reads in
+    `GpuRenderDevice::BaseFrame`); `src/scene.h` no longer includes the
+    loaders or `system_utils.h` (the Metal device includes the latter
+    itself; it used nothing else from the loaders); `CachedTransformedEnvironment`
+    (`src/hydra/environment_cache.h`) reports a singular transform instead of
+    calling TF_WARN; `src/hydra/scene_bridge.cpp` converts Gf matrices at the
+    camera and AOV boundaries.
+  - No shader change: `shaders/` is untouched.
+  - Runs: build; `ctest -R "core_without_usd|matrix4d|mesh_source|camera_rays|obj_|gltf_"`
+    (CPU); an egg and the chess set with `--device metal` against
+    `--device cpu`, and `prism_hydra_render` of `tests/hydra/fixtures/parity.usda`
+    on Metal.
 
 ## Diagnostics
 

@@ -1,9 +1,10 @@
 # PrismRT SDK and Python API: design
 
-Status: migration steps 1a-1e (section 7) are implemented; the rest is design.
-Plan context: `docs/PLAN.md`, "Then: renderer SDK and Python API". Line numbers
-refer to commit `c0e44c1`; the **Status** notes in the inventory (section 2)
-describe the code after step 1.
+Status: migration steps 1a-1e and most of step 2 (section 7) are implemented;
+the rest is design. Plan context: `docs/PLAN.md`, "Then: renderer SDK and
+Python API". Line numbers refer to commit `c0e44c1`; the **Status** notes in
+the inventory (section 2) describe the code after step 1, the step 2 note in
+section 7 what moved where.
 
 Contents:
 1. Goals and non-goals
@@ -717,8 +718,8 @@ Hydra (`src/hydra/`):
 | `_prism` (Python extension) | nanobind bindings | `prism`, `prism_io`, loaders; `prism_usd` optional | |
 
 `prism` must be a shared library:
-- Today `prism_core` is static (`CMakeLists.txt:236`) and linked into both
-  `PrismRT` and `hdPrism` (`src/hydra/CMakeLists.txt:11`).
+- Today `prism` (formerly `prism_core`) is static and linked into both
+  `PrismRT` and `hdPrism` (`src/hydra/CMakeLists.txt`), as are its modules.
 - A Python process that loads `hdPrism` (usdview, or `UsdImagingGL` from a
   script) and `_prism` would hold two copies of every global of section 2,
   including two owners of the one `INeuray`.
@@ -1076,6 +1077,33 @@ Rules for every step:
 | 7 | Python bindings (nanobind) + pytest under CTest (CPU; Vulkan tests with the gpu label and lock) | new tests: Python-vs-CLI images exact (CPU, fixed seed), zero-copy (array addresses), cancellation, StageCache, `atexit` join | M |
 | 8 | Packaging (wheel, DLLs, load order) | install test in a clean venv | M-L |
 | 9 | Motion blur (Phase 8b) on the reserved shapes | its own plan | L |
+
+**Step 2 status (2026-10-28)**: done except render settings off
+`SceneManager` (deferred, `docs/DECISIONS.md`). What landed:
+- `src/matrix4d.h`: std-only `prism::Vec3d`/`Vec4d`/`Matrix4d` with Gf's exact
+  arithmetic (`prism_matrix4d_test` compares bit for bit with Gf);
+  `CameraRayParameters` and `ResolveGeometricAov` use them; Gf conversions in
+  `src/usd/gf_convert.h`.
+- `src/mesh/mesh_conversion.h`: std-only `MeshSource` (spans, `PrimvarView`,
+  `Interpolation`); the Vt side is `prism::usd::UsdMeshSource`
+  (`src/usd/usd_mesh_source.*`, `prism_mesh_source_test`); triangulation moved
+  to `src/mesh/triangulation.h` (std-only). OBJ displacement builds its
+  `MeshSource` from std vectors.
+- `src/scene.h` includes no loader: `SceneManager::attachMesh` attaches
+  triangles, `prism::usd::AttachImportedMesh` (`usd_mesh.h`) the USD
+  placements.
+- Material resources: `src/materialx/material_resource.h` (std-only, a
+  `MaterialResourceReader` for plain files) and `resolved_resource.h` (the Ar
+  reader); glTF and OBJ read without Ar.
+- CMake targets `prism` (core), `prism_io`, `prism_usd`, `prism_gltf`,
+  `prism_obj`, all static; `PrismRT::core` is an interface target with all of
+  them (tests); `PrismRT` and `hdPrism` link the modules they use.
+  `cmake/PrismCoreWithoutUsd.cmake` fails the configure when a pxr target or
+  include directory reaches `prism`, and `prism_core_without_usd_test`
+  re-checks the generated settings.
+- Still under `src/hydra/` but std-only and compiled into the core:
+  `fallback_material.h`, `environment_cache.h` (the devices mirror them); they
+  move with the public `Scene` (step 3).
 
 Notes:
 - Step 6 is mechanical and can move earlier if the CLI/Hydra double copy of

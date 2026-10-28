@@ -2,6 +2,10 @@
 
 Phase reports, newest first. Detailed reports live in `local/reports/` (git-ignored).
 
+## 2026-10-28 � SDK step 2: core without USD
+- CMake targets `prism` (core, no pxr: configure check and `prism_core_without_usd_test`), `prism_io`, `prism_usd`, `prism_gltf`, `prism_obj`; the CLI and hdPrism link the modules they use. Camera and AOV math on a std-only `Matrix4d` (Gf's arithmetic, bit-identical); a std-only `MeshSource` with a Vt adapter; `SceneManager` without loader includes; glTF/OBJ material resources without Ar.
+- Not done: render settings off `SceneManager` (deferred to the `Session` steps; `docs/DECISIONS.md`).
+- New tests: `prism_matrix4d_test`, `prism_mesh_source_test`, `prism_core_without_usd_test`, plain-file checks in `prism_resolved_material_resource_test`. Images bit-identical to main (aa65105) at every commit: 10 CLI scenes (USD, glTF, OBJ, subdivision, displacement) and 3 Hydra renders on the CPU. Metal unbuilt (checklist in `docs/gpu_devices.md`). Report: `local/reports/sdk_step2.md`.
 ## 2026-10-28 — SDK steps 1a–1e: per-renderer state
 - `RendererContext` with `RendererOptions::FromEnvironment()` (only the CLI and Hydra read the API-level env vars); colour management, SSS fallback, binding purposes, logger, progress and the varying-emission note belong to the renderer; process runtime for the cache root and budgets (first renderer wins); texture services per option set; Vulkan stack-size entry point per device.
 - Fixed: compiled-material, early-association and template cache keys lacked the working space and SSS fallback (`prism_material_identity_test`).
