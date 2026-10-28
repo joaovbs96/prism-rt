@@ -27,7 +27,7 @@
 #include "../resource_limits.h"
 #include "../materialx/obj_material.h"
 #include "../materialx/cached_document.h"
-#include "../materialx/resolved_resource.h"
+#include "../materialx/material_resource.h"
 #include "../render_defaults.h"
 #include "mesh_conversion.h"
 
@@ -377,7 +377,7 @@ class ObjMesh : public Mesh {
             static const std::set<std::string> readable = {".png", ".jpg", ".jpeg", ".exr", ".tif", ".tiff", ".hdr"};
             if (readable.contains(extension)) {
                 auto resource = prism::materialx::PrepareMaterialResource(
-                    PXR_NS::ArResolvedPath(std::filesystem::absolute(path).string()), PXR_NS::ArResolverContext(), "",
+                    prism::materialx::FileResourceReader(std::filesystem::absolute(path)), "",
                     cache, extension).resource;
                 return resource ? resource->path.filename().generic_string() : "";
             }

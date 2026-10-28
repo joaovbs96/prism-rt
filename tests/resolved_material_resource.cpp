@@ -82,6 +82,28 @@ int main()
                 retainedStatsAfterHit.sourceBytesRead == retainedStatsAfterFirst.sourceBytesRead,
                 "retained same-version request incremented source read/hash counters");
 
+        // Plain-file readers (glTF, OBJ) key and publish a file as USD's
+        // default resolver does.
+        require(PXR_NS::ArResolverContext().GetDebugString() == prism::materialx::kFileResolverIdentity,
+                "the plain-file resolver identity differs from the default Ar context's");
+        const auto plainSource = root / "plain.mtlx";
+        writeBytes(plainSource, "<materialx name=\"plain\"/>\n");
+        const auto viaFile = prism::materialx::PrepareMaterialResource(
+            prism::materialx::FileResourceReader(std::filesystem::absolute(plainSource)), "", cache, ".mtlx");
+        const auto viaAr = prism::materialx::PrepareMaterialResource(
+            PXR_NS::ArResolvedPath(std::filesystem::absolute(plainSource).string()), PXR_NS::ArResolverContext(), "",
+            cache, ".mtlx");
+        require(viaFile.resource && viaAr.resource && viaFile.bytesRead == std::filesystem::file_size(plainSource) &&
+                    viaFile.resource->path == viaAr.resource->path &&
+                    viaFile.resource->fingerprint == viaAr.resource->fingerprint,
+                "a plain-file reader published a file differently from the Ar reader");
+        bool missingThrew = false;
+        try {
+            (void)prism::materialx::PrepareMaterialResource(
+                prism::materialx::FileResourceReader(root / "missing.png"), "", cache, ".png");
+        } catch (std::exception const &) { missingThrew = true; }
+        require(missingThrew, "a missing plain file did not fail");
+
         const auto concurrentSource = root / "concurrent.mtlx";
         writeBytes(concurrentSource, "<materialx name=\"shared\">concurrent</materialx>");
         const auto concurrentPath = resolve(concurrentSource);

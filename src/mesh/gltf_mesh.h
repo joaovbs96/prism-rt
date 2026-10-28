@@ -27,7 +27,7 @@
 #include "../color/color_management.h"
 #include "../materialx/gltf_material.h"
 #include "../materialx/cached_document.h"
-#include "../materialx/resolved_resource.h"
+#include "../materialx/material_resource.h"
 
 // glTF 2.0 scenes (.gltf, .glb). Materials load as MaterialX gltf_pbr
 // documents compiled through MDL (docs/gltf.md). A material whose conversion
