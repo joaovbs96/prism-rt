@@ -6575,6 +6575,12 @@ VtDictionary SceneBridge::GetStats() const
     result["percentDone"] = VtValue(converged ? 100.0 :
         std::clamp(100.0 * progress, 0.0, std::nextafter(100.0, 0.0)));
     result["activePixelFraction"] = VtValue(active);
+    // Render progress timing (docs/hydra.md): rendering time since the last
+    // restart (loading and device preparation excluded), pixel-samples per
+    // second of the last passes, and the estimated time left (-1 unknown).
+    result["elapsedSeconds"] = VtValue(engineStats.elapsedSeconds);
+    result["samplesPerSecond"] = VtValue(engineStats.samplesPerSecond);
+    result["estimatedSecondsRemaining"] = VtValue(engineStats.estimatedSecondsRemaining);
     result["timeLimitReached"] = VtValue(_impl->engine->timeLimitReached.load());
     // Denoising (docs/denoising.md): denoises shown and the last one's time.
     result["denoises"] = VtValue(static_cast<int64_t>(_impl->engine->denoisesPublished.load()));

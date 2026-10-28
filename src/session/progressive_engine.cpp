@@ -361,6 +361,28 @@ ProgressiveStats ProgressiveEngine::Stats() const
     std::lock_guard lock(m_mutex);
     ProgressiveStats stats = m_stats;
     stats.devicePreparing = m_devicePreparedEpoch != m_deviceSceneEpoch;
+    // Render progress timing. A front end that restarted the accumulation
+    // (samples 0) before the next run sees it as not started.
+    Timing const &t = m_timing;
+    if (samples.load() == 0 && !t.rendering && !t.preparing) return stats;
+    stats.elapsedSeconds = t.seconds;
+    if (t.rendering)
+        stats.elapsedSeconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - t.since).count();
+    double pixelSamples = 0.0, seconds = 0.0;
+    for (auto const &pass : t.passes) {
+        pixelSamples += pass.pixelSamples;
+        seconds += pass.seconds;
+    }
+    stats.samplesPerSecond = seconds > 0.0 ? pixelSamples / seconds : 0.0;
+    if (t.complete) {
+        stats.estimatedSecondsRemaining = 0.0;
+    } else if (!t.preparing && t.completedPasses >= 2 && stats.samplesPerSecond > 0.0) {
+        const double remaining = double(std::max<int64_t>(0, int64_t(t.targetSamples) - int64_t(t.completedPasses))) *
+            double(t.activePixels);
+        double eta = remaining / stats.samplesPerSecond;
+        if (t.timeLimit > 0.0) eta = std::min(eta, std::max(0.0, t.timeLimit - stats.elapsedSeconds));
+        stats.estimatedSecondsRemaining = eta;
+    }
     return stats;
 }
 
@@ -526,6 +548,30 @@ ProgressiveEngine::Outcome ProgressiveEngine::Run(ProgressiveRun const &run, Pro
     const bool denoising = hasColor && (settings.denoise || hasDenoised);
     hasLight |= denoising;
     const int sampleCount = hasColor ? std::max(1, settings.samples) : 1;
+    // Render progress timing: a new accumulation starts over; the time
+    // counts from the end of device preparation to the end of this run.
+    {
+        std::lock_guard lock(m_mutex);
+        if (samples.load() == 0) {
+            m_timing = {};
+            m_timing.activePixels = size_t(width) * height;
+        }
+        m_timing.preparing = true;
+        m_timing.complete = false;
+        m_timing.targetSamples = sampleCount;
+        m_timing.timeLimit = hasColor ? settings.timeLimitSeconds : 0.0;
+    }
+    struct TimingEnd {
+        ProgressiveEngine &engine;
+        ~TimingEnd()
+        {
+            std::lock_guard lock(engine.m_mutex);
+            Timing &t = engine.m_timing;
+            if (t.rendering)
+                t.seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - t.since).count();
+            t.rendering = t.preparing = false;
+        }
+    } timingEnd{*this};
     // Kernel compilation and scene upload happen here, not inside the
     // preview or pass, so a host stop never waits for them.
     // While a GPU device is still preparing, the CPU device renders instead
@@ -543,6 +589,12 @@ ProgressiveEngine::Outcome ProgressiveEngine::Run(ProgressiveRun const &run, Pro
     }
     if (!previewingGpu) EndGpuPreview(*renderDevice, run.preference);
     progress.Begin(Phase::Rendering);
+    {
+        std::lock_guard lock(m_mutex);
+        m_timing.preparing = false;
+        m_timing.rendering = true;
+        m_timing.since = std::chrono::steady_clock::now();
+    }
     for (size_t index = 0; index < outputs.size(); ++index)
         if (outputs[index].kind == AovKind::Unknown) target.WarnUnsupported(index);
     const int firstSample = static_cast<int>(samples.load());
@@ -765,6 +817,10 @@ ProgressiveEngine::Outcome ProgressiveEngine::Run(ProgressiveRun const &run, Pro
         }
         if (target.StopRequested()) return Outcome::Stopped;
         target.FramePublished(frame);
+        {
+            std::lock_guard lock(m_mutex);
+            m_timing.complete = true;
+        }
         return Outcome::Finished;
     }
     struct PresentationCleanup {
@@ -862,6 +918,12 @@ ProgressiveEngine::Outcome ProgressiveEngine::Run(ProgressiveRun const &run, Pro
             }
             samples.store(0);
             if (denoising) ResetDenoise(static_cast<size_t>(width) * height);
+            {
+                std::lock_guard lock(m_mutex);
+                m_timing.passes.clear();
+                m_timing.completedPasses = 0;
+                m_timing.activePixels = size_t(width) * height;
+            }
             textureStreamingRestarts.fetch_add(1);
             load_profile::Mark("frame.texture_restart", "sample=" + std::to_string(sample));
             restarted = true;
@@ -871,6 +933,9 @@ ProgressiveEngine::Outcome ProgressiveEngine::Run(ProgressiveRun const &run, Pro
             std::copy(m_committedRngStates.begin(), m_committedRngStates.end(), rngStates.begin());
         const bool presenting = target.BeginPresentation(frame, tiles.size());
         const auto traceStart = std::chrono::steady_clock::now();
+        // The pixel-samples this pass traces (render progress timing).
+        const size_t passPixels = !hasColor ? 0
+            : adaptive.Enabled() ? m_adaptiveActive.Count() : static_cast<size_t>(width) * height;
         using Clock = std::chrono::steady_clock;
         const auto milliseconds = [](auto duration) {
             return std::chrono::duration<double, std::milli>(duration).count();
@@ -1131,6 +1196,17 @@ ProgressiveEngine::Outcome ProgressiveEngine::Run(ProgressiveRun const &run, Pro
         }
         m_committedRngStates.swap(rngStates);
         samples.store(static_cast<uint64_t>(sample + 1));
+        {
+            std::lock_guard lock(m_mutex);
+            Timing &t = m_timing;
+            const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - traceStart).count();
+            if (passPixels && seconds > 0.0) {
+                if (t.passes.size() == kRatePasses) t.passes.erase(t.passes.begin());
+                t.passes.push_back({double(passPixels), seconds});
+            }
+            t.completedPasses = static_cast<uint64_t>(sample + 1);
+            t.activePixels = adaptive.Enabled() ? m_adaptiveActive.Count() : static_cast<size_t>(width) * height;
+        }
         if (denoising) {
             publishDenoise();
             // Every denoiseInterval passes (the last pass denoises below).
@@ -1159,6 +1235,10 @@ ProgressiveEngine::Outcome ProgressiveEngine::Run(ProgressiveRun const &run, Pro
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
+    }
+    {
+        std::lock_guard lock(m_mutex);
+        m_timing.complete = true;
     }
     return Outcome::Finished;
 }

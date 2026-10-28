@@ -122,7 +122,18 @@ struct ProgressInfo {
     double samples = 0.0;
     int targetSamples = 0;
     double activeFraction = 1.0;
+    // Seconds since the commit or render started; for a progressive session,
+    // the time spent rendering the current accumulation (device preparation
+    // excluded).
     double elapsedSeconds = 0.0;
+    // Progressive sessions (SessionStatus has the same): pixel-samples per
+    // second over the last few passes, and the estimated seconds until the
+    // accumulation completes (the remaining passes over the pixels adaptive
+    // sampling still traces, at that rate, at most the time limit's rest):
+    // -1 while unknown (preparing, before two passes, and in batch renders),
+    // 0 once complete.
+    double samplesPerSecond = 0.0;
+    double estimatedSecondsRemaining = -1.0;
 };
 
 // Called with progress; returning false cancels (the blocking call then

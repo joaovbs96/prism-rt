@@ -225,6 +225,19 @@ struct ProgressiveStats {
     double devicePreparationSeconds = 0.0;
     bool devicePreparing = false;
     std::string denoiserName;
+    // Render progress timing of the current accumulation:
+    // - elapsedSeconds: time spent rendering it since it (re)started (the
+    //   preview and the passes; scene loading and device preparation
+    //   excluded);
+    // - samplesPerSecond: pixel-samples per second over the last few passes
+    //   (0 before the first);
+    // - estimatedSecondsRemaining: the remaining pixel-samples ((target -
+    //   completed) passes over the pixels adaptive sampling still traces) at
+    //   that rate, at most the time limit's remainder; -1 while unknown
+    //   (preparing, or before two passes), 0 once the accumulation is done.
+    double elapsedSeconds = 0.0;
+    double samplesPerSecond = 0.0;
+    double estimatedSecondsRemaining = -1.0;
 };
 
 struct DenoiseJob;
@@ -342,6 +355,24 @@ private:
     double m_accumulationSeconds = 0.0;
     unsigned m_tileWidth = 0, m_tileHeight = 0;
     std::vector<RefinementTile> m_refinementTiles;
+
+    // Render progress timing (under m_mutex; ProgressiveStats).
+    struct Timing {
+        bool preparing = false;   // inside Run, before rendering
+        bool rendering = false;   // inside Run, past device preparation
+        bool complete = false;    // the accumulation finished
+        std::chrono::steady_clock::time_point since;  // while rendering
+        double seconds = 0.0;     // rendering time before `since`
+        struct Pass {
+            double pixelSamples, seconds;
+        };
+        std::vector<Pass> passes;  // the last few
+        uint64_t completedPasses = 0;
+        size_t activePixels = 0;
+        int targetSamples = 0;
+        double timeLimit = 0.0;
+    } m_timing;
+    static constexpr size_t kRatePasses = 4;
 };
 
 } // namespace prism::session

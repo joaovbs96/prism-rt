@@ -244,6 +244,17 @@ struct SessionStatus {
     double fraction = 0.0;
     double activeFraction = 1.0;
     bool timeLimitReached = false;
+    // Render progress timing of the current accumulation: the time spent
+    // rendering it since it (re)started (the preview and the passes; scene
+    // loading and device preparation excluded), the pixel-samples per second
+    // over the last few passes, and the estimated seconds until it completes:
+    // the remaining pixel-samples ((target - completed) passes over the
+    // pixels adaptive sampling still traces) at that rate, at most the time
+    // limit's remainder; -1 while unknown (preparing, or before two passes),
+    // 0 once complete.
+    double elapsedSeconds = 0.0;
+    double samplesPerSecond = 0.0;
+    double estimatedSecondsRemaining = -1.0;
     // Accumulations started (each restart counts) and the scene revision the
     // current one renders.
     uint64_t accumulations = 0;

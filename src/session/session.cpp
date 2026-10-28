@@ -861,6 +861,11 @@ SessionStatus Session::Impl::statusLocked() const
     status.revision = runningRevision;
     status.error = errorText;
     if (!engine) return status;
+    // The timing first: the passes it counts are then at most `samples`.
+    const session::ProgressiveStats stats = engine->Stats();
+    status.elapsedSeconds = stats.elapsedSeconds;
+    status.samplesPerSecond = stats.samplesPerSecond;
+    status.estimatedSecondsRemaining = stats.estimatedSecondsRemaining;
     status.samples = engine->samples.load();
     status.activeFraction = status.samples ? engine->activePixelFraction.load() : 1.0;
     status.timeLimitReached = engine->timeLimitReached.load();
@@ -950,7 +955,6 @@ session::ProgressiveEngine::Outcome Session::Impl::runProgressive(SessionOptions
     run.generation = revision.revision;
     run.diagnosticsLabel = "session";
 
-    const auto started = std::chrono::steady_clock::now();
     auto describe = [&](ProgressInfo& info) {
         SessionStatus status;
         {
@@ -962,7 +966,9 @@ session::ProgressiveEngine::Outcome Session::Impl::runProgressive(SessionOptions
         info.targetSamples = status.targetSamples;
         info.activeFraction = status.activeFraction;
         info.fraction = status.fraction;
-        info.elapsedSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+        info.elapsedSeconds = status.elapsedSeconds;
+        info.samplesPerSecond = status.samplesPerSecond;
+        info.estimatedSecondsRemaining = status.estimatedSecondsRemaining;
     };
     FilmTarget target(*this, sceneLock, options, callback, describe);
     const auto outcome = engine->Run(run, target);

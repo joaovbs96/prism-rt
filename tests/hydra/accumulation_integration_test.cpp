@@ -116,6 +116,22 @@ void RequireProgressStats(VtDictionary const &stats, int completed, int target,
         Require(percent >= 0.0 && percent < 100.0 &&
                     std::abs(percent - 100.0 * completed / target) < 1e-9,
                 "percentDone does not track completed/target samples");
+    // Render timing (docs/hydra.md): unknown before two passes, none left
+    // once converged.
+    auto const elapsed = stats.find("elapsedSeconds");
+    auto const rate = stats.find("samplesPerSecond");
+    auto const eta = stats.find("estimatedSecondsRemaining");
+    Require(elapsed != stats.end() && elapsed->second.IsHolding<double>() &&
+                rate != stats.end() && rate->second.IsHolding<double>() &&
+                eta != stats.end() && eta->second.IsHolding<double>(),
+            "Render stats lack double elapsedSeconds/samplesPerSecond/estimatedSecondsRemaining");
+    const double remaining = eta->second.UncheckedGet<double>();
+    if (converged)
+        Require(remaining == 0.0 && elapsed->second.UncheckedGet<double>() > 0.0 &&
+                    rate->second.UncheckedGet<double>() > 0.0,
+                "A converged render reports time left or no elapsed time and rate");
+    else if (completed < 2)
+        Require(remaining == -1.0, "The time left is not unknown before two passes");
 }
 
 } // namespace

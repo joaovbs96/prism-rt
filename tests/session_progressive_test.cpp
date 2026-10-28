@@ -359,6 +359,53 @@ void sharedScene(prism::Renderer const& renderer)
     within(60, "cancel", [&] { progressive.wait(); });
 }
 
+// Render progress timing: the estimate is -1 until two passes completed, then
+// finite and nonnegative, and 0 once converged; the elapsed time never goes
+// back. No timings are asserted (a busy machine).
+void timing(prism::Renderer const& renderer)
+{
+    TestScene test = build(renderer);
+    prism::SessionOptions options = sessionOptions(test.camera, 256);
+    options.width = 64;
+    options.height = 48;
+    prism::Session session = renderer.createSession(test.scene, options);
+    bool callbackValid = true, sawDone = false;
+    session.start([&](prism::ProgressInfo const& info) {
+        callbackValid &= info.estimatedSecondsRemaining == -1.0 || info.estimatedSecondsRemaining >= 0.0;
+        callbackValid &= info.elapsedSeconds >= 0.0 && info.samplesPerSecond >= 0.0;
+        if (info.phase == "done") sawDone = info.estimatedSecondsRemaining == 0.0;
+        return true;
+    });
+    bool unknownEarly = true, sawFinite = false, monotonic = true;
+    double lastElapsed = 0.0;
+    for (;;) {
+        const prism::SessionStatus status = session.status();
+        if (status.state != prism::SessionState::Running) break;
+        if (status.samples < 2) unknownEarly &= status.estimatedSecondsRemaining == -1.0;
+        if (status.samples >= 2 && status.samples < 256 && std::isfinite(status.estimatedSecondsRemaining) &&
+            status.estimatedSecondsRemaining >= 0.0)
+            sawFinite = true;
+        monotonic &= status.elapsedSeconds >= lastElapsed;
+        lastElapsed = status.elapsedSeconds;
+        std::this_thread::sleep_for(std::chrono::microseconds(500));
+    }
+    prism::SessionStatus status;
+    within(120, "wait for convergence (timing)", [&] { status = session.wait(); });
+    check(status.state == prism::SessionState::Converged, "the timed render converges");
+    check(unknownEarly, "the estimate is unknown (-1) before two passes");
+    check(sawFinite, "the estimate is finite and nonnegative while refining");
+    check(monotonic && status.elapsedSeconds >= lastElapsed && status.elapsedSeconds > 0.0,
+          "the elapsed time grows");
+    check(status.estimatedSecondsRemaining == 0.0 && status.samplesPerSecond > 0.0,
+          "a converged render has no time left and a sample rate");
+    check(callbackValid && sawDone, "the progress callback reports the timing, 0 left when done");
+    // A restart starts the timing over.
+    session.restart();
+    within(120, "wait after restart (timing)", [&] { status = session.wait(); });
+    check(status.accumulations == 2 && status.estimatedSecondsRemaining == 0.0,
+          "the restarted render completes with no time left");
+}
+
 } // namespace
 
 int main()
@@ -374,6 +421,8 @@ int main()
         control(renderer);
         note("shared scene");
         sharedScene(renderer);
+        note("timing");
+        timing(renderer);
     } catch (std::exception const& error) {
         std::cerr << "FAILED: unexpected exception: " << error.what() << '\n';
         return 1;

@@ -200,6 +200,18 @@ moving while the last pixels refine; with a time limit it is at least the
 elapsed fraction of the limit. It is 100 only once the render converged.
 `activePixelFraction` is the fraction of pixels still sampled.
 
+**Render timing.** `GetRenderStats()` also reports, for the current
+accumulation (a host polls them with `IsConverged()`):
+
+| Key | Type | Meaning |
+|---|---|---|
+| `elapsedSeconds` | double | Rendering time since the last restart (camera move, edit, setting change): the preview and the passes, without scene loading and device preparation. |
+| `samplesPerSecond` | double | Pixel-samples per second over the last four passes (0 before the first). |
+| `estimatedSecondsRemaining` | double | Remaining pixel-samples / that rate: (`samplesPerPixel` − completed passes) × the pixels adaptive sampling still traces, so later passes that trace fewer pixels shorten it; with a time limit at most the limit's remainder. -1 while unknown (while preparing, before two passes), 0 once converged. |
+
+The progressive `prism::Session` reports the same three values in its
+`SessionStatus` and progress callback (`ProgressInfo`).
+
 The CLI prints the same measure as a progress line on stderr, for example
 `[###########---------] 57%  584/2048 spp  31% px active  1m12s elapsed, ETA 0m54s`:
 the samples of the pixels still sampled, the share of pixels adaptive sampling
