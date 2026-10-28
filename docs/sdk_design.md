@@ -1221,6 +1221,55 @@ landed:
   cameras and depth of field, adaptive sampling); `prism_session_test` covers
   the API itself.
 
+**Step 5a status (2026-10-28)**: done. The progressive session is public and
+the Hydra delegate's render thread runs its loop. What landed:
+- `src/session/progressive_engine.*` (core, std-only):
+  `prism::session::ProgressiveEngine` is `SceneBridge::Render` and its helpers
+  moved unchanged: device preparation as a job with the GPU preparation
+  preview (CPU renders while a GPU prepares, hand-over at a pass boundary),
+  the adaptive low-resolution preview, the refinement delay, full-resolution
+  passes over refinement tiles with adaptive sampling (`ActivePixels`) and
+  its publication, the time limit, texture-streaming restarts, the denoise
+  worker and interval, texture settling. A front end gives it outputs (AOV
+  kinds), a `ProgressiveRun` (device, scene, settings, view) and a
+  `ProgressiveTarget`: control (stop, pause, a pass-boundary hook), frames,
+  the outputs' storage (begin, write, keep, publish, previews, denoised
+  results) and optional mid-pass presentation. Its accumulation (RNG states,
+  adaptive and denoise sums, sample count) survives a stopped run, which the
+  next run resumes. `refinement_tiles.h` moved with it.
+- Hydra: `SceneBridge::Render` keeps what is Hydra's (device creation with
+  `PRISM_DEVICE` and `TF_STATUS`, snapshot and binding capture, binding
+  deduplication, convergence flags) and drives the engine through a
+  `ProgressiveTarget` over its `PrismRenderBuffer`s, whose refinement-tile
+  presentation and denoised presentation stay in the target. Render
+  statistics read the engine's. Images bit-identical to the previous build.
+- Public session (`include/prism/session.h`): `start(progress)`, `pause()`,
+  `resume()`, `cancel()`, `restart()`, `wait(timeout)`, `status()`
+  (`SessionStatus`: state, samples, fraction, active fraction, time limit,
+  accumulations, revision, error), `aov(Aov)` (the last published pass, the
+  preview upscaled before the first), `pick(x, y)` (`Pick`: instance, ids,
+  user data, position, normal, depth), `SessionOptions::progressive`
+  (`ProgressiveOptions`: preview, refinement delay, denoise interval, GPU
+  preparation preview). The session runs the engine on its own thread over
+  host films that accumulate as the delegate's buffers do; setting changes,
+  `restart()` and new commits start a new accumulation (a converged session
+  takes a new commit too). `prism_session_progressive_test`.
+- Scene lock: `detail::RenderLock` counts waiters; a progressive session
+  holds the scene's render lock across passes and yields at pass boundaries
+  to other sessions' renders and to `commit()`, which now replaces the
+  revision under that lock. Revisions are shared (`CommittedRevision`), so a
+  session renders and picks the revision it took while the scene commits the
+  next; a settings change by another session makes it re-apply its own and
+  resume.
+- Deviations (`docs/DECISIONS.md`, 2026-10-28): Hydra drives the session's
+  engine, not a public `Session`, since its scene is not a public `Scene`
+  until step 5b; `pause()` stops the run at the next tile and resumes it
+  (the delegate's in-loop pause, which keeps the render thread, stays for
+  Hydra); progress callbacks run on the session's thread at pass boundaries;
+  no `Session::denoised()` (the Denoised AOV and `denoisedColor` cover it);
+  render settings still reach the devices through the committed
+  `SceneManager`.
+
 Notes:
 - Step 6 is mechanical and can move earlier if the CLI/Hydra double copy of
   globals bites (it does not today: no process loads both).

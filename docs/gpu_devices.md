@@ -1143,6 +1143,28 @@ called done there.
     `prism::Session` on Metal cancelled from its progress callback (the
     session test with `options.device = Metal`) returns `Error(Cancelled)`
     and renders again afterwards.
+- **SDK step 5a: progressive session** ([sdk_design.md](sdk_design.md),
+  section 7; written on Windows, the Metal device unbuilt):
+  - Build: `prism` gains `src/session/progressive_engine.*` and
+    `refinement_tiles.h` (std-only); `src/hydra/refinement_tiles.h` forwards
+    to it.
+  - Shared host code: `src/hydra/scene_bridge.cpp` (`SceneBridge::Render` now
+    drives `prism::session::ProgressiveEngine` through a `ProgressiveTarget`
+    over its render buffers; device preparation, the GPU preparation preview
+    (`DeviceKind::Metal` is eligible as before), previews, passes, adaptive
+    publication and the denoise interval moved unchanged). The device
+    interface (`RenderPass`, `RenderPreview`, `Prepare`, `SceneChanged`,
+    `SettleTextures`, `AccumulationOutdated`, `CreateDenoiser`) is called as
+    before; no shader or device change.
+  - Runs: `ctest -R "prism_hydra_scene_bridge_test|adaptive_publication|session"`
+    on the Mac; `prism_hydra_render tests/hydra/fixtures/parity.usda
+    /World/Camera out.exr 128 128 16 --adaptive-threshold 0` with
+    `PRISM_DEVICE=metal`, bit-identical to the previous build's Metal render;
+    `PRISM_TEST_GPU_PREPARATION_DELAY_MS=3000` with `PRISM_DEVICE=metal` and
+    `PRISM_GPU_PREPARATION_PREVIEW=1` shows the CPU preview and hands over
+    (`gpuPreviewHandovers` 1); a `prism::Session` with `device = Metal`
+    started, paused, resumed and cancelled (the progressive session test
+    with Metal).
 
 ## Diagnostics
 

@@ -835,6 +835,12 @@ if(PRISM_BUILD_HYDRA)
     target_link_libraries(prism_session_test PRIVATE prism prism_io)
     add_test(NAME prism_session_test COMMAND prism_session_test "${CMAKE_BINARY_DIR}/session_test")
     set_tests_properties(prism_session_test PROPERTIES ENVIRONMENT "${_prism_test_environment}" TIMEOUT 300)
+    # The progressive session: polling, pause/resume, cancel, restart, pick,
+    # sessions and commits sharing a scene. The core only.
+    add_executable(prism_session_progressive_test tests/session_progressive_test.cpp)
+    target_link_libraries(prism_session_progressive_test PRIVATE prism)
+    add_test(NAME prism_session_progressive_test COMMAND prism_session_progressive_test)
+    set_tests_properties(prism_session_progressive_test PROPERTIES ENVIRONMENT "${_prism_test_environment}" TIMEOUT 600)
     # Camera rays from the public CameraDesc match Gf and CameraUtil bit for bit.
     add_executable(prism_camera_projection_test tests/camera_projection_test.cpp)
     target_link_libraries(prism_camera_projection_test PRIVATE PrismRT::core ${PXR_LIBRARIES})

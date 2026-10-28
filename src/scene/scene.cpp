@@ -40,6 +40,7 @@
 #include <map>
 #include <optional>
 #include <set>
+#include <thread>
 #include <unordered_map>
 
 namespace prism {
@@ -614,8 +615,11 @@ struct Scene::Impl {
     detail::SceneRenderSettings renderSettings;
     uint64_t renderSettingsGeneration = 0;
     std::mutex renderMutex;  // the scene's sessions render one at a time
-    std::unique_ptr<Revision> committed;
-    uint64_t revision = 0;
+    std::atomic<int> renderWaiters{0};  // RenderLock: renders and commits waiting for it
+    // Replaced under the render lock; a progressive session keeps the
+    // revision it renders alive (SceneAccess::committedRevision).
+    std::shared_ptr<Revision> committed;
+    std::atomic<uint64_t> revision{0};
     std::vector<Diagnostic> diagnostics;
 
     void diagnose(DiagnosticLevel level, std::string category, std::string message, bool print = true)
@@ -1187,8 +1191,21 @@ CommitResult Scene::Impl::commit(ProgressCallback const& progress)
         }
     }
 
-    committed = std::move(revision);
-    result.revision = ++this->revision;
+    {
+        // Sessions render the committed revision (and set their render
+        // settings on it) under the render lock: a progressive session
+        // yields at its next pass boundary and takes this revision.
+        detail::RenderLock lock(renderMutex, renderWaiters);
+        manager.max_depth = renderSettings.maxDepth;
+        manager.rr_min_depth = renderSettings.rouletteDepth;
+        manager.environmentSampling = renderSettings.environmentSampling;
+        manager.textureFiltering = renderSettings.textureFiltering;
+        manager.honorDoubleSided = renderSettings.honorDoubleSided;
+        manager.textureStreaming = renderSettings.textureStreaming;
+        manager.gpuTextureBudgetMiB = renderSettings.gpuTextureBudgetMiB;
+        committed = std::move(revision);
+        result.revision = ++this->revision;
+    }
     result.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     return result;
 }
@@ -1365,6 +1382,66 @@ SceneManager& SceneAccess::committed(Scene& scene)
 {
     if (!scene.m_impl->committed) Throw(ErrorCode::InvalidArgument, "the scene has not been committed");
     return *scene.m_impl->committed->manager;
+}
+
+std::atomic<int>& SceneAccess::renderWaiters(Scene const& scene) { return scene.m_impl->renderWaiters; }
+
+CommittedRevision SceneAccess::committedRevision(Scene const& scene)
+{
+    auto const& revision = scene.m_impl->committed;
+    if (!revision) Throw(ErrorCode::InvalidArgument, "the scene has not been committed");
+    CommittedRevision result;
+    result.manager = std::shared_ptr<SceneManager>(revision, revision->manager.get());
+    result.placements = std::shared_ptr<const std::unordered_map<unsigned, PlacementInfo>>(revision, &revision->placements);
+    result.revision = scene.m_impl->revision.load();
+    return result;
+}
+
+PlacementInfo const* CommittedRevision::placement(unsigned geometryId) const
+{
+    if (!placements) return nullptr;
+    auto found = placements->find(geometryId);
+    return found == placements->end() ? nullptr : &found->second;
+}
+
+RenderLock::RenderLock(Scene const& scene)
+    : RenderLock(SceneAccess::renderMutex(scene), SceneAccess::renderWaiters(scene))
+{
+}
+
+RenderLock::RenderLock(std::mutex& mutex, std::atomic<int>& waiters) : m_mutex(mutex), m_waiters(waiters) { lock(); }
+
+RenderLock::~RenderLock()
+{
+    if (m_locked) m_mutex.unlock();
+}
+
+void RenderLock::lock()
+{
+    m_waiters.fetch_add(1);
+    m_mutex.lock();
+    m_waiters.fetch_sub(1);
+    m_locked = true;
+}
+
+void RenderLock::unlock()
+{
+    m_locked = false;
+    m_mutex.unlock();
+}
+
+bool RenderLock::yield()
+{
+    const int waiting = m_waiters.load();
+    if (waiting == 0) return false;
+    unlock();
+    // Until one of them has the lock (or a second passed: one may have
+    // given up waiting), then queue again.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (m_waiters.load() >= waiting && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    lock();
+    return true;
 }
 
 PlacementInfo const* SceneAccess::placement(Scene const& scene, unsigned geometryId)

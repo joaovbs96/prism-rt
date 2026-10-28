@@ -2,15 +2,25 @@
 
 // Render sessions (docs/sdk_design.md, section 3.7): a device, render
 // settings and a camera that render committed revisions of one scene into
-// images (the colour and the requested AOVs). This version has the batch
-// path: render() renders the whole image to completion (samples, adaptive
-// sampling, time limit), as the CLI does; progressive sessions (passes on an
-// internal thread, previews, picking) come later.
+// images (the colour and the requested AOVs). Two paths:
+// - batch: render() renders the whole image to completion (samples, adaptive
+//   sampling, time limit) and returns it, as the CLI does;
+// - progressive: start() renders passes on the session's own thread (a
+//   low-resolution preview, then full-resolution passes with adaptive
+//   sampling and periodic denoising), the loop the Hydra delegate runs;
+//   aov() and pick() read the last published pass while it runs, pause(),
+//   resume(), cancel() and restart() control it, status() and wait() report.
 //
 // Errors are exceptions (prism::Error): InvalidArgument for misuse (no
 // committed scene, no camera, invalid settings), Unsupported for a device or
 // denoiser the build or machine lacks (with allowFallback false), Cancelled
 // when the progress callback or cancel() stopped a render.
+//
+// A progressive session's methods may be called from any thread while it
+// renders. The sessions of one scene render one at a time (their render
+// settings live on the scene's committed revision): a progressive session
+// yields to another session's render, and to Scene::commit, at its next
+// pass boundary, and takes a new revision there (its accumulation restarts).
 
 #include "scene.h"
 #include "settings.h"
@@ -104,6 +114,28 @@ struct Window {
     bool operator==(Window const&) const = default;
 };
 
+// The progressive path (start()): the delegate's interactive loop.
+struct ProgressiveOptions {
+    // A one-sample preview at reduced resolution first: about
+    // previewTargetMs long (adaptivePreview, measured on the previous one)
+    // and at most previewMaxDimension pixels on its long edge (0: 512 on GPU
+    // devices, 96 on the CPU).
+    bool adaptivePreview = true;
+    int previewTargetMs = 33;
+    int previewMaxDimension = 0;
+    // The wait between the preview and the full-resolution passes (the
+    // delegate's prism:refinementDelayMs lets camera input settle).
+    int refinementDelayMs = 0;
+    // With denoising: the Denoised AOV (and with denoisedColor the colour)
+    // updates every denoiseInterval passes and at the end.
+    int denoiseInterval = 16;
+    // While a GPU device prepares the scene (kernel compilation, upload), the
+    // CPU renders and hands over when the GPU is ready; not for scenes whose
+    // geometry takes more than gpuPreparationPreviewMaxMiB (0: any size).
+    bool gpuPreparationPreview = true;
+    int gpuPreparationPreviewMaxMiB = 8192;
+};
+
 struct SessionOptions {
     DevicePreference device = DevicePreference::Auto;
     // Without the preferred device: the CPU device (with a note, deviceNote())
@@ -127,6 +159,7 @@ struct SessionOptions {
     // colour (requires denoising).
     std::optional<DenoiseSettings> denoise;
     bool denoisedColor = false;
+    ProgressiveOptions progressive;
 };
 
 // Host pixels with shared ownership (copies share them): width x height
@@ -180,6 +213,44 @@ struct RenderResult {
     Image const& aov(Aov aov) const;
 };
 
+// What a pixel centre sees (Session::pick): the instance and its ids, the
+// surface point and normal in world space, and the NDC depth.
+struct Pick {
+    bool hit = false;
+    InstanceId instance;
+    int32_t primId = -1, instanceId = -1, elementId = -1;
+    uint64_t userData = 0;
+    Float3 position{0.0f}, normal{0.0f};
+    float depth = 1.0f;
+};
+
+enum class SessionState {
+    Idle,       // no progressive render yet
+    Running,    // preparing the device, previewing or refining
+    Paused,
+    Converged,  // the accumulation is complete (samples, adaptive, time limit)
+    Cancelled,
+    Failed,     // SessionStatus::error says why; wait() rethrows it
+};
+
+struct SessionStatus {
+    SessionState state = SessionState::Idle;
+    // Completed full-resolution passes of the current accumulation and the
+    // target (adaptive sampling stops converged pixels earlier).
+    uint64_t samples = 0;
+    int targetSamples = 0;
+    // Overall progress in [0, 1] (1 when converged): pixels adaptive sampling
+    // stopped count as done; with a time limit, at least its elapsed share.
+    double fraction = 0.0;
+    double activeFraction = 1.0;
+    bool timeLimitReached = false;
+    // Accumulations started (each restart counts) and the scene revision the
+    // current one renders.
+    uint64_t accumulations = 0;
+    uint64_t revision = 0;
+    std::string error;
+};
+
 class Session {
 public:
     // Sessions come from Renderer::createSession. Copies share the session.
@@ -195,7 +266,8 @@ public:
     std::string deviceNote() const;
 
     SessionOptions const& options() const;
-    // Changes take effect at the next render.
+    // Changes take effect at the next render; a progressive render restarts
+    // its accumulation with them.
     void setSettings(RenderSettings const& settings);
     void setCamera(CameraId camera);
     void setCamera(CameraDesc const& camera);
@@ -218,8 +290,43 @@ public:
 
     // Stops the running render (from any thread) at its next sample
     // boundary (a CPU render also between rows); render() then throws
-    // Error(Cancelled). Without a running render it does nothing.
+    // Error(Cancelled). A progressive render stops at its next tile (state
+    // Cancelled). Without a running render it does nothing.
     void cancel();
+
+    // Progressive rendering on the session's own thread (render() throws
+    // Error(InvalidArgument) while it is active, until cancel() and wait()).
+    // Renders the scene's last committed revision: a preview, then
+    // full-resolution passes until the accumulation converges. A new
+    // commit, a setting change or restart() starts a new accumulation, also
+    // after one converged. The callback runs on the session's thread at pass
+    // boundaries (at most ten times a second) and once when an accumulation
+    // completes; returning false cancels. On a running session start() only
+    // replaces the callback; on a paused one it resumes; after a cancel or a
+    // failure it starts over. Invalid options throw here; errors while
+    // rendering set Failed.
+    void start(ProgressCallback const& progress = {});
+    // pause() stops at the next tile and keeps the accumulation; resume()
+    // continues it.
+    void pause();
+    void resume();
+    // A new accumulation from sample 0.
+    void restart();
+    // Waits until the progressive render is not running (converged, paused,
+    // cancelled, failed or idle) or the timeout passed (negative: none), and
+    // rethrows the error of a failed render.
+    SessionStatus wait(double timeoutSeconds = -1.0) const;
+    SessionStatus status() const;
+    // The progressive render's last published pass of an AOV (before the
+    // first pass, its preview, upscaled), dataWindow-sized; empty before
+    // anything was published. The image shares nothing the render writes
+    // later. Throws Error(NotFound) for an AOV the session does not render.
+    Image aov(Aov aov) const;
+    // What the pixel centre (x, y) of the progressive render's camera sees
+    // in the scene revision it renders (top row first, data window
+    // coordinates). Throws Error(InvalidArgument) before start() or outside
+    // the image.
+    Pick pick(unsigned x, unsigned y) const;
 
     struct Impl;
 

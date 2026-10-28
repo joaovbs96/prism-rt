@@ -12,9 +12,11 @@
 #include "../mesh/mesh_conversion.h"
 #include "../texture.h"
 
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 
 class Material;
 class SceneManager;
@@ -51,6 +53,39 @@ struct SceneRenderSettings {
     bool operator==(SceneRenderSettings const&) const = default;
 };
 
+// A committed revision kept alive by its holder: a progressive session
+// renders it while the scene commits the next one.
+struct CommittedRevision {
+    std::shared_ptr<SceneManager> manager;
+    std::shared_ptr<const std::unordered_map<unsigned, PlacementInfo>> placements;
+    uint64_t revision = 0;
+    // The placement of an Embree geometry id, or null.
+    PlacementInfo const* placement(unsigned geometryId) const;
+};
+
+// The render lock of a scene (its sessions render one at a time, and a
+// commit replaces the revision under it). It counts who waits for it, so a
+// progressive session that holds it across passes yields to them at its pass
+// boundaries (yield()).
+class RenderLock {
+public:
+    explicit RenderLock(Scene const& scene);
+    RenderLock(std::mutex& mutex, std::atomic<int>& waiters);
+    ~RenderLock();
+    RenderLock(RenderLock const&) = delete;
+    RenderLock& operator=(RenderLock const&) = delete;
+    void lock();
+    void unlock();
+    // Lets a waiting render or commit go first, then locks again; true when
+    // it did.
+    bool yield();
+
+private:
+    std::mutex& m_mutex;
+    std::atomic<int>& m_waiters;
+    bool m_locked = false;
+};
+
 struct SceneAccess {
     static RendererContext& context(Scene const& scene);
     // A material the caller compiled (or a built-in one): the scene holds
@@ -64,6 +99,10 @@ struct SceneAccess {
     // Held by the scene's sessions while they render: one at a time per
     // scene (the render settings above live on the committed revision).
     static std::mutex& renderMutex(Scene const& scene);
+    static std::atomic<int>& renderWaiters(Scene const& scene);
+    // The last committed revision, kept alive by the result; call with the
+    // render lock held. Throws when nothing is committed.
+    static CommittedRevision committedRevision(Scene const& scene);
     // The last committed revision's scene; throws when nothing is committed.
     static SceneManager& committed(Scene& scene);
     // The placement of an Embree geometry id of the committed scene, or null.
