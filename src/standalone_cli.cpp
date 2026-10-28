@@ -1,33 +1,28 @@
+// The standalone CLI: argument parsing (flags, UsdRender settings and
+// products) in front of the public API: a Renderer, a Scene the loaders fill,
+// a Session that renders each view, and prism_io (through the products'
+// writer) for the files.
 #include "standalone_cli.h"
 #include <prism/gltf.h>
+#include <prism/io.h>
 #include <prism/obj.h>
 #include <prism/renderer.h>
+#include <prism/session.h>
 #include <prism/usd.h>
-#include "scene.h"
-#include "scene/scene_internal.h"
 #include "render_defaults.h"
-#include "materialx/shared_mdl_context.h"
-#include "mdl/context.h"
-#include "camera_rays.h"
-#include "usd/gf_convert.h"
-#include "camera_ray_diagnostics.h"
+// Internal: option parsing helpers (device and denoise names), the loading
+// progress model and the GPU program report (diagnostic hooks).
+#include "scene/scene_internal.h"
 #include "device/device.h"
-#include "device/light_table.h"
 #include "color/color_management.h"
 #include "renderer/renderer_context.h"
-#include "output/image_writer.h"
 #include "output/render_products.h"
-#include <pxr/usd/usdGeom/camera.h>
 #include <pxr/usd/usdGeom/tokens.h>
 #include <pxr/usd/usdRender/settings.h>
 #include <pxr/usd/usd/stage.h>
 #include <pxr/base/plug/plugin.h>
 #include <pxr/base/plug/registry.h>
 #include <pxr/base/gf/camera.h>
-#include <pxr/base/gf/frustum.h>
-#include <pxr/imaging/cameraUtil/conformWindow.h>
-#include <pxr/imaging/cameraUtil/framing.h>
-#include <tbb/parallel_for.h>
 #include <charconv>
 #include <cstdlib>
 #include <limits>
@@ -430,43 +425,12 @@ void applyRenderSettings(VtDictionary const& settings, Options& o) {
     }
 }
 
-// Independent USD camera ingestion, deliberately separate from the Hydra adapter.
-struct UsdCameraRays {
-    prism::CameraRayParameters parameters;
-
-    // The view's display window, pixel aspect ratio and data window, framed
-    // as Hydra frames a render pass (CameraUtilFraming).
-    UsdCameraRays(const GfCamera& c, prism::output::RenderProductRequest const& view) {
-        const GfMatrix4d projection = c.GetFrustum().ComputeProjectionMatrix();
-        if (view.FullDataWindow() && view.pixelAspectRatio == 1.0f &&
-            prism::output::ConformPolicy(view.aspectRatioConformPolicy) == CameraUtilFit) {
-            parameters.inverseProjection = prism::usd::ToMatrix4d(CameraUtilConformedWindow(
-                projection, CameraUtilFit, double(view.width) / view.height).GetInverse());
-        } else {
-            const CameraUtilFraming framing(
-                GfRange2f(GfVec2f(0.0f), GfVec2f(float(view.width), float(view.height))),
-                GfRect2i(GfVec2i(view.dataX, view.dataY), view.dataWidth, view.dataHeight),
-                view.pixelAspectRatio);
-            parameters.inverseProjection = prism::usd::ToMatrix4d(framing.ApplyToProjectionMatrix(
-                projection, prism::output::ConformPolicy(view.aspectRatioConformPolicy)).GetInverse());
-        }
-        parameters.cameraToWorld = prism::usd::ToMatrix4d(c.GetTransform());
-        const GfRange1f clipping = c.GetClippingRange();
-        parameters.nearClip = static_cast<float>(clipping.GetMin());
-        parameters.farClip = static_cast<float>(clipping.GetMax());
-        parameters.orthographic =
-            c.GetProjection() == GfCamera::Orthographic;
-        parameters.apertureRadius = prism::CameraApertureRadius(
-            c.GetFocalLength() * GfCamera::FOCAL_LENGTH_UNIT, c.GetFStop());
-        parameters.focusDistance = c.GetFocusDistance();
-    }
-};
-
 // The progress line on stderr: the loading stage, then a bar per colour
-// render. A monitor thread polls the device's ImageProgress (relaxed atomics)
-// and the renderer's prism::Progress model four times a second, so nothing in
-// the render path waits on it. On a terminal it rewrites one line with \r;
-// otherwise (logs, CTest) it prints a plain line per stage and per 10%.
+// render. A monitor thread prints four times a second what the renderer's
+// prism::Progress model (loading) and the session's progress callback
+// (rendering) last reported, so nothing in the render path waits on it. On a
+// terminal it rewrites one line with \r; otherwise (logs, CTest) it prints a
+// plain line per stage and per 10%.
 class ProgressPrinter {
 public:
     explicit ProgressPrinter(bool enabled) : m_enabled(enabled)
@@ -493,19 +457,19 @@ public:
         if (!m_enabled) return;
         std::lock_guard lock(m_mutex);
         m_stage = std::move(text);
-        m_render = nullptr;
+        m_rendering = false;
         if (m_stage.empty() && m_terminal && m_width) {
             std::cerr << '\r' << std::string(m_width, ' ') << '\r' << std::flush;
             m_width = 0;
         }
     }
     // With a time limit, the progress is at least its elapsed fraction.
-    void BeginRender(prism::device::ImageProgress* progress, bool adaptive, std::string label,
-                     double timeLimit)
+    void BeginRender(bool adaptive, std::string label, double timeLimit)
     {
         if (!m_enabled) return;
         std::lock_guard lock(m_mutex);
-        m_render = progress;
+        m_rendering = true;
+        m_info = {};
         m_adaptive = adaptive;
         m_timeLimit = timeLimit;
         m_rate = m_rateSamples = m_rateTime = 0.0;
@@ -513,12 +477,19 @@ public:
         m_renderStart = std::chrono::steady_clock::now();
         m_lastDecile = -1;
     }
+    // The session's progress callback (on its thread).
+    void Update(prism::ProgressInfo const& info)
+    {
+        if (!m_enabled) return;
+        std::lock_guard lock(m_mutex);
+        if (info.phase == "rendering") m_info = info;
+    }
     void EndRender()
     {
         if (!m_enabled) return;
         std::lock_guard lock(m_mutex);
-        if (m_render) Print(Line(1.0), true);
-        m_render = nullptr;
+        if (m_rendering) Print(Line(1.0), true);
+        m_rendering = false;
         m_stage.clear();
     }
     void Stop()
@@ -542,33 +513,31 @@ private:
     // Called with m_mutex held.
     double Fraction() const
     {
-        double fraction = m_render->Fraction();
+        double fraction = m_info.fraction;
         if (m_timeLimit > 0.0)
             fraction = std::max(fraction, std::min(1.0, std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - m_renderStart).count() / m_timeLimit));
         return fraction;
     }
-    // Called with m_mutex held. `fraction` overrides the polled one (1 at the end).
+    // Called with m_mutex held. `fraction` overrides the reported one (1 at the end).
     std::string Line(double fraction = -1.0)
     {
-        auto& p = *m_render;
+        auto const& p = m_info;
         const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - m_renderStart).count();
         // GPU devices compile and upload before their first sample.
-        if (fraction < 0.0 && p.samples.load(std::memory_order_relaxed) == 0.0)
+        if (fraction < 0.0 && p.samples == 0.0)
             return "Preparing the render device... " + Duration(elapsed);
         if (fraction < 0.0) fraction = Fraction();
         const int width = 20, filled = int(fraction * width + 1e-9);
         std::ostringstream line;
         line << '[' << std::string(filled, '#') << std::string(width - filled, '-') << "] "
-             << int(fraction * 100.0) << "%  " << long(p.samples.load(std::memory_order_relaxed)) << '/'
-             << p.target.load(std::memory_order_relaxed) << " spp";
-        if (m_adaptive)
-            line << "  " << int(p.activeFraction.load(std::memory_order_relaxed) * 100.0 + 0.5) << "% px active";
+             << int(fraction * 100.0) << "%  " << long(p.samples) << '/' << std::max(1, p.targetSamples) << " spp";
+        if (m_adaptive) line << "  " << int(p.activeFraction * 100.0 + 0.5) << "% px active";
         line << "  " << Duration(elapsed) << " elapsed";
         // ETA: the samples left at the current rate (adaptive sampling may
         // stop the remaining pixels earlier), within the time limit.
-        const double samples = p.samples.load(std::memory_order_relaxed);
-        const double target = p.target.load(std::memory_order_relaxed);
+        const double samples = p.samples;
+        const double target = std::max(1, p.targetSamples);
         if (samples > m_rateSamples && elapsed > m_rateTime + 0.5) {
             const double rate = (samples - m_rateSamples) / (elapsed - m_rateTime);
             m_rate = m_rate > 0.0 ? 0.7 * m_rate + 0.3 * rate : rate;
@@ -600,7 +569,7 @@ private:
         std::string lastStage;
         std::unique_lock lock(m_mutex);
         while (!m_stop) {
-            if (m_render) {
+            if (m_rendering) {
                 const double fraction = Fraction();
                 const int decile = int(fraction * 10.0);
                 if (m_terminal) Print(Line(), false);
@@ -626,7 +595,7 @@ private:
         }
     }
 
-    bool m_enabled = false, m_terminal = false, m_stop = false, m_adaptive = false;
+    bool m_enabled = false, m_terminal = false, m_stop = false, m_adaptive = false, m_rendering = false;
     double m_timeLimit = 0.0;
     // Sample rate for the ETA (samples per second, smoothed).
     double m_rate = 0.0, m_rateSamples = 0.0, m_rateTime = 0.0;
@@ -634,12 +603,22 @@ private:
     std::condition_variable m_wake;
     std::thread m_thread;
     std::string m_stage;
-    prism::device::ImageProgress* m_render = nullptr;
+    prism::ProgressInfo m_info;
     prism::Progress* m_model = nullptr;
     std::chrono::steady_clock::time_point m_renderStart;
     int m_lastDecile = -1;
     size_t m_width = 0;
 };
+
+const char* DeviceName(prism::DeviceKind kind)
+{
+    switch (kind) {
+    case prism::DeviceKind::Cpu: return "cpu";
+    case prism::DeviceKind::Vulkan: return "vulkan";
+    case prism::DeviceKind::Metal: return "metal";
+    }
+    return "unknown";
+}
 
 }
 
@@ -653,15 +632,12 @@ int runStandaloneCli(int argc, char** argv) {
         // flags and render settings override below.
         prism::RendererOptions rendererOptions = prism::RendererOptions::FromEnvironment();
         if (argc == 2 && std::string(argv[1]) == "--list-devices") {
-            for (auto const& info : prism::device::AvailableDevices(rendererOptions.devices))
-                std::cout << prism::device::ToString(info.kind) << ": " << info.name
+            for (auto const& info : prism::Renderer(rendererOptions).devices())
+                std::cout << DeviceName(info.kind) << ": " << info.name
                           << (info.hardwareRayTracing ? " (hardware ray tracing)" : "") << '\n';
             return 0;
         }
         Options o = parse(argc, argv);
-        // Outlives the printer, whose thread reads it (also while an error
-        // unwinds).
-        prism::device::ImageProgress imageProgress;
         ProgressPrinter progress(o.progress);
         auto start = std::chrono::steady_clock::now();
         auto seconds =[&] { return std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count(); };
@@ -734,16 +710,6 @@ int runStandaloneCli(int argc, char** argv) {
             }
             views.push_back(std::move(view));
         }
-        // The denoiser is needed for --denoise replace and for denoised vars.
-        bool anyDenoised = o.denoise == "replace";
-        for (auto const& view : views)
-            for (auto const& var : view.vars) anyDenoised |= var.kind == prism::output::AovKind::Denoised;
-        if (anyDenoised && !prism::device::DenoisingAvailable()) {
-            std::string reason;
-            prism::device::SharedCpuDenoiser(&reason);
-            throw std::runtime_error("denoising was asked for (--denoise, prism:denoise or a 'denoised' "
-                                     "render var) but " + reason);
-        }
         const UsdTimeCode time = o.time ? UsdTimeCode(*o.time) : UsdTimeCode::Default();
         // Colour options from the flags and render settings; the config
         // defaults to the renderer's ($OCIO).
@@ -754,25 +720,35 @@ int runStandaloneCli(int argc, char** argv) {
         rendererOptions.materials.materialxMdlPath = rendererOptions.materials.materialxLibraries + "/mdl";
         // --sss-fallback and prism:sssFallback (default PRISM_SSS_FALLBACK).
         rendererOptions.materials.sssFallback = o.sssFallback;
-        // The renderer (its context: colour, materials, textures, Embree,
-        // logging and progress) and its public face.
-        const prism::Renderer api(std::make_shared<prism::RendererContext>(rendererOptions));
-        prism::RendererContext& renderer = *api.context();
+        // The renderer: colour, materials, textures, Embree, logging and
+        // progress.
+        const prism::Renderer renderer(rendererOptions);
+        // The denoiser is needed for --denoise replace and for denoised vars.
+        bool anyDenoised = o.denoise == "replace";
+        for (auto const& view : views)
+            for (auto const& var : view.vars) anyDenoised |= var.kind == prism::output::AovKind::Denoised;
+        if (anyDenoised) {
+            const prism::Capabilities capabilities = renderer.capabilities();
+            if (!capabilities.denoising)
+                throw std::runtime_error("denoising was asked for (--denoise, prism:denoise or a 'denoised' "
+                                         "render var) but " + capabilities.denoisingNote);
+        }
         // Loading phases (materials, textures) report to the renderer's model,
         // and its diagnostics go to standard error, also from this thread.
-        progress.SetModel(&renderer.progress());
+        prism::RendererContext& context = *renderer.context();
+        progress.SetModel(&context.progress());
         // The printer outlives the renderer: it stops reading the model first.
         struct ModelRelease {
             ProgressPrinter& printer;
             ~ModelRelease() { printer.SetModel(nullptr); }
         } modelRelease{progress};
-        prism::progress::Bind progressBinding(&renderer.progress());
-        prism::logging::Bind logBinding(&renderer.logger());
+        prism::progress::Bind progressBinding(&context.progress());
+        prism::logging::Bind logBinding(&context.logger());
         // Before anything loads: materials, lights and textures convert into
         // the working space as they are read.
-        const auto colorManagement = renderer.colorManagement();
-        std::cout << "Color: working space " << colorManagement->workingSpace() << ", view " << colorManagement->view()
-                  << " on " << colorManagement->display() << " (" << colorManagement->configName() << ")\n";
+        const prism::ColorInfo color = renderer.color();
+        std::cout << "Color: working space " << color.workingSpace << ", view " << color.view
+                  << " on " << color.display << " (" << color.configName << ")\n";
         const double stageSeconds = seconds();
         for (auto const& view : views) {
             if (view.width <= 0 || view.height <= 0 ||
@@ -781,43 +757,29 @@ int runStandaloneCli(int argc, char** argv) {
             if (view.camera.IsEmpty() && !explicitCamera)
                 throw std::runtime_error("Render product <" + view.path.GetString() + "> has no camera");
         }
-        // The cameras' exposure (UsdGeomCamera exposure, exposure:iso,
-        // :time, :fStop and :responsivity), which scales the colour as the
-        // Hydra delegate's exposure compensation does.
-        std::vector<float> exposureScales;
+        // The cameras, checked before the scene loads: USD cameras with their
+        // exposure (UsdGeomCamera exposure, exposure:iso, :time, :fStop and
+        // :responsivity, which scales the colour as the Hydra delegate's
+        // exposure compensation does), or the explicit look-at camera.
         auto cameraFor = [&](prism::output::RenderProductRequest const& view) {
-            GfCamera camera;
-            float exposureScale = 1.0f;
             if (!view.camera.IsEmpty()) {
                 if (!stage) throw std::runtime_error("--camera prim paths require a USD scene");
-                UsdGeomCamera authored(stage->GetPrimAtPath(view.camera));
-                if (!authored) throw std::runtime_error("Not a USD camera: " + view.camera.GetString());
-                camera = authored.GetCamera(time);
-                exposureScale = authored.ComputeLinearExposureScale(time);
-            } else {
-                auto asGf = [](Float3 v) { return GfVec3d(v.x(),v.y(),v.z()); };
-                GfMatrix4d viewMatrix(1); viewMatrix.SetLookAt(asGf(*o.cameraPosition), asGf(*o.cameraTarget), asGf(o.cameraUp));
-                camera.SetTransform(viewMatrix.GetInverse());
-                camera.SetPerspectiveFromAspectRatioAndFieldOfView(double(view.width)/view.height, o.verticalFov, GfCamera::FOVVertical);
-                camera.SetFocusDistance(o.focusDistance);
-                const float radius = o.focusDistance * std::tan(deg2rad(o.defocusAngle/2));
-                camera.SetFStop(radius > 0 ? camera.GetFocalLength()*0.1f/(2*radius) : 0);
-                camera.SetClippingRange(GfRange1f(0.001f, 1e30f));
+                return prism::usd::LoadCamera(stage, view.camera, time);
             }
-            exposureScales.push_back(std::isfinite(exposureScale) ? exposureScale : 1.0f);
-            return UsdCameraRays(camera, view);
+            GfCamera camera;
+            auto asGf = [](Float3 v) { return GfVec3d(v.x(),v.y(),v.z()); };
+            GfMatrix4d viewMatrix(1); viewMatrix.SetLookAt(asGf(*o.cameraPosition), asGf(*o.cameraTarget), asGf(o.cameraUp));
+            camera.SetTransform(viewMatrix.GetInverse());
+            camera.SetPerspectiveFromAspectRatioAndFieldOfView(double(view.width)/view.height, o.verticalFov, GfCamera::FOVVertical);
+            camera.SetFocusDistance(o.focusDistance);
+            const float radius = o.focusDistance * std::tan(deg2rad(o.defocusAngle/2));
+            camera.SetFStop(radius > 0 ? camera.GetFocalLength()*0.1f/(2*radius) : 0);
+            camera.SetClippingRange(GfRange1f(0.001f, 1e30f));
+            return prism::usd::CameraFromGf(camera);
         };
-        // Cameras are checked before the scene loads.
-        std::vector<UsdCameraRays> viewRays;
-        for (auto const& view : views) viewRays.push_back(cameraFor(view));
-        prism::DumpCameraRayDiagnostics(
-            viewRays.front().parameters, static_cast<unsigned int>(views.front().dataWidth),
-            static_cast<unsigned int>(views.front().dataHeight), o.seed, "standalone");
+        std::vector<prism::CameraDesc> cameras;
+        for (auto const& view : views) cameras.push_back(cameraFor(view));
         progress.Stage("Loading scene");
-        // The process-lifetime runtime the material service shares its caches
-        // and templates through (as in the Hydra delegate).
-        mdl::Context& context = prism::materials::SharedMdlContext();
-        if (!context.is_valid()) throw std::runtime_error(context.get_error());
         // The scene, through the public API: the loaders add to it and its
         // commit converts meshes, compiles materials and builds the
         // acceleration structure.
@@ -834,7 +796,7 @@ int runStandaloneCli(int argc, char** argv) {
         // the same rule (scene_bridge.cpp _ApplyDefaultDome).
         sceneOptions.defaultDome = o.defaultDome;
         if (o.defaultDome) sceneOptions.defaultDomeTexture = DefaultDomeTexture();
-        prism::Scene scene = api.createScene(sceneOptions);
+        prism::Scene scene = renderer.createScene(sceneOptions);
         if (isUsd) {
             prism::usd::LoadOptions load;
             if (job) {
@@ -874,198 +836,123 @@ int runStandaloneCli(int argc, char** argv) {
             environment.exposure = o.exposure;
             scene.addEnvironment(environment);
         }
-        prism::detail::SceneRenderSettings renderSettings;
-        renderSettings.maxDepth = o.depth;
-        renderSettings.rouletteDepth = o.roulette;
-        renderSettings.environmentSampling = o.environmentSampling == "mis";
-        renderSettings.textureFiltering = o.textureFiltering == "bilinear" ? prism::TextureFiltering::Bilinear
-                                                                          : prism::TextureFiltering::Filtered;
-        renderSettings.honorDoubleSided = o.honorDoubleSided;
-        renderSettings.textureStreaming = o.textureStreaming;
-        renderSettings.gpuTextureBudgetMiB = prism::defaults::ClampGpuTextureBudgetMiB(o.gpuTextureBudgetMiB);
-        prism::detail::SceneAccess::setRenderSettings(scene, renderSettings);
         progress.Stage("Building the scene");
         scene.commit();
         progress.Stage("");
-        // The committed scene the device renders (the session API takes over
-        // in migration step 4).
-        SceneManager& sceneManager = prism::detail::SceneAccess::committed(scene);
         if (const char* report = std::getenv("PRISM_GPU_PROGRAM_REPORT"); report && *report == '1') {
-            if (!prism::device::ReportGpuPrograms(sceneManager, std::cout, renderer.varyingEmitters().get()))
+            // Diagnostics without a GPU device (an internal hook).
+            if (!prism::device::ReportGpuPrograms(prism::detail::SceneAccess::committed(scene), std::cout,
+                                                  context.varyingEmitters().get()))
                 std::cerr << "PrismRT: this build has no Vulkan device\n";
             return 0;
         }
+
+        // The session: the device, the render settings and the camera of
+        // each view.
+        prism::SessionOptions sessionOptions;
+        sessionOptions.device = o.device;
+        prism::RenderSettings& settings = sessionOptions.settings;
+        settings.samples = o.samples;
+        settings.adaptiveThreshold = o.adaptiveThreshold;
+        settings.adaptiveMinSamples = o.adaptiveMinSamples;
+        settings.maxDepth = o.depth;
+        settings.rouletteDepth = o.roulette;
+        settings.seed = o.seed;
+        settings.sampleClamp = o.clamp;
+        settings.environmentMis = o.environmentSampling == "mis";
+        settings.textureFiltering = o.textureFiltering == "bilinear" ? prism::TextureFiltering::Bilinear
+                                                                    : prism::TextureFiltering::Filtered;
+        settings.honorDoubleSided = o.honorDoubleSided;
+        settings.nee = o.nee;
+        settings.textureStreaming = o.textureStreaming;
+        settings.gpuTextureBudgetMiB = o.gpuTextureBudgetMiB;
+        settings.debugContributions = o.contributions;
+        sessionOptions.cameraDesc = cameras.front();
         progress.Stage("Creating the render device");
-        std::string deviceNote;
-        auto renderDevice = prism::device::CreateDevice(o.device, renderer.deviceOptions(), &deviceNote);
+        prism::Session session = renderer.createSession(scene, sessionOptions);
         progress.Stage("");
-        if (!deviceNote.empty()) std::cerr << "PrismRT: " << deviceNote << '\n';
-        const auto deviceInfo = renderDevice->Info();
-        std::cout << "Rendering on " << prism::device::ToString(deviceInfo.kind) << " device: "
-                  << deviceInfo.name << '\n';
-        renderDevice->SceneChanged(sceneManager);
+        if (!session.deviceNote().empty()) std::cerr << "PrismRT: " << session.deviceNote() << '\n';
+        const prism::DeviceInfo deviceInfo = session.device();
+        std::cout << "Rendering on " << DeviceName(deviceInfo.kind) << " device: " << deviceInfo.name << '\n';
         const double loadSeconds = seconds();
         using prism::output::AovKind;
         double renderSeconds = 0, meanSamples = o.samples, fractionAtMaxSamples = 1.0;
         double denoiseMilliseconds = 0;
         std::string denoiserName; // the last denoise's (for the profile)
         bool timeLimitReached = false;
-        std::vector<prism::output::RenderedAov> rendered;
+        prism::RenderResult result;
         for (size_t index = 0; index < views.size(); ++index) {
             auto const& view = views[index];
-            const auto& rays = viewRays[index];
-            const unsigned width = static_cast<unsigned>(view.dataWidth);
-            const unsigned height = static_cast<unsigned>(view.dataHeight);
-            // Products that differ only in their vars share one render.
-            if (index == 0 || !view.SameView(views[index - 1])) rendered.clear();
-            const double renderStart = seconds();
-            auto renderedKind = [&](AovKind kind) {
-                return std::any_of(rendered.begin(), rendered.end(),
-                                   [&](auto const& aov) { return aov.kind == kind; });
-            };
-            // The light AOVs render with the colour: ask for them if a
-            // product sharing this view has one.
-            bool lightAovs = false;
-            // The denoised colour, likewise (and for --denoise replace).
+            // Products that differ only in their vars share one render: the
+            // first renders what all of them ask for.
+            const bool newView = index == 0 || !view.SameView(views[index - 1]);
+            std::vector<prism::Aov> aovs;
             bool denoise = o.denoise == "replace";
-            for (size_t other = index; other < views.size() && views[other].SameView(view); ++other)
-                for (auto const& var : views[other].vars) {
-                    lightAovs |= prism::output::LightAov(var.kind);
-                    denoise |= var.kind == AovKind::Denoised;
-                }
-            std::vector<AovKind> geometric;
-            for (auto const& var : view.vars) {
-                auto const* info = prism::output::FindAov(var.kind);
-                if (!info || renderedKind(var.kind)) continue;
-                if (!info->standalone) {
-                    std::cerr << "PrismRT: render var <" << var.path << "> ('" << var.sourceName
-                              << "') is only available in the Hydra delegate; skipped\n";
-                    continue;
-                }
-                if (prism::output::ColorAov(var.kind) || prism::output::LightAov(var.kind)) {
-                    prism::device::ImageRequest imageRequest;
-                    imageRequest.camera = rays.parameters;
-                    imageRequest.width = width;
-                    imageRequest.height = height;
-                    imageRequest.samples = o.samples;
-                    imageRequest.seed = o.seed;
-                    imageRequest.sampleClamp = o.clamp;
-                    imageRequest.adaptive.threshold = o.adaptiveThreshold;
-                    imageRequest.adaptive.minSamples = o.adaptiveMinSamples;
-                    imageRequest.contributions = o.contributions;
-                    imageRequest.nee = o.nee;
-                    imageRequest.meanSamples = &meanSamples;
-                    imageRequest.fractionAtMaxSamples = &fractionAtMaxSamples;
-                    // The limit covers all of the views together.
-                    imageRequest.progress = &imageProgress;
-                    bool stopped = false;
-                    if (o.timeLimit > 0) {
-                        imageRequest.timeLimitSeconds = std::max(1e-6, o.timeLimit - renderSeconds);
-                        imageRequest.timeLimitReached = &stopped;
+            bool traced = false;
+            if (newView) {
+                for (size_t other = index; other < views.size() && views[other].SameView(view); ++other)
+                    for (auto const& var : views[other].vars) {
+                        auto const* info = prism::output::FindAov(var.kind);
+                        const auto aov = prism::output::PublicAov(var.kind);
+                        if (!info || !aov) continue;
+                        if (!info->standalone) {
+                            std::cerr << "PrismRT: render var <" << var.path << "> ('" << var.sourceName
+                                      << "') is only available in the Hydra delegate; skipped\n";
+                            continue;
+                        }
+                        denoise |= var.kind == AovKind::Denoised;
+                        traced |= prism::output::ColorAov(var.kind) || prism::output::LightAov(var.kind);
+                        if (std::find(aovs.begin(), aovs.end(), *aov) == aovs.end()) aovs.push_back(*aov);
                     }
-                    std::vector<prism::device::LightAovPixel> lightPixels;
-                    if (lightAovs) imageRequest.lightAovs = &lightPixels;
-                    std::vector<float> denoisedPixels;
-                    double viewDenoiseMilliseconds = 0;
-                    if (denoise) {
-                        imageRequest.denoise = o.denoiseSettings;
-                        imageRequest.denoised = &denoisedPixels;
-                        imageRequest.denoiseMilliseconds = &viewDenoiseMilliseconds;
-                        imageRequest.denoiser = &denoiserName;
-                    }
-                    progress.BeginRender(&imageProgress, o.adaptiveThreshold > 0,
+                result = prism::RenderResult{};
+            }
+            if (newView && !aovs.empty()) {
+                session.setAovs(aovs);
+                if (denoise) session.setDenoise(o.denoiseSettings, o.denoise == "replace");
+                else session.setDenoise(std::nullopt);
+                session.setCamera(cameras[index]);
+                std::optional<prism::Window> window;
+                if (!view.FullDataWindow())
+                    window = prism::Window{unsigned(view.dataX), unsigned(view.dataY), unsigned(view.dataWidth),
+                                           unsigned(view.dataHeight)};
+                session.resize(unsigned(view.width), unsigned(view.height), window, view.pixelAspectRatio,
+                               prism::output::PublicConformPolicy(view.aspectRatioConformPolicy));
+                // The limit covers all of the views together.
+                prism::RenderSettings viewSettings = settings;
+                viewSettings.timeLimitSeconds = o.timeLimit > 0 ? std::max(1e-6, o.timeLimit - renderSeconds) : 0.0;
+                session.setSettings(viewSettings);
+                if (traced)
+                    progress.BeginRender(o.adaptiveThreshold > 0,
                         views.size() > 1 ? "view " + std::to_string(index + 1) + "/" + std::to_string(views.size()) : "",
-                        imageRequest.timeLimitSeconds);
-                    rendered.push_back({AovKind::Color, 3, renderDevice->RenderImage(sceneManager, imageRequest)});
-                    // Applied after the sample clamp, as in every render loop;
-                    // adaptive sampling measures its error relative to the
-                    // image's brightness, so scaling afterwards is the same.
-                    const float scale = exposureScales[index];
-                    if (scale != 1.0f)
-                        for (float& value : rendered.back().pixels) value *= scale;
-                    if (denoise) {
-                        // HDR denoising is scale invariant (OIDN scales its input
-                        // to its training range), so the exposure applies after.
-                        if (scale != 1.0f)
-                            for (float& value : denoisedPixels) value *= scale;
-                        denoiseMilliseconds += viewDenoiseMilliseconds;
-                        std::cout << "Denoised " << width << "x" << height << " in " << viewDenoiseMilliseconds
-                                  << " ms with " << denoiserName << " ("
-                                  << prism::device::ToString(o.denoiseSettings.quality) << " quality"
-                                  << (o.denoiseSettings.prefilter ? ", prefiltered guides" : "") << ")\n";
-                        // --denoise replace: the colour outputs are the denoised colour.
-                        if (o.denoise == "replace") rendered.back().pixels = denoisedPixels;
-                        rendered.push_back({AovKind::Denoised, 3, std::move(denoisedPixels)});
-                    }
-                    if (lightAovs) {
-                        // Radiance AOVs take the colour's exposure; the albedo does not.
-                        for (AovKind kind : {AovKind::Albedo, AovKind::Diffuse, AovKind::Specular, AovKind::Emission}) {
-                            prism::output::RenderedAov plane{kind, 3, std::vector<float>(lightPixels.size() * 3)};
-                            const float planeScale = kind == AovKind::Albedo ? 1.0f : scale;
-                            for (size_t p = 0; p < lightPixels.size(); ++p) {
-                                auto const& a = lightPixels[p];
-                                const Color3& value = kind == AovKind::Albedo ? a.albedo
-                                    : kind == AovKind::Diffuse ? a.diffuse
-                                    : kind == AovKind::Specular ? a.specular : a.emission;
-                                for (int c = 0; c < 3; ++c) plane.pixels[3 * p + c] = value[c] * planeScale;
-                            }
-                            rendered.push_back(std::move(plane));
-                        }
-                    }
-                    progress.EndRender();
-                    timeLimitReached |= stopped;
-                } else if (std::find(geometric.begin(), geometric.end(), var.kind) == geometric.end()) {
-                    geometric.push_back(var.kind);
+                        viewSettings.timeLimitSeconds);
+                result = session.render([&](prism::ProgressInfo const& info) {
+                    progress.Update(info);
+                    return true;
+                });
+                if (traced) progress.EndRender();
+                renderSeconds += result.renderSeconds;
+                if (result.traced) {
+                    meanSamples = result.meanSamples;
+                    fractionAtMaxSamples = result.fractionAtMaxSamples;
+                    timeLimitReached |= result.timeLimitReached;
+                }
+                if (!result.denoiser.empty()) {
+                    denoiserName = result.denoiser;
+                    denoiseMilliseconds += result.denoiseMilliseconds;
+                    std::cout << "Denoised " << view.dataWidth << "x" << view.dataHeight << " in "
+                              << result.denoiseMilliseconds << " ms with " << denoiserName << " ("
+                              << prism::device::ToString(o.denoiseSettings.quality) << " quality"
+                              << (o.denoiseSettings.prefilter ? ", prefiltered guides" : "") << ")\n";
                 }
             }
-            if (!geometric.empty()) {
-                // Pixel-centre primary hits, as the Hydra delegate resolves
-                // its geometric AOVs.
-                const prism::Matrix4d worldToView = rays.parameters.cameraToWorld.inverse();
-                const prism::Matrix4d projection = rays.parameters.inverseProjection.inverse();
-                std::vector<prism::output::RenderedAov> planes;
-                for (AovKind kind : geometric)
-                    planes.push_back({kind, prism::output::AovComponents(kind),
-                        std::vector<float>(size_t(width) * height * prism::output::AovComponents(kind))});
-                const bool culling = sceneManager.cullsBackFaces();
-                // Prim, element and instance ids (-1 on a miss): USD scenes
-                // number their placements as the Hydra delegate does; glTF
-                // and OBJ scenes are one prim of triangles.
-                auto resolveId = [&](AovKind kind, RayHit const& hit) -> float {
-                    if (hit.geomid == int(RTC_INVALID_GEOMETRY_ID)) return -1.0f;
-                    if (!isUsd)
-                        return kind == AovKind::PrimId ? 0.0f : kind == AovKind::ElementId ? float(hit.primid) : -1.0f;
-                    auto const* ids = prism::detail::SceneAccess::placement(scene, unsigned(hit.geomid));
-                    if (!ids) return -1.0f;
-                    if (kind == AovKind::PrimId) return float(ids->primId);
-                    if (kind == AovKind::InstanceId) return float(ids->instanceId);
-                    return hit.primid >= 0 && size_t(hit.primid) < ids->coarseFaces.size()
-                        ? float(ids->coarseFaces[size_t(hit.primid)]) : -1.0f;
-                };
-                tbb::parallel_for(0u, height, [&](unsigned y) {
-                    for (unsigned x = 0; x < width; ++x) {
-                        const RayHit hit = sceneManager.castRayCulled(prism::MakeCameraRayWithLens(rays.parameters,
-                            float(x) + 0.5f, float(y) + 0.5f, width, height, nullptr), culling);
-                        for (auto& plane : planes) {
-                            float* values = plane.pixels.data() + (size_t(y) * width + x) * plane.components;
-                            if (prism::output::IntegerAov(plane.kind)) values[0] = resolveId(plane.kind, hit);
-                            else prism::output::ResolveGeometricAov(plane.kind, hit, worldToView, projection, values);
-                        }
-                    }
-                });
-                for (auto& plane : planes) rendered.push_back(std::move(plane));
-            }
-            renderSeconds += seconds() - renderStart;
+            // EXR: every layer, linear working space, tagged. Other formats:
+            // the colour display-encoded through the view, exactly once.
             std::vector<std::string> warnings;
-            const prism::output::Image image = prism::output::BuildProductImage(view, rendered, &warnings);
-            if (image.layers.empty()) {
+            if (!prism::output::WriteProduct(view, result, renderer, &warnings)) {
                 for (auto const& warning : warnings) std::cerr << "PrismRT: " << warning << '\n';
                 std::cerr << "PrismRT: nothing to write to " << view.output << '\n';
                 continue;
             }
-            // EXR: every layer, linear working space, tagged. Other formats:
-            // the colour display-encoded through the view, exactly once.
-            prism::output::WriteImage(view.output, image, *colorManagement, &warnings);
             for (auto const& warning : warnings) std::cerr << "PrismRT: " << warning << '\n';
             std::cout << "Rendered " << view.dataWidth << "x" << view.dataHeight;
             if (!view.FullDataWindow())
@@ -1078,7 +965,7 @@ int runStandaloneCli(int argc, char** argv) {
             std::cout << " to " << view.output << '\n';
         }
         const double outputSeconds = seconds() - loadSeconds - renderSeconds;
-        const auto textureStats = renderer.textures()->stats();
+        const prism::RendererStats stats = renderer.stats();
         std::cout << "[PrismProfile] {\"stageSeconds\":" << stageSeconds
                   << ",\"loadSeconds\":" << loadSeconds
                   << ",\"renderSeconds\":" << renderSeconds
@@ -1089,11 +976,11 @@ int runStandaloneCli(int argc, char** argv) {
                   << ",\"denoiseMilliseconds\":" << denoiseMilliseconds
                   << ",\"denoiser\":\"" << denoiserName << "\""
                   << ",\"textureFiltering\":\"" << o.textureFiltering << "\""
-                  << ",\"texturePrepareCalls\":" << textureStats.prepareCalls
-                  << ",\"textureMemoryCacheHits\":" << textureStats.memoryCacheHits
-                  << ",\"textureDiskCacheHits\":" << textureStats.diskCacheHits
-                  << ",\"textureSourceBytesHashed\":" << textureStats.sourceBytesHashed
-                  << ",\"texturePreparationWorkerSeconds\":" << textureStats.preparationNanoseconds / 1e9
+                  << ",\"texturePrepareCalls\":" << stats.texturePrepareCalls
+                  << ",\"textureMemoryCacheHits\":" << stats.textureMemoryCacheHits
+                  << ",\"textureDiskCacheHits\":" << stats.textureDiskCacheHits
+                  << ",\"textureSourceBytesHashed\":" << stats.textureSourceBytesHashed
+                  << ",\"texturePreparationWorkerSeconds\":" << stats.texturePreparationNanoseconds / 1e9
                   << "}\n";
         return 0;
     } catch (const std::exception& error) {
