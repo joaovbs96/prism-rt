@@ -10,7 +10,7 @@
 #include "../../src/hydra/render_buffer.h"
 #include "../../src/hydra/native_tasks.h"
 #include "../../src/hydra/task_delegate.h"
-#include "../../src/hydra/triangulation.h"
+#include "../../src/mesh/triangulation.h"
 #include "../../src/usd/gf_convert.h"
 #include "../../src/scene.h"
 #include "../../src/device/cpu_device.h"
@@ -716,7 +716,7 @@ int main(int argc, char **argv)
     // that the ear-clipped result covers exactly the authored polygon area.
     const std::vector<GfVec3d> concave{{0, 0, 0}, {2, 0, 0}, {2, 2, 0},
                                        {1, 1, 0}, {0, 2, 0}};
-    const auto concaveTriangles = prism::hydra::TriangulatePolygon(concave);
+    const auto concaveTriangles = prism::mesh::TriangulatePolygon(concave);
     double concaveArea = 0.0;
     for (auto const &triangle : concaveTriangles) {
         concaveArea += 0.5 * GfCross(
@@ -922,7 +922,7 @@ int main(int argc, char **argv)
     ok &= Check(concaveTriangles.size() == 3 &&
                     std::abs(concaveArea - 3.0) < 1e-9,
                 "concave polygon triangulation escaped the authored boundary");
-    const std::vector<int> subsetSlots = prism::hydra::ExpandFaceAssignments(
+    const std::vector<int> subsetSlots = prism::mesh::ExpandFaceAssignments(
         {0, 0, 1, 2, 2}, {{0, 4}, {2, 9}}, 1);
     ok &= Check(subsetSlots == std::vector<int>({4, 4, 1, 9, 9}),
                 "material subset assignment did not preserve coarse faces");

@@ -30,9 +30,6 @@
 #include "../materialx/resolved_resource.h"
 #include "../render_defaults.h"
 #include "mesh_conversion.h"
-#include <pxr/base/gf/vec2f.h>
-#include <pxr/base/gf/vec3f.h>
-#include <pxr/base/vt/types.h>
 
 // Wavefront OBJ scenes. MTL materials load as MaterialX open_pbr_surface
 // documents compiled through MDL (docs/obj.md). A material whose conversion
@@ -171,25 +168,29 @@ class ObjMesh : public Mesh {
             }
             size_t refinedTriangles = 0;
             for (auto const& [material, faces] : displaced) {
-                prism::mesh::MeshSource source;
-                pxr::VtVec3fArray points;
-                pxr::VtVec2fArray uvs;
+                std::vector<int> counts, corners;
+                std::vector<float> points, uvs; // xyz per point, uv per corner
                 std::map<std::array<float, 3>, int> welded;
                 for (size_t t : faces) {
-                    source.faceVertexCounts.push_back(3);
+                    counts.push_back(3);
                     for (int k = 0; k < 3; ++k) {
                         const unsigned v = indices[3 * t + k];
                         const std::array<float, 3> key{vertices[v].x(), vertices[v].y(), vertices[v].z()};
-                        auto [found, added] = welded.emplace(key, int(points.size()));
-                        if (added) points.push_back(pxr::GfVec3f(key[0], key[1], key[2]));
-                        source.faceVertexIndices.push_back(found->second);
-                        uvs.push_back(pxr::GfVec2f(texcoords[v].u(), texcoords[v].v()));
+                        auto [found, added] = welded.emplace(key, int(points.size() / 3));
+                        if (added) points.insert(points.end(), key.begin(), key.end());
+                        corners.push_back(found->second);
+                        uvs.push_back(texcoords[v].u());
+                        uvs.push_back(texcoords[v].v());
                     }
                 }
-                source.points.value = pxr::VtValue(std::move(points));
-                source.points.interpolation = pxr::TfToken("vertex");
-                source.uvs.value = pxr::VtValue(std::move(uvs));
-                source.uvs.interpolation = pxr::TfToken("faceVarying");
+                using View = prism::mesh::PrimvarView;
+                prism::mesh::MeshSource source;
+                source.faceVertexCounts = counts;
+                source.faceVertexIndices = corners;
+                source.points = {prism::mesh::Interpolation::Vertex, View::Type::Float, 3, true, points.data(),
+                                 points.size() / 3};
+                source.uvs = {prism::mesh::Interpolation::FaceVarying, View::Type::Float, 2, true, uvs.data(),
+                              uvs.size() / 2};
                 source.doubleSided = true;
                 prism::mesh::MeshConversion conversion =
                     prism::mesh::ConvertMesh(source, subdivision, materials.at(material));

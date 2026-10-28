@@ -5,8 +5,8 @@
 #include "environment_cache.h"
 #include "render_buffer.h"
 #include "refinement_tiles.h"
-#include "triangulation.h"
 #include "../mesh/mesh_conversion.h"
+#include "../usd/usd_mesh_source.h"
 #include "../mesh/subdivision.h"
 
 #include "../environment.h"
@@ -364,8 +364,8 @@ SdfPath _MaterialPath(HdContainerDataSourceHandle const &ds, TfTokenVector const
     return {};
 }
 
-using prism::mesh::PrimvarData;
-using prism::mesh::MeshSource;
+using PrimvarData = prism::usd::UsdPrimvarData;
+using MeshSource = prism::usd::UsdMeshSource;
 
 struct PrimKey {
     SdfPath path;
@@ -1226,7 +1226,7 @@ bool _ApplyHiddenGeometryBudget(Snapshot *snapshot, bool useCurrentEligibility =
     return !detach.empty();
 }
 
-using prism::mesh::PrimvarFloats;
+using prism::usd::PrimvarFloats;
 using prism::mesh::BudgetSubdivisionLevels;
 
 // The mesh prim as the shared conversion reads it (src/mesh/mesh_conversion.h),
@@ -1296,7 +1296,7 @@ std::vector<size_t> _RefinementFaces(HdContainerDataSourceHandle const &dataSour
         return {};
     TfToken scheme;
     if (auto authored = meshSchema.GetSubdivisionScheme()) scheme = authored->GetTypedValue(0.0f);
-    return prism::mesh::RefinementFaces(std::span<const int>(counts.cdata(), counts.size()), scheme,
+    return prism::mesh::RefinementFaces(std::span<const int>(counts.cdata(), counts.size()), scheme.GetString(),
                                         displaced, subdivision);
 }
 
@@ -1315,7 +1315,7 @@ MeshConversion _ConvertMesh(HdContainerDataSourceHandle const &dataSource,
         result.info.motionBlur = motionBlur;
         return result;
     }
-    return prism::mesh::ConvertMesh(*source, subdivision, displacer, levelCap);
+    return prism::usd::ConvertMesh(*source, subdivision, displacer, levelCap);
 }
 
 bool _EqualMeshGeometry(Mesh const &mesh, Mesh const *other)

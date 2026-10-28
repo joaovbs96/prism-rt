@@ -110,6 +110,7 @@ namespace mx = MaterialX;
 #include "../materialx/preview_surface.h"
 #include "../render_defaults.h"
 #include "mesh_conversion.h"
+#include "../usd/usd_mesh_source.h"
 
 // ============================================================================
 // MaterialX material recovery from USD stages
@@ -300,9 +301,9 @@ CollectBoundMaterials(const UsdStageRefPtr& stage,
 
 namespace prism::usd_detail {
 
-inline prism::mesh::PrimvarData ReadPrimvar(pxr::UsdGeomPrimvar const& primvar, pxr::UsdTimeCode time)
+inline prism::usd::UsdPrimvarData ReadPrimvar(pxr::UsdGeomPrimvar const& primvar, pxr::UsdTimeCode time)
 {
-    prism::mesh::PrimvarData result;
+    prism::usd::UsdPrimvarData result;
     if (!primvar) return result;
     pxr::VtValue value;
     if (!primvar.ComputeFlattened(&value, time)) return result;
@@ -314,7 +315,7 @@ inline prism::mesh::PrimvarData ReadPrimvar(pxr::UsdGeomPrimvar const& primvar, 
 // The named primvars of a gprim with the constant primvars it inherits
 // (UsdImaging flattens inherited primvars into each prim); points, normals
 // and namespaced primvars are not among them.
-inline void ReadNamedPrimvars(pxr::UsdPrim const& prim, pxr::UsdTimeCode time, prism::mesh::MeshSource* source)
+inline void ReadNamedPrimvars(pxr::UsdPrim const& prim, pxr::UsdTimeCode time, prism::usd::UsdMeshSource* source)
 {
     static const std::unordered_set<std::string> geometry = {
         "points", "normals", "widths", "velocities", "accelerations", "angularVelocities"};
@@ -322,12 +323,12 @@ inline void ReadNamedPrimvars(pxr::UsdPrim const& prim, pxr::UsdTimeCode time, p
         const pxr::TfToken name = primvar.GetPrimvarName();
         const std::string& text = name.GetString();
         if (geometry.count(text) || text.find(':') != std::string::npos || !primvar.HasValue()) continue;
-        prism::mesh::PrimvarData data = ReadPrimvar(primvar, time);
+        prism::usd::UsdPrimvarData data = ReadPrimvar(primvar, time);
         if (!data.value.IsEmpty()) source->primvars.emplace_back(name, std::move(data));
     }
 }
 
-inline void ReadSurfacePrimvars(pxr::UsdPrim const& prim, pxr::UsdTimeCode time, prism::mesh::MeshSource* source)
+inline void ReadSurfacePrimvars(pxr::UsdPrim const& prim, pxr::UsdTimeCode time, prism::usd::UsdMeshSource* source)
 {
     pxr::UsdGeomPrimvarsAPI primvars(prim);
     pxr::UsdGeomPrimvar st = primvars.GetPrimvar(pxr::TfToken("st"));
@@ -340,10 +341,10 @@ inline void ReadSurfacePrimvars(pxr::UsdPrim const& prim, pxr::UsdTimeCode time,
 }
 
 // A UsdGeomMesh at a time; skinnedPoints replace its points (UsdSkel).
-inline std::optional<prism::mesh::MeshSource> MeshSourceFromUsd(pxr::UsdGeomMesh const& mesh, pxr::UsdTimeCode time,
+inline std::optional<prism::usd::UsdMeshSource> MeshSourceFromUsd(pxr::UsdGeomMesh const& mesh, pxr::UsdTimeCode time,
                                                                  pxr::VtVec3fArray const* skinnedPoints = nullptr)
 {
-    prism::mesh::MeshSource source;
+    prism::usd::UsdMeshSource source;
     if (!mesh.GetFaceVertexCountsAttr().Get(&source.faceVertexCounts, time) ||
         !mesh.GetFaceVertexIndicesAttr().Get(&source.faceVertexIndices, time))
         return std::nullopt;
@@ -409,7 +410,7 @@ inline bool IsImplicitSurface(pxr::UsdPrim const& prim)
 
 // Cubes, cylinders, cones, capsules and planes as the meshes Hydra makes of
 // them (HdsiImplicitSurfaceSceneIndex, GeomUtil generators).
-inline std::optional<prism::mesh::MeshSource> ImplicitMeshSource(pxr::UsdPrim const& prim, pxr::UsdTimeCode time)
+inline std::optional<prism::usd::UsdMeshSource> ImplicitMeshSource(pxr::UsdPrim const& prim, pxr::UsdTimeCode time)
 {
     constexpr size_t kRadial = 10, kCapAxial = 4;
     pxr::PxOsdMeshTopology topology;
@@ -461,7 +462,7 @@ inline std::optional<prism::mesh::MeshSource> ImplicitMeshSource(pxr::UsdPrim co
     } else {
         return std::nullopt;
     }
-    prism::mesh::MeshSource source;
+    prism::usd::UsdMeshSource source;
     source.faceVertexCounts = topology.GetFaceVertexCounts();
     source.faceVertexIndices = topology.GetFaceVertexIndices();
     source.holeIndices = topology.GetHoleIndices();
@@ -527,7 +528,7 @@ inline void Triangulate(std::vector<unsigned int>& out, const std::vector<unsign
 // authored normals too), and a mirroring transform turns them with the
 // triangles (SceneManager flips placed prototypes the same way). Returns the
 // mesh's coarse face per triangle, or nothing when no triangle is left.
-inline bool BuildPolygonMesh(prism::mesh::MeshSource const& source, pxr::GfMatrix4d const& world,
+inline bool BuildPolygonMesh(prism::usd::UsdMeshSource const& source, pxr::GfMatrix4d const& world,
                              Mesh& out, std::vector<int>& coarseFaces)
 {
     using pxr::UsdGeomTokens;
@@ -553,7 +554,7 @@ inline bool BuildPolygonMesh(prism::mesh::MeshSource const& source, pxr::GfMatri
         }
     }
     const std::vector<prism::mesh::NamedPrimvar> extras =
-        prism::mesh::NamedPrimvars(source, points.size(), counts.size(), indices.size());
+        prism::mesh::NamedPrimvars(source.View(), points.size(), counts.size(), indices.size());
     const pxr::VtVec2fArray uvs = FloatVectors<pxr::GfVec2f>(source.uvs.value);
     const pxr::VtVec3fArray normals = FloatVectors<pxr::GfVec3f>(source.normals.value);
     const pxr::TfToken& uvInterpolation = source.uvs.interpolation;
@@ -563,7 +564,9 @@ inline bool BuildPolygonMesh(prism::mesh::MeshSource const& source, pxr::GfMatri
     };
     bool expand = (!uvs.empty() && perCorner(uvInterpolation)) ||
         (!normals.empty() && perCorner(normalInterpolation));
-    for (auto const& extra : extras) expand |= perCorner(extra.interpolation);
+    for (auto const& extra : extras)
+        expand |= extra.interpolation == prism::mesh::Interpolation::FaceVarying ||
+            extra.interpolation == prism::mesh::Interpolation::Uniform;
 
     // Area-weighted per-point normals of the authored winding.
     std::vector<pxr::GfVec3f> generated(points.size(), pxr::GfVec3f(0.f));
@@ -587,7 +590,7 @@ inline bool BuildPolygonMesh(prism::mesh::MeshSource const& source, pxr::GfMatri
     // The shading normal at a corner: authored where it is usable (negated
     // for leftHanded meshes), otherwise generated.
     auto normalAt = [&](size_t point, size_t corner, size_t face) {
-        const size_t index = prism::mesh::PrimvarIndex(normalInterpolation, point, corner, face);
+        const size_t index = prism::usd::PrimvarIndex(normalInterpolation, point, corner, face);
         if (index < normals.size()) {
             const pxr::GfVec3f& n = normals[index];
             const float lengthSq = n.GetLengthSq();
@@ -597,7 +600,7 @@ inline bool BuildPolygonMesh(prism::mesh::MeshSource const& source, pxr::GfMatri
         return TransformNormal(generated[point], normalMatrix, mirrored);
     };
     auto uvAt = [&](size_t point, size_t corner, size_t face) {
-        const size_t index = prism::mesh::PrimvarIndex(uvInterpolation, point, corner, face);
+        const size_t index = prism::usd::PrimvarIndex(uvInterpolation, point, corner, face);
         return index < uvs.size() ? Float2(uvs[index][0], uvs[index][1]) : Float2(0.f, 0.f);
     };
     int stride = 0;
@@ -609,7 +612,7 @@ inline bool BuildPolygonMesh(prism::mesh::MeshSource const& source, pxr::GfMatri
     auto appendExtras = [&](size_t point, size_t corner, size_t face) {
         for (auto const& extra : extras) {
             const size_t n = size_t(extra.components);
-            const size_t element = extra.interpolation == UsdGeomTokens->constant ? 0
+            const size_t element = extra.interpolation == prism::mesh::Interpolation::Constant ? 0
                 : prism::mesh::PrimvarIndex(extra.interpolation, point, corner, face);
             out.primvarValues.insert(out.primvarValues.end(), extra.values.begin() + element * n,
                                      extra.values.begin() + (element + 1) * n);
@@ -962,7 +965,7 @@ private:
     // by the placements of an instanced gprim (per displacing material).
     struct Shape {
         pxr::UsdPrim prim;
-        std::optional<prism::mesh::MeshSource> source;
+        std::optional<prism::usd::UsdMeshSource> source;
         bool worldSpace = false;            // a single placement baked in world space
         pxr::GfMatrix4d world{1.0};         // for worldSpace
         Material const* displacer = nullptr;
@@ -1049,7 +1052,7 @@ private:
             if (!primvar.ComputeFlattened(&value, time)) continue;
             PointInstancerData::Column column;
             column.name = name;
-            if (!prism::mesh::PrimvarFloats(value, &column.values, &column.components) ||
+            if (!prism::usd::PrimvarFloats(value, &column.values, &column.components) ||
                 column.components < 1 || column.components > 4) continue;
             data.primvars.push_back(std::move(column));
         }
@@ -1223,7 +1226,7 @@ private:
                 InstancePrimvars::Value entry;
                 entry.name = name;
                 std::vector<float> floats;
-                if (!prism::mesh::PrimvarFloats(value, &floats, &entry.components) ||
+                if (!prism::usd::PrimvarFloats(value, &floats, &entry.components) ||
                     entry.components < 1 || entry.components > 4) continue;
                 std::copy_n(floats.begin(), entry.components, entry.value.begin());
                 set(std::move(entry));
@@ -1492,7 +1495,7 @@ private:
             if (!shape.source) continue;
             auto const& counts = shape.source->faceVertexCounts;
             faces[i] = prism::mesh::RefinementFaces(std::span<const int>(counts.cdata(), counts.size()),
-                shape.source->subdivisionScheme, shape.displacer != nullptr, m_options.subdivision);
+                shape.source->subdivisionScheme.GetString(), shape.displacer != nullptr, m_options.subdivision);
         }
         const std::vector<int> levels = prism::mesh::BudgetSubdivisionLevels(
             faces, fixed, m_options.subdivision.budgetFaces, nullptr, nullptr);
@@ -1501,10 +1504,10 @@ private:
             Shape& shape = *m_shapes[i];
             if (!shape.source) return;
             shape.level = levels[i];
-            const pxr::TfToken scheme = prism::mesh::RefinementScheme(shape.source->subdivisionScheme,
-                                                                      shape.displacer != nullptr);
+            const std::string_view scheme = prism::mesh::RefinementScheme(
+                shape.source->subdivisionScheme.GetString(), shape.displacer != nullptr);
             if (shape.level > 0 || shape.displacer) {
-                prism::mesh::MeshConversion conversion = prism::mesh::ConvertMesh(
+                prism::mesh::MeshConversion conversion = prism::usd::ConvertMesh(
                     *shape.source, m_options.subdivision, shape.displacer, shape.level);
                 shape.info = conversion.info;
                 shape.coarseFaces = conversion.info.coarseFaces;
@@ -1512,7 +1515,7 @@ private:
                 shape.instanced = true;
                 if (conversion.info.subdivisionControlHull) controlHulls = true;
             } else {
-                if (scheme != pxr::TfToken("none")) controlHulls = true;
+                if (scheme != "none") controlHulls = true;
                 std::unique_ptr<Mesh, prism::mesh::ConvertedMeshDeleter> mesh(new Mesh());
                 std::vector<int> coarse;
                 if (prism::usd_detail::BuildPolygonMesh(*shape.source,

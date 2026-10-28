@@ -1,23 +1,22 @@
 #pragma once
 
-// Polygon and subdivision mesh conversion shared by both USD loaders: the
-// Hydra delegate (src/hydra/scene_bridge.cpp, from scene-index data sources)
-// and the standalone CLI (src/mesh/usd_mesh.h, from UsdGeomMesh). Each fills
-// a MeshSource; ConvertMesh triangulates it into a prototype-space Mesh,
-// refining subdivision surfaces (OpenSubdiv, subdivision.h) and displacing
-// it by its material at load time.
+// Polygon and subdivision mesh conversion shared by the loaders: the Hydra
+// delegate (src/hydra/scene_bridge.cpp, from scene-index data sources), the
+// standalone USD loader (src/mesh/usd_mesh.h, from UsdGeomMesh) and the OBJ
+// loader's displaced faces (src/mesh/obj_mesh.h). Each describes its mesh as
+// a MeshSource: std-only views (spans) of arrays the loader keeps alive (the
+// USD loaders' Vt arrays through src/usd/usd_mesh_source.h). ConvertMesh
+// triangulates it into a prototype-space Mesh, refining subdivision surfaces
+// (OpenSubdiv, subdivision.h) and displacing it by its material at load time.
 
 #include "../geometry.h"
-
-#include <pxr/base/tf/token.h>
-#include <pxr/base/vt/array.h>
-#include <pxr/base/vt/value.h>
 
 #include <cstddef>
 #include <memory>
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 class Material;
@@ -93,31 +92,54 @@ struct MeshConversion {
     std::unique_ptr<Mesh, ConvertedMeshDeleter> mesh;
 };
 
-// A primvar's value (indices applied) and interpolation token (constant,
-// uniform, varying, vertex, faceVarying).
-struct PrimvarData {
-    pxr::TfToken interpolation;
-    pxr::VtValue value;
+// A primvar's interpolation (USD's interpolation tokens; Unauthored: none
+// authored, Other: a token this conversion does not know).
+enum class Interpolation { Unauthored, Constant, Uniform, Varying, Vertex, FaceVarying, Instance, Other };
+
+// The interpolation a USD interpolation token names ("constant", "uniform",
+// "varying", "vertex", "faceVarying", "instance"; empty: Unauthored).
+Interpolation InterpolationFromName(std::string_view name);
+
+// A primvar's value (indices applied): `size` elements of `components`
+// scalars of `type`, contiguous at `data`, which its loader keeps alive.
+// `array`: an array value (one element per point, face, ...), not a single
+// value. Empty: no value; Unsupported: a value of another type.
+struct PrimvarView {
+    enum class Type { Empty, Unsupported, Float, Double, Int };
+    Interpolation interpolation = Interpolation::Unauthored;
+    Type type = Type::Empty;
+    int components = 0;
+    bool array = false;
+    void const *data = nullptr;
+    size_t size = 0;
+
+    bool empty() const { return type == Type::Empty; }
+    // An array of `n`-component floats or doubles (points, normals, UVs).
+    bool floatArray(int n) const { return array && components == n && type == Type::Float; }
+    bool doubleArray(int n) const { return array && components == n && type == Type::Double; }
+    float const *floats() const { return static_cast<float const *>(data); }
+    double const *doubles() const { return static_cast<double const *>(data); }
+    int const *ints() const { return static_cast<int const *>(data); }
 };
 
-// The mesh prim as both loaders read it. Empty tokens are unauthored.
+// The mesh prim as the loaders read it. Empty strings are unauthored.
 struct MeshSource {
-    pxr::VtIntArray faceVertexCounts, faceVertexIndices, holeIndices;
-    PrimvarData points;   // VtVec3fArray or VtVec3dArray
-    PrimvarData normals;  // primvars:normals over normals
-    PrimvarData uvs;      // primvar st, else uv
+    std::span<const int> faceVertexCounts, faceVertexIndices, holeIndices;
+    PrimvarView points;   // 3 floats or doubles per point
+    PrimvarView normals;  // primvars:normals over normals
+    PrimvarView uvs;      // primvar st, else uv
     bool multipleUvSets = false;
     // The other primvars (inherited constant ones included), for the mesh's
     // named primvars (geompropvalue lookups); points, normals and
     // namespaced names are skipped.
-    std::vector<std::pair<pxr::TfToken, PrimvarData>> primvars;
-    pxr::TfToken subdivisionScheme;  // empty: none (a polygon mesh)
-    pxr::TfToken orientation;        // empty: rightHanded
-    std::optional<bool> doubleSided; // unauthored: single-sided
+    std::vector<std::pair<std::string_view, PrimvarView>> primvars;
+    std::string_view subdivisionScheme;  // empty: none (a polygon mesh)
+    std::string_view orientation;        // empty: rightHanded
+    std::optional<bool> doubleSided;     // unauthored: single-sided
     // Subdivision tags.
-    pxr::VtIntArray creaseIndices, creaseLengths, cornerIndices;
-    pxr::VtFloatArray creaseSharpnesses, cornerSharpnesses;
-    pxr::TfToken interpolateBoundary, faceVaryingLinearInterpolation, triangleSubdivisionRule;
+    std::span<const int> creaseIndices, creaseLengths, cornerIndices;
+    std::span<const float> creaseSharpnesses, cornerSharpnesses;
+    std::string_view interpolateBoundary, faceVaryingLinearInterpolation, triangleSubdivisionRule;
     bool motionBlur = false;
 };
 
@@ -125,7 +147,7 @@ struct MeshSource {
 struct NamedPrimvar {
     std::string name;
     int components = 0;
-    pxr::TfToken interpolation;
+    Interpolation interpolation = Interpolation::Unauthored;
     std::vector<float> values;
 };
 
@@ -136,19 +158,19 @@ struct NamedPrimvar {
 std::vector<NamedPrimvar> NamedPrimvars(MeshSource const &source, size_t points, size_t faces, size_t corners);
 
 // Values of a primvar as floats (scalars, vectors; arrays or single values).
-bool PrimvarFloats(pxr::VtValue const &value, std::vector<float> *out, int *components);
+bool PrimvarFloats(PrimvarView const &value, std::vector<float> *out, int *components);
 
 // The index of a primvar value at one face corner for its interpolation.
-size_t PrimvarIndex(pxr::TfToken const &interpolation, size_t pointIndex, size_t cornerIndex, size_t faceIndex);
+size_t PrimvarIndex(Interpolation interpolation, size_t pointIndex, size_t cornerIndex, size_t faceIndex);
 
 // The subdivision scheme a mesh refines with: the authored one, bilinear for
-// displaced polygon meshes, none for polygon meshes.
-pxr::TfToken RefinementScheme(pxr::TfToken const &authored, bool displaced);
+// displaced polygon meshes, "none" for polygon meshes.
+std::string_view RefinementScheme(std::string_view authored, bool displaced);
 
 // The faces a mesh refines to at each subdivision level up to the one its
 // conversion would use (index = level); a single entry, its own face count,
 // for meshes that do not refine. Reads only the topology.
-std::vector<size_t> RefinementFaces(std::span<const int> faceVertexCounts, pxr::TfToken const &scheme,
+std::vector<size_t> RefinementFaces(std::span<const int> faceVertexCounts, std::string_view scheme,
                                     bool displaced, SubdivisionSettings const &subdivision);
 
 // Highest subdivision level for each mesh such that all of them together

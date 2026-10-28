@@ -1,5 +1,4 @@
 #pragma once
-#include <pxr/base/gf/vec3d.h>
 #include <array>
 #include <algorithm>
 #include <cmath>
@@ -7,7 +6,7 @@
 #include <unordered_map>
 #include <vector>
 
-namespace prism::hydra {
+namespace prism::mesh {
 
 // Return original face-corner indices, preserving winding and face-varying data.
 // Project onto the dominant Newell-normal plane and clip ears so concave faces
@@ -15,11 +14,13 @@ namespace prism::hydra {
 // This output-parameter form serves per-face loops: `triangles` needs room for
 // count-2 entries, and the number written is returned (zero when the face is
 // degenerate). Faces of up to eight corners use no heap memory.
-inline size_t TriangulatePolygon(const pxr::GfVec3d* points, size_t count,
+// Point: three doubles by operator[] (prism::Vec3d, pxr::GfVec3d).
+template <class Point>
+inline size_t TriangulatePolygon(const Point* points, size_t count,
                                  std::array<int,3>* triangles)
 {
     if (count < 3) return 0;
-    pxr::GfVec3d normal(0);
+    double normal[3] = {0.0, 0.0, 0.0};
     for (size_t i=0;i<count;++i) {
         const auto& a=points[i]; const auto& b=points[(i+1)%count];
         normal[0]+=(a[1]-b[1])*(a[2]+b[2]);
@@ -34,7 +35,12 @@ inline size_t TriangulatePolygon(const pxr::GfVec3d* points, size_t count,
                (points[b][v]-points[a][v])*(points[c][u]-points[a][u]);
     };
     double scale=0;
-    for (size_t i=0;i<count;++i) scale=std::max(scale,(points[i]-points[0]).GetLengthSq());
+    // Like GfVec3d::GetLengthSq of the difference.
+    const auto lengthSq=[&](size_t i) {
+        const double d0=points[i][0]-points[0][0], d1=points[i][1]-points[0][1], d2=points[i][2]-points[0][2];
+        return d0*d0+d1*d1+d2*d2;
+    };
+    for (size_t i=0;i<count;++i) scale=std::max(scale,lengthSq(i));
     const double epsilon=std::max(scale*1e-12,1e-30);
     double area=0;
     for (size_t i=1;i+1<count;++i) area+=cross(0,int(i),int(i+1));
@@ -79,8 +85,9 @@ inline size_t TriangulatePolygon(const pxr::GfVec3d* points, size_t count,
     return written;
 }
 
+template <class Point>
 inline std::vector<std::array<int,3>> TriangulatePolygon(
-    const std::vector<pxr::GfVec3d>& points)
+    const std::vector<Point>& points)
 {
     std::vector<std::array<int,3>> result(points.size()<3 ? 0 : points.size()-2);
     result.resize(TriangulatePolygon(points.data(),points.size(),result.data()));
@@ -104,4 +111,4 @@ inline std::vector<int> ExpandFaceAssignments(
     }
     return result;
 }
-} // namespace prism::hydra
+} // namespace prism::mesh

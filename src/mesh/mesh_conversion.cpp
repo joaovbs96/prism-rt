@@ -1,18 +1,10 @@
 #include "mesh_conversion.h"
 
 #include "subdivision.h"
-#include "../hydra/triangulation.h"
+#include "triangulation.h"
 #include "../material.h"
+#include "../matrix4d.h"
 #include "../ray.h"
-
-#include <pxr/base/gf/matrix4d.h>
-#include <pxr/base/gf/vec2d.h>
-#include <pxr/base/gf/vec2f.h>
-#include <pxr/base/gf/vec3d.h>
-#include <pxr/base/gf/vec3f.h>
-#include <pxr/base/gf/vec4d.h>
-#include <pxr/base/gf/vec4f.h>
-#include <pxr/imaging/hd/primvarSchema.h>
 
 #include <tbb/parallel_for.h>
 
@@ -25,21 +17,41 @@
 #include <unordered_map>
 #include <unordered_set>
 
-PXR_NAMESPACE_USING_DIRECTIVE
-
 namespace prism::mesh {
 namespace {
 
-
-
-prism::subdivision::Scheme SchemeKind(TfToken const &scheme)
+prism::subdivision::Scheme SchemeKind(std::string_view scheme)
 {
-    return scheme == TfToken("loop") ? prism::subdivision::Scheme::Loop
-        : scheme == TfToken("bilinear") ? prism::subdivision::Scheme::Bilinear
-                                        : prism::subdivision::Scheme::CatmullClark;
+    return scheme == "loop" ? prism::subdivision::Scheme::Loop
+        : scheme == "bilinear" ? prism::subdivision::Scheme::Bilinear
+                               : prism::subdivision::Scheme::CatmullClark;
+}
+
+// A point or normal as a double vector: floats widened, doubles rounded to
+// float first (as GfVec3d(GfVec3f(...)) did in the Vt-based conversion).
+Vec3d WidenedPoint(PrimvarView const &view, size_t i)
+{
+    if (view.type == PrimvarView::Type::Float) {
+        float const *p = view.floats() + 3 * i;
+        return Vec3d(double(p[0]), double(p[1]), double(p[2]));
+    }
+    double const *p = view.doubles() + 3 * i;
+    return Vec3d(double(float(p[0])), double(float(p[1])), double(float(p[2])));
 }
 
 } // namespace
+
+Interpolation InterpolationFromName(std::string_view name)
+{
+    if (name.empty()) return Interpolation::Unauthored;
+    if (name == "constant") return Interpolation::Constant;
+    if (name == "uniform") return Interpolation::Uniform;
+    if (name == "varying") return Interpolation::Varying;
+    if (name == "vertex") return Interpolation::Vertex;
+    if (name == "faceVarying") return Interpolation::FaceVarying;
+    if (name == "instance") return Interpolation::Instance;
+    return Interpolation::Other;
+}
 
 std::vector<NamedPrimvar> NamedPrimvars(MeshSource const &source, size_t points, size_t faces, size_t corners)
 {
@@ -48,29 +60,29 @@ std::vector<NamedPrimvar> NamedPrimvars(MeshSource const &source, size_t points,
     constexpr int kMaxComponents = 64;
     std::vector<NamedPrimvar> result;
     int total = 0;
-    std::vector<std::pair<TfToken, PrimvarData> const *> sorted;
+    std::vector<std::pair<std::string_view, PrimvarView> const *> sorted;
     sorted.reserve(source.primvars.size());
     for (auto const &primvar : source.primvars) sorted.push_back(&primvar);
     std::sort(sorted.begin(), sorted.end(), [](auto const *a, auto const *b) { return a->first < b->first; });
     for (auto const *primvar : sorted) {
-        const std::string text = primvar->first.GetString();
+        const std::string text(primvar->first);
         if (skipped.count(text) || text.find(':') != std::string::npos) continue;
-        PrimvarData const &data = primvar->second;
+        PrimvarView const &data = primvar->second;
         // Constant display colors drive the fallback material, so their edits
         // stay material edits.
         if ((text == "displayColor" || text == "displayOpacity") &&
-            data.interpolation == HdPrimvarSchemaTokens->constant) continue;
+            data.interpolation == Interpolation::Constant) continue;
         NamedPrimvar extra;
         extra.name = text;
         extra.interpolation = data.interpolation;
-        if (!PrimvarFloats(data.value, &extra.values, &extra.components)) continue;
+        if (!PrimvarFloats(data, &extra.values, &extra.components)) continue;
         const size_t count = extra.values.size() / size_t(extra.components);
         size_t expected = 0;
-        if (extra.interpolation == HdPrimvarSchemaTokens->constant) expected = 1;
-        else if (extra.interpolation == HdPrimvarSchemaTokens->uniform) expected = faces;
-        else if (extra.interpolation == HdPrimvarSchemaTokens->faceVarying) expected = corners;
+        if (extra.interpolation == Interpolation::Constant) expected = 1;
+        else if (extra.interpolation == Interpolation::Uniform) expected = faces;
+        else if (extra.interpolation == Interpolation::FaceVarying) expected = corners;
         else expected = points; // vertex, varying
-        if (extra.interpolation == HdPrimvarSchemaTokens->constant ? count < 1 : count != expected) continue;
+        if (extra.interpolation == Interpolation::Constant ? count < 1 : count != expected) continue;
         if (total + extra.components > kMaxComponents) break;
         total += extra.components;
         result.push_back(std::move(extra));
@@ -78,60 +90,47 @@ std::vector<NamedPrimvar> NamedPrimvars(MeshSource const &source, size_t points,
     return result;
 }
 
-bool PrimvarFloats(VtValue const &value, std::vector<float> *out, int *components)
+bool PrimvarFloats(PrimvarView const &value, std::vector<float> *out, int *components)
 {
-    auto take = [&](auto const &array, int n) {
+    // Arrays and single values alike, scalar by scalar.
+    auto take = [&](auto const *data) {
+        const size_t n = size_t(value.components);
         out->clear();
-        out->reserve(array.size() * size_t(n));
-        for (auto const &element : array) {
-            if constexpr (std::is_arithmetic_v<std::decay_t<decltype(element)>>) {
-                out->push_back(float(element));
-            } else {
-                for (int c = 0; c < n; ++c) out->push_back(float(element[c]));
-            }
-        }
-        *components = n;
+        out->reserve(value.size * n);
+        for (size_t i = 0; i < value.size * n; ++i) out->push_back(float(data[i]));
+        *components = value.components;
         return !out->empty();
     };
-    if (value.IsHolding<VtFloatArray>()) return take(value.UncheckedGet<VtFloatArray>(), 1);
-    if (value.IsHolding<VtDoubleArray>()) return take(value.UncheckedGet<VtDoubleArray>(), 1);
-    if (value.IsHolding<VtIntArray>()) return take(value.UncheckedGet<VtIntArray>(), 1);
-    if (value.IsHolding<VtVec2fArray>()) return take(value.UncheckedGet<VtVec2fArray>(), 2);
-    if (value.IsHolding<VtVec2dArray>()) return take(value.UncheckedGet<VtVec2dArray>(), 2);
-    if (value.IsHolding<VtVec3fArray>()) return take(value.UncheckedGet<VtVec3fArray>(), 3);
-    if (value.IsHolding<VtVec3dArray>()) return take(value.UncheckedGet<VtVec3dArray>(), 3);
-    if (value.IsHolding<VtVec4fArray>()) return take(value.UncheckedGet<VtVec4fArray>(), 4);
-    if (value.IsHolding<VtVec4dArray>()) return take(value.UncheckedGet<VtVec4dArray>(), 4);
-    if (value.IsHolding<float>()) return take(std::array<float, 1>{value.UncheckedGet<float>()}, 1);
-    if (value.IsHolding<double>()) return take(std::array<double, 1>{value.UncheckedGet<double>()}, 1);
-    if (value.IsHolding<int>()) return take(std::array<int, 1>{value.UncheckedGet<int>()}, 1);
-    if (value.IsHolding<GfVec2f>()) return take(std::array<GfVec2f, 1>{value.UncheckedGet<GfVec2f>()}, 2);
-    if (value.IsHolding<GfVec3f>()) return take(std::array<GfVec3f, 1>{value.UncheckedGet<GfVec3f>()}, 3);
-    if (value.IsHolding<GfVec4f>()) return take(std::array<GfVec4f, 1>{value.UncheckedGet<GfVec4f>()}, 4);
-    return false;
+    if (value.components < 1) return false;
+    switch (value.type) {
+    case PrimvarView::Type::Float: return take(value.floats());
+    case PrimvarView::Type::Double: return take(value.doubles());
+    case PrimvarView::Type::Int: return take(value.ints());
+    default: return false;
+    }
 }
 
-size_t PrimvarIndex(TfToken const &interpolation, size_t pointIndex, size_t cornerIndex, size_t faceIndex)
+size_t PrimvarIndex(Interpolation interpolation, size_t pointIndex, size_t cornerIndex, size_t faceIndex)
 {
-    if (interpolation == HdPrimvarSchemaTokens->faceVarying) return cornerIndex;
-    if (interpolation == HdPrimvarSchemaTokens->uniform) return faceIndex;
-    if (interpolation == HdPrimvarSchemaTokens->constant) return 0;
+    if (interpolation == Interpolation::FaceVarying) return cornerIndex;
+    if (interpolation == Interpolation::Uniform) return faceIndex;
+    if (interpolation == Interpolation::Constant) return 0;
     return pointIndex;
 }
 
-TfToken RefinementScheme(TfToken const &authored, bool displaced)
+std::string_view RefinementScheme(std::string_view authored, bool displaced)
 {
-    TfToken scheme = authored.IsEmpty() ? TfToken("none") : authored;
-    if (displaced && scheme == TfToken("none")) scheme = TfToken("bilinear");
+    std::string_view scheme = authored.empty() ? std::string_view("none") : authored;
+    if (displaced && scheme == "none") scheme = "bilinear";
     return scheme;
 }
 
-std::vector<size_t> RefinementFaces(std::span<const int> counts, TfToken const &authored,
+std::vector<size_t> RefinementFaces(std::span<const int> counts, std::string_view authored,
                                     bool displaced, SubdivisionSettings const &subdivision)
 {
     std::vector<size_t> faces{counts.size()};
-    const TfToken scheme = RefinementScheme(authored, displaced);
-    if (scheme == TfToken("none")) return faces;
+    const std::string_view scheme = RefinementScheme(authored, displaced);
+    if (scheme == "none") return faces;
     const auto kind = SchemeKind(scheme);
     const int top = displaced ? subdivision.displacementLevel : subdivision.level;
     const size_t maxFaces = displaced ? subdivision.displacementMaxFaces : subdivision.maxFaces;
@@ -247,33 +246,21 @@ void Displace(Mesh &mesh, Material const &material)
 MeshConversion ConvertMesh(MeshSource const &source, SubdivisionSettings const &subdivision,
                            Material const *displacer, int levelCap)
 {
-    using prism::hydra::TriangulatePolygon;
     MeshConversion result;
     MeshConversionInfo &info = result.info;
     info.motionBlur = source.motionBlur;
 
-    PrimvarData const &pointsPv = source.points;
-    VtVec3fArray const *pointsFloat = nullptr;
-    VtVec3dArray const *pointsDouble = nullptr;
-    if (pointsPv.value.IsHolding<VtVec3fArray>()) {
-        pointsFloat = &pointsPv.value.UncheckedGet<VtVec3fArray>();
-    } else if (pointsPv.value.IsHolding<VtVec3dArray>()) {
-        pointsDouble = &pointsPv.value.UncheckedGet<VtVec3dArray>();
-    } else {
-        info.missingPoints = pointsPv.value.IsEmpty();
-        info.unsupportedPoints = !pointsPv.value.IsEmpty();
+    PrimvarView points = source.points;
+    if (!points.floatArray(3) && !points.doubleArray(3)) {
+        info.missingPoints = points.empty();
+        info.unsupportedPoints = !points.empty();
         return result;
     }
-    size_t pointCount = pointsFloat ? pointsFloat->size() : pointsDouble->size();
-    auto pointAt = [&](size_t i) -> GfVec3d {
-        return pointsFloat ? GfVec3d((*pointsFloat)[i])
-                           : GfVec3d(GfVec3f((*pointsDouble)[i]));
-    };
-    // Const views: indexing a non-const VtArray detaches (copies) the buffer
-    // it still shares with the captured data source.
-    VtIntArray const &coarseCounts = source.faceVertexCounts;
-    VtIntArray const &coarseIndices = source.faceVertexIndices;
-    VtIntArray const &coarseHoles = source.holeIndices;
+    size_t pointCount = points.size;
+    auto pointAt = [&](size_t i) -> Vec3d { return WidenedPoint(points, i); };
+    std::span<const int> const coarseCounts = source.faceVertexCounts;
+    std::span<const int> const coarseIndices = source.faceVertexIndices;
+    std::span<const int> const coarseHoles = source.holeIndices;
     if (pointCount == 0) {
         info.missingPoints = true;
         return result;
@@ -281,8 +268,8 @@ MeshConversion ConvertMesh(MeshSource const &source, SubdivisionSettings const &
     info.topologyRead = true;
     info.faceCount = coarseCounts.size();
 
-    PrimvarData normalPv = source.normals;
-    PrimvarData uvPv = source.uvs;
+    PrimvarView normalPv = source.normals;
+    PrimvarView uvPv = source.uvs;
     info.multipleUvSets = source.multipleUvSets;
     std::vector<NamedPrimvar> extras = NamedPrimvars(source, pointCount, coarseCounts.size(),
                                                      coarseIndices.size());
@@ -292,8 +279,8 @@ MeshConversion ConvertMesh(MeshSource const &source, SubdivisionSettings const &
     for (auto const &extra : extras) {
         extraOffsets.push_back(extraStride);
         extraStride += extra.components;
-        const bool perPoint = extra.interpolation == HdPrimvarSchemaTokens->vertex ||
-            extra.interpolation == HdPrimvarSchemaTokens->varying;
+        const bool perPoint = extra.interpolation == Interpolation::Vertex ||
+            extra.interpolation == Interpolation::Varying;
         extraPointOffsets.push_back(perPoint ? pointDataStride : -1);
         if (perPoint) pointDataStride += extra.components;
     }
@@ -303,17 +290,15 @@ MeshConversion ConvertMesh(MeshSource const &source, SubdivisionSettings const &
     // UsdImaging always provides the scheme (USD's fallback is catmullClark);
     // scene indices that omit it describe polygon meshes.
     prism::subdivision::Output refined;
-    VtIntArray refinedCounts, refinedIndices;
-    VtVec3fArray refinedPoints;
     // Displaced surfaces are diced finer; polygon meshes then refine bilinearly.
     const bool displaced = displacer && displacer->hasDisplacement();
-    const TfToken scheme = RefinementScheme(source.subdivisionScheme, displaced);
-    if (scheme != TfToken("none")) {
+    const std::string_view scheme = RefinementScheme(source.subdivisionScheme, displaced);
+    if (scheme != "none") {
         prism::subdivision::Input input;
         input.scheme = SchemeKind(scheme);
         input.level = displaced ? subdivision.displacementLevel : subdivision.level;
         const size_t maxFaces = displaced ? subdivision.displacementMaxFaces : subdivision.maxFaces;
-        std::span<const int> countSpan(coarseCounts.cdata(), coarseCounts.size());
+        std::span<const int> countSpan = coarseCounts;
         while (input.level > 0 &&
                prism::subdivision::RefinedFaceCount(countSpan, input.scheme, input.level) > maxFaces)
             --input.level;
@@ -322,54 +307,51 @@ MeshConversion ConvertMesh(MeshSource const &source, SubdivisionSettings const &
         if (input.level > 0) {
             std::vector<float> points(pointCount * 3);
             for (size_t i = 0; i < pointCount; ++i) {
-                const GfVec3d p = pointAt(i);
+                const Vec3d p = pointAt(i);
                 points[3 * i] = float(p[0]); points[3 * i + 1] = float(p[1]); points[3 * i + 2] = float(p[2]);
             }
             input.points = points;
             input.faceVertexCounts = countSpan;
-            input.faceVertexIndices = std::span<const int>(coarseIndices.cdata(), coarseIndices.size());
-            input.holes = std::span<const int>(coarseHoles.cdata(), coarseHoles.size());
+            input.faceVertexIndices = coarseIndices;
+            input.holes = coarseHoles;
             {
-                TfToken const &value = source.interpolateBoundary;
-                if (value == TfToken("none")) input.boundary = prism::subdivision::BoundaryInterpolation::None;
-                else if (value == TfToken("edgeOnly"))
+                std::string_view const value = source.interpolateBoundary;
+                if (value == "none") input.boundary = prism::subdivision::BoundaryInterpolation::None;
+                else if (value == "edgeOnly")
                     input.boundary = prism::subdivision::BoundaryInterpolation::EdgeOnly;
             }
             {
                 using F = prism::subdivision::FaceVaryingInterpolation;
-                TfToken const &value = source.faceVaryingLinearInterpolation;
-                if (value == TfToken("none")) input.faceVarying = F::None;
-                else if (value == TfToken("cornersOnly")) input.faceVarying = F::CornersOnly;
-                else if (value == TfToken("cornersPlus2")) input.faceVarying = F::CornersPlus2;
-                else if (value == TfToken("boundaries")) input.faceVarying = F::Boundaries;
-                else if (value == TfToken("all")) input.faceVarying = F::All;
+                std::string_view const value = source.faceVaryingLinearInterpolation;
+                if (value == "none") input.faceVarying = F::None;
+                else if (value == "cornersOnly") input.faceVarying = F::CornersOnly;
+                else if (value == "cornersPlus2") input.faceVarying = F::CornersPlus2;
+                else if (value == "boundaries") input.faceVarying = F::Boundaries;
+                else if (value == "all") input.faceVarying = F::All;
             }
-            if (!source.triangleSubdivisionRule.IsEmpty())
-                input.smoothTriangles = source.triangleSubdivisionRule == TfToken("smooth");
-            input.creaseIndices = std::span<const int>(source.creaseIndices.cdata(), source.creaseIndices.size());
-            input.creaseLengths = std::span<const int>(source.creaseLengths.cdata(), source.creaseLengths.size());
-            input.creaseSharpnesses = std::span<const float>(source.creaseSharpnesses.cdata(),
-                                                             source.creaseSharpnesses.size());
-            input.cornerIndices = std::span<const int>(source.cornerIndices.cdata(), source.cornerIndices.size());
-            input.cornerSharpnesses = std::span<const float>(source.cornerSharpnesses.cdata(),
-                                                             source.cornerSharpnesses.size());
+            if (!source.triangleSubdivisionRule.empty())
+                input.smoothTriangles = source.triangleSubdivisionRule == "smooth";
+            input.creaseIndices = source.creaseIndices;
+            input.creaseLengths = source.creaseLengths;
+            input.creaseSharpnesses = source.creaseSharpnesses;
+            input.cornerIndices = source.cornerIndices;
+            input.cornerSharpnesses = source.cornerSharpnesses;
             std::vector<float> uvs;
-            const bool faceVaryingUvs = uvPv.interpolation == HdPrimvarSchemaTokens->faceVarying;
-            const bool vertexUvs = uvPv.interpolation == HdPrimvarSchemaTokens->vertex ||
-                uvPv.interpolation == HdPrimvarSchemaTokens->varying;
-            auto appendUvs = [&](auto const &values, size_t expected) {
-                if (values.size() != expected) return;
+            const bool faceVaryingUvs = uvPv.interpolation == Interpolation::FaceVarying;
+            const bool vertexUvs = uvPv.interpolation == Interpolation::Vertex ||
+                uvPv.interpolation == Interpolation::Varying;
+            auto appendUvs = [&](auto const *values, size_t expected) {
+                if (uvPv.size != expected) return;
                 uvs.reserve(expected * 2);
-                for (auto const &uv : values) {
-                    uvs.push_back(float(uv[0]));
-                    uvs.push_back(float(uv[1]));
+                for (size_t i = 0; i < expected; ++i) {
+                    uvs.push_back(float(values[2 * i]));
+                    uvs.push_back(float(values[2 * i + 1]));
                 }
             };
             if (faceVaryingUvs || vertexUvs) {
                 const size_t expected = faceVaryingUvs ? coarseIndices.size() : pointCount;
-                if (uvPv.value.IsHolding<VtVec2fArray>()) appendUvs(uvPv.value.UncheckedGet<VtVec2fArray>(), expected);
-                else if (uvPv.value.IsHolding<VtVec2dArray>())
-                    appendUvs(uvPv.value.UncheckedGet<VtVec2dArray>(), expected);
+                if (uvPv.floatArray(2)) appendUvs(uvPv.floats(), expected);
+                else if (uvPv.doubleArray(2)) appendUvs(uvPv.doubles(), expected);
             }
             input.uvs = uvs;
             input.uvPerPoint = vertexUvs;
@@ -389,32 +371,30 @@ MeshConversion ConvertMesh(MeshSource const &source, SubdivisionSettings const &
             refined = prism::subdivision::Refine(input);
         }
         if (refined.valid) {
-            refinedCounts.assign(refined.faceVertexCounts.begin(), refined.faceVertexCounts.end());
-            refinedIndices.assign(refined.faceVertexIndices.begin(), refined.faceVertexIndices.end());
-            refinedPoints.resize(refined.points.size() / 3);
-            for (size_t i = 0; i < refinedPoints.size(); ++i)
-                refinedPoints[i] = GfVec3f(refined.points[3 * i], refined.points[3 * i + 1], refined.points[3 * i + 2]);
-            pointsFloat = &refinedPoints;
-            pointsDouble = nullptr;
-            pointCount = refinedPoints.size();
-            normalPv = PrimvarData();
+            points.type = PrimvarView::Type::Float;
+            points.data = refined.points.data();
+            points.size = refined.points.size() / 3;
+            pointCount = points.size;
+            normalPv = PrimvarView();
             if (!refined.uvs.empty()) {
-                VtVec2fArray refinedUvs(refined.uvs.size() / 2);
-                for (size_t i = 0; i < refinedUvs.size(); ++i)
-                    refinedUvs[i] = GfVec2f(refined.uvs[2 * i], refined.uvs[2 * i + 1]);
-                uvPv.value = VtValue(std::move(refinedUvs));
-                uvPv.interpolation = HdPrimvarSchemaTokens->faceVarying;
-            } else if (uvPv.interpolation != HdPrimvarSchemaTokens->constant) {
-                uvPv = PrimvarData();
+                uvPv.type = PrimvarView::Type::Float;
+                uvPv.components = 2;
+                uvPv.array = true;
+                uvPv.data = refined.uvs.data();
+                uvPv.size = refined.uvs.size() / 2;
+                uvPv.interpolation = Interpolation::FaceVarying;
+            } else if (uvPv.interpolation != Interpolation::Constant) {
+                uvPv = PrimvarView();
             }
         } else {
             info.subdivisionControlHull = true;
         }
     }
-    VtIntArray const &counts = refined.valid ? refinedCounts : coarseCounts;
-    VtIntArray const &indices = refined.valid ? refinedIndices : coarseIndices;
-    static const VtIntArray noHoles;
-    VtIntArray const &holes = refined.valid ? noHoles : coarseHoles;
+    std::span<const int> const counts =
+        refined.valid ? std::span<const int>(refined.faceVertexCounts) : coarseCounts;
+    std::span<const int> const indices =
+        refined.valid ? std::span<const int>(refined.faceVertexIndices) : coarseIndices;
+    std::span<const int> const holes = refined.valid ? std::span<const int>() : coarseHoles;
     // The authored face of a (refined) face.
     auto coarseFace = [&](size_t face) {
         return refined.valid ? size_t(refined.coarseFaces[face]) : face;
@@ -423,7 +403,7 @@ MeshConversion ConvertMesh(MeshSource const &source, SubdivisionSettings const &
     std::vector<std::vector<float>> faceMeans(extras.size());
     if (refined.valid) {
         for (size_t e = 0; e < extras.size(); ++e) {
-            if (extras[e].interpolation != HdPrimvarSchemaTokens->faceVarying) continue;
+            if (extras[e].interpolation != Interpolation::FaceVarying) continue;
             const int n = extras[e].components;
             faceMeans[e].assign(coarseCounts.size() * size_t(n), 0.0f);
             size_t corner = 0;
@@ -446,10 +426,10 @@ MeshConversion ConvertMesh(MeshSource const &source, SubdivisionSettings const &
                 values = refined.valid
                     ? refined.pointData.data() + point * pointDataStride + extraPointOffsets[e]
                     : extra.values.data() + point * n;
-            } else if (extra.interpolation == HdPrimvarSchemaTokens->faceVarying) {
+            } else if (extra.interpolation == Interpolation::FaceVarying) {
                 values = refined.valid ? faceMeans[e].data() + coarseFace(face) * n
                                        : extra.values.data() + cornerIndex * n;
-            } else if (extra.interpolation == HdPrimvarSchemaTokens->uniform) {
+            } else if (extra.interpolation == Interpolation::Uniform) {
                 values = extra.values.data() + coarseFace(face) * n;
             } else {
                 values = extra.values.data();
@@ -457,40 +437,24 @@ MeshConversion ConvertMesh(MeshSource const &source, SubdivisionSettings const &
             out.insert(out.end(), values, values + n);
         }
     };
-    VtVec3fArray const *authoredNormalsFloat = nullptr;
-    VtVec3dArray const *authoredNormalsDouble = nullptr;
-    if (normalPv.value.IsHolding<VtVec3fArray>()) {
-        authoredNormalsFloat = &normalPv.value.UncheckedGet<VtVec3fArray>();
-    } else if (normalPv.value.IsHolding<VtVec3dArray>()) {
-        authoredNormalsDouble = &normalPv.value.UncheckedGet<VtVec3dArray>();
-    }
-    const size_t authoredNormalCount = authoredNormalsFloat
-        ? authoredNormalsFloat->size() : (authoredNormalsDouble ? authoredNormalsDouble->size() : 0);
-    auto authoredNormalAt = [&](size_t i) -> GfVec3d {
-        return authoredNormalsFloat ? GfVec3d((*authoredNormalsFloat)[i])
-            : GfVec3d(GfVec3f((*authoredNormalsDouble)[i]));
-    };
-    VtVec2fArray const *authoredUvsFloat = nullptr;
-    VtVec2dArray const *authoredUvsDouble = nullptr;
-    if (uvPv.value.IsHolding<VtVec2fArray>()) {
-        authoredUvsFloat = &uvPv.value.UncheckedGet<VtVec2fArray>();
-    } else if (uvPv.value.IsHolding<VtVec2dArray>()) {
-        authoredUvsDouble = &uvPv.value.UncheckedGet<VtVec2dArray>();
-    }
-    const size_t authoredUvCount = authoredUvsFloat
-        ? authoredUvsFloat->size() : (authoredUvsDouble ? authoredUvsDouble->size() : 0);
+    const bool normalsAuthored = normalPv.floatArray(3) || normalPv.doubleArray(3);
+    const size_t authoredNormalCount = normalsAuthored ? normalPv.size : 0;
+    auto authoredNormalAt = [&](size_t i) -> Vec3d { return WidenedPoint(normalPv, i); };
+    float const *authoredUvsFloat = uvPv.floatArray(2) ? uvPv.floats() : nullptr;
+    double const *authoredUvsDouble = uvPv.doubleArray(2) ? uvPv.doubles() : nullptr;
+    const size_t authoredUvCount = (authoredUvsFloat || authoredUvsDouble) ? uvPv.size : 0;
 
-    const bool flip = source.orientation == TfToken("leftHanded");
-    const GfMatrix4d geometryTransform(1.0);
-    const bool mirrored = geometryTransform.GetDeterminant() < 0.0;
-    const GfMatrix4d normalMatrix = geometryTransform.GetInverse().GetTranspose();
+    const bool flip = source.orientation == "leftHanded";
+    const Matrix4d geometryTransform(1.0);
+    const bool mirrored = geometryTransform.determinant() < 0.0;
+    const Matrix4d normalMatrix = geometryTransform.inverse().transpose();
     std::unordered_set<int> holeSet(holes.begin(), holes.end());
 
     // Match the standalone USD path when normals are missing, zero, or only
     // partially authored: accumulate one area-weighted coarse-face normal at
     // each referenced point. Keep this in prototype space; placement applies
     // the inverse transpose later.
-    std::vector<GfVec3d> generatedNormals(pointCount, GfVec3d(0.0));
+    std::vector<Vec3d> generatedNormals(pointCount, Vec3d(0.0));
     size_t generatedCorner = 0;
     size_t triangleEstimate = 0;
     for (size_t face = 0; face < counts.size(); ++face) {
@@ -513,7 +477,7 @@ MeshConversion ConvertMesh(MeshSource const &source, SubdivisionSettings const &
             const int p0 = indices[generatedCorner];
             const int p1 = indices[generatedCorner + 1];
             const int p2 = indices[generatedCorner + 2];
-            GfVec3d contribution = GfCross(
+            Vec3d contribution = cross(
                 pointAt(p1) - pointAt(p0), pointAt(p2) - pointAt(p0));
             if (flip) contribution = -contribution;
             for (int k = 0; k < count; ++k)
@@ -524,8 +488,8 @@ MeshConversion ConvertMesh(MeshSource const &source, SubdivisionSettings const &
     if (refined.valid) {
         // Limit normals follow the winding of the authored faces.
         for (size_t i = 0; i < pointCount && 3 * i + 2 < refined.normals.size(); ++i) {
-            GfVec3d n(refined.normals[3 * i], refined.normals[3 * i + 1], refined.normals[3 * i + 2]);
-            if (n.GetLengthSq() > 1e-20) generatedNormals[i] = flip ? -n : n;
+            Vec3d n(refined.normals[3 * i], refined.normals[3 * i + 1], refined.normals[3 * i + 2]);
+            if (n.lengthSq() > 1e-20) generatedNormals[i] = flip ? -n : n;
         }
     }
 
@@ -542,7 +506,7 @@ MeshConversion ConvertMesh(MeshSource const &source, SubdivisionSettings const &
     std::vector<int> coarseFaces;
     coarseFaces.reserve(triangleEstimate);
     // Reused across faces so ordinary faces allocate nothing.
-    std::vector<GfVec3d> facePoints;
+    std::vector<Vec3d> facePoints;
     std::vector<std::array<int, 3>> triangles;
     size_t corner = 0;
     for (size_t face = 0; face < counts.size(); ++face) {
@@ -580,48 +544,48 @@ MeshConversion ConvertMesh(MeshSource const &source, SubdivisionSettings const &
             std::array<int, 3> const &triangle = triangles[t];
             int local[3] = {triangle[0], triangle[1], triangle[2]};
             if (flip) std::swap(local[1], local[2]);
-            GfVec3d wp[3];
+            Vec3d wp[3];
             size_t first = mesh->vertices.size();
             for (int v = 0; v < 3; ++v) {
                 const size_t ci = corner + local[v];
                 const int pi = indices[ci];
-                wp[v] = geometryTransform.Transform(pointAt(pi));
+                wp[v] = geometryTransform.transform(pointAt(pi));
                 mesh->vertices.emplace_back(static_cast<float>(wp[v][0]),
                                             static_cast<float>(wp[v][1]),
                                             static_cast<float>(wp[v][2]));
                 const size_t ui = PrimvarIndex(uvPv.interpolation, pi, ci, coarseFace(face));
                 if (ui < authoredUvCount) {
                     if (authoredUvsFloat) {
-                        mesh->texcoords.emplace_back((*authoredUvsFloat)[ui][0],
-                                                     (*authoredUvsFloat)[ui][1]);
+                        mesh->texcoords.emplace_back(authoredUvsFloat[2 * ui],
+                                                     authoredUvsFloat[2 * ui + 1]);
                     } else {
                         mesh->texcoords.emplace_back(
-                            static_cast<float>((*authoredUvsDouble)[ui][0]),
-                            static_cast<float>((*authoredUvsDouble)[ui][1]));
+                            static_cast<float>(authoredUvsDouble[2 * ui]),
+                            static_cast<float>(authoredUvsDouble[2 * ui + 1]));
                     }
                 }
                 else mesh->texcoords.emplace_back(0.0f, 0.0f);
                 if (extraStride) appendExtras(mesh->primvarValues, size_t(pi), ci, face);
             }
-            const GfVec3d geometric = GfCross(wp[1] - wp[0], wp[2] - wp[0]).GetNormalized();
+            const Vec3d geometric = cross(wp[1] - wp[0], wp[2] - wp[0]).normalized();
             for (int v = 0; v < 3; ++v) {
                 const size_t ci = corner + local[v];
                 const int pi = indices[ci];
                 const size_t ni = PrimvarIndex(normalPv.interpolation, pi, ci, coarseFace(face));
-                GfVec3d n = geometric;
+                Vec3d n = geometric;
                 if (ni < authoredNormalCount) {
-                    GfVec3d authored = authoredNormalAt(ni);
-                    if (authored.GetLengthSq() > 1e-20 &&
-                        std::isfinite(authored.GetLengthSq())) {
-                        n = normalMatrix.TransformDir(authored).GetNormalized();
+                    Vec3d authored = authoredNormalAt(ni);
+                    if (authored.lengthSq() > 1e-20 &&
+                        std::isfinite(authored.lengthSq())) {
+                        n = normalMatrix.transformDir(authored).normalized();
                         if (flip != mirrored) n = -n;
-                    } else if (generatedNormals[pi].GetLengthSq() > 1e-20 &&
-                               std::isfinite(generatedNormals[pi].GetLengthSq())) {
-                        n = generatedNormals[pi].GetNormalized();
+                    } else if (generatedNormals[pi].lengthSq() > 1e-20 &&
+                               std::isfinite(generatedNormals[pi].lengthSq())) {
+                        n = generatedNormals[pi].normalized();
                     }
-                } else if (generatedNormals[pi].GetLengthSq() > 1e-20 &&
-                           std::isfinite(generatedNormals[pi].GetLengthSq())) {
-                    n = generatedNormals[pi].GetNormalized();
+                } else if (generatedNormals[pi].lengthSq() > 1e-20 &&
+                           std::isfinite(generatedNormals[pi].lengthSq())) {
+                    n = generatedNormals[pi].normalized();
                 }
                 mesh->normals.emplace_back(static_cast<float>(n[0]),
                                            static_cast<float>(n[1]),
