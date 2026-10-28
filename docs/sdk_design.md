@@ -1254,6 +1254,13 @@ the Hydra delegate's render thread runs its loop. What landed:
   host films that accumulate as the delegate's buffers do; setting changes,
   `restart()` and new commits start a new accumulation (a converged session
   takes a new commit too). `prism_session_progressive_test`.
+- Render progress timing (engine, both front ends): the rendering time of the
+  current accumulation (device preparation excluded), pixel-samples per
+  second over the last four passes and an estimate of the time left (the
+  remaining passes over the pixels adaptive sampling still traces, capped by
+  the time limit; -1 unknown, 0 converged): Hydra's `elapsedSeconds`,
+  `samplesPerSecond`, `estimatedSecondsRemaining` render stats,
+  `SessionStatus` and `ProgressInfo`. The CLI's progress line is unchanged.
 - Scene lock: `detail::RenderLock` counts waiters; a progressive session
   holds the scene's render lock across passes and yields at pass boundaries
   to other sessions' renders and to `commit()`, which now replaces the

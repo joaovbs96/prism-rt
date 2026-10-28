@@ -2,6 +2,12 @@
 
 Phase reports, newest first. Detailed reports live in `local/reports/` (git-ignored).
 
+## 2026-10-28 — SDK step 5a: progressive session
+- The Hydra delegate's progressive loop (device preparation with the GPU preparation preview, adaptive preview, refinement passes over tiles, adaptive publication, time limit, texture-streaming restarts, denoise interval) moved unchanged into the core `prism::session::ProgressiveEngine`; `SceneBridge::Render` drives it over its render buffers. Hydra still builds its own `SceneManager` (incremental commit is step 5b).
+- Public progressive `Session`: `start/pause/resume/cancel/restart/wait/status/aov/pick`, `ProgressiveOptions`, `SessionStatus`, `Pick`; host films on the session's own thread; new commits and setting changes restart the accumulation. Sessions of one scene share a counted render lock: a progressive session yields to other renders and to `commit()` at pass boundaries (commit now swaps a shared revision under it).
+- Render timing: Hydra stats `elapsedSeconds`, `samplesPerSecond`, `estimatedSecondsRemaining`, also in `SessionStatus`/`ProgressInfo`.
+- Hydra and CLI outputs bit-identical to main (c61712d) on 15 CPU cases, every EXR channel (Hydra: colour, adaptive, denoise AOV and products, id and light AOV products, a time sample; CLI: 3). Interactivity ratios new/old (5 alternating runs, InOneWeekend, CPU): usdview first frame 0.98, camera move 1.00 (p95 0.99), preview cost 1.03, edit to converged 1.01. One Vulkan run under `VK_LAYER_KHRONOS_validation` (CornellBox): clean. New tests: `prism_session_progressive_test`, timing keys in the bridge's accumulation test. Metal unbuilt (checklist in `docs/gpu_devices.md`). Report: `local/reports/sdk_session_progressive.md`.
+
 ## 2026-10-28 — SDK step 4: batch session and prism_io
 - `include/prism/`: public `RendererOptions` (`options.h`), shared setting types (`settings.h`), `Session` with `render()` → `RenderResult` (colour and AOVs by Hydra token, `Int32` ids), render settings, crop and pixel aspect ratio, exposure, denoising, time limit, a progress callback and `cancel()` (`session.h`); `prism::io::Write` for EXR layers and 8-bit through the view (`io.h`); `Scene::commit` takes a progress callback. Camera rays come from `CameraDesc` (Gf's and CameraUtil's arithmetic, 20000 cameras bit-identical in `prism_camera_projection_test`).
 - The CLI is parsing → scene → one session → `prism_io` (render products through it); Hydra unchanged; the core still builds without USD (`prism_session_test` links the core and `prism_io` only).
