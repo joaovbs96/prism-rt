@@ -2,6 +2,10 @@
 
 Phase reports, newest first. Detailed reports live in `local/reports/` (git-ignored).
 
+## 2026-10-28 — Free camera with a huge far clip converges
+- A host camera set with `SetCameraState` and a far clip of 1e30 restarted the accumulation on every `Render()` (0 samples after 60 s; present since v0.1.0). Cause: Hydra derives the camera's clipping range from the matrices, and the far comes back as -inf, so the projection Hydra builds has NaN depth terms; NaN never equals itself, so `Prepare` saw a new camera each frame (and the rays came from a NaN projection).
+- Fix: `CameraFromPass` repairs an unbounded far plane (far set to 1e30, depth terms rebuilt; sane cameras untouched), and `Prepare` compares camera states bitwise (`CameraStatesIdentical`), so the camera counts as changed only when the host's input changed. Test: free cameras with far 1e30 and an infinite-far projection in `prism_hydra_pass_camera_test` (failed before: no convergence, revision above 6000; passes now with finite pixels).
+- `prism:denoise` with a non-bool value now warns and keeps the previous value (it was ignored silently). Report: `local/reports/free_camera_fix.md`.
 ## 2026-10-28 - Fix: loading counters missed by the mesh task
 - `prism_hydra_scene_bridge_test` failed about 1 run in 5-10 with "Mesh conversion counters did not complete": the snapshot build ran mesh preparation as a `tbb::task_group` task, and the progress model and logger are bound per thread. When a TBB worker (not the build thread) took the task, `Progress::Current()` was null there: `prismMeshesTotal`/`prismMeshesDone` stayed 0 and the subdivision-budget warning went to the process logger. The task now binds the build thread's progress model and logger.
 - New CTest `prism_hydra_progress_status` (`prism_hydra_scene_bridge_test progress-status`) runs the progress check alone, in seconds. Details in `local/reports/flaky_progress_counters.md`.
