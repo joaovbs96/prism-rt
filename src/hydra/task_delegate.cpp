@@ -492,8 +492,13 @@ void PrismTaskDelegate::SetRenderSetting(TfToken const &key, VtValue const &valu
         s.gpuPreparationPreviewMaxMiB = std::max(0, _Get(value, s.gpuPreparationPreviewMaxMiB));
     else if (key == _resourceRevision)
         s.resourceRevision = _Get(value, s.resourceRevision);
-    else if (key == _denoise)
-        s.denoise = _Get(value, s.denoise);
+    else if (key == _denoise) {
+        if (!value.IsHolding<bool>()) {
+            TF_WARN("PrismRT: prism:denoise must be a bool; retaining the previous value");
+            return;
+        }
+        s.denoise = value.UncheckedGet<bool>();
+    }
     else if (key == _denoiseInterval)
         s.denoiseInterval = std::max(1, _Number(value, s.denoiseInterval));
     else if (key == _denoisePrefilter)

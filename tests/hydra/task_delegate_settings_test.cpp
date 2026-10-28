@@ -183,6 +183,9 @@ int RunAuthoredSettingsTests()
             delegate.SetRenderSetting(quality, VtValue(std::string("best")));
             Require(delegate.GetRenderSetting(quality).UncheckedGet<std::string>() == "fast",
                     "An unknown denoise quality replaced the previous one");
+            delegate.SetRenderSetting(denoise, VtValue(std::string("aov")));
+            Require(delegate.GetRenderSetting(denoise).UncheckedGet<bool>(),
+                    "A non-bool prism:denoise replaced the previous value");
             delegate.SetRenderSetting(denoise, VtValue(false));
             delegate.SetRenderSetting(interval, VtValue(16));
             delegate.SetRenderSetting(quality, VtValue(std::string("high")));
