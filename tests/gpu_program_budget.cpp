@@ -8,7 +8,7 @@
 #include "../src/device/gpu/hlsl_compiler.h"
 #include "../src/device/vulkan/vulkan_material_calls.h"
 #include "../src/mdl_material.h"
-#include "../src/mesh/usd_mesh.h"
+#include "scene_api_test_util.h"
 #include "../src/scene.h"
 
 #include <algorithm>
@@ -106,19 +106,10 @@ int main(int argc, char** argv)
         std::cerr << "usage: prism_gpu_program_budget_test <textured_emitters_glass.usda>\n";
         return 2;
     }
-    mdl::Context context;
-    check(context.is_valid(), "MDL context");
-    RTCDevice device = rtcNewDevice(nullptr);
     {
-        SceneManager scene(device, prism::color::ColorManagement::Create({}));
-        const char* libraries = std::getenv("PRISM_MATERIALX_LIBRARY_PATH");
-        const std::string libraryPath = libraries ? libraries : "";
-        USDMesh mesh(argv[1], &context, libraryPath, libraryPath + "/mdl");
-        prism::usd::AttachImportedMesh(scene, mesh);
-        ColorTexture black(Color3(0.0f));
-        ConstantColorBackground background(&black);
-        scene.environment = &background;
-        scene.commitScene();
+        const prism::Renderer renderer(prism::test::TestRendererOptions());
+        prism::Scene api = renderer.createScene();
+        SceneManager& scene = prism::test::LoadUsd(api, argv[1]);
         gpu::GpuSceneData data = gpu::BuildGpuScene(scene);
         check(data.mdlMaterials.size() == 5, std::format("5 MDL materials, not {}", data.mdlMaterials.size()));
         size_t varying = 0;
@@ -195,7 +186,6 @@ int main(int argc, char** argv)
               "PRISM_VULKAN_MAX_SPIRV_MIB=2 keeps the glass callable and refuses 3 MiB");
         SetVariable("PRISM_VULKAN_MAX_SPIRV_MIB", nullptr);
     }
-    rtcReleaseDevice(device);
     if (failures) return 1;
     std::cout << "GPU program budget: all checks passed\n";
     return 0;

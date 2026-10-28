@@ -17,6 +17,8 @@
 #include <OpenImageIO/imagebuf.h>
 #include <OpenImageIO/imageio.h>
 
+#include <prism/material.h>
+
 // internal deps
 #include "../geometry.h"
 #include "../float3.h"
@@ -31,22 +33,27 @@
 #include "../render_defaults.h"
 #include "mesh_conversion.h"
 
-// Wavefront OBJ scenes. MTL materials load as MaterialX open_pbr_surface
-// documents compiled through MDL (docs/obj.md). A material whose conversion
-// or compilation fails (or that has no MDL context to compile with) renders
-// with the magenta error material, after a one-line warning; faces without a
-// material are grey (Diffuse 0.5).
+// Wavefront OBJ scenes, read for prism::obj::Load (src/obj/obj_loader.cpp):
+// per-corner triangles and their MTL materials as MaterialX
+// open_pbr_surface documents in the material cache (docs/obj.md), which the
+// scene compiles through MDL at commit (and displaces the faces of materials
+// with MTL disp). A material whose conversion fails renders with the magenta
+// error material, after a one-line warning; faces without a material are
+// grey (Diffuse 0.5).
 class ObjMesh : public Mesh {
     public:
-        // Faces whose material displaces them (MTL disp) are diced and
-        // displaced at load time with `subdivision`'s displacement level and
-        // face limit, as USD meshes are. materialSettings: the renderer's colour
-        // management (materials convert into its working space) and cache
-        // directory.
-        ObjMesh(const std::filesystem::path &file_path, mdl::Context* mdl_context,
-                const std::string& mx_libraries_path, const std::string& mx_mdl_path,
-                prism::MaterialSettings materialSettings,
-                prism::mesh::SubdivisionSettings subdivision = DefaultSubdivision())
+        // The document of an MTL material (-1: faces without one, a grey
+        // Diffuse), or why it has none.
+        struct MaterialSource {
+            std::optional<prism::MaterialDesc> desc;
+            std::string failure;
+        };
+
+        // materialSettings: the renderer's colour management (materials convert
+        // into its working space) and cache directory. Without MaterialX
+        // libraries every MTL material is the error material.
+        ObjMesh(const std::filesystem::path &file_path, bool materialx,
+                prism::MaterialSettings materialSettings)
             : m_path(file_path), m_materials(std::move(materialSettings))
         {
             if (!m_materials.color) throw std::invalid_argument("ObjMesh needs a colour management");
@@ -114,106 +121,19 @@ class ObjMesh : public Mesh {
             }
             std::cout << "Finished creating mesh data. " << std::endl;
 
-            buildMaterials(obj_materials, used, reader, mdl_context, mx_libraries_path, mx_mdl_path);
-            displace(subdivision);
+            buildMaterials(obj_materials, used, reader, materialx);
             std::cout << "OBJ: " << vertices.size() << " vertices, " << indices.size() / 3 << " triangles, "
-                      << materials.size() << " material(s)\n";
+                      << m_sources.size() << " material(s)\n";
         }
 
-        // Materials that compiled through MaterialX, and those rendered with
-        // the error material.
+        // Materials converted to MaterialX, and those rendered with the error
+        // material.
         size_t materialxMaterialCount() const { return m_materialxCount; }
         size_t errorMaterialCount() const { return m_errorCount; }
-
-        static prism::mesh::SubdivisionSettings DefaultSubdivision()
-        {
-            auto const& defaults = prism::defaults::FromEnvironment();
-            prism::mesh::SubdivisionSettings result;
-            result.displacementLevel = defaults.displacementLevel;
-            result.displacementMaxFaces = size_t(defaults.displacementMaxFaces);
-            return result;
-        }
+        // By MTL material (-1: faces without one), the materials faces use.
+        std::map<int, MaterialSource> const& materialSources() const { return m_sources; }
 
     private:
-        // Faces of displacing materials, by the shared conversion: each
-        // material's faces become a mesh (corners at one position welded, so
-        // the surface stays closed), refined bilinearly to the displacement
-        // level within its face limit, and displaced.
-        void displace(prism::mesh::SubdivisionSettings const& subdivision)
-        {
-            std::map<int, std::vector<size_t>> displaced; // material -> triangles
-            const size_t triangles = indices.size() / 3;
-            for (size_t t = 0; t < triangles; ++t) {
-                auto material = materials.find(material_mapping.at(int(t)));
-                if (material != materials.end() && material->second && material->second->hasDisplacement())
-                    displaced[material->first].push_back(t);
-            }
-            if (displaced.empty()) return;
-            std::vector<Float3> keptVertices, keptNormals;
-            std::vector<Float2> keptTexcoords;
-            std::vector<unsigned> keptIndices;
-            std::unordered_map<int, int> keptMaterials;
-            int face = 0;
-            for (size_t t = 0; t < triangles; ++t) {
-                const int material = material_mapping.at(int(t));
-                if (displaced.contains(material)) continue;
-                for (int k = 0; k < 3; ++k) {
-                    const unsigned v = indices[3 * t + k];
-                    keptIndices.push_back(unsigned(keptVertices.size()));
-                    keptVertices.push_back(vertices[v]);
-                    keptNormals.push_back(normals[v]);
-                    keptTexcoords.push_back(texcoords[v]);
-                }
-                keptMaterials[face++] = material;
-            }
-            size_t refinedTriangles = 0;
-            for (auto const& [material, faces] : displaced) {
-                std::vector<int> counts, corners;
-                std::vector<float> points, uvs; // xyz per point, uv per corner
-                std::map<std::array<float, 3>, int> welded;
-                for (size_t t : faces) {
-                    counts.push_back(3);
-                    for (int k = 0; k < 3; ++k) {
-                        const unsigned v = indices[3 * t + k];
-                        const std::array<float, 3> key{vertices[v].x(), vertices[v].y(), vertices[v].z()};
-                        auto [found, added] = welded.emplace(key, int(points.size() / 3));
-                        if (added) points.insert(points.end(), key.begin(), key.end());
-                        corners.push_back(found->second);
-                        uvs.push_back(texcoords[v].u());
-                        uvs.push_back(texcoords[v].v());
-                    }
-                }
-                using View = prism::mesh::PrimvarView;
-                prism::mesh::MeshSource source;
-                source.faceVertexCounts = counts;
-                source.faceVertexIndices = corners;
-                source.points = {prism::mesh::Interpolation::Vertex, View::Type::Float, 3, true, points.data(),
-                                 points.size() / 3};
-                source.uvs = {prism::mesh::Interpolation::FaceVarying, View::Type::Float, 2, true, uvs.data(),
-                              uvs.size() / 2};
-                source.doubleSided = true;
-                prism::mesh::MeshConversion conversion =
-                    prism::mesh::ConvertMesh(source, subdivision, materials.at(material));
-                if (!conversion.mesh) continue;
-                Mesh const& mesh = *conversion.mesh;
-                const unsigned base = unsigned(keptVertices.size());
-                keptVertices.insert(keptVertices.end(), mesh.vertices.begin(), mesh.vertices.end());
-                keptNormals.insert(keptNormals.end(), mesh.normals.begin(), mesh.normals.end());
-                keptTexcoords.insert(keptTexcoords.end(), mesh.texcoords.begin(), mesh.texcoords.end());
-                for (unsigned index : mesh.indices) keptIndices.push_back(base + index);
-                for (size_t t = 0; t < mesh.indices.size() / 3; ++t) keptMaterials[face++] = material;
-                refinedTriangles += mesh.indices.size() / 3;
-            }
-            vertices = std::move(keptVertices);
-            normals = std::move(keptNormals);
-            texcoords = std::move(keptTexcoords);
-            indices = std::move(keptIndices);
-            material_mapping = std::move(keptMaterials);
-            tangents.clear();
-            std::cout << "OBJ: displaced the faces of " << displaced.size() << " material(s) into "
-                      << refinedTriangles << " triangles\n";
-        }
-
         // tinyobjloader's file reader for mtllib, which also keeps each MTL
         // file's statements (tinyobjloader cannot tell its defaults from
         // authored values) and the directory its maps resolve against.
@@ -250,31 +170,28 @@ class ObjMesh : public Mesh {
 
         std::filesystem::path m_path;
         prism::MaterialSettings m_materials;
-        std::vector<std::shared_ptr<MDLMaterial>> m_ownedMdl;
-        std::unique_ptr<Texture<Color3>> m_greyTexture;
-        std::unique_ptr<Material> m_grey;
+        std::map<int, MaterialSource> m_sources;
         size_t m_materialxCount = 0, m_errorCount = 0;
 
         void buildMaterials(const std::vector<tinyobj::material_t>& source, const std::set<int>& used,
-                            const MaterialFiles& files, mdl::Context* mdl_context, const std::string& libraries,
-                            const std::string& mdlLibraries)
+                            const MaterialFiles& files, bool materialx)
         {
             if (used.contains(-1)) {
                 // Faces without a material.
-                m_greyTexture = std::make_unique<ColorTexture>(Color3(.5f));
-                m_grey = std::make_unique<Diffuse>(m_greyTexture.get());
-                materials[-1] = m_grey.get();
+                prism::MaterialDesc grey;
+                grey.kind = prism::MaterialDesc::Kind::Diffuse;
+                grey.color = Color3(.5f);
+                grey.name = "OBJ faces without a material";
+                m_sources[-1].desc = grey;
             }
-            if (!mdl_context || libraries.empty()) {
+            if (!materialx) {
                 for (int m : used)
                     if (m >= 0) useErrorMaterial(source, m, "no MDL context or MaterialX libraries");
                 return;
             }
             const auto start = std::chrono::steady_clock::now();
             const std::filesystem::path cache = m_materials.cacheDirectory / "materials";
-            // Maps resolve beside the cached documents (as for USD and glTF).
-            mdl_context->add_resource_path(cache.string());
-            std::map<std::string, std::shared_ptr<MDLMaterial>> compiled; // by document
+            std::set<std::string> documents;
             std::map<std::string, std::string> published;                 // map path -> cached file name
             struct ImageHeader {
                 bool alpha = false;
@@ -298,7 +215,7 @@ class ObjMesh : public Mesh {
                         if (std::filesystem::exists(base / path)) return base / path;
                     return {};
                 };
-                std::shared_ptr<MDLMaterial> compiledMaterial;
+                std::optional<prism::MaterialDesc> compiledMaterial;
                 std::string failure;
                 try {
                     prism::obj::MaterialConversionOptions options;
@@ -336,23 +253,22 @@ class ObjMesh : public Mesh {
                         if (warned.insert(warning).second) std::cerr << "PrismRT OBJ: " << warning << "\n";
                     for (auto const& statement : conversion.unsupported) unsupported.emplace(statement, material.name);
                     const std::string xml = MaterialX::writeToXmlString(conversion.document);
-                    if (auto found = compiled.find(xml); found != compiled.end()) {
-                        compiledMaterial = found->second;
-                        ++reused;
-                    } else {
-                        const auto path = prism::materialx::PublishMaterialXDocument(xml, cache, "obj_");
-                        compiledMaterial = std::make_shared<MDLMaterial>(path.string(), *mdl_context, libraries,
-                                                                         mdlLibraries, m_materials,
-                                                                         prism::obj::kMaterialName);
-                        if (compiledMaterial->is_valid()) compiled.emplace(xml, compiledMaterial);
-                        else failure = "MDL compilation failed (" + path.string() + ")";
-                    }
+                    // Equal documents publish to one file, which the loader
+                    // adds once.
+                    const auto path = prism::materialx::PublishMaterialXDocument(xml, cache, "obj_");
+                    if (!documents.insert(path.string()).second) ++reused;
+                    compiledMaterial.emplace();
+                    compiledMaterial->kind = prism::MaterialDesc::Kind::MaterialXFile;
+                    compiledMaterial->path = path.string();
+                    compiledMaterial->materialName = prism::obj::kMaterialName;
+                    // Maps resolve beside the cached documents (as for USD and glTF).
+                    compiledMaterial->searchPath = cache.string();
+                    compiledMaterial->name = "'" + material.name + "'";
                 } catch (const std::exception& error) {
                     failure = error.what();
                 }
-                if (compiledMaterial && compiledMaterial->is_valid()) {
-                    materials[m] = compiledMaterial.get();
-                    m_ownedMdl.push_back(std::move(compiledMaterial));
+                if (compiledMaterial) {
+                    m_sources[m].desc = std::move(compiledMaterial);
                     ++m_materialxCount;
                 } else {
                     useErrorMaterial(source, m, failure);
@@ -361,8 +277,8 @@ class ObjMesh : public Mesh {
             for (auto const& [statement, material] : unsupported)
                 std::cerr << "PrismRT OBJ: MTL " << statement << " is not supported; ignored (first in material '"
                           << material << "')\n";
-            std::cout << "OBJ: " << m_materialxCount << " MaterialX material(s) (" << compiled.size()
-                      << " compiled, " << reused << " reused), " << m_errorCount << " failed, in "
+            std::cout << "OBJ: " << m_materialxCount << " MaterialX material(s) (" << documents.size()
+                      << " documents, " << reused << " reused), " << m_errorCount << " failed to convert, in "
                       << std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() << " s\n";
         }
 
@@ -406,7 +322,7 @@ class ObjMesh : public Mesh {
             std::cerr << "PrismRT OBJ: material '" << source[size_t(m)].name << "' failed to load ("
                       << (reason.empty() ? std::string("unknown error") : reason)
                       << "); rendering it with the magenta error material\n";
-            materials[m] = ErrorMaterial::Shared();
+            m_sources[m].failure = reason.empty() ? std::string("unknown error") : reason;
             ++m_errorCount;
         }
 };

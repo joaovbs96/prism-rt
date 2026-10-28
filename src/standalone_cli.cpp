@@ -1,11 +1,13 @@
 #include "standalone_cli.h"
+#include <prism/gltf.h>
+#include <prism/obj.h>
+#include <prism/renderer.h>
+#include <prism/usd.h>
 #include "scene.h"
-#include "mesh/gltf_mesh.h"
-#include "mesh/obj_mesh.h"
-#include "mesh/usd_mesh.h"
+#include "scene/scene_internal.h"
 #include "render_defaults.h"
-#include "materialx/loader.h"
-#include "materialx/material_service.h"
+#include "materialx/shared_mdl_context.h"
+#include "mdl/context.h"
 #include "camera_rays.h"
 #include "usd/gf_convert.h"
 #include "camera_ray_diagnostics.h"
@@ -16,22 +18,9 @@
 #include "output/image_writer.h"
 #include "output/render_products.h"
 #include <pxr/usd/usdGeom/camera.h>
-#include <pxr/usd/usdLux/blackbody.h>
-#include <pxr/usd/usdLux/cylinderLight.h>
-#include <pxr/usd/usdLux/diskLight.h>
-#include <pxr/usd/usdLux/distantLight.h>
-#include <pxr/usd/usdLux/domeLight.h>
-#include <pxr/usd/usdLux/domeLight_1.h>
-#include <pxr/usd/usdLux/lightAPI.h>
-#include <pxr/usd/usdLux/rectLight.h>
-#include <pxr/usd/usdLux/shapingAPI.h>
-#include <pxr/usd/usdLux/sphereLight.h>
-#include <pxr/usd/usdLux/tokens.h>
-#include <pxr/usd/usdGeom/xformCache.h>
+#include <pxr/usd/usdGeom/tokens.h>
 #include <pxr/usd/usdRender/settings.h>
-#include <pxr/usd/usd/collectionAPI.h>
-#include <pxr/usd/usd/collectionMembershipQuery.h>
-#include <pxr/usd/ar/resolver.h>
+#include <pxr/usd/usd/stage.h>
 #include <pxr/base/plug/plugin.h>
 #include <pxr/base/plug/registry.h>
 #include <pxr/base/gf/camera.h>
@@ -54,6 +43,8 @@
 #include <mutex>
 #include <thread>
 #include "progress.h"
+PXR_NAMESPACE_USING_DIRECTIVE
+
 #ifdef _WIN32
 #include <io.h>
 #else
@@ -439,108 +430,6 @@ void applyRenderSettings(VtDictionary const& settings, Options& o) {
     }
 }
 
-// The colour space of a light's texture: linear Rec.709, like the light's
-// color. The Hydra delegate cannot see attribute colorSpace metadata, so
-// neither loader reads it (docs/color_management.md).
-std::string TextureColorSpace(UsdAttribute const&) {
-    return prism::color::kLightColorSpace;
-}
-
-// A light's texture file, resolved as the Hydra delegate resolves it (the
-// asset's resolved path, else the resolver on its authored path); empty when
-// it does not exist.
-std::string ResolvedLightTexture(SdfAssetPath const& asset) {
-    std::string resolved = asset.GetResolvedPath();
-    if (resolved.empty() && !asset.GetAssetPath().empty())
-        resolved = ArGetResolver().Resolve(asset.GetAssetPath()).GetPathString();
-    if (!resolved.empty() && !std::filesystem::exists(resolved)) resolved.clear();
-    return resolved;
-}
-
-// UsdLuxShapingAPI inputs, as the Hydra delegate reads them
-// (scene_bridge.cpp _ShapingParameters): the light is shaped when one of
-// them has a value (the API applied, which gives every input its fallback,
-// or an input authored); unauthored ones take the schema's fallbacks.
-prism::LightShapingParameters ShapingParameters(UsdPrim const& prim, UsdTimeCode time)
-{
-    prism::LightShapingParameters s;
-    const UsdLuxShapingAPI shaping(prim);
-    auto read = [&](UsdAttribute const& attribute, auto* value) {
-        if (attribute && attribute.HasValue() && attribute.Get(value, time)) s.active = true;
-    };
-    GfVec3f tint(0.0f);
-    SdfAssetPath ies;
-    read(shaping.GetShapingFocusAttr(), &s.focus);
-    read(shaping.GetShapingFocusTintAttr(), &tint);
-    read(shaping.GetShapingConeAngleAttr(), &s.coneAngle);
-    read(shaping.GetShapingConeSoftnessAttr(), &s.coneSoftness);
-    read(shaping.GetShapingIesFileAttr(), &ies);
-    read(shaping.GetShapingIesAngleScaleAttr(), &s.iesAngleScale);
-    read(shaping.GetShapingIesNormalizeAttr(), &s.iesNormalize);
-    s.focusTint = Color3(tint[0], tint[1], tint[2]);
-    if (s.active && !ies.GetAssetPath().empty()) {
-        std::string resolved = ies.GetResolvedPath();
-        if (resolved.empty()) resolved = ArGetResolver().Resolve(ies.GetAssetPath()).GetPathString();
-        if (!resolved.empty() && std::filesystem::exists(resolved)) s.ies = prism::LoadIesProfile(resolved);
-        else prism::WarnUnresolvedIesProfile(ies.GetAssetPath());
-    }
-    return s;
-}
-
-// Light and shadow linking as the Hydra delegate gets it from
-// HdsiLightLinkingSceneIndex: a category bit per distinct collection that
-// does not include everything (at most 32 of each kind), and on each
-// placement the bits of the collections that include its prim.
-class LightLinks {
-public:
-    // The category bit of a light's lightLink or shadowLink collection (0:
-    // it links everything).
-    uint32_t bit(UsdCollectionAPI const& collection, bool shadow)
-    {
-        if (!collection) return 0u;
-        UsdCollectionMembershipQuery query = collection.ComputeMembershipQuery();
-        std::string key;
-        if (query.UsesPathExpansionRuleMap()) {
-            auto const& rules = query.GetAsPathExpansionRuleMap();
-            if (rules.size() == 1 && rules.begin()->first == SdfPath::AbsoluteRootPath() &&
-                rules.begin()->second == UsdTokens->expandPrims) return 0u;
-            for (auto const& [path, rule] : rules) key += path.GetString() + "=" + rule.GetString() + ";";
-        } else {
-            const SdfPathExpression expression = collection.ResolveCompleteMembershipExpression();
-            if (expression == SdfPathExpression::Everything()) return 0u;
-            key = "expression:" + expression.GetText();
-        }
-        auto& kind = shadow ? m_shadow : m_light;
-        for (auto const& category : kind)
-            if (category.key == key) return category.bit;
-        if (kind.size() >= 32) {
-            if (!m_warned) std::cerr << "PrismRT: more than 32 light or shadow link collections; further ones are ignored\n";
-            m_warned = true;
-            return 0u;
-        }
-        kind.push_back({key, std::move(query), 1u << kind.size()});
-        return kind.back().bit;
-    }
-    bool active() const { return !m_light.empty() || !m_shadow.empty(); }
-    // The light and shadow link masks of a prim.
-    std::pair<uint32_t, uint32_t> masks(SdfPath const& path) const
-    {
-        std::pair<uint32_t, uint32_t> result{0u, 0u};
-        for (auto const& category : m_light) if (category.query.IsPathIncluded(path)) result.first |= category.bit;
-        for (auto const& category : m_shadow) if (category.query.IsPathIncluded(path)) result.second |= category.bit;
-        return result;
-    }
-
-private:
-    struct Category {
-        std::string key;
-        UsdCollectionMembershipQuery query;
-        uint32_t bit = 0;
-    };
-    std::vector<Category> m_light, m_shadow;
-    bool m_warned = false;
-};
-
 // Independent USD camera ingestion, deliberately separate from the Hydra adapter.
 struct UsdCameraRays {
     prism::CameraRayParameters parameters;
@@ -752,22 +641,6 @@ private:
     size_t m_width = 0;
 };
 
-struct EmbreeDevice {
-    RTCDevice value = rtcNewDevice(nullptr);
-    ~EmbreeDevice() { if (value) rtcReleaseDevice(value); }
-};
-struct SceneRelease {
-    SceneManager& manager;
-    Mesh* mesh = nullptr;
-    ~SceneRelease() {
-        rtcReleaseScene(manager.scene);
-        if (mesh) {
-            if (mesh->geom) rtcReleaseGeometry(mesh->geom);
-            delete mesh->transform;
-            mesh->transform = nullptr;
-        }
-    }
-};
 }
 
 int runStandaloneCli(int argc, char** argv) {
@@ -790,8 +663,6 @@ int runStandaloneCli(int argc, char** argv) {
         // unwinds).
         prism::device::ImageProgress imageProgress;
         ProgressPrinter progress(o.progress);
-        EmbreeDevice device;
-        if (!device.value) throw std::runtime_error("Cannot create Embree device");
         auto start = std::chrono::steady_clock::now();
         auto seconds =[&] { return std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count(); };
         const auto extension = std::filesystem::path(o.scene).extension().string();
@@ -883,7 +754,10 @@ int runStandaloneCli(int argc, char** argv) {
         rendererOptions.materials.materialxMdlPath = rendererOptions.materials.materialxLibraries + "/mdl";
         // --sss-fallback and prism:sssFallback (default PRISM_SSS_FALLBACK).
         rendererOptions.materials.sssFallback = o.sssFallback;
-        prism::RendererContext renderer(rendererOptions);
+        // The renderer (its context: colour, materials, textures, Embree,
+        // logging and progress) and its public face.
+        const prism::Renderer api(std::make_shared<prism::RendererContext>(rendererOptions));
+        prism::RendererContext& renderer = *api.context();
         // Loading phases (materials, textures) report to the renderer's model,
         // and its diagnostics go to standard error, also from this thread.
         progress.SetModel(&renderer.progress());
@@ -944,20 +818,25 @@ int runStandaloneCli(int argc, char** argv) {
         // and templates through (as in the Hydra delegate).
         mdl::Context& context = prism::materials::SharedMdlContext();
         if (!context.is_valid()) throw std::runtime_error(context.get_error());
-        SceneManager scene(device.value, colorManagement);
-        const std::string libraryPath = renderer.options().materials.materialxLibraries;
-        const std::string mdlPath = renderer.options().materials.materialxMdlPath;
-        std::unique_ptr<Mesh> mesh;
+        // The scene, through the public API: the loaders add to it and its
+        // commit converts meshes, compiles materials and builds the
+        // acceleration structure.
+        prism::SceneOptions sceneOptions;
         // Subdivision surfaces and load-time displacement (USD meshes; OBJ
         // faces their MTL disp displaces).
-        prism::mesh::SubdivisionSettings subdivision;
-        subdivision.level = prism::defaults::ClampSubdivisionLevel(o.subdivisionLevel);
-        subdivision.maxFaces = size_t(prism::defaults::ClampFaces(o.subdivisionMaxFaces));
-        subdivision.budgetFaces = size_t(prism::defaults::ClampFaces(o.subdivisionBudgetFaces));
-        subdivision.displacementLevel = prism::defaults::ClampSubdivisionLevel(o.displacementLevel);
-        subdivision.displacementMaxFaces = size_t(prism::defaults::ClampFaces(o.displacementMaxFaces));
+        sceneOptions.subdivisionLevel = prism::defaults::ClampSubdivisionLevel(o.subdivisionLevel);
+        sceneOptions.subdivisionMaxFaces = uint64_t(prism::defaults::ClampFaces(o.subdivisionMaxFaces));
+        sceneOptions.subdivisionBudgetFaces = uint64_t(prism::defaults::ClampFaces(o.subdivisionBudgetFaces));
+        sceneOptions.displacementLevel = prism::defaults::ClampSubdivisionLevel(o.displacementLevel);
+        sceneOptions.displacementMaxFaces = uint64_t(prism::defaults::ClampFaces(o.displacementMaxFaces));
+        // A scene with no lights, emissive geometry or environment would render
+        // black: usdview's default dome, which the Hydra delegate applies by
+        // the same rule (scene_bridge.cpp _ApplyDefaultDome).
+        sceneOptions.defaultDome = o.defaultDome;
+        if (o.defaultDome) sceneOptions.defaultDomeTexture = DefaultDomeTexture();
+        prism::Scene scene = api.createScene(sceneOptions);
         if (isUsd) {
-            USDMesh::LoadOptions load;
+            prism::usd::LoadOptions load;
             if (job) {
                 load.bindingPurposes.assign(job->materialBindingPurposes.begin(), job->materialBindingPurposes.end());
                 // includedPurposes: default geometry always renders; without
@@ -966,189 +845,53 @@ int runStandaloneCli(int argc, char** argv) {
                 if (load.includedPurposes.empty()) load.includedPurposes.push_back(UsdGeomTokens->default_);
             }
             load.time = time;
-            load.subdivision = subdivision;
-            load.renderer = renderer.options();
-            load.materials = renderer.materialSettings();
-            mesh = std::make_unique<USDMesh>(stage, &context, libraryPath, mdlPath, std::move(load));
+            // --env and --env-color replace the scene's domes.
+            load.domes = !o.environmentColor && o.environment.empty();
+            if (prism::usd::Load(scene, stage, load).renderablePlacements() == 0)
+                throw std::runtime_error("Scene contains no renderable geometry");
         }
-        else if (extension == ".gltf" || extension == ".glb") {
-            mesh = std::make_unique<glTFMesh>(o.scene, &context, libraryPath, mdlPath, renderer.materialSettings());
-        }
+        else if (extension == ".gltf" || extension == ".glb")
+            prism::gltf::Load(scene, o.scene);
         else if (extension == ".obj")
-            mesh = std::make_unique<ObjMesh>(o.scene, &context, libraryPath, mdlPath, renderer.materialSettings(),
-                                             subdivision);
+            prism::obj::Load(scene, o.scene);
         else throw std::runtime_error("Unsupported scene format: " + extension);
-        const auto usdMesh = dynamic_cast<USDMesh*>(mesh.get());
-        if (usdMesh ? usdMesh->renderablePlacementCount() == 0
-                    : (mesh->vertices.empty() || mesh->indices.empty()))
-            throw std::runtime_error("Scene contains no renderable geometry");
-        SceneRelease release{scene};
-        release.mesh = mesh.get();
-        if (usdMesh) prism::usd::AttachImportedMesh(scene, *usdMesh);
-        else scene.attachMesh(mesh.get());
-        scene.max_depth = o.depth;
-        scene.rr_min_depth = o.roulette;
-        scene.environmentSampling = o.environmentSampling == "mis";
-        scene.textureFiltering = o.textureFiltering == "bilinear" ? prism::TextureFiltering::Bilinear : prism::TextureFiltering::Filtered;
-        scene.honorDoubleSided = o.honorDoubleSided;
-        scene.textureStreaming = o.textureStreaming;
-        scene.gpuTextureBudgetMiB = prism::defaults::ClampGpuTextureBudgetMiB(o.gpuTextureBudgetMiB);
-        ColorTexture black(Color3(0));
-        ConstantColorBackground background(&black);
-        std::unique_ptr<ImageTexture<Color3>> envImage;
-        std::unique_ptr<Environment> env;
-        std::unique_ptr<ColorTexture> domeColor;
-        scene.environment = &background;
         if (o.environmentColor) {
-            domeColor = std::make_unique<ColorTexture>(colorManagement->FromRec709(*o.environmentColor) * std::exp2(o.exposure));
-            env = std::make_unique<ConstantColorBackground>(domeColor.get());
-            scene.environment = env.get();
+            // A constant dome of that radiance (linear Rec.709), times 2^--env-exposure.
+            prism::EnvironmentDesc environment;
+            environment.kind = prism::EnvironmentDesc::Kind::Constant;
+            environment.color = *o.environmentColor;
+            environment.exposure = o.exposure;
+            scene.addEnvironment(environment);
         } else if (!o.environment.empty()) {
             if (!std::filesystem::exists(o.environment)) throw std::runtime_error("Environment does not exist: " + o.environment);
-            envImage = std::make_unique<ImageTexture<Color3>>(o.environment, prism::color::kLightColorSpace,
-                                                              colorManagement);
-            envImage->adjustExposure(o.exposure);
             // As an untransformed USD dome of the file at intensity 1: the
             // texels times 2^--env-exposure.
-            env = std::make_unique<EnvironmentMap>(envImage.get(), Color3(1.0f), *colorManagement);
-            scene.environment = env.get();
+            prism::EnvironmentDesc environment;
+            environment.kind = prism::EnvironmentDesc::Kind::LatLong;
+            environment.texture = o.environment;
+            environment.textureColorSpace = prism::color::kLightColorSpace;
+            environment.colorSpace.clear(); // the multiplier 1, in the working space
+            environment.exposure = o.exposure;
+            scene.addEnvironment(environment);
         }
-        std::vector<std::unique_ptr<Texture<Color3>>> domeTextures;
-        std::vector<std::unique_ptr<Environment>> domes;
-        LightLinks links;
-        if (stage) {
-            UsdGeomXformCache transforms(time);
-            const bool useDomes = !o.environmentColor && o.environment.empty();
-            for (const auto& prim : stage->Traverse()) {
-                if (!prim.HasAPI<UsdLuxLightAPI>()) continue;
-                if (UsdGeomImageable(prim).ComputeVisibility(time) == UsdGeomTokens->invisible) continue;
-                UsdLuxLightAPI light(prim);
-                GfVec3f color(1); float intensity = 1, exposure = 0;
-                light.GetColorAttr().Get(&color, time); light.GetIntensityAttr().Get(&intensity, time);
-                light.GetExposureAttr().Get(&exposure, time);
-                bool enableTemperature = false; float temperature = 6500.0f;
-                light.GetEnableColorTemperatureAttr().Get(&enableTemperature, time);
-                light.GetColorTemperatureAttr().Get(&temperature, time);
-                if (enableTemperature) color = GfCompMult(color, UsdLuxBlackbodyTemperatureAsRgb(temperature));
-                const GfMatrix4d world = transforms.GetLocalToWorldTransform(prim);
-                const bool isDome = prim.IsA<UsdLuxDomeLight>() || prim.IsA<UsdLuxDomeLight_1>();
-                if (isDome) {
-                    if (!useDomes) continue;
-                    const Color3 multiplier = colorManagement->FromRec709(Float3(color[0], color[1], color[2])) *
-                        (intensity*std::exp2(exposure));
-                    SdfAssetPath asset;
-                    const UsdAttribute file = prim.GetAttribute(UsdLuxTokens->inputsTextureFile);
-                    file.Get(&asset, time);
-                    const std::string texturePath = ResolvedLightTexture(asset);
-                    // As in the Hydra delegate: a white dome.
-                    if (!asset.GetAssetPath().empty() && texturePath.empty())
-                        std::cerr << "PrismRT: could not resolve dome texture '" << asset.GetAssetPath()
-                                  << "'; the dome is white\n";
-                    if (!texturePath.empty())
-                        domeTextures.push_back(std::make_unique<ImageTexture<Color3>>(texturePath, TextureColorSpace(file),
-                                                                                      colorManagement));
-                    else domeTextures.push_back(std::make_unique<ColorTexture>(Color3(1)));
-                    const auto inverse = world.GetInverse();
-                    std::array<float,9> linear;
-                    for (int row=0; row<3; ++row) for (int col=0; col<3; ++col) linear[row*3+col] = float(inverse[col][row]);
-                    domes.push_back(std::make_unique<TransformedEnvironmentMap>(domeTextures.back().get(), multiplier, linear,
-                                                                                *colorManagement));
-                    light.GetDiffuseAttr().Get(&domes.back()->diffuseFactor, time);
-                    light.GetSpecularAttr().Get(&domes.back()->specularFactor, time);
-                    continue;
-                }
-                prism::LightParameters params;
-                if (prim.IsA<UsdLuxSphereLight>()) {
-                    params.shape = prism::LightShape::Sphere;
-                    UsdLuxSphereLight(prim).GetRadiusAttr().Get(&params.radius, time);
-                    UsdLuxSphereLight(prim).GetTreatAsPointAttr().Get(&params.treatAsPoint, time);
-                } else if (prim.IsA<UsdLuxRectLight>()) {
-                    params.shape = prism::LightShape::Rect;
-                    UsdLuxRectLight(prim).GetWidthAttr().Get(&params.width, time);
-                    UsdLuxRectLight(prim).GetHeightAttr().Get(&params.height, time);
-                } else if (prim.IsA<UsdLuxDiskLight>()) {
-                    params.shape = prism::LightShape::Disk;
-                    UsdLuxDiskLight(prim).GetRadiusAttr().Get(&params.radius, time);
-                } else if (prim.IsA<UsdLuxCylinderLight>()) {
-                    params.shape = prism::LightShape::Cylinder;
-                    UsdLuxCylinderLight(prim).GetRadiusAttr().Get(&params.radius, time);
-                    UsdLuxCylinderLight(prim).GetLengthAttr().Get(&params.length, time);
-                } else if (prim.IsA<UsdLuxDistantLight>()) {
-                    params.shape = prism::LightShape::Distant;
-                    UsdLuxDistantLight(prim).GetAngleAttr().Get(&params.angle, time);
-                } else {
-                    std::cerr << "PrismRT: light type '" << prim.GetTypeName() << "' is not supported; skipped\n";
-                    continue;
-                }
-                params.color = Color3(color[0], color[1], color[2]);
-                params.intensity = intensity;
-                params.exposure = exposure;
-                light.GetNormalizeAttr().Get(&params.normalize, time);
-                light.GetDiffuseAttr().Get(&params.diffuse, time);
-                light.GetSpecularAttr().Get(&params.specular, time);
-                params.shaping = ShapingParameters(prim, time);
-                // Hydra's light:cameraVisibility, which UsdImaging reads from
-                // the prim's `cameraVisibility` attribute.
-                if (const UsdAttribute visibility = prim.GetAttribute(TfToken("cameraVisibility")))
-                    visibility.Get(&params.cameraVisible, time);
-                std::array<double, 16> matrix{};
-                for (int row = 0; row < 4; ++row)
-                    for (int column = 0; column < 4; ++column) matrix[row * 4 + column] = world[row][column];
-                prism::SceneLight sceneLight = prism::MakeSceneLight(params, matrix, *colorManagement);
-                sceneLight.lightLinkBit = links.bit(light.GetLightLinkCollectionAPI(), false);
-                sceneLight.shadowLinkBit = links.bit(light.GetShadowLinkCollectionAPI(), true);
-                if (params.shape == prism::LightShape::Rect) {
-                    SdfAssetPath asset;
-                    const UsdAttribute file = UsdLuxRectLight(prim).GetTextureFileAttr();
-                    file.Get(&asset, time);
-                    if (const std::string texture = ResolvedLightTexture(asset); !texture.empty())
-                        sceneLight.texture = std::make_shared<ImageTexture<Color3>>(
-                            texture, TextureColorSpace(file), colorManagement);
-                }
-                scene.lights.push_back(std::move(sceneLight));
-            }
-            // Link masks of the placements, by the prims they place.
-            scene.lightLinking = links.active();
-            if (links.active() && usdMesh)
-                for (auto const& [id, ids] : usdMesh->attachedIds)
-                    scene.placement_link_masks[int(id)] = links.masks(ids.path);
-            if (domes.size() == 1) {
-                scene.environment = domes.front().get();
-            } else if (domes.size() > 1) {
-                std::vector<const Environment*> parts;
-                for (auto const& dome : domes) parts.push_back(dome.get());
-                env = std::make_unique<CompositeEnvironment>(std::move(parts), *colorManagement);
-                scene.environment = env.get();
-            }
-        }
+        prism::detail::SceneRenderSettings renderSettings;
+        renderSettings.maxDepth = o.depth;
+        renderSettings.rouletteDepth = o.roulette;
+        renderSettings.environmentSampling = o.environmentSampling == "mis";
+        renderSettings.textureFiltering = o.textureFiltering == "bilinear" ? prism::TextureFiltering::Bilinear
+                                                                          : prism::TextureFiltering::Filtered;
+        renderSettings.honorDoubleSided = o.honorDoubleSided;
+        renderSettings.textureStreaming = o.textureStreaming;
+        renderSettings.gpuTextureBudgetMiB = prism::defaults::ClampGpuTextureBudgetMiB(o.gpuTextureBudgetMiB);
+        prism::detail::SceneAccess::setRenderSettings(scene, renderSettings);
         progress.Stage("Building the scene");
-        scene.commitScene();
+        scene.commit();
         progress.Stage("");
-        // A scene with no lights, emissive geometry or environment would render
-        // black. Light it with usdview's default dome, which the Hydra delegate
-        // applies by the same rule (scene_bridge.cpp _ApplyDefaultDome).
-        if (o.defaultDome && scene.environment == &background && scene.lights.empty() &&
-            !prism::device::SceneHasEmitters(scene)) {
-            if (const std::string texture = DefaultDomeTexture(); texture.empty()) {
-                std::cerr << "PrismRT: the scene has no lights, emissive geometry or environment, and USD's "
-                             "default dome texture was not found; the image will be black (pass --env or "
-                             "--env-color)\n";
-            } else {
-                // As a USD dome (intensity 1, exposure 0, untransformed), like
-                // usdview's.
-                envImage = std::make_unique<ImageTexture<Color3>>(texture, prism::color::kLightColorSpace,
-                                                                  colorManagement);
-                env = std::make_unique<TransformedEnvironmentMap>(envImage.get(), Color3(1.0f),
-                                                                  std::array<float, 9>{1, 0, 0, 0, 1, 0, 0, 0, 1},
-                                                                  *colorManagement);
-                scene.environment = env.get();
-                std::cerr << "PrismRT: the scene has no lights, emissive geometry or environment; lighting it "
-                             "with USD's default dome (" << texture << "). --env, --env-color or "
-                             "--default-dome false override this\n";
-            }
-        }
+        // The committed scene the device renders (the session API takes over
+        // in migration step 4).
+        SceneManager& sceneManager = prism::detail::SceneAccess::committed(scene);
         if (const char* report = std::getenv("PRISM_GPU_PROGRAM_REPORT"); report && *report == '1') {
-            if (!prism::device::ReportGpuPrograms(scene, std::cout, renderer.varyingEmitters().get()))
+            if (!prism::device::ReportGpuPrograms(sceneManager, std::cout, renderer.varyingEmitters().get()))
                 std::cerr << "PrismRT: this build has no Vulkan device\n";
             return 0;
         }
@@ -1160,7 +903,7 @@ int runStandaloneCli(int argc, char** argv) {
         const auto deviceInfo = renderDevice->Info();
         std::cout << "Rendering on " << prism::device::ToString(deviceInfo.kind) << " device: "
                   << deviceInfo.name << '\n';
-        renderDevice->SceneChanged(scene);
+        renderDevice->SceneChanged(sceneManager);
         const double loadSeconds = seconds();
         using prism::output::AovKind;
         double renderSeconds = 0, meanSamples = o.samples, fractionAtMaxSamples = 1.0;
@@ -1233,7 +976,7 @@ int runStandaloneCli(int argc, char** argv) {
                     progress.BeginRender(&imageProgress, o.adaptiveThreshold > 0,
                         views.size() > 1 ? "view " + std::to_string(index + 1) + "/" + std::to_string(views.size()) : "",
                         imageRequest.timeLimitSeconds);
-                    rendered.push_back({AovKind::Color, 3, renderDevice->RenderImage(scene, imageRequest)});
+                    rendered.push_back({AovKind::Color, 3, renderDevice->RenderImage(sceneManager, imageRequest)});
                     // Applied after the sample clamp, as in every render loop;
                     // adaptive sampling measures its error relative to the
                     // image's brightness, so scaling afterwards is the same.
@@ -1284,25 +1027,24 @@ int runStandaloneCli(int argc, char** argv) {
                 for (AovKind kind : geometric)
                     planes.push_back({kind, prism::output::AovComponents(kind),
                         std::vector<float>(size_t(width) * height * prism::output::AovComponents(kind))});
-                const bool culling = scene.cullsBackFaces();
+                const bool culling = sceneManager.cullsBackFaces();
                 // Prim, element and instance ids (-1 on a miss): USD scenes
                 // number their placements as the Hydra delegate does; glTF
                 // and OBJ scenes are one prim of triangles.
                 auto resolveId = [&](AovKind kind, RayHit const& hit) -> float {
                     if (hit.geomid == int(RTC_INVALID_GEOMETRY_ID)) return -1.0f;
-                    if (!usdMesh)
+                    if (!isUsd)
                         return kind == AovKind::PrimId ? 0.0f : kind == AovKind::ElementId ? float(hit.primid) : -1.0f;
-                    auto found = usdMesh->attachedIds.find(unsigned(hit.geomid));
-                    if (found == usdMesh->attachedIds.end()) return -1.0f;
-                    auto const& ids = found->second;
-                    if (kind == AovKind::PrimId) return float(ids.primId);
-                    if (kind == AovKind::InstanceId) return float(ids.instanceId);
-                    return hit.primid >= 0 && size_t(hit.primid) < ids.coarseFaces.size()
-                        ? float(ids.coarseFaces[size_t(hit.primid)]) : -1.0f;
+                    auto const* ids = prism::detail::SceneAccess::placement(scene, unsigned(hit.geomid));
+                    if (!ids) return -1.0f;
+                    if (kind == AovKind::PrimId) return float(ids->primId);
+                    if (kind == AovKind::InstanceId) return float(ids->instanceId);
+                    return hit.primid >= 0 && size_t(hit.primid) < ids->coarseFaces.size()
+                        ? float(ids->coarseFaces[size_t(hit.primid)]) : -1.0f;
                 };
                 tbb::parallel_for(0u, height, [&](unsigned y) {
                     for (unsigned x = 0; x < width; ++x) {
-                        const RayHit hit = scene.castRayCulled(prism::MakeCameraRayWithLens(rays.parameters,
+                        const RayHit hit = sceneManager.castRayCulled(prism::MakeCameraRayWithLens(rays.parameters,
                             float(x) + 0.5f, float(y) + 0.5f, width, height, nullptr), culling);
                         for (auto& plane : planes) {
                             float* values = plane.pixels.data() + (size_t(y) * width + x) * plane.components;

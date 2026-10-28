@@ -2,8 +2,7 @@
 // generated MDL HLSL code next to a summary.
 //   prism_gpu_codegen_dump <scene.usd> <output-directory>
 #include "../src/device/gpu/gpu_scene.h"
-#include "../src/mesh/usd_mesh.h"
-#include "../src/scene.h"
+#include "scene_api_test_util.h"
 
 #include <cstdlib>
 #include <fstream>
@@ -18,19 +17,10 @@ int main(int argc, char** argv)
     using namespace prism::device::gpu;
     const std::filesystem::path output(argv[2]);
     std::filesystem::create_directories(output);
-    mdl::Context context;
-    if (!context.is_valid()) { std::cerr << context.get_error() << '\n'; return 1; }
-    RTCDevice device = rtcNewDevice(nullptr);
     {
-        SceneManager scene(device, prism::color::ColorManagement::Create({}));
-        const char* libraries = std::getenv("PRISM_MATERIALX_LIBRARY_PATH");
-        const std::string libraryPath = libraries ? libraries : "";
-        USDMesh mesh(argv[1], &context, libraryPath, libraryPath + "/mdl");
-        prism::usd::AttachImportedMesh(scene, mesh);
-        ColorTexture black(Color3(0.0f));
-        ConstantColorBackground background(&black);
-        scene.environment = &background;
-        scene.commitScene();
+        const prism::Renderer renderer(prism::test::TestRendererOptions());
+        prism::Scene api = renderer.createScene();
+        SceneManager& scene = prism::test::LoadUsd(api, argv[1]);
 
         GpuSceneData data = BuildGpuScene(scene);
         std::cout << "prototypes " << data.prototypes.size() << ", instances " << data.instances.size()
@@ -52,6 +42,5 @@ int main(int argc, char** argv)
         for (auto const& m : code.materials)
             if (!m.valid) std::cout << "  invalid: " << m.error << '\n';
     }
-    rtcReleaseDevice(device);
     return 0;
 }

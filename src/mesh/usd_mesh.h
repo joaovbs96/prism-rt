@@ -98,6 +98,8 @@
 PXR_NAMESPACE_USING_DIRECTIVE
 namespace mx = MaterialX;
 
+#include <prism/scene.h>
+
 // internal deps
 #include "../geometry.h"
 #include "../hydra/fallback_material.h"
@@ -110,7 +112,8 @@ namespace mx = MaterialX;
 #include "../materialx/preview_surface.h"
 #include "../render_defaults.h"
 #include "mesh_conversion.h"
-#include "../scene.h"
+#include "../scene/scene_internal.h"
+#include "../usd/gf_convert.h"
 #include "../usd/usd_mesh_source.h"
 
 // ============================================================================
@@ -478,196 +481,6 @@ inline std::optional<prism::usd::UsdMeshSource> ImplicitMeshSource(pxr::UsdPrim 
     return source;
 }
 
-inline pxr::VtVec3fArray FloatPoints(pxr::VtValue const& value)
-{
-    if (value.IsHolding<pxr::VtVec3fArray>()) return value.UncheckedGet<pxr::VtVec3fArray>();
-    pxr::VtVec3fArray result;
-    if (value.IsHolding<pxr::VtVec3dArray>())
-        for (auto const& p : value.UncheckedGet<pxr::VtVec3dArray>()) result.push_back(pxr::GfVec3f(p));
-    return result;
-}
-
-template<class Vec>
-inline pxr::VtArray<Vec> FloatVectors(pxr::VtValue const& value)
-{
-    using Double = std::conditional_t<std::is_same_v<Vec, pxr::GfVec2f>, pxr::GfVec2d, pxr::GfVec3d>;
-    if (value.IsHolding<pxr::VtArray<Vec>>()) return value.UncheckedGet<pxr::VtArray<Vec>>();
-    pxr::VtArray<Vec> result;
-    if (value.IsHolding<pxr::VtArray<Double>>())
-        for (auto const& v : value.UncheckedGet<pxr::VtArray<Double>>()) result.push_back(Vec(v));
-    return result;
-}
-
-/// Transform and normalize a normal vector.
-inline Float3 TransformNormal(const pxr::GfVec3f& n, const pxr::GfMatrix4d& normalMatrix, bool flip)
-{
-    pxr::GfVec3d nd(n[0], n[1], n[2]);
-    pxr::GfVec3d tn = normalMatrix.TransformDir(nd);
-    if (flip) tn = -tn;
-    double len = tn.GetLength();
-    if (len > 0.0) tn /= len;
-    return Float3(static_cast<float>(tn[0]), static_cast<float>(tn[1]), static_cast<float>(tn[2]));
-}
-
-// Fan triangulation of a face given its corner vertex indices; leftHanded
-// faces swap the winding.
-inline void Triangulate(std::vector<unsigned int>& out, const std::vector<unsigned int>& corners, bool leftHanded)
-{
-    const int count = static_cast<int>(corners.size());
-    for (int i = 1; i + 1 < count; ++i) {
-        out.push_back(corners[0]);
-        out.push_back(corners[leftHanded ? i + 1 : i]);
-        out.push_back(corners[leftHanded ? i : i + 1]);
-    }
-}
-
-// The standalone loader's polygon conversion of a mesh that does not refine:
-// fan triangulation, a vertex per point unless a primvar varies per face or
-// face corner (then one per corner). Positions and normals are transformed by
-// `world` (identity: prototype space). Normals follow Hydra's conversion:
-// generated ones face along the authored winding (leftHanded flips them,
-// authored normals too), and a mirroring transform turns them with the
-// triangles (SceneManager flips placed prototypes the same way). Returns the
-// mesh's coarse face per triangle, or nothing when no triangle is left.
-inline bool BuildPolygonMesh(prism::usd::UsdMeshSource const& source, pxr::GfMatrix4d const& world,
-                             Mesh& out, std::vector<int>& coarseFaces)
-{
-    using pxr::UsdGeomTokens;
-    const pxr::VtVec3fArray points = FloatPoints(source.points.value);
-    pxr::VtIntArray const& counts = source.faceVertexCounts;
-    pxr::VtIntArray const& indices = source.faceVertexIndices;
-    if (points.empty() || counts.empty()) return false;
-    const bool leftHanded = source.orientation == pxr::TfToken("leftHanded");
-    const pxr::GfMatrix4d normalMatrix = world.GetInverse().GetTranspose();
-    const bool mirrored = world.GetDeterminant() < 0.0;
-    std::unordered_set<int> holes(source.holeIndices.begin(), source.holeIndices.end());
-    // Faces with a valid winding: three corners or more, inside the arrays.
-    std::vector<uint8_t> valid(counts.size(), 0);
-    {
-        size_t corner = 0;
-        for (size_t face = 0; face < counts.size(); ++face) {
-            const int count = counts[face];
-            bool ok = count >= 3 && corner + size_t(count) <= indices.size() && !holes.count(int(face));
-            for (int k = 0; ok && k < count; ++k)
-                ok = indices[corner + k] >= 0 && size_t(indices[corner + k]) < points.size();
-            valid[face] = ok;
-            corner += size_t(std::max(0, count));
-        }
-    }
-    const std::vector<prism::mesh::NamedPrimvar> extras =
-        prism::mesh::NamedPrimvars(source.View(), points.size(), counts.size(), indices.size());
-    const pxr::VtVec2fArray uvs = FloatVectors<pxr::GfVec2f>(source.uvs.value);
-    const pxr::VtVec3fArray normals = FloatVectors<pxr::GfVec3f>(source.normals.value);
-    const pxr::TfToken& uvInterpolation = source.uvs.interpolation;
-    const pxr::TfToken& normalInterpolation = source.normals.interpolation;
-    auto perCorner = [](pxr::TfToken const& interpolation) {
-        return interpolation == UsdGeomTokens->faceVarying || interpolation == UsdGeomTokens->uniform;
-    };
-    bool expand = (!uvs.empty() && perCorner(uvInterpolation)) ||
-        (!normals.empty() && perCorner(normalInterpolation));
-    for (auto const& extra : extras)
-        expand |= extra.interpolation == prism::mesh::Interpolation::FaceVarying ||
-            extra.interpolation == prism::mesh::Interpolation::Uniform;
-
-    // Area-weighted per-point normals of the authored winding.
-    std::vector<pxr::GfVec3f> generated(points.size(), pxr::GfVec3f(0.f));
-    {
-        size_t corner = 0;
-        for (size_t face = 0; face < counts.size(); ++face) {
-            const int count = counts[face];
-            if (valid[face]) {
-                const int i0 = indices[corner], i1 = indices[corner + 1], i2 = indices[corner + 2];
-                pxr::GfVec3f fn = (points[i1] - points[i0]) ^ (points[i2] - points[i0]);
-                if (leftHanded) fn = -fn;
-                for (int k = 0; k < count; ++k) generated[indices[corner + k]] += fn;
-            }
-            corner += size_t(std::max(0, count));
-        }
-        for (auto& n : generated) {
-            const float length = n.GetLength();
-            n = length > 0.f ? n / length : pxr::GfVec3f(0.f, 1.f, 0.f);
-        }
-    }
-    // The shading normal at a corner: authored where it is usable (negated
-    // for leftHanded meshes), otherwise generated.
-    auto normalAt = [&](size_t point, size_t corner, size_t face) {
-        const size_t index = prism::usd::PrimvarIndex(normalInterpolation, point, corner, face);
-        if (index < normals.size()) {
-            const pxr::GfVec3f& n = normals[index];
-            const float lengthSq = n.GetLengthSq();
-            if (lengthSq > 1e-20f && std::isfinite(lengthSq))
-                return TransformNormal(leftHanded ? -n : n, normalMatrix, mirrored);
-        }
-        return TransformNormal(generated[point], normalMatrix, mirrored);
-    };
-    auto uvAt = [&](size_t point, size_t corner, size_t face) {
-        const size_t index = prism::usd::PrimvarIndex(uvInterpolation, point, corner, face);
-        return index < uvs.size() ? Float2(uvs[index][0], uvs[index][1]) : Float2(0.f, 0.f);
-    };
-    int stride = 0;
-    for (auto const& extra : extras) {
-        out.primvars.push_back({extra.name, extra.components, stride});
-        stride += extra.components;
-    }
-    out.primvarStride = stride;
-    auto appendExtras = [&](size_t point, size_t corner, size_t face) {
-        for (auto const& extra : extras) {
-            const size_t n = size_t(extra.components);
-            const size_t element = extra.interpolation == prism::mesh::Interpolation::Constant ? 0
-                : prism::mesh::PrimvarIndex(extra.interpolation, point, corner, face);
-            out.primvarValues.insert(out.primvarValues.end(), extra.values.begin() + element * n,
-                                     extra.values.begin() + (element + 1) * n);
-        }
-    };
-    auto position = [&](size_t point) {
-        const pxr::GfVec3d p = world.Transform(pxr::GfVec3d(points[point][0], points[point][1], points[point][2]));
-        return Float3(static_cast<float>(p[0]), static_cast<float>(p[1]), static_cast<float>(p[2]));
-    };
-
-    std::vector<unsigned int> corners;
-    size_t corner = 0;
-    if (expand) {
-        for (size_t face = 0; face < counts.size(); ++face) {
-            const int count = counts[face];
-            if (valid[face]) {
-                corners.clear();
-                for (int k = 0; k < count; ++k) {
-                    const size_t point = size_t(indices[corner + k]);
-                    corners.push_back(static_cast<unsigned int>(out.vertices.size()));
-                    out.vertices.push_back(position(point));
-                    out.texcoords.push_back(uvAt(point, corner + k, face));
-                    out.normals.push_back(normalAt(point, corner + k, face));
-                    if (stride) appendExtras(point, corner + k, face);
-                }
-                const size_t before = out.indices.size();
-                Triangulate(out.indices, corners, leftHanded);
-                coarseFaces.insert(coarseFaces.end(), (out.indices.size() - before) / 3, int(face));
-            }
-            corner += size_t(std::max(0, count));
-        }
-    } else {
-        out.vertices.reserve(points.size());
-        for (size_t point = 0; point < points.size(); ++point) {
-            out.vertices.push_back(position(point));
-            out.normals.push_back(normalAt(point, 0, 0));
-            out.texcoords.push_back(uvAt(point, 0, 0));
-            if (stride) appendExtras(point, 0, 0);
-        }
-        for (size_t face = 0; face < counts.size(); ++face) {
-            const int count = counts[face];
-            if (valid[face]) {
-                corners.assign(indices.begin() + corner, indices.begin() + corner + count);
-                const size_t before = out.indices.size();
-                Triangulate(out.indices, corners, leftHanded);
-                coarseFaces.insert(coarseFaces.end(), (out.indices.size() - before) / 3, int(face));
-            }
-            corner += size_t(std::max(0, count));
-        }
-    }
-    out.single_sided_all = source.doubleSided ? !*source.doubleSided : true;
-    return !out.indices.empty();
-}
-
 } // namespace prism::usd_detail
 
 // ============================================================================
@@ -689,10 +502,9 @@ public:
         // Purposes rendered besides default (UsdRenderSettings
         // includedPurposes); empty: render.
         std::vector<pxr::TfToken> includedPurposes;
-        prism::mesh::SubdivisionSettings subdivision = DefaultSubdivision();
         // The renderer's options for the material service (compile policy,
         // workers, cache directory); its MaterialX paths are the
-        // constructor's. Default: the environment's, as for the subdivision.
+        // constructor's. Default: the environment's.
         prism::RendererOptions renderer = prism::RendererOptions::FromEnvironment();
         // The colour management materials convert into, the SSS fallback and
         // the cache directory (the renderer's). Without a colour management:
@@ -700,45 +512,11 @@ public:
         prism::MaterialSettings materials;
     };
 
-    static prism::mesh::SubdivisionSettings DefaultSubdivision()
-    {
-        auto const& defaults = prism::defaults::FromEnvironment();
-        prism::mesh::SubdivisionSettings result;
-        result.level = defaults.subdivisionLevel;
-        result.maxFaces = size_t(defaults.subdivisionMaxFaces);
-        result.displacementLevel = defaults.displacementLevel;
-        result.displacementMaxFaces = size_t(defaults.displacementMaxFaces);
-        result.budgetFaces = size_t(defaults.subdivisionBudgetFaces);
-        return result;
-    }
-
-    // What the render products and light linking need to know about an
-    // attached placement (by Embree geometry id).
+    // What the id AOVs and light linking need to know about a placement.
     struct PlacementIds {
         int primId = -1;
         int instanceId = -1;
-        prism::mesh::SharedFaceTable coarseFaces; // elementId per triangle (empty: the triangle)
         pxr::SdfPath path;                        // the prim (an instance proxy for native instances)
-    };
-    std::unordered_map<unsigned, PlacementIds> attachedIds;
-
-    struct AttachedSphere {
-        unsigned int id;
-        Sphere* geometry;
-        pxr::GfMatrix4d world;
-        Material* material;
-        PlacementIds ids;
-        std::shared_ptr<const InstancePrimvars> instancePrimvars;
-    };
-    struct AttachedMesh {
-        unsigned int id;
-        Mesh* mesh;
-        bool instanced;               // an Embree instance of the prototype mesh at `world`
-        pxr::GfMatrix4d world;
-        Material* material;
-        std::shared_ptr<const std::unordered_map<int, Material*>> triangleMaterials;
-        PlacementIds ids;
-        std::shared_ptr<const InstancePrimvars> instancePrimvars;
     };
 
     size_t sphereCount() const { return m_spherePlacements.size(); }
@@ -752,66 +530,84 @@ public:
         return count;
     }
 
-    // Spheres retain their local analytic shape. Affine Embree instances also
-    // represent nonuniformly scaled spheres without baking or tessellating them.
-    std::vector<AttachedSphere> attachSphereInstances(RTCDevice device, RTCScene target) {
-        std::vector<AttachedSphere> result;
-        for (const auto& placement : m_spherePlacements) {
-            if (!placement.enabled) continue;
-            auto& prototype = m_spherePrototypes[placement.radius];
-            if (!prototype) prototype = std::make_unique<SpherePrototype>(device, placement.radius);
-            RTCGeometry instance = rtcNewGeometry(device, RTC_GEOMETRY_TYPE_INSTANCE);
-            rtcSetGeometryInstancedScene(instance, prototype->scene);
-            float matrix[16];
-            for (int c=0; c<4; ++c) for (int r=0; r<4; ++r)
-                matrix[c*4+r] = float(placement.world[c][r]);
-            rtcSetGeometryTransform(instance, 0, RTC_FORMAT_FLOAT4X4_COLUMN_MAJOR, matrix);
-            rtcCommitGeometry(instance);
-            const unsigned id = rtcAttachGeometry(target, instance);
-            rtcReleaseGeometry(instance);
-            result.push_back({id, &prototype->geometry, placement.world,
-                material_override ? material_override : placement.material,
-                placement.ids, placement.instancePrimvars});
-        }
-        return result;
-    }
+    // Light and shadow link categories of a placement's prim (its light and
+    // shadow categories).
+    using LinkCategories = std::function<void(pxr::SdfPath const&, std::vector<std::string>*,
+                                              std::vector<std::string>*)>;
 
-    // Mesh placements: world-space meshes are attached directly, prototypes
-    // once each into a scene of their own that their placements instance.
-    std::vector<AttachedMesh> attachMeshPlacements(RTCDevice device, RTCScene target) {
-        std::vector<AttachedMesh> result;
-        for (const auto& placement : m_meshPlacements) {
-            if (!placement.enabled) continue;
-            Shape& shape = *m_shapes[placement.shape];
-            if (!shape.mesh) continue;
-            Material* material = material_override ? material_override : placement.material;
-            if (!shape.instanced) {
-                const unsigned id = shape.mesh->setupEmbree(device, target);
-                result.push_back({id, shape.mesh.get(), false, pxr::GfMatrix4d(1.0), material,
-                    material_override ? nullptr : placement.triangleMaterials, placement.ids,
-                    placement.instancePrimvars});
-                continue;
+    // Adds the loaded prims to `scene` (src/usd/usd_loader.cpp): the
+    // materials, a mesh per shape (one per prim; instanced prims share it), an
+    // instance per placement in traversal order, and the analytic spheres (a
+    // prototype per radius). The scene's commit converts them as this loader
+    // did: polygon meshes baked into world space, refined, displaced and
+    // instanced meshes as prototypes placed by Embree instances.
+    void emit(prism::Scene& scene, LinkCategories const& categories)
+    {
+        std::map<Material const*, prism::MaterialId> ids;
+        auto idOf = [&](Material* material) -> prism::MaterialId {
+            if (!material) return {};
+            auto [found, added] = ids.try_emplace(material);
+            if (added) {
+                auto owned = m_ownedByPointer.find(material);
+                std::shared_ptr<Material> shared = owned != m_ownedByPointer.end()
+                    ? owned->second : std::shared_ptr<Material>(std::shared_ptr<Material>(), material);
+                found->second = prism::detail::SceneAccess::addCompiledMaterial(scene, std::move(shared), "");
             }
-            if (!shape.scene) {
-                shape.scene = rtcNewScene(device);
-                shape.mesh->setupEmbree(device, shape.scene);
-                rtcCommitScene(shape.scene);
-            }
-            RTCGeometry instance = rtcNewGeometry(device, RTC_GEOMETRY_TYPE_INSTANCE);
-            rtcSetGeometryInstancedScene(instance, shape.scene);
-            float matrix[16];
-            // GfMatrix uses row vectors; Embree's column-major affine convention.
-            for (int c = 0; c < 4; ++c) for (int r = 0; r < 4; ++r)
-                matrix[c * 4 + r] = float(placement.world[c][r]);
-            rtcSetGeometryTransform(instance, 0, RTC_FORMAT_FLOAT4X4_COLUMN_MAJOR, matrix);
-            rtcCommitGeometry(instance);
-            const unsigned id = rtcAttachGeometry(target, instance);
-            rtcReleaseGeometry(instance);
-            result.push_back({id, shape.mesh.get(), true, placement.world, material,
-                material_override ? nullptr : placement.triangleMaterials, placement.ids,
-                placement.instancePrimvars});
+            return found->second;
+        };
+        std::vector<prism::MeshId> meshes(m_shapes.size());
+        for (size_t i = 0; i < m_shapes.size(); ++i) {
+            Shape const& shape = *m_shapes[i];
+            if (!shape.source) continue;
+            meshes[i] = scene.addMesh(MeshDescOf(shape));
         }
-        return result;
+        auto instanceOf = [&](PlacementIds const& ids, pxr::GfMatrix4d const& world,
+                              std::shared_ptr<const InstancePrimvars> const& primvars) {
+            prism::InstanceDesc instance;
+            instance.transform = prism::Constant(prism::usd::ToMatrix4d(world));
+            instance.primId = ids.primId;
+            instance.instanceId = ids.instanceId;
+            if (primvars)
+                for (auto const& value : primvars->values) {
+                    auto data = std::make_shared<std::vector<float>>(value.value.begin(),
+                                                                     value.value.begin() + value.components);
+                    prism::Primvar primvar;
+                    primvar.name = value.name;
+                    primvar.interpolation = prism::Interpolation::Constant;
+                    primvar.data = prism::BufferView::Of(std::shared_ptr<const std::vector<float>>(data),
+                                                         uint32_t(value.components), prism::DataType::Float32);
+                    instance.primvars.push_back(std::move(primvar));
+                }
+            if (categories) categories(ids.path, &instance.lightLinkCategories, &instance.shadowLinkCategories);
+            return instance;
+        };
+        for (auto const& placement : m_meshPlacements) {
+            if (!meshes[placement.shape]) continue;
+            prism::InstanceDesc instance = instanceOf(placement.ids, placement.world, placement.instancePrimvars);
+            instance.prototype = meshes[placement.shape];
+            instance.materials.push_back(idOf(material_override ? material_override : placement.material));
+            if (!material_override)
+                for (Material* subset : placement.subsetMaterials) instance.materials.push_back(idOf(subset));
+            scene.addInstance(instance);
+        }
+        std::map<float, prism::SpheresId> spheres;
+        for (auto const& placement : m_spherePlacements) {
+            auto& prototype = spheres[placement.radius];
+            if (!prototype) {
+                prism::SpheresDesc desc;
+                auto center = std::make_shared<std::vector<float>>(3, 0.0f);
+                auto radius = std::make_shared<std::vector<float>>(1, placement.radius);
+                desc.centers = prism::Constant(prism::BufferView::Of(
+                    std::shared_ptr<const std::vector<float>>(center), 3, prism::DataType::Float32));
+                desc.radii = prism::BufferView::Of(std::shared_ptr<const std::vector<float>>(radius), 1,
+                                                   prism::DataType::Float32);
+                prototype = scene.addSpheres(desc);
+            }
+            prism::InstanceDesc instance = instanceOf(placement.ids, placement.world, placement.instancePrimvars);
+            instance.prototype = prototype;
+            instance.materials.push_back(idOf(material_override ? material_override : placement.material));
+            scene.addInstance(instance);
+        }
     }
 
     // Basic constructor — no MDL/MaterialX support, uses displayColor fallback
@@ -853,14 +649,6 @@ public:
         : m_bindingPurposes(options.bindingPurposes), m_options(std::move(options))
     {
         if (stage) load(stage, mdl_context, mx_libraries_path, mx_mdl_path);
-    }
-
-    ~USDMesh() override
-    {
-        for (auto& shape : m_shapes) {
-            if (shape->scene) rtcReleaseScene(shape->scene);
-            if (shape->mesh && shape->mesh->geom) rtcReleaseGeometry(shape->mesh->geom);
-        }
     }
 
 private:
@@ -924,6 +712,7 @@ private:
                 auto [id, added] = ids.try_emplace(material.get(), int(m_owned_materials.size()));
                 if (added) {
                     materials[id->second] = material.get();
+                    m_ownedByPointer.emplace(material.get(), material);
                     m_owned_materials.push_back(std::move(material));
                 }
                 m_mdl_material_lookup[path] = id->second;
@@ -943,48 +732,36 @@ private:
                           << " s, native JIT " << stats.nativeJitSeconds << " s\n";
         }
 
-        // ── Phase 2: Process geometry ──────────────────────────────────────
+        // ── Phase 2: Collect geometry (converted at the scene's commit) ────
         collectGeometry(stage);
-        convertShapes();
 
-        size_t triangles = 0, instanced = 0;
-        for (auto const& placement : m_meshPlacements) {
-            if (!placement.enabled || !m_shapes[placement.shape]->mesh) continue;
-            triangles += m_shapes[placement.shape]->mesh->indices.size() / 3;
-            instanced += m_shapes[placement.shape]->instanced;
-        }
+        size_t instanced = 0;
+        for (auto const& placement : m_meshPlacements) instanced += m_shapes[placement.shape]->instanced;
         std::cout << "Finished processing USD file:\n"
                   << "    Mesh placements: " << m_meshPlacements.size() << " (" << instanced
                   << " instanced), spheres: " << m_spherePlacements.size() << "\n"
-                  << "    Total triangles: " << triangles << "\n"
                   << "    Total materials: " << materials.size() << "\n";
     }
 
     // ── Geometry ────────────────────────────────────────────────────────────
 
-    // One mesh conversion: a world-space polygon mesh, or a prototype shared
-    // by the placements of an instanced gprim (per displacing material).
+    // A mesh of the scene: a gprim's mesh source, shared by the placements
+    // of an instanced gprim (point instancing, native instances).
     struct Shape {
         pxr::UsdPrim prim;
-        std::optional<prism::usd::UsdMeshSource> source;
-        bool worldSpace = false;            // a single placement baked in world space
-        pxr::GfMatrix4d world{1.0};         // for worldSpace
-        Material const* displacer = nullptr;
-        // Results.
-        bool instanced = false;             // placed by Embree instances
-        std::unique_ptr<Mesh, prism::mesh::ConvertedMeshDeleter> mesh;
-        prism::mesh::SharedFaceTable coarseFaces;
-        prism::mesh::MeshConversionInfo info;
-        RTCScene scene = nullptr;
-        std::vector<size_t> refinementFaces;
-        int level = 0;
+        std::shared_ptr<const prism::usd::UsdMeshSource> source;
+        bool instanced = false;             // placed by Embree instances even with one placement
+        // GeomSubset slots by coarse face (0: the mesh's material; k: the k-th
+        // face subset, later subsets over earlier ones); empty: no subsets.
+        std::vector<int32_t> faceSlots;
     };
     struct MeshPlacement {
         size_t shape = 0;
         pxr::GfMatrix4d world{1.0};
         Material* material = nullptr;
-        std::shared_ptr<const std::unordered_map<int, Material*>> triangleMaterials;
-        std::shared_ptr<const std::unordered_map<int, Material*>> faceMaterials; // by coarse face
+        // The bound materials of the prim's face subsets (null: unbound), the
+        // material slots after the mesh's own.
+        std::vector<Material*> subsetMaterials;
         bool enabled = true;
         PlacementIds ids;
         std::shared_ptr<const InstancePrimvars> instancePrimvars;
@@ -1306,64 +1083,166 @@ private:
             }
         }
         int mat_id = static_cast<int>(materials.size());
-        auto texture = std::make_unique<ColorTexture>(color);
-        std::unique_ptr<Diffuse> material;
+        // The material with its texture, shared with the scene.
+        struct Fallback {
+            std::unique_ptr<ColorTexture> texture;
+            std::unique_ptr<Diffuse> material;
+        };
+        auto fallback = std::make_shared<Fallback>();
+        fallback->texture = std::make_unique<ColorTexture>(color);
         if (primvarColor || primvarOpacity || prism::hydra::NormalizeFallbackOpacity(opacity) < 1.0f)
-            material = std::make_unique<prism::hydra::FallbackMaterial>(texture.get(), opacity, primvarColor,
-                                                                        primvarOpacity);
+            fallback->material = std::make_unique<prism::hydra::FallbackMaterial>(fallback->texture.get(), opacity,
+                                                                                  primvarColor, primvarOpacity);
         else
-            material = std::make_unique<Diffuse>(texture.get());
-        materials[mat_id] = material.get();
-        m_owned_fallback_textures.push_back(std::move(texture));
-        m_owned_fallback_materials.push_back(std::move(material));
+            fallback->material = std::make_unique<Diffuse>(fallback->texture.get());
+        Material* material = fallback->material.get();
+        materials[mat_id] = material;
+        m_ownedByPointer.emplace(material, std::shared_ptr<Material>(fallback, material));
         m_fallbackByPath.emplace(prim.GetPath(), mat_id);
         return materials.at(mat_id);
     }
 
-    // GeomSubset material bindings of a mesh, by coarse face (faces outside
-    // the subsets keep the mesh's material).
-    std::shared_ptr<const std::unordered_map<int, Material*>> subsetMaterials(pxr::UsdPrim const& prim)
+    // The face GeomSubsets of a mesh, in order.
+    static std::vector<pxr::UsdGeomSubset> faceSubsets(pxr::UsdPrim const& prim)
     {
-        if (!prim.IsA<pxr::UsdGeomMesh>()) return nullptr;
-        auto faces = std::make_shared<std::unordered_map<int, Material*>>();
+        std::vector<pxr::UsdGeomSubset> result;
+        if (!prim.IsA<pxr::UsdGeomMesh>()) return result;
         for (pxr::UsdGeomSubset const& subset : pxr::UsdGeomSubset::GetAllGeomSubsets(pxr::UsdGeomImageable(prim))) {
             pxr::TfToken elementType;
             subset.GetElementTypeAttr().Get(&elementType);
-            if (elementType != pxr::UsdGeomTokens->face) continue;
-            Material* material = boundMaterial(subset.GetPrim());
-            if (!material) continue;
-            pxr::VtIntArray indices;
-            subset.GetIndicesAttr().Get(&indices, m_options.time);
-            for (int face : indices) if (face >= 0) (*faces)[face] = material;
+            if (elementType == pxr::UsdGeomTokens->face) result.push_back(subset);
         }
-        if (faces->empty()) return nullptr;
-        return faces;
+        return result;
     }
 
-    size_t shapeFor(pxr::UsdPrim const& prim, bool instanced, pxr::GfMatrix4d const& world,
-                    Material const* displacer)
+    // The bound materials of a placement's face subsets (faces outside the
+    // subsets, and those of unbound subsets, keep the mesh's material).
+    std::vector<Material*> subsetMaterials(pxr::UsdPrim const& prim)
+    {
+        std::vector<Material*> result;
+        for (pxr::UsdGeomSubset const& subset : faceSubsets(prim)) result.push_back(boundMaterial(subset.GetPrim()));
+        return result;
+    }
+
+    size_t shapeFor(pxr::UsdPrim const& prim, bool instanced)
     {
         if (instanced) {
-            auto key = std::make_pair(prim.GetPath(), displacer);
-            auto found = m_shapeIndex.find(key);
+            auto found = m_shapeIndex.find(prim.GetPath());
             if (found != m_shapeIndex.end()) return found->second;
-            m_shapeIndex.emplace(key, m_shapes.size());
+            m_shapeIndex.emplace(prim.GetPath(), m_shapes.size());
         }
         auto shape = std::make_unique<Shape>();
         shape->prim = prim;
-        shape->worldSpace = !instanced;
-        shape->world = world;
-        shape->displacer = displacer;
+        shape->instanced = instanced;
+        std::optional<prism::usd::UsdMeshSource> source;
         if (prim.IsA<pxr::UsdGeomMesh>()) {
-            shape->source = prism::usd_detail::MeshSourceFromUsd(pxr::UsdGeomMesh(prim), m_options.time,
-                                                                 skinnedPoints(prim));
-            if (!shape->source)
-                std::cerr << "[USDMesh] Missing required attributes on " << prim.GetPath() << "\n";
+            source = prism::usd_detail::MeshSourceFromUsd(pxr::UsdGeomMesh(prim), m_options.time, skinnedPoints(prim));
+            if (!source) std::cerr << "[USDMesh] Missing required attributes on " << prim.GetPath() << "\n";
         } else {
-            shape->source = prism::usd_detail::ImplicitMeshSource(prim, m_options.time);
+            source = prism::usd_detail::ImplicitMeshSource(prim, m_options.time);
+        }
+        if (source) {
+            const std::vector<pxr::UsdGeomSubset> subsets = faceSubsets(prim);
+            if (!subsets.empty()) {
+                shape->faceSlots.assign(source->faceVertexCounts.size(), 0);
+                for (size_t k = 0; k < subsets.size(); ++k) {
+                    pxr::VtIntArray indices;
+                    subsets[k].GetIndicesAttr().Get(&indices, m_options.time);
+                    for (int face : indices)
+                        if (face >= 0 && size_t(face) < shape->faceSlots.size()) shape->faceSlots[size_t(face)] = int32_t(k + 1);
+                }
+            }
+            shape->source = std::make_shared<const prism::usd::UsdMeshSource>(std::move(*source));
         }
         m_shapes.push_back(std::move(shape));
         return m_shapes.size() - 1;
+    }
+
+    // A shape's mesh for the scene: views of its Vt arrays, which the scene
+    // holds through the shared source.
+    static prism::MeshDesc MeshDescOf(Shape const& shape)
+    {
+        auto const& source = shape.source;
+        auto viewOf = [&](pxr::VtValue const& value) {
+            const prism::mesh::PrimvarView view = prism::usd::View(value);
+            prism::BufferView result;
+            using Type = prism::mesh::PrimvarView::Type;
+            if (view.type != Type::Float && view.type != Type::Double && view.type != Type::Int) return result;
+            result.data = view.data;
+            result.count = view.size;
+            result.components = uint32_t(view.components);
+            result.type = view.type == Type::Float ? prism::DataType::Float32
+                : view.type == Type::Double ? prism::DataType::Float64 : prism::DataType::Int32;
+            result.owner = std::shared_ptr<const void>(source, view.data);
+            return result;
+        };
+        // Points, normals and uvs as the conversions read them: arrays of 3
+        // (2) floats or doubles.
+        auto vectors = [&](pxr::VtValue const& value, int components) {
+            const prism::mesh::PrimvarView view = prism::usd::View(value);
+            return view.floatArray(components) || view.doubleArray(components) ? viewOf(value) : prism::BufferView{};
+        };
+        auto ints = [&](pxr::VtIntArray const& array) {
+            prism::BufferView result;
+            if (array.empty()) return result;
+            result.data = array.cdata();
+            result.count = array.size();
+            result.type = prism::DataType::Int32;
+            result.owner = std::shared_ptr<const void>(source, array.cdata());
+            return result;
+        };
+        auto floats = [&](pxr::VtFloatArray const& array) {
+            prism::BufferView result;
+            if (array.empty()) return result;
+            result.data = array.cdata();
+            result.count = array.size();
+            result.owner = std::shared_ptr<const void>(source, array.cdata());
+            return result;
+        };
+        auto interpolation = [](pxr::TfToken const& token) {
+            if (token == pxr::UsdGeomTokens->constant) return prism::Interpolation::Constant;
+            if (token == pxr::UsdGeomTokens->uniform) return prism::Interpolation::Uniform;
+            if (token == pxr::UsdGeomTokens->varying) return prism::Interpolation::Varying;
+            if (token == pxr::UsdGeomTokens->faceVarying) return prism::Interpolation::FaceVarying;
+            if (token == pxr::TfToken("instance")) return prism::Interpolation::Instance;
+            return prism::Interpolation::Vertex;
+        };
+        prism::MeshDesc desc;
+        desc.points = prism::Constant(vectors(source->points.value, 3));
+        desc.faceVertexCounts = ints(source->faceVertexCounts);
+        desc.faceVertexIndices = ints(source->faceVertexIndices);
+        desc.normals = vectors(source->normals.value, 3);
+        desc.normalsInterpolation = interpolation(source->normals.interpolation);
+        desc.uvs = vectors(source->uvs.value, 2);
+        desc.uvsInterpolation = interpolation(source->uvs.interpolation);
+        for (auto const& [name, data] : source->primvars) {
+            prism::BufferView view = viewOf(data.value);
+            if (view.empty()) continue;
+            desc.primvars.push_back({name.GetString(), interpolation(data.interpolation), std::move(view)});
+        }
+        auto& subdivision = desc.subdivision;
+        const pxr::TfToken& scheme = source->subdivisionScheme;
+        subdivision.scheme = scheme == pxr::UsdGeomTokens->catmullClark ? prism::SubdivisionDesc::Scheme::CatmullClark
+            : scheme == pxr::UsdGeomTokens->loop ? prism::SubdivisionDesc::Scheme::Loop
+            : scheme == pxr::UsdGeomTokens->bilinear ? prism::SubdivisionDesc::Scheme::Bilinear
+            : prism::SubdivisionDesc::Scheme::None;
+        subdivision.creaseIndices = ints(source->creaseIndices);
+        subdivision.creaseLengths = ints(source->creaseLengths);
+        subdivision.creaseSharpness = floats(source->creaseSharpnesses);
+        subdivision.cornerIndices = ints(source->cornerIndices);
+        subdivision.cornerSharpness = floats(source->cornerSharpnesses);
+        subdivision.holeIndices = ints(source->holeIndices);
+        subdivision.interpolateBoundary = source->interpolateBoundary.GetString();
+        subdivision.faceVaryingLinearInterpolation = source->faceVaryingLinearInterpolation.GetString();
+        subdivision.triangleSubdivisionRule = source->triangleSubdivisionRule.GetString();
+        desc.leftHanded = source->orientation == pxr::UsdGeomTokens->leftHanded;
+        desc.doubleSided = source->doubleSided.value_or(false);
+        desc.instanced = shape.instanced;
+        if (!shape.faceSlots.empty()) {
+            auto slots = std::make_shared<const std::vector<int32_t>>(shape.faceSlots);
+            desc.faceMaterialSlots = prism::BufferView::Of(slots, 1, prism::DataType::Int32);
+        }
+        return desc;
     }
 
     // Skinned points of a mesh bound to a skeleton (UsdSkel), at the load
@@ -1448,12 +1327,11 @@ private:
                               instancePrimvars(placement.chain));
                 continue;
             }
-            Material const* displacer = material->hasDisplacement() ? material : nullptr;
             MeshPlacement mesh;
-            mesh.shape = shapeFor(prim, instanced, placement.toWorld, displacer);
+            mesh.shape = shapeFor(prim, instanced);
             mesh.world = placement.toWorld;
             mesh.material = material;
-            mesh.faceMaterials = subsetMaterials(proxy);
+            mesh.subsetMaterials = subsetMaterials(proxy);
             mesh.enabled = enabled;
             mesh.ids = ids;
             mesh.instancePrimvars = instancePrimvars(placement.chain);
@@ -1484,69 +1362,6 @@ private:
             for (pxr::UsdPrim const& prim : pxr::UsdPrimRange(root)) addGprim(prim);
     }
 
-    // Refinement levels within the scene's budget, then the conversions:
-    // shapes that refine or displace by the shared conversion (as
-    // prototypes), the others by the polygon conversion.
-    void convertShapes()
-    {
-        std::vector<std::vector<size_t>> faces(m_shapes.size());
-        std::vector<bool> fixed(m_shapes.size(), false);
-        for (size_t i = 0; i < m_shapes.size(); ++i) {
-            Shape& shape = *m_shapes[i];
-            if (!shape.source) continue;
-            auto const& counts = shape.source->faceVertexCounts;
-            faces[i] = prism::mesh::RefinementFaces(std::span<const int>(counts.cdata(), counts.size()),
-                shape.source->subdivisionScheme.GetString(), shape.displacer != nullptr, m_options.subdivision);
-        }
-        const std::vector<int> levels = prism::mesh::BudgetSubdivisionLevels(
-            faces, fixed, m_options.subdivision.budgetFaces, nullptr, nullptr);
-        std::atomic<bool> controlHulls{false};
-        tbb::parallel_for(size_t(0), m_shapes.size(), [&](size_t i) {
-            Shape& shape = *m_shapes[i];
-            if (!shape.source) return;
-            shape.level = levels[i];
-            const std::string_view scheme = prism::mesh::RefinementScheme(
-                shape.source->subdivisionScheme.GetString(), shape.displacer != nullptr);
-            if (shape.level > 0 || shape.displacer) {
-                prism::mesh::MeshConversion conversion = prism::usd::ConvertMesh(
-                    *shape.source, m_options.subdivision, shape.displacer, shape.level);
-                shape.info = conversion.info;
-                shape.coarseFaces = conversion.info.coarseFaces;
-                shape.mesh = std::move(conversion.mesh);
-                shape.instanced = true;
-                if (conversion.info.subdivisionControlHull) controlHulls = true;
-            } else {
-                if (scheme != "none") controlHulls = true;
-                std::unique_ptr<Mesh, prism::mesh::ConvertedMeshDeleter> mesh(new Mesh());
-                std::vector<int> coarse;
-                if (prism::usd_detail::BuildPolygonMesh(*shape.source,
-                        shape.worldSpace ? shape.world : pxr::GfMatrix4d(1.0), *mesh, coarse)) {
-                    shape.coarseFaces = prism::mesh::SharedFaceTable(std::move(coarse));
-                    shape.mesh = std::move(mesh);
-                }
-                shape.instanced = !shape.worldSpace;
-            }
-            shape.source.reset();
-        });
-        if (controlHulls)
-            std::cerr << "[USDMesh] some subdivision surfaces are rendered as control hulls (subdivision level "
-                         "0, over the maximum faces, or the refinement budget)\n";
-        // Materials of GeomSubsets per triangle, from the coarse faces.
-        for (auto& placement : m_meshPlacements) {
-            Shape const& shape = *m_shapes[placement.shape];
-            if (!shape.mesh) continue;
-            if (!placement.faceMaterials) continue;
-            auto triangles = std::make_shared<std::unordered_map<int, Material*>>();
-            for (size_t t = 0; t < shape.coarseFaces.size(); ++t) {
-                auto found = placement.faceMaterials->find(shape.coarseFaces[t]);
-                (*triangles)[int(t)] = found == placement.faceMaterials->end() ? placement.material : found->second;
-            }
-            placement.triangleMaterials = std::move(triangles);
-            placement.faceMaterials.reset();
-        }
-        for (auto& placement : m_meshPlacements) placement.ids.coarseFaces = m_shapes[placement.shape]->coarseFaces;
-    }
-
     struct SpherePlacement {
         float radius;
         pxr::GfMatrix4d world;
@@ -1555,22 +1370,7 @@ private:
         PlacementIds ids;
         std::shared_ptr<const InstancePrimvars> instancePrimvars;
     };
-    struct SpherePrototype {
-        Sphere geometry;
-        RTCScene scene;
-        SpherePrototype(RTCDevice device, float radius)
-            : geometry(Float3(0), radius, nullptr), scene(rtcNewScene(device)) {
-            geometry.setupEmbree(device, scene);
-            rtcCommitScene(scene);
-        }
-        ~SpherePrototype() {
-            rtcReleaseScene(scene);
-            if (geometry.geom) rtcReleaseGeometry(geometry.geom);
-            delete geometry.transform;
-        }
-    };
     std::vector<SpherePlacement> m_spherePlacements;
-    std::map<float, std::unique_ptr<SpherePrototype>> m_spherePrototypes;
 
     void captureSphere(const pxr::UsdGeomSphere& sphere, const pxr::GfMatrix4d& transform, Material* material,
                        bool enabled, PlacementIds ids, std::shared_ptr<const InstancePrimvars> primvars) {
@@ -1586,15 +1386,15 @@ private:
     }
 
     std::vector<std::shared_ptr<Material>> m_owned_materials;
-    std::vector<std::unique_ptr<ColorTexture>> m_owned_fallback_textures;
-    std::vector<std::unique_ptr<Diffuse>> m_owned_fallback_materials;
+    // Every material this loader made (compiled and fallback), for the scene.
+    std::map<Material const*, std::shared_ptr<Material>> m_ownedByPointer;
     std::map<SdfPath, int>                    m_mdl_material_lookup;
     std::map<SdfPath, int>                    m_fallbackByPath;
     std::vector<pxr::TfToken>                 m_bindingPurposes;
     LoadOptions                               m_options;
     std::unique_ptr<pxr::UsdGeomXformCache>   m_xformCache;
     std::vector<std::unique_ptr<Shape>>       m_shapes;
-    std::map<std::pair<pxr::SdfPath, Material const*>, size_t> m_shapeIndex;
+    std::map<pxr::SdfPath, size_t> m_shapeIndex;
     std::vector<MeshPlacement>                m_meshPlacements;
     std::map<pxr::SdfPath, std::vector<std::pair<pxr::UsdPrim, int>>> m_prototypeRoots;
     std::unordered_map<pxr::SdfPath, PointInstancerData, pxr::SdfPath::Hash> m_instancerData;
@@ -1602,54 +1402,3 @@ private:
     std::map<std::pair<pxr::SdfPath, pxr::SdfPath>, int> m_primIds;
     std::unordered_map<pxr::SdfPath, pxr::VtVec3fArray, pxr::SdfPath::Hash> m_skinnedPoints;
 };
-
-namespace prism::usd {
-
-// Attaches a loaded USD scene: its merged triangles (SceneManager::attachMesh)
-// and a placement per gprim, as in the Hydra delegate: world-space meshes,
-// and prototypes placed by Embree instances. The importer owns sphere
-// prototypes and their material lifetimes.
-inline void AttachImportedMesh(SceneManager& scene, USDMesh& usd)
-{
-    scene.attachMesh(&usd);
-    RTCDevice& device = *scene.device;
-    for (const auto& placed : usd.attachMeshPlacements(device, scene.scene)) {
-        scene.geometry.emplace(placed.id, placed.mesh);
-        if (placed.instanced) {
-            scene.intersection_geometry.emplace(placed.id, placed.mesh->geom);
-            SceneManager::PlacementTransform placement;
-            const auto normal = placed.world.GetInverse().GetTranspose();
-            for (int r = 0; r < 3; ++r) for (int c = 0; c < 3; ++c) {
-                placement.normal[r * 3 + c] = float(normal[r][c]);
-                placement.tangent[r * 3 + c] = float(placed.world[r][c]);
-            }
-            placement.mirrored = placed.world.GetDeterminant() < 0.0;
-            placement.flipOrientation = placement.mirrored;
-            scene.placement_transforms.emplace(placed.id, placement);
-        }
-        auto& binding = scene.placement_materials[placed.id];
-        binding.fallback = placed.material;
-        if (placed.triangleMaterials) binding.triangles = *placed.triangleMaterials;
-        if (placed.instancePrimvars) scene.placement_primvars[int(placed.id)] = placed.instancePrimvars;
-        usd.attachedIds[placed.id] = placed.ids;
-    }
-    for (const auto& sphere : usd.attachSphereInstances(device, scene.scene)) {
-        scene.geometry.emplace(sphere.id, sphere.geometry);
-        scene.intersection_geometry.emplace(sphere.id, sphere.geometry->geom);
-        SceneManager::PlacementTransform placement;
-        const auto normal = sphere.world.GetInverse().GetTranspose();
-        for (int r=0; r<3; ++r) for (int c=0; c<3; ++c) {
-            placement.normal[r*3+c] = float(normal[r][c]);
-            placement.tangent[r*3+c] = float(sphere.world[r][c]);
-        }
-        // Reflection changes UV-frame handedness, not sphere winding.
-        placement.mirrored = sphere.world.GetDeterminant() < 0;
-        placement.flipOrientation = false;
-        scene.placement_transforms.emplace(sphere.id, placement);
-        scene.placement_materials[sphere.id].fallback = sphere.material;
-        if (sphere.instancePrimvars) scene.placement_primvars[int(sphere.id)] = sphere.instancePrimvars;
-        usd.attachedIds[sphere.id] = sphere.ids;
-    }
-}
-
-} // namespace prism::usd

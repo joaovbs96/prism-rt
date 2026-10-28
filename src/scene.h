@@ -51,9 +51,9 @@ public:
 
     prism::color::ColorManagement const& color() const { return *colorManagement; }
 
-    // Attaches a loaded mesh's triangles (when it has any) as one placement.
-    // Loaders with placements of their own (USD: prism::usd::AttachImportedMesh,
-    // src/mesh/usd_mesh.h) add them after this.
+    // Attaches a mesh's triangles (when it has any) as one placement. The
+    // public scene's commit (src/scene/scene.cpp) builds SceneManagers; the
+    // Hydra delegate builds its own.
     void attachMesh(Mesh* mesh) {
         if (!mesh->vertices.empty() && !mesh->indices.empty()) {
             const unsigned id = mesh->setupEmbree(*device, scene);

@@ -6,7 +6,7 @@
 #include "../src/device/gpu/hlsl_compiler.h"
 #include "../src/device/gpu/shader_sources.h"
 #include "../src/device/gpu/hlsl_fp32_rewrite.h"
-#include "../src/mesh/usd_mesh.h"
+#include "scene_api_test_util.h"
 #include "../src/scene.h"
 #ifdef PRISM_HAS_VULKAN
 #include "../src/device/vulkan/vulkan_device.h"
@@ -58,19 +58,10 @@ int main(int argc, char** argv)
         std::cerr << "usage: prism_gpu_shader_compile_test <scene.usda>\n";
         return 2;
     }
-    mdl::Context context;
-    check(context.is_valid(), "MDL context");
-    RTCDevice device = rtcNewDevice(nullptr);
     {
-        SceneManager scene(device, prism::color::ColorManagement::Create({}));
-        const char* libraries = std::getenv("PRISM_MATERIALX_LIBRARY_PATH");
-        const std::string libraryPath = libraries ? libraries : "";
-        USDMesh mesh(argv[1], &context, libraryPath, libraryPath + "/mdl");
-        prism::usd::AttachImportedMesh(scene, mesh);
-        ColorTexture black(Color3(0.0f));
-        ConstantColorBackground background(&black);
-        scene.environment = &background;
-        scene.commitScene();
+        const prism::Renderer renderer(prism::test::TestRendererOptions());
+        prism::Scene api = renderer.createScene();
+        SceneManager& scene = prism::test::LoadUsd(api, argv[1]);
         GpuSceneData data = BuildGpuScene(scene);
         check(!data.mdlMaterials.empty(), "the scene has MDL materials");
         MdlShaderCode code = GenerateMdlShaderCode(data.mdlMaterials);
@@ -161,7 +152,6 @@ int main(int argc, char** argv)
                           &aovDxil, &error) && aovDxil.size() > 1000,
               "Metal light AOV kernel compiles to DXIL: " + error);
     }
-    rtcReleaseDevice(device);
     if (failures) return 1;
     std::cout << "GPU shader compile: all checks passed\n";
     return 0;

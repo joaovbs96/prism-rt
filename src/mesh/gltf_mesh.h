@@ -16,6 +16,8 @@
 #include <tiny_gltf.h>
 #include <MaterialXFormat/XmlIo.h>
 
+#include <prism/material.h>
+
 // internal deps
 #include "../geometry.h"
 #include "../float3.h"
@@ -29,16 +31,25 @@
 #include "../materialx/cached_document.h"
 #include "../materialx/material_resource.h"
 
-// glTF 2.0 scenes (.gltf, .glb). Materials load as MaterialX gltf_pbr
-// documents compiled through MDL (docs/gltf.md). A material whose conversion
-// or compilation fails (or that has no MDL context to compile with) renders
-// with the magenta error material, after a one-line warning.
+// glTF 2.0 scenes (.gltf, .glb), read for prism::gltf::Load
+// (src/gltf/gltf_loader.cpp): the merged world-space triangles and their
+// materials as MaterialX gltf_pbr documents in the material cache
+// (docs/gltf.md), which the scene compiles through MDL at commit. A material
+// whose conversion fails renders with the magenta error material, after a
+// one-line warning.
 class glTFMesh : public Mesh {
     public:
+        // The document of a glTF material (-1: the default material), or why it
+        // has none.
+        struct MaterialSource {
+            std::optional<prism::MaterialDesc> desc;
+            std::string failure;
+        };
+
         // materialSettings: the renderer's colour management (vertex colours and
         // material colours convert into its working space) and cache directory.
-        glTFMesh(const std::filesystem::path &file_path, mdl::Context* mdl_context,
-                 const std::string& mx_libraries_path, const std::string& mx_mdl_path,
+        // Without MaterialX libraries every material is the error material.
+        glTFMesh(const std::filesystem::path &file_path, bool materialx,
                  prism::MaterialSettings materialSettings)
             : m_path(file_path), m_materials(std::move(materialSettings))
         {
@@ -63,7 +74,7 @@ class glTFMesh : public Mesh {
 
             // Materials first: the geometry's texture coordinates follow
             // the convention of the material drawn with them.
-            buildMaterials(mdl_context, mx_libraries_path, mx_mdl_path);
+            buildMaterials(materialx);
 
             int n_faces = 0;
             for (size_t node_idx = 0; node_idx < m_model.nodes.size(); ++node_idx) {
@@ -80,22 +91,24 @@ class glTFMesh : public Mesh {
                 single_sided.clear();
             }
             std::cout << "glTF: " << vertices.size() << " vertices, " << indices.size() / 3 << " triangles, "
-                      << materials.size() << " material(s)\n";
+                      << m_sources.size() << " material(s)\n";
             // Encoded and decoded images are no longer needed.
             m_model = tinygltf::Model();
         }
 
-        // Materials that compiled through MaterialX, and those rendered with
-        // the error material.
+        // Materials converted to MaterialX, and those rendered with the error
+        // material.
         size_t materialxMaterialCount() const { return m_materialxCount; }
         size_t errorMaterialCount() const { return m_errorCount; }
+        // By glTF material (-1: the default), the materials primitives use.
+        std::map<int, MaterialSource> const& materialSources() const { return m_sources; }
 
     private:
         std::filesystem::path m_path;
         prism::MaterialSettings m_materials;
         tinygltf::Model m_model;
         std::vector<TransformMatrix> nodeTransforms;
-        std::vector<std::shared_ptr<MDLMaterial>> m_ownedMdl;
+        std::map<int, MaterialSource> m_sources;
         std::map<int, std::string> m_imageFiles;
         size_t m_materialxCount = 0, m_errorCount = 0;
         // Primvar layout (Mesh::primvars), -1: absent.
@@ -105,7 +118,7 @@ class glTFMesh : public Mesh {
         // Materials
         // ---------------------------------------------------------------
 
-        void buildMaterials(mdl::Context* mdl_context, const std::string& libraries, const std::string& mdlLibraries)
+        void buildMaterials(bool materialx)
         {
             // The materials primitives draw with (-1: the glTF default
             // material), and whether one of them has vertex colours.
@@ -116,21 +129,19 @@ class glTFMesh : public Mesh {
                     const int material = primitive.material < int(m_model.materials.size()) ? primitive.material : -1;
                     used[material] = used[material] || primitive.attributes.contains("COLOR_0");
                 }
-            if (!mdl_context || libraries.empty()) {
+            if (!materialx) {
                 for (auto const& [m, vertexColor] : used) useErrorMaterial(m, "no MDL context or MaterialX libraries");
                 return;
             }
 
             const auto start = std::chrono::steady_clock::now();
             const std::filesystem::path cache = m_materials.cacheDirectory / "materials";
-            // Textures resolve beside the cached documents (as for USD).
-            mdl_context->add_resource_path(cache.string());
-            std::map<std::string, std::shared_ptr<MDLMaterial>> compiled; // by document
+            std::set<std::string> documents;
             std::set<std::string> warned;
             size_t reused = 0;
             bool texcoord1 = false, color0 = false;
             for (auto const& [m, vertexColor] : used) {
-                std::shared_ptr<MDLMaterial> material;
+                std::optional<prism::MaterialDesc> material;
                 std::string failure;
                 try {
                     prism::gltf::MaterialConversionOptions options;
@@ -144,26 +155,24 @@ class glTFMesh : public Mesh {
                     for (auto const& warning : conversion.warnings)
                         if (warned.insert(warning).second) std::cerr << "PrismRT glTF: " << warning << "\n";
                     const std::string xml = MaterialX::writeToXmlString(conversion.document);
-                    if (auto found = compiled.find(xml); found != compiled.end()) {
-                        material = found->second;
-                        ++reused;
-                    } else {
-                        const auto path = prism::materialx::PublishMaterialXDocument(xml, cache, "gltf_");
-                        material = std::make_shared<MDLMaterial>(path.string(), *mdl_context, libraries,
-                                                                 mdlLibraries, m_materials, prism::gltf::kMaterialName);
-                        if (material->is_valid()) compiled.emplace(xml, material);
-                        else failure = "MDL compilation failed (" + path.string() + ")";
-                    }
-                    if (material && material->is_valid()) {
-                        texcoord1 = texcoord1 || conversion.usesTexcoord1;
-                        color0 = color0 || conversion.usesVertexColor;
-                    }
+                    // Equal documents publish to one file, which the loader
+                    // adds once.
+                    const auto path = prism::materialx::PublishMaterialXDocument(xml, cache, "gltf_");
+                    if (!documents.insert(path.string()).second) ++reused;
+                    material.emplace();
+                    material->kind = prism::MaterialDesc::Kind::MaterialXFile;
+                    material->path = path.string();
+                    material->materialName = prism::gltf::kMaterialName;
+                    // Textures resolve beside the cached documents (as for USD).
+                    material->searchPath = cache.string();
+                    material->name = materialLabel(m);
+                    texcoord1 = texcoord1 || conversion.usesTexcoord1;
+                    color0 = color0 || conversion.usesVertexColor;
                 } catch (const std::exception& error) {
                     failure = error.what();
                 }
-                if (material && material->is_valid()) {
-                    materials[m] = material.get();
-                    m_ownedMdl.push_back(std::move(material));
+                if (material) {
+                    m_sources[m].desc = std::move(material);
                     ++m_materialxCount;
                 } else {
                     useErrorMaterial(m, failure);
@@ -171,8 +180,8 @@ class glTFMesh : public Mesh {
             }
             if (texcoord1) addPrimvar(prism::gltf::kTexcoord1Primvar, 2, &m_texcoord1Offset);
             if (color0) addPrimvar(prism::gltf::kColor0Primvar, 4, &m_color0Offset);
-            std::cout << "glTF: " << m_materialxCount << " MaterialX material(s) (" << compiled.size()
-                      << " compiled, " << reused << " reused), " << m_errorCount << " failed, in "
+            std::cout << "glTF: " << m_materialxCount << " MaterialX material(s) (" << documents.size()
+                      << " documents, " << reused << " reused), " << m_errorCount << " failed to convert, in "
                       << std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() << " s\n";
         }
 
@@ -183,7 +192,7 @@ class glTFMesh : public Mesh {
             std::cerr << "PrismRT glTF: material " << materialLabel(m) << " failed to load ("
                       << (reason.empty() ? std::string("unknown error") : reason)
                       << "); rendering it with the magenta error material\n";
-            materials[m] = ErrorMaterial::Shared();
+            m_sources[m].failure = reason.empty() ? std::string("unknown error") : reason;
             ++m_errorCount;
         }
 

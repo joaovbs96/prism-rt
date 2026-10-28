@@ -1,8 +1,10 @@
-#include "../src/scene.h"
-#include "../src/mesh/usd_mesh.h"
+#include "scene_api_test_util.h"
 #include <pxr/usd/usdGeom/sphere.h>
 #include <pxr/usd/usdGeom/pointInstancer.h>
+#include <pxr/usd/sdf/layer.h>
 #include <fstream>
+
+PXR_NAMESPACE_USING_DIRECTIVE
 #include <stdexcept>
 
 namespace {
@@ -10,7 +12,7 @@ void require(bool value, const char* message) {
     if (!value) throw std::runtime_error(message);
 }
 Float3 v(const GfVec3d& p) { return Float3(float(p[0]), float(p[1]), float(p[2])); }
-void run(RTCDevice device) {
+void run() {
     const auto path = std::filesystem::current_path() / "analytic-spheres.usda";
     auto stage = UsdStage::CreateNew(path.string());
     auto ground = UsdGeomSphere::Define(stage, SdfPath("/Ground"));
@@ -29,13 +31,12 @@ void run(RTCDevice device) {
     stage->GetRootLayer()->Save();
     stage.Reset();
 
-    USDMesh imported(path);
-    require(imported.vertices.empty() && imported.sphereCount() == 4,
+    const prism::Renderer renderer(prism::test::TestRendererOptions());
+    prism::Scene api = renderer.createScene();
+    prism::usd::LoadResult loaded;
+    SceneManager& scene = prism::test::LoadUsd(api, path.string(), &loaded);
+    require(loaded.meshPlacements == 0 && loaded.spheres == 4,
             "USD spheres must remain analytic, including point instances");
-    SceneManager scene(device, prism::color::ColorManagement::Create({}));
-    prism::usd::AttachImportedMesh(scene, imported);
-    scene.commitScene();
-    struct Release { RTCScene scene; ~Release() { rtcReleaseScene(scene); } } release{scene.scene};
     const auto hit = scene.cast_ray(initialize_ray(Float3(0,2,0), Float3(0,-1,0)));
     require(hit.geomid != RTC_INVALID_GEOMETRY_ID && std::abs(hit.p.y()) < 0.001f,
             "Large analytic ground must reach y=0");
@@ -62,7 +63,6 @@ void run(RTCDevice device) {
 }
 }
 int main() {
-    RTCDevice device = rtcNewDevice(nullptr);
-    try { run(device); rtcReleaseDevice(device); return 0; }
-    catch (const std::exception& e) { std::cerr << e.what() << '\n'; rtcReleaseDevice(device); return 1; }
+    try { run(); return 0; }
+    catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
 }
