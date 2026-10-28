@@ -221,6 +221,22 @@ list(FILTER PRISM_CORE_SOURCES EXCLUDE REGEX "/(main|standalone_cli)\\.cpp$")
 list(FILTER PRISM_CORE_SOURCES EXCLUDE REGEX "/hydra/")
 # Device backends are added below when enabled.
 list(FILTER PRISM_CORE_SOURCES EXCLUDE REGEX "/device/(vulkan|metal)/")
+# The front-end modules around the core (docs/sdk_design.md, section 4.1):
+# USD (stage loading, the material service, render products), glTF, OBJ and
+# image writing. The core library itself has no USD.
+set(_prism_module_regex "/src/(usd/|materialx/(material_service|gltf_material|obj_material)\\.cpp$|output/(render_products|image_writer)\\.cpp$|tiny(gltf|obj)_impl\\.cpp$)")
+list(FILTER PRISM_CORE_SOURCES EXCLUDE REGEX "${_prism_module_regex}")
+file(GLOB_RECURSE PRISM_USD_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/usd/*.cpp")
+list(APPEND PRISM_USD_SOURCES
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/materialx/material_service.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/output/render_products.cpp")
+set(PRISM_GLTF_SOURCES
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/tinygltf_impl.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/materialx/gltf_material.cpp")
+set(PRISM_OBJ_SOURCES
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/tinyobj_impl.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/materialx/obj_material.cpp")
+set(PRISM_IO_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/output/image_writer.cpp")
 
 # GPU shader sources, embedded into the core library.
 file(GLOB_RECURSE PRISM_SHADER_FILES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/*")
@@ -233,13 +249,14 @@ add_custom_command(
     DEPENDS ${PRISM_SHADER_FILES} "${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedShaders.cmake"
     COMMENT "Embedding GPU shader sources")
 
-add_library(prism_core STATIC ${PRISM_CORE_SOURCES} "${PRISM_EMBEDDED_SHADERS}")
-add_library(PrismRT::core ALIAS prism_core)
+# The core: renderer, scene, materials (MaterialX -> MDL), devices,
+# integrator, colour, textures, denoisers. No USD (prism_core_without_usd_test).
+add_library(prism STATIC ${PRISM_CORE_SOURCES} "${PRISM_EMBEDDED_SHADERS}")
 
 # GPU devices compile their HLSL kernel with DXC at run time.
 find_program(PRISM_DXC_EXECUTABLE dxc HINTS "$ENV{VULKAN_SDK}/bin" DOC "DXC compiler for the GPU devices")
 if(PRISM_DXC_EXECUTABLE)
-    target_compile_definitions(prism_core PRIVATE PRISM_DXC_EXECUTABLE="${PRISM_DXC_EXECUTABLE}")
+    target_compile_definitions(prism PRIVATE PRISM_DXC_EXECUTABLE="${PRISM_DXC_EXECUTABLE}")
 endif()
 
 # Metal device: DXIL from DXC, converted by Metal shader converter.
@@ -264,14 +281,14 @@ if(PRISM_ENABLE_METAL)
     # (tools/ci/build_oidn_macos.sh builds OIDN with both devices).
     if(PRISM_ENABLE_OIDN)
         list(APPEND _prism_metal_sources "${CMAKE_CURRENT_SOURCE_DIR}/src/device/metal/metal_denoiser.mm")
-        target_compile_definitions(prism_core PRIVATE PRISM_HAS_METAL_OIDN=1)
+        target_compile_definitions(prism PRIVATE PRISM_HAS_METAL_OIDN=1)
     endif()
     set_source_files_properties(${_prism_metal_sources} PROPERTIES
         LANGUAGE CXX COMPILE_FLAGS "-x objective-c++ -fobjc-arc")
-    target_sources(prism_core PRIVATE ${_prism_metal_sources})
-    target_include_directories(prism_core PRIVATE "${PRISM_METAL_SHADER_CONVERTER_DIR}/include")
-    target_compile_definitions(prism_core PRIVATE PRISM_HAS_METAL=1)
-    target_link_libraries(prism_core PUBLIC ${PRISM_METAL_IRCONVERTER_LIBRARY}
+    target_sources(prism PRIVATE ${_prism_metal_sources})
+    target_include_directories(prism PRIVATE "${PRISM_METAL_SHADER_CONVERTER_DIR}/include")
+    target_compile_definitions(prism PRIVATE PRISM_HAS_METAL=1)
+    target_link_libraries(prism PUBLIC ${PRISM_METAL_IRCONVERTER_LIBRARY}
         "-framework Metal" "-framework Foundation")
     get_filename_component(_prism_msc_lib_dir "${PRISM_METAL_IRCONVERTER_LIBRARY}" DIRECTORY)
     list(APPEND CMAKE_BUILD_RPATH "${_prism_msc_lib_dir}")
@@ -300,10 +317,10 @@ if(PRISM_ENABLE_VULKAN)
     if(NOT PRISM_DXC_EXECUTABLE)
         message(FATAL_ERROR "The Vulkan device needs DXC (PRISM_DXC_EXECUTABLE); or set PRISM_ENABLE_VULKAN=OFF.")
     endif()
-    target_sources(prism_core PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/device/vulkan/vulkan_device.cpp"
+    target_sources(prism PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/device/vulkan/vulkan_device.cpp"
                                       "${CMAKE_CURRENT_SOURCE_DIR}/src/device/vulkan/vulkan_material_calls.cpp")
-    target_compile_definitions(prism_core PRIVATE PRISM_HAS_VULKAN=1)
-    target_link_libraries(prism_core PUBLIC Vulkan::Vulkan)
+    target_compile_definitions(prism PRIVATE PRISM_HAS_VULKAN=1)
+    target_link_libraries(prism PUBLIC Vulkan::Vulkan)
 endif()
 # vk_oidn (above): the denoiser, and the prefilter weights embedded in the
 # library (cmake/embed_files.py), so nothing is loaded at run time.
@@ -326,42 +343,65 @@ elseif(PRISM_ENABLE_VK_OIDN)
                 "${PRISM_VK_OIDN_WEIGHTS_SOURCE}" VkOidnPrefilterWeights ${_prism_prefilter_weights}
         DEPENDS ${_prism_prefilter_weights} "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_files.py"
         COMMENT "Embedding vk_oidn's prefilter weights")
-    target_sources(prism_core PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/device/vulkan/vulkan_denoiser.cpp"
+    target_sources(prism PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/device/vulkan/vulkan_denoiser.cpp"
                                       "${PRISM_VK_OIDN_WEIGHTS_SOURCE}")
-    target_compile_definitions(prism_core PRIVATE PRISM_HAS_VK_OIDN=1)
-    target_link_libraries(prism_core PRIVATE vk_oidn::vk_oidn)
+    target_compile_definitions(prism PRIVATE PRISM_HAS_VK_OIDN=1)
+    target_link_libraries(prism PRIVATE vk_oidn::vk_oidn)
 endif()
-target_include_directories(prism_core PUBLIC
-    "${CMAKE_CURRENT_SOURCE_DIR}/external/tinygltf"
-    "${CMAKE_CURRENT_SOURCE_DIR}/external/tinyobj")
 if(MDL_SDK_DIR)
-    target_include_directories(prism_core PUBLIC "${MDL_SDK_DIR}/include")
+    target_include_directories(prism PUBLIC "${MDL_SDK_DIR}/include")
 endif()
 get_target_property(PRISM_TBB_INCLUDE_DIRS TBB::tbb INTERFACE_INCLUDE_DIRECTORIES)
-target_include_directories(prism_core BEFORE PUBLIC ${PRISM_TBB_INCLUDE_DIRS})
-target_include_directories(prism_core PUBLIC ${PXR_INCLUDE_DIRS})
-target_include_directories(prism_core PUBLIC ${Python3_INCLUDE_DIRS})
-target_link_libraries(prism_core PUBLIC
+target_include_directories(prism BEFORE PUBLIC ${PRISM_TBB_INCLUDE_DIRS})
+target_link_libraries(prism PUBLIC
     OpenImageIO::OpenImageIO
     OpenColorIO::OpenColorIO
     embree
     TBB::tbb
-    ${PXR_LIBRARIES}
     ${PRISM_OSD_CPU_TARGET}
     MaterialXCore
     MaterialXFormat
     MaterialXGenShader
     MaterialXGenMdl)
 if(MSVC)
-    target_compile_options(prism_core PUBLIC "/Zc:preprocessor")
+    target_compile_options(prism PUBLIC "/Zc:preprocessor")
 endif()
 if(PRISM_ENABLE_OIDN)
-    target_link_libraries(prism_core PUBLIC OpenImageDenoise)
-    target_compile_definitions(prism_core PUBLIC PRISM_HAS_OIDN=1)
+    target_link_libraries(prism PUBLIC OpenImageDenoise)
+    target_compile_definitions(prism PUBLIC PRISM_HAS_OIDN=1)
 endif()
 
+# Image writing (OpenImageIO).
+add_library(prism_io STATIC ${PRISM_IO_SOURCES})
+target_link_libraries(prism_io PUBLIC prism OpenImageIO::OpenImageIO)
+
+# USD: stage loading (src/mesh/usd_mesh.h), the material service over
+# Hydra material data sources, render settings and products, the Vt adapters.
+add_library(prism_usd STATIC ${PRISM_USD_SOURCES})
+target_include_directories(prism_usd PUBLIC ${PXR_INCLUDE_DIRS} ${Python3_INCLUDE_DIRS})
+target_link_libraries(prism_usd PUBLIC prism prism_io ${PXR_LIBRARIES})
+
+# glTF (tinygltf) and OBJ (tinyobjloader) scenes.
+add_library(prism_gltf STATIC ${PRISM_GLTF_SOURCES})
+target_include_directories(prism_gltf PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/external/tinygltf")
+target_link_libraries(prism_gltf PUBLIC prism)
+add_library(prism_obj STATIC ${PRISM_OBJ_SOURCES})
+target_include_directories(prism_obj PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/external/tinyobj")
+target_link_libraries(prism_obj PUBLIC prism)
+
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/PrismCoreWithoutUsd.cmake")
+prism_check_core_without_usd(prism)
+
+# Everything the front ends and tests use: the core and its modules. The
+# glTF and OBJ modules link first: MaterialXRender (reached through USD)
+# holds an older tinyobjloader, and a static library earlier on the link line
+# would provide tinyobj's functions instead of ours (prism_obj_material_test).
+add_library(prism_frontend INTERFACE)
+target_link_libraries(prism_frontend INTERFACE prism_gltf prism_obj prism prism_io prism_usd)
+add_library(PrismRT::core ALIAS prism_frontend)
+
 add_executable(PrismRT src/main.cpp src/standalone_cli.cpp)
-target_link_libraries(PrismRT PRIVATE PrismRT::core)
+target_link_libraries(PrismRT PRIVATE prism_gltf prism_obj prism prism_io prism_usd)
 
 if(PRISM_COPY_ASSETS)
     add_custom_target(copy_assets ALL
@@ -381,6 +421,9 @@ if(PRISM_BUILD_HYDRA)
     enable_testing()
     # Keep the original MaterialX compatibility regressions in clean builds.
     add_subdirectory(tests "${CMAKE_BINARY_DIR}/materialx-tests")
+
+    # The core library builds without USD (cmake/PrismCoreWithoutUsd.cmake).
+    prism_add_core_without_usd_test()
 
     # vcpkg manifests and the docs agree with tools/deps.json.
     add_test(NAME prism_deps_consistency_test

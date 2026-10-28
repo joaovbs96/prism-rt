@@ -8,7 +8,7 @@ set(PRISM_HYDRA_SOURCES
     native_tasks.cpp)
 
 add_library(hdPrism SHARED ${PRISM_HYDRA_SOURCES})
-target_link_libraries(hdPrism PRIVATE PrismRT::core hd hdx ${PXR_LIBRARIES})
+target_link_libraries(hdPrism PRIVATE prism prism_usd hd hdx ${PXR_LIBRARIES})
 target_include_directories(hdPrism PRIVATE ${PXR_INCLUDE_DIRS} ${Python3_INCLUDE_DIRS})
 if(MSVC)
     target_compile_options(hdPrism PRIVATE "/Zc:preprocessor")
