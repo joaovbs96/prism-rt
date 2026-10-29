@@ -141,6 +141,8 @@ LoadResult Load(Scene& scene, UsdStageRefPtr const& stage, LoadOptions const& op
 {
     if (!stage) throw Error(ErrorCode::InvalidArgument, "no USD stage");
     RendererContext& renderer = detail::SceneAccess::context(scene);
+    // Diagnostics of the material service and lights go to the scene's renderer.
+    prism::logging::Bind logBinding(&renderer.logger());
     const UsdTimeCode time = options.time;
     LoadResult result;
 

@@ -295,6 +295,9 @@ public:
     CommitResult commit(ProgressCallback const& progress = {});
     // Revisions committed so far (0: none).
     uint64_t revision() const;
+    // The DirtyKind bits of the edits since the last commit (0: commit()
+    // would publish nothing). A cancelled commit leaves them pending.
+    uint32_t pendingEdits() const;
     // Diagnostics of the last commit (of the work it did).
     std::vector<Diagnostic> diagnostics() const;
 

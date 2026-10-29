@@ -1077,6 +1077,9 @@ CommitResult Scene::Impl::commit(ProgressCallback const& progress)
         info.elapsedSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
         if (!progress(info)) Throw(ErrorCode::Cancelled, "the commit was cancelled");
     };
+    // Diagnostics of deep code (IES profiles, materials) go to this scene's
+    // renderer, whichever thread commits (the Python module commits on its own).
+    prism::logging::Bind logBinding(&context->logger());
     auto colorManagement = context->colorManagement();
     RTCDevice& device = context->embreeDevice();
     CommitResult result;
@@ -1800,6 +1803,7 @@ void Scene::remove(CameraId id) { m_impl->cameras.remove(id.v, "camera"); }
 
 CommitResult Scene::commit(ProgressCallback const& progress) { return m_impl->commit(progress); }
 uint64_t Scene::revision() const { return m_impl->revision; }
+uint32_t Scene::pendingEdits() const { return m_impl->dirty; }
 std::vector<Diagnostic> Scene::diagnostics() const { return m_impl->diagnostics; }
 SceneOptions const& Scene::options() const { return m_impl->options; }
 
