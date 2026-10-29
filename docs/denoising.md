@@ -41,6 +41,13 @@ Where the data lives:
   would mean keeping the pass accumulation on the GPU, which `PassRequest`
   does not do.
 
+OIDN's CPU device is created once per process (`SharedCpuDenoiser`) and is
+never destroyed. Destroying it at exit hung the process about once in a
+hundred runs: a static destructor in `prism.dll` runs in its
+`DLL_PROCESS_DETACH`, after `ExitProcess` has killed every other thread, and
+releasing the device terminates its oneTBB arena, which then waits forever on
+a worker that was killed inside it. Process exit reclaims the device instead.
+
 ## The Vulkan denoiser (vk_oidn)
 
 nvpro-samples' [vk_oidn](https://github.com/nvpro-samples/vk_oidn)

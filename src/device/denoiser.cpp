@@ -143,18 +143,23 @@ bool DenoisingAvailable() { return true; }
 std::shared_ptr<Denoiser> SharedCpuDenoiser(std::string* error)
 {
     static std::mutex mutex;
-    static std::shared_ptr<Denoiser> shared;
+    // Never destroyed. A static destructor of this library runs in its
+    // DLL_PROCESS_DETACH, after ExitProcess has killed every other thread:
+    // releasing OIDN's device there terminates its oneTBB arena, which can
+    // wait forever for a worker that was killed inside it (a hang at exit,
+    // docs/denoising.md). The process's exit reclaims the device instead.
+    static auto* const shared = new std::shared_ptr<Denoiser>();
     static std::string failure;
     std::lock_guard lock(mutex);
-    if (!shared && failure.empty()) {
+    if (!*shared && failure.empty()) {
         try {
-            shared = std::make_shared<OidnCpuDenoiser>();
+            *shared = std::make_shared<OidnCpuDenoiser>();
         } catch (std::exception const& e) {
             failure = e.what();
         }
     }
-    if (!shared && error) *error = failure;
-    return shared;
+    if (!*shared && error) *error = failure;
+    return *shared;
 }
 
 #else
