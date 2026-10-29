@@ -1172,6 +1172,21 @@ called done there.
     with Metal).
 - **Mesh preparation counts loading progress on its TBB worker** (`src/hydra/scene_bridge.cpp`): shared host
   code only; run `prism_hydra_scene_bridge_test progress-status` on the Mac.
+- **SDK step 5b: incremental scene commits** ([sdk_design.md](sdk_design.md),
+  section 7; written on Windows, the Metal device unbuilt):
+  - Shared host code: `src/geometry.h` (`Mesh::setupEmbree` split into
+    `createEmbreeGeometry` and the attach, same calls), `src/scene/scene.cpp`
+    (revisions share mesh geometry, prototype scenes and, for lighting edits,
+    the top-level scene; geometry ids are placement ordinals with holes for
+    hidden instances; the spare revision's `SceneManager` is edited in place
+    between renders). The devices see revisions as before: a new revision
+    number means `SceneChanged`, and a spare edited in place has the same
+    `SceneManager` address as two revisions earlier (the delegate's banks
+    alternate the same way). `GpuScene` must treat placement ids with gaps
+    (it reads the maps). No shader change; `src/hydra/` untouched.
+  - Runs: `ctest -R "scene_incremental|scene_api|session"` with
+    `prism_scene_incremental_test`'s renders on `DevicePreference::Metal`
+    against the CPU (the dirty-kinds case compares edits with fresh scenes).
 
 ## Diagnostics
 

@@ -1277,6 +1277,39 @@ the Hydra delegate's render thread runs its loop. What landed:
   render settings still reach the devices through the committed
   `SceneManager`.
 
+**Step 5b status (2026-10-29)**: first of four stages done; stopped at
+that boundary (`docs/DECISIONS.md`, 2026-10-29). What landed:
+- Incremental `Scene::commit()` (`src/scene/scene.cpp`): edits record their
+  `DirtyKind` (Placement, Prototype, Material, Light, Environment,
+  Structure); a commit without edits publishes nothing. Revisions share what
+  did not change: compiled materials, mesh conversions with their Embree
+  geometry and prototype scenes (a pool keyed by the conversion's inputs),
+  sphere prototypes, environments, lights, and for lighting edits the
+  top-level acceleration structure. The scene keeps the published revision
+  and the one before it; a commit updates that spare in place (transforms,
+  visibility, materials, primvars) when no session holds it and it places
+  the same instances, else builds a new revision over the pooled parts.
+  Sessions keep rendering the published revision until the swap (under the
+  render lock, as in 5a).
+- `CommitResult` reports the kinds and the work (`dirty`,
+  `materialsCompiled`, `meshesConverted`/`meshesReused`,
+  `placementsAttached`/`placementsUpdated`, `accelerationShared`,
+  `revisionReused`, `lightingRebuilt`); `prism_scene_incremental_test`
+  checks them per kind, renders each edit against a fresh scene bit for bit,
+  and runs commits beside progressive and batch renders (one revision per
+  image, rapid edits, no deadlock).
+- Geometry ids are placement ordinals (`rtcAttachGeometryByID`); hidden
+  instances keep their id and conversion. Images of scenes without hidden
+  instances are unchanged (12 Hydra and 9 CLI renders, every channel).
+- Not done: stages 2-4 (the delegate's scene-index observer as a translator to
+  `Scene` edits, then Hydra through the public `Session`). The delegate's
+  snapshot and bank machinery is keyed on Hydra identities (data-source
+  handles, paths, structural renames, prim-id registry, instancer picking,
+  sphere batches, hidden-geometry eviction) the public scene does not have;
+  moving it is a rewrite of the delegate's scene path. The gaps to close
+  first are listed in `docs/DECISIONS.md`. Render settings stay on
+  `SceneManager`.
+
 Notes:
 - Step 6 is mechanical and can move earlier if the CLI/Hydra double copy of
   globals bites (it does not today: no process loads both).
