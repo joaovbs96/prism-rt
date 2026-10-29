@@ -176,3 +176,14 @@ if(PRISM_BUILD_HYDRA)
             TIMEOUT 600 SKIP_REGULAR_EXPRESSION "[0-9]+ skipped, 0 passed|^[0-9]+ skipped in")
     endforeach()
 endif()
+
+# The wheel (tools/build_wheel.py, Windows so far): built from this tree,
+# installed into a fresh venv in the build directory and rendered there with
+# a sanitized environment, against the build tree's images (CPU, exact).
+# It needs pip to reach NumPy (tools/deps.json's version; pip's cache works).
+if(WIN32 AND TARGET prism_compare_images)
+    add_test(NAME prism_python_wheel_install
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/wheel_install_test.py")
+    set_tests_properties(prism_python_wheel_install PROPERTIES LABELS python TIMEOUT 1800
+        ENVIRONMENT "PRISMRT_TEST_BUILD=${CMAKE_BINARY_DIR};PRISMRT_TEST_CONFIG=$<CONFIG>;PRISMRT_TEST_SOURCE=${CMAKE_CURRENT_SOURCE_DIR};PRISMRT_TEST_COMPARE=$<TARGET_FILE:prism_compare_images>;PRISMRT_TEST_USD=1")
+endif()
