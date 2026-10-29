@@ -1834,6 +1834,8 @@ namespace detail {
 
 RendererContext& SceneAccess::context(Scene const& scene) { return *scene.m_impl->context; }
 
+Scene SceneAccess::detached() { return Scene(nullptr); }
+
 MaterialId SceneAccess::addCompiledMaterial(Scene& scene, std::shared_ptr<Material> material, std::string name)
 {
     if (!material) Throw(ErrorCode::InvalidArgument, "a compiled material is null");

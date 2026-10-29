@@ -262,6 +262,8 @@ struct SessionStatus {
     std::string error;
 };
 
+namespace detail { struct SessionAccess; }
+
 class PRISM_API Session {
 public:
     // Sessions come from Renderer::createSession. Copies share the session.
@@ -343,6 +345,7 @@ public:
 
 private:
     friend class Renderer;
+    friend struct detail::SessionAccess;
     explicit Session(std::shared_ptr<Impl> impl);
     std::shared_ptr<Impl> m_impl;
 };

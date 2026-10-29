@@ -89,6 +89,9 @@ private:
 
 struct PRISM_INTERNAL_API SceneAccess {
     static RendererContext& context(Scene const& scene);
+    // A Scene handle without a scene (a hosted session's, which renders its
+    // front end's revisions); only copied and destroyed.
+    static Scene detached();
     // A material the caller compiled (or a built-in one): the scene holds
     // it while any revision uses it. A null material is rejected.
     static MaterialId addCompiledMaterial(Scene& scene, std::shared_ptr<Material> material, std::string name);

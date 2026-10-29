@@ -4,7 +4,7 @@
 #include "../materialx/material_service.h"
 #include "environment_cache.h"
 #include "render_buffer.h"
-#include "../session/progressive_engine.h"
+#include "../session/session_internal.h"
 #include "../mesh/mesh_conversion.h"
 #include "../usd/usd_mesh_source.h"
 #include "../mesh/subdivision.h"
@@ -101,6 +101,7 @@ PXR_NAMESPACE_USING_DIRECTIVE
 namespace prism::hydra {
 using prism::materials::MaterialService;
 using prism::materials::SharedMdlContext;
+using prism::detail::SessionAccess;
 namespace {
 
 // Once per renderer (the calling thread's logger: the delegate binds its own).
@@ -4401,7 +4402,6 @@ public:
             settings.gpuPreparationPreview = std::strcmp(value, "0") != 0;
         if (const char *value = std::getenv("PRISM_GPU_PREPARATION_PREVIEW_MAX_MIB"); value && *value)
             settings.gpuPreparationPreviewMaxMiB = std::max(0, std::atoi(value));
-        engine->embreeLiveBytes = &embreeLiveBytes;
         try {
             mdl::Context &context = SharedMdlContext();
             if (context.is_valid()) {
@@ -4425,16 +4425,6 @@ public:
         return options;
     }
 
-    // Waits for a device job, returning false (and leaving the job running)
-    // as soon as the host asks the render worker to stop.
-    template <class T>
-    bool WaitForDeviceJob(std::future<T> &job) const
-    {
-        while (job.wait_for(std::chrono::milliseconds(2)) != std::future_status::ready)
-            if (renderThread->IsStopRequested()) return false;
-        return true;
-    }
-
     // Loading is active from the first scene edit until its snapshot is
     // published (a spare bank job does not count). Call with mutex held.
     void RefreshLoadingPhaseLocked()
@@ -4444,59 +4434,22 @@ public:
     }
 
     // Returns the render device for the requested preference, creating it
-    // on first use or when the preference changed. Render worker only;
-    // returns null if a stop was requested before the device was ready.
+    // on first use or when the preference changed (the session's job).
+    // Render worker only; returns null if a stop was requested before the
+    // device was ready.
     std::shared_ptr<prism::device::RenderDevice> AcquireRenderDevice(
         prism::device::DevicePreference preference)
     {
-        {
-            std::lock_guard lock(mutex);
-            if (renderDevice && renderDevicePreference == preference) return renderDevice;
-        }
-        if (deviceCreation.valid() && deviceCreationPreference != preference) {
-            if (!WaitForDeviceJob(deviceCreation)) {
-                ++engine->devicePreparationsInterrupted;
-                return nullptr;
-            }
-            try { (void)deviceCreation.get(); }
-            catch (...) {}
-        }
-        if (!deviceCreation.valid()) {
-            deviceCreationPreference = preference;
-            progress.Begin(prism::Phase::Device);
-            deviceCreation = std::async(std::launch::async, [preference, this] {
-                prism::logging::Bind logBinding(&renderer->logger());
-                prism::progress::Bind progressBinding(&progress);
-                prism::load_profile::Scope profile("device.create");
-                CreatedDevice created;
-                created.device = prism::device::CreateDevice(preference, renderer->deviceOptions(), &created.note);
-                progress.End(prism::Phase::Device);
-                return created;
-            });
-        }
-        if (!WaitForDeviceJob(deviceCreation)) {
-            ++engine->devicePreparationsInterrupted;
-            return nullptr;
-        }
-        CreatedDevice created;
-        try {
-            created = deviceCreation.get();
-        } catch (std::exception const &e) {
-            TF_WARN("PrismRT: render device creation failed: %s", e.what());
-        }
-        if (!created.device) created.device = prism::device::CreateDevice(
-            prism::device::DevicePreference::Cpu, renderer->deviceOptions(), &created.note);
-        if (!created.note.empty()) TF_WARN("PrismRT: %s", created.note.c_str());
-        const auto info = created.device->Info();
-        progress.SetDevice(prism::session::ProgressiveEngine::DescribeDevice(
-            *created.device, preference, created.note));
+        prism::detail::HostedDevice acquired = SessionAccess::acquireDevice(
+            session, preference, [this] { return renderThread->IsStopRequested(); });
+        if (!acquired.created) return acquired.device;
+        if (!acquired.error.empty())
+            TF_WARN("PrismRT: render device creation failed: %s", acquired.error.c_str());
+        if (!acquired.note.empty()) TF_WARN("PrismRT: %s", acquired.note.c_str());
+        const auto info = acquired.device->Info();
         TF_STATUS("PrismRT: rendering on %s device: %s",
             prism::device::ToString(info.kind), info.name.c_str());
-        std::lock_guard lock(mutex);
-        renderDevice = created.device;
-        renderDevicePreference = preference;
-        engine->DeviceReplaced();
-        return renderDevice;
+        return acquired.device;
     }
 
     // Builds the second bank for the snapshot just published, from the same
@@ -4573,11 +4526,7 @@ public:
     {
         // Device jobs own their device and snapshot; let them finish before
         // the snapshots' shared Embree device is released.
-        if (deviceCreation.valid()) {
-            try { (void)deviceCreation.get(); }
-            catch (...) {}
-        }
-        engine->WaitForJobs();
+        SessionAccess::waitForJobs(session);
         if (buildCancel) buildCancel->store(true, std::memory_order_relaxed);
         if (buildFuture.valid()) {
             try { (void)buildFuture.get(); }
@@ -4601,31 +4550,18 @@ public:
     std::shared_ptr<prism::RendererContext> renderer =
         std::make_shared<prism::RendererContext>(HydraRendererOptions());
     prism::Progress &progress = renderer->progress();
-    // The progressive render loop (src/session/progressive_engine.h): device
+    // The session the delegate renders through (a hosted session,
+    // src/session/session_internal.h): the render device, created as a job
+    // the render worker waits on while polling for a stop (a host StopRender
+    // never waits for it), and the progressive render loop (device
     // preparation with the GPU preparation preview, previews, passes,
-    // adaptive sampling, the denoise interval. Its accumulation persists
+    // adaptive sampling, the denoise interval), whose accumulation persists
     // across Render calls.
-    std::unique_ptr<prism::session::ProgressiveEngine> engine =
-        std::make_unique<prism::session::ProgressiveEngine>(renderer);
+    std::atomic<int64_t> embreeLiveBytes{0};
+    prism::Session session = SessionAccess::createHosted(renderer, &embreeLiveBytes);
     HdSceneIndexBaseRefPtr sceneIndex;
     HdRenderThread *renderThread;
     RTCDevice device = nullptr;
-    // Executes the per-pixel work; recreated when the device setting changes.
-    std::shared_ptr<prism::device::RenderDevice> renderDevice;
-    prism::device::DevicePreference renderDevicePreference = prism::device::DevicePreference::Auto;
-    // Device creation can take seconds. It runs as a job the render worker
-    // waits on while polling for a stop, so a host StopRender never waits
-    // for it; an interrupted job keeps running and the next Render resumes
-    // waiting on it. Only the render worker touches this future (and ~Impl,
-    // after the worker has stopped). Per-scene device preparation is the
-    // engine's.
-    struct CreatedDevice {
-        std::shared_ptr<prism::device::RenderDevice> device;
-        std::string note;
-    };
-    std::future<CreatedDevice> deviceCreation;
-    prism::device::DevicePreference deviceCreationPreference = prism::device::DevicePreference::Auto;
-    std::atomic<int64_t> embreeLiveBytes{0};
     std::atomic<int64_t> embreePeakBytes{0};
     mutable std::mutex mutex;
     bool sceneDirty = true;
@@ -4897,7 +4833,7 @@ void SceneBridge::RestartAccumulation()
 {
     _impl->renderThread->StopRender();
     std::lock_guard lock(_impl->mutex);
-    _impl->engine->samples.store(0);
+    SessionAccess::restartAccumulation(_impl->session);
     _impl->stateDirty = true;
     for (HdRenderPassAovBinding const &binding : _impl->bindings)
         if (auto *buffer = dynamic_cast<PrismRenderBuffer *>(binding.renderBuffer))
@@ -5010,7 +4946,7 @@ void SceneBridge::SetSettings(RenderSettings const &requested)
             current.denoiseInterval != settings.denoiseInterval ||
             current.denoiseSettings != settings.denoiseSettings;
         if (budgetChanged && !imageChanged && _converged.load() &&
-            _impl->engine->samples.load() != 0 &&
+            SessionAccess::counters(_impl->session).samples != 0 &&
             std::none_of(_impl->bindings.begin(), _impl->bindings.end(),
                 [](auto const &binding) {
                     return _TracedAov(_AovKind(binding.aovName)) &&
@@ -6138,7 +6074,7 @@ bool SceneBridge::Prepare(CameraState const &camera,
     }
     if (stateChanged || cameraChanged || bindingsChanged ||
         renderTagsChanged || published) {
-        _impl->engine->samples.store(0);
+        SessionAccess::restartAccumulation(_impl->session);
         for (HdRenderPassAovBinding const &binding : _impl->bindings) {
             if (auto *buffer = dynamic_cast<PrismRenderBuffer *>(binding.renderBuffer)) {
                 buffer->SetConverged(false);
@@ -6184,7 +6120,7 @@ void SceneBridge::Render()
         // Published edits replace the snapshot or advance its generation;
         // camera changes do neither.
         if (snapshot && snapshot->scene)
-            _impl->engine->NoteScene(*renderDevice, *snapshot->scene, _impl->activeGeneration);
+            SessionAccess::noteScene(_impl->session, *snapshot->scene, _impl->activeGeneration);
         width = _impl->width; height = _impl->height;
         generation = _impl->activeGeneration;
         cameraRevision = _impl->cameraRevision;
@@ -6218,7 +6154,7 @@ void SceneBridge::Render()
     }
 
     // The render buffers as the progressive loop's outputs
-    // (src/session/progressive_engine.h).
+    // (src/session/progressive_target.h).
     struct BufferTarget final : prism::session::ProgressiveTarget {
         using Frame = prism::session::Frame;
         Impl &impl;
@@ -6427,8 +6363,7 @@ void SceneBridge::Render()
         }
     } target(*_impl, bindings, snapshot, camera, width, height, generation, cameraRevision);
 
-    prism::session::ProgressiveRun run;
-    run.device = renderDevice;
+    prism::detail::HostedRun run;
     run.preference = settings.device;
     // The job and the passes own the snapshot, so a published replacement
     // cannot free or (as an inactive bank) edit the scene they read.
@@ -6459,7 +6394,7 @@ void SceneBridge::Render()
     run.view.height = height;
     run.generation = generation;
     run.diagnosticsLabel = "hydra";
-    if (_impl->engine->Run(run, target) == prism::session::ProgressiveEngine::Outcome::Stopped) return;
+    if (!SessionAccess::runHosted(_impl->session, run, target)) return;
     for (HdRenderPassAovBinding const &binding : bindings)
         if (auto *buffer = dynamic_cast<PrismRenderBuffer *>(binding.renderBuffer))
             buffer->SetConverged(!preparing);
@@ -6537,7 +6472,7 @@ VtDictionary SceneBridge::GetProgressStats() const
     result["prismDevice"] = VtValue(progress.device);
     result["prismError"] = VtValue(progress.error);
     // True while the CPU device renders a preview for a GPU that is preparing.
-    result["prismGpuPreview"] = VtValue(_impl->engine->gpuPreviewActive.load(std::memory_order_relaxed));
+    result["prismGpuPreview"] = VtValue(SessionAccess::counters(_impl->session).gpuPreviewActive);
     std::string active;
     for (size_t i = 0; i < progress.phases.size(); ++i) {
         if (!progress.phases[i].active) continue;
@@ -6561,13 +6496,14 @@ VtDictionary SceneBridge::GetStats() const
     // Progress first and lock-free: it must stay current while the bridge
     // mutex below is busy.
     VtDictionary result = GetProgressStats();
-    const int64_t completed = static_cast<int64_t>(_impl->engine->samples.load());
+    const prism::detail::HostedCounters counters = SessionAccess::counters(_impl->session);
+    const int64_t completed = static_cast<int64_t>(counters.samples);
     const bool converged = _converged.load();
     result["completedSamples"] = VtValue(completed);
     result["converged"] = VtValue(converged);
     // The progressive loop's statistics (under its own mutex, which may be
     // taken inside the bridge mutex but never around it).
-    const prism::session::ProgressiveStats engineStats = _impl->engine->Stats();
+    const prism::session::ProgressiveStats engineStats = SessionAccess::stats(_impl->session);
     std::lock_guard lock(_impl->mutex);
     // Standard Hydra progress keys that hosts such as usdview read:
     // numCompletedSamples (int) and percentDone (double, 0-100). A converged
@@ -6579,12 +6515,9 @@ VtDictionary SceneBridge::GetStats() const
     result["numCompletedSamples"] = VtValue(static_cast<int>(
         std::min<int64_t>(completed, std::numeric_limits<int>::max())));
     result["targetSamples"] = VtValue(targetSamples);
-    const double sampleFraction = std::clamp(
-        static_cast<double>(completed) / targetSamples, 0.0, 1.0);
-    const double active = completed > 0 ? _impl->engine->activePixelFraction.load() : 1.0;
-    double progress = (1.0 - active) + active * sampleFraction;
-    if (completed > 0 && _impl->settings.timeLimitSeconds > 0.0)
-        progress = std::max(progress, _impl->engine->timeLimitFraction.load());
+    const double active = completed > 0 ? counters.activePixelFraction : 1.0;
+    const double progress = prism::detail::ProgressFraction(counters.samples, targetSamples, active,
+        _impl->settings.timeLimitSeconds, counters.timeLimitFraction);
     result["percentDone"] = VtValue(converged ? 100.0 :
         std::clamp(100.0 * progress, 0.0, std::nextafter(100.0, 0.0)));
     result["activePixelFraction"] = VtValue(active);
@@ -6594,25 +6527,25 @@ VtDictionary SceneBridge::GetStats() const
     result["elapsedSeconds"] = VtValue(engineStats.elapsedSeconds);
     result["samplesPerSecond"] = VtValue(engineStats.samplesPerSecond);
     result["estimatedSecondsRemaining"] = VtValue(engineStats.estimatedSecondsRemaining);
-    result["timeLimitReached"] = VtValue(_impl->engine->timeLimitReached.load());
+    result["timeLimitReached"] = VtValue(counters.timeLimitReached);
     // Denoising (docs/denoising.md): denoises shown and the last one's time.
-    result["denoises"] = VtValue(static_cast<int64_t>(_impl->engine->denoisesPublished.load()));
-    result["denoiseMilliseconds"] = VtValue(_impl->engine->lastDenoiseMilliseconds.load());
+    result["denoises"] = VtValue(static_cast<int64_t>(counters.denoisesPublished));
+    result["denoiseMilliseconds"] = VtValue(counters.lastDenoiseMilliseconds);
     result["denoiser"] = VtValue(engineStats.denoiserName);
     result["refinementPublishes"] = VtValue(static_cast<int64_t>(engineStats.refinementPublishes));
     result["devicePreparing"] = VtValue(engineStats.devicePreparing);
-    result["devicePreparations"] = VtValue(static_cast<int64_t>(_impl->engine->devicePreparations.load()));
+    result["devicePreparations"] = VtValue(static_cast<int64_t>(counters.devicePreparations));
     result["devicePreparationsInterrupted"] = VtValue(
-        static_cast<int64_t>(_impl->engine->devicePreparationsInterrupted.load()));
+        static_cast<int64_t>(counters.devicePreparationsInterrupted));
     result["devicePreparationSeconds"] = VtValue(engineStats.devicePreparationSeconds);
     result["deferredEnvironmentCaptures"] = VtValue(
         static_cast<int64_t>(_impl->deferredEnvironmentCaptures));
-    result["gpuPreviewPasses"] = VtValue(static_cast<int64_t>(_impl->engine->gpuPreviewSamples.load()));
-    result["gpuPreviewHandovers"] = VtValue(static_cast<int64_t>(_impl->engine->gpuPreviewHandovers.load()));
-    result["gpuPreviewHandoverSample"] = VtValue(static_cast<int64_t>(_impl->engine->gpuPreviewHandoverSample.load()));
+    result["gpuPreviewPasses"] = VtValue(static_cast<int64_t>(counters.gpuPreviewSamples));
+    result["gpuPreviewHandovers"] = VtValue(static_cast<int64_t>(counters.gpuPreviewHandovers));
+    result["gpuPreviewHandoverSample"] = VtValue(static_cast<int64_t>(counters.gpuPreviewHandoverSample));
     // GPU texture streaming (see docs/texture_service.md#gpu-texture-streaming).
-    if (_impl->renderDevice) {
-        const prism::device::TextureStreamingStats streaming = _impl->renderDevice->TextureStreaming();
+    if (auto const renderDevice = SessionAccess::device(_impl->session)) {
+        const prism::device::TextureStreamingStats streaming = renderDevice->TextureStreaming();
         constexpr double mib = 1.0 / 1048576.0;
         result["prismTextureStreaming"] = VtValue(streaming.active);
         result["prismTextureResidentMiB"] = VtValue(double(streaming.residentBytes) * mib);
@@ -6627,10 +6560,10 @@ VtDictionary SceneBridge::GetStats() const
         result["textureStreamingUploadedMiB"] = VtValue(double(streaming.uploadedBytes) * mib);
         result["textureStreamingFeedbackRounds"] = VtValue(static_cast<int64_t>(streaming.feedbackRounds));
     }
-    result["textureStreamingRestarts"] = VtValue(static_cast<int64_t>(_impl->engine->textureStreamingRestarts.load()));
+    result["textureStreamingRestarts"] = VtValue(static_cast<int64_t>(counters.textureStreamingRestarts));
     result["firstPassPrimaryScratchBytes"] = VtValue(static_cast<int64_t>(engineStats.firstPassPrimaryScratchBytes));
-    result["colorTracedPixels"] = VtValue(static_cast<int64_t>(_impl->engine->colorTracedPixels.load()));
-    result["geometricOnlyPixels"] = VtValue(static_cast<int64_t>(_impl->engine->geometricOnlyPixels.load()));
+    result["colorTracedPixels"] = VtValue(static_cast<int64_t>(counters.colorTracedPixels));
+    result["geometricOnlyPixels"] = VtValue(static_cast<int64_t>(counters.geometricOnlyPixels));
     result["colorPassScratchBytes"] = VtValue(static_cast<int64_t>(engineStats.colorPassScratchBytes));
     result["colorRngStorageBytes"] = VtValue(static_cast<int64_t>(engineStats.colorRngStorageBytes));
     result["lastPassTraceMilliseconds"] = VtValue(engineStats.lastPassTraceMilliseconds);
@@ -6918,7 +6851,7 @@ VtDictionary SceneBridge::GetStats() const
         }
     }
     result["bufferWriteProfilingEnabled"] = VtValue(
-        _impl->engine->profileBufferWrites);
+        SessionAccess::counters(_impl->session).profileBufferWrites);
     result["presentationCopyBytes"] = VtValue(static_cast<int64_t>(presentationCopyBytes));
     result["bufferWriteMilliseconds"] = VtValue(writeNs / 1.0e6);
     result["bufferPublicationMilliseconds"] = VtValue(publishNs / 1.0e6);

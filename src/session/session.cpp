@@ -10,12 +10,14 @@
 #include "../device/denoiser.h"
 #include "../device/device.h"
 #include "../output/aov.h"
+#include "../load_profile.h"
 #include "../render_defaults.h"
 #include "../renderer/renderer_context.h"
 #include "../scene.h"
 #include "../scene/scene_internal.h"
 #include "../texture_service.h"
 #include "progressive_engine.h"
+#include "session_internal.h"
 
 #include <tbb/parallel_for.h>
 
@@ -26,6 +28,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <exception>
+#include <future>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -264,12 +267,29 @@ struct Session::Impl {
 
     std::shared_ptr<RendererContext> context;
     Scene scene;
+    // A hosted session (detail::SessionAccess::createHosted) renders its
+    // front end's scene revisions and has no scene of its own.
+    bool hosted = false;
     // The options (under optionsMutex); renders copy them when they start.
     SessionOptions current;
     mutable std::mutex optionsMutex;
+    // The device: fixed for a session from createSession; a hosted session's
+    // changes with its front end's preference (under deviceMutex, set by its
+    // render thread).
     std::shared_ptr<device::RenderDevice> device;
     DeviceInfo info;
     std::string note;
+    mutable std::mutex deviceMutex;
+    device::DevicePreference devicePreference = device::DevicePreference::Auto;
+    // A hosted session's device creation (render thread only): it can take
+    // seconds, so the render thread waits on it while polling for a stop and
+    // an interrupted creation keeps running for the next call.
+    struct CreatedDevice {
+        std::shared_ptr<device::RenderDevice> device;
+        std::string note;
+    };
+    std::future<CreatedDevice> deviceCreation;
+    device::DevicePreference deviceCreationPreference = device::DevicePreference::Auto;
     // What the device last saw: the scene revision and the generation of the
     // scene's render settings (another session may have changed them since).
     uint64_t preparedRevision = 0;
@@ -315,6 +335,11 @@ struct Session::Impl {
     session::ProgressiveEngine::Outcome runProgressive(SessionOptions const& options, bool restart,
                                                       ProgressCallback const& callback);
     SessionStatus statusLocked() const;
+    detail::HostedDevice acquireDevice(device::DevicePreference preference, std::function<bool()> const& stopRequested);
+    void checkNotHosted() const
+    {
+        if (hosted) Throw(ErrorCode::InvalidArgument, "a hosted session renders through its front end");
+    }
 };
 
 // Called with the scene's render mutex held (SceneAccess::renderMutex).
@@ -339,6 +364,7 @@ SceneManager& Session::Impl::sceneForDevice(SessionOptions const& options)
 RenderResult Session::Impl::render(ProgressCallback const& progressCallback)
 {
     using Clock = std::chrono::steady_clock;
+    checkNotHosted();
     // Before the render mutex, which a progressive run holds: the thread
     // starts no run while a batch render runs.
     {
@@ -838,6 +864,11 @@ Session::Impl::~Impl()
     }
     controlChanged.notify_all();
     if (thread.joinable()) thread.join();
+    // Device jobs own their device and scene; let them finish.
+    if (deviceCreation.valid()) {
+        try { (void)deviceCreation.get(); }
+        catch (...) {}
+    }
     engine.reset();
 }
 
@@ -870,10 +901,8 @@ SessionStatus Session::Impl::statusLocked() const
     status.activeFraction = status.samples ? engine->activePixelFraction.load() : 1.0;
     status.timeLimitReached = engine->timeLimitReached.load();
     // As the delegate's percentDone.
-    const double sampleFraction =
-        std::clamp(double(status.samples) / double(std::max(1, targetSamples)), 0.0, 1.0);
-    double fraction = (1.0 - status.activeFraction) + status.activeFraction * sampleFraction;
-    if (status.samples && timeLimitSeconds > 0.0) fraction = std::max(fraction, engine->timeLimitFraction.load());
+    const double fraction = detail::ProgressFraction(status.samples, targetSamples, status.activeFraction,
+                                                     timeLimitSeconds, engine->timeLimitFraction.load());
     status.fraction = state == SessionState::Converged ? 1.0 : std::clamp(fraction, 0.0, 1.0);
     return status;
 }
@@ -1132,6 +1161,7 @@ void Session::setDenoise(std::optional<DenoiseSettings> const& denoise, bool den
 
 void Session::prepare()
 {
+    m_impl->checkNotHosted();
     {
         std::lock_guard guard(m_impl->control);
         if (m_impl->state == SessionState::Running || m_impl->state == SessionState::Paused)
@@ -1179,6 +1209,7 @@ void Session::cancel()
 
 void Session::start(ProgressCallback const& progress)
 {
+    m_impl->checkNotHosted();
     const SessionOptions options = m_impl->options();
     Setup(options, m_impl->scene);  // throws for invalid options
     ValidProgressive(options.progressive);
@@ -1311,6 +1342,184 @@ Pick Session::pick(unsigned x, unsigned y) const
     }
     return pick;
 }
+
+// ── Hosted sessions (session_internal.h): the front end's scene revisions
+// and render targets, this session's device, loop and state.
+
+double detail::ProgressFraction(uint64_t samples, int targetSamples, double activeFraction, double timeLimitSeconds,
+                                double timeLimitFraction)
+{
+    const double sampleFraction = std::clamp(double(samples) / double(std::max(1, targetSamples)), 0.0, 1.0);
+    double fraction = (1.0 - activeFraction) + activeFraction * sampleFraction;
+    if (samples && timeLimitSeconds > 0.0) fraction = std::max(fraction, timeLimitFraction);
+    return fraction;
+}
+
+// Moved from the Hydra delegate's render worker (AcquireRenderDevice).
+detail::HostedDevice Session::Impl::acquireDevice(device::DevicePreference preference,
+                                                  std::function<bool()> const& stopRequested)
+{
+    detail::HostedDevice result;
+    {
+        std::lock_guard lock(deviceMutex);
+        if (device && devicePreference == preference) {
+            result.device = device;
+            return result;
+        }
+    }
+    auto waitFor = [&](std::future<CreatedDevice>& job) {
+        while (job.wait_for(std::chrono::milliseconds(2)) != std::future_status::ready)
+            if (stopRequested()) return false;
+        return true;
+    };
+    if (deviceCreation.valid() && deviceCreationPreference != preference) {
+        if (!waitFor(deviceCreation)) {
+            ++engine->devicePreparationsInterrupted;
+            return result;
+        }
+        try { (void)deviceCreation.get(); }
+        catch (...) {}
+    }
+    if (!deviceCreation.valid()) {
+        deviceCreationPreference = preference;
+        context->progress().Begin(Phase::Device);
+        deviceCreation = std::async(std::launch::async, [preference, context = context] {
+            logging::Bind logBinding(&context->logger());
+            progress::Bind progressBinding(&context->progress());
+            load_profile::Scope profile("device.create");
+            CreatedDevice created;
+            created.device = device::CreateDevice(preference, context->deviceOptions(), &created.note);
+            context->progress().End(Phase::Device);
+            return created;
+        });
+    }
+    if (!waitFor(deviceCreation)) {
+        ++engine->devicePreparationsInterrupted;
+        return result;
+    }
+    CreatedDevice created;
+    try {
+        created = deviceCreation.get();
+    } catch (std::exception const& e) {
+        result.error = e.what();
+    }
+    if (!created.device)
+        created.device = device::CreateDevice(device::DevicePreference::Cpu, context->deviceOptions(), &created.note);
+    context->progress().SetDevice(session::ProgressiveEngine::DescribeDevice(*created.device, preference, created.note));
+    {
+        std::lock_guard lock(deviceMutex);
+        device = created.device;
+        devicePreference = preference;
+        info = device->Info();
+        note = created.note;
+    }
+    engine->DeviceReplaced();
+    result.device = std::move(created.device);
+    result.created = true;
+    result.note = std::move(created.note);
+    return result;
+}
+
+namespace detail {
+
+Session SessionAccess::createHosted(std::shared_ptr<RendererContext> context,
+                                    std::atomic<int64_t> const* embreeLiveBytes)
+{
+    auto impl = std::make_shared<Session::Impl>(context, SceneAccess::detached(), SessionOptions{});
+    impl->hosted = true;
+    impl->engine = std::make_unique<session::ProgressiveEngine>(impl->context);
+    impl->engine->embreeLiveBytes = embreeLiveBytes;
+    return Session(std::move(impl));
+}
+
+HostedDevice SessionAccess::acquireDevice(Session& session, device::DevicePreference preference,
+                                          std::function<bool()> const& stopRequested)
+{
+    return session.m_impl->acquireDevice(preference, stopRequested);
+}
+
+std::shared_ptr<device::RenderDevice> SessionAccess::device(Session const& session)
+{
+    std::lock_guard lock(session.m_impl->deviceMutex);
+    return session.m_impl->device;
+}
+
+void SessionAccess::noteScene(Session& session, SceneManager& scene, uint64_t generation)
+{
+    if (auto current = device(session)) session.m_impl->engine->NoteScene(*current, scene, generation);
+}
+
+bool SessionAccess::runHosted(Session& session, HostedRun const& hosted, session::ProgressiveTarget& target)
+{
+    Session::Impl& impl = *session.m_impl;
+    session::ProgressiveEngine& engine = *impl.engine;
+    {
+        std::lock_guard lock(impl.control);
+        if (engine.samples.load() == 0) ++impl.accumulations;
+        impl.active = true;
+        impl.state = SessionState::Running;
+        impl.runningRevision = hosted.generation;
+        impl.targetSamples = hosted.settings.samples;
+        impl.timeLimitSeconds = hosted.settings.timeLimitSeconds;
+    }
+    session::ProgressiveRun run;
+    run.device = device(session);
+    run.preference = hosted.preference;
+    run.scene = hosted.scene;
+    run.outputs = hosted.outputs;
+    run.settings = hosted.settings;
+    run.view = hosted.view;
+    run.generation = hosted.generation;
+    run.diagnosticsLabel = hosted.diagnosticsLabel;
+    const auto outcome = engine.Run(run, target);
+    {
+        // A stopped run keeps its accumulation for the next one (paused).
+        std::lock_guard lock(impl.control);
+        impl.state = outcome == session::ProgressiveEngine::Outcome::Finished ? SessionState::Converged
+                                                                               : SessionState::Paused;
+    }
+    impl.controlChanged.notify_all();
+    return outcome == session::ProgressiveEngine::Outcome::Finished;
+}
+
+void SessionAccess::restartAccumulation(Session& session) { session.m_impl->engine->samples.store(0); }
+
+HostedCounters SessionAccess::counters(Session const& session)
+{
+    session::ProgressiveEngine const& engine = *session.m_impl->engine;
+    HostedCounters counters;
+    counters.samples = engine.samples.load();
+    counters.activePixelFraction = engine.activePixelFraction.load();
+    counters.timeLimitFraction = engine.timeLimitFraction.load();
+    counters.timeLimitReached = engine.timeLimitReached.load();
+    counters.denoisesPublished = engine.denoisesPublished.load();
+    counters.lastDenoiseMilliseconds = engine.lastDenoiseMilliseconds.load();
+    counters.colorTracedPixels = engine.colorTracedPixels.load();
+    counters.geometricOnlyPixels = engine.geometricOnlyPixels.load();
+    counters.gpuPreviewActive = engine.gpuPreviewActive.load(std::memory_order_relaxed);
+    counters.gpuPreviewSamples = engine.gpuPreviewSamples.load();
+    counters.gpuPreviewHandovers = engine.gpuPreviewHandovers.load();
+    counters.gpuPreviewHandoverSample = engine.gpuPreviewHandoverSample.load();
+    counters.textureStreamingRestarts = engine.textureStreamingRestarts.load();
+    counters.devicePreparations = engine.devicePreparations.load();
+    counters.devicePreparationsInterrupted = engine.devicePreparationsInterrupted.load();
+    counters.profileBufferWrites = engine.profileBufferWrites;
+    return counters;
+}
+
+session::ProgressiveStats SessionAccess::stats(Session const& session) { return session.m_impl->engine->Stats(); }
+
+void SessionAccess::waitForJobs(Session& session)
+{
+    Session::Impl& impl = *session.m_impl;
+    if (impl.deviceCreation.valid()) {
+        try { (void)impl.deviceCreation.get(); }
+        catch (...) {}
+    }
+    impl.engine->WaitForJobs();
+}
+
+} // namespace detail
 
 // ── Renderer (the parts with devices and sessions)
 
