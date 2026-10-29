@@ -591,6 +591,19 @@ if(PRISM_BUILD_HYDRA)
                 ENVIRONMENT "${_prism_test_environment}")
         endif()
     endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/edit_fuzz_test.cpp")
+        # A seeded random edit sequence through the delegate and through the
+        # public Scene: each updated image against a fresh build bit for bit,
+        # the two front ends within the noise floor. CPU only.
+        add_executable(prism_hydra_edit_fuzz tests/hydra/edit_fuzz_test.cpp)
+        target_include_directories(prism_hydra_edit_fuzz PRIVATE ${PXR_INCLUDE_DIRS})
+        target_link_libraries(prism_hydra_edit_fuzz PRIVATE PrismRT::core usdImagingGL hd ${PXR_LIBRARIES})
+        set_target_properties(prism_hydra_edit_fuzz PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY "$<1:${CMAKE_BINARY_DIR}/hydra/plugin>")
+        add_test(NAME prism_hydra_edit_fuzz COMMAND prism_hydra_edit_fuzz 1 20)
+        set_tests_properties(prism_hydra_edit_fuzz PROPERTIES
+            ENVIRONMENT "${_prism_test_environment};PRISM_DEVICE=cpu;PRISM_DISABLE_VULKAN=1" TIMEOUT 900)
+    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/render_settings_test.cpp")
         # UsdRender settings, products and vars (docs/hydra.md).
         add_executable(prism_render_settings_test tests/hydra/render_settings_test.cpp)
