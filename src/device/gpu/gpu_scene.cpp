@@ -3,7 +3,7 @@
 #include "../light_table.h"
 
 #include "../../batched_spheres.h"
-#include "../../hydra/environment_cache.h"
+#include "../../scene/environment_cache.h"
 #include "../../hydra/fallback_material.h"
 #include "../../mdl_material.h"
 #include "../../scene.h"
@@ -301,7 +301,7 @@ GpuEnvironment BuildEnvironmentRecord(Environment const* environment, Builder& b
         record.multiplier.w = det;
     };
 
-    if (auto const* cached = dynamic_cast<prism::hydra::CachedTransformedEnvironment const*>(environment)) {
+    if (auto const* cached = dynamic_cast<prism::revision::CachedTransformedEnvironment const*>(environment)) {
         setTransform(cached->worldToEnvironment(), cached->environmentToWorld(),
                      cached->transformDeterminant());
         setLatLong(cached->localMap());

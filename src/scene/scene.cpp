@@ -10,6 +10,7 @@
 #include <prism/renderer.h>
 #include <prism/scene.h>
 
+#include "environment_cache.h"
 #include "revision_parts.h"
 #include "scene_internal.h"
 
@@ -758,6 +759,9 @@ struct Scene::Impl {
     std::map<std::pair<uint64_t, uint64_t>, std::weak_ptr<SphereStorage>> spherePool;
     std::shared_ptr<DefaultDomeStorage> defaultDome;
     std::map<std::tuple<uint64_t, uint64_t, bool>, std::vector<size_t>> refinementFaces;
+    // Domes' importance tables, shared by revisions (and by a dome's moves).
+    revision::EnvironmentCache environmentCache;
+    std::shared_ptr<ColorTexture> whiteEnvironment = std::make_shared<ColorTexture>(Color3(1));
 
     void diagnose(DiagnosticLevel level, std::string category, std::string message, bool print = true)
     {
@@ -877,18 +881,20 @@ std::shared_ptr<EnvironmentStorage> Scene::Impl::buildEnvironment(
                                                            desc.intensity, *colorManagement);
             storage->textures.push_back(std::move(texture));
         } else {
-            std::unique_ptr<Texture<Color3>> texture;
+            // As the delegate's domes: over the cache's importance tables.
+            std::shared_ptr<Texture<Color3>> texture = whiteEnvironment;
             if (!desc.texture.empty())
-                texture = std::make_unique<ImageTexture<Color3>>(desc.texture, desc.textureColorSpace, colorManagement);
-            else
-                texture = std::make_unique<ColorTexture>(Color3(1));
+                texture = std::make_shared<ImageTexture<Color3>>(desc.texture, desc.textureColorSpace, colorManagement);
             const Color3 multiplier = toWorking(desc.color, desc.colorSpace) * (desc.intensity * std::exp2(desc.exposure));
             const Matrix4d inverse = Nearest(desc.transform).inverse();
             std::array<float, 9> linear;
             for (int row = 0; row < 3; ++row)
                 for (int col = 0; col < 3; ++col) linear[size_t(row * 3 + col)] = float(inverse[size_t(col)][row]);
-            environment = std::make_unique<TransformedEnvironmentMap>(texture.get(), multiplier, linear, *colorManagement);
-            storage->textures.push_back(std::move(texture));
+            auto dome = std::make_unique<revision::CachedTransformedEnvironment>(
+                environmentCache.Get(std::move(texture), multiplier, *colorManagement), linear);
+            if (dome->singularTransform())
+                diagnose(DiagnosticLevel::Warning, "environment", "invalid or singular dome transform; using identity");
+            environment = std::move(dome);
         }
         environment->diffuseFactor = desc.diffuse;
         environment->specularFactor = desc.specular;
