@@ -26,6 +26,8 @@
 #include "../mdl_material.h"
 #include "../mesh/mesh_conversion.h"
 #include "../mesh/polygon_mesh.h"
+#include "../progress.h"
+#include "../renderer/logger.h"
 #include "../renderer/renderer_context.h"
 #include "../scene.h"
 
@@ -554,54 +556,205 @@ SceneManager::PlacementTransform PlacementOf(Matrix4d const& world, bool flipWit
     return placement;
 }
 
-// An Embree instance of `prototype` at `world` (row vectors; Embree's
-// column-major affine convention).
-unsigned AttachInstance(RTCDevice device, RTCScene target, RTCScene prototype, Matrix4d const& world)
+// An instance's transform (row vectors) in Embree's column-major affine
+// convention.
+void SetInstanceTransform(RTCGeometry instance, Matrix4d const& world)
 {
-    RTCGeometry instance = rtcNewGeometry(device, RTC_GEOMETRY_TYPE_INSTANCE);
-    rtcSetGeometryInstancedScene(instance, prototype);
     float matrix[16];
     for (int c = 0; c < 4; ++c)
         for (int r = 0; r < 4; ++r) matrix[c * 4 + r] = float(world[size_t(c)][r]);
     rtcSetGeometryTransform(instance, 0, RTC_FORMAT_FLOAT4X4_COLUMN_MAJOR, matrix);
-    rtcCommitGeometry(instance);
-    const unsigned id = rtcAttachGeometry(target, instance);
-    rtcReleaseGeometry(instance);
-    return id;
 }
+
+// An Embree instance of `prototype` at `world`, geometry `id` of `target`.
+void AttachInstance(RTCDevice device, RTCScene target, RTCScene prototype, Matrix4d const& world, unsigned id)
+{
+    RTCGeometry instance = rtcNewGeometry(device, RTC_GEOMETRY_TYPE_INSTANCE);
+    rtcSetGeometryInstancedScene(instance, prototype);
+    SetInstanceTransform(instance, world);
+    rtcCommitGeometry(instance);
+    rtcAttachGeometryByID(target, instance, id);
+    rtcReleaseGeometry(instance);
+}
+
+bool SameBits(Matrix4d const& a, Matrix4d const& b) { return std::memcmp(a.m, b.m, sizeof(a.m)) == 0; }
+
+std::array<uint64_t, 16> Bits(Matrix4d const& m)
+{
+    std::array<uint64_t, 16> bits{};
+    std::memcpy(bits.data(), m.m, sizeof(m.m));
+    return bits;
+}
+
+bool SamePrimvars(std::shared_ptr<const InstancePrimvars> const& a, std::shared_ptr<const InstancePrimvars> const& b)
+{
+    if (a == b) return true;
+    if (!a || !b || a->values.size() != b->values.size()) return false;
+    for (size_t i = 0; i < a->values.size(); ++i) {
+        auto const &x = a->values[i], &y = b->values[i];
+        if (x.name != y.name || x.components != y.components ||
+            std::memcmp(x.value.data(), y.value.data(), sizeof(x.value)) != 0)
+            return false;
+    }
+    return true;
+}
+
+constexpr uint32_t kAllKinds = DirtyKind::Placement | DirtyKind::Prototype | DirtyKind::Material |
+                               DirtyKind::Light | DirtyKind::Environment | DirtyKind::Structure;
 
 } // namespace
 
-// One committed revision: the SceneManager devices render and everything it
-// points to.
-struct Revision {
-    std::unique_ptr<SceneManager> manager;
-    std::vector<std::unique_ptr<Mesh, mesh::ConvertedMeshDeleter>> meshes;
-    std::vector<std::unique_ptr<Geometry, GeometryDeleter>> geometries;  // spheres
-    std::vector<RTCScene> prototypes;
-    std::vector<std::shared_ptr<Material>> materials;
-    std::vector<std::unique_ptr<Texture<Color3>>> textures;
-    std::vector<std::unique_ptr<Environment>> environments;
-    std::vector<std::shared_ptr<const InstancePrimvars>> primvars;
-    std::unordered_map<unsigned, detail::PlacementInfo> placements;
+// ── Revisions and what they share (docs/sdk_design.md 3.5)
+//
+// A revision is the SceneManager devices render and everything it points
+// to. Revisions share what did not change, as the Hydra delegate's snapshot
+// banks do: mesh conversions with their Embree geometry and prototype
+// scenes (ShapeStorage, pooled by the conversion's inputs: the prototype
+// pool), sphere prototypes, compiled materials, the environments and lights,
+// and for lighting edits the top-level acceleration structure (TopLevel).
+// The scene keeps the published revision and the one before it (the spare
+// bank): when nothing renders the spare any more and its placements are the
+// same instances, a commit updates it in place (transforms, visibility,
+// materials, primvars) instead of building a new revision.
 
-    ~Revision()
+// A mesh's conversion for one set of inputs (ShapeKey).
+struct ShapeStorage {
+    std::unique_ptr<Mesh, mesh::ConvertedMeshDeleter> mesh;  // null: no triangles
+    mesh::SharedFaceTable coarseFaces;
+    std::vector<int> triangleSlots;  // per triangle (empty: from the faces)
+    bool verbatim = false;           // a triangle list taken as given
+    bool instanced = false;          // placed through Embree instances of `scene`
+    RTCScene scene = nullptr;        // instanced: the prototype scene
+    bool embree = false;             // the Embree geometry (and scene) exists
+    BufferView faceSlots;            // the mesh's faceMaterialSlots
+    // The materials of the key, alive while the entry is: their addresses
+    // are part of the key.
+    std::vector<std::shared_ptr<Material>> keyMaterials;
+
+    ~ShapeStorage()
     {
-        if (manager && manager->scene) rtcReleaseScene(manager->scene);
-        for (RTCScene scene : prototypes) rtcReleaseScene(scene);
-        for (auto& mesh : meshes)
-            if (mesh && mesh->geom) {
-                rtcReleaseGeometry(mesh->geom);
-                mesh->geom = nullptr;
-            }
+        if (scene) rtcReleaseScene(scene);
+        if (mesh && mesh->geom) {
+            rtcReleaseGeometry(mesh->geom);
+            mesh->geom = nullptr;
+        }
     }
 };
+
+// What a mesh's conversion depends on. Material addresses stand for the
+// materials (ShapeStorage keeps them alive); worlds compare bit for bit.
+struct ShapeKey {
+    uint64_t mesh = 0, version = 0;
+    Material const* displacer = nullptr;
+    std::vector<Material const*> slotMaterials;
+    int level = 0;
+    bool instanced = false;
+    bool baked = false;  // world-space conversion: `world` is part of the key
+    std::array<uint64_t, 16> world{};
+    auto operator<=>(ShapeKey const&) const = default;
+};
+
+struct SphereStorage {
+    std::unique_ptr<Geometry, GeometryDeleter> geometry;
+    RTCScene scene = nullptr;
+    ~SphereStorage()
+    {
+        if (scene) rtcReleaseScene(scene);
+    }
+};
+
+// The top-level Embree scene of one or more revisions (lighting edits share it).
+struct TopLevel {
+    RTCScene scene = nullptr;
+    ~TopLevel()
+    {
+        if (scene) rtcReleaseScene(scene);
+    }
+};
+
+struct EnvironmentStorage {
+    std::vector<std::unique_ptr<Texture<Color3>>> textures;
+    std::vector<std::unique_ptr<Environment>> environments;
+    Environment* environment = nullptr;
+    bool black = true;  // `environment` is the black background (no environment)
+};
+
+struct LightStorage {
+    std::vector<SceneLight> lights;
+    std::vector<std::string> lightCategories, shadowCategories;
+};
+
+struct DefaultDomeStorage {
+    std::shared_ptr<const color::ColorManagement> colorManagement;
+    std::unique_ptr<Texture<Color3>> texture;
+    std::unique_ptr<Environment> dome;
+};
+
+// An attachable placement; its Embree geometry id is its index in
+// Revision::placed (hidden ones keep their id, unattached).
+struct Placed {
+    uint64_t instance = 0;
+    std::shared_ptr<ShapeStorage> shape;     // mesh placements
+    std::shared_ptr<SphereStorage> spheres;  // sphere placements
+    Matrix4d world;
+    bool visible = true;
+    std::vector<Material*> materials;        // slots (slot 0 resolved)
+    std::shared_ptr<const InstancePrimvars> primvars;
+};
+
+struct Revision {
+    std::unique_ptr<SceneManager> manager;
+    std::shared_ptr<TopLevel> top;           // owns manager->scene
+    std::vector<Placed> placed;
+    std::vector<std::shared_ptr<Material>> materials;
+    std::shared_ptr<EnvironmentStorage> environment;
+    std::shared_ptr<LightStorage> lights;
+    std::shared_ptr<DefaultDomeStorage> defaultDome;
+    std::unordered_map<unsigned, detail::PlacementInfo> placements;
+};
+
+// A placement's materials: slot 0 for the placement, and per triangle the
+// materials of the other slots (face slots, or the triangle slots of a
+// displaced triangle list).
+static SceneManager::PlacementMaterialBinding BindingOf(ShapeStorage const* shape, std::vector<Material*> const& materials)
+{
+    SceneManager::PlacementMaterialBinding binding;
+    binding.fallback = materials[0];
+    if (!shape) return binding;
+    BufferView const& faceSlots = shape->faceSlots;
+    if (!faceSlots.empty() || !shape->triangleSlots.empty()) {
+        const size_t triangles = shape->mesh->indices.size() / 3;
+        for (size_t t = 0; t < triangles; ++t) {
+            int slot = 0;
+            if (!shape->triangleSlots.empty()) {
+                slot = t < shape->triangleSlots.size() ? shape->triangleSlots[t] : 0;
+            } else {
+                const size_t face = shape->coarseFaces.size() ? size_t(shape->coarseFaces[t]) : t;
+                slot = face < faceSlots.count ? IntAt(faceSlots, face) : 0;
+            }
+            if (slot <= 0) continue;
+            Material* material = size_t(slot) < materials.size() ? materials[size_t(slot)] : nullptr;
+            binding.triangles[int(t)] = material ? material : materials[0];
+        }
+    }
+    return binding;
+}
 
 struct Scene::Impl {
     std::shared_ptr<RendererContext> context;
     SceneOptions options;
-    Slots<MeshDesc> meshes;
-    Slots<SpheresDesc> spheres;
+    // Mesh and spheres data with a version that changes with every edit (a
+    // conversion's key).
+    struct MeshEntry {
+        MeshDesc desc;
+        uint64_t version = 0;
+    };
+    struct SpheresEntry {
+        SpheresDesc desc;
+        uint64_t version = 0;
+    };
+    Slots<MeshEntry> meshes;
+    Slots<SpheresEntry> spheres;
     Slots<InstanceDesc> instances;
     struct MaterialEntry {
         MaterialDesc desc;
@@ -617,19 +770,39 @@ struct Scene::Impl {
     std::mutex renderMutex;  // the scene's sessions render one at a time
     std::atomic<int> renderWaiters{0};  // RenderLock: renders and commits waiting for it
     // Replaced under the render lock; a progressive session keeps the
-    // revision it renders alive (SceneAccess::committedRevision).
-    std::shared_ptr<Revision> committed;
+    // revision it renders alive (SceneAccess::committedRevision). `spare` is
+    // the one before it, updated in place by a later commit when nothing
+    // holds it any more.
+    std::shared_ptr<Revision> committed, spare;
     std::atomic<uint64_t> revision{0};
     std::vector<Diagnostic> diagnostics;
+
+    // Edits since the last commit (DirtyKind bits), and the version counter.
+    uint32_t dirty = 0;
+    uint64_t versions = 0;
+    // Shared by revisions: the grey of geometry without a material, the
+    // prototype pool, sphere prototypes, the default dome and the faces
+    // meshes refine to (by mesh, version and displacement).
+    std::shared_ptr<Material> grey;
+    std::map<ShapeKey, std::weak_ptr<ShapeStorage>> shapePool;
+    std::map<std::pair<uint64_t, uint64_t>, std::weak_ptr<SphereStorage>> spherePool;
+    std::shared_ptr<DefaultDomeStorage> defaultDome;
+    std::map<std::tuple<uint64_t, uint64_t, bool>, std::vector<size_t>> refinementFaces;
 
     void diagnose(DiagnosticLevel level, std::string category, std::string message, bool print = true)
     {
         if (print) std::cerr << "PrismRT: " << message << '\n';
         diagnostics.push_back({level, std::move(category), std::move(message)});
     }
+    void edited(DirtyKind kind) { dirty |= uint32_t(kind); }
+    void edited(uint32_t kinds) { dirty |= kinds; }
 
     std::shared_ptr<Material> compile(MaterialEntry& entry);
     CommitResult commit(ProgressCallback const& progress);
+    std::shared_ptr<EnvironmentStorage> buildEnvironment(std::shared_ptr<const color::ColorManagement> const& color);
+    std::shared_ptr<LightStorage> buildLights(color::ColorManagement const& color);
+    void attach(Revision& revision, unsigned id, RTCDevice device);
+    void detach(Revision& revision, unsigned id);
 };
 
 std::shared_ptr<Material> Scene::Impl::compile(MaterialEntry& entry)
@@ -700,348 +873,11 @@ std::shared_ptr<Material> Scene::Impl::compile(MaterialEntry& entry)
     return std::shared_ptr<Material>(std::shared_ptr<Material>(), ErrorMaterial::Shared());
 }
 
-CommitResult Scene::Impl::commit(ProgressCallback const& progress)
+// Environments, in order; several add up.
+std::shared_ptr<EnvironmentStorage> Scene::Impl::buildEnvironment(
+    std::shared_ptr<const color::ColorManagement> const& colorManagement)
 {
-    const auto start = std::chrono::steady_clock::now();
-    // Progress per phase (and material); a false return stops the commit.
-    auto report = [&](const char* phase, size_t done, size_t total) {
-        if (!progress) return;
-        ProgressInfo info;
-        info.phase = phase;
-        info.done = done;
-        info.total = total;
-        info.fraction = total ? double(done) / double(total) : 0.0;
-        info.elapsedSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-        if (!progress(info)) Throw(ErrorCode::Cancelled, "the commit was cancelled");
-    };
-    diagnostics.clear();
-    auto revision = std::make_unique<Revision>();
-    auto colorManagement = context->colorManagement();
-    RTCDevice& device = context->embreeDevice();
-    revision->manager = std::make_unique<SceneManager>(device, colorManagement);
-    SceneManager& manager = *revision->manager;
-    CommitResult result;
-
-    // ── Materials: compiled once per description (load time only).
-    size_t materialCount = 0, materialsDone = 0;
-    materials.forEach([&](uint64_t, MaterialEntry&) { ++materialCount; });
-    report("materials", 0, materialCount);
-    materials.forEach([&](uint64_t, MaterialEntry& entry) {
-        if (!entry.compiled) entry.compiled = compile(entry);
-        revision->materials.push_back(entry.compiled);
-        report("materials", ++materialsDone, materialCount);
-    });
-    result.materials = revision->materials.size();
-    // Geometry without a material: the delegate's fallback grey.
-    std::shared_ptr<Material> grey;
-    auto defaultMaterial = [&]() -> Material* {
-        if (!grey) {
-            MaterialEntry fallback;
-            fallback.desc.kind = MaterialDesc::Kind::Diffuse;
-            fallback.desc.color = Color3(0.5f);
-            grey = compile(fallback);
-            revision->materials.push_back(grey);
-        }
-        return grey.get();
-    };
-    auto resolve = [&](std::vector<MaterialId> const& ids) {
-        std::vector<Material*> resolved;
-        for (MaterialId id : ids) resolved.push_back(id ? materials.get(id.v, "material").compiled.get() : nullptr);
-        if (resolved.empty()) resolved.push_back(nullptr);
-        if (!resolved[0]) resolved[0] = defaultMaterial();
-        return resolved;
-    };
-
-    mesh::SubdivisionSettings subdivision;
-    subdivision.level = options.subdivisionLevel;
-    subdivision.maxFaces = size_t(options.subdivisionMaxFaces);
-    subdivision.budgetFaces = size_t(options.subdivisionBudgetFaces);
-    subdivision.displacementLevel = options.displacementLevel;
-    subdivision.displacementMaxFaces = size_t(options.displacementMaxFaces);
-
-    // ── Mesh placements and the conversions they need ("shapes"): one per
-    // mesh and displacing material(s), in the order of their first instance.
-    struct Shape {
-        uint64_t mesh = 0;
-        MeshDesc const* desc = nullptr;
-        bool verbatim = false;           // a triangle list taken as given
-        Material* displacer = nullptr;   // polygon meshes: slot 0's displacement
-        std::vector<Material*> slotMaterials;  // triangle lists with displacing slots
-        bool flatten = false;            // baked into world space (one placement)
-        Matrix4d world;
-        std::vector<int> counts;         // a triangle list's faces (polygon conversion)
-        std::vector<int> triangleSlots;  // per triangle (empty: from the faces)
-        int level = 0;
-        // Results.
-        std::unique_ptr<Mesh, mesh::ConvertedMeshDeleter> converted;
-        mesh::SharedFaceTable coarseFaces;
-        bool instanced = false;
-        RTCScene scene = nullptr;
-    };
-    struct Placement {
-        uint64_t instance = 0;
-        InstanceDesc const* desc = nullptr;
-        size_t shape = 0;
-        std::vector<Material*> materials;
-        Matrix4d world;
-    };
-    std::vector<std::unique_ptr<Shape>> shapes;
-    std::vector<Placement> placements;
-    std::map<uint64_t, size_t> instanceCounts;
-    instances.forEach([&](uint64_t, InstanceDesc& instance) {
-        if (!instance.visible) return;
-        if (auto const* mesh = std::get_if<MeshId>(&instance.prototype)) ++instanceCounts[mesh->v];
-    });
-    std::map<std::tuple<uint64_t, Material*, std::vector<Material*>>, size_t> shapeIndex;
-    instances.forEach([&](uint64_t handle, InstanceDesc& instance) {
-        if (!instance.visible) return;
-        auto const* meshId = std::get_if<MeshId>(&instance.prototype);
-        if (!meshId) return;
-        MeshDesc const& desc = meshes.get(meshId->v, "mesh (of an instance)");
-        Placement placement;
-        placement.instance = handle;
-        placement.desc = &instance;
-        placement.materials = resolve(instance.materials);
-        placement.world = Nearest(instance.transform);
-        const bool verbatim = VerbatimTriangles(desc);
-        Material* displacer = nullptr;
-        std::vector<Material*> slotMaterials;
-        if (verbatim) {
-            bool displaces = false;
-            for (Material* material : placement.materials) displaces |= material && material->hasDisplacement();
-            if (displaces) slotMaterials = placement.materials;
-        } else if (placement.materials[0]->hasDisplacement()) {
-            displacer = placement.materials[0];
-        }
-        const bool single = instanceCounts[meshId->v] == 1 && !desc.instanced;
-        auto key = std::make_tuple(meshId->v, displacer, slotMaterials);
-        auto found = shapeIndex.find(key);
-        if (found == shapeIndex.end() || single) {
-            auto shape = std::make_unique<Shape>();
-            shape->mesh = meshId->v;
-            shape->desc = &desc;
-            shape->verbatim = verbatim;
-            shape->displacer = displacer;
-            shape->slotMaterials = slotMaterials;
-            shape->flatten = single;
-            shape->world = placement.world;
-            if (!verbatim && desc.faceVertexCounts.empty())
-                shape->counts.assign(desc.faceVertexIndices.count / 3, 3);
-            found = shapeIndex.insert_or_assign(key, shapes.size()).first;
-            shapes.push_back(std::move(shape));
-        }
-        placement.shape = found->second;
-        placements.push_back(std::move(placement));
-    });
-
-    report("geometry", 0, shapes.size());
-    // Refinement levels within the scene's budget, then the conversions:
-    // meshes that refine or displace by the shared conversion (as
-    // prototypes), the others by the polygon conversion.
-    {
-        std::vector<std::vector<size_t>> faces(shapes.size());
-        std::vector<bool> fixed(shapes.size(), false);
-        for (size_t i = 0; i < shapes.size(); ++i) {
-            Shape const& shape = *shapes[i];
-            if (shape.verbatim) continue;
-            const mesh::MeshSource source = SourceOf(*shape.desc, shape.counts);
-            faces[i] = mesh::RefinementFaces(source.faceVertexCounts, source.subdivisionScheme,
-                                             shape.displacer != nullptr, subdivision);
-        }
-        const std::vector<int> levels =
-            mesh::BudgetSubdivisionLevels(faces, fixed, subdivision.budgetFaces, nullptr, nullptr);
-        std::atomic<bool> controlHulls{false};
-        std::atomic<size_t> displacedSlots{0}, displacedTriangles{0};
-        std::vector<std::string> errors(shapes.size());
-        tbb::parallel_for(size_t(0), shapes.size(), [&](size_t i) {
-            Shape& shape = *shapes[i];
-            try {
-                if (shape.verbatim) {
-                    shape.converted = TriangleMesh(*shape.desc);
-                    shape.instanced = !shape.flatten || !(shape.world == Matrix4d());
-                    if (!shape.slotMaterials.empty()) {
-                        const size_t triangles = shape.converted->indices.size() / 3;
-                        shape.triangleSlots.assign(triangles, 0);
-                        BufferView const& slots = shape.desc->faceMaterialSlots;
-                        for (size_t t = 0; t < triangles && t < slots.count; ++t) shape.triangleSlots[t] = IntAt(slots, t);
-                        size_t slotsDisplaced = 0;
-                        displacedTriangles += DisplaceTriangleSlots(*shape.converted, shape.triangleSlots,
-                                                                    shape.slotMaterials, subdivision, &slotsDisplaced);
-                        displacedSlots += slotsDisplaced;
-                    }
-                    if (shape.converted->indices.empty()) shape.converted.reset();
-                    return;
-                }
-                const mesh::MeshSource source = SourceOf(*shape.desc, shape.counts);
-                shape.level = levels[i];
-                if (shape.desc->subdivision.level >= 0) shape.level = std::min(shape.level, shape.desc->subdivision.level);
-                const std::string_view scheme = mesh::RefinementScheme(source.subdivisionScheme, shape.displacer != nullptr);
-                if (shape.level > 0 || shape.displacer) {
-                    mesh::MeshConversion conversion = mesh::ConvertMesh(source, subdivision, shape.displacer, shape.level);
-                    shape.coarseFaces = conversion.info.coarseFaces;
-                    shape.converted = std::move(conversion.mesh);
-                    shape.instanced = true;
-                    if (conversion.info.subdivisionControlHull) controlHulls = true;
-                } else {
-                    if (scheme != "none") controlHulls = true;
-                    std::unique_ptr<Mesh, mesh::ConvertedMeshDeleter> converted(new Mesh());
-                    std::vector<int> coarse;
-                    if (mesh::BuildPolygonMesh(source, shape.flatten ? shape.world : Matrix4d(), *converted, coarse)) {
-                        shape.coarseFaces = mesh::SharedFaceTable(std::move(coarse));
-                        shape.converted = std::move(converted);
-                    }
-                    shape.instanced = !shape.flatten;
-                }
-            } catch (std::exception const& error) {
-                errors[i] = error.what();
-            }
-        });
-        for (auto const& error : errors)
-            if (!error.empty()) Throw(ErrorCode::InvalidArgument, error);
-        if (controlHulls)
-            diagnose(DiagnosticLevel::Warning, "geometry", "some subdivision surfaces are rendered as control hulls "
-                     "(subdivision level 0, over the maximum faces, or the refinement budget)");
-        if (displacedSlots) {
-            diagnose(DiagnosticLevel::Info, "geometry", "displaced the faces of " + std::to_string(displacedSlots.load()) +
-                     " material(s) into " + std::to_string(displacedTriangles.load()) + " triangles", false);
-            std::cout << "PrismRT: " << diagnostics.back().message << '\n';
-        }
-    }
-
-    // ── Attach: mesh placements in instance order, then spheres.
-    auto instancePrimvars = [&](InstanceDesc const& instance) -> std::shared_ptr<const InstancePrimvars> {
-        if (instance.primvars.empty()) return nullptr;
-        auto values = std::make_shared<InstancePrimvars>();
-        for (auto const& primvar : instance.primvars) {
-            InstancePrimvars::Value value;
-            value.name = primvar.name;
-            value.components = int(primvar.data.components);
-            for (int c = 0; c < value.components; ++c)
-                value.value[size_t(c)] = primvar.data.type == DataType::Int32
-                    ? float(static_cast<int32_t const*>(primvar.data.data)[c])
-                    : primvar.data.type == DataType::UInt32 ? float(static_cast<uint32_t const*>(primvar.data.data)[c])
-                    : FloatAt(primvar.data, size_t(c));
-            values->values.push_back(std::move(value));
-        }
-        return values;
-    };
-    std::vector<std::pair<unsigned, InstanceDesc const*>> attached;
-    for (Placement const& placement : placements) {
-        Shape& shape = *shapes[placement.shape];
-        if (!shape.converted) continue;
-        Mesh* mesh = shape.converted.get();
-        unsigned id;
-        if (!shape.instanced) {
-            id = mesh->setupEmbree(device, manager.scene);
-        } else {
-            if (!shape.scene) {
-                shape.scene = rtcNewScene(device);
-                mesh->setupEmbree(device, shape.scene);
-                rtcCommitScene(shape.scene);
-                revision->prototypes.push_back(shape.scene);
-            }
-            id = AttachInstance(device, manager.scene, shape.scene, placement.world);
-            manager.intersection_geometry.emplace(int(id), mesh->geom);
-            manager.placement_transforms.emplace(int(id), PlacementOf(placement.world, true));
-        }
-        manager.geometry.emplace(int(id), mesh);
-        auto& binding = manager.placement_materials[int(id)];
-        binding.fallback = placement.materials[0];
-        // Per-triangle materials of the slots other than 0.
-        BufferView const& faceSlots = shape.desc->faceMaterialSlots;
-        if (!faceSlots.empty() || !shape.triangleSlots.empty()) {
-            const size_t triangles = mesh->indices.size() / 3;
-            for (size_t t = 0; t < triangles; ++t) {
-                int slot = 0;
-                if (!shape.triangleSlots.empty()) {
-                    slot = t < shape.triangleSlots.size() ? shape.triangleSlots[t] : 0;
-                } else {
-                    const size_t face = shape.coarseFaces.size() ? size_t(shape.coarseFaces[t]) : t;
-                    slot = face < faceSlots.count ? IntAt(faceSlots, face) : 0;
-                }
-                if (slot <= 0) continue;
-                Material* material = size_t(slot) < placement.materials.size() ? placement.materials[size_t(slot)] : nullptr;
-                binding.triangles[int(t)] = material ? material : placement.materials[0];
-            }
-        }
-        if (auto primvars = instancePrimvars(*placement.desc)) {
-            manager.placement_primvars[int(id)] = primvars;
-            revision->primvars.push_back(std::move(primvars));
-        }
-        detail::PlacementInfo info;
-        info.instance = InstanceId{placement.instance};
-        info.primId = placement.desc->primId;
-        info.instanceId = placement.desc->instanceId;
-        info.userData = placement.desc->userData;
-        info.coarseFaces = shape.coarseFaces;
-        info.triangleList = shape.verbatim;
-        revision->placements[id] = std::move(info);
-        attached.emplace_back(id, placement.desc);
-        result.triangles += mesh->indices.size() / 3;
-    }
-    for (auto& shape : shapes)
-        if (shape->converted) revision->meshes.push_back(std::move(shape->converted));
-    result.meshes = revision->meshes.size();
-
-    // Spheres: a prototype per spheres description, placed by Embree
-    // instances (affine instances keep nonuniformly scaled spheres analytic).
-    std::map<uint64_t, std::pair<Geometry*, RTCScene>> spherePrototypes;
-    instances.forEach([&](uint64_t handle, InstanceDesc& instance) {
-        if (!instance.visible) return;
-        auto const* spheresId = std::get_if<SpheresId>(&instance.prototype);
-        if (!spheresId) return;
-        SpheresDesc const& desc = spheres.get(spheresId->v, "spheres (of an instance)");
-        auto& prototype = spherePrototypes[spheresId->v];
-        if (!prototype.first) {
-            BufferView const& centers = Nearest(desc.centers);
-            auto const* c = static_cast<float const*>(centers.data);
-            auto const* r = static_cast<float const*>(desc.radii.data);
-            std::unique_ptr<Geometry, GeometryDeleter> geometry;
-            if (centers.count == 1) {
-                geometry.reset(new Sphere(Float3(c[0], c[1], c[2]), r[0], nullptr));
-            } else {
-                auto* batch = new BatchedSpheres();
-                for (size_t i = 0; i < centers.count; ++i)
-                    batch->entries.push_back({Float3(c[3 * i], c[3 * i + 1], c[3 * i + 2]), r[i], nullptr});
-                geometry.reset(batch);
-            }
-            RTCScene scene = rtcNewScene(device);
-            geometry->setupEmbree(device, scene);
-            rtcCommitScene(scene);
-            revision->prototypes.push_back(scene);
-            prototype = {geometry.get(), scene};
-            revision->geometries.push_back(std::move(geometry));
-        }
-        const Matrix4d world = Nearest(instance.transform);
-        const unsigned id = AttachInstance(device, manager.scene, prototype.second, world);
-        manager.geometry.emplace(int(id), prototype.first);
-        manager.intersection_geometry.emplace(int(id), prototype.first->geom);
-        // Reflection changes the UV frame's handedness, not sphere winding.
-        manager.placement_transforms.emplace(int(id), PlacementOf(world, false));
-        manager.placement_materials[int(id)].fallback = resolve(instance.materials)[0];
-        if (auto primvars = instancePrimvars(instance)) {
-            manager.placement_primvars[int(id)] = primvars;
-            revision->primvars.push_back(std::move(primvars));
-        }
-        detail::PlacementInfo info;
-        info.instance = InstanceId{handle};
-        info.primId = instance.primId;
-        info.instanceId = instance.instanceId;
-        info.userData = instance.userData;
-        revision->placements[id] = std::move(info);
-        attached.emplace_back(id, &instance);
-    });
-    result.instances = attached.size();
-    manager.max_depth = renderSettings.maxDepth;
-    manager.rr_min_depth = renderSettings.rouletteDepth;
-    manager.environmentSampling = renderSettings.environmentSampling;
-    manager.textureFiltering = renderSettings.textureFiltering;
-    manager.honorDoubleSided = renderSettings.honorDoubleSided;
-    manager.textureStreaming = renderSettings.textureStreaming;
-    manager.gpuTextureBudgetMiB = renderSettings.gpuTextureBudgetMiB;
-
-    report("lights", 0, 0);
-    // ── Environments, in order; several add up.
+    auto storage = std::make_shared<EnvironmentStorage>();
     auto toWorking = [&](Color3 const& color, std::string const& space) {
         if (space.empty()) return color;
         if (space == color::kLightColorSpace) return colorManagement->FromRec709(color);
@@ -1051,10 +887,9 @@ CommitResult Scene::Impl::commit(ProgressCallback const& progress)
     };
     auto black = std::make_unique<ColorTexture>(Color3(0));
     auto background = std::make_unique<ConstantColorBackground>(black.get());
-    manager.environment = background.get();
-    Environment* blackBackground = background.get();
-    revision->textures.push_back(std::move(black));
-    revision->environments.push_back(std::move(background));
+    storage->environment = background.get();
+    storage->textures.push_back(std::move(black));
+    storage->environments.push_back(std::move(background));
     std::vector<Environment const*> domes;
     environments.forEach([&](uint64_t, EnvironmentDesc& desc) {
         std::unique_ptr<Environment> environment;
@@ -1062,7 +897,7 @@ CommitResult Scene::Impl::commit(ProgressCallback const& progress)
             auto texture = std::make_unique<ColorTexture>(toWorking(desc.color, desc.colorSpace) *
                                                           (desc.intensity * std::exp2(desc.exposure)));
             environment = std::make_unique<ConstantColorBackground>(texture.get());
-            revision->textures.push_back(std::move(texture));
+            storage->textures.push_back(std::move(texture));
         } else if (desc.kind == EnvironmentDesc::Kind::LatLong) {
             if (!std::filesystem::exists(desc.texture))
                 Throw(ErrorCode::NotFound, "Environment does not exist: " + desc.texture);
@@ -1070,7 +905,7 @@ CommitResult Scene::Impl::commit(ProgressCallback const& progress)
             texture->adjustExposure(desc.exposure);
             environment = std::make_unique<EnvironmentMap>(texture.get(), toWorking(desc.color, desc.colorSpace) *
                                                            desc.intensity, *colorManagement);
-            revision->textures.push_back(std::move(texture));
+            storage->textures.push_back(std::move(texture));
         } else {
             std::unique_ptr<Texture<Color3>> texture;
             if (!desc.texture.empty())
@@ -1083,24 +918,32 @@ CommitResult Scene::Impl::commit(ProgressCallback const& progress)
             for (int row = 0; row < 3; ++row)
                 for (int col = 0; col < 3; ++col) linear[size_t(row * 3 + col)] = float(inverse[size_t(col)][row]);
             environment = std::make_unique<TransformedEnvironmentMap>(texture.get(), multiplier, linear, *colorManagement);
-            revision->textures.push_back(std::move(texture));
+            storage->textures.push_back(std::move(texture));
         }
         environment->diffuseFactor = desc.diffuse;
         environment->specularFactor = desc.specular;
         domes.push_back(environment.get());
-        revision->environments.push_back(std::move(environment));
+        storage->environments.push_back(std::move(environment));
     });
     if (domes.size() == 1) {
-        manager.environment = const_cast<Environment*>(domes.front());
+        storage->environment = const_cast<Environment*>(domes.front());
+        storage->black = false;
     } else if (domes.size() > 1) {
         auto composite = std::make_unique<CompositeEnvironment>(domes, *colorManagement);
-        manager.environment = composite.get();
-        revision->environments.push_back(std::move(composite));
+        storage->environment = composite.get();
+        storage->black = false;
+        storage->environments.push_back(std::move(composite));
     }
+    return storage;
+}
 
-    // ── Lights, and light and shadow linking: a category bit per distinct
-    // category of the lights (at most 32 of each kind), in light order.
-    std::vector<std::string> lightCategories, shadowCategories;
+// Lights, and the light and shadow link categories: a category bit per
+// distinct category of the lights (at most 32 of each kind), in light order.
+std::shared_ptr<LightStorage> Scene::Impl::buildLights(color::ColorManagement const& colorManagement)
+{
+    auto storage = std::make_shared<LightStorage>();
+    std::vector<std::string>& lightCategories = storage->lightCategories;
+    std::vector<std::string>& shadowCategories = storage->shadowCategories;
     bool warnedCategories = false;
     auto bit = [&](std::vector<std::string>& categories, std::string const& name) -> uint32_t {
         if (name.empty()) return 0u;
@@ -1115,6 +958,7 @@ CommitResult Scene::Impl::commit(ProgressCallback const& progress)
         categories.push_back(name);
         return 1u << (categories.size() - 1);
     };
+    std::shared_ptr<const color::ColorManagement> textures = context->colorManagement();
     lights.forEach([&](uint64_t, LightDesc& desc) {
         LightParameters params;
         params.shape = LightShape(int(desc.shape));
@@ -1142,15 +986,573 @@ CommitResult Scene::Impl::commit(ProgressCallback const& progress)
             if (std::filesystem::exists(desc.shaping.iesFile)) params.shaping.ies = LoadIesProfile(desc.shaping.iesFile);
             else WarnUnresolvedIesProfile(desc.shaping.iesFile);
         }
-        SceneLight light = MakeSceneLight(params, Flat(Nearest(desc.transform)), *colorManagement);
+        SceneLight light = MakeSceneLight(params, Flat(Nearest(desc.transform)), colorManagement);
         light.lightLinkBit = bit(lightCategories, desc.lightLinkCategory);
         light.shadowLinkBit = bit(shadowCategories, desc.shadowLinkCategory);
         if (desc.shape == LightDesc::Shape::Rect && !desc.texture.empty())
-            light.texture = std::make_shared<ImageTexture<Color3>>(desc.texture, desc.textureColorSpace, colorManagement);
-        manager.lights.push_back(std::move(light));
+            light.texture = std::make_shared<ImageTexture<Color3>>(desc.texture, desc.textureColorSpace, textures);
+        storage->lights.push_back(std::move(light));
     });
-    result.lights = manager.lights.size();
-    manager.lightLinking = !lightCategories.empty() || !shadowCategories.empty();
+    return storage;
+}
+
+// Places revision.placed[id] (visible) as Embree geometry `id` of the
+// revision's top-level scene, with its maps.
+void Scene::Impl::attach(Revision& revision, unsigned id, RTCDevice device)
+{
+    Placed const& placed = revision.placed[id];
+    SceneManager& manager = *revision.manager;
+    RTCScene top = revision.top->scene;
+    const int key = int(id);
+    detail::PlacementInfo info;
+    if (placed.shape) {
+        ShapeStorage& shape = *placed.shape;
+        Mesh* mesh = shape.mesh.get();
+        if (!shape.embree) {
+            if (!shape.instanced) {
+                mesh->createEmbreeGeometry(device);
+            } else {
+                shape.scene = rtcNewScene(device);
+                mesh->setupEmbree(device, shape.scene);
+                rtcCommitScene(shape.scene);
+            }
+            shape.embree = true;
+        }
+        if (!shape.instanced) {
+            rtcAttachGeometryByID(top, mesh->geom, id);
+        } else {
+            AttachInstance(device, top, shape.scene, placed.world, id);
+            manager.intersection_geometry[key] = mesh->geom;
+            manager.placement_transforms[key] = PlacementOf(placed.world, true);
+        }
+        manager.geometry[key] = mesh;
+        manager.placement_materials[key] = BindingOf(&shape, placed.materials);
+        info.coarseFaces = shape.coarseFaces;
+        info.triangleList = shape.verbatim;
+    } else {
+        SphereStorage& spheres = *placed.spheres;
+        AttachInstance(device, top, spheres.scene, placed.world, id);
+        manager.geometry[key] = spheres.geometry.get();
+        manager.intersection_geometry[key] = spheres.geometry->geom;
+        // Reflection changes the UV frame's handedness, not sphere winding.
+        manager.placement_transforms[key] = PlacementOf(placed.world, false);
+        manager.placement_materials[key] = BindingOf(nullptr, placed.materials);
+    }
+    if (placed.primvars) manager.placement_primvars[key] = placed.primvars;
+    else manager.placement_primvars.erase(key);
+    InstanceDesc const& desc = instances.get(placed.instance, "instance");
+    info.instance = InstanceId{placed.instance};
+    info.primId = desc.primId;
+    info.instanceId = desc.instanceId;
+    info.userData = desc.userData;
+    revision.placements[id] = std::move(info);
+}
+
+// Removes placement `id` (attached) from the revision's top-level scene.
+void Scene::Impl::detach(Revision& revision, unsigned id)
+{
+    SceneManager& manager = *revision.manager;
+    const int key = int(id);
+    rtcDetachGeometry(revision.top->scene, id);
+    manager.geometry.erase(key);
+    manager.intersection_geometry.erase(key);
+    manager.placement_transforms.erase(key);
+    manager.placement_materials.erase(key);
+    manager.placement_primvars.erase(key);
+    manager.placement_link_masks.erase(key);
+    revision.placements.erase(id);
+}
+
+CommitResult Scene::Impl::commit(ProgressCallback const& progress)
+{
+    const auto start = std::chrono::steady_clock::now();
+    // Progress per phase (and material); a false return stops the commit.
+    auto report = [&](const char* phase, size_t done, size_t total) {
+        if (!progress) return;
+        ProgressInfo info;
+        info.phase = phase;
+        info.done = done;
+        info.total = total;
+        info.fraction = total ? double(done) / double(total) : 0.0;
+        info.elapsedSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        if (!progress(info)) Throw(ErrorCode::Cancelled, "the commit was cancelled");
+    };
+    auto colorManagement = context->colorManagement();
+    RTCDevice& device = context->embreeDevice();
+    CommitResult result;
+    // The edits this commit publishes: all of them the first time; a new
+    // working space reloads the lighting.
+    uint32_t edits = dirty;
+    if (!committed) edits = kAllKinds;
+    else if (committed->manager->colorManagement != colorManagement) edits |= DirtyKind::Light | DirtyKind::Environment;
+    auto counts = [&](Revision const& revision) {
+        std::set<Mesh const*> meshes;
+        result.instances = result.triangles = 0;
+        for (Placed const& placed : revision.placed) {
+            if (!placed.visible) continue;
+            ++result.instances;
+            if (!placed.shape) continue;
+            meshes.insert(placed.shape->mesh.get());
+            result.triangles += placed.shape->mesh->indices.size() / 3;
+        }
+        result.meshes = meshes.size();
+        result.lights = revision.manager->lights.size();
+    };
+    if (committed && edits == 0) {
+        // Nothing to publish: the committed revision stays.
+        result.revision = revision;
+        result.materials = size_t(0);
+        materials.forEach([&](uint64_t, MaterialEntry&) { ++result.materials; });
+        counts(*committed);
+        result.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        return result;
+    }
+    result.dirty = edits;
+    diagnostics.clear();
+
+    // ── Materials: compiled once per description (load time only).
+    size_t materialCount = 0, materialsDone = 0;
+    materials.forEach([&](uint64_t, MaterialEntry&) { ++materialCount; });
+    report("materials", 0, materialCount);
+    std::vector<std::shared_ptr<Material>> used;
+    materials.forEach([&](uint64_t, MaterialEntry& entry) {
+        if (!entry.compiled) {
+            entry.compiled = compile(entry);
+            ++result.materialsCompiled;
+        }
+        used.push_back(entry.compiled);
+        report("materials", ++materialsDone, materialCount);
+    });
+    result.materials = used.size();
+    // Geometry without a material: the delegate's fallback grey (one for
+    // the scene's lifetime, so revisions agree on it).
+    bool greyUsed = false;
+    auto defaultMaterial = [&]() -> std::shared_ptr<Material> const& {
+        if (!grey) {
+            MaterialEntry fallback;
+            fallback.desc.kind = MaterialDesc::Kind::Diffuse;
+            fallback.desc.color = Color3(0.5f);
+            grey = compile(fallback);
+        }
+        greyUsed = true;
+        return grey;
+    };
+    auto resolve = [&](std::vector<MaterialId> const& ids) {
+        std::vector<std::shared_ptr<Material>> resolved;
+        for (MaterialId id : ids) resolved.push_back(id ? materials.get(id.v, "material").compiled : nullptr);
+        if (resolved.empty()) resolved.push_back(nullptr);
+        if (!resolved[0]) resolved[0] = defaultMaterial();
+        return resolved;
+    };
+    auto raw = [](std::vector<std::shared_ptr<Material>> const& list) {
+        std::vector<Material*> result;
+        for (auto const& material : list) result.push_back(material.get());
+        return result;
+    };
+    auto instancePrimvars = [&](InstanceDesc const& instance) -> std::shared_ptr<const InstancePrimvars> {
+        if (instance.primvars.empty()) return nullptr;
+        auto values = std::make_shared<InstancePrimvars>();
+        for (auto const& primvar : instance.primvars) {
+            InstancePrimvars::Value value;
+            value.name = primvar.name;
+            value.components = int(primvar.data.components);
+            for (int c = 0; c < value.components; ++c)
+                value.value[size_t(c)] = primvar.data.type == DataType::Int32
+                    ? float(static_cast<int32_t const*>(primvar.data.data)[c])
+                    : primvar.data.type == DataType::UInt32 ? float(static_cast<uint32_t const*>(primvar.data.data)[c])
+                    : FloatAt(primvar.data, size_t(c));
+            values->values.push_back(std::move(value));
+        }
+        return values;
+    };
+
+    mesh::SubdivisionSettings subdivision;
+    subdivision.level = options.subdivisionLevel;
+    subdivision.maxFaces = size_t(options.subdivisionMaxFaces);
+    subdivision.budgetFaces = size_t(options.subdivisionBudgetFaces);
+    subdivision.displacementLevel = options.displacementLevel;
+    subdivision.displacementMaxFaces = size_t(options.displacementMaxFaces);
+
+    // Lighting edits alone keep the placements and the acceleration
+    // structure of the committed revision.
+    const bool lightingOnly = committed && (edits & ~(DirtyKind::Light | DirtyKind::Environment)) == 0;
+    std::vector<Placed> placed;
+    std::map<std::tuple<uint64_t, uint64_t, bool>, std::vector<size_t>> facesUsed;
+    if (lightingOnly) {
+        report("geometry", 0, 0);
+        placed = committed->placed;
+    } else {
+        // ── Mesh placements and the conversions they need ("shapes"): one
+        // per mesh and displacing material(s), in the order of their first
+        // instance. Hidden instances count: showing them only places them.
+        struct Shape {
+            uint64_t mesh = 0;
+            MeshEntry const* entry = nullptr;
+            bool verbatim = false;                 // a triangle list taken as given
+            std::shared_ptr<Material> displacer;   // polygon meshes: slot 0's displacement
+            std::vector<std::shared_ptr<Material>> slotMaterials;  // triangle lists with displacing slots
+            bool flatten = false;                  // baked into world space (one placement)
+            Matrix4d world;
+            std::vector<int> counts;               // a triangle list's faces (polygon conversion)
+            int level = 0;
+            std::shared_ptr<ShapeStorage> storage;
+            bool convert = false;                  // not in the pool: converted now
+            std::string error;
+        };
+        struct Placement {
+            uint64_t instance = 0;
+            InstanceDesc const* desc = nullptr;
+            size_t shape = 0;
+            std::vector<std::shared_ptr<Material>> materials;
+            Matrix4d world;
+        };
+        std::vector<std::unique_ptr<Shape>> shapes;
+        std::vector<Placement> placements;
+        std::map<uint64_t, size_t> instanceCounts;
+        instances.forEach([&](uint64_t, InstanceDesc& instance) {
+            if (auto const* mesh = std::get_if<MeshId>(&instance.prototype)) ++instanceCounts[mesh->v];
+        });
+        std::map<std::tuple<uint64_t, Material*, std::vector<Material*>>, size_t> shapeIndex;
+        instances.forEach([&](uint64_t handle, InstanceDesc& instance) {
+            auto const* meshId = std::get_if<MeshId>(&instance.prototype);
+            if (!meshId) return;
+            MeshEntry const& entry = meshes.get(meshId->v, "mesh (of an instance)");
+            MeshDesc const& desc = entry.desc;
+            Placement placement;
+            placement.instance = handle;
+            placement.desc = &instance;
+            placement.materials = resolve(instance.materials);
+            placement.world = Nearest(instance.transform);
+            const bool verbatim = VerbatimTriangles(desc);
+            std::shared_ptr<Material> displacer;
+            std::vector<std::shared_ptr<Material>> slotMaterials;
+            if (verbatim) {
+                bool displaces = false;
+                for (auto const& material : placement.materials) displaces |= material && material->hasDisplacement();
+                if (displaces) slotMaterials = placement.materials;
+            } else if (placement.materials[0]->hasDisplacement()) {
+                displacer = placement.materials[0];
+            }
+            const bool single = instanceCounts[meshId->v] == 1 && !desc.instanced;
+            auto key = std::make_tuple(meshId->v, displacer.get(), raw(slotMaterials));
+            auto found = shapeIndex.find(key);
+            if (found == shapeIndex.end() || single) {
+                auto shape = std::make_unique<Shape>();
+                shape->mesh = meshId->v;
+                shape->entry = &entry;
+                shape->verbatim = verbatim;
+                shape->displacer = displacer;
+                shape->slotMaterials = slotMaterials;
+                shape->flatten = single;
+                shape->world = placement.world;
+                if (!verbatim && desc.faceVertexCounts.empty())
+                    shape->counts.assign(desc.faceVertexIndices.count / 3, 3);
+                found = shapeIndex.insert_or_assign(key, shapes.size()).first;
+                shapes.push_back(std::move(shape));
+            }
+            placement.shape = found->second;
+            placements.push_back(std::move(placement));
+        });
+
+        report("geometry", 0, shapes.size());
+        // Refinement levels within the scene's budget; then each shape's
+        // conversion from the pool, or converted now: meshes that refine or
+        // displace by the shared conversion (as prototypes), the others by
+        // the polygon conversion.
+        std::vector<std::vector<size_t>> faces(shapes.size());
+        std::vector<bool> fixed(shapes.size(), false);
+        for (size_t i = 0; i < shapes.size(); ++i) {
+            Shape const& shape = *shapes[i];
+            if (shape.verbatim) continue;
+            const auto cacheKey = std::make_tuple(shape.mesh, shape.entry->version, shape.displacer != nullptr);
+            auto cached = refinementFaces.find(cacheKey);
+            if (cached == refinementFaces.end()) {
+                const mesh::MeshSource source = SourceOf(shape.entry->desc, shape.counts);
+                cached = refinementFaces.emplace(cacheKey, mesh::RefinementFaces(source.faceVertexCounts,
+                    source.subdivisionScheme, shape.displacer != nullptr, subdivision)).first;
+            }
+            faces[i] = cached->second;
+            facesUsed.emplace(cacheKey, cached->second);
+        }
+        const std::vector<int> levels =
+            mesh::BudgetSubdivisionLevels(faces, fixed, subdivision.budgetFaces, nullptr, nullptr);
+        std::vector<Shape*> pending;
+        for (size_t i = 0; i < shapes.size(); ++i) {
+            Shape& shape = *shapes[i];
+            ShapeKey key;
+            key.mesh = shape.mesh;
+            key.version = shape.entry->version;
+            key.displacer = shape.displacer.get();
+            for (auto const& material : shape.slotMaterials) key.slotMaterials.push_back(material.get());
+            if (shape.verbatim) {
+                key.instanced = !shape.flatten || !(shape.world == Matrix4d());
+            } else {
+                shape.level = levels[i];
+                if (shape.entry->desc.subdivision.level >= 0)
+                    shape.level = std::min(shape.level, shape.entry->desc.subdivision.level);
+                key.level = shape.level;
+                key.instanced = shape.level > 0 || shape.displacer || !shape.flatten;
+                if (!key.instanced) {
+                    key.baked = true;
+                    key.world = Bits(shape.world);
+                }
+            }
+            auto found = shapePool.find(key);
+            if (found != shapePool.end()) shape.storage = found->second.lock();
+            if (shape.storage) {
+                ++result.meshesReused;
+                continue;
+            }
+            shape.storage = std::make_shared<ShapeStorage>();
+            shape.storage->verbatim = shape.verbatim;
+            shape.storage->instanced = key.instanced;
+            shape.storage->faceSlots = shape.entry->desc.faceMaterialSlots;
+            if (shape.displacer) shape.storage->keyMaterials.push_back(shape.displacer);
+            shape.storage->keyMaterials.insert(shape.storage->keyMaterials.end(), shape.slotMaterials.begin(),
+                                               shape.slotMaterials.end());
+            shapePool[key] = shape.storage;
+            shape.convert = true;
+            pending.push_back(&shape);
+        }
+        std::atomic<bool> controlHulls{false};
+        std::atomic<size_t> displacedSlots{0}, displacedTriangles{0};
+        // The tasks run on TBB threads, and the progress model and logger are
+        // bound per thread: carry the committing thread's over.
+        tbb::parallel_for(size_t(0), pending.size(), [&, progressModel = prism::Progress::Current(),
+                                                      logger = &prism::logging::Current()](size_t i) {
+            prism::progress::Bind progressBinding(progressModel);
+            prism::logging::Bind logBinding(logger);
+            Shape& shape = *pending[i];
+            ShapeStorage& storage = *shape.storage;
+            MeshDesc const& desc = shape.entry->desc;
+            try {
+                if (shape.verbatim) {
+                    storage.mesh = TriangleMesh(desc);
+                    if (!shape.slotMaterials.empty()) {
+                        const size_t triangles = storage.mesh->indices.size() / 3;
+                        storage.triangleSlots.assign(triangles, 0);
+                        BufferView const& slots = desc.faceMaterialSlots;
+                        for (size_t t = 0; t < triangles && t < slots.count; ++t) storage.triangleSlots[t] = IntAt(slots, t);
+                        std::vector<Material*> slotMaterials = raw(shape.slotMaterials);
+                        size_t slotsDisplaced = 0;
+                        displacedTriangles += DisplaceTriangleSlots(*storage.mesh, storage.triangleSlots,
+                                                                    slotMaterials, subdivision, &slotsDisplaced);
+                        displacedSlots += slotsDisplaced;
+                    }
+                    if (storage.mesh->indices.empty()) storage.mesh.reset();
+                    return;
+                }
+                const mesh::MeshSource source = SourceOf(desc, shape.counts);
+                const std::string_view scheme = mesh::RefinementScheme(source.subdivisionScheme, shape.displacer != nullptr);
+                if (shape.level > 0 || shape.displacer) {
+                    mesh::MeshConversion conversion =
+                        mesh::ConvertMesh(source, subdivision, shape.displacer.get(), shape.level);
+                    storage.coarseFaces = conversion.info.coarseFaces;
+                    storage.mesh = std::move(conversion.mesh);
+                    if (conversion.info.subdivisionControlHull) controlHulls = true;
+                } else {
+                    if (scheme != "none") controlHulls = true;
+                    std::unique_ptr<Mesh, mesh::ConvertedMeshDeleter> converted(new Mesh());
+                    std::vector<int> coarse;
+                    if (mesh::BuildPolygonMesh(source, shape.flatten ? shape.world : Matrix4d(), *converted, coarse)) {
+                        storage.coarseFaces = mesh::SharedFaceTable(std::move(coarse));
+                        storage.mesh = std::move(converted);
+                    }
+                }
+            } catch (std::exception const& error) {
+                shape.error = error.what();
+            }
+        });
+        for (Shape* shape : pending) {
+            if (shape->error.empty()) continue;
+            // A failed conversion is not a pool entry.
+            for (Shape* other : pending) other->storage.reset();
+            Throw(ErrorCode::InvalidArgument, shape->error);
+        }
+        result.meshesConverted = pending.size();
+        if (controlHulls)
+            diagnose(DiagnosticLevel::Warning, "geometry", "some subdivision surfaces are rendered as control hulls "
+                     "(subdivision level 0, over the maximum faces, or the refinement budget)");
+        if (displacedSlots) {
+            diagnose(DiagnosticLevel::Info, "geometry", "displaced the faces of " + std::to_string(displacedSlots.load()) +
+                     " material(s) into " + std::to_string(displacedTriangles.load()) + " triangles", false);
+            std::cout << "PrismRT: " << diagnostics.back().message << '\n';
+        }
+
+        // ── Placements by geometry id: meshes in instance order, then
+        // spheres (a prototype per spheres description, placed by Embree
+        // instances: affine instances keep nonuniformly scaled spheres
+        // analytic).
+        for (Placement const& placement : placements) {
+            Shape& shape = *shapes[placement.shape];
+            if (!shape.storage->mesh) continue;
+            Placed entry;
+            entry.instance = placement.instance;
+            entry.shape = shape.storage;
+            entry.world = placement.world;
+            entry.visible = placement.desc->visible;
+            entry.materials = raw(placement.materials);
+            entry.primvars = instancePrimvars(*placement.desc);
+            placed.push_back(std::move(entry));
+        }
+        instances.forEach([&](uint64_t handle, InstanceDesc& instance) {
+            auto const* spheresId = std::get_if<SpheresId>(&instance.prototype);
+            if (!spheresId) return;
+            SpheresEntry const& entry = spheres.get(spheresId->v, "spheres (of an instance)");
+            SpheresDesc const& desc = entry.desc;
+            const auto key = std::make_pair(spheresId->v, entry.version);
+            std::shared_ptr<SphereStorage> prototype;
+            if (auto found = spherePool.find(key); found != spherePool.end()) prototype = found->second.lock();
+            if (!prototype) {
+                prototype = std::make_shared<SphereStorage>();
+                BufferView const& centers = Nearest(desc.centers);
+                auto const* c = static_cast<float const*>(centers.data);
+                auto const* r = static_cast<float const*>(desc.radii.data);
+                if (centers.count == 1) {
+                    prototype->geometry.reset(new Sphere(Float3(c[0], c[1], c[2]), r[0], nullptr));
+                } else {
+                    auto* batch = new BatchedSpheres();
+                    for (size_t i = 0; i < centers.count; ++i)
+                        batch->entries.push_back({Float3(c[3 * i], c[3 * i + 1], c[3 * i + 2]), r[i], nullptr});
+                    prototype->geometry.reset(batch);
+                }
+                prototype->scene = rtcNewScene(device);
+                prototype->geometry->setupEmbree(device, prototype->scene);
+                rtcCommitScene(prototype->scene);
+                spherePool[key] = prototype;
+            }
+            Placed placement;
+            placement.instance = handle;
+            placement.spheres = std::move(prototype);
+            placement.world = Nearest(instance.transform);
+            placement.visible = instance.visible;
+            placement.materials = {resolve(instance.materials)[0].get()};
+            placement.primvars = instancePrimvars(instance);
+            placed.push_back(std::move(placement));
+        });
+    }
+    if (greyUsed) used.push_back(grey);
+
+    // ── Environments and lights: rebuilt when they changed (before any
+    // placement is touched, so a failure leaves the revisions as they are).
+    report("lights", 0, 0);
+    std::shared_ptr<EnvironmentStorage> environment =
+        committed && !Has(edits, DirtyKind::Environment) ? committed->environment : buildEnvironment(colorManagement);
+    std::shared_ptr<LightStorage> lightStorage =
+        committed && !Has(edits, DirtyKind::Light) ? committed->lights : buildLights(*colorManagement);
+    result.lightingRebuilt = !committed || Has(edits, DirtyKind::Light) || Has(edits, DirtyKind::Environment);
+
+    // ── The revision: lighting edits share the committed one's geometry; a
+    // spare bank nothing renders, placing the same instances, is updated in
+    // place; otherwise a new revision over the pooled conversions.
+    std::shared_ptr<Revision> next;
+    auto sameInstances = [&](Revision const& revision) {
+        if (revision.placed.size() != placed.size()) return false;
+        for (size_t i = 0; i < placed.size(); ++i)
+            if (revision.placed[i].instance != placed[i].instance ||
+                bool(revision.placed[i].shape) != bool(placed[i].shape))
+                return false;
+        return true;
+    };
+    if (lightingOnly) {
+        next = std::make_shared<Revision>();
+        next->manager = std::make_unique<SceneManager>(device, colorManagement);
+        SceneManager& manager = *next->manager;
+        SceneManager const& previous = *committed->manager;
+        rtcReleaseScene(manager.scene);
+        next->top = committed->top;
+        manager.scene = next->top->scene;
+        manager.geometry = previous.geometry;
+        manager.intersection_geometry = previous.intersection_geometry;
+        manager.placement_transforms = previous.placement_transforms;
+        manager.placement_materials = previous.placement_materials;
+        manager.disabled_placements = previous.disabled_placements;
+        manager.single_sided_placements = previous.single_sided_placements;
+        manager.placement_primvars = previous.placement_primvars;
+        next->placed = std::move(placed);
+        next->placements = committed->placements;
+        next->materials = committed->materials;
+        result.accelerationShared = true;
+    } else if (spare && spare.use_count() == 1 && spare->top && spare->top.use_count() == 1 && sameInstances(*spare)) {
+        next = std::move(spare);
+        result.revisionReused = true;
+        SceneManager& manager = *next->manager;
+        manager.colorManagement = colorManagement;
+        for (size_t i = 0; i < placed.size(); ++i) {
+            Placed& old = next->placed[i];
+            Placed& now = placed[i];
+            const unsigned id = unsigned(i);
+            const bool sameShape = old.shape == now.shape && old.spheres == now.spheres;
+            if (!sameShape || old.visible != now.visible) {
+                // Another conversion, or shown or hidden: placed again.
+                const bool update = old.visible || now.visible;
+                if (old.visible) detach(*next, id);
+                old = std::move(now);
+                if (old.visible) {
+                    attach(*next, id, device);
+                    ++result.placementsAttached;
+                }
+                if (update) ++result.placementsUpdated;
+                continue;
+            }
+            if (!now.visible) {
+                old = std::move(now);
+                continue;
+            }
+            bool changed = false;
+            if (!SameBits(old.world, now.world)) {
+                // Only Embree instances move here: a world-space conversion
+                // has its world in its key, so it is another conversion.
+                if (RTCGeometry instance = rtcGetGeometry(next->top->scene, id)) {
+                    SetInstanceTransform(instance, now.world);
+                    rtcCommitGeometry(instance);
+                }
+                manager.placement_transforms[int(id)] = PlacementOf(now.world, bool(now.shape));
+                changed = true;
+            }
+            if (old.materials != now.materials) {
+                manager.placement_materials[int(id)] = BindingOf(now.shape.get(), now.materials);
+                changed = true;
+            }
+            if (SamePrimvars(old.primvars, now.primvars)) {
+                now.primvars = old.primvars;
+            } else {
+                if (now.primvars) manager.placement_primvars[int(id)] = now.primvars;
+                else manager.placement_primvars.erase(int(id));
+                changed = true;
+            }
+            if (changed) ++result.placementsUpdated;
+            old = std::move(now);
+            // The id AOVs' record.
+            InstanceDesc const& desc = instances.get(old.instance, "instance");
+            detail::PlacementInfo& info = next->placements[id];
+            info.primId = desc.primId;
+            info.instanceId = desc.instanceId;
+            info.userData = desc.userData;
+        }
+        next->materials = used;
+    } else {
+        next = std::make_shared<Revision>();
+        next->manager = std::make_unique<SceneManager>(device, colorManagement);
+        next->top = std::make_shared<TopLevel>();
+        next->top->scene = next->manager->scene;
+        next->placed = std::move(placed);
+        for (size_t i = 0; i < next->placed.size(); ++i) {
+            if (!next->placed[i].visible) continue;
+            attach(*next, unsigned(i), device);
+            ++result.placementsAttached;
+        }
+        next->materials = used;
+    }
+    SceneManager& manager = *next->manager;
+
+    // ── Lighting on the revision: environment, lights and link masks.
+    next->environment = environment;
+    next->lights = lightStorage;
+    manager.environment = environment->environment;
+    manager.lights = lightStorage->lights;
+    manager.lightLinking = !lightStorage->lightCategories.empty() || !lightStorage->shadowCategories.empty();
+    manager.placement_link_masks.clear();
     if (manager.lightLinking) {
         auto mask = [](std::vector<std::string> const& categories, std::vector<std::string> const& names) {
             uint32_t bits = 0;
@@ -1158,43 +1560,52 @@ CommitResult Scene::Impl::commit(ProgressCallback const& progress)
                 if (std::find(names.begin(), names.end(), categories[i]) != names.end()) bits |= 1u << i;
             return bits;
         };
-        for (auto const& [id, instance] : attached)
-            manager.placement_link_masks[int(id)] = {mask(lightCategories, instance->lightLinkCategories),
-                                                     mask(shadowCategories, instance->shadowLinkCategories)};
+        for (size_t i = 0; i < next->placed.size(); ++i) {
+            if (!next->placed[i].visible) continue;
+            InstanceDesc const& instance = instances.get(next->placed[i].instance, "instance");
+            manager.placement_link_masks[int(i)] = {mask(lightStorage->lightCategories, instance.lightLinkCategories),
+                                                    mask(lightStorage->shadowCategories, instance.shadowLinkCategories)};
+        }
     }
 
     report("acceleration", 0, 0);
-    manager.commitScene();
+    if (!result.accelerationShared) manager.commitScene();
 
     // A scene with no lights, emissive geometry or environment would render
     // black: usdview's default dome, by the Hydra delegate's rule
     // (scene_bridge.cpp _ApplyDefaultDome).
-    if (options.defaultDome && manager.environment == blackBackground && manager.lights.empty() &&
-        !device::SceneHasEmitters(manager)) {
+    next->defaultDome.reset();
+    if (options.defaultDome && environment->black && manager.lights.empty() && !device::SceneHasEmitters(manager)) {
         if (options.defaultDomeTexture.empty()) {
             diagnose(DiagnosticLevel::Warning, "environment", "the scene has no lights, emissive geometry or "
                      "environment, and USD's default dome texture was not found; the image will be black (pass --env "
                      "or --env-color)");
         } else {
             // As a USD dome (intensity 1, exposure 0, untransformed), like usdview's.
-            auto texture = std::make_unique<ImageTexture<Color3>>(options.defaultDomeTexture, color::kLightColorSpace,
-                                                                  colorManagement);
-            auto dome = std::make_unique<TransformedEnvironmentMap>(texture.get(), Color3(1.0f),
-                                                                    std::array<float, 9>{1, 0, 0, 0, 1, 0, 0, 0, 1},
-                                                                    *colorManagement);
-            manager.environment = dome.get();
-            revision->textures.push_back(std::move(texture));
-            revision->environments.push_back(std::move(dome));
+            if (!defaultDome || defaultDome->colorManagement != colorManagement) {
+                auto dome = std::make_shared<DefaultDomeStorage>();
+                dome->colorManagement = colorManagement;
+                dome->texture = std::make_unique<ImageTexture<Color3>>(options.defaultDomeTexture,
+                                                                       color::kLightColorSpace, colorManagement);
+                dome->dome = std::make_unique<TransformedEnvironmentMap>(
+                    dome->texture.get(), Color3(1.0f), std::array<float, 9>{1, 0, 0, 0, 1, 0, 0, 0, 1}, *colorManagement);
+                defaultDome = std::move(dome);
+            }
+            next->defaultDome = defaultDome;
+            manager.environment = defaultDome->dome.get();
             diagnose(DiagnosticLevel::Info, "environment", "the scene has no lights, emissive geometry or environment; "
                      "lighting it with USD's default dome (" + options.defaultDomeTexture + "). --env, --env-color or "
                      "--default-dome false override this");
         }
     }
+    counts(*next);
 
+    std::shared_ptr<Revision> retired;
     {
         // Sessions render the committed revision (and set their render
         // settings on it) under the render lock: a progressive session
-        // yields at its next pass boundary and takes this revision.
+        // yields at its next pass boundary and takes this revision. The
+        // replaced one becomes the spare bank.
         detail::RenderLock lock(renderMutex, renderWaiters);
         manager.max_depth = renderSettings.maxDepth;
         manager.rr_min_depth = renderSettings.rouletteDepth;
@@ -1203,9 +1614,17 @@ CommitResult Scene::Impl::commit(ProgressCallback const& progress)
         manager.honorDoubleSided = renderSettings.honorDoubleSided;
         manager.textureStreaming = renderSettings.textureStreaming;
         manager.gpuTextureBudgetMiB = renderSettings.gpuTextureBudgetMiB;
-        committed = std::move(revision);
+        retired = std::move(spare);
+        spare = std::move(committed);
+        committed = std::move(next);
         result.revision = ++this->revision;
     }
+    retired.reset();
+    dirty = 0;
+    // Forget pool entries no revision holds, and faces of meshes that changed.
+    std::erase_if(shapePool, [](auto const& entry) { return entry.second.expired(); });
+    std::erase_if(spherePool, [](auto const& entry) { return entry.second.expired(); });
+    if (!lightingOnly) refinementFaces = std::move(facesUsed);
     result.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     return result;
 }
@@ -1215,23 +1634,40 @@ CommitResult Scene::Impl::commit(ProgressCallback const& progress)
 Scene::Scene(std::shared_ptr<Impl> impl) : m_impl(std::move(impl)) {}
 Scene::~Scene() = default;
 
-MeshId Scene::addMesh(MeshDesc const& desc) { return MeshId{m_impl->meshes.add(RetainMesh(desc))}; }
+MeshId Scene::addMesh(MeshDesc const& desc)
+{
+    const MeshId id{m_impl->meshes.add({RetainMesh(desc), ++m_impl->versions})};
+    m_impl->edited(DirtyKind::Structure);
+    return id;
+}
 void Scene::updateMesh(MeshId id, MeshDesc const& desc)
 {
-    MeshDesc& mesh = m_impl->meshes.get(id.v, "mesh");
-    mesh = RetainMesh(desc);
+    auto& mesh = m_impl->meshes.get(id.v, "mesh");
+    mesh.desc = RetainMesh(desc);
+    mesh.version = ++m_impl->versions;
+    m_impl->edited(DirtyKind::Prototype);
 }
 void Scene::updateMeshPoints(MeshId id, Sampled<BufferView> const& points)
 {
-    MeshDesc desc = m_impl->meshes.get(id.v, "mesh");
+    MeshDesc desc = m_impl->meshes.get(id.v, "mesh").desc;
     desc.points = points;
-    m_impl->meshes.get(id.v, "mesh") = RetainMesh(std::move(desc));
+    auto& mesh = m_impl->meshes.get(id.v, "mesh");
+    mesh.desc = RetainMesh(std::move(desc));
+    mesh.version = ++m_impl->versions;
+    m_impl->edited(DirtyKind::Prototype);
 }
-SpheresId Scene::addSpheres(SpheresDesc const& desc) { return SpheresId{m_impl->spheres.add(RetainSpheres(desc))}; }
+SpheresId Scene::addSpheres(SpheresDesc const& desc)
+{
+    const SpheresId id{m_impl->spheres.add({RetainSpheres(desc), ++m_impl->versions})};
+    m_impl->edited(DirtyKind::Structure);
+    return id;
+}
 void Scene::updateSpheres(SpheresId id, SpheresDesc const& desc)
 {
-    SpheresDesc& spheres = m_impl->spheres.get(id.v, "spheres");
-    spheres = RetainSpheres(desc);
+    auto& spheres = m_impl->spheres.get(id.v, "spheres");
+    spheres.desc = RetainSpheres(desc);
+    spheres.version = ++m_impl->versions;
+    m_impl->edited(DirtyKind::Prototype);
 }
 
 InstanceId Scene::addInstance(InstanceDesc const& desc)
@@ -1241,7 +1677,9 @@ InstanceId Scene::addInstance(InstanceDesc const& desc)
     else m_impl->spheres.get(std::get<SpheresId>(retained.prototype).v, "spheres");
     for (MaterialId material : retained.materials)
         if (material) m_impl->materials.get(material.v, "material");
-    return InstanceId{m_impl->instances.add(std::move(retained))};
+    const InstanceId id{m_impl->instances.add(std::move(retained))};
+    m_impl->edited(DirtyKind::Structure);
+    return id;
 }
 void Scene::updateInstance(InstanceId id, InstanceDesc const& desc)
 {
@@ -1252,25 +1690,34 @@ void Scene::updateInstance(InstanceId id, InstanceDesc const& desc)
     for (MaterialId material : retained.materials)
         if (material) m_impl->materials.get(material.v, "material");
     m_impl->instances.get(id.v, "instance") = std::move(retained);
+    m_impl->edited(DirtyKind::Structure | DirtyKind::Placement | DirtyKind::Material);
 }
 void Scene::setTransform(InstanceId id, Sampled<Matrix4d> const& transform)
 {
     Check(!transform.empty(), "an instance needs a transform");
     m_impl->instances.get(id.v, "instance").transform = transform;
+    m_impl->edited(DirtyKind::Placement);
 }
-void Scene::setVisible(InstanceId id, bool visible) { m_impl->instances.get(id.v, "instance").visible = visible; }
+void Scene::setVisible(InstanceId id, bool visible)
+{
+    m_impl->instances.get(id.v, "instance").visible = visible;
+    m_impl->edited(DirtyKind::Placement);
+}
 void Scene::setMaterials(InstanceId id, std::vector<MaterialId> const& materials)
 {
     for (MaterialId material : materials)
         if (material) m_impl->materials.get(material.v, "material");
     m_impl->instances.get(id.v, "instance").materials = materials;
+    m_impl->edited(DirtyKind::Material);
 }
 
 MaterialId Scene::addMaterial(MaterialDesc const& desc)
 {
     Impl::MaterialEntry entry;
     entry.desc = desc;
-    return MaterialId{m_impl->materials.add(std::move(entry))};
+    const MaterialId id{m_impl->materials.add(std::move(entry))};
+    m_impl->edited(DirtyKind::Material);
+    return id;
 }
 void Scene::updateMaterial(MaterialId id, MaterialDesc const& desc)
 {
@@ -1278,27 +1725,34 @@ void Scene::updateMaterial(MaterialId id, MaterialDesc const& desc)
     entry.desc = desc;
     entry.compiled.reset();
     entry.prebuilt = false;
+    m_impl->edited(DirtyKind::Material);
 }
 LightId Scene::addLight(LightDesc const& desc)
 {
     Check(!desc.transform.empty(), "a light needs a transform");
-    return LightId{m_impl->lights.add(desc)};
+    const LightId id{m_impl->lights.add(desc)};
+    m_impl->edited(DirtyKind::Light);
+    return id;
 }
 void Scene::updateLight(LightId id, LightDesc const& desc)
 {
     Check(!desc.transform.empty(), "a light needs a transform");
     m_impl->lights.get(id.v, "light") = desc;
+    m_impl->edited(DirtyKind::Light);
 }
 EnvironmentId Scene::addEnvironment(EnvironmentDesc const& desc)
 {
     Check(!desc.transform.empty(), "an environment needs a transform");
     Check(desc.kind != EnvironmentDesc::Kind::LatLong || !desc.texture.empty(), "a lat-long environment needs a texture");
-    return EnvironmentId{m_impl->environments.add(desc)};
+    const EnvironmentId id{m_impl->environments.add(desc)};
+    m_impl->edited(DirtyKind::Environment);
+    return id;
 }
 void Scene::updateEnvironment(EnvironmentId id, EnvironmentDesc const& desc)
 {
     Check(!desc.transform.empty(), "an environment needs a transform");
     m_impl->environments.get(id.v, "environment") = desc;
+    m_impl->edited(DirtyKind::Environment);
 }
 CameraId Scene::addCamera(CameraDesc const& desc)
 {
@@ -1312,12 +1766,36 @@ void Scene::updateCamera(CameraId id, CameraDesc const& desc)
 }
 CameraDesc Scene::camera(CameraId id) const { return m_impl->cameras.get(id.v, "camera"); }
 
-void Scene::remove(MeshId id) { m_impl->meshes.remove(id.v, "mesh"); }
-void Scene::remove(SpheresId id) { m_impl->spheres.remove(id.v, "spheres"); }
-void Scene::remove(InstanceId id) { m_impl->instances.remove(id.v, "instance"); }
-void Scene::remove(MaterialId id) { m_impl->materials.remove(id.v, "material"); }
-void Scene::remove(LightId id) { m_impl->lights.remove(id.v, "light"); }
-void Scene::remove(EnvironmentId id) { m_impl->environments.remove(id.v, "environment"); }
+void Scene::remove(MeshId id)
+{
+    m_impl->meshes.remove(id.v, "mesh");
+    m_impl->edited(DirtyKind::Structure);
+}
+void Scene::remove(SpheresId id)
+{
+    m_impl->spheres.remove(id.v, "spheres");
+    m_impl->edited(DirtyKind::Structure);
+}
+void Scene::remove(InstanceId id)
+{
+    m_impl->instances.remove(id.v, "instance");
+    m_impl->edited(DirtyKind::Structure);
+}
+void Scene::remove(MaterialId id)
+{
+    m_impl->materials.remove(id.v, "material");
+    m_impl->edited(DirtyKind::Material);
+}
+void Scene::remove(LightId id)
+{
+    m_impl->lights.remove(id.v, "light");
+    m_impl->edited(DirtyKind::Light);
+}
+void Scene::remove(EnvironmentId id)
+{
+    m_impl->environments.remove(id.v, "environment");
+    m_impl->edited(DirtyKind::Environment);
+}
 void Scene::remove(CameraId id) { m_impl->cameras.remove(id.v, "camera"); }
 
 CommitResult Scene::commit(ProgressCallback const& progress) { return m_impl->commit(progress); }

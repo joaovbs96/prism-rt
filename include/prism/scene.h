@@ -5,9 +5,11 @@
 // as handles; commit() publishes them as a renderable revision.
 //
 // Edit model: one writer per scene (external synchronisation); edits are
-// recorded and nothing changes for rendering until commit(). In this
-// version commit() rebuilds the whole scene (incremental commits come with
-// the progressive session).
+// recorded and nothing changes for rendering until commit(). commit() is
+// incremental: it rebuilds what its edits reach (DirtyKind) and reuses the
+// rest (compiled materials, mesh conversions, the acceleration structure);
+// sessions keep rendering the previous revision until the new one is
+// published.
 
 #include "material.h"
 #include "types.h"
@@ -199,10 +201,42 @@ struct Diagnostic {
     std::string message;
 };
 
+// The kinds of edits (CommitResult::dirty), as the Hydra delegate classifies
+// its scene's changes. A commit rebuilds only what its edits reach.
+enum class DirtyKind : uint32_t {
+    Placement = 1u << 0,    // instance transforms and visibility
+    Prototype = 1u << 1,    // mesh and spheres data
+    Material = 1u << 2,     // materials, and the materials of instances
+    Light = 1u << 3,        // lights
+    Environment = 1u << 4,  // environments
+    Structure = 1u << 5,    // added or removed meshes, spheres and instances; instance updates
+};
+constexpr uint32_t operator|(DirtyKind a, DirtyKind b) { return uint32_t(a) | uint32_t(b); }
+constexpr uint32_t operator|(uint32_t a, DirtyKind b) { return a | uint32_t(b); }
+constexpr bool Has(uint32_t bits, DirtyKind kind) { return (bits & uint32_t(kind)) != 0; }
+
 struct CommitResult {
-    uint64_t revision = 0;
+    uint64_t revision = 0;  // the revision now committed (unchanged when there was nothing to commit)
     size_t meshes = 0, instances = 0, triangles = 0, materials = 0, lights = 0;
     double seconds = 0;
+    // What the commit did. `dirty`: the DirtyKind bits of the edits it
+    // published (every kind for the first commit; 0: nothing to commit, no
+    // new revision).
+    uint32_t dirty = 0;
+    size_t materialsCompiled = 0;
+    // Mesh conversions done, and the ones taken over from earlier revisions.
+    size_t meshesConverted = 0, meshesReused = 0;
+    // Placements attached to the acceleration structure, and placements of a
+    // reused revision updated in place (transform, visibility, materials,
+    // primvars).
+    size_t placementsAttached = 0, placementsUpdated = 0;
+    // Lighting edits alone: the revision shares the previous one's
+    // acceleration structure.
+    bool accelerationShared = false;
+    // The revision before the previous one (no longer rendered) was updated
+    // in place instead of building a new one (double buffering).
+    bool revisionReused = false;
+    bool lightingRebuilt = false;
 };
 
 class Scene {
@@ -244,16 +278,24 @@ public:
     void remove(CameraId);
 
     // Publishes the edits as a new revision: compiles new materials, converts
-    // meshes (subdivision, displacement), loads light and environment
-    // textures and builds the acceleration structure. Blocking. Material
-    // failures are diagnostics (the material renders magenta); invalid
-    // references throw. The callback hears each phase and material on this
-    // thread; returning false stops the commit (Error(Cancelled); the last
-    // committed revision stays).
+    // the meshes whose conversion changed (subdivision, displacement), loads
+    // light and environment textures when they changed and updates or
+    // builds the acceleration structure. The new revision is built beside
+    // the published one (or the one before it, when nothing renders that
+    // one any more, is updated in place); sessions take it at their next
+    // pass. Without edits since the last commit it publishes nothing.
+    // Blocking. Material failures are diagnostics (the material renders
+    // magenta); invalid references throw. The callback hears each phase and
+    // material on this thread; returning false stops the commit
+    // (Error(Cancelled); the last committed revision stays, and the edits
+    // stay pending).
+    //
+    // Hidden instances (setVisible(false)) keep their mesh conversions, so
+    // showing them again only places them.
     CommitResult commit(ProgressCallback const& progress = {});
     // Revisions committed so far (0: none).
     uint64_t revision() const;
-    // Diagnostics of the last commit.
+    // Diagnostics of the last commit (of the work it did).
     std::vector<Diagnostic> diagnostics() const;
 
     SceneOptions const& options() const;

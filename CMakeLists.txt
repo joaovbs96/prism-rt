@@ -852,6 +852,13 @@ if(PRISM_BUILD_HYDRA)
     target_link_libraries(prism_session_progressive_test PRIVATE prism)
     add_test(NAME prism_session_progressive_test COMMAND prism_session_progressive_test)
     set_tests_properties(prism_session_progressive_test PROPERTIES ENVIRONMENT "${_prism_test_environment}" TIMEOUT 600)
+    # Incremental commits: what each dirty kind rebuilds, the spare revision
+    # updated in place, renders against full rebuilds, commits beside
+    # progressive renders. The core only.
+    add_executable(prism_scene_incremental_test tests/scene_incremental_test.cpp)
+    target_link_libraries(prism_scene_incremental_test PRIVATE prism)
+    add_test(NAME prism_scene_incremental_test COMMAND prism_scene_incremental_test)
+    set_tests_properties(prism_scene_incremental_test PROPERTIES ENVIRONMENT "${_prism_test_environment}" TIMEOUT 900)
     # Camera rays from the public CameraDesc match Gf and CameraUtil bit for bit.
     add_executable(prism_camera_projection_test tests/camera_projection_test.cpp)
     target_link_libraries(prism_camera_projection_test PRIVATE PrismRT::core ${PXR_LIBRARIES})

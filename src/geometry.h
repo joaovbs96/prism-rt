@@ -223,6 +223,16 @@ class Mesh : public Geometry {
         Mesh() {}
 
         unsigned int setupEmbree(RTCDevice &device, RTCScene &scene) override {
+            createEmbreeGeometry(device);
+            geomid = rtcAttachGeometry(scene, geom);
+            // rtcReleaseGeometry(geom);
+
+            return geomid;
+        }
+
+        // setupEmbree without attaching: creates and commits `geom`, which
+        // the caller attaches (to one or more scenes, at ids of its choice).
+        void createEmbreeGeometry(RTCDevice &device) {
             // new geometry pointer
             type = RTC_GEOMETRY_TYPE_TRIANGLE;
             geom = rtcNewGeometry(device, type);
@@ -253,10 +263,6 @@ class Mesh : public Geometry {
 
             // commit and release geom handle
             rtcCommitGeometry(geom);
-            geomid = rtcAttachGeometry(scene, geom);
-            // rtcReleaseGeometry(geom);
-
-            return geomid;
         }
 
         Material* getMaterial(unsigned int primid, unsigned int instid) override {
