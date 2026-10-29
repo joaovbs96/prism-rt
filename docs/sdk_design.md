@@ -1341,6 +1341,54 @@ libraries; the CLI, hdPrism and the tests link them. What landed:
   position-independent static modules), the plugin's rpath is in the Metal
   checklist (`docs/gpu_devices.md`).
 
+**Step 7 status (2026-10-29)**: done (build tree; packaging is step 8).
+The Python package `prismrt` exists, tested under CTest. What landed:
+- `python/src/`: two nanobind 3.1.0 extension modules over the public API,
+  linking the shared libraries (no second copy of the core):
+  `prismrt._prism` (Renderer, Scene, Session, the `*Desc` structs, options,
+  Image/RenderResult, the glTF and OBJ loaders and `prism_io`, which are
+  static) and `prismrt._prism_usd` (`prism_usd.dll`: `load`, `load_cached`,
+  `load_layers`, cameras). One class per C++ class or struct, snake_case
+  fields, enums by member or name (`"rect"`, `"primvars:st"`); `.pyi` stubs
+  from nanobind's stubgen at build time. `cp311`, not the stable ABI
+  (nanobind's needs CPython 3.12 or later).
+- `python/prismrt/`: the Pythonic layer: `Renderer(env=..., log=...)`,
+  `add_*` with keywords and `name=`, handles or names everywhere,
+  `scene.params` (Mitsuba's traverse: setting a key calls the matching
+  update, `params.update()` commits), `Scene.from_dict`/`to_dict` with
+  references by name and key paths in errors, `prism.render(...)`,
+  per-call `samples=`/`seed=`, `translate`/`rotate`/`scale`/`look_at` and
+  `Camera.look_at` as NumPy 4x4, exceptions per `ErrorCode` that also derive
+  from the matching builtins, the logging bridge (logger `prismrt.<category>`),
+  and an `atexit` hook that cancels and joins running sessions.
+- GIL and threads as 6.6: released in every long call; callbacks take it on
+  the C++ threads; `commit` and `render` run on a C++ thread while the caller
+  waits in 100 ms slices, so Ctrl-C cancels, joins and raises; an exception
+  in a callback cancels and is re-raised. Zero copy: arrays become
+  `BufferView`s over their own memory (the scene holds a reference until it
+  reads them at commit); images are read-only NumPy/DLPack views that keep
+  the C++ image alive.
+- Windows DLLs: `_build_config.py` (generated per configuration) names the
+  directories of `prism.dll` and its dependencies for `os.add_dll_directory`;
+  a DLL found in several (Embree's `tbb12.dll` 2021.11 beside oneTBB's
+  2022.2) is preloaded from the first, as `PATH` order would; an older
+  `msvcp140.dll` already loaded (PySide6's) is refused with a clear error.
+- `prismrt.usd`: refuses an imported `pxr` of another version or another
+  `usd_usd.dll` before `prism_usd.dll` loads. Deviation from 6.5: `load(scene,
+  stage)` does not insert the stage into `UsdUtils.StageCache` (USD's Python
+  bindings hand the stage's ownership to the cache, and erasing it closes the
+  caller's stage); a cached stage loads by its id, any other through a second
+  stage over its open layers (unsaved edits included).
+- Core additions: `Scene::pendingEdits()` (render() raises on uncommitted
+  edits in Python); `Scene::commit()` and `prism::usd::Load()` bind the
+  scene's renderer logger (Python commits on its own thread). Images
+  unchanged (bit-identical CLI outputs against the main build).
+- Tests (`tests/python`, label `python`): `prism_python_api`,
+  `prism_python_render` (Python and CLI images bit-identical on CornellBox and
+  InOneWeekend), `prism_python_progress`, `prism_python_exit`,
+  `prism_python_usd`, `prism_python_render_vulkan` (gpu). User guide:
+  `docs/python.md`; decisions: `docs/DECISIONS.md` (2026-10-29).
+
 Notes:
 - Step 6 is mechanical and can move earlier if the CLI/Hydra double copy of
   globals bites (it does not today: no process loads both).
