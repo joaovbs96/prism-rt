@@ -9,6 +9,7 @@
 // where they use them), so the rays are bit-identical to the ones the CLI
 // built with Gf (prism_camera_projection_test compares them).
 
+#include "../internal_export.h"
 #include "../../include/prism/scene.h"
 #include "../../include/prism/settings.h"
 #include "../camera_rays.h"
@@ -36,7 +37,7 @@ struct Framing {
 Matrix4d CameraToWorld(CameraDesc const& camera);
 
 // GfCamera::GetFrustum().ComputeProjectionMatrix().
-Matrix4d ProjectionMatrix(CameraDesc const& camera);
+PRISM_INTERNAL_API Matrix4d ProjectionMatrix(CameraDesc const& camera);
 
 // CameraUtilConformedWindow(projection, policy, targetAspect).
 Matrix4d ConformedWindow(Matrix4d const& projection, ConformPolicy policy, double targetAspect);
@@ -48,6 +49,6 @@ Matrix4d ApplyFraming(Matrix4d const& projection, Framing const& framing);
 // The ray parameters of `camera` for `framing`: the projection conformed to
 // the image (a full data window of square pixels expanding the aperture), or
 // framed (crops, other pixel aspect ratios or policies), as the CLI did.
-CameraRayParameters RayParameters(CameraDesc const& camera, Framing const& framing);
+PRISM_INTERNAL_API CameraRayParameters RayParameters(CameraDesc const& camera, Framing const& framing);
 
 } // namespace prism::camera

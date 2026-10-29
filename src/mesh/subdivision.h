@@ -5,6 +5,7 @@
 // surface: limit positions and normals per vertex, face-varying texture
 // coordinates per corner, and the coarse face of every refined face.
 
+#include "../internal_export.h"
 #include <cstddef>
 #include <span>
 #include <vector>
@@ -51,10 +52,10 @@ struct Output {
     bool valid = false;
 };
 
-Output Refine(Input const& input);
+PRISM_INTERNAL_API Output Refine(Input const& input);
 
 // Faces after `level` uniform refinements of a mesh with these face sizes
 // (quads: 4^level per quad, n-gons split into n quads first).
-size_t RefinedFaceCount(std::span<const int> faceVertexCounts, Scheme scheme, int level);
+PRISM_INTERNAL_API size_t RefinedFaceCount(std::span<const int> faceVertexCounts, Scheme scheme, int level);
 
 } // namespace prism::subdivision

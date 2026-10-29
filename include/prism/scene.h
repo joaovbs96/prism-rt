@@ -239,7 +239,7 @@ struct CommitResult {
     bool lightingRebuilt = false;
 };
 
-class Scene {
+class PRISM_API Scene {
 public:
     // Scenes come from Renderer::createScene.
     Scene(Scene const&) = default;

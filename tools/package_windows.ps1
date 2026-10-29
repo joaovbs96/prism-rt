@@ -158,6 +158,10 @@ if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -F
 if ($LASTEXITCODE) { throw "cmake --install failed: $LASTEXITCODE" }
 New-Item -ItemType Directory -Path (Join-Path $pkg "bin") | Out-Null
 Copy-Item -LiteralPath (Join-Path $stage "bin\PrismRT.exe") -Destination (Join-Path $pkg "bin")
+# The shared core and USD module, used by PrismRT.exe and hdPrism.dll alike.
+foreach ($dll in @("prism.dll", "prism_usd.dll")) {
+    Copy-Item -LiteralPath (Join-Path $stage "bin\$dll") -Destination (Join-Path $pkg "bin")
+}
 Copy-Tree (Join-Path $stage "bin\assets") (Join-Path $pkg "bin\assets")
 Copy-Tree (Join-Path $stage "lib\usd\plugins") (Join-Path $pkg "lib\usd\plugins") @("*.pdb", "*.lib", "*.exp")
 Remove-Item -LiteralPath $stage -Recurse -Force

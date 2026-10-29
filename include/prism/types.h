@@ -11,6 +11,8 @@
 #include <string>
 #include <vector>
 
+#include "export.h"
+
 // The renderer's own math types (std-only). They stay in src/ because the
 // GPU shaders include them; packaging (migration step 6) installs them with
 // the public headers.
@@ -33,9 +35,15 @@ using ::Float4;
 // Errors of the API (docs/DECISIONS.md: errors are exceptions).
 enum class ErrorCode { InvalidArgument, InvalidHandle, NotFound, Unsupported, DeviceLost, OutOfMemory, Cancelled, Internal };
 
-class Error : public std::runtime_error {
+// Exported with its vtable and type information (the out-of-line destructor
+// anchors them in the core), so a client's catch (prism::Error const&)
+// matches what the library throws.
+class PRISM_API Error : public std::runtime_error {
 public:
     Error(ErrorCode code, std::string const& message) : std::runtime_error(message), m_code(code) {}
+    Error(Error const&) = default;
+    Error& operator=(Error const&) = default;
+    ~Error() override;
     ErrorCode code() const noexcept { return m_code; }
 
 private:

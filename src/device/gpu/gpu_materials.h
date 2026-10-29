@@ -7,6 +7,7 @@
 // arguments out exactly like the native backend, so only resource indices
 // are rewritten into the link unit's single texture index space.
 
+#include "../../internal_export.h"
 #include "../../texture_service.h"
 
 #include <cstdint>
@@ -121,7 +122,7 @@ struct MdlShaderCode {
 // trades registers for recomputation; results do not depend on it.
 constexpr int kGpuTextureResults = 16;
 
-MdlShaderCode GenerateMdlShaderCode(std::vector<MDLMaterial const*> const& materials);
+PRISM_INTERNAL_API MdlShaderCode GenerateMdlShaderCode(std::vector<MDLMaterial const*> const& materials);
 
 // GenerateMdlShaderCode, reusing the result for the same material bindings
 // (bindings are immutable, so equal bindings give equal code and data). Scene
@@ -131,13 +132,13 @@ std::shared_ptr<const MdlShaderCode> CachedMdlShaderCode(std::vector<MDLMaterial
 // The per-program layout of the materials: each distinct program's own code
 // (ProgramCodes), with read-only data, texture and string tables placed per
 // program and material. Cached like CachedMdlShaderCode.
-MdlShaderCode GenerateProgramShaderCode(std::vector<MDLMaterial const*> const& materials);
+PRISM_INTERNAL_API MdlShaderCode GenerateProgramShaderCode(std::vector<MDLMaterial const*> const& materials);
 std::shared_ptr<const MdlShaderCode> CachedProgramShaderCode(std::vector<MDLMaterial const*> const& materials);
 
 // The code of each material's program alone (null for materials without a
 // usable program), translating the programs no early translation produced, in
 // parallel.
-std::vector<std::shared_ptr<const MdlProgramCode>> ProgramCodes(std::vector<MDLMaterial const*> const& materials);
+PRISM_INTERNAL_API std::vector<std::shared_ptr<const MdlProgramCode>> ProgramCodes(std::vector<MDLMaterial const*> const& materials);
 
 // Early translation: while at least one listener is registered, every
 // reusable MDL class is translated on the thread that compiles it, right

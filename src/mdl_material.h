@@ -461,13 +461,10 @@ public:
     // Light samples evaluate the emitter between the shading point's prepare
     // and its BSDF: that point's texture-runtime context is kept.
     Color3 emittedRadiance(const RayHit& hit) override {
-        float origin[3];
-        std::copy(std::begin(mdl::NativeTextureRuntime::viewOrigin), std::end(mdl::NativeTextureRuntime::viewOrigin),
-                  origin);
-        const auto context = mdl::NativeTextureRuntime::primvarContext;
+        auto& shading = mdl::NativeTextureRuntime::Thread();
+        const auto saved = shading;
         const Color3 radiance = m_valid ? evaluate_emission(hit) : Color3(0.0f);
-        std::copy(origin, origin + 3, mdl::NativeTextureRuntime::viewOrigin);
-        mdl::NativeTextureRuntime::primvarContext = context;
+        shading = saved;
         return radiance;
     }
 
@@ -625,10 +622,11 @@ private:
     void build_shading_state(const RayHit& hit, ShadingStateData& ss) const
     {
         memset(&ss, 0, sizeof(ss));
-        mdl::NativeTextureRuntime::viewOrigin[0] = hit.o.x();
-        mdl::NativeTextureRuntime::viewOrigin[1] = hit.o.y();
-        mdl::NativeTextureRuntime::viewOrigin[2] = hit.o.z();
-        mdl::NativeTextureRuntime::primvarContext = {hit.primvarMesh, unsigned(hit.primid), hit.bary_u, hit.bary_v,
+        auto& shading = mdl::NativeTextureRuntime::Thread();
+        shading.viewOrigin[0] = hit.o.x();
+        shading.viewOrigin[1] = hit.o.y();
+        shading.viewOrigin[2] = hit.o.z();
+        shading.primvarContext = {hit.primvarMesh, unsigned(hit.primid), hit.bary_u, hit.bary_v,
             [](const void* mesh, const char* name, unsigned primitive, float u, float v, float* out, int count) {
                 return static_cast<Mesh const*>(mesh)->interpolatePrimvar(name, primitive, u, v, out, count);
             }, hit.instancePrimvars,

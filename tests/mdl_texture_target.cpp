@@ -589,7 +589,7 @@ int main()
         // program as string id 0 and every lookup returned its default (blue).
         // Two materials of one class that differ only in the primvar name.
         int dummyMesh=0;
-        mdl::NativeTextureRuntime::primvarContext={&dummyMesh,0,0,0,
+        mdl::NativeTextureRuntime::Thread().primvarContext={&dummyMesh,0,0,0,
             [](const void*,const char* name,unsigned,float,float,float* out,int count) {
                 const std::string_view primvar(name?name:"");
                 if(count!=3||(primvar!="displayColor"&&primvar!="otherColor"))return false;
@@ -607,7 +607,7 @@ int main()
                 "class-compiled scene data lookup used another material's primvar name");
         require(dominant(evaluate(sceneDataRed.target,.25f,.25f),0),
                 "scene data variant changed an earlier material's lookup");
-        mdl::NativeTextureRuntime::primvarContext={};
+        mdl::NativeTextureRuntime::Thread().primvarContext={};
 
         // Constant emission (emissive triangles join the light table) must
         // not depend on the compile mode: under class compilation a

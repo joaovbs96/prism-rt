@@ -1,5 +1,6 @@
 #pragma once
 
+#include "../internal_export.h"
 #include "loader.h"
 #include <mi/mdl_sdk.h>
 #include <functional>
@@ -11,7 +12,7 @@
 namespace mdl {
 
 // Wrapper for MDL SDK initialization and core interfaces
-class Context {
+class PRISM_INTERNAL_API Context {
 public:
     // Initialize MDL SDK with optional library path and plugins to load.
     // Plugins MUST be loaded before neuray->start(), so they are passed

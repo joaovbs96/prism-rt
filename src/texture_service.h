@@ -1,5 +1,6 @@
 #pragma once
 
+#include "internal_export.h"
 #include <OpenImageIO/imagebuf.h>
 #include <OpenImageIO/texture.h>
 
@@ -108,7 +109,7 @@ struct TextureServiceStats {
     uint64_t aheadMemoryHits = 0;
 };
 
-class TextureResource final {
+class PRISM_INTERNAL_API TextureResource final {
 public:
     int width() const noexcept;
     int height() const noexcept;
@@ -128,7 +129,7 @@ private:
 
 // What a texture service is made with: a renderer's options, the cache root
 // and disk budget the runtime's (renderer/runtime.h).
-struct TextureServiceOptions {
+struct PRISM_INTERNAL_API TextureServiceOptions {
     std::filesystem::path cacheDirectory; // prepared textures and fingerprints
     uint64_t diskBudgetBytes = 0;         // the prepared textures' share
     uint64_t memoryMiB = 0;               // OIIO's tile cache; 0: default
@@ -145,7 +146,7 @@ struct TextureServiceOptions {
     static TextureServiceOptions FromRuntime();
 };
 
-class TextureService final : public std::enable_shared_from_this<TextureService> {
+class PRISM_INTERNAL_API TextureService final : public std::enable_shared_from_this<TextureService> {
 public:
     // The service for `options`: one instance per distinct options, shared
     // while someone holds it (renderers with the same options share one).

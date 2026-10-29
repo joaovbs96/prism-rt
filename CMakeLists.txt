@@ -254,7 +254,17 @@ add_custom_command(
 
 # The core: renderer, scene, materials (MaterialX -> MDL), devices,
 # integrator, colour, textures, denoisers. No USD (prism_core_without_usd_test).
-add_library(prism STATIC ${PRISM_CORE_SOURCES} "${PRISM_EMBEDDED_SHADERS}")
+# A shared library, so a process holds one copy of its state (the MDL SDK
+# runtime, Embree/TBB, the caches) whichever front ends it loads: hdPrism, the
+# CLI and the Python module link this one (docs/sdk_design.md, section 4.1).
+# Exports are explicit (include/prism/export.h: PRISM_API for the public API,
+# src/internal_export.h: PRISM_INTERNAL_API for what front ends and tests
+# still use); other symbols stay hidden on every platform.
+add_library(prism SHARED ${PRISM_CORE_SOURCES} "${PRISM_EMBEDDED_SHADERS}")
+set_target_properties(prism PROPERTIES
+    DEFINE_SYMBOL PRISM_BUILDING_CORE
+    CXX_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN ON)
 # The public headers (include/prism: Renderer, Scene, the loader modules'
 # entry points); std and PrismRT types only, except prism/usd.h.
 target_include_directories(prism PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
@@ -377,23 +387,48 @@ if(PRISM_ENABLE_OIDN)
     target_compile_definitions(prism PUBLIC PRISM_HAS_OIDN=1)
 endif()
 
-# Image writing (OpenImageIO).
+# Image writing (OpenImageIO). Static: it holds no state.
 add_library(prism_io STATIC ${PRISM_IO_SOURCES})
 target_link_libraries(prism_io PUBLIC prism OpenImageIO::OpenImageIO)
 
 # USD: stage loading (src/mesh/usd_mesh.h), the material service over
 # Hydra material data sources, render settings and products, the Vt adapters.
-add_library(prism_usd STATIC ${PRISM_USD_SOURCES})
+# Shared like the core: it holds process state that hdPrism and the CLI (and
+# later Python) share, the material service's template and captured-material
+# registries (src/usd/usd_module_state.cpp). Exports: PRISM_USD_API,
+# PRISM_USD_INTERNAL_API.
+add_library(prism_usd SHARED ${PRISM_USD_SOURCES})
+set_target_properties(prism_usd PROPERTIES
+    DEFINE_SYMBOL PRISM_BUILDING_USD
+    CXX_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN ON)
 target_include_directories(prism_usd PUBLIC ${PXR_INCLUDE_DIRS} ${Python3_INCLUDE_DIRS})
-target_link_libraries(prism_usd PUBLIC prism prism_io ${PXR_LIBRARIES})
+target_link_libraries(prism_usd PUBLIC prism ${PXR_LIBRARIES} PRIVATE prism_io)
 
-# glTF (tinygltf) and OBJ (tinyobjloader) scenes.
+# glTF (tinygltf) and OBJ (tinyobjloader) scenes. Static: no state of their
+# own; they reach the core's caches through its exports.
 add_library(prism_gltf STATIC ${PRISM_GLTF_SOURCES})
 target_include_directories(prism_gltf PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/external/tinygltf")
 target_link_libraries(prism_gltf PUBLIC prism)
 add_library(prism_obj STATIC ${PRISM_OBJ_SOURCES})
 target_include_directories(prism_obj PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/external/tinyobj")
 target_link_libraries(prism_obj PUBLIC prism)
+# The static modules may be linked into shared libraries (prism_usd takes
+# prism_io; the Python module will take them all).
+set_target_properties(prism_io prism_gltf prism_obj PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+# The shared libraries go beside every binary that loads them, so no PATH
+# entry is needed: the build's RelWithDebInfo (CLI, most tests) and, with
+# Hydra, hydra/plugin (hdPrism.dll and the Hydra tests).
+if(WIN32 AND PRISM_BUILD_HYDRA)
+    foreach(_prism_shared IN ITEMS prism prism_usd)
+        add_custom_command(TARGET ${_prism_shared} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/hydra/plugin"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:${_prism_shared}>"
+                "${CMAKE_BINARY_DIR}/hydra/plugin/"
+            COMMENT "Copying ${_prism_shared}.dll beside hdPrism.dll")
+    endforeach()
+endif()
 
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/PrismCoreWithoutUsd.cmake")
 prism_check_core_without_usd(prism)
@@ -834,6 +869,18 @@ if(PRISM_BUILD_HYDRA)
     add_test(NAME prism_mesh_source_test COMMAND prism_mesh_source_test)
     # The public scene API: scenes from arrays, commit, a CPU render, handles
     # and errors. It links the core alone (no USD, glTF or OBJ module).
+    # One copy of the core per process: the CLI, hdPrism and prism_usd import
+    # prism.dll, only it holds the MDL runtime's code, and a process that
+    # links the core and loads hdPrism.dll has one prism.dll and one module
+    # exporting the MDL runtime accessor (tests/single_runtime_test.cpp).
+    add_executable(prism_single_runtime_test tests/single_runtime_test.cpp)
+    target_link_libraries(prism_single_runtime_test PRIVATE prism prism_usd)
+    add_dependencies(prism_single_runtime_test PrismRT hdPrism)
+    add_test(NAME prism_single_runtime_test COMMAND prism_single_runtime_test
+        $<TARGET_FILE:prism> $<TARGET_FILE:prism_usd> $<TARGET_FILE:PrismRT> $<TARGET_FILE:hdPrism>)
+    set_tests_properties(prism_single_runtime_test PROPERTIES
+        ENVIRONMENT "${_prism_test_environment}" SKIP_RETURN_CODE 77)
+
     add_executable(prism_scene_api_test tests/scene_api_test.cpp)
     target_link_libraries(prism_scene_api_test PRIVATE prism)
     add_test(NAME prism_scene_api_test COMMAND prism_scene_api_test
@@ -2097,6 +2144,12 @@ endforeach()
 
 include(GNUInstallDirs)
 install(TARGETS PrismRT RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
+# The shared core and USD module: DLLs beside PrismRT.exe (bin, which is also
+# on hdPrism.dll's PATH in the package), shared objects in lib.
+install(TARGETS prism prism_usd
+    RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
+    LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+    ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}")
 install(FILES prism_env.ps1 run_usdview.ps1 prism_env.sh
     DESTINATION "${CMAKE_INSTALL_BINDIR}")
 install(PROGRAMS run_usdview.sh DESTINATION "${CMAKE_INSTALL_BINDIR}")

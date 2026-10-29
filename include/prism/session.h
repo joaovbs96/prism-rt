@@ -61,9 +61,9 @@ enum class Aov {
 };
 
 // The Hydra AOV token of an AOV ("color", "primvars:st", "primId", ...).
-std::string_view AovName(Aov aov);
+PRISM_API std::string_view AovName(Aov aov);
 // The AOV of a Hydra AOV token ("P" is Pworld); nullopt for an unknown name.
-std::optional<Aov> AovFromName(std::string_view name);
+PRISM_API std::optional<Aov> AovFromName(std::string_view name);
 
 // Shutter interval in time codes around the frame time; reserved (section 5):
 // accepted, one instant renders until motion blur exists.
@@ -164,7 +164,7 @@ struct SessionOptions {
 
 // Host pixels with shared ownership (copies share them): width x height
 // pixels of `channels` scalars, row-major, top row first.
-class Image {
+class PRISM_API Image {
 public:
     Image() = default;
     // Zero-filled pixels.
@@ -193,7 +193,7 @@ private:
     std::shared_ptr<void> m_data;
 };
 
-struct RenderResult {
+struct PRISM_API RenderResult {
     // The requested AOVs, dataWindow-sized.
     std::map<Aov, Image> aovs;
     // The display window and the part of it these pixels are.
@@ -262,7 +262,7 @@ struct SessionStatus {
     std::string error;
 };
 
-class Session {
+class PRISM_API Session {
 public:
     // Sessions come from Renderer::createSession. Copies share the session.
     Session(Session const&) = default;

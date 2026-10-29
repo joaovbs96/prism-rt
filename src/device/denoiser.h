@@ -17,6 +17,7 @@
 //                  CPU denoiser on host copies when OIDN has no Metal device.
 // Every backend runs the same network weights (OIDN 2.5.1's).
 
+#include "../internal_export.h"
 #include "../../include/prism/settings.h"
 
 #include <memory>
@@ -29,8 +30,8 @@ namespace prism::device {
 using prism::DenoiseQuality;
 using prism::DenoiseSettings;
 
-const char* ToString(DenoiseQuality quality);
-bool ParseDenoiseQuality(std::string_view text, DenoiseQuality* quality);
+PRISM_INTERNAL_API const char* ToString(DenoiseQuality quality);
+PRISM_INTERNAL_API bool ParseDenoiseQuality(std::string_view text, DenoiseQuality* quality);
 
 // The images of one denoise on the host: width x height pixels, top row
 // first, `stride` floats per pixel of which the first three are used (RGB,
@@ -61,11 +62,11 @@ public:
 };
 
 // True when this build has a denoiser (PRISM_ENABLE_OIDN).
-bool DenoisingAvailable();
+PRISM_INTERNAL_API bool DenoisingAvailable();
 
 // OIDN's CPU device, created once per process and shared (its threads come
 // from the process's oneTBB). Null with the reason in *error when the build
 // has no OIDN or the device cannot be created.
-std::shared_ptr<Denoiser> SharedCpuDenoiser(std::string* error = nullptr);
+PRISM_INTERNAL_API std::shared_ptr<Denoiser> SharedCpuDenoiser(std::string* error = nullptr);
 
 } // namespace prism::device

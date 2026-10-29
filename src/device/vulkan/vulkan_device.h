@@ -1,5 +1,6 @@
 #pragma once
 
+#include "../../internal_export.h"
 #include "../cpu_device.h"
 #include "../gpu/gpu_device.h"
 
@@ -66,7 +67,7 @@ private:
 
 // The Vulkan kernel for the given MDL code, as SPIR-V (exposed for the shader compile test).
 // With lightAovs, the variant that also writes the light AOVs (PRISM_LIGHT_AOVS).
-bool CompileVulkanKernel(std::string const& mdlCode, std::vector<uint32_t>* spirv, std::string* error,
+PRISM_INTERNAL_API bool CompileVulkanKernel(std::string const& mdlCode, std::vector<uint32_t>* spirv, std::string* error,
                          uint32_t programCount = 0, bool lightAovs = false);
 
 // Diagnostics without a Vulkan device: the GPU programs of the scene's materials and their SPIR-V sizes.

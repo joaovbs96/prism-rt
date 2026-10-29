@@ -19,6 +19,7 @@
 // renderer (tests, tools) gets the environment's settings
 // (RendererOptions::FromEnvironment).
 
+#include "../internal_export.h"
 #include "renderer_options.h"
 
 #include <cstdint>
@@ -27,7 +28,7 @@
 
 namespace prism {
 
-struct RuntimeSettings {
+struct PRISM_INTERNAL_API RuntimeSettings {
     // The explicit cache root; empty: each cache's platform default
     // (DefaultCacheDirectory; GPU shaders keep their own, hlsl_compiler.h).
     std::filesystem::path cacheDirectory;
@@ -45,7 +46,7 @@ struct RuntimeSettings {
     std::filesystem::path CacheRoot() const;
 };
 
-class Runtime {
+class PRISM_INTERNAL_API Runtime {
 public:
     // The process runtime; configured from the environment on first use
     // unless a renderer context configured it before.

@@ -6,6 +6,7 @@
 // textures and the environment become records that the kernels evaluate with
 // the same mathematics as the CPU classes.
 
+#include "../../internal_export.h"
 #include "../hlsl_math.h"
 #include "../../../shaders/shared/prism_gpu_types.h"
 #include "../../../shaders/integrator/lights.h"
@@ -86,7 +87,7 @@ struct GpuSceneData {
     size_t triangleCount() const { return indices.size() / 3; }
 };
 
-GpuSceneData BuildGpuScene(SceneManager& scene);
+PRISM_INTERNAL_API GpuSceneData BuildGpuScene(SceneManager& scene);
 
 // Whether two scenes have the same prototype geometry (vertex data, indices,
 // prototypes, spheres), so their per-prototype acceleration structures and

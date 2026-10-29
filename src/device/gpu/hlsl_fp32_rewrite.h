@@ -10,10 +10,11 @@
 // that still names the double type afterwards is rejected, so a new SDK
 // construct fails with a clear error instead of reaching the converter.
 
+#include "../../internal_export.h"
 #include <string>
 
 namespace prism::device::gpu {
 
-bool RewriteHlslToFp32(std::string const& code, std::string* result, std::string* error);
+PRISM_INTERNAL_API bool RewriteHlslToFp32(std::string const& code, std::string* result, std::string* error);
 
 } // namespace prism::device::gpu

@@ -3,6 +3,7 @@
 // Compiles the GPU kernel with DXC: to DXIL for the Metal device (followed by
 // Metal shader converter) and to SPIR-V for the Vulkan device.
 
+#include "../../internal_export.h"
 #include <cstdint>
 #include <filesystem>
 #include <string>
@@ -14,7 +15,7 @@ enum class HlslTarget { Dxil, Spirv };
 
 // The per-device shader cache directory (PRISM_CACHE_DIR or the platform
 // cache location, plus `device`).
-std::filesystem::path ShaderCacheDirectory(std::string const& device);
+PRISM_INTERNAL_API std::filesystem::path ShaderCacheDirectory(std::string const& device);
 
 // A stable digest of a source text, for cache file names.
 std::string SourceDigest(std::string const& text);
@@ -34,7 +35,7 @@ struct HlslCompileStats {
 
 // Compiles `stage` of `source`. The source and the output pass through
 // `workDirectory`.
-bool CompileHlsl(std::string const& source, HlslTarget target, std::filesystem::path const& workDirectory,
+PRISM_INTERNAL_API bool CompileHlsl(std::string const& source, HlslTarget target, std::filesystem::path const& workDirectory,
                  std::vector<char>* binary, std::string* error, HlslStage const& stage = {},
                  HlslCompileStats* stats = nullptr);
 

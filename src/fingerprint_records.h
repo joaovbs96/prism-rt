@@ -13,6 +13,8 @@
 
 #include <OpenImageIO/hash.h>
 
+#include "module_state.h"
+
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
@@ -137,14 +139,13 @@ inline void Write(std::filesystem::path const &directory, std::string const &ide
     const auto path = RecordPath(directory, identity);
     std::error_code ec;
     std::filesystem::create_directories(path.parent_path(), ec);
-    static std::atomic<uint64_t> serial{0};
 #ifdef _WIN32
     const auto process = _getpid();
 #else
     const auto process = getpid();
 #endif
     const auto temporary = std::filesystem::path(path.string() + "." + std::to_string(process) + "." +
-                                                 std::to_string(++serial) + ".tmp");
+                                                 std::to_string(prism::NextTemporaryFileSerial()) + ".tmp");
     const std::string body = detail::Body(identity, record);
     {
         std::ofstream out(temporary, std::ios::binary | std::ios::trunc);

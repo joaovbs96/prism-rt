@@ -7,6 +7,7 @@
 // exists (migration step 4), and the render settings that still live on
 // SceneManager (docs/DECISIONS.md, 2026-10-28: deferred from step 2).
 
+#include "../internal_export.h"
 #include <prism/scene.h>
 
 #include "../mesh/mesh_conversion.h"
@@ -67,7 +68,7 @@ struct CommittedRevision {
 // commit replaces the revision under it). It counts who waits for it, so a
 // progressive session that holds it across passes yields to them at its pass
 // boundaries (yield()).
-class RenderLock {
+class PRISM_INTERNAL_API RenderLock {
 public:
     explicit RenderLock(Scene const& scene);
     RenderLock(std::mutex& mutex, std::atomic<int>& waiters);
@@ -86,7 +87,7 @@ private:
     bool m_locked = false;
 };
 
-struct SceneAccess {
+struct PRISM_INTERNAL_API SceneAccess {
     static RendererContext& context(Scene const& scene);
     // A material the caller compiled (or a built-in one): the scene holds
     // it while any revision uses it. A null material is rejected.

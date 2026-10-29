@@ -5,6 +5,7 @@
 #include "rng.h"
 #include "ray.h"
 #include "texture.h"
+#include "internal_export.h"
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -215,7 +216,8 @@ class ErrorMaterial : public Emissive {
         ErrorMaterial() : Emissive(&m_magenta) {}
         std::optional<ConstantEmission> constantEmission() const override { return std::nullopt; }
         // One instance serves every failed material.
-        static ErrorMaterial* Shared() { static ErrorMaterial material; return &material; }
+        // One per process, in the core library (src/module_state.cpp).
+    PRISM_INTERNAL_API static ErrorMaterial* Shared();
 
     private:
         ValueTexture<Color3> m_magenta{Color3(1.0f, 0.0f, 1.0f)};

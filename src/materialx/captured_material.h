@@ -7,6 +7,7 @@
 #include <pxr/usd/sdf/assetPath.h>
 #include <pxr/usd/sdf/path.h>
 #include "../texture_service.h"
+#include "../internal_export.h"
 #include "udim_resource.h"
 #include <MaterialXCore/Document.h>
 
@@ -323,10 +324,8 @@ public:
         bool m_owner = false, m_active = false;
     };
 
-    static CapturedMaterialRegistry& Shared() {
-        static auto* registry = new CapturedMaterialRegistry;
-        return *registry;
-    }
+    // One per process, in the USD module (src/usd/usd_module_state.cpp).
+    PRISM_USD_INTERNAL_API static CapturedMaterialRegistry& Shared();
     bool find(const CapturedConversionArtifact& key,
               CapturedConversionArtifact* result) const {
         std::lock_guard lock(m_mutex);

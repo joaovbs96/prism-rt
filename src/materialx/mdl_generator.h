@@ -1,5 +1,6 @@
 #pragma once
 
+#include "../internal_export.h"
 #include <MaterialXCore/Document.h>
 #include <MaterialXCore/Node.h>
 #include "../color/color_management.h"
@@ -27,7 +28,7 @@ struct GeneratedMDL {
     std::string error_message;
 };
 
-class MDLGenerator {
+class PRISM_INTERNAL_API MDLGenerator {
 public:
     // `color`, when given, prepares the generator for that colour management
     // (else the first generation does).

@@ -9,6 +9,7 @@
 // triangulates it into a prototype-space Mesh, refining subdivision surfaces
 // (OpenSubdiv, subdivision.h) and displacing it by its material at load time.
 
+#include "../internal_export.h"
 #include "../geometry.h"
 
 #include <cstddef>
@@ -98,7 +99,7 @@ enum class Interpolation { Unauthored, Constant, Uniform, Varying, Vertex, FaceV
 
 // The interpolation a USD interpolation token names ("constant", "uniform",
 // "varying", "vertex", "faceVarying", "instance"; empty: Unauthored).
-Interpolation InterpolationFromName(std::string_view name);
+PRISM_INTERNAL_API Interpolation InterpolationFromName(std::string_view name);
 
 // A primvar's value (indices applied): `size` elements of `components`
 // scalars of `type`, contiguous at `data`, which its loader keeps alive.
@@ -158,7 +159,7 @@ struct NamedPrimvar {
 std::vector<NamedPrimvar> NamedPrimvars(MeshSource const &source, size_t points, size_t faces, size_t corners);
 
 // Values of a primvar as floats (scalars, vectors; arrays or single values).
-bool PrimvarFloats(PrimvarView const &value, std::vector<float> *out, int *components);
+PRISM_INTERNAL_API bool PrimvarFloats(PrimvarView const &value, std::vector<float> *out, int *components);
 
 // The index of a primvar value at one face corner for its interpolation.
 size_t PrimvarIndex(Interpolation interpolation, size_t pointIndex, size_t cornerIndex, size_t faceIndex);
@@ -170,7 +171,7 @@ std::string_view RefinementScheme(std::string_view authored, bool displaced);
 // The faces a mesh refines to at each subdivision level up to the one its
 // conversion would use (index = level); a single entry, its own face count,
 // for meshes that do not refine. Reads only the topology.
-std::vector<size_t> RefinementFaces(std::span<const int> faceVertexCounts, std::string_view scheme,
+PRISM_INTERNAL_API std::vector<size_t> RefinementFaces(std::span<const int> faceVertexCounts, std::string_view scheme,
                                     bool displaced, SubdivisionSettings const &subdivision);
 
 // Highest subdivision level for each mesh such that all of them together
@@ -178,7 +179,7 @@ std::vector<size_t> RefinementFaces(std::span<const int> faceVertexCounts, std::
 // at a time, always the one currently refining to the most faces, so dense
 // meshes (whose control hulls are already fine) give up refinement first.
 // Fixed entries (already converted prototypes) count but are not lowered.
-std::vector<int> BudgetSubdivisionLevels(std::vector<std::vector<size_t>> const &faces,
+PRISM_INTERNAL_API std::vector<int> BudgetSubdivisionLevels(std::vector<std::vector<size_t>> const &faces,
                                          std::vector<bool> const &fixed, size_t budget,
                                          size_t *plannedFaces, size_t *requestedFaces);
 
@@ -191,7 +192,7 @@ void Displace(Mesh &mesh, Material const &material);
 // workers. The caller emits the warnings recorded in MeshConversionInfo.
 // levelCap, when not negative, limits the subdivision level (see
 // BudgetSubdivisionLevels).
-MeshConversion ConvertMesh(MeshSource const &source, SubdivisionSettings const &subdivision,
+PRISM_INTERNAL_API MeshConversion ConvertMesh(MeshSource const &source, SubdivisionSettings const &subdivision,
                            Material const *displacer = nullptr, int levelCap = -1);
 
 } // namespace prism::mesh

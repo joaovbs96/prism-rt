@@ -42,7 +42,7 @@ struct RendererStats {
     uint64_t texturePreparationNanoseconds = 0;  // summed over workers
 };
 
-class Renderer {
+class PRISM_API Renderer {
 public:
     // The front ends' defaults: options from the environment (OCIO, PRISM_*).
     Renderer();

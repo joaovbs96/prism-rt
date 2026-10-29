@@ -17,6 +17,8 @@
 // prism::progress, which report to the model bound to the calling thread
 // (progress::Bind) and do nothing without one.
 
+#include "internal_export.h"
+
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -78,8 +80,12 @@ public:
     Progress(const Progress&) = delete;
     Progress& operator=(const Progress&) = delete;
 
-    // The model bound to the calling thread (progress::Bind), or null.
-    static Progress* Current() { return s_current; }
+    // The model bound to the calling thread (progress::Bind), or null. The
+    // binding is one thread-local in the core library (src/module_state.cpp),
+    // shared by every module of the process.
+    PRISM_INTERNAL_API static Progress* Current();
+    // Binds `model` to the calling thread and returns the previous binding.
+    PRISM_INTERNAL_API static Progress* Exchange(Progress* model);
 
     // Starts a phase with fresh counters. Beginning an active phase keeps it.
     void Begin(Phase phase)
@@ -194,15 +200,13 @@ private:
     mutable std::mutex m_mutex;
     std::string m_device;
     std::string m_error;
-    inline static thread_local Progress* s_current = nullptr;
-    friend class ProgressBinding;
 };
 
 // Binds a model to the calling thread for a scope (progress::Bind).
 class ProgressBinding {
 public:
-    explicit ProgressBinding(Progress* model) : m_previous(Progress::s_current) { Progress::s_current = model; }
-    ~ProgressBinding() { Progress::s_current = m_previous; }
+    explicit ProgressBinding(Progress* model) : m_previous(Progress::Exchange(model)) {}
+    ~ProgressBinding() { Progress::Exchange(m_previous); }
     ProgressBinding(const ProgressBinding&) = delete;
     ProgressBinding& operator=(const ProgressBinding&) = delete;
 private:

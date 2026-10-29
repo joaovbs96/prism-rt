@@ -4,6 +4,7 @@
 // mesh prim as Vt arrays (shared with Hydra data sources or read from a
 // UsdGeomMesh, no copies), and its std-only MeshSource view for the core.
 
+#include "../internal_export.h"
 #include "../mesh/mesh_conversion.h"
 
 #include <pxr/base/tf/token.h>
@@ -25,7 +26,7 @@ struct UsdPrimvarData {
 };
 
 // The mesh prim as both USD loaders read it. Empty tokens are unauthored.
-struct UsdMeshSource {
+struct PRISM_USD_INTERNAL_API UsdMeshSource {
     pxr::VtIntArray faceVertexCounts, faceVertexIndices, holeIndices;
     UsdPrimvarData points;   // VtVec3fArray or VtVec3dArray
     UsdPrimvarData normals;  // primvars:normals over normals
@@ -51,11 +52,11 @@ struct UsdMeshSource {
 // A view of a primvar value: arrays of float, double and int scalars and
 // vectors (2-4), and single float, double, int and GfVec2f/3f/4f values;
 // other types are Unsupported.
-prism::mesh::PrimvarView View(pxr::VtValue const& value, pxr::TfToken const& interpolation = {});
+PRISM_USD_INTERNAL_API prism::mesh::PrimvarView View(pxr::VtValue const& value, pxr::TfToken const& interpolation = {});
 inline prism::mesh::PrimvarView View(UsdPrimvarData const& data) { return View(data.value, data.interpolation); }
 
 // Values of a primvar as floats (prism::mesh::PrimvarFloats of its view).
-bool PrimvarFloats(pxr::VtValue const& value, std::vector<float>* out, int* components);
+PRISM_USD_INTERNAL_API bool PrimvarFloats(pxr::VtValue const& value, std::vector<float>* out, int* components);
 
 // prism::mesh::PrimvarIndex for an interpolation token.
 inline size_t PrimvarIndex(pxr::TfToken const& interpolation, size_t point, size_t corner, size_t face)

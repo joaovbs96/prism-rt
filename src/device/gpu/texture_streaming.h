@@ -27,6 +27,7 @@
 // Plans are deterministic for the same feedback. Tiles would extend a level
 // to per-tile residency; the budget and priority rules stay.
 
+#include "../../internal_export.h"
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -43,13 +44,13 @@ struct StreamedImage {
     uint32_t tailLevel = 0;         // finest level of the always resident tail
 };
 
-uint64_t StreamedLevelBytes(StreamedImage const& image, uint32_t level);
+PRISM_INTERNAL_API uint64_t StreamedLevelBytes(StreamedImage const& image, uint32_t level);
 // Bytes of levels [finest, levels).
-uint64_t StreamedBytes(StreamedImage const& image, uint32_t finest);
+PRISM_INTERNAL_API uint64_t StreamedBytes(StreamedImage const& image, uint32_t finest);
 // The finest level whose larger side is at most `tailSize` (0 for small images).
-uint32_t TailLevel(uint32_t width, uint32_t height, uint32_t levels, uint32_t tailSize);
+PRISM_INTERNAL_API uint32_t TailLevel(uint32_t width, uint32_t height, uint32_t levels, uint32_t tailSize);
 
-class StreamingPlanner {
+class PRISM_INTERNAL_API StreamingPlanner {
 public:
     struct Stats {
         uint64_t budget = 0;

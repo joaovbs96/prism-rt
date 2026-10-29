@@ -691,7 +691,7 @@ mi::neuraylib::Texture_handler_deriv_vtable const &NativeTextureRuntime::Vtable(
             mi::neuraylib::Shading_state_material*,unsigned id,float const d[3],bool){
             const bool view=Self(base)->isCameraPositionSceneData(id);
             if(!view&&Self(base)->lookupPrimvar(id,out,3))return;
-            for(int i=0;i<3;++i)out[i]=view?viewOrigin[i]:d[i];};
+            for(int i=0;i<3;++i)out[i]=view?Thread().viewOrigin[i]:d[i];};
         v.m_scene_data_lookup_float4=[](float out[4],Base const* base,
             mi::neuraylib::Shading_state_material*,unsigned id,float const d[4],bool){
             if(Self(base)->lookupPrimvar(id,out,4))return;
@@ -745,7 +745,7 @@ mi::neuraylib::Texture_handler_deriv_vtable const &NativeTextureRuntime::Vtable(
             *out=*d;
             float value[3];
             if(Self(base)->isCameraPositionSceneData(id))
-                for(int i=0;i<3;++i){out->val[i]=viewOrigin[i];out->dx[i]=0.0f;out->dy[i]=0.0f;}
+                for(int i=0;i<3;++i){out->val[i]=Thread().viewOrigin[i];out->dx[i]=0.0f;out->dy[i]=0.0f;}
             else if(Self(base)->lookupPrimvar(id,value,3))
                 for(int i=0;i<3;++i){out->val[i]=value[i];out->dx[i]=out->dy[i]=0.0f;}};
         v.m_scene_data_lookup_deriv_float4=[](
@@ -767,5 +767,10 @@ mi::neuraylib::Texture_handler_deriv_vtable const &NativeTextureRuntime::Vtable(
         return v;
     }();
     return table;
+}
+NativeTextureRuntime::ThreadShading& NativeTextureRuntime::Thread()
+{
+    static thread_local ThreadShading shading;
+    return shading;
 }
 } // namespace mdl

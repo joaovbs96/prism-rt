@@ -12,6 +12,7 @@
 // threads they run) or else the process default, which writes to standard
 // error with the environment's debug categories (PRISM_MDL_VERBOSE and so on).
 
+#include "../internal_export.h"
 #include <functional>
 #include <mutex>
 #include <set>
@@ -24,7 +25,7 @@
 
 namespace prism {
 
-class Logger {
+class PRISM_INTERNAL_API Logger {
 public:
     // An empty sink writes to standard error (debug output to standard
     // output, as the verbose switches always did).
@@ -59,12 +60,12 @@ private:
 namespace logging {
 
 // The logger bound to the calling thread, else the process default.
-Logger const& Current();
+PRISM_INTERNAL_API Logger const& Current();
 // The process default: standard error, the environment's debug categories.
-Logger const& Default();
+PRISM_INTERNAL_API Logger const& Default();
 
 // Binds a logger to the calling thread for a scope.
-class Bind {
+class PRISM_INTERNAL_API Bind {
 public:
     explicit Bind(Logger const* logger);
     ~Bind();

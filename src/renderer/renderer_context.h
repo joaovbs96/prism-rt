@@ -7,6 +7,7 @@
 // need of it, to the loaders, services and devices. It becomes the public
 // prism::Renderer's implementation later (migration step 3).
 
+#include "../internal_export.h"
 #include "../progress.h"
 #include "../varying_emitter_signal.h"
 #include "logger.h"
@@ -21,7 +22,7 @@
 
 namespace prism {
 
-class RendererContext {
+class PRISM_INTERNAL_API RendererContext {
 public:
     explicit RendererContext(RendererOptions options);
     ~RendererContext();

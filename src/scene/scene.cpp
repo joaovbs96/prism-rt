@@ -1805,6 +1805,10 @@ SceneOptions const& Scene::options() const { return m_impl->options; }
 
 // ── Renderer
 
+// The key function of Error: its vtable and type information live in the
+// core library, which exports them (prism/types.h).
+Error::~Error() = default;
+
 Renderer::Renderer() : Renderer(RendererOptions::FromEnvironment()) {}
 Renderer::Renderer(RendererOptions const& options) : m_context(std::make_shared<RendererContext>(options)) {}
 Renderer::Renderer(std::shared_ptr<RendererContext> context) : m_context(std::move(context))

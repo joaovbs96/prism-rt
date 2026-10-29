@@ -1,5 +1,6 @@
 #pragma once
 
+#include "../internal_export.h"
 #include "context.h"
 #include "../materialx/mdl_generator.h"
 
@@ -64,7 +65,7 @@ struct CompiledMaterial {
 
 // Phase 4: Loads MaterialX-generated MDL code into the MDL SDK,
 // creates a material instance, and compiles it.
-class MaterialCompiler {
+class PRISM_INTERNAL_API MaterialCompiler {
 public:
     // Takes a reference to an already-initialized MDL Context
     // mx_mdl_path: path to MaterialX's MDL support libraries

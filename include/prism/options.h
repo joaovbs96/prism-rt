@@ -13,6 +13,8 @@
 #include <string_view>
 #include <vector>
 
+#include "export.h"
+
 namespace prism {
 
 // Colour management (docs/color_management.md).
@@ -53,7 +55,7 @@ struct MaterialOptions {
 };
 
 // Resource limits; 0 is the built-in default.
-struct Limits {
+struct PRISM_API Limits {
     unsigned materialThreads = 0;     // PRISM_MATERIAL_THREADS (1-64)
     unsigned textureThreads = 0;      // PRISM_TEXTURE_THREADS (1-64)
     // Unused compiled materials kept in memory: PRISM_MATERIAL_CACHE_MB
@@ -110,7 +112,7 @@ enum class LogLevel { Debug, Info, Warning, Error };
 // possibly on several threads at once.
 using LogSink = std::function<void(LogLevel level, std::string_view category, std::string_view message)>;
 
-struct RendererOptions {
+struct PRISM_API RendererOptions {
     // Colour management. An empty config is $OCIO in FromEnvironment and the
     // built-in studio config otherwise.
     ColorOptions color;
@@ -140,6 +142,6 @@ struct RendererOptions {
 
 // The platform's cache directory for PrismRT: %LOCALAPPDATA%/PrismRT/cache,
 // else the temporary directory's PrismRT/cache.
-std::filesystem::path DefaultCacheDirectory();
+PRISM_API std::filesystem::path DefaultCacheDirectory();
 
 } // namespace prism

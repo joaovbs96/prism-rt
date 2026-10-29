@@ -7,6 +7,7 @@
 // Frontends keep ownership of scene ingestion, accumulation, tiling policy and
 // presentation, and describe each unit of work with a request struct.
 
+#include "../internal_export.h"
 #include "adaptive_sampling.h"
 #include "denoiser.h"
 #include "../camera_rays.h"
@@ -39,12 +40,12 @@ using prism::DevicePreference;
 using prism::DeviceInfo;
 using prism::NeeSettings;
 
-const char* ToString(DeviceKind kind);
-const char* ToString(DevicePreference preference);
-bool ParseDevicePreference(std::string_view text, DevicePreference* preference);
+PRISM_INTERNAL_API const char* ToString(DeviceKind kind);
+PRISM_INTERNAL_API const char* ToString(DevicePreference preference);
+PRISM_INTERNAL_API bool ParseDevicePreference(std::string_view text, DevicePreference* preference);
 // Why a device name is not accepted ("the cpu-reference device was removed;
 // use cpu" for that former device, empty for an ordinary unknown name).
-std::string RemovedDeviceMessage(std::string_view text);
+PRISM_INTERNAL_API std::string RemovedDeviceMessage(std::string_view text);
 
 // A screen-space block of pixels. Tiles are processed in the given order.
 struct PixelTile {
@@ -224,7 +225,7 @@ struct TextureStreamingStats {
     uint64_t restarts = 0;        // accumulation restarts asked for
 };
 
-class RenderDevice {
+class PRISM_INTERNAL_API RenderDevice {
 public:
     virtual ~RenderDevice() = default;
     virtual DeviceInfo Info() const = 0;
@@ -281,19 +282,19 @@ void DenoiseRenderedImage(RenderDevice& device, ImageRequest const& request,
 
 // Devices compiled into this build with a usable adapter and not disabled by
 // `options`, CPU always last.
-std::vector<DeviceInfo> AvailableDevices(DeviceResources const& options);
+PRISM_INTERNAL_API std::vector<DeviceInfo> AvailableDevices(DeviceResources const& options);
 
 // Diagnostics without a GPU device (PRISM_GPU_PROGRAM_REPORT): the scene's GPU programs and their sizes.
 // False if this build has no Vulkan device.
 // `varyingEmitters`: the renderer's note of varying emission (which raygen
 // variants a device would prewarm); null: none.
-bool ReportGpuPrograms(SceneManager& scene, std::ostream& out,
+PRISM_INTERNAL_API bool ReportGpuPrograms(SceneManager& scene, std::ostream& out,
                        prism::VaryingEmitterSignal const* varyingEmitters = nullptr);
 
 // Creates the preferred device. If it is unavailable, falls back to the CPU
 // device and explains why in *note (when non-null). `options` disable
 // devices and set their initial texture budget (the renderer's).
-std::unique_ptr<RenderDevice> CreateDevice(DevicePreference preference, DeviceResources const& options,
+PRISM_INTERNAL_API std::unique_ptr<RenderDevice> CreateDevice(DevicePreference preference, DeviceResources const& options,
                                            std::string* note = nullptr);
 
 } // namespace prism::device

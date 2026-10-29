@@ -1,5 +1,6 @@
 #pragma once
 
+#include "../internal_export.h"
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -20,14 +21,14 @@ struct GeneratedTemplateArtifact {
 };
 
 // Hashes length-delimited fields with OIIO's stable SHA-1 implementation.
-std::string GeneratedTemplateKey(std::vector<std::string> const& fields);
+PRISM_INTERNAL_API std::string GeneratedTemplateKey(std::vector<std::string> const& fields);
 
 // Hashes the complete, ordered contents below a MaterialX library root. The
 // root's absolute name is deliberately excluded so relocated identical
 // installations share artifacts.
-std::string MaterialXLibraryDigest(std::filesystem::path const& root);
+PRISM_INTERNAL_API std::string MaterialXLibraryDigest(std::filesystem::path const& root);
 
-class GeneratedTemplateDiskCache {
+class PRISM_INTERNAL_API GeneratedTemplateDiskCache {
 public:
     GeneratedTemplateDiskCache(std::filesystem::path root, uint64_t budgetBytes);
     std::optional<GeneratedTemplateArtifact> load(std::string const& key) const;

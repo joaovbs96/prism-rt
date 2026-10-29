@@ -19,6 +19,7 @@
 // Internal: std and PrismRT types only (no USD); the render thread that
 // calls Run is the front end's (Hydra's render thread, the session's).
 
+#include "../internal_export.h"
 #include "../camera_rays.h"
 #include "../device/adaptive_sampling.h"
 #include "../device/denoiser.h"
@@ -243,7 +244,7 @@ struct ProgressiveStats {
 struct DenoiseJob;
 class DenoiseWorker;
 
-class ProgressiveEngine {
+class PRISM_INTERNAL_API ProgressiveEngine {
 public:
     explicit ProgressiveEngine(std::shared_ptr<RendererContext> renderer);
     ~ProgressiveEngine();

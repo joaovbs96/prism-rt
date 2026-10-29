@@ -14,6 +14,7 @@
 // so no tile buffer leaks, each row's result is checked, and nothing is
 // written after a failure.
 
+#include "internal_export.h"
 #include <OpenImageIO/imageio.h>
 
 #include <filesystem>
@@ -31,14 +32,14 @@ struct Level {
 // a 1x1 level, exactly as make_texture's box filter (resize_block) computes
 // them: a 2x2 average when both dimensions are even, otherwise a bilinear
 // sample of the previous level at each texel center with clamped edges.
-void BuildMipChain(std::vector<Level> &levels, int channels);
+PRISM_INTERNAL_API void BuildMipChain(std::vector<Level> &levels, int channels);
 
 // Writes `levels` (a full chain from BuildMipChain) to `path` as a tiled,
 // mipmapped float OpenEXR texture with `spec`'s channel names, alpha
 // channel and attributes. The file is flushed to disk before returning.
 // Returns false, with `error` set, after the first failure; the file is
 // then incomplete and the caller removes it.
-bool WriteMipmappedExr(std::filesystem::path const &path, OIIO::ImageSpec const &spec,
+PRISM_INTERNAL_API bool WriteMipmappedExr(std::filesystem::path const &path, OIIO::ImageSpec const &spec,
                        std::vector<Level> const &levels, std::string *error);
 
 // Writes a whole image (scanline or tiled, as `spec` says) through the same
@@ -50,6 +51,6 @@ bool WriteImageSafely(std::filesystem::path const &path, OIIO::ImageSpec const &
 // The compression of prepared textures: configured (the texture service's
 // TextureServiceOptions::compression, PRISM_TEXTURE_COMPRESSION), default
 // "zip:1" (OpenEXR's zip at deflate level 1).
-std::string PreparedCompression(std::string const &configured = {});
+PRISM_INTERNAL_API std::string PreparedCompression(std::string const &configured = {});
 
 } // namespace prism::texture_writer

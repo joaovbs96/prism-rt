@@ -4,6 +4,7 @@
 // frontends (the standalone CLI and prism_hydra_render) with
 // UsdRenderComputeSpec (docs/hydra.md, "Render settings and products").
 
+#include "../internal_export.h"
 #include "aov.h"
 #include "image_writer.h"
 
@@ -34,7 +35,7 @@ struct RenderVarRequest {
 
 // What one image is rendered from: a RenderProduct, or the settings prim
 // itself (no vars; the frontend's own output).
-struct RenderProductRequest {
+struct PRISM_USD_INTERNAL_API RenderProductRequest {
     pxr::SdfPath path;
     pxr::TfToken type;              // raster
     std::string output;             // productName, against the output directory
@@ -77,21 +78,21 @@ struct RenderJob {
 // product names resolve against outputDirectory (when not empty).
 // Unsupported products and vars are left out with a message in *warnings.
 // Throws std::runtime_error when `settingsPath` is not a RenderSettings prim.
-std::optional<RenderJob> ResolveRenderJob(pxr::UsdStageRefPtr const &stage,
+PRISM_USD_INTERNAL_API std::optional<RenderJob> ResolveRenderJob(pxr::UsdStageRefPtr const &stage,
                                           std::string const &settingsPath,
                                           std::string const &outputDirectory,
                                           std::vector<std::string> *warnings);
 
 // The AOV a RenderVar asks for (Unknown when PrismRT has none).
-AovKind RenderVarAov(std::string const &sourceName, pxr::TfToken const &sourceType);
+PRISM_USD_INTERNAL_API AovKind RenderVarAov(std::string const &sourceName, pxr::TfToken const &sourceType);
 
 // Pixels of a dataWindowNDC (UsdRender rasterization: a pixel is in when
 // its centre is), top row first.
-void DataWindowPixels(pxr::GfRange2f const &ndc, int width, int height,
+PRISM_USD_INTERNAL_API void DataWindowPixels(pxr::GfRange2f const &ndc, int width, int height,
                       int *x, int *y, int *dataWidth, int *dataHeight);
 
 // CameraUtil's policy for an aspectRatioConformPolicy token.
-pxr::CameraUtilConformWindowPolicy ConformPolicy(pxr::TfToken const &policy);
+PRISM_USD_INTERNAL_API pxr::CameraUtilConformWindowPolicy ConformPolicy(pxr::TfToken const &policy);
 
 // One rendered AOV of a product's view: dataWidth x dataHeight pixels of
 // `components` floats, top row first (integer AOVs as floats).
@@ -104,23 +105,23 @@ struct RenderedAov {
 // The product's image: a layer per var, from the rendered AOVs. Vars whose
 // AOV was not rendered are left out with a message in *warnings; a colour
 // var asking for alpha from an RGB render gets alpha 1.
-Image BuildProductImage(RenderProductRequest const &product,
+PRISM_USD_INTERNAL_API Image BuildProductImage(RenderProductRequest const &product,
                         std::vector<RenderedAov> const &aovs,
                         std::vector<std::string> *warnings);
 
 // The public AOV of a kind (nullopt for Unknown).
-std::optional<prism::Aov> PublicAov(AovKind kind);
+PRISM_USD_INTERNAL_API std::optional<prism::Aov> PublicAov(AovKind kind);
 // The public conform policy of an aspectRatioConformPolicy token.
-prism::ConformPolicy PublicConformPolicy(pxr::TfToken const &policy);
+PRISM_USD_INTERNAL_API prism::ConformPolicy PublicConformPolicy(pxr::TfToken const &policy);
 
 // Writes the product from a session's render (prism_io): a layer per var, as
 // BuildProductImage. Returns false, with messages in *warnings, when none of
 // its vars was rendered (nothing is written).
-bool WriteProduct(RenderProductRequest const &product, prism::RenderResult const &result,
+PRISM_USD_INTERNAL_API bool WriteProduct(RenderProductRequest const &product, prism::RenderResult const &result,
                   prism::Renderer const &renderer, std::vector<std::string> *warnings);
 
 // The value of a prism:* setting as text (string, token or asset path), or
 // empty.
-std::string SettingText(pxr::VtDictionary const &settings, std::string const &name);
+PRISM_USD_INTERNAL_API std::string SettingText(pxr::VtDictionary const &settings, std::string const &name);
 
 } // namespace prism::output

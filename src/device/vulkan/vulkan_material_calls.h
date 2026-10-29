@@ -14,6 +14,7 @@
 // scene and compiles in the background from device creation, a scene compiles
 // only the callables no earlier scene had, and its pipeline links them.
 
+#include "../../internal_export.h"
 #include "../../progress.h"
 #include "../../renderer/logger.h"
 
@@ -81,22 +82,22 @@ size_t CallableThresholdBytes();
 constexpr size_t kDefaultMaxDriverSpirvMib = 24;
 size_t MaxDriverSpirvBytes();
 // Empty when `bytes` of SPIR-V may go to the driver; otherwise the reason, naming `shader`.
-std::string DriverSpirvLimitError(size_t bytes, std::string_view shader);
+PRISM_INTERNAL_API std::string DriverSpirvLimitError(size_t bytes, std::string_view shader);
 // The estimated memory of the driver's compile of `spirvBytes` of SPIR-V.
-uint64_t DriverCompileBytes(size_t spirvBytes);
+PRISM_INTERNAL_API uint64_t DriverCompileBytes(size_t spirvBytes);
 // The estimated peak memory of DXC compiling `hlslBytes` of HLSL to SPIR-V
 // (2.65 MB of callable HLSL: 0.85-1.75 GB; 0.93 MB: 0.25 GB). DXC's memory
 // follows the code it legalizes: a program's sample part peaked at up to 59%
 // of the whole's (1027 of 1740 MiB), its evaluate part at 42% (724).
-uint64_t DxcCompileBytes(size_t hlslBytes, MaterialCallPart part = MaterialCallPart::Whole);
+PRISM_INTERNAL_API uint64_t DxcCompileBytes(size_t hlslBytes, MaterialCallPart part = MaterialCallPart::Whole);
 // The memory concurrent compiles may take together
 // (PRISM_VULKAN_DRIVER_MEMORY_MIB; default a quarter of what the process may
 // commit: the physical memory, or its job's memory limit when lower).
-uint64_t DriverMemoryBudget();
+PRISM_INTERNAL_API uint64_t DriverMemoryBudget();
 // Holds `bytes` of that budget for one compile: waits while the compiles
 // running hold too much of it. A compile larger than the whole budget runs
 // alone.
-class CompileMemorySlot {
+class PRISM_INTERNAL_API CompileMemorySlot {
 public:
     explicit CompileMemorySlot(uint64_t bytes);
     ~CompileMemorySlot();
@@ -148,16 +149,16 @@ bool RaygenSource(bool reorder, uint32_t programs, bool varyingEmitters, std::st
 // Programs whose generated code exceeds this are split
 // (PRISM_VULKAN_SPLIT_PROGRAM_KIB, default 1536; 0 splits every program).
 size_t SplitProgramThresholdBytes();
-bool SplitProgram(size_t codeBytes);
+PRISM_INTERNAL_API bool SplitProgram(size_t codeBytes);
 // The part a callable source of MaterialCallSources or ProgramCallableSource compiles.
-MaterialCallPart CallablePart(std::string const& source);
+PRISM_INTERNAL_API MaterialCallPart CallablePart(std::string const& source);
 // For each callable slot of `sources` (MaterialCallSources), the index of its source.
-std::vector<uint32_t> CallableSlots(std::vector<std::string> const& sources);
+PRISM_INTERNAL_API std::vector<uint32_t> CallableSlots(std::vector<std::string> const& sources);
 // The HLSL of the callable pipeline: the raygen shader, then each program of
 // `code` as one callable or two parts (that program's dispatch and, with
 // `trim`, only the functions of the link unit it reaches), each compiled
 // alone with the kMaterialCallProfile library profile.
-bool MaterialCallSources(gpu::MdlShaderCode const& code, bool reorder, std::vector<std::string>* sources,
+PRISM_INTERNAL_API bool MaterialCallSources(gpu::MdlShaderCode const& code, bool reorder, std::vector<std::string>* sources,
                          std::string* error, bool trim = true);
 // One part of the callables of one program translated alone (MdlProgramCode):
 // the same source in every scene, so it can compile before the scene is complete.
@@ -165,7 +166,7 @@ bool ProgramCallableSource(gpu::MdlProgramCode const& program, MaterialCallPart 
                            std::string* error);
 // The parts a program's code of `codeBytes` compiles to (Whole, or Sample and Evaluate).
 std::vector<MaterialCallPart> ProgramParts(size_t codeBytes);
-extern const char* const kMaterialCallProfile; // lib_6_6
+extern PRISM_INTERNAL_API const char* const kMaterialCallProfile; // lib_6_6
 
 // Prints the statistics of every executable of `pipeline` (created with
 // VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR).

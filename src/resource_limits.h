@@ -12,6 +12,7 @@
 #include <string>
 #include <thread>
 
+#include "internal_export.h"
 #include "renderer/runtime.h"
 
 namespace prism {
@@ -88,7 +89,8 @@ public:
     };
     // Process-wide (the runtime's): its budget is the largest any renderer
     // asked for (Limits::preparationMiB).
-    static PreparationAdmission& Shared() { static PreparationAdmission value; return value; }
+    // One per process, in the core library (src/module_state.cpp).
+    PRISM_INTERNAL_API static PreparationAdmission& Shared();
     uint64_t peakReservedBytes() const { std::lock_guard lock(mutex); return peak; }
     uint64_t admissionWaitNanoseconds() const {
         std::lock_guard lock(mutex); return waitNanoseconds;

@@ -2,6 +2,9 @@ cmake_minimum_required(VERSION 3.20)
 project(PrismMaterialXTests LANGUAGES CXX)
 find_package(MaterialX REQUIRED)
 enable_testing()
+# These tests compile src/materialx/loader.cpp themselves: its export macro
+# (src/internal_export.h) must not import it from the core library.
+add_compile_definitions(PRISM_STATIC)
 add_executable(materialx_loader_sss materialx_loader_sss.cpp ../src/materialx/loader.cpp)
 target_compile_features(materialx_loader_sss PRIVATE cxx_std_20)
 target_link_libraries(materialx_loader_sss PRIVATE MaterialXCore MaterialXFormat)

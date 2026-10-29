@@ -10,6 +10,7 @@
 // Linear outputs (EXR, Hydra AOVs) stay in the working space; 8-bit outputs
 // go through the configured display and view (ACES 2.0 SDR on sRGB).
 
+#include "../internal_export.h"
 #include "../float3.h"
 #include "../../include/prism/options.h"
 
@@ -41,7 +42,7 @@ inline Float3 Apply(Matrix3 const &m, Float3 const &c)
 // (RenderingColorSpaceWorkingSpace), else ACEScg.
 using Options = prism::ColorOptions;
 
-class ColorManagement {
+class PRISM_INTERNAL_API ColorManagement {
 public:
     // Throws std::runtime_error for an unreadable config, an unknown or
     // non-linear working space, or an unknown display/view.
@@ -102,7 +103,7 @@ private:
 // colours and light colours in. unknown and an empty token take the default;
 // so do names the config lacks and spaces that are not scene-linear, with a
 // message in *warning.
-std::string RenderingColorSpaceWorkingSpace(std::string const &token, std::string const &config,
+PRISM_INTERNAL_API std::string RenderingColorSpaceWorkingSpace(std::string const &token, std::string const &config,
                                             std::string *warning = nullptr);
 
 // Colour space names of the colour-space metadata authored on USD attributes

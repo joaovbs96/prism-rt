@@ -7,6 +7,8 @@
 
 #include <OpenImageIO/hash.h>
 
+#include "../module_state.h"
+
 #include <atomic>
 #include <filesystem>
 #include <fstream>
@@ -28,14 +30,13 @@ inline std::filesystem::path PublishMaterialXDocument(const std::string& xml, co
     const std::filesystem::path path = cacheDir / (prefix + OIIO::SHA1::digest(xml.data(), xml.size()) + ".mtlx");
     std::filesystem::create_directories(cacheDir);
     if (std::filesystem::exists(path)) return path;
-    static std::atomic<unsigned long long> serial{0};
 #ifdef _WIN32
     const auto process = _getpid();
 #else
     const auto process = getpid();
 #endif
     const auto staging = std::filesystem::path(path.string() + ".tmp-" + std::to_string(process) + "-" +
-                                               std::to_string(serial++));
+                                               std::to_string(prism::NextTemporaryFileSerial()));
     struct Cleanup {
         std::filesystem::path path;
         ~Cleanup() { std::error_code ec; std::filesystem::remove(path, ec); }

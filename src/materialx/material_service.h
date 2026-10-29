@@ -1,5 +1,6 @@
 #pragma once
 
+#include "../internal_export.h"
 #include <memory>
 #include <cstdint>
 #include <string>
@@ -28,7 +29,7 @@ namespace prism::materials {
 // Both front ends use it: the Hydra delegate with its scene index's material
 // prims, the standalone CLI (src/mesh/usd_mesh.h) with data sources it builds
 // from the composed UsdShade networks.
-class MaterialService {
+class PRISM_USD_INTERNAL_API MaterialService {
 public:
     struct Request {
         pxr::HdContainerDataSourceHandle dataSource;

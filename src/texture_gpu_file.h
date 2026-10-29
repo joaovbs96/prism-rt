@@ -17,6 +17,7 @@
 // prepared again. Version 1 files (one level, 256-byte header) fail
 // validation and are written again from the source.
 
+#include "internal_export.h"
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -83,7 +84,7 @@ uint64_t Digest(void const *data, size_t bytes);
 
 // Fills a header for `levelCount` levels of a `width` x `height` x
 // `channels` image (1: level 0 only; 0: the full chain).
-Header MakeHeader(uint32_t width, uint32_t height, uint32_t channels, Component component, uint32_t flags,
+PRISM_INTERNAL_API Header MakeHeader(uint32_t width, uint32_t height, uint32_t channels, Component component, uint32_t flags,
                   float peak, uint32_t levelCount = 1);
 
 // The payload of the full mip chain of `level0` (width x height x channels
@@ -91,16 +92,16 @@ Header MakeHeader(uint32_t width, uint32_t height, uint32_t channels, Component 
 // filtered from the previous one as vkCmdBlitImage with VK_FILTER_LINEAR
 // does (bilinear at each destination texel's center, clamped to the edge;
 // a 2 x 2 box for even sizes) and rounded to the component.
-std::vector<uint8_t> BuildMipChain(void const *level0, uint32_t width, uint32_t height, uint32_t channels,
+PRISM_INTERNAL_API std::vector<uint8_t> BuildMipChain(void const *level0, uint32_t width, uint32_t height, uint32_t channels,
                                    Component component);
 
 // Writes header and payload to a temporary sibling of `path`, flushes it to
 // disk and renames it into place. False on any failure (nothing is left).
-bool Write(std::filesystem::path const &path, Header header, void const *payload, std::string *error);
+PRISM_INTERNAL_API bool Write(std::filesystem::path const &path, Header header, void const *payload, std::string *error);
 
 // Reads and validates `path`: header fields, file size and digests. With
 // `payload` null only the header is read and checked.
-bool Read(std::filesystem::path const &path, Header *header, std::vector<uint8_t> *payload, std::string *error);
+PRISM_INTERNAL_API bool Read(std::filesystem::path const &path, Header *header, std::vector<uint8_t> *payload, std::string *error);
 
 // Reads the payload of a file whose `header` Read returned into
 // `destination` (header.payloadBytes long) and checks its digests.
@@ -109,17 +110,17 @@ bool ReadPayload(std::filesystem::path const &path, Header const &header, void *
 // Reads levels [first, first + count) of a file whose `header` Read returned
 // into `destination` (their bytes, contiguous as in the payload) and checks
 // their digests. Only those levels are read.
-bool ReadLevels(std::filesystem::path const &path, Header const &header, uint32_t first, uint32_t count,
+PRISM_INTERNAL_API bool ReadLevels(std::filesystem::path const &path, Header const &header, uint32_t first, uint32_t count,
                 void *destination, std::string *error);
 
 // The bytes of levels [first, levelCount).
-uint64_t LevelRangeBytes(Header const &header, uint32_t first, uint32_t count);
+PRISM_INTERNAL_API uint64_t LevelRangeBytes(Header const &header, uint32_t first, uint32_t count);
 
 // Statistics of float texels for a Float32 header.
 void FloatStatistics(float const *values, size_t count, uint32_t *flags, float *peak);
 
 // IEEE binary16 conversions (round to nearest even), as the devices use them.
-uint16_t FloatToHalf(float value);
-float HalfToFloat(uint16_t half);
+PRISM_INTERNAL_API uint16_t FloatToHalf(float value);
+PRISM_INTERNAL_API float HalfToFloat(uint16_t half);
 
 } // namespace prism::gpu_texture

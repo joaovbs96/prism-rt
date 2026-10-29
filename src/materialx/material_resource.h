@@ -129,10 +129,8 @@ struct Registry {
     // Requests answered by a persistent fingerprint record.
     std::atomic<uint64_t> recordHits{0};
 };
-inline Registry& GetRegistry() {
-    static auto* registry = new Registry;
-    return *registry;
-}
+// One per process, in the core library (src/module_state.cpp).
+PRISM_INTERNAL_API Registry& GetRegistry();
 inline prism::materialx::ResolvedMaterialResourceStats GetStats() {
     auto& registry = GetRegistry();
     return {registry.sourceReadCalls.load(std::memory_order_relaxed),
@@ -254,14 +252,13 @@ inline std::shared_ptr<const ResolvedMaterialResource> PublishMaterialResourceBy
         if (!resource_detail::Matches(resource->path, bytes, size))
             throw std::runtime_error("corrupt material resource cache artifact: " + resource->path.string());
     } else {
-        static std::atomic<uint64_t> serial{0};
 #ifdef _WIN32
         const auto process = _getpid();
 #else
         const auto process = getpid();
 #endif
         const std::filesystem::path temporary = resource->path.string() + "." + std::to_string(process) + "." +
-            std::to_string(++serial) + ".tmp";
+            std::to_string(prism::NextTemporaryFileSerial()) + ".tmp";
         {
             std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
             if (!out || !out.write(bytes, static_cast<std::streamsize>(size)))
@@ -406,14 +403,13 @@ inline MaterialResourceResult PrepareMaterialResource(
         }
 
         if (!std::filesystem::exists(resource->path)) {
-            static std::atomic<uint64_t> serial{0};
-#ifdef _WIN32
+    #ifdef _WIN32
             const auto process = _getpid();
 #else
             const auto process = getpid();
 #endif
             temporary = resource->path.string() + "." + std::to_string(process) + "." +
-                std::to_string(++serial) + ".tmp";
+                std::to_string(prism::NextTemporaryFileSerial()) + ".tmp";
             {
                 std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
                 if (!out || !out.write(bytes.get(), static_cast<std::streamsize>(size)))

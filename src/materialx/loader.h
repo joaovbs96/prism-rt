@@ -1,11 +1,12 @@
 #pragma once
 
+#include "../internal_export.h"
 #include <MaterialXCore/Document.h>
 #include <array>
 #include <functional>
 #include <string>
 
-class DocumentLoader
+class PRISM_INTERNAL_API DocumentLoader
 {
 public:
     // Takes the stdlib from MDLGenerator so both share the same instance

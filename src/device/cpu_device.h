@@ -1,5 +1,6 @@
 #pragma once
 
+#include "../internal_export.h"
 #include "device.h"
 
 #include <memory>
@@ -21,7 +22,7 @@ struct CpuSceneState {
 // CPU rendering (Embree intersection, TBB parallelism, MDL native code): the
 // shared integrator (shaders/integrator) on a CPU backend. Stateless: every
 // call renders the scene it is given.
-class CpuDevice final : public RenderDevice {
+class PRISM_INTERNAL_API CpuDevice final : public RenderDevice {
 public:
     DeviceInfo Info() const override;
     std::vector<float> RenderImage(SceneManager& scene, ImageRequest const& request) override;

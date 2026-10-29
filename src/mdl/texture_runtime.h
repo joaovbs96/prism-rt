@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../texture_service.h"
+#include "../internal_export.h"
 
 #include <mi/mdl_sdk.h>
 
@@ -28,7 +29,7 @@ struct PrimvarContext {
     bool (*instanceLookup)(const void* instance, const char* name, float* out, int count) = nullptr;
 };
 
-class NativeTextureRuntime {
+class PRISM_INTERNAL_API NativeTextureRuntime {
 public:
     struct ArgumentResourcePreflight {
         // TextureService indexes prepared resources weakly. Retain successful
@@ -94,15 +95,19 @@ public:
         return id < m_cameraPositionSceneData.size() && m_cameraPositionSceneData[id];
     }
     static bool IsCameraPositionName(const char* name);
-    // The origin of the ray being shaded on this thread (MDLMaterial sets it
-    // with the shading state): scene data CAMERA_POSITION.
-    static inline thread_local float viewOrigin[3] = {0.0f, 0.0f, 0.0f};
-    // The surface point being shaded on this thread, for named primvar
-    // lookups (MDLMaterial sets it with the shading state).
-    static inline thread_local PrimvarContext primvarContext{};
+    // The point being shaded on this thread (MDLMaterial sets it with the
+    // shading state): the ray's origin (scene data CAMERA_POSITION) and the
+    // surface point, for named primvar lookups.
+    struct ThreadShading {
+        float viewOrigin[3] = {0.0f, 0.0f, 0.0f};
+        PrimvarContext primvarContext{};
+    };
+    // The calling thread's: one thread-local in the core library, which
+    // every module of the process sets and the compiled materials read.
+    static ThreadShading& Thread();
     // Scene data `id` (a string constant) of the current point into out[count].
     bool lookupPrimvar(unsigned id, float* out, int count) const {
-        auto const& c = primvarContext;
+        auto const& c = Thread().primvarContext;
         if (id >= m_sceneDataNames.size() || m_sceneDataNames[id].empty()) return false;
         if (c.instance && c.instanceLookup && c.instanceLookup(c.instance, m_sceneDataNames[id].c_str(), out, count))
             return true;

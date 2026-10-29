@@ -1,5 +1,6 @@
 #pragma once
 
+#include "../internal_export.h"
 #include "context.h"
 #include "material_compiler.h"
 
@@ -17,7 +18,7 @@ namespace mdl {
 class NativeTextureRuntime;
 
 // Releases process cache entries before an MDL SDK context shuts down.
-void ClearTargetCodeCache(const Context* context = nullptr);
+PRISM_INTERNAL_API void ClearTargetCodeCache(const Context* context = nullptr);
 
 // Called on the compiling thread with each compiled class, before its
 // native code is generated, so GPU devices can translate it for their shading
@@ -141,7 +142,7 @@ struct MaterialBinding {
     std::optional<float> constant_cutout_opacity;
 };
 
-struct TargetCode {
+struct PRISM_INTERNAL_API TargetCode {
     std::shared_ptr<const CompiledProgram> program;
     std::shared_ptr<const MaterialBinding> binding;
     std::string textureFallbackReason;
@@ -162,7 +163,7 @@ struct TargetCode {
 
 // Phase 5: Compiles a CompiledMaterial to native CPU code using the
 // MDL SDK's LLVM-based native backend.
-class BackendCompiler {
+class PRISM_INTERNAL_API BackendCompiler {
 public:
     // resourceMode (MaterialOptions::mdlResourceMode): how compiled code
     // reads textures, auto, custom or builtin; any other value fails every

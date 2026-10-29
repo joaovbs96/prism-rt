@@ -6,20 +6,21 @@
 // running at the same time contribute to it). Disabled, a scope costs one
 // cached flag test.
 
+#include "internal_export.h"
 #include <string>
 #include <string_view>
 
 namespace prism::load_profile {
 
-bool Enabled();
+PRISM_INTERNAL_API bool Enabled();
 // Seconds since the process started (Windows), or since the first call.
 double Now();
 double ProcessCpuSeconds();
 // "[load] t=<now> mark <name> <detail>"
-void Mark(std::string_view name, std::string_view detail = {});
+PRISM_INTERNAL_API void Mark(std::string_view name, std::string_view detail = {});
 
 // "[load] t=<end> span <name> start=<s> wall=<w> cpu=<c> par=<c/w> <detail>"
-class Scope {
+class PRISM_INTERNAL_API Scope {
 public:
     explicit Scope(std::string_view name);
     Scope(const Scope&) = delete;

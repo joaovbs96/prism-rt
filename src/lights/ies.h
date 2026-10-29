@@ -17,6 +17,7 @@
 // its vertical range they are zero (reached linearly over one grid step past
 // its last angle, when that is below 180 degrees).
 
+#include "../internal_export.h"
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -24,7 +25,7 @@
 
 namespace prism {
 
-struct IesProfile {
+struct PRISM_INTERNAL_API IesProfile {
     static constexpr int kIesRows = 181;        // 1 degree steps
     static constexpr int kIesColumns = 360;     // 1 degree steps, unless symmetric
     int width = 1;
@@ -40,13 +41,13 @@ struct IesProfile {
 };
 
 // Parses an LM-63 profile. Throws std::runtime_error on malformed files.
-IesProfile ParseIesProfile(std::string const& text, std::string const& source = {});
+PRISM_INTERNAL_API IesProfile ParseIesProfile(std::string const& text, std::string const& source = {});
 
 // Loads a profile; on failure prints one warning per file (per process) and
 // returns null, so the light renders without its profile.
-std::shared_ptr<const IesProfile> LoadIesProfile(std::filesystem::path const& path);
+PRISM_INTERNAL_API std::shared_ptr<const IesProfile> LoadIesProfile(std::filesystem::path const& path);
 
 // Warns once per authored path that a profile could not be resolved.
-void WarnUnresolvedIesProfile(std::string const& assetPath);
+PRISM_INTERNAL_API void WarnUnresolvedIesProfile(std::string const& assetPath);
 
 } // namespace prism

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "captured_material.h"
+#include "../internal_export.h"
 #include "hdmtlx_names.h"
 #include "resolved_resource.h"
 #include "udim_resource.h"
@@ -398,10 +399,8 @@ inline CompatibleBindResult BindCompatibleTemplate(
 
 class CompatibleTemplateRegistry {
 public:
-    static CompatibleTemplateRegistry& Shared() {
-        static auto* value = new CompatibleTemplateRegistry;
-        return *value;
-    }
+    // One per process, in the USD module (src/usd/usd_module_state.cpp).
+    PRISM_USD_INTERNAL_API static CompatibleTemplateRegistry& Shared();
     // materialIdentity (MaterialSettings::Identity): compiled code holds the
     // working space's colour transforms.
     bool find(mdl::Context* context, const std::string& libraries,
