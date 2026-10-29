@@ -320,6 +320,30 @@ void control(prism::Renderer const& renderer)
 
 // Sessions of one scene share its render lock: a progressive session yields
 // to another session's batch render and to commits, with other settings.
+// cancel() right after a commit: the commit stops the run for a restart, and
+// a cancel between that run and the next one must still end the session (it
+// was lost: the next run cleared the stop and rendered all its samples).
+void cancelAfterCommit(prism::Renderer const& renderer)
+{
+    TestScene test = build(renderer);
+    prism::Session session = renderer.createSession(test.scene, sessionOptions(test.camera, 1 << 20));
+    for (int i = 0; i < 300; ++i) {
+        session.start();
+        check(eventually([&] { return session.status().samples >= 1; }), "the session renders before the commits");
+        for (int k = 0; k < 3; ++k) {
+            test.scene.setTransform(test.quad, prism::Constant(translate(0.01 * (k + 1), 0, 0)));
+            test.scene.commit();
+        }
+        // Cancel at varying points of the restart the commits cause.
+        const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(50 * (i % 40));
+        while (std::chrono::steady_clock::now() < until) {}
+        session.cancel();
+        prism::SessionStatus status;
+        within(60, "wait after a cancel right after commits", [&] { status = session.wait(); });
+        check(status.state == prism::SessionState::Cancelled, "a cancel right after commits ends the session");
+    }
+}
+
 void sharedScene(prism::Renderer const& renderer)
 {
     TestScene test = build(renderer);
@@ -421,6 +445,8 @@ int main()
         control(renderer);
         note("shared scene");
         sharedScene(renderer);
+        note("cancel after a commit");
+        cancelAfterCommit(renderer);
         note("timing");
         timing(renderer);
     } catch (std::exception const& error) {

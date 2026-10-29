@@ -996,6 +996,19 @@ void Session::Impl::progressiveLoop()
             std::unique_lock lock(control);
             for (;;) {
                 if (quit) return;
+                // A cancel() that came between two runs (a run stopped for a
+                // restart or a new revision): the next run must not start, or
+                // it would clear the stop and render on.
+                if (cancelProgressive && active && state == SessionState::Running) {
+                    cancelProgressive = false;
+                    state = SessionState::Cancelled;
+                    active = false;
+                    restartRequested = false;
+                    lock.unlock();
+                    controlChanged.notify_all();
+                    lock.lock();
+                    continue;
+                }
                 const bool runnable = active && !pauseRequested && batchRenders == 0;
                 if (runnable && (restartRequested || state == SessionState::Running)) break;
                 // A converged render takes a new commit.
