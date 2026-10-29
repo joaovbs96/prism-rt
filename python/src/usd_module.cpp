@@ -12,6 +12,8 @@
 
 #include <prism/usd.h>
 
+#include <pxr/base/plug/plugin.h>
+#include <pxr/base/plug/registry.h>
 #include <pxr/pxr.h>
 #include <pxr/usd/sdf/layer.h>
 #include <pxr/usd/usd/primRange.h>
@@ -208,6 +210,14 @@ NB_MODULE(_prism_usd, m)
             return prism::usd::LoadCamera(CachedStage(stageId), pxr::SdfPath(camera), TimeOf(time));
         },
         "stage_id"_a, "camera"_a, "time"_a = nb::none());
+    m.def(
+        "default_dome_texture",
+        [] {
+            const pxr::PlugPluginPtr hdx = pxr::PlugRegistry::GetInstance().GetPluginWithName("hdx");
+            return hdx ? hdx->FindPluginResource("textures/StinsonBeach.hdr", true) : std::string();
+        },
+        "usdview's default dome texture (hdx's StinsonBeach.hdr), as the CLI uses it for "
+        "SceneOptions.default_dome_texture; empty when hdx is not found.");
     m.def("pxr_version", [] { return nb::make_tuple(PXR_MAJOR_VERSION, PXR_MINOR_VERSION, PXR_PATCH_VERSION); },
           "The USD version prism_usd was built with, as pxr.Usd.GetVersion() reports it.");
     m.def("loaded_modules", &LoadedModules, "name"_a,

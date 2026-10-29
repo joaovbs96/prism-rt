@@ -34,6 +34,7 @@ def test_same_usd_build_in_process():
         loaded = usd._native.loaded_modules("usd_usd.dll")
         assert len(loaded) == 1, loaded
     usd.check_pxr()
+    assert usd.default_dome_texture().endswith("StinsonBeach.hdr")
 
 
 def test_load_file_and_cameras(renderer, source_dir):

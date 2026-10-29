@@ -27,7 +27,7 @@ import sys
 from . import _dll  # noqa: F401 - DLL directories first
 from ._api import Scene
 
-__all__ = ["load", "load_cached", "load_camera", "check_pxr", "LoadResult"]
+__all__ = ["load", "load_cached", "load_camera", "default_dome_texture", "check_pxr", "LoadResult"]
 
 
 def _loaded_module(name: str) -> str | None:
@@ -86,6 +86,7 @@ check_pxr()  # before prism_usd.dll loads (it would reuse an already-loaded usd_
 from . import _prism_usd as _native  # noqa: E402
 
 LoadResult = _native.LoadResult
+default_dome_texture = _native.default_dome_texture
 
 
 def _time(time):
