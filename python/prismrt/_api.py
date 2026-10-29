@@ -721,7 +721,7 @@ class Scene:
         counts: dict[str, int] = {}
         for entry in self._entries.values():
             counts[entry.kind] = counts.get(entry.kind, 0) + 1
-        text = ", ".join(f"{kind}s={n}" for kind, n in counts.items())
+        text = ", ".join(f"{kind if kind.endswith('s') else kind + 's'}={n}" for kind, n in counts.items())
         return f"Scene(revision={self.revision}, {text or 'empty'}, pending_edits={self.pending_edits})"
 
 
