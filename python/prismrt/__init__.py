@@ -94,7 +94,7 @@ from ._prism import (  # noqa: E402
     SubdivisionDesc, SubdivisionScheme, TextureFiltering, TextureOptions, Window, aov_from_name, aov_name,
     default_cache_directory)
 from ._api import Renderer, Scene, SceneParameters, Session, buffer, devices, render  # noqa: E402
-from .transforms import Camera, identity, look_at, rotate, scale, translate  # noqa: E402
+from .transforms import Camera, identity, look_at, matrix_at, rotate, scale, translate  # noqa: E402
 from . import gltf, io, obj, scene_dict, transforms  # noqa: E402,F401
 
 

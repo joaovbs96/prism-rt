@@ -126,9 +126,14 @@ class _Entry:
         self.arrays = arrays or {}
 
 
+_KIND_SUFFIX = {"material": "mat", "mesh": "mesh", "instance": "inst", "spheres": "spheres", "light": "light",
+                "environment": "env", "camera": "cam"}
+
+
 class SceneParameters:
     """A traverse-like view of a scene's named objects: ``params["key.intensity"]``
-    reads a copy of a description field; setting it applies the matching
+    reads a copy of a description field (a ``transform`` or ``camera_to_world``
+    with one sample reads as a 4x4 array, as it is written); setting it applies the matching
     update (update_light, set_transform, ...) as a scene edit. ``update()``
     commits them (``scene.commit()``)."""
 
@@ -167,6 +172,8 @@ class SceneParameters:
         if field in entry.arrays:
             return np.array(entry.arrays[field], copy=True)
         value = getattr(entry.desc, field)
+        if field in ("transform", "camera_to_world") and len(value) == 1:
+            return np.array(value[0][1], copy=True)    # written as a 4x4, read as a 4x4
         return value.copy() if isinstance(value, np.ndarray) else value
 
     def __setitem__(self, key: str, value) -> None:
@@ -257,7 +264,12 @@ class Renderer:
         """A session rendering ``scene`` on ``device`` ("auto", "cpu", "vulkan",
         "metal"). ``camera``: a CameraId, a camera's name (USD cameras: their
         prim path) or a CameraDesc. ``settings``: a RenderSettings, and/or its
-        fields as keywords (``samples=64, seed=1``). ``denoise``: True or
+        fields as keywords (``samples=64, seed=1``). ``aovs``: AOVs to render,
+        as ``prismrt.Aov`` members or Hydra token strings ("color", "albedo",
+        "normal", "cameraDepth", "primId", ...), also the keys of
+        ``result.aovs``. Note "depth" is normalised device depth (about 1.0
+        everywhere), not a distance: use "cameraDepth" for the distance along
+        the view axis. ``denoise``: True or
         DenoiseSettings. Without ``allow_fallback`` a missing device raises
         UnsupportedError."""
         o = options if options is not None else _prism.SessionOptions()
@@ -333,15 +345,18 @@ class Scene:
                 n += 1
             self._counters[kind] = n + 1
             name = f"{kind}{n}"
-        elif name in self._entries:
-            raise InvalidArgumentError(f"name '{name}' is already used in this scene")
+        else:
+            self._check_name(name)
         entry = _Entry(name, kind, handle, desc, arrays)
         self._entries[name] = entry
         self._by_handle[(kind, handle.value)] = entry
 
     def _check_name(self, name) -> None:
         if name is not None and name in self._entries:
-            raise InvalidArgumentError(f"name '{name}' is already used in this scene")
+            kind = self._entries[name].kind
+            raise InvalidArgumentError(
+                f"name '{name}' is already used by a{'n' if kind[0] in 'aeiou' else ''} {kind} in this scene; "
+                f"names are unique across kinds (e.g. '{name}_{_KIND_SUFFIX.get(kind, kind)}')")
 
     def _handle(self, value, cls):
         if isinstance(value, cls):

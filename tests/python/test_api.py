@@ -273,3 +273,49 @@ def test_two_renderers(renderer):
         images.append(np.asarray(cpu_session(r, scene).render().aovs["color"]).copy())
     assert images[0].max() > 0 and images[1].max() > 0
     assert not np.array_equal(images[0], images[1])
+
+
+def test_camera_transform_helper(renderer):
+    scene = quad_scene(renderer)
+    cam = scene.camera("camera")
+    assert isinstance(cam.camera_to_world, list)            # the C++ form: (time, matrix) samples
+    m = prism.Camera.transform(cam)
+    assert m.shape == (4, 4) and np.allclose(m, prism.translate(0, 0, 4))
+    assert np.allclose(prism.matrix_at(cam.camera_to_world), m) and np.allclose(prism.matrix_at(m), m)
+    # params reads match how transforms are written (a 4x4)
+    assert np.allclose(scene.params["camera.camera_to_world"], prism.translate(0, 0, 4))
+    assert np.allclose(scene.params["quad_instance.transform"], np.eye(4))
+    # several samples: a time picks the nearest, none is an error
+    scene.update_camera("camera", camera_to_world=[(0.0, prism.translate(0, 0, 4)), (1.0, prism.translate(0, 0, 8))])
+    cam = scene.camera("camera")
+    assert np.allclose(prism.Camera.transform(cam, time=0.9), prism.translate(0, 0, 8))
+    assert np.allclose(prism.Camera.transform(cam, time=0.1), prism.translate(0, 0, 4))
+    with pytest.raises(ValueError, match="time samples"):
+        prism.Camera.transform(cam)
+    assert len(scene.params["camera.camera_to_world"]) == 2
+
+
+def test_camera_depth_aov_string(renderer):
+    scene = quad_scene(renderer)
+    scene.commit()
+    session = cpu_session(renderer, scene, aovs=["color", "cameraDepth", "depth"])
+    result = session.render()
+    assert {"cameraDepth", "depth"} <= set(result.aovs.keys())
+    assert result.has("cameraDepth") and result.has(prism.Aov.CameraDepth)
+    distance = np.asarray(result.aov("cameraDepth"))
+    assert distance.shape[-1] == 1 and distance[12, 16, 0] == pytest.approx(4.0, abs=1e-3)   # the quad at z = 0
+    assert prism.aov_from_name("cameraDepth") == prism.Aov.CameraDepth
+    assert "view axis" in (prism.Aov.__doc__ or "")
+
+
+def test_names_are_unique_across_kinds(renderer):
+    scene = quad_scene(renderer)
+    with pytest.raises(prism.InvalidArgumentError) as info:
+        scene.add_mesh(np.zeros((3, 3), np.float32), indices=np.array([0, 1, 2], np.int32), name="red")
+    message = str(info.value)
+    assert "'red' is already used by a material" in message and "unique across kinds" in message
+    assert "'red_mat'" in message
+    with pytest.raises(prism.InvalidArgumentError, match="already used by an instance"):
+        scene.add_material(diffuse=(1, 1, 1), name="quad_instance")
+    with pytest.raises(prism.InvalidArgumentError, match="already used by a camera"):
+        scene.add_light("point", name="camera")

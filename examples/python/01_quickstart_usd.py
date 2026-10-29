@@ -28,7 +28,7 @@ print(f"commit: {commit.meshes} meshes, {commit.materials} materials in {commit.
 
 camera = args.camera or next(iter(loaded.cameras))
 session = renderer.create_session(scene, device=args.device, width=args.width, height=args.height,
-                                  camera=camera, aovs=["color", "albedo", "normal", prism.Aov.CameraDepth, "primId"],
+                                  camera=camera, aovs=["color", "albedo", "normal", "cameraDepth", "primId"],
                                   samples=args.spp, seed=1)
 print(f"rendering on {session.device.name} {session.device_note}")
 result = session.render()
@@ -39,7 +39,7 @@ prism.io.write(f"{args.output}.png", result.aovs["color"])
 
 # The pixels are NumPy views (no copy): (height, width, channels), top row first.
 color = np.asarray(result.aovs["color"])
-distance = np.asarray(result.aov(prism.Aov.CameraDepth))[..., 0]   # along the view axis, scene units
+distance = np.asarray(result.aov("cameraDepth"))[..., 0]   # along the view axis, scene units
 hit = np.asarray(result.aovs["primId"])[..., 0] >= 0             # -1 where no geometry was hit
 print(f"{result.render_seconds:.2f} s, mean colour {color.reshape(-1, 3).mean(0)}, "
       f"{hit.mean():.0%} of pixels hit geometry, distance {distance[hit].min():.2f}..{distance[hit].max():.2f}")

@@ -158,6 +158,13 @@ result.write("cornell.exr", r._native)     # every AOV as EXR layers (prism_io)
 result.aovs["color"].write("cornell.png")  # the colour through the renderer's view
 ```
 
+AOVs are `prism.Aov` members or their Hydra tokens as strings, in `aovs=[...]`
+and as keys of `result.aovs` / arguments of `result.aov(...)`:
+`"color"`, `"albedo"`, `"normal"`, `"primId"`, `"instanceId"`, ...
+**`"depth"` (`Aov.Depth`) is normalised device depth, about 1.0 everywhere in
+typical scenes: it is not a distance.** The distance along the view axis, in
+scene units, is `"cameraDepth"` (`Aov.CameraDepth`).
+
 Images are `(height, width, channels)` arrays, top row first; ids
 (`primId`, `elementId`, `instanceId`) are `int32`, everything else
 `float32`. `np.asarray(image)` and `np.from_dlpack(image)` (or
@@ -189,7 +196,11 @@ scene.commit()
 ```
 
 - Every `add_*` returns a handle (`MeshId`, `InstanceId`, ...) and takes
-  `name=` (else `mesh0`, `light1`, ...; names are unique in a scene).
+  `name=` (else `mesh0`, `light1`, ...). **Names are unique across all
+  object kinds**: a material and an instance cannot both be `"floor"`, so
+  `params` keys (`<name>.<field>`) and name-or-handle arguments are never
+  ambiguous. A clash raises `InvalidArgumentError` naming the kind that
+  holds the name; use a suffix (`"floor_mat"`, `"floor_inst"`).
   Handles and names are interchangeable in the other calls;
   `scene["key"]` is the handle.
 - Keyword arguments are the C++ `*Desc` fields in snake_case
@@ -229,7 +240,14 @@ result = params.update()                  # scene.commit(): a CommitResult
 ```
 
 Keys are `<name>.<field>` for objects added through the Python API; reads
-return copies. `session.render()` raises `InvalidArgumentError` while the
+return copies. A `transform` or `camera_to_world` with one sample reads back
+as a 4x4 array, as it is written; with several it stays a list of
+`(time, matrix)` pairs.
+
+Description objects (`scene.camera(id)`, `desc.transform`) keep the C++
+form, a list of `(time, matrix)` samples even for a static value.
+`prism.Camera.transform(desc, time=None)` and `prism.matrix_at(samples,
+time=None)` return a NumPy 4x4: the only sample, or the one nearest `time`. `session.render()` raises `InvalidArgumentError` while the
 scene has uncommitted edits (the C++ session would render the last committed
 revision; `allow_uncommitted=True` does that); a progressive session takes a
 new commit at its next pass. Camera edits take effect without a commit.

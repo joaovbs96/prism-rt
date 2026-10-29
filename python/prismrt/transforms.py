@@ -13,7 +13,7 @@ import numpy as np
 
 from . import _prism
 
-__all__ = ["identity", "translate", "scale", "rotate", "look_at", "Camera"]
+__all__ = ["identity", "translate", "scale", "rotate", "look_at", "matrix_at", "Camera"]
 
 
 def _vec3(value, what: str) -> np.ndarray:
@@ -83,6 +83,25 @@ def look_at(eye, target, up=(0.0, 1.0, 0.0)) -> np.ndarray:
     return m
 
 
+def matrix_at(value, time: float | None = None) -> np.ndarray:
+    """A 4x4 NumPy matrix from what a description field reads back: a list of
+    (time, matrix) samples (``desc.transform``, ``desc.camera_to_world``), or a
+    matrix. ``time=None`` needs a single sample; with a time, the sample
+    nearest to it is used."""
+    if isinstance(value, list) and value and isinstance(value[0], tuple):
+        if time is None:
+            if len(value) != 1:
+                raise ValueError(f"the transform has {len(value)} time samples: pass time=")
+            sample = value[0]
+        else:
+            sample = min(value, key=lambda s: abs(s[0] - time))
+        value = sample[1]
+    m = np.array(value, dtype=np.float64)
+    if m.shape != (4, 4):
+        raise ValueError(f"expected a 4x4 matrix, got shape {m.shape}")
+    return m
+
+
 class Camera:
     """CameraDesc constructors (USD camera units: lens values in tenths of the scene unit)."""
 
@@ -105,3 +124,9 @@ class Camera:
     def from_matrix(camera_to_world, **fields) -> _prism.CameraDesc:
         """A camera with this camera-to-world transform (or (time, matrix) samples)."""
         return _prism.CameraDesc(camera_to_world=camera_to_world, **fields)
+
+    @staticmethod
+    def transform(desc: _prism.CameraDesc, time: float | None = None) -> np.ndarray:
+        """The camera-to-world matrix of a CameraDesc (``scene.camera(id)``) as
+        a 4x4 NumPy array: its only sample, or the sample nearest to ``time``."""
+        return matrix_at(desc.camera_to_world, time)

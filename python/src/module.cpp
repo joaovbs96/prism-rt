@@ -518,10 +518,15 @@ void BindModule(nb::module_& m)
         .value("Fast", DenoiseQuality::Fast)
         .value("Balanced", DenoiseQuality::Balanced)
         .value("High", DenoiseQuality::High);
-    nb::enum_<Aov>(m, "Aov")
+    nb::enum_<Aov>(m, "Aov",
+                   "A render output (AOV). Hydra tokens (\"color\", \"cameraDepth\", \"primId\", ...) are accepted "
+                   "wherever an Aov is. Depth is normalised device depth, about 1.0 everywhere in typical scenes: it "
+                   "is not a distance. For the distance along the view axis use CameraDepth (\"cameraDepth\").")
         .value("Color", Aov::Color)
-        .value("Depth", Aov::Depth)
-        .value("CameraDepth", Aov::CameraDepth)
+        .value("Depth", Aov::Depth,
+                "Normalised device depth (token \"depth\"), about 1.0 for typical scenes: not a distance; see CameraDepth.")
+        .value("CameraDepth", Aov::CameraDepth,
+                "Distance along the view axis, in scene units (token \"cameraDepth\").")
         .value("Normal", Aov::Normal)
         .value("Neye", Aov::Neye)
         .value("Peye", Aov::Peye)

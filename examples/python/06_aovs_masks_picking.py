@@ -23,12 +23,12 @@ scene.commit()
 
 session = renderer.create_session(scene, device="cpu", width=args.size, height=args.size,
                                   camera=args.camera or next(iter(loaded.cameras)), samples=args.spp, seed=1,
-                                  aovs=["color", "albedo", "normal", prism.Aov.CameraDepth, "primId", "instanceId"])
+                                  aovs=["color", "albedo", "normal", "cameraDepth", "primId", "instanceId"])
 result = session.render()
 
 color = np.asarray(result.aovs["color"])
 normal = np.asarray(result.aovs["normal"])
-depth = np.asarray(result.aov(prism.Aov.CameraDepth))[..., 0]   # distance along the view axis
+depth = np.asarray(result.aov("cameraDepth"))[..., 0]   # distance along the view axis
 prim_id = np.asarray(result.aovs["primId"])[..., 0]           # int32, -1 where nothing was hit
 
 # One mask per object: pixel coverage and average colour of each prim.

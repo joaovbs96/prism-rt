@@ -53,7 +53,7 @@ scene.add_camera(prism.Camera.look_at((0, 6, 8), (0, 0, 0), vertical_fov=40), na
 scene.commit()
 
 session = renderer.create_session(scene, device="cpu", width=args.size, height=args.size, camera="cam",
-                                  samples=args.spp, aovs=["color", "primId", "depth"])
+                                  samples=args.spp, aovs=["color", "primId", "cameraDepth"])
 params = scene.params
 
 for n in range(args.samples):
@@ -83,7 +83,7 @@ for n in range(args.samples):
     prism.io.write(out / f"{n:05d}.png", result.aovs["color"])
     mask = np.asarray(result.aovs["primId"])[..., 0]         # 0..N object ids, -1 for the background
     np.save(out / f"{n:05d}_mask.npy", np.where(mask > 0, mask, 0).astype(np.uint8))
-    np.save(out / f"{n:05d}_depth.npy", np.asarray(result.aovs["depth"])[..., 0])
+    np.save(out / f"{n:05d}_depth.npy", np.asarray(result.aovs["cameraDepth"])[..., 0])
     record["visible_ids"] = sorted(int(v) for v in np.unique(mask) if v > 0)
     (out / f"{n:05d}.json").write_text(json.dumps(record, indent=1))
     print(f"sample {n + 1}/{args.samples}: {len(record['visible_ids'])} objects in view, "

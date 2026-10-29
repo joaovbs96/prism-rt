@@ -32,6 +32,6 @@ python examples\python\12_material_preview.py assets\materials\standard_surface_
 Notes:
 - `import pxr` before `prismrt` and PySide6 when a script uses both (DLL load order).
 - AOVs are Hydra tokens (`"color"`, `"normal"`, `"primId"`, ...) or `prismrt.Aov` members;
-  `"depth"` is normalised device depth, `prismrt.Aov.CameraDepth` the distance along the view axis.
+  `"depth"` is normalised device depth (about 1.0 everywhere, not a distance); `"cameraDepth"` (`prismrt.Aov.CameraDepth`) is the distance along the view axis.
 - Images are `(height, width, channels)` read-only NumPy views without a copy; `.copy()` for a
   writable array.

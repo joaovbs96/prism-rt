@@ -2,6 +2,9 @@
 
 Phase reports, newest first. Detailed reports live in `local/reports/` (git-ignored).
 
+## 2026-10-29 - Python API rough edges
+- Documented `depth` (normalised device depth) vs `cameraDepth` (string form already worked; examples use it); `prismrt.matrix_at` / `Camera.transform` and 4x4 `params` reads for single-sample transforms; cross-kind name clashes say which kind holds the name. Design in `docs/DECISIONS.md`.
+
 ## 2026-10-29 - Material preview: grey stand
 - The shaderball's `core` and `base` rendered near white: the asset's default `OpenPBRSurface` variant leaves its `neutral` material without a `base_color` texture. `resources/material_preview.usda` now sublayers the unchanged asset and selects `standard_surface` (shipped beside `prism_usd`, installed, in the wheel); `reference_marble.exr` regenerated. Details in `docs/DECISIONS.md`. Report: `local/reports/preview_neutral_fix.md`.
 

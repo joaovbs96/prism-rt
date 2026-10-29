@@ -30,13 +30,13 @@ scene.commit()
 # camera-depth AOV gives the distance to whatever is under the centre pixel.
 start_id = next(iter(loaded.cameras))
 start = scene.camera(start_id)
-camera_to_world = np.asarray(start.camera_to_world[0][1], dtype=np.float64)   # (time, matrix) samples
+camera_to_world = prism.Camera.transform(start)                          # a 4x4 NumPy array
 eye = camera_to_world[3, :3]
 forward = -camera_to_world[2, :3] / np.linalg.norm(camera_to_world[2, :3])    # cameras look down -Z
 probe = renderer.create_session(scene, device="cpu", width=33, height=33, camera=start_id, samples=1,
-                                aovs=["color", prism.Aov.CameraDepth, "primId"]).render()
+                                aovs=["color", "cameraDepth", "primId"]).render()
 hit = np.asarray(probe.aovs["primId"])[16, 16, 0] >= 0
-distance = float(np.asarray(probe.aov(prism.Aov.CameraDepth))[16, 16, 0]) if hit else 10.0
+distance = float(np.asarray(probe.aov("cameraDepth"))[16, 16, 0]) if hit else 10.0
 target = eye + forward * (args.radius or distance)
 height = eye[1]
 
