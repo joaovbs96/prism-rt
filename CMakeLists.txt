@@ -655,6 +655,11 @@ if(PRISM_BUILD_HYDRA)
             COMMAND prism_hydra_scene_bridge_test progress-status)
         set_tests_properties(prism_hydra_progress_status PROPERTIES
             ENVIRONMENT "${_prism_test_environment}")
+        # The edit racing the spare-bank job (both orderings) alone, on the CPU.
+        add_test(NAME prism_hydra_spare_bank_edit
+            COMMAND prism_hydra_scene_bridge_test spare-bank-edit cpu)
+        set_tests_properties(prism_hydra_spare_bank_edit PROPERTIES
+            ENVIRONMENT "${_prism_test_environment}")
         foreach(_device cpu vulkan)
             add_test(NAME prism_hydra_adaptive_publication_${_device}
                 COMMAND prism_hydra_scene_bridge_test adaptive-publication ${_device})

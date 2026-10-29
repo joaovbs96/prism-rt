@@ -652,6 +652,495 @@ RayHit HitTransformedSphere(bool mirrored)
     return result;
 }
 
+// The spare-bank checks, cases A to H, on device. `only` names one case to
+// run alone; 0 runs them all.
+bool RunSpareBankChecks(HdRenderThread &thread,
+                        prism::hydra::SceneBridge *&activeBridge, char only,
+                        prism::device::DevicePreference device)
+{
+    bool ok = true;
+    auto runs = [only](char c) { return only == 0 || only == c; };
+    {
+        // A full rebuild publishes its snapshot first; the spare bank used by
+        // later local edits is built by a follow-up job and installed without
+        // touching the displayed frame.
+        constexpr unsigned resolution = 16;
+        const TfTokenVector geometryTags{HdRenderTagTokens->geometry};
+        prism::hydra::CameraState camera;
+        GfFrustum frustum;
+        frustum.SetPerspective(100.0, 1.0, 0.1, 100.0);
+        camera.projection = frustum.ComputeProjectionMatrix();
+        camera.worldToView.SetTranslate(GfVec3d(0, 0, -3));
+        camera.nearClip = 0.1f;
+        camera.farClip = 100.0f;
+        prism::hydra::RenderSettings settings;
+        settings.samples = 1;
+        settings.maxDepth = 2;
+        settings.refinementDelayMs = 0;
+        settings.device = device;
+        PrismRenderBuffer colorBuffer(SdfPath("/SpareColor"), &thread);
+        PrismRenderBuffer primBuffer(SdfPath("/SparePrims"), &thread);
+        colorBuffer.Allocate(GfVec3i(resolution, resolution, 1),
+                             HdFormatFloat32Vec4, false);
+        primBuffer.Allocate(GfVec3i(resolution, resolution, 1),
+                            HdFormatInt32, false);
+        HdRenderPassAovBindingVector aovs(2);
+        aovs[0].aovName = HdAovTokens->color;
+        aovs[0].renderBuffer = &colorBuffer;
+        aovs[0].clearValue = VtValue(GfVec4f(0.0f));
+        aovs[1].aovName = HdAovTokens->primId;
+        aovs[1].renderBuffer = &primBuffer;
+        aovs[1].clearValue = VtValue(-1);
+        // Drives Prepare by hand until the displayed generation catches up,
+        // stopping at publication rather than waiting for the spare bank.
+        auto prepareUntilDisplayed = [&](prism::hydra::SceneBridge &bridge,
+                                         HdRenderPassAovBindingVector const &bindings) {
+            bridge.Prepare(camera, bindings, geometryTags, resolution, resolution);
+            const int64_t target = Stat(bridge.GetStats(), "preparationGeneration");
+            auto const deadline = std::chrono::steady_clock::now() +
+                std::chrono::seconds(60);
+            while (Stat(bridge.GetStats(), "displayedGeneration") < target &&
+                   std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                bridge.Prepare(camera, bindings, geometryTags, resolution,
+                               resolution);
+            }
+            return Stat(bridge.GetStats(), "displayedGeneration") >= target;
+        };
+        // Spare-only Prepare calls report no change, so PumpPrepare's return
+        // value is not meaningful for them; wait for preparation to settle.
+        auto settle = [&](prism::hydra::SceneBridge &bridge,
+                          HdRenderPassAovBindingVector const &bindings) {
+            auto const deadline = std::chrono::steady_clock::now() +
+                std::chrono::seconds(60);
+            while (BoolStat(bridge.GetStats(), "preparationPending") &&
+                   std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                bridge.Prepare(camera, bindings, geometryTags, resolution,
+                               resolution);
+            }
+            return !BoolStat(bridge.GetStats(), "preparationPending");
+        };
+        auto renderFrame = [&](prism::hydra::SceneBridge &bridge) {
+            activeBridge = &bridge;
+            thread.StartRender();
+            const bool done = WaitFor([&] {
+                return bridge.IsConverged() &&
+                    Stat(bridge.GetStats(), "completedSamples") > 0;
+            });
+            thread.StopRender();
+            return done;
+        };
+        auto gridPixels = [&](prism::hydra::SceneBridge &bridge,
+                              size_t *hitPixels) {
+            size_t count = 0;
+            *hitPixels = 0;
+            for (int const id : ReadBuffer<int>(&primBuffer)) {
+                if (id < 0) continue;
+                ++*hitPixels;
+                count += bridge.GetPrimPath(id).GetParentPath() ==
+                    SdfPath("/Grid");
+            }
+            return count;
+        };
+
+        // A: the initial load leaves a displayed snapshot and an installed
+        // spare, and the spare reused every conversion.
+        if (runs('A')) {
+            HdRetainedSceneIndexRefPtr scene = HdRetainedSceneIndex::New();
+            AddConversionScene(scene);
+            prism::hydra::SceneBridge bridge(scene, &thread);
+            bridge.SetSettings(settings);
+            ok &= Check(PumpPrepare(bridge, camera, {}, geometryTags,
+                                    resolution, resolution),
+                        "spare scene initial prepare did not publish");
+            VtDictionary const stats = bridge.GetStats();
+            ok &= Check(Stat(stats, "snapshotBuilds") == 1 &&
+                            Stat(stats, "spareSnapshotsInstalled") == 1 &&
+                            Stat(stats, "spareSnapshotsDiscarded") == 0 &&
+                            Stat(stats, "retainedSnapshotCount") == 2,
+                        "initial load did not install exactly one spare bank");
+            ok &= Check(Stat(stats, "sparePrototypeConversionCacheHits") == 69 &&
+                            Stat(stats, "sparePrototypeConversions") == 0 &&
+                            Stat(stats, "prototypeBuildCount") == 67,
+                        "spare bank converted or rebuilt mesh prototypes");
+            ok &= Check(DoubleStat(stats, "firstPublishSeconds") > 0.0 &&
+                            DoubleStat(stats, "spareSnapshotSeconds") >= 0.0,
+                        "first publication or spare timing was not recorded");
+        }
+
+        // B: the snapshot is displayed while the spare job is still pending,
+        // because only a later Prepare call can install it.
+        if (runs('B')) {
+            HdRetainedSceneIndexRefPtr scene = HdRetainedSceneIndex::New();
+            AddConversionScene(scene);
+            prism::hydra::SceneBridge bridge(scene, &thread);
+            bridge.SetSettings(settings);
+            ok &= Check(prepareUntilDisplayed(bridge, {}),
+                        "manual preparation did not publish");
+            VtDictionary const published = bridge.GetStats();
+            ok &= Check(BoolStat(published, "preparationPending") &&
+                            Stat(published, "spareSnapshotsInstalled") == 0 &&
+                            Stat(published, "retainedSnapshotCount") == 1 &&
+                            Stat(published, "snapshotBuilds") == 1,
+                        "publication waited for the spare bank");
+            ok &= Check(settle(bridge, {}), "spare bank did not settle");
+            VtDictionary const settled = bridge.GetStats();
+            ok &= Check(Stat(settled, "spareSnapshotsInstalled") == 1 &&
+                            Stat(settled, "retainedSnapshotCount") == 2 &&
+                            Stat(settled, "snapshotBuilds") == 1 &&
+                            Stat(settled, "discardedSnapshotBuilds") == 0 &&
+                            Stat(settled, "prototypeBuildCount") == 67,
+                        "installing the spare bank counted as a snapshot build");
+        }
+
+        // C: a transform edit right after publication, while the spare job
+        // may still run; the edit is displayed and a following edit reuses a
+        // bank. The cancel races the small spare job, so either ordering is
+        // legal:
+        // - the cancel lands first: the spare is discarded, the edit takes
+        //   the missing-bank path (a full build) and installs its own spare;
+        // - the spare finishes first: it is installed although the edit came
+        //   after it (it matches the displayed generation), and the edit is
+        //   replayed on it.
+        // The second pass waits for the spare to finish, forcing the second
+        // ordering; case H forces the first one on a larger scene.
+        if (runs('C'))
+        for (bool const spareFinished : {false, true}) {
+            HdRetainedSceneIndexRefPtr scene = HdRetainedSceneIndex::New();
+            AddConversionScene(scene);
+            prism::hydra::SceneBridge bridge(scene, &thread);
+            bridge.SetSettings(settings);
+            ok &= Check(prepareUntilDisplayed(bridge, aovs) &&
+                            BoolStat(bridge.GetStats(), "preparationPending"),
+                        "spare job was not pending after publication");
+            if (spareFinished)
+                ok &= Check(WaitFor([&] {
+                    return BoolStat(bridge.GetStats(), "spareSnapshotReady");
+                }), "spare job did not finish before the forced edit");
+            scene->AddPrims({{SdfPath("/Grid"), TfToken("xform"),
+                              FixtureXformData(GfVec3d(100.0, 0.0, 0.0))}});
+            bridge.MarkSceneDirty(prism::hydra::SceneDirtyKind::Placement,
+                                  SdfPath("/Grid"));
+            ok &= Check(PumpPrepare(bridge, camera, aovs, geometryTags,
+                                    resolution, resolution),
+                        "transform edit during the spare job did not prepare");
+            VtDictionary const moved = bridge.GetStats();
+            const int64_t installed = Stat(moved, "spareSnapshotsInstalled");
+            const int64_t discarded = Stat(moved, "spareSnapshotsDiscarded");
+            const int64_t builds = Stat(moved, "snapshotBuilds");
+            const int64_t reused = Stat(moved, "reusedSnapshotBuilds");
+            const bool interrupted = installed == 1 && discarded == 1 &&
+                builds == 2 && reused == 0;
+            const bool finishedFirst = installed == 1 && discarded == 0 &&
+                builds == 1 && reused == 1;
+            ok &= Check((spareFinished ? finishedFirst
+                                       : interrupted || finishedFirst) &&
+                            Stat(moved, "retainedSnapshotCount") == 2 &&
+                            Stat(moved, "primCount") == 69 &&
+                            Stat(moved, "triangleCount") == 64 * 3 + 3 + 2 + 3,
+                        "spare job interrupted by an edit was not accounted for");
+            size_t hits = 0;
+            ok &= Check(renderFrame(bridge), "moved grid frame did not converge");
+            ok &= Check(gridPixels(bridge, &hits) == 0 && hits > 0,
+                        "transform edit during the spare job was not displayed");
+            const int64_t reusedBefore = Stat(moved, "reusedSnapshotBuilds");
+            scene->AddPrims({{SdfPath("/Grid"), TfToken("xform"),
+                              FixtureXformData(GfVec3d(0.0, 0.0, 0.5))}});
+            bridge.MarkSceneDirty(prism::hydra::SceneDirtyKind::Placement,
+                                  SdfPath("/Grid"));
+            ok &= Check(PumpPrepare(bridge, camera, aovs, geometryTags,
+                                    resolution, resolution),
+                        "second transform edit did not prepare");
+            VtDictionary const returned = bridge.GetStats();
+            ok &= Check(Stat(returned, "reusedSnapshotBuilds") ==
+                            reusedBefore + 1 &&
+                            Stat(returned, "snapshotBuilds") ==
+                                Stat(moved, "snapshotBuilds") &&
+                            Stat(returned, "primCount") == 69,
+                        "second edit did not reuse the installed spare bank");
+            ok &= Check(renderFrame(bridge), "returned grid frame did not converge");
+            std::vector<int> const prims = ReadBuffer<int>(&primBuffer);
+            // The center ray grazes the edge of /Subset's apex face, where
+            // Embree and hardware ray tracing break the tie differently; two
+            // pixels to the left only the moved grid is in view.
+            const size_t center = (resolution / 2) * resolution + resolution / 2 - 2;
+            ok &= Check(prims.size() == resolution * resolution &&
+                            prims[center] >= 0 &&
+                            bridge.GetPrimPath(prims[center]).GetParentPath() ==
+                                SdfPath("/Grid"),
+                        "second transform edit was not displayed");
+            activeBridge = nullptr;
+        }
+
+        // D: the spare bank binds the same materials, including geom-subset
+        // materials and a displayColor fallback, as the displayed snapshot.
+        if (runs('D')) {
+            HdRetainedSceneIndexRefPtr scene = HdRetainedSceneIndex::New();
+            scene->AddPrims({
+                {SdfPath("/Looks"), TfToken("xform"),
+                 FixtureXformData(GfVec3d(0.0))},
+                {SdfPath("/Looks/Red"), HdPrimTypeTokens->material,
+                 PreviewMaterialData(SdfPath("/Looks/Red"),
+                                     GfVec3f(0.8f, 0.1f, 0.1f))},
+                {SdfPath("/Looks/Blue"), HdPrimTypeTokens->material,
+                 PreviewMaterialData(SdfPath("/Looks/Blue"),
+                                     GfVec3f(0.1f, 0.1f, 0.8f))},
+                {SdfPath("/Left"), TfToken("xform"),
+                 FixtureXformData(GfVec3d(-1.1, 0.0, 0.0))},
+                {SdfPath("/Left/Mesh"), HdPrimTypeTokens->mesh,
+                 FixtureMeshData(false)},
+                {SdfPath("/Left/Mesh/Quad"), HdPrimTypeTokens->geomSubset,
+                 FaceSubsetData(VtIntArray{0}, SdfPath("/Looks/Red"))},
+                {SdfPath("/Left/Mesh/Apex"), HdPrimTypeTokens->geomSubset,
+                 FaceSubsetData(VtIntArray{1}, SdfPath("/Looks/Blue"))},
+                {SdfPath("/Right"), TfToken("xform"),
+                 FixtureXformData(GfVec3d(1.1, 0.0, 0.0))},
+                {SdfPath("/Right/Mesh"), HdPrimTypeTokens->mesh,
+                 FixtureMeshData(false, HdRenderTagTokens->geometry,
+                                 GfVec3f(0.2f, 0.9f, 0.3f), 0.1f)},
+                {SdfPath("/Dome"), HdPrimTypeTokens->domeLight, DomeData()}});
+            prism::hydra::SceneBridge bridge(scene, &thread);
+            bridge.SetSettings(settings);
+            ok &= Check(PumpPrepare(bridge, camera, aovs, geometryTags,
+                                    resolution, resolution),
+                        "material parity scene did not prepare");
+            VtDictionary const before = bridge.GetStats();
+            ok &= Check(Stat(before, "spareSnapshotsInstalled") == 1 &&
+                            Stat(before, "materialFailures") <= 0,
+                        "material parity scene did not install a spare bank");
+            ok &= Check(renderFrame(bridge), "material parity frame did not converge");
+            std::vector<float> const colorsBefore = ReadBuffer<float>(&colorBuffer);
+            std::vector<int> const primsBefore = ReadBuffer<int>(&primBuffer);
+            std::vector<SdfPath> pathsBefore;
+            for (int64_t id = 0; id < Stat(before, "primCount"); ++id)
+                pathsBefore.push_back(bridge.GetPrimPath(static_cast<int>(id)));
+            // The Apex subset is edge-on to this camera; the red Quad subset
+            // and the green displayColor mesh are both in view.
+            bool red = false, green = false;
+            for (size_t pixel = 0; pixel < primsBefore.size(); ++pixel) {
+                if (primsBefore[pixel] < 0) continue;
+                float const r = colorsBefore[pixel * 4];
+                float const g = colorsBefore[pixel * 4 + 1];
+                float const b = colorsBefore[pixel * 4 + 2];
+                SdfPath const path = bridge.GetPrimPath(primsBefore[pixel]);
+                if (path == SdfPath("/Left/Mesh")) {
+                    red |= r > 2.0f * b && r > 2.0f * g;
+                } else if (path == SdfPath("/Right/Mesh")) {
+                    green |= g > 2.0f * r && g > 2.0f * b;
+                }
+            }
+            ok &= Check(red && green,
+                        "subset materials or displayColor were not rendered");
+
+            // Re-authoring an unchanged transform publishes the spare bank and
+            // retires the snapshot that was displayed.
+            scene->AddPrims({{SdfPath("/Right"), TfToken("xform"),
+                              FixtureXformData(GfVec3d(1.1, 0.0, 0.0))}});
+            bridge.MarkSceneDirty(prism::hydra::SceneDirtyKind::Placement,
+                                  SdfPath("/Right"));
+            ok &= Check(PumpPrepare(bridge, camera, aovs, geometryTags,
+                                    resolution, resolution),
+                        "bank swap did not prepare");
+            VtDictionary const after = bridge.GetStats();
+            ok &= Check(Stat(after, "reusedSnapshotBuilds") ==
+                            Stat(before, "reusedSnapshotBuilds") + 1 &&
+                            Stat(after, "snapshotBuilds") ==
+                                Stat(before, "snapshotBuilds") &&
+                            Stat(after, "primCount") == Stat(before, "primCount"),
+                        "unchanged transform edit did not swap to the spare bank");
+            ok &= Check(renderFrame(bridge), "swapped bank frame did not converge");
+            std::vector<SdfPath> pathsAfter;
+            for (int64_t id = 0; id < Stat(after, "primCount"); ++id)
+                pathsAfter.push_back(bridge.GetPrimPath(static_cast<int>(id)));
+            ok &= Check(pathsAfter == pathsBefore &&
+                            ReadBuffer<int>(&primBuffer) == primsBefore,
+                        "spare bank changed picking");
+            ok &= Check(ReadBuffer<float>(&colorBuffer) == colorsBefore,
+                        "spare bank changed material assignments");
+
+            // Rebinding a face subset must refresh its parent mesh's face
+            // material table. Marking only the subset path reproduces the
+            // pre-fix bug: _RefreshMaterials recognizes material-user and
+            // prototype paths, but the subset path is neither.
+            const SdfPath quadSubset("/Left/Mesh/Quad");
+            scene->AddPrims({{quadSubset, HdPrimTypeTokens->geomSubset,
+                              FaceSubsetData(VtIntArray{0},
+                                             SdfPath("/Looks/Blue"))}});
+            bridge.MarkSceneDirtyBatch({{
+                prism::hydra::SceneDirtyKind::Material,
+                {quadSubset, SdfPath("/Left/Mesh")},
+                "geomSubset/materialBindings edit"}});
+            ok &= Check(prepareUntilDisplayed(bridge, aovs) &&
+                            settle(bridge, aovs) &&
+                            renderFrame(bridge),
+                        "subset material rebind did not prepare");
+            const std::vector<float> colorsAfterSubsetRebind =
+                ReadBuffer<float>(&colorBuffer);
+            const std::vector<int> primsAfterSubsetRebind =
+                ReadBuffer<int>(&primBuffer);
+            bool leftRedAfterRebind = false;
+            bool leftBlueAfterRebind = false;
+            for (size_t pixel = 0; pixel < primsAfterSubsetRebind.size(); ++pixel) {
+                if (primsAfterSubsetRebind[pixel] < 0 ||
+                    bridge.GetPrimPath(primsAfterSubsetRebind[pixel]) !=
+                        SdfPath("/Left/Mesh")) continue;
+                const float r = colorsAfterSubsetRebind[pixel * 4];
+                const float g = colorsAfterSubsetRebind[pixel * 4 + 1];
+                const float b = colorsAfterSubsetRebind[pixel * 4 + 2];
+                leftRedAfterRebind |= r > 2.0f * b && r > 2.0f * g;
+                leftBlueAfterRebind |= b > 2.0f * r && b > 2.0f * g;
+            }
+            ok &= Check(leftBlueAfterRebind && !leftRedAfterRebind,
+                        "geomSubset material rebind left stale face materials");
+            activeBridge = nullptr;
+        }
+
+        // F: a spare that finished while nobody called Prepare is installed
+        // by the Prepare that follows an edit, so the edit stays incremental.
+        if (runs('F')) {
+            HdRetainedSceneIndexRefPtr scene = HdRetainedSceneIndex::New();
+            AddConversionScene(scene);
+            prism::hydra::SceneBridge bridge(scene, &thread);
+            bridge.SetSettings(settings);
+            ok &= Check(prepareUntilDisplayed(bridge, aovs),
+                        "idle-host scene did not publish");
+            ok &= Check(WaitFor([&] {
+                return BoolStat(bridge.GetStats(), "spareSnapshotReady");
+            }), "spare job did not finish without Prepare calls");
+            VtDictionary const ready = bridge.GetStats();
+            ok &= Check(BoolStat(ready, "preparationPending") &&
+                            Stat(ready, "spareSnapshotsInstalled") == 0,
+                        "reading spareSnapshotReady consumed the spare job");
+            scene->AddPrims({{SdfPath("/Grid"), TfToken("xform"),
+                              FixtureXformData(GfVec3d(0.0, 0.0, 0.5))}});
+            bridge.MarkSceneDirty(prism::hydra::SceneDirtyKind::Placement,
+                                  SdfPath("/Grid"));
+            ok &= Check(PumpPrepare(bridge, camera, aovs, geometryTags,
+                                    resolution, resolution),
+                        "edit after an unconsumed spare did not prepare");
+            VtDictionary const edited = bridge.GetStats();
+            ok &= Check(Stat(edited, "spareSnapshotsInstalled") ==
+                            Stat(ready, "spareSnapshotsInstalled") + 1 &&
+                            Stat(edited, "spareSnapshotsDiscarded") ==
+                                Stat(ready, "spareSnapshotsDiscarded") &&
+                            Stat(edited, "snapshotBuilds") ==
+                                Stat(ready, "snapshotBuilds") &&
+                            Stat(edited, "reusedSnapshotBuilds") ==
+                                Stat(ready, "reusedSnapshotBuilds") + 1 &&
+                            Stat(edited, "primCount") == 69,
+                        "finished spare was discarded instead of taking the edit");
+            ok &= Check(renderFrame(bridge), "idle-host edit frame did not converge");
+            std::vector<int> const prims = ReadBuffer<int>(&primBuffer);
+            // The center ray grazes the edge of /Subset's apex face, where
+            // Embree and hardware ray tracing break the tie differently; two
+            // pixels to the left only the moved grid is in view.
+            const size_t center = (resolution / 2) * resolution + resolution / 2 - 2;
+            ok &= Check(prims.size() == resolution * resolution &&
+                            prims[center] >= 0 &&
+                            bridge.GetPrimPath(prims[center]).GetParentPath() ==
+                                SdfPath("/Grid"),
+                        "edit applied to the installed spare was not displayed");
+            activeBridge = nullptr;
+        }
+
+        // G: a structural edit after an unconsumed spare still installs it,
+        // then rebuilds because structure cannot be replayed on a bank.
+        if (runs('G')) {
+            HdRetainedSceneIndexRefPtr scene = HdRetainedSceneIndex::New();
+            AddConversionScene(scene);
+            prism::hydra::SceneBridge bridge(scene, &thread);
+            bridge.SetSettings(settings);
+            ok &= Check(prepareUntilDisplayed(bridge, {}),
+                        "structural idle-host scene did not publish");
+            ok &= Check(WaitFor([&] {
+                return BoolStat(bridge.GetStats(), "spareSnapshotReady");
+            }), "structural idle-host spare did not finish");
+            VtDictionary const ready = bridge.GetStats();
+            scene->AddPrims({{SdfPath("/Extra"), HdPrimTypeTokens->mesh,
+                              FixtureMeshData(false, HdRenderTagTokens->geometry,
+                                              GfVec3f(0.7f), 0.95f)}});
+            bridge.MarkSceneDirty(prism::hydra::SceneDirtyKind::Structure,
+                                  SdfPath("/Extra"));
+            ok &= Check(PumpPrepare(bridge, camera, {}, geometryTags,
+                                    resolution, resolution),
+                        "structural edit after an unconsumed spare did not prepare");
+            VtDictionary const edited = bridge.GetStats();
+            ok &= Check(Stat(edited, "primCount") == 70 &&
+                            Stat(edited, "prototypeCount") == 68 &&
+                            Stat(edited, "triangleCount") == 64 * 3 + 3 + 2 + 3 + 3 &&
+                            Stat(edited, "instanceCount") == 2,
+                        "structural edit after an unconsumed spare lost scene contents");
+            ok &= Check(Stat(edited, "snapshotBuilds") ==
+                            Stat(ready, "snapshotBuilds") + 1 &&
+                            Stat(edited, "reusedSnapshotBuilds") ==
+                                Stat(ready, "reusedSnapshotBuilds") &&
+                            Stat(edited, "spareSnapshotsInstalled") ==
+                                Stat(ready, "spareSnapshotsInstalled") + 2 &&
+                            Stat(edited, "spareSnapshotsDiscarded") ==
+                                Stat(ready, "spareSnapshotsDiscarded") &&
+                            Stat(edited, "retainedSnapshotCount") == 2,
+                        "structural edit did not rebuild with a fresh spare bank");
+        }
+
+        // H: an edit while the spare job is still running cancels it before
+        // it completes; that spare is discarded and the edit is displayed.
+        // Enough meshes keep the spare job running well past the edit.
+        if (runs('H')) {
+            constexpr int meshCount = 10000;
+            HdRetainedSceneIndexRefPtr scene = HdRetainedSceneIndex::New();
+            HdRetainedSceneIndex::AddedPrimEntries prims;
+            prims.reserve(meshCount + 1);
+            prims.push_back({SdfPath("/Grid"), TfToken("xform"),
+                             FixtureXformData(GfVec3d(0.0))});
+            for (int i = 0; i < meshCount; ++i)
+                prims.push_back({SdfPath("/Grid/M" + std::to_string(i)),
+                    HdPrimTypeTokens->mesh,
+                    FixtureMeshData(false, HdRenderTagTokens->geometry,
+                                    GfVec3f(0.7f),
+                                    0.00005f * static_cast<float>(i + 1))});
+            scene->AddPrims(prims);
+            prism::hydra::SceneBridge bridge(scene, &thread);
+            bridge.SetSettings(settings);
+            ok &= Check(prepareUntilDisplayed(bridge, aovs),
+                        "large spare scene did not publish");
+            ok &= Check(!BoolStat(bridge.GetStats(), "spareSnapshotReady"),
+                        "spare job finished before the edit could interrupt it");
+            scene->AddPrims({{SdfPath("/Grid"), TfToken("xform"),
+                              FixtureXformData(GfVec3d(100.0, 0.0, 0.0))}});
+            bridge.MarkSceneDirty(prism::hydra::SceneDirtyKind::Placement,
+                                  SdfPath("/Grid"));
+            ok &= Check(PumpPrepare(bridge, camera, aovs, geometryTags,
+                                    resolution, resolution),
+                        "edit during a running spare job did not prepare");
+            VtDictionary const edited = bridge.GetStats();
+            ok &= Check(Stat(edited, "spareSnapshotsDiscarded") == 1 &&
+                            Stat(edited, "spareSnapshotsInstalled") == 1 &&
+                            Stat(edited, "primCount") == meshCount &&
+                            Stat(edited, "retainedSnapshotCount") == 2,
+                        "interrupted spare job was not discarded");
+            size_t hits = 0;
+            ok &= Check(renderFrame(bridge), "large moved frame did not converge");
+            ok &= Check(gridPixels(bridge, &hits) == 0,
+                        "edit during a running spare job was not displayed");
+            activeBridge = nullptr;
+        }
+
+        // E: tearing a bridge down while its spare job is pending must cancel
+        // and join it like any other build.
+        if (runs('E'))
+        for (int repetition = 0; repetition < 5; ++repetition) {
+            HdRetainedSceneIndexRefPtr scene = HdRetainedSceneIndex::New();
+            AddConversionScene(scene);
+            prism::hydra::SceneBridge bridge(scene, &thread);
+            ok &= Check(prepareUntilDisplayed(bridge, {}) &&
+                            BoolStat(bridge.GetStats(), "preparationPending"),
+                        "spare job was not pending before teardown");
+        }
+    }
+    return ok;
+}
+
 } // namespace
 
 int main(int argc, char **argv)
@@ -677,6 +1166,21 @@ int main(int argc, char **argv)
     // `progress-status` runs only the progress statistics check.
     if (argc == 2 && std::string(argv[1]) == "progress-status")
         return RunProgressStatusTests();
+    // `spare-bank-edit auto|cpu|vulkan|metal` runs only the edit-during-spare-job
+    // check (case C) on that device.
+    prism::device::DevicePreference spareDevice{};
+    if (argc == 3 && std::string(argv[1]) == "spare-bank-edit" &&
+        prism::device::ParseDevicePreference(argv[2], &spareDevice)) {
+        HdRenderThread thread;
+        prism::hydra::SceneBridge *activeBridge = nullptr;
+        thread.SetRenderCallback([&] {
+            if (activeBridge) activeBridge->Render();
+        });
+        thread.StartThread();
+        const bool ok = RunSpareBankChecks(thread, activeBridge, 'C', spareDevice);
+        thread.StopThread();
+        return ok ? 0 : 1;
+    }
     if (RunAuthoredSettingsTests() != 0) return 1;
     if (RunB2DoublePrimvarIntegrationTests() != 0) return 1;
     if (RunB3FallbackOpacityIntegrationTests() != 0) return 1;
@@ -1823,460 +2327,8 @@ int main(int argc, char **argv)
                     "conversion cache changed incremental snapshot geometry");
         activeBridge = nullptr;
     }
-    {
-        // A full rebuild publishes its snapshot first; the spare bank used by
-        // later local edits is built by a follow-up job and installed without
-        // touching the displayed frame.
-        constexpr unsigned resolution = 16;
-        const TfTokenVector geometryTags{HdRenderTagTokens->geometry};
-        prism::hydra::CameraState camera;
-        GfFrustum frustum;
-        frustum.SetPerspective(100.0, 1.0, 0.1, 100.0);
-        camera.projection = frustum.ComputeProjectionMatrix();
-        camera.worldToView.SetTranslate(GfVec3d(0, 0, -3));
-        camera.nearClip = 0.1f;
-        camera.farClip = 100.0f;
-        prism::hydra::RenderSettings settings;
-        settings.samples = 1;
-        settings.maxDepth = 2;
-        settings.refinementDelayMs = 0;
-        PrismRenderBuffer colorBuffer(SdfPath("/SpareColor"), &thread);
-        PrismRenderBuffer primBuffer(SdfPath("/SparePrims"), &thread);
-        colorBuffer.Allocate(GfVec3i(resolution, resolution, 1),
-                             HdFormatFloat32Vec4, false);
-        primBuffer.Allocate(GfVec3i(resolution, resolution, 1),
-                            HdFormatInt32, false);
-        HdRenderPassAovBindingVector aovs(2);
-        aovs[0].aovName = HdAovTokens->color;
-        aovs[0].renderBuffer = &colorBuffer;
-        aovs[0].clearValue = VtValue(GfVec4f(0.0f));
-        aovs[1].aovName = HdAovTokens->primId;
-        aovs[1].renderBuffer = &primBuffer;
-        aovs[1].clearValue = VtValue(-1);
-        // Drives Prepare by hand until the displayed generation catches up,
-        // stopping at publication rather than waiting for the spare bank.
-        auto prepareUntilDisplayed = [&](prism::hydra::SceneBridge &bridge,
-                                         HdRenderPassAovBindingVector const &bindings) {
-            bridge.Prepare(camera, bindings, geometryTags, resolution, resolution);
-            const int64_t target = Stat(bridge.GetStats(), "preparationGeneration");
-            auto const deadline = std::chrono::steady_clock::now() +
-                std::chrono::seconds(60);
-            while (Stat(bridge.GetStats(), "displayedGeneration") < target &&
-                   std::chrono::steady_clock::now() < deadline) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                bridge.Prepare(camera, bindings, geometryTags, resolution,
-                               resolution);
-            }
-            return Stat(bridge.GetStats(), "displayedGeneration") >= target;
-        };
-        // Spare-only Prepare calls report no change, so PumpPrepare's return
-        // value is not meaningful for them; wait for preparation to settle.
-        auto settle = [&](prism::hydra::SceneBridge &bridge,
-                          HdRenderPassAovBindingVector const &bindings) {
-            auto const deadline = std::chrono::steady_clock::now() +
-                std::chrono::seconds(60);
-            while (BoolStat(bridge.GetStats(), "preparationPending") &&
-                   std::chrono::steady_clock::now() < deadline) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                bridge.Prepare(camera, bindings, geometryTags, resolution,
-                               resolution);
-            }
-            return !BoolStat(bridge.GetStats(), "preparationPending");
-        };
-        auto renderFrame = [&](prism::hydra::SceneBridge &bridge) {
-            activeBridge = &bridge;
-            thread.StartRender();
-            const bool done = WaitFor([&] {
-                return bridge.IsConverged() &&
-                    Stat(bridge.GetStats(), "completedSamples") > 0;
-            });
-            thread.StopRender();
-            return done;
-        };
-        auto gridPixels = [&](prism::hydra::SceneBridge &bridge,
-                              size_t *hitPixels) {
-            size_t count = 0;
-            *hitPixels = 0;
-            for (int const id : ReadBuffer<int>(&primBuffer)) {
-                if (id < 0) continue;
-                ++*hitPixels;
-                count += bridge.GetPrimPath(id).GetParentPath() ==
-                    SdfPath("/Grid");
-            }
-            return count;
-        };
-
-        // A: the initial load leaves a displayed snapshot and an installed
-        // spare, and the spare reused every conversion.
-        {
-            HdRetainedSceneIndexRefPtr scene = HdRetainedSceneIndex::New();
-            AddConversionScene(scene);
-            prism::hydra::SceneBridge bridge(scene, &thread);
-            bridge.SetSettings(settings);
-            ok &= Check(PumpPrepare(bridge, camera, {}, geometryTags,
-                                    resolution, resolution),
-                        "spare scene initial prepare did not publish");
-            VtDictionary const stats = bridge.GetStats();
-            ok &= Check(Stat(stats, "snapshotBuilds") == 1 &&
-                            Stat(stats, "spareSnapshotsInstalled") == 1 &&
-                            Stat(stats, "spareSnapshotsDiscarded") == 0 &&
-                            Stat(stats, "retainedSnapshotCount") == 2,
-                        "initial load did not install exactly one spare bank");
-            ok &= Check(Stat(stats, "sparePrototypeConversionCacheHits") == 69 &&
-                            Stat(stats, "sparePrototypeConversions") == 0 &&
-                            Stat(stats, "prototypeBuildCount") == 67,
-                        "spare bank converted or rebuilt mesh prototypes");
-            ok &= Check(DoubleStat(stats, "firstPublishSeconds") > 0.0 &&
-                            DoubleStat(stats, "spareSnapshotSeconds") >= 0.0,
-                        "first publication or spare timing was not recorded");
-        }
-
-        // B: the snapshot is displayed while the spare job is still pending,
-        // because only a later Prepare call can install it.
-        {
-            HdRetainedSceneIndexRefPtr scene = HdRetainedSceneIndex::New();
-            AddConversionScene(scene);
-            prism::hydra::SceneBridge bridge(scene, &thread);
-            bridge.SetSettings(settings);
-            ok &= Check(prepareUntilDisplayed(bridge, {}),
-                        "manual preparation did not publish");
-            VtDictionary const published = bridge.GetStats();
-            ok &= Check(BoolStat(published, "preparationPending") &&
-                            Stat(published, "spareSnapshotsInstalled") == 0 &&
-                            Stat(published, "retainedSnapshotCount") == 1 &&
-                            Stat(published, "snapshotBuilds") == 1,
-                        "publication waited for the spare bank");
-            ok &= Check(settle(bridge, {}), "spare bank did not settle");
-            VtDictionary const settled = bridge.GetStats();
-            ok &= Check(Stat(settled, "spareSnapshotsInstalled") == 1 &&
-                            Stat(settled, "retainedSnapshotCount") == 2 &&
-                            Stat(settled, "snapshotBuilds") == 1 &&
-                            Stat(settled, "discardedSnapshotBuilds") == 0 &&
-                            Stat(settled, "prototypeBuildCount") == 67,
-                        "installing the spare bank counted as a snapshot build");
-        }
-
-        // C: a transform edit while the spare job runs cancels it; the edit
-        // is still displayed and a following edit uses the rebuilt banks.
-        {
-            HdRetainedSceneIndexRefPtr scene = HdRetainedSceneIndex::New();
-            AddConversionScene(scene);
-            prism::hydra::SceneBridge bridge(scene, &thread);
-            bridge.SetSettings(settings);
-            ok &= Check(prepareUntilDisplayed(bridge, aovs) &&
-                            BoolStat(bridge.GetStats(), "preparationPending"),
-                        "spare job was not pending after publication");
-            scene->AddPrims({{SdfPath("/Grid"), TfToken("xform"),
-                              FixtureXformData(GfVec3d(100.0, 0.0, 0.0))}});
-            bridge.MarkSceneDirty(prism::hydra::SceneDirtyKind::Placement,
-                                  SdfPath("/Grid"));
-            ok &= Check(PumpPrepare(bridge, camera, aovs, geometryTags,
-                                    resolution, resolution),
-                        "transform edit during the spare job did not prepare");
-            VtDictionary const moved = bridge.GetStats();
-            ok &= Check(Stat(moved, "spareSnapshotsDiscarded") +
-                            Stat(moved, "spareSnapshotsInstalled") == 2 &&
-                            Stat(moved, "spareSnapshotsInstalled") >= 1 &&
-                            Stat(moved, "primCount") == 69 &&
-                            Stat(moved, "triangleCount") == 64 * 3 + 3 + 2 + 3,
-                        "spare job interrupted by an edit was not accounted for");
-            size_t hits = 0;
-            ok &= Check(renderFrame(bridge), "moved grid frame did not converge");
-            ok &= Check(gridPixels(bridge, &hits) == 0 && hits > 0,
-                        "transform edit during the spare job was not displayed");
-            const int64_t reusedBefore = Stat(moved, "reusedSnapshotBuilds");
-            scene->AddPrims({{SdfPath("/Grid"), TfToken("xform"),
-                              FixtureXformData(GfVec3d(0.0, 0.0, 0.5))}});
-            bridge.MarkSceneDirty(prism::hydra::SceneDirtyKind::Placement,
-                                  SdfPath("/Grid"));
-            ok &= Check(PumpPrepare(bridge, camera, aovs, geometryTags,
-                                    resolution, resolution),
-                        "second transform edit did not prepare");
-            VtDictionary const returned = bridge.GetStats();
-            ok &= Check(Stat(returned, "reusedSnapshotBuilds") ==
-                            reusedBefore + 1 &&
-                            Stat(returned, "snapshotBuilds") ==
-                                Stat(moved, "snapshotBuilds") &&
-                            Stat(returned, "primCount") == 69,
-                        "second edit did not reuse the installed spare bank");
-            ok &= Check(renderFrame(bridge), "returned grid frame did not converge");
-            std::vector<int> const prims = ReadBuffer<int>(&primBuffer);
-            // The center ray grazes the edge of /Subset's apex face, where
-            // Embree and hardware ray tracing break the tie differently; two
-            // pixels to the left only the moved grid is in view.
-            const size_t center = (resolution / 2) * resolution + resolution / 2 - 2;
-            ok &= Check(prims.size() == resolution * resolution &&
-                            prims[center] >= 0 &&
-                            bridge.GetPrimPath(prims[center]).GetParentPath() ==
-                                SdfPath("/Grid"),
-                        "second transform edit was not displayed");
-            activeBridge = nullptr;
-        }
-
-        // D: the spare bank binds the same materials, including geom-subset
-        // materials and a displayColor fallback, as the displayed snapshot.
-        {
-            HdRetainedSceneIndexRefPtr scene = HdRetainedSceneIndex::New();
-            scene->AddPrims({
-                {SdfPath("/Looks"), TfToken("xform"),
-                 FixtureXformData(GfVec3d(0.0))},
-                {SdfPath("/Looks/Red"), HdPrimTypeTokens->material,
-                 PreviewMaterialData(SdfPath("/Looks/Red"),
-                                     GfVec3f(0.8f, 0.1f, 0.1f))},
-                {SdfPath("/Looks/Blue"), HdPrimTypeTokens->material,
-                 PreviewMaterialData(SdfPath("/Looks/Blue"),
-                                     GfVec3f(0.1f, 0.1f, 0.8f))},
-                {SdfPath("/Left"), TfToken("xform"),
-                 FixtureXformData(GfVec3d(-1.1, 0.0, 0.0))},
-                {SdfPath("/Left/Mesh"), HdPrimTypeTokens->mesh,
-                 FixtureMeshData(false)},
-                {SdfPath("/Left/Mesh/Quad"), HdPrimTypeTokens->geomSubset,
-                 FaceSubsetData(VtIntArray{0}, SdfPath("/Looks/Red"))},
-                {SdfPath("/Left/Mesh/Apex"), HdPrimTypeTokens->geomSubset,
-                 FaceSubsetData(VtIntArray{1}, SdfPath("/Looks/Blue"))},
-                {SdfPath("/Right"), TfToken("xform"),
-                 FixtureXformData(GfVec3d(1.1, 0.0, 0.0))},
-                {SdfPath("/Right/Mesh"), HdPrimTypeTokens->mesh,
-                 FixtureMeshData(false, HdRenderTagTokens->geometry,
-                                 GfVec3f(0.2f, 0.9f, 0.3f), 0.1f)},
-                {SdfPath("/Dome"), HdPrimTypeTokens->domeLight, DomeData()}});
-            prism::hydra::SceneBridge bridge(scene, &thread);
-            bridge.SetSettings(settings);
-            ok &= Check(PumpPrepare(bridge, camera, aovs, geometryTags,
-                                    resolution, resolution),
-                        "material parity scene did not prepare");
-            VtDictionary const before = bridge.GetStats();
-            ok &= Check(Stat(before, "spareSnapshotsInstalled") == 1 &&
-                            Stat(before, "materialFailures") <= 0,
-                        "material parity scene did not install a spare bank");
-            ok &= Check(renderFrame(bridge), "material parity frame did not converge");
-            std::vector<float> const colorsBefore = ReadBuffer<float>(&colorBuffer);
-            std::vector<int> const primsBefore = ReadBuffer<int>(&primBuffer);
-            std::vector<SdfPath> pathsBefore;
-            for (int64_t id = 0; id < Stat(before, "primCount"); ++id)
-                pathsBefore.push_back(bridge.GetPrimPath(static_cast<int>(id)));
-            // The Apex subset is edge-on to this camera; the red Quad subset
-            // and the green displayColor mesh are both in view.
-            bool red = false, green = false;
-            for (size_t pixel = 0; pixel < primsBefore.size(); ++pixel) {
-                if (primsBefore[pixel] < 0) continue;
-                float const r = colorsBefore[pixel * 4];
-                float const g = colorsBefore[pixel * 4 + 1];
-                float const b = colorsBefore[pixel * 4 + 2];
-                SdfPath const path = bridge.GetPrimPath(primsBefore[pixel]);
-                if (path == SdfPath("/Left/Mesh")) {
-                    red |= r > 2.0f * b && r > 2.0f * g;
-                } else if (path == SdfPath("/Right/Mesh")) {
-                    green |= g > 2.0f * r && g > 2.0f * b;
-                }
-            }
-            ok &= Check(red && green,
-                        "subset materials or displayColor were not rendered");
-
-            // Re-authoring an unchanged transform publishes the spare bank and
-            // retires the snapshot that was displayed.
-            scene->AddPrims({{SdfPath("/Right"), TfToken("xform"),
-                              FixtureXformData(GfVec3d(1.1, 0.0, 0.0))}});
-            bridge.MarkSceneDirty(prism::hydra::SceneDirtyKind::Placement,
-                                  SdfPath("/Right"));
-            ok &= Check(PumpPrepare(bridge, camera, aovs, geometryTags,
-                                    resolution, resolution),
-                        "bank swap did not prepare");
-            VtDictionary const after = bridge.GetStats();
-            ok &= Check(Stat(after, "reusedSnapshotBuilds") ==
-                            Stat(before, "reusedSnapshotBuilds") + 1 &&
-                            Stat(after, "snapshotBuilds") ==
-                                Stat(before, "snapshotBuilds") &&
-                            Stat(after, "primCount") == Stat(before, "primCount"),
-                        "unchanged transform edit did not swap to the spare bank");
-            ok &= Check(renderFrame(bridge), "swapped bank frame did not converge");
-            std::vector<SdfPath> pathsAfter;
-            for (int64_t id = 0; id < Stat(after, "primCount"); ++id)
-                pathsAfter.push_back(bridge.GetPrimPath(static_cast<int>(id)));
-            ok &= Check(pathsAfter == pathsBefore &&
-                            ReadBuffer<int>(&primBuffer) == primsBefore,
-                        "spare bank changed picking");
-            ok &= Check(ReadBuffer<float>(&colorBuffer) == colorsBefore,
-                        "spare bank changed material assignments");
-
-            // Rebinding a face subset must refresh its parent mesh's face
-            // material table. Marking only the subset path reproduces the
-            // pre-fix bug: _RefreshMaterials recognizes material-user and
-            // prototype paths, but the subset path is neither.
-            const SdfPath quadSubset("/Left/Mesh/Quad");
-            scene->AddPrims({{quadSubset, HdPrimTypeTokens->geomSubset,
-                              FaceSubsetData(VtIntArray{0},
-                                             SdfPath("/Looks/Blue"))}});
-            bridge.MarkSceneDirtyBatch({{
-                prism::hydra::SceneDirtyKind::Material,
-                {quadSubset, SdfPath("/Left/Mesh")},
-                "geomSubset/materialBindings edit"}});
-            ok &= Check(prepareUntilDisplayed(bridge, aovs) &&
-                            settle(bridge, aovs) &&
-                            renderFrame(bridge),
-                        "subset material rebind did not prepare");
-            const std::vector<float> colorsAfterSubsetRebind =
-                ReadBuffer<float>(&colorBuffer);
-            const std::vector<int> primsAfterSubsetRebind =
-                ReadBuffer<int>(&primBuffer);
-            bool leftRedAfterRebind = false;
-            bool leftBlueAfterRebind = false;
-            for (size_t pixel = 0; pixel < primsAfterSubsetRebind.size(); ++pixel) {
-                if (primsAfterSubsetRebind[pixel] < 0 ||
-                    bridge.GetPrimPath(primsAfterSubsetRebind[pixel]) !=
-                        SdfPath("/Left/Mesh")) continue;
-                const float r = colorsAfterSubsetRebind[pixel * 4];
-                const float g = colorsAfterSubsetRebind[pixel * 4 + 1];
-                const float b = colorsAfterSubsetRebind[pixel * 4 + 2];
-                leftRedAfterRebind |= r > 2.0f * b && r > 2.0f * g;
-                leftBlueAfterRebind |= b > 2.0f * r && b > 2.0f * g;
-            }
-            ok &= Check(leftBlueAfterRebind && !leftRedAfterRebind,
-                        "geomSubset material rebind left stale face materials");
-            activeBridge = nullptr;
-        }
-
-        // F: a spare that finished while nobody called Prepare is installed
-        // by the Prepare that follows an edit, so the edit stays incremental.
-        {
-            HdRetainedSceneIndexRefPtr scene = HdRetainedSceneIndex::New();
-            AddConversionScene(scene);
-            prism::hydra::SceneBridge bridge(scene, &thread);
-            bridge.SetSettings(settings);
-            ok &= Check(prepareUntilDisplayed(bridge, aovs),
-                        "idle-host scene did not publish");
-            ok &= Check(WaitFor([&] {
-                return BoolStat(bridge.GetStats(), "spareSnapshotReady");
-            }), "spare job did not finish without Prepare calls");
-            VtDictionary const ready = bridge.GetStats();
-            ok &= Check(BoolStat(ready, "preparationPending") &&
-                            Stat(ready, "spareSnapshotsInstalled") == 0,
-                        "reading spareSnapshotReady consumed the spare job");
-            scene->AddPrims({{SdfPath("/Grid"), TfToken("xform"),
-                              FixtureXformData(GfVec3d(0.0, 0.0, 0.5))}});
-            bridge.MarkSceneDirty(prism::hydra::SceneDirtyKind::Placement,
-                                  SdfPath("/Grid"));
-            ok &= Check(PumpPrepare(bridge, camera, aovs, geometryTags,
-                                    resolution, resolution),
-                        "edit after an unconsumed spare did not prepare");
-            VtDictionary const edited = bridge.GetStats();
-            ok &= Check(Stat(edited, "spareSnapshotsInstalled") ==
-                            Stat(ready, "spareSnapshotsInstalled") + 1 &&
-                            Stat(edited, "spareSnapshotsDiscarded") ==
-                                Stat(ready, "spareSnapshotsDiscarded") &&
-                            Stat(edited, "snapshotBuilds") ==
-                                Stat(ready, "snapshotBuilds") &&
-                            Stat(edited, "reusedSnapshotBuilds") ==
-                                Stat(ready, "reusedSnapshotBuilds") + 1 &&
-                            Stat(edited, "primCount") == 69,
-                        "finished spare was discarded instead of taking the edit");
-            ok &= Check(renderFrame(bridge), "idle-host edit frame did not converge");
-            std::vector<int> const prims = ReadBuffer<int>(&primBuffer);
-            // The center ray grazes the edge of /Subset's apex face, where
-            // Embree and hardware ray tracing break the tie differently; two
-            // pixels to the left only the moved grid is in view.
-            const size_t center = (resolution / 2) * resolution + resolution / 2 - 2;
-            ok &= Check(prims.size() == resolution * resolution &&
-                            prims[center] >= 0 &&
-                            bridge.GetPrimPath(prims[center]).GetParentPath() ==
-                                SdfPath("/Grid"),
-                        "edit applied to the installed spare was not displayed");
-            activeBridge = nullptr;
-        }
-
-        // G: a structural edit after an unconsumed spare still installs it,
-        // then rebuilds because structure cannot be replayed on a bank.
-        {
-            HdRetainedSceneIndexRefPtr scene = HdRetainedSceneIndex::New();
-            AddConversionScene(scene);
-            prism::hydra::SceneBridge bridge(scene, &thread);
-            bridge.SetSettings(settings);
-            ok &= Check(prepareUntilDisplayed(bridge, {}),
-                        "structural idle-host scene did not publish");
-            ok &= Check(WaitFor([&] {
-                return BoolStat(bridge.GetStats(), "spareSnapshotReady");
-            }), "structural idle-host spare did not finish");
-            VtDictionary const ready = bridge.GetStats();
-            scene->AddPrims({{SdfPath("/Extra"), HdPrimTypeTokens->mesh,
-                              FixtureMeshData(false, HdRenderTagTokens->geometry,
-                                              GfVec3f(0.7f), 0.95f)}});
-            bridge.MarkSceneDirty(prism::hydra::SceneDirtyKind::Structure,
-                                  SdfPath("/Extra"));
-            ok &= Check(PumpPrepare(bridge, camera, {}, geometryTags,
-                                    resolution, resolution),
-                        "structural edit after an unconsumed spare did not prepare");
-            VtDictionary const edited = bridge.GetStats();
-            ok &= Check(Stat(edited, "primCount") == 70 &&
-                            Stat(edited, "prototypeCount") == 68 &&
-                            Stat(edited, "triangleCount") == 64 * 3 + 3 + 2 + 3 + 3 &&
-                            Stat(edited, "instanceCount") == 2,
-                        "structural edit after an unconsumed spare lost scene contents");
-            ok &= Check(Stat(edited, "snapshotBuilds") ==
-                            Stat(ready, "snapshotBuilds") + 1 &&
-                            Stat(edited, "reusedSnapshotBuilds") ==
-                                Stat(ready, "reusedSnapshotBuilds") &&
-                            Stat(edited, "spareSnapshotsInstalled") ==
-                                Stat(ready, "spareSnapshotsInstalled") + 2 &&
-                            Stat(edited, "spareSnapshotsDiscarded") ==
-                                Stat(ready, "spareSnapshotsDiscarded") &&
-                            Stat(edited, "retainedSnapshotCount") == 2,
-                        "structural edit did not rebuild with a fresh spare bank");
-        }
-
-        // H: an edit while the spare job is still running cancels it before
-        // it completes; that spare is discarded and the edit is displayed.
-        // Enough meshes keep the spare job running well past the edit.
-        {
-            constexpr int meshCount = 10000;
-            HdRetainedSceneIndexRefPtr scene = HdRetainedSceneIndex::New();
-            HdRetainedSceneIndex::AddedPrimEntries prims;
-            prims.reserve(meshCount + 1);
-            prims.push_back({SdfPath("/Grid"), TfToken("xform"),
-                             FixtureXformData(GfVec3d(0.0))});
-            for (int i = 0; i < meshCount; ++i)
-                prims.push_back({SdfPath("/Grid/M" + std::to_string(i)),
-                    HdPrimTypeTokens->mesh,
-                    FixtureMeshData(false, HdRenderTagTokens->geometry,
-                                    GfVec3f(0.7f),
-                                    0.00005f * static_cast<float>(i + 1))});
-            scene->AddPrims(prims);
-            prism::hydra::SceneBridge bridge(scene, &thread);
-            bridge.SetSettings(settings);
-            ok &= Check(prepareUntilDisplayed(bridge, aovs),
-                        "large spare scene did not publish");
-            ok &= Check(!BoolStat(bridge.GetStats(), "spareSnapshotReady"),
-                        "spare job finished before the edit could interrupt it");
-            scene->AddPrims({{SdfPath("/Grid"), TfToken("xform"),
-                              FixtureXformData(GfVec3d(100.0, 0.0, 0.0))}});
-            bridge.MarkSceneDirty(prism::hydra::SceneDirtyKind::Placement,
-                                  SdfPath("/Grid"));
-            ok &= Check(PumpPrepare(bridge, camera, aovs, geometryTags,
-                                    resolution, resolution),
-                        "edit during a running spare job did not prepare");
-            VtDictionary const edited = bridge.GetStats();
-            ok &= Check(Stat(edited, "spareSnapshotsDiscarded") == 1 &&
-                            Stat(edited, "spareSnapshotsInstalled") == 1 &&
-                            Stat(edited, "primCount") == meshCount &&
-                            Stat(edited, "retainedSnapshotCount") == 2,
-                        "interrupted spare job was not discarded");
-            size_t hits = 0;
-            ok &= Check(renderFrame(bridge), "large moved frame did not converge");
-            ok &= Check(gridPixels(bridge, &hits) == 0,
-                        "edit during a running spare job was not displayed");
-            activeBridge = nullptr;
-        }
-
-        // E: tearing a bridge down while its spare job is pending must cancel
-        // and join it like any other build.
-        for (int repetition = 0; repetition < 5; ++repetition) {
-            HdRetainedSceneIndexRefPtr scene = HdRetainedSceneIndex::New();
-            AddConversionScene(scene);
-            prism::hydra::SceneBridge bridge(scene, &thread);
-            ok &= Check(prepareUntilDisplayed(bridge, {}) &&
-                            BoolStat(bridge.GetStats(), "preparationPending"),
-                        "spare job was not pending before teardown");
-        }
-    }
+    ok &= RunSpareBankChecks(
+        thread, activeBridge, 0, prism::device::DevicePreference::Auto);
     {
         // Until a bound buffer shows a rendered frame it must hold its AOV
         // clear value: the host blends the delegate's colour over its own
