@@ -96,6 +96,10 @@ int RunProgressStatusTests()
         }
 
         // Frontend: statistics progress to rendering/converged and name the device.
+        // The fallback case disables Vulkan and then restores the caller's
+        // setting (a CPU-only run keeps Vulkan disabled for the later checks).
+        const char *disabledVulkan = std::getenv("PRISM_DISABLE_VULKAN");
+        const std::string callerDisabledVulkan = disabledVulkan ? disabledVulkan : "";
         for (int fallback = 0; fallback < 2; ++fallback) {
             if (fallback) SetEnvironment("PRISM_DISABLE_VULKAN", "1");
             Fixture fixture;
@@ -157,7 +161,7 @@ int RunProgressStatusTests()
                         "A failed Vulkan device was not reported as a fallback");
             else
                 Require(device == "cpu", "The CPU device was misnamed");
-            if (fallback) SetEnvironment("PRISM_DISABLE_VULKAN", "");
+            if (fallback) SetEnvironment("PRISM_DISABLE_VULKAN", callerDisabledVulkan.c_str());
         }
         std::cout << "Progress status checks passed\n";
         return 0;
