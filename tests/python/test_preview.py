@@ -53,7 +53,8 @@ def test_preview_matches_cli(usd, source_dir, output_dir):
 def test_preview_scene_is_shipped(usd):
     scene_file = usd.material_preview_scene()
     assert os.path.isfile(scene_file)
-    folder = os.path.dirname(scene_file)
+    assert os.path.basename(scene_file) == "material_preview.usda"
+    folder = os.path.join(os.path.dirname(scene_file), "shaderball")
     for name in ("LICENCE", "ATTRIBUTION.md", "material_surface_geo/subdiv.usda", "maps/ground.ACEScg.exr"):
         assert os.path.isfile(os.path.join(folder, name)), name
 

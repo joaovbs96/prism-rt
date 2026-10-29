@@ -18,7 +18,7 @@ prism.io.write("look.png", result.aovs["color"], prism.Renderer())
 The preview is the USD Working Group's
 [Standard Shader Ball](https://github.com/usd-wg/assets/tree/main/full_assets/StandardShaderBall)
 (CC BY 4.0; `resources/shaderball/ATTRIBUTION.md`), shipped unchanged in
-`resources/shaderball`:
+`resources/shaderball`, opened through `resources/material_preview.usda`:
 
 - **Geometry: the `subdiv` variant** (the asset's default): the material
   surface is a Catmull-Clark subdivision surface, refined by OpenSubdiv like
@@ -36,7 +36,11 @@ The preview is the USD Working Group's
   `/standard_shader_ball_scene/shader_ball/material_surface` at load time
   (`prism::usd::LoadOptions::materialOverrides`); the files are not edited.
   The stand (`neutral_objects/base`, `core`) and the subsurface bars keep the
-  asset's materials (`neutral`, `sss_bars`, its OpenPBR variant).
+  asset's materials (`neutral`, `sss_bars`), in the asset's `standard_surface`
+  `material_model` variant, selected by `resources/material_preview.usda` (a
+  PrismRT layer over the unchanged asset). The asset's file default, OpenPBR,
+  leaves `neutral` without its `base_color` texture (the stand renders near
+  white instead of mid-grey with the "Material Preview" text).
 
 ## Material documents
 
@@ -75,9 +79,9 @@ The preview is the USD Working Group's
 
 ## Where the files are found
 
-`MaterialPreviewScene()` looks for `resources/shaderball/standard_shader_ball_scene.usda`
+`MaterialPreviewScene()` looks for `resources/material_preview.usda`
 beside the `prism_usd` library (then one directory up), so no environment
-variable is needed: the build copies `resources/shaderball` next to
+variable is needed: the build copies it and `resources/shaderball` next to
 `prism_usd.dll` (`build/<config>`, target `prism_preview_resources`), `install`
 puts it in `bin/resources` (Windows; `lib/resources` elsewhere) and
 `tools/package_windows.ps1` copies it into the package. A wheel must put it

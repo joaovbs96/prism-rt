@@ -81,8 +81,9 @@ struct MaterialPreview {
 };
 
 // The shipped preview stage: $PRISM_MATERIAL_PREVIEW_SCENE when set, else
-// resources/shaderball/standard_shader_ball_scene.usda beside the prism_usd
-// library (or one directory up). Throws Error(NotFound) when there is none.
+// resources/material_preview.usda (the shaderball asset with its
+// standard_surface variant selected) beside the prism_usd library (or one
+// directory up). Throws Error(NotFound) when there is none.
 PRISM_USD_API std::string MaterialPreviewScene();
 
 // Adds the preview stage to `scene` with `material` bound to the shaderball's

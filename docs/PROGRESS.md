@@ -2,6 +2,9 @@
 
 Phase reports, newest first. Detailed reports live in `local/reports/` (git-ignored).
 
+## 2026-10-29 - Material preview: grey stand
+- The shaderball's `core` and `base` rendered near white: the asset's default `OpenPBRSurface` variant leaves its `neutral` material without a `base_color` texture. `resources/material_preview.usda` now sublayers the unchanged asset and selects `standard_surface` (shipped beside `prism_usd`, installed, in the wheel); `reference_marble.exr` regenerated. Details in `docs/DECISIONS.md`. Report: `local/reports/preview_neutral_fix.md`.
+
 ## 2026-10-29 - Hydra through a hosted session; shared revision layer
 - Hydra renders through `prism::Session`: a hosted session (`src/session/session_internal.h`, internal) owns the render device and its creation job, the progressive loop and the session state, and renders the delegate's own snapshot into its render buffers on Hydra's render thread. `ProgressiveEngine` is no longer exported (`prism.dll` 507 to 503 exports).
 - One revision layer for both scene paths (`src/scene/revision_parts.h`, `src/scene/environment_cache.h`): Embree instance placement and its shading transform, link category bits, the spare-revision rule, and the domes' importance-table cache, which the public scene's domes now use too. The delegate keeps its identity layer and its pools, journal replay and visibility model (reasons in `docs/DECISIONS.md`).

@@ -449,6 +449,9 @@ foreach(_file IN LISTS _prism_preview_files)
         "${_prism_preview_root}/${_file}" "$<TARGET_FILE_DIR:prism_usd>/resources/shaderball/${_file}")
 endforeach()
 add_custom_target(prism_preview_resources ${_prism_preview_commands}
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/resources/material_preview.usda"
+        "$<TARGET_FILE_DIR:prism_usd>/resources/material_preview.usda"
     COMMENT "Material preview scene beside prism_usd")
 add_dependencies(prism_usd prism_preview_resources)
 
@@ -2259,6 +2262,7 @@ else()
 endif()
 install(DIRECTORY resources/shaderball DESTINATION "${_prism_preview_destination}"
     PATTERN ".gitattributes" EXCLUDE)
+install(FILES resources/material_preview.usda DESTINATION "${_prism_preview_destination}")
 install(FILES prism_env.ps1 run_usdview.ps1 prism_env.sh
     DESTINATION "${CMAKE_INSTALL_BINDIR}")
 install(PROGRAMS run_usdview.sh DESTINATION "${CMAKE_INSTALL_BINDIR}")

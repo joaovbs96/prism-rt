@@ -504,6 +504,7 @@ def main() -> int:
     if with_usd:
         # The material preview's stage, found beside prism_usd's directory (bin/..).
         copy_tree(ROOT / "resources/shaderball", package / "resources/shaderball", skip=(".gitattributes",))
+        copy(ROOT / "resources/material_preview.usda", package / "resources/material_preview.usda")
 
     # 5. The packaged configuration.
     (package / "_build_config.py").write_text(

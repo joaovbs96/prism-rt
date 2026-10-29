@@ -1,8 +1,10 @@
 // prism::usd::LoadMaterialPreview (include/prism/usd.h, docs/material_preview.md):
 // a material on the USD-WG StandardShaderBall, shared by the CLI's --material
-// and prismrt.preview_material. The shipped stage (resources/shaderball) is
-// loaded unchanged; the previewed material replaces the binding of the
-// ball's material surface (LoadOptions::materialOverrides).
+// and prismrt.preview_material. The stage is resources/material_preview.usda,
+// which sublayers the shipped asset (resources/shaderball, unchanged) and
+// selects its standard_surface material_model variant; the previewed material
+// replaces the binding of the ball's material surface
+// (LoadOptions::materialOverrides).
 
 #include <prism/usd.h>
 
@@ -35,7 +37,7 @@ namespace {
 // The asset's prims (resources/shaderball/standard_shader_ball_scene.usda).
 constexpr const char* kMaterialSurface = "/standard_shader_ball_scene/shader_ball/material_surface";
 constexpr const char* kCamera = "/standard_shader_ball_scene/camera";
-constexpr const char* kSceneFile = "standard_shader_ball_scene.usda";
+constexpr const char* kSceneFile = "material_preview.usda";
 
 // The directory of the library holding this function (prism_usd).
 std::filesystem::path ModuleDirectory()
@@ -98,8 +100,8 @@ std::string MaterialPreviewScene()
     }
     const std::filesystem::path module = ModuleDirectory();
     if (!module.empty()) {
-        candidates.push_back(module / "resources" / "shaderball" / kSceneFile);
-        candidates.push_back(module.parent_path() / "resources" / "shaderball" / kSceneFile);
+        candidates.push_back(module / "resources" / kSceneFile);
+        candidates.push_back(module.parent_path() / "resources" / kSceneFile);
     }
     std::string searched;
     for (auto const& candidate : candidates) {
@@ -108,7 +110,7 @@ std::string MaterialPreviewScene()
         searched += (searched.empty() ? "" : ", ") + candidate.string();
     }
     throw Error(ErrorCode::NotFound, "the material preview scene is not installed (looked for " +
-                (searched.empty() ? std::string("resources/shaderball beside prism_usd") : searched) +
+                (searched.empty() ? std::string("resources/material_preview.usda beside prism_usd") : searched) +
                 "; PRISM_MATERIAL_PREVIEW_SCENE names another)");
 }
 
