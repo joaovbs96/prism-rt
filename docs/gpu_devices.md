@@ -1226,6 +1226,19 @@ called done there.
     `--device metal` against the previous build's Metal render (a scene dome
     is now a cached environment on the GPU); `PRISM_DEVICE=metal`
     `prism_hydra_render` on `parity.usda` bit-identical to the previous build.
+- **Document colour space of a `.mtlx` referenced into USD**
+  ([materialx_compatibility.md](materialx_compatibility.md#document-colour-space-through-usd);
+  written on Windows, the Metal device unbuilt):
+  - Shared host code only: `src/materialx/material_service.cpp` tags untagged
+    colour/file parameters with the document's space before capture;
+    `src/hydra/mtlx_color_space_adapter.cpp` (a UsdImaging API schema adapter
+    in hdPrism, declared in `plugInfo.json`); `src/mesh/usd_mesh.h`. The
+    generated MaterialX/MDL changes only for such materials (they gain colour
+    transforms, as through `--material`). No shader or device change.
+  - Check on the Mac: `ctest -R "mtlx_colorspace|mtlx_document_colorspace|material_preview|mtlx_emission"`
+    (hdPrism's adapter must load from the build's `plugInfo.json`); the CLI
+    on `tests/hydra/fixtures/mtlx_document_colorspace.usda` with
+    `--device metal` against `--device cpu`.
 
 ## Diagnostics
 

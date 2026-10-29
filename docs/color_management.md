@@ -84,7 +84,7 @@ images from the old renderer and compare (see Tests).
 
 | Input | Authored in | Conversion |
 | --- | --- | --- |
-| MaterialX values and images with a colour space (`colorspace` on the input, node, graph or document; USD `colorSpace` metadata) | that space | MaterialX's generated MDL code, into the working space |
+| MaterialX values and images with a colour space (`colorspace` on the input, node, graph or document, also of a `.mtlx` referenced into USD: [materialx_compatibility.md](materialx_compatibility.md#document-colour-space-through-usd); USD `colorSpace` metadata) | that space | MaterialX's generated MDL code, into the working space |
 | MaterialX values and images without a colour space | - | none: used as working-space values |
 | MaterialX data spaces (`raw`, `Raw`, `data`, `non-color`) | - | none (the loader maps them to `none`) |
 | UsdLux `inputs:color`, `colorTemperature` (blackbody) | linear Rec.709 | matrix, in `MakeSceneLight` (both loaders) and the Hydra dome |

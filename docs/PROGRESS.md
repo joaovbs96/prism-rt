@@ -2,6 +2,11 @@
 
 Phase reports, newest first. Detailed reports live in `local/reports/` (git-ignored).
 
+## 2026-10-29 - Document colour space of referenced .mtlx files
+- A `.mtlx` referenced into a USD stage lost its document `colorspace` in both loaders (usdMtlx keeps it as layer metadata only). Both now publish it on the material prim (CLI: prim stack; Hydra: a `MaterialXConfigAPI` adapter in hdPrism) and the material service tags untagged colour/file parameters before capture. Details in `docs/DECISIONS.md` and `docs/materialx_compatibility.md`.
+- Before/after (CPU, fixed samples): new fixture against its UsdShade-tagged twin 0.104 to 0 (CLI and Hydra bit-identical); material preview stage against `--material` 0.0063 to 3.5e-6 (test tolerance 0.02 to 1e-4); `two_materials.mtlx` red 0.20 to 6.0e-8. Other images bit-identical to the previous build; `mtlx_emission` (a `lin_rec709` document, untagged emission colour) changes by design: 0.175 normalized RMSE (10% mean) against the previous build, CLI and Hydra alike (9e-7 apart; parity-only fixture). No stored reference changed.
+- New tests: `prism_mtlx_colorspace_test`, `prism_parity_mtlx_document_colorspace_*`, `prism_mtlx_document_colorspace_matches_tagged`. GPU checks owed (Vulkan parity of the new fixture). Report: `local/reports/mtlx_colorspace.md`.
+
 ## 2026-10-29 - Python API rough edges
 - Documented `depth` (normalised device depth) vs `cameraDepth` (string form already worked; examples use it); `prismrt.matrix_at` / `Camera.transform` and 4x4 `params` reads for single-sample transforms; cross-kind name clashes say which kind holds the name. Design in `docs/DECISIONS.md`.
 

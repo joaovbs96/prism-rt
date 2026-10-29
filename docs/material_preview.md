@@ -97,7 +97,7 @@ All on the CPU, 64x64, 64 samples, seed 7, no adaptive sampling:
   the noise (0.037 normalized RMSE, mean 0.0007; two seeds differ by 0.089):
   the five rect lights are ordered differently, as in the `lights` fixture.
 - `prism_material_preview_matches_stage`: the CLI's `--material` render against
-  that stage's CLI render (0.006, mean 0.0005; see below).
+  that stage's CLI render (3.5e-6, mean 7.5e-8; tolerance 1e-4; see below).
 - `prism_material_preview_reference`: against
   `tests/hydra/fixtures/material_preview/reference_marble.exr`, at a noise-floor
   tolerance (normalized RMSE 0.15, mean 0.01; another material differs by 0.34
@@ -106,11 +106,11 @@ All on the CPU, 64x64, 64 samples, seed 7, no adaptive sampling:
   `_scene_conflict`, `_first_material`) and `prism_python_preview` (Python
   against the CLI bit for bit at 128x128; names, documents and errors).
 
-**Known difference from a material bound in USD**: a `.mtlx` referenced into a
-stage (usdMtlx, then the material service) loses a *document-level*
-`colorspace` (the marble and `two_materials.mtlx` say `lin_rec709`): its
-colours are used as working-space (ACEScg) values, so a red renders more
-saturated than through `--material`, which converts them as
-`docs/color_management.md` says. With `colorspace="acescg"` the two paths agree
-to 2.7e-7. This is a property of the USD path (CLI and Hydra alike), not of the
-preview.
+**A material bound in USD renders the same**: a `.mtlx` referenced into a
+stage (usdMtlx, then the material service) keeps its *document-level*
+`colorspace` (the marble and `two_materials.mtlx` say `lin_rec709`) in both
+loaders (`src/usd/mtlx_color_space.h`; `docs/materialx_compatibility.md`,
+"Document colour space through USD"). Until 2026-10-29 it was lost and the
+colours were used as working-space (ACEScg) values: the marble's stage differed
+from `--material` by 0.006 normalized RMSE, `two_materials.mtlx`'s red by 0.20
+(2.8% mean); now 3.5e-6 and 6.0e-8.

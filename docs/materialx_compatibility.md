@@ -36,6 +36,59 @@ their textures would stay unconverted. The loader maps these aliases to
 MaterialX's names (`srgb_texture`, `lin_rec709`, `acescg`, ...) on the document
 and on every element (`CanonicalColorSpace` in `src/materialx/loader.cpp`).
 
+## Document colour space through USD
+
+A `.mtlx` file referenced into a USD stage reaches the renderer as a UsdShade
+network (usdMtlx), not as the document. usdMtlx (OpenUSD 26.08) authors an
+input's own `colorspace` as USD `colorSpace` attribute metadata, which UsdImaging
+(`UsdColorSpaceAPI::ComputeColorSpaceName`) and hdMtlx carry into the generated
+document; the document's `<materialx colorspace="...">` it keeps only as the
+translated layer's `customLayerData["colorSpace"]`. Layer metadata does not
+compose through a reference, so the stage's untagged colours arrived untagged
+and were used as working-space (ACEScg) values, while the same document through
+`--material`, glTF/OBJ or `MaterialDesc` converted them (the shader ball's marble
+differed by 0.006 normalized RMSE, `two_materials.mtlx`'s red by 0.20).
+
+The repair restores the document's space where the composed stage is still
+visible (`src/usd/mtlx_color_space.h`):
+
+- `MtlxDocumentColorSpace(UsdPrim)` takes the strongest layer of the Material
+  prim's stack that has usdMtlx's file format (`mtlx`) and returns its
+  `customLayerData["colorSpace"]`. Each Material takes its own document's, so a
+  scope referencing several documents (the shader ball's examples: three
+  `lin_rec709`, `bubblegum.mtlx` none) is handled per material.
+- Both loaders publish it as the material prim data source
+  `prismMtlxDocument.colorSpace`: the CLI in `UsdMaterialDataSource`
+  (`src/mesh/usd_mesh.h`); Hydra through an API schema adapter for
+  `MaterialXConfigAPI`, which usdMtlx applies to every Material it translates
+  (`src/hydra/mtlx_color_space_adapter.cpp`, registered in hdPrism's
+  `plugInfo.json`; it only adds that key, so other render delegates ignore it).
+- The material service (`Prepare` in `src/materialx/material_service.cpp`) tags
+  every network parameter that holds a colour or file value (`GfVec3f`,
+  `GfVec4f`, `SdfAssetPath`) and has no colour space with it, before the network
+  is captured. An input's own space wins, as MaterialX inherits it. vector3/4
+  values share the Gf types; MaterialX applies a colour space to colour-typed
+  inputs and colour images only, as with the document attribute.
+
+Because the tags are in the captured network, every cache keyed by it (the
+early material cache, conversion artifacts, the captured-material and template
+registries) and the serialized document's content key include the space; a
+document without `colorspace` (or a UsdShade material) gets no tags, so its
+materials and images are unchanged.
+
+Not repaired: a value authored over a referenced material in another layer
+(an `over` in the stage) also takes the document's space, as the referenced
+values do; a material whose nodes come from several `.mtlx` documents takes its
+Material prim's document. Neither occurs in our assets.
+
+Checks: `prism_mtlx_colorspace_test` (the prim and Hydra data sources, the
+tags), `prism_parity_mtlx_document_colorspace_*` and
+`prism_mtlx_document_colorspace_matches_tagged` (the referenced document,
+CLI and Hydra, against the same network in UsdShade with `colorSpace` metadata,
+`tests/hydra/fixtures/mtlx_document_colorspace/tagged.usda`: 0.104 normalized
+RMSE before, bit-identical after), and `prism_material_preview_matches_stage`
+(tolerance 0.02 to 1e-4).
+
 ## Tagged colours on uniform inputs
 
 A few library inputs are `uniform`: `gltf_pbr`'s `attenuation_color` (the only
