@@ -501,6 +501,9 @@ def main() -> int:
 
     # 4. Data.
     copy_tree(Path(runtime["materialXLibraries"]), package / "materialx/libraries")
+    if with_usd:
+        # The material preview's stage, found beside prism_usd's directory (bin/..).
+        copy_tree(ROOT / "resources/shaderball", package / "resources/shaderball", skip=(".gitattributes",))
 
     # 5. The packaged configuration.
     (package / "_build_config.py").write_text(

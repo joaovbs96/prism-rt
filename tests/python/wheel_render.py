@@ -115,6 +115,11 @@ def main() -> int:
                                           camera="/World/Camera", samples=8, adaptive_threshold=0.0, seed=3,
                                           sample_clamp=10.0)
         write("cornell_usd", renderer, session.render())
+        # The built-in material preview (its shaderball stage ships in the package).
+        preview = prism.preview_material(os.path.join(args.source, "assets/materials/standard_surface_marble_solid.mtlx"),
+                                         renderer=renderer, device="cpu", width=48, height=48, samples=8,
+                                         adaptive_threshold=0.0, seed=5)
+        write("material_preview", renderer, preview)
 
     summary["modules_after_render"] = loaded_modules()
     print("WHEEL_RENDER " + json.dumps(summary))
