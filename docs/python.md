@@ -7,8 +7,7 @@ names, `scene.params`, `Scene.from_dict`). It links the shared `prism.dll`
 loads hdPrism holds one copy of the core. Design: `docs/sdk_design.md`
 section 6; decisions: `docs/DECISIONS.md` (2026-10-29).
 
-This page covers the build tree. Wheels and a packaged layout are the next
-migration step (8).
+This page covers the build tree and the Windows wheel ([Wheel](#wheel)).
 
 ## Build
 
@@ -62,6 +61,82 @@ Import order: `import pxr` (and `prismrt`) before PySide6. PySide6 ships an
 old `msvcp140.dll`; `import prismrt` raises an `ImportError` that says so when
 an older C++ runtime than the build's is already loaded
 (`PRISMRT_SKIP_RUNTIME_CHECK=1` skips the check).
+
+## Wheel
+
+A Windows wheel for CPython 3.11 (`prismrt-<version>-cp311-cp311-win_amd64.whl`)
+is assembled from a built tree with one command, using the build's Python:
+
+```
+C:\...\Python311\python.exe tools\build_wheel.py --build-dir D:\prism-builds\<build> [--config RelWithDebInfo] [--out <dir>] [--no-usd]
+```
+
+It writes `<build>/python_wheel/dist/` by default (the staging folder is
+`<build>/python_wheel/stage`). Install it into any Python 3.11 environment;
+nothing else is needed (no build tree, `prism_env.ps1`, `PATH` or `PRISM_*`
+variables):
+
+```
+py -3.11 -m venv venv
+venv\Scripts\python -m pip install prismrt-0.2.0a9-cp311-cp311-win_amd64.whl
+venv\Scripts\python -c "import prismrt; print(prismrt.__version__)"
+```
+
+What the wheel holds (`prismrt/`):
+
+- the package, the two extension modules and their stubs;
+- `bin/`: `prism.dll`, `prism_usd.dll` and every DLL they need (Embree,
+  oneTBB, MaterialX, OpenImageIO, OpenColorIO and their vcpkg dependencies,
+  OIDN with its CPU device, OpenSubdiv, the MDL SDK's `libmdl_sdk.dll` and
+  `nv_openimageio.dll`, DXC's `dxc.exe` and `dxcompiler.dll` for the Vulkan
+  device, the Vulkan loader `vulkan-1.dll`, which `prism.dll` imports and
+  machines without a GPU driver lack, the MSVC C++ runtime; MaterialX and
+  OpenSubdiv are linked statically). The script finds them by walking the PE
+  import tables (delay-loaded imports too) from the extension modules and
+  the libraries loaded by name at run time, in the build's DLL directory
+  order, and fails on an unresolved import or a second `tbb12.dll`. System
+  DLLs (System32, API sets) and `python311.dll` stay out; no PDBs.
+- `usd/`: the USD build `prism_usd` links (all of its libraries, `lib/usd`
+  plug-in resources, the `usdShaders` and `sdrGlslfx` plug-ins), added to the
+  DLL search only when `prismrt.usd` is imported: `import prismrt` loads no
+  USD. It is the same, not namespaced, USD build as the CLI's (see below).
+- `materialx/libraries/`: MaterialX's data libraries (the default
+  `materialx_libraries`, also with `Renderer(env=False)`).
+- `licenses/`: the licences of everything bundled.
+- `_build_config.py`, written by the script: paths relative to the package
+  (`bin`, the USD directories, the defaults for `PRISM_MATERIALX_LIBRARY_PATH`,
+  `PRISM_MATERIALX_MDL`, `PRISM_DXC`, set only when unset), and the MDL SDK
+  libraries that `_dll.py` loads by full path first (the renderer loads them
+  by name with `LoadLibrary`, which does not search `os.add_dll_directory`'s
+  directories).
+
+Size: about 196 MiB (411 MiB installed: the MDL SDK 120 MiB, `prism.dll`
+54 MiB, OIDN 46 MiB, Embree 36 MiB, DXC 20 MiB, USD 106 MiB), above PyPI's
+default 100 MiB file limit. `--no-usd` leaves USD and `prismrt.usd` out. The
+wheel is reproducible (sorted entries, timestamps from `SOURCE_DATE_EPOCH` or
+the last commit): two builds of one tree are byte-identical.
+
+Caches go to `%LOCALAPPDATA%\PrismRT\cache` (`prismrt.default_cache_directory()`;
+`PRISM_CACHE_DIR` or `Renderer(cache_directory=...)` moves them), never into
+`site-packages`.
+
+USD in the wheel: `prismrt.usd` loads files (`load(scene, "shot.usda")`).
+Its USD is a plain build of OpenUSD, so another `pxr` (for example
+`usd-core`) in the same process is refused at import (`prismrt.usd` after
+`pxr`) or may clash (`pxr` after `prismrt.usd`); a `PXR_PLUGINPATH_NAME`
+naming another USD's plug-ins would be read by the wheel's USD too. The
+planned fix is a private, namespaced USD (`docs/DECISIONS.md`, 2026-10-27).
+
+The version comes from `python/prismrt/_version.py` only (`0.2.0aN` is the
+SDK pre-release `v0.2.0-alpha.N`). Test: `prism_python_wheel_install` (below).
+
+Not yet: Linux and macOS wheels. The script's import walk and layout are
+Windows-specific; those platforms need the equivalent (`auditwheel repair`
+or ELF parsing with `$ORIGIN` rpaths on Linux, `delocate` or Mach-O parsing
+with `@loader_path` on macOS), the MDL SDK's `.so`/`.dylib` names, and the
+Metal shader converter's licence (open). The rest is portable: the package
+code reads only `_build_config.py`, and the CMake changes add a test only
+under `WIN32`.
 
 ## A first render
 
@@ -306,7 +381,15 @@ renderers), `prism_python_render` (Python and CLI images bit-identical on
 two USD scenes), `prism_python_progress` (callbacks, cancel, Ctrl-C,
 progressive sessions, cancelled commits), `prism_python_exit` (interpreter
 exit with running sessions), `prism_python_usd` (files, StageCache, unsaved
-edits, the pxr check; skipped without `pxr`), `prism_python_render_vulkan`.
+edits, the pxr check; skipped without `pxr`), `prism_python_render_vulkan`,
+`prism_python_wheel_install` (Windows: builds the wheel, installs it with
+NumPy into a fresh venv in `<build>/python_wheel/venv`, renders a scene from
+arrays with a textured glTF file and CornellBox through `prismrt.usd` with
+`PATH` reduced to System32 and the venv, no `PYTHONPATH`, `PXR_*`, `PRISM_*`
+or `OCIO`, and `python -I`; the images must be bit-identical to the build
+tree's, every loaded module must come from the venv, the base Python or
+Windows, and `import prismrt` must load no USD; pip needs NumPy from its
+cache or PyPI).
 They need pytest 9.1.1 and NumPy in the build's Python; CPU tests run with
 `PRISM_DISABLE_VULKAN=1`.
 
@@ -314,5 +397,5 @@ They need pytest 9.1.1 and NumPy in the build's Python; CPU tests run with
 ctest --test-dir <build> -C RelWithDebInfo -L python -LE gpu --output-on-failure
 ```
 
-Not yet: wheels and a relocatable layout (step 8), free-threaded Python,
+Not yet: Linux/macOS wheels, a namespaced USD in the wheel, free-threaded Python,
 `MaterialDesc` parameter overrides, GPU-resident DLPack.

@@ -2,6 +2,12 @@
 
 Phase reports, newest first. Detailed reports live in `local/reports/` (git-ignored).
 
+## 2026-10-29 - SDK step 8: Windows wheel
+- `tools/build_wheel.py --build-dir <build>` assembles `prismrt-0.2.0a9-cp311-cp311-win_amd64.whl` from a built tree (standard library only, reproducible): the package, its DLLs found through the PE import tables (MDL SDK, Embree, oneTBB, OIIO/OCIO and vcpkg dependencies, OIDN, DXC, the Vulkan loader, the MSVC runtime), the USD build for `prismrt.usd` in its own directory, the MaterialX libraries and the licences. 196 MiB (411 MiB installed). Version from `python/prismrt/_version.py` only.
+- `prismrt` reads a packaged `_build_config.py` (package-relative DLL directories and defaults; the MDL SDK loaded by full path first); `import prismrt` loads no USD.
+- Test `prism_python_wheel_install` (label python, cpu): clean venv, sanitized environment, renders from arrays + glTF and CornellBox through `prismrt.usd` bit-identical to the build tree, no DLL from outside the venv/Python/Windows.
+- Remaining: the namespaced USD (option A), Linux/macOS wheels, PyPI's 100 MiB limit. Report: `local/reports/sdk_packaging.md`.
+
 ## 2026-10-29 - SDK step 7: Python bindings
 - New package `prismrt` (`docs/python.md`): nanobind 3.1.0 extension modules `prismrt._prism` (the core over the shared `prism.dll`, with the static glTF, OBJ and image-writing modules) and `prismrt._prism_usd` (`prism_usd.dll`, imported on first use), `.pyi` stubs generated at build time, and a pure-Python layer: keyword arguments for the descriptions, `name=` on every `add_*`, `scene.params` (traverse-like; `update()` commits), `Scene.from_dict`/`to_dict` with key paths in errors, zero-copy `BufferView`s over NumPy arrays and read-only NumPy/DLPack views of images, `Image.write` through `prism_io`, exceptions that also derive from the matching builtins, the `logging` bridge, `prismrt.render(...)`. `PRISM_BUILD_PYTHON` defaults to ON when nanobind is found (`tools/deps.json`: nanobind 3.1.0, pytest 9.1.1).
 - GIL released in long calls; `commit`/`render` wait in 100 ms slices so Ctrl-C cancels and raises; callback exceptions cancel and re-raise; an `atexit` hook stops running sessions. DLLs from the build tree through `os.add_dll_directory` (a generated `_build_config.py`), with duplicated DLLs preloaded from the first directory (Embree's older `tbb12.dll` had been picked over oneTBB's).

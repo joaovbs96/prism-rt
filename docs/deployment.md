@@ -110,6 +110,14 @@ a minimal `PATH`:
 `cornell_box.png`) and `usdview.bat --quitAfterStartup` (logs "rendering on
 vulkan device").
 
+## Python wheel
+
+`tools/build_wheel.py --build-dir <build>` turns a built tree into
+`prismrt-<version>-cp311-cp311-win_amd64.whl` (the `prismrt` package with its
+DLLs, the MaterialX libraries, a USD build for `prismrt.usd` and the
+licences). Contents, size and limits: [python.md](python.md#wheel); the
+`prism_python_wheel_install` test installs it into a clean venv.
+
 ## Dependency versions
 
 `tools/deps.json` is the only list of dependency versions: OpenUSD, MaterialX

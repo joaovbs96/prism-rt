@@ -1389,6 +1389,30 @@ The Python package `prismrt` exists, tested under CTest. What landed:
   `prism_python_usd`, `prism_python_render_vulkan` (gpu). User guide:
   `docs/python.md`; decisions: `docs/DECISIONS.md` (2026-10-29).
 
+**Step 8 status (2026-10-29)**: done for Windows and CPython 3.11; the
+namespaced USD and Linux/macOS wheels remain. What landed:
+- `tools/build_wheel.py` (standard library only) assembles
+  `prismrt-0.2.0a9-cp311-cp311-win_amd64.whl` from a built tree: the package,
+  `bin/` with every DLL found by walking the PE import tables from the
+  extensions and the libraries loaded by name (MDL SDK and `nv_openimageio`,
+  OIDN's devices, DXC), the Vulkan loader and the MSVC runtime; `usd/` (the
+  USD build, found only by `prismrt.usd`); `materialx/libraries`;
+  `licenses/`; a packaged `_build_config.py` with package-relative paths.
+  About 196 MiB (411 MiB installed), reproducible byte for byte.
+- `_dll.py` reads the packaged config: `bin` for `os.add_dll_directory`, the
+  MDL SDK loaded by full path first, defaults for the MaterialX libraries,
+  the MDL path and DXC; `prismrt.usd` adds the USD directories on import.
+  The version is in `python/prismrt/_version.py` only.
+- USD: the existing build, bundled (step 7's `pxr` check kept); the private,
+  namespaced USD of 8.10 is the remaining packaging item (`docs/DECISIONS.md`).
+- `prism_python_wheel_install`: a fresh venv with the wheel and NumPy only,
+  a sanitized environment (`PATH` = System32 + the venv), `python -I`; arrays
+  plus a textured glTF file and CornellBox through `prismrt.usd`, on the CPU,
+  bit-identical to the build tree; no module loaded from outside the venv,
+  the base Python or Windows; `import prismrt` loads no USD.
+- Not built here: Linux and macOS (the import walk, rpaths, `.so`/`.dylib`
+  names, the Metal shader converter's licence); `docs/python.md` lists them.
+
 Notes:
 - Step 6 is mechanical and can move earlier if the CLI/Hydra double copy of
   globals bites (it does not today: no process loads both).
