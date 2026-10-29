@@ -11,6 +11,8 @@
 #include <pxr/usd/usd/stage.h>
 #include <pxr/usd/usd/timeCode.h>
 
+#include <string>
+#include <utility>
 #include <vector>
 
 namespace prism::usd {
@@ -28,6 +30,10 @@ struct LoadOptions {
     // Dome lights become environments (off when the front end lights the
     // scene itself, as the CLI's --env).
     bool domes = true;
+    // Materials of the scene that replace the bound material of the gprims
+    // at or under a prim path (all of their face subsets too; the longest
+    // matching path wins). The material preview binds its material this way.
+    std::vector<std::pair<pxr::SdfPath, MaterialId>> materialOverrides;
 };
 
 struct LoadResult {
@@ -53,5 +59,40 @@ PRISM_USD_API CameraDesc CameraFromGf(pxr::GfCamera const& camera);
 // when `path` is not a camera.
 PRISM_USD_API CameraDesc LoadCamera(pxr::UsdStageRefPtr const& stage, pxr::SdfPath const& path,
                                     pxr::UsdTimeCode time = pxr::UsdTimeCode::Default());
+
+// The built-in material preview (docs/material_preview.md): the USD-WG
+// StandardShaderBall (its subdivision-surface variant) in the asset's own
+// lit box, with one material bound to the ball's material surface. The stand,
+// the box and the lights keep the asset's materials and lights.
+struct MaterialPreviewOptions {
+    // The preview stage; empty: MaterialPreviewScene().
+    std::string scene;
+    pxr::UsdTimeCode time = pxr::UsdTimeCode::Default();
+};
+
+struct MaterialPreview {
+    LoadResult load;              // the stage's placements, lights and materials
+    MaterialId material;          // the previewed material (added to the scene)
+    // The document's material that is previewed (MaterialX documents: the
+    // named one, else the first), and all of the document's materials.
+    std::string materialName;
+    std::vector<std::string> documentMaterials;
+    CameraDesc camera;            // the asset's camera (not added to the scene)
+};
+
+// The shipped preview stage: $PRISM_MATERIAL_PREVIEW_SCENE when set, else
+// resources/shaderball/standard_shader_ball_scene.usda beside the prism_usd
+// library (or one directory up). Throws Error(NotFound) when there is none.
+PRISM_USD_API std::string MaterialPreviewScene();
+
+// Adds the preview stage to `scene` with `material` bound to the shaderball's
+// material surface; the caller commits and renders from `camera`. A MaterialX
+// document is checked first: a missing file throws Error(NotFound), an
+// unreadable document or one without materials Error(InvalidArgument), and a
+// materialName the document does not have Error(NotFound) (the message lists
+// its materials). Without a materialName the document's first material is
+// previewed (MaterialDesc's rule), also when it has several.
+PRISM_USD_API MaterialPreview LoadMaterialPreview(Scene& scene, MaterialDesc material,
+                                                  MaterialPreviewOptions const& options = {});
 
 } // namespace prism::usd

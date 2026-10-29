@@ -157,7 +157,7 @@ if(PRISM_BUILD_HYDRA)
         "PRISMRT_TEST_COMPARE=$<TARGET_FILE:prism_compare_images>"
         "PRISMRT_TEST_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}"
         "PRISMRT_TEST_OUTPUT=${CMAKE_BINARY_DIR}/python_tests")
-    foreach(_prism_python_test IN ITEMS api render progress exit usd vulkan)
+    foreach(_prism_python_test IN ITEMS api render progress exit usd preview vulkan)
         set(_name prism_python_${_prism_python_test})
         if(_prism_python_test STREQUAL "vulkan")
             if(NOT PRISM_ENABLE_VULKAN)

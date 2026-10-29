@@ -163,6 +163,8 @@ foreach ($dll in @("prism.dll", "prism_usd.dll")) {
     Copy-Item -LiteralPath (Join-Path $stage "bin\$dll") -Destination (Join-Path $pkg "bin")
 }
 Copy-Tree (Join-Path $stage "bin\assets") (Join-Path $pkg "bin\assets")
+# The material preview's stage, beside prism_usd.dll (docs/material_preview.md).
+Copy-Tree (Join-Path $stage "bin\resources") (Join-Path $pkg "bin\resources")
 Copy-Tree (Join-Path $stage "lib\usd\plugins") (Join-Path $pkg "lib\usd\plugins") @("*.pdb", "*.lib", "*.exp")
 Remove-Item -LiteralPath $stage -Recurse -Force
 
@@ -308,6 +310,7 @@ foreach ($name in @("usdview.bat", "prism_render.bat", "list_devices.bat", "env_
 $lic = Join-Path $pkg "licenses"
 Copy-IfExists (Join-Path $root "LICENSE") $lic "PrismRT-LICENSE.txt"
 Copy-IfExists (Join-Path $root "NOTICE") $lic "PrismRT-NOTICE.txt"
+Copy-IfExists (Join-Path $root "resources\shaderball\LICENCE") $lic "StandardShaderBall-LICENCE.txt"
 $usdSource = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $UsdviewScript))))
 foreach ($c in @((Join-Path $usdSource "LICENSE.txt"), (Join-Path $UsdRoot "LICENSE.txt"))) { Copy-IfExists $c $lic "OpenUSD-LICENSE.txt" }
 Copy-IfExists (Join-Path $UsdRoot "NOTICE.txt") $lic "OpenUSD-NOTICE.txt"

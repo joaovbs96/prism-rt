@@ -17,6 +17,7 @@ Paths in the commands are relative to the repository root.
 | `09_usd_unsaved_edits.py` | Edit a pxr stage in memory and render it without saving; the StageCache path |
 | `10_convergence_study.py` | Noise against samples per pixel, RMSE slope against a reference |
 | `11_gltf_material_swap.py` | Swap a glTF model's material for MaterialX looks; only the material recompiles |
+| `12_material_preview.py` | MaterialX looks on the built-in shaderball: `preview_material`, then one preview scene with the material swapped |
 
 ```
 . .\prism_env.ps1
@@ -25,6 +26,7 @@ python examples\python\01_quickstart_usd.py assets\scenes\CornellBox.usda
 python examples\python\03_turntable.py assets\scenes\InOneWeekend.usda --frames 24
 python examples\python\09_usd_unsaved_edits.py assets\scenes\CornellBox.usda --camera /World/Camera
 python examples\python\11_gltf_material_swap.py assets\models\Duck\Duck.glb
+python examples\python\12_material_preview.py assets\materials\standard_surface_marble_solid.mtlx assets\materials\Car_Paint_1k_8b\Car_Paint.mtlx
 ```
 
 Notes:

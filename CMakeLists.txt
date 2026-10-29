@@ -430,6 +430,28 @@ if(WIN32 AND PRISM_BUILD_HYDRA)
     endforeach()
 endif()
 
+# The material preview's stage (resources/shaderball, the USD-WG
+# StandardShaderBall; docs/material_preview.md) beside prism_usd, where
+# prism::usd::MaterialPreviewScene() finds it without environment variables.
+set(_prism_preview_root "${CMAKE_CURRENT_SOURCE_DIR}/resources/shaderball")
+file(GLOB_RECURSE _prism_preview_files CONFIGURE_DEPENDS RELATIVE "${_prism_preview_root}" "${_prism_preview_root}/*")
+list(REMOVE_ITEM _prism_preview_files ".gitattributes")
+set(_prism_preview_commands "")
+set(_prism_preview_dirs "")
+foreach(_file IN LISTS _prism_preview_files)
+    get_filename_component(_dir "${_file}" DIRECTORY)
+    if(NOT _dir IN_LIST _prism_preview_dirs)
+        list(APPEND _prism_preview_dirs "${_dir}")
+        list(APPEND _prism_preview_commands COMMAND ${CMAKE_COMMAND} -E make_directory
+            "$<TARGET_FILE_DIR:prism_usd>/resources/shaderball/${_dir}")
+    endif()
+    list(APPEND _prism_preview_commands COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${_prism_preview_root}/${_file}" "$<TARGET_FILE_DIR:prism_usd>/resources/shaderball/${_file}")
+endforeach()
+add_custom_target(prism_preview_resources ${_prism_preview_commands}
+    COMMENT "Material preview scene beside prism_usd")
+add_dependencies(prism_usd prism_preview_resources)
+
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/PrismCoreWithoutUsd.cmake")
 prism_check_core_without_usd(prism)
 
@@ -1169,6 +1191,66 @@ if(TARGET prism_hydra_render AND TARGET prism_compare_images)
     prism_add_parity_fixture(NAME cornell_box SCENE assets/scenes/CornellBox.usda)
     prism_add_parity_fixture(NAME quad_test SCENE assets/scenes/QuadTest.usda)
     prism_add_parity_fixture(NAME in_one_weekend SCENE assets/scenes/InOneWeekend.usda)
+
+    # The material preview (docs/material_preview.md). The shipped stage with
+    # a .mtlx bound in USD renders alike in both loaders, and the CLI's
+    # --material render of the same document (bound at load time) matches
+    # it; a stored reference catches changes to the preview itself.
+    # Five rect lights: the loaders order them differently, so the parity is
+    # within the noise (0.037 normalized RMSE at 0.089 between two seeds) and
+    # the mean agrees (0.0007), as for the lights fixture.
+    set(_prism_preview_args --seed 7)
+    prism_add_parity_fixture(NAME material_preview SCENE tests/hydra/fixtures/material_preview.usda
+        CAMERA /standard_shader_ball_scene/camera SPP 64 TOLERANCE 0.1 MEAN_TOLERANCE 0.01
+        ARGS ${_prism_preview_args})
+    set(_prism_preview_out "${CMAKE_BINARY_DIR}/material_preview")
+    set(_prism_preview_fixtures "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/material_preview")
+    set(_prism_preview_env ${_prism_test_environment} PRISM_DISABLE_VULKAN=1)
+    add_test(NAME prism_material_preview_render
+        COMMAND PrismRT --material "${CMAKE_CURRENT_SOURCE_DIR}/assets/materials/standard_surface_marble_solid.mtlx"
+            --width 64 --height 64 --spp 64 ${_prism_preview_args} ${_prism_fixed_sampling} --device cpu
+            --output "${_prism_preview_out}/marble.exr")
+    set_tests_properties(prism_material_preview_render PROPERTIES
+        ENVIRONMENT "${_prism_preview_env}" FIXTURES_SETUP prism_material_preview)
+    # Not bit-identical (0.006 normalized RMSE, 0.0005 mean): the stage's
+    # material comes through usdMtlx and the material service, which drop the
+    # document's colorspace="lin_rec709" (its colours are read as working-space
+    # values); --material's MaterialDesc converts them. With colorspace="acescg"
+    # the two agree (2.7e-7); see docs/material_preview.md.
+    add_test(NAME prism_material_preview_matches_stage
+        COMMAND prism_compare_images "${prism_parity_material_preview_dir}/cli/image.exr"
+            "${_prism_preview_out}/marble.exr" --tolerance 0.02 --mean-tolerance 0.005)
+    set_tests_properties(prism_material_preview_matches_stage PROPERTIES
+        FIXTURES_REQUIRED "prism_material_preview;prism_parity_material_preview")
+    # Noise floor: two seeds differ by 0.089 normalized RMSE and 0.002 mean
+    # luminance; another material (two_materials.mtlx's blue) by 0.34 and 0.24.
+    add_test(NAME prism_material_preview_reference
+        COMMAND prism_compare_images "${_prism_preview_fixtures}/reference_marble.exr"
+            "${_prism_preview_out}/marble.exr" --tolerance 0.15 --mean-tolerance 0.01)
+    set_tests_properties(prism_material_preview_reference PROPERTIES FIXTURES_REQUIRED prism_material_preview)
+    # Error cases: a missing document, a material the document does not
+    # have, options that do not apply; a document with several materials
+    # and no --material-name previews the first.
+    set(_prism_preview_quick --width 8 --height 8 --spp 1 ${_prism_fixed_sampling} --device cpu
+        --output "${_prism_preview_out}/quick.exr")
+    add_test(NAME prism_material_preview_missing_file
+        COMMAND PrismRT --material "${_prism_preview_fixtures}/missing.mtlx" ${_prism_preview_quick})
+    set_tests_properties(prism_material_preview_missing_file PROPERTIES ENVIRONMENT "${_prism_preview_env}"
+        PASS_REGULAR_EXPRESSION "PrismRT: MaterialX document '.*missing.mtlx' does not exist")
+    add_test(NAME prism_material_preview_unknown_name
+        COMMAND PrismRT --material "${_prism_preview_fixtures}/two_materials.mtlx" --material-name green
+            ${_prism_preview_quick})
+    set_tests_properties(prism_material_preview_unknown_name PROPERTIES ENVIRONMENT "${_prism_preview_env}"
+        PASS_REGULAR_EXPRESSION "has no material 'green' \\(its materials: red, blue\\)")
+    add_test(NAME prism_material_preview_scene_conflict
+        COMMAND PrismRT --material "${_prism_preview_fixtures}/two_materials.mtlx"
+            --scene "${CMAKE_CURRENT_SOURCE_DIR}/assets/scenes/CornellBox.usda" ${_prism_preview_quick})
+    set_tests_properties(prism_material_preview_scene_conflict PROPERTIES ENVIRONMENT "${_prism_preview_env}"
+        PASS_REGULAR_EXPRESSION "--scene does not apply")
+    add_test(NAME prism_material_preview_first_material
+        COMMAND PrismRT --material "${_prism_preview_fixtures}/two_materials.mtlx" ${_prism_preview_quick})
+    set_tests_properties(prism_material_preview_first_material PROPERTIES ENVIRONMENT "${_prism_preview_env}"
+        PASS_REGULAR_EXPRESSION "Material: red of .*two_materials.mtlx \\(the first of 2: red blue")
     # Render settings: material binding purposes and prism:* settings of the
     # chosen settings prim, and RenderProducts with their RenderVars.
     foreach(_settings Preview AllPurpose)
@@ -2156,6 +2238,14 @@ install(TARGETS prism prism_usd
     RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
     LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"
     ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}")
+# The material preview's stage beside prism_usd (MaterialPreviewScene()).
+if(WIN32)
+    set(_prism_preview_destination "${CMAKE_INSTALL_BINDIR}/resources")
+else()
+    set(_prism_preview_destination "${CMAKE_INSTALL_LIBDIR}/resources")
+endif()
+install(DIRECTORY resources/shaderball DESTINATION "${_prism_preview_destination}"
+    PATTERN ".gitattributes" EXCLUDE)
 install(FILES prism_env.ps1 run_usdview.ps1 prism_env.sh
     DESTINATION "${CMAKE_INSTALL_BINDIR}")
 install(PROGRAMS run_usdview.sh DESTINATION "${CMAKE_INSTALL_BINDIR}")

@@ -42,6 +42,17 @@ struct UsdLoadResult {
     std::map<std::string, CameraId> cameras;
 };
 
+// prism::usd::LoadMaterialPreview's result, with the asset's camera added to
+// the scene.
+struct UsdMaterialPreview {
+    usd::LoadResult counts;
+    MaterialId material;
+    CameraId camera;
+    CameraDesc cameraDesc;
+    std::string materialName;
+    std::vector<std::string> documentMaterials;
+};
+
 pxr::UsdTimeCode TimeOf(std::optional<double> time)
 {
     return time ? pxr::UsdTimeCode(*time) : pxr::UsdTimeCode::Default();
@@ -210,6 +221,42 @@ NB_MODULE(_prism_usd, m)
             return prism::usd::LoadCamera(CachedStage(stageId), pxr::SdfPath(camera), TimeOf(time));
         },
         "stage_id"_a, "camera"_a, "time"_a = nb::none());
+    nb::class_<UsdMaterialPreview>(m, "MaterialPreview")
+        .def_ro("material", &UsdMaterialPreview::material, "The previewed material (added to the scene).")
+        .def_ro("camera", &UsdMaterialPreview::camera, "The asset's camera (added to the scene).")
+        .def_ro("camera_desc", &UsdMaterialPreview::cameraDesc)
+        .def_ro("material_name", &UsdMaterialPreview::materialName,
+                "The document's material that is previewed (the named one, else the first).")
+        .def_ro("document_materials", &UsdMaterialPreview::documentMaterials, "All of the document's materials.")
+        .def_prop_ro("renderable_placements", [](UsdMaterialPreview const& r) { return r.counts.renderablePlacements(); })
+        .def_prop_ro("lights", [](UsdMaterialPreview const& r) { return r.counts.lights; })
+        .def("__repr__", [](UsdMaterialPreview const& r) {
+            return "MaterialPreview(material_name='" + r.materialName + "', placements=" +
+                   std::to_string(r.counts.renderablePlacements()) + ", lights=" + std::to_string(r.counts.lights) + ")";
+        });
+    m.def(
+        "load_material_preview",
+        [](PyScene& scene, prism::MaterialDesc const& material, std::string const& sceneFile,
+           std::optional<double> time) {
+            prism::usd::MaterialPreviewOptions options;
+            options.scene = sceneFile;
+            options.time = TimeOf(time);
+            nb::gil_scoped_release release;
+            const prism::usd::MaterialPreview preview = prism::usd::LoadMaterialPreview(scene.get(), material, options);
+            UsdMaterialPreview result;
+            result.counts = preview.load;
+            result.material = preview.material;
+            result.cameraDesc = preview.camera;
+            result.camera = scene.get().addCamera(preview.camera);
+            result.materialName = preview.materialName;
+            result.documentMaterials = preview.documentMaterials;
+            return result;
+        },
+        "scene"_a, "material"_a, "scene_file"_a = std::string(), "time"_a = nb::none(),
+        "Adds the built-in material preview (the StandardShaderBall in its lit box) to the scene with the "
+        "material bound to the ball's surface, and the asset's camera.");
+    m.def("material_preview_scene", &prism::usd::MaterialPreviewScene,
+          "The shipped material preview stage (PRISM_MATERIAL_PREVIEW_SCENE overrides it).");
     m.def(
         "default_dome_texture",
         [] {

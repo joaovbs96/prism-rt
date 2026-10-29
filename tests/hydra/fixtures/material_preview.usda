@@ -1,0 +1,35 @@
+#usda 1.0
+(
+    defaultPrim = "standard_shader_ball_scene"
+    metersPerUnit = 0.01
+    upAxis = "Y"
+    subLayers = [
+        @../../../resources/shaderball/standard_shader_ball_scene.usda@
+    ]
+)
+
+# The material preview's stage (resources/shaderball, the USD-WG
+# StandardShaderBall: subdivision surfaces, rect lights, a textured box) with
+# a .mtlx material bound to the ball's material surface in USD, as
+# PrismRT --material binds it at load time (docs/material_preview.md). The
+# CLI and Hydra render it from the asset's camera (prism_parity_material_preview),
+# and the CLI's --material render of the same document is compared with it
+# (prism_material_preview_matches_stage).
+over "standard_shader_ball_scene"
+{
+    over "shader_ball"
+    {
+        over "material_surface" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            rel material:binding = </standard_shader_ball_scene/preview_materials/Marble_3D>
+        }
+    }
+
+    def Scope "preview_materials" (
+        prepend references = @../../../assets/materials/standard_surface_marble_solid.mtlx@</MaterialX/Materials>
+    )
+    {
+    }
+}

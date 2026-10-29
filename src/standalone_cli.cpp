@@ -56,6 +56,9 @@ std::string DefaultDomeTexture()
 
 struct Options {
     std::string scene, camera, environment, output = "output.exr";
+    // The material preview (--material, --material-name): a MaterialX
+    // document on the built-in shaderball instead of a scene.
+    std::string material, materialName;
     std::string environmentSampling = "mis", textureFiltering = "filtered";
     // UsdRender settings prim (empty: the stage's renderSettingsPrimPath) and
     // the directory its relative product names resolve against.
@@ -103,7 +106,12 @@ struct Options {
 void help() {
     std::cout << "PrismRT --scene FILE --camera /Camera [options]\n"
         "PrismRT --scene FILE --camera-position x,y,z --camera-target x,y,z [options]\n"
+        "PrismRT --material FILE.mtlx [--material-name NAME] [options]\n"
         "  Supported scene formats: USD, glTF, GLB, OBJ\n"
+        "  --material renders a MaterialX document on the built-in shaderball (the USD-WG\n"
+        "                 StandardShaderBall in its own lit box, with its camera; default 512x512;\n"
+        "                 docs/material_preview.md). --material-name picks one of the document's\n"
+        "                 materials (default: the first)\n"
         "  --camera-up 0,1,0 --vfov 40 --focus-distance 10 --defocus-angle 0\n"
         "  --env FILE --env-exposure STOPS (or --env-color r,g,b)\n"
         "  --width 1280 --height 720 --spp 2048 (with adaptive sampling, the per-pixel maximum)\n"
@@ -210,6 +218,8 @@ Options parse(int argc, char** argv) {
         const std::string value = argv[++i];
         o.given.insert(key);
         if (key == "--scene") o.scene = value;
+        else if (key == "--material") o.material = value;
+        else if (key == "--material-name") o.materialName = value;
         else if (key == "--camera") o.camera = value;
         else if (key == "--camera-position") o.cameraPosition = triple(value);
         else if (key == "--camera-target") o.cameraTarget = triple(value);
@@ -304,9 +314,22 @@ Options parse(int argc, char** argv) {
         }
         else throw std::runtime_error("Unknown option: " + key);
     }
+    if (!o.materialName.empty() && o.material.empty())
+        throw std::runtime_error("--material-name requires --material");
+    if (!o.material.empty()) {
+        // The preview has its scene, camera and settings.
+        for (const char* flag : {"--scene", "--camera", "--camera-position", "--camera-target", "--camera-up",
+                                 "--vfov", "--focus-distance", "--defocus-angle", "--render-settings", "--output-dir"})
+            if (o.given.count(flag))
+                throw std::runtime_error(std::string("--material renders the built-in preview scene; ") + flag +
+                                         " does not apply");
+        if (!o.widthSet) o.width = 512;
+        if (!o.heightSet) o.height = 512;
+        return o;
+    }
     // The camera may also come from the stage's render settings.
     if (o.scene.empty())
-        throw std::runtime_error("--scene and an explicit camera source are required (see --help)");
+        throw std::runtime_error("--scene and an explicit camera source, or --material, are required (see --help)");
     const bool explicitCamera = o.cameraPosition.has_value() && o.cameraTarget.has_value();
     if ((!o.camera.empty() && (o.cameraPosition || o.cameraTarget || o.explicitLens)) ||
         (o.cameraPosition.has_value() != o.cameraTarget.has_value()))
@@ -641,6 +664,8 @@ int runStandaloneCli(int argc, char** argv) {
         ProgressPrinter progress(o.progress);
         auto start = std::chrono::steady_clock::now();
         auto seconds =[&] { return std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count(); };
+        // --material: the built-in preview scene (prism::usd::LoadMaterialPreview).
+        const bool preview = !o.material.empty();
         const auto extension = std::filesystem::path(o.scene).extension().string();
         const bool isUsd = extension == ".usd" || extension == ".usda" || extension == ".usdc" || extension == ".usdz";
         UsdStageRefPtr stage;
@@ -681,8 +706,8 @@ int runStandaloneCli(int argc, char** argv) {
         } else {
             prism::output::RenderProductRequest view;
             if (job) view = job->base;
-            if (o.camera.empty() && !explicitCamera) o.camera = view.camera.GetString();
-            if (o.camera.empty() && !explicitCamera)
+            if (!preview && o.camera.empty() && !explicitCamera) o.camera = view.camera.GetString();
+            if (!preview && o.camera.empty() && !explicitCamera)
                 throw std::runtime_error("--scene and an explicit camera source are required (see --help)");
             view.camera = o.camera.empty() ? SdfPath() : SdfPath(o.camera);
             // The authored data window applies to the requested size.
@@ -754,7 +779,7 @@ int runStandaloneCli(int argc, char** argv) {
             if (view.width <= 0 || view.height <= 0 ||
                 static_cast<uint64_t>(view.dataWidth) * view.dataHeight > std::numeric_limits<unsigned>::max() / 4)
                 throw std::runtime_error("Authored render resolution is invalid or too large");
-            if (view.camera.IsEmpty() && !explicitCamera)
+            if (view.camera.IsEmpty() && !explicitCamera && !preview)
                 throw std::runtime_error("Render product <" + view.path.GetString() + "> has no camera");
         }
         // The cameras, checked before the scene loads: USD cameras with their
@@ -777,8 +802,10 @@ int runStandaloneCli(int argc, char** argv) {
             camera.SetClippingRange(GfRange1f(0.001f, 1e30f));
             return prism::usd::CameraFromGf(camera);
         };
+        // The preview's camera comes with its scene, below.
         std::vector<prism::CameraDesc> cameras;
-        for (auto const& view : views) cameras.push_back(cameraFor(view));
+        if (!preview)
+            for (auto const& view : views) cameras.push_back(cameraFor(view));
         progress.Stage("Loading scene");
         // The scene, through the public API: the loaders add to it and its
         // commit converts meshes, compiles materials and builds the
@@ -797,7 +824,23 @@ int runStandaloneCli(int argc, char** argv) {
         sceneOptions.defaultDome = o.defaultDome;
         if (o.defaultDome) sceneOptions.defaultDomeTexture = DefaultDomeTexture();
         prism::Scene scene = renderer.createScene(sceneOptions);
-        if (isUsd) {
+        std::string previewNote;
+        if (preview) {
+            prism::MaterialDesc material;
+            material.kind = prism::MaterialDesc::Kind::MaterialXFile;
+            material.path = o.material;
+            material.materialName = o.materialName;
+            prism::usd::MaterialPreviewOptions previewOptions;
+            previewOptions.time = time;
+            const prism::usd::MaterialPreview loaded = prism::usd::LoadMaterialPreview(scene, material, previewOptions);
+            cameras.assign(views.size(), loaded.camera);
+            previewNote = "Material: " + loaded.materialName + " of " + o.material;
+            if (o.materialName.empty() && loaded.documentMaterials.size() > 1) {
+                previewNote += " (the first of " + std::to_string(loaded.documentMaterials.size()) + ":";
+                for (auto const& name : loaded.documentMaterials) previewNote += " " + name;
+                previewNote += "; --material-name picks another)";
+            }
+        } else if (isUsd) {
             prism::usd::LoadOptions load;
             if (job) {
                 load.bindingPurposes.assign(job->materialBindingPurposes.begin(), job->materialBindingPurposes.end());
@@ -839,6 +882,7 @@ int runStandaloneCli(int argc, char** argv) {
         progress.Stage("Building the scene");
         scene.commit();
         progress.Stage("");
+        if (!previewNote.empty()) std::cout << previewNote << '\n';
         if (const char* report = std::getenv("PRISM_GPU_PROGRAM_REPORT"); report && *report == '1') {
             // Diagnostics without a GPU device (an internal hook).
             if (!prism::device::ReportGpuPrograms(prism::detail::SceneAccess::committed(scene), std::cout,

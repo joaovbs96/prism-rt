@@ -98,6 +98,16 @@ from .transforms import Camera, identity, look_at, rotate, scale, translate  # n
 from . import gltf, io, obj, scene_dict, transforms  # noqa: E402,F401
 
 
+def preview_material(material, **kwargs) -> RenderResult:
+    """Renders a MaterialX material (a .mtlx path, XML text or a
+    ``MaterialX.Document``) on the built-in shaderball: ``PrismRT --material``
+    in Python (prismrt.usd.preview_material; loads USD on first use). Keywords:
+    ``material_name``, ``width=512``, ``height=512``, ``samples``,
+    ``device="auto"``, ``renderer`` and create_session's."""
+    import importlib
+    return importlib.import_module(".usd", __name__).preview_material(material, **kwargs)
+
+
 def __getattr__(name: str):
     # prismrt.usd loads USD (prism_usd.dll) on first use.
     if name == "usd":

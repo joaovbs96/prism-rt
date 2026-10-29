@@ -30,7 +30,8 @@ import sys
 from . import _dll  # DLL directories first
 from ._api import Scene
 
-__all__ = ["load", "load_cached", "load_camera", "default_dome_texture", "check_pxr", "LoadResult"]
+__all__ = ["load", "load_cached", "load_camera", "default_dome_texture", "check_pxr", "LoadResult",
+           "load_material_preview", "material_preview_scene", "preview_material", "MaterialPreview"]
 
 
 def _loaded_module(name: str) -> str | None:
@@ -101,7 +102,9 @@ _add_usd_directories()
 from . import _prism_usd as _native  # noqa: E402
 
 LoadResult = _native.LoadResult
+MaterialPreview = _native.MaterialPreview
 default_dome_texture = _native.default_dome_texture
+material_preview_scene = _native.material_preview_scene
 
 
 def _time(time):
@@ -164,6 +167,79 @@ def _with_stage(stage, cached, layers):
         return cached(stage_id.ToLongInt())
     session = stage.GetSessionLayer()
     return layers(stage.GetRootLayer().identifier, session.identifier if session else "")
+
+
+def _material_desc(material, material_name, search_path):
+    """A MaterialDesc of a .mtlx path, MaterialX XML text or a ``MaterialX.Document``."""
+    from . import _prism
+    desc = _prism.MaterialDesc()
+    if isinstance(material, _prism.MaterialDesc):
+        desc = material
+    elif hasattr(material, "getMaterialNodes"):
+        import MaterialX  # the caller's MaterialX; serialised here (as Scene.add_material)
+        desc.kind, desc.document = "materialx_string", MaterialX.writeToXmlString(material)
+        # Textures resolve against the document's own file, when it has one.
+        source = material.getSourceUri() if hasattr(material, "getSourceUri") else ""
+        if search_path is None and source and os.path.isfile(source):
+            search_path = os.path.dirname(os.path.abspath(source))
+    elif isinstance(material, str) and material.lstrip().startswith("<"):
+        desc.kind, desc.document = "materialx_string", material
+    elif isinstance(material, (str, os.PathLike)):
+        desc.kind, desc.path = "materialx_file", os.fspath(material)
+    else:
+        raise TypeError("expected a .mtlx path, MaterialX XML text, a MaterialX.Document or a MaterialDesc, got "
+                        f"{type(material).__name__}")
+    if material_name is not None:
+        desc.material_name = str(material_name)
+    if search_path is not None:
+        desc.search_path = os.fspath(search_path)
+    return desc
+
+
+def load_material_preview(scene: Scene, material, *, material_name: str | None = None, search_path=None,
+                          scene_file=None, time=None, name: str | None = None) -> "MaterialPreview":
+    """Adds the built-in material preview to ``scene``: the USD-WG
+    StandardShaderBall (subdivision surfaces) in the asset's lit box, with
+    ``material`` bound to the ball's surface, and the asset's camera
+    (``result.camera``; named ``preview_camera``). ``material``: a .mtlx
+    path, MaterialX XML text or a ``MaterialX.Document``; ``material_name``
+    picks one of its materials (default: the first; see
+    ``result.document_materials``). The material is named ``name`` (default:
+    ``preview_material``). ``scene_file``: another preview stage with the
+    same prims (default: the shipped one). Raises NotFoundError for a
+    missing file or an unknown ``material_name``, InvalidArgumentError for a
+    document without materials. The caller commits and renders."""
+    desc = _material_desc(material, material_name, search_path)
+    material_label = name if name is not None else "preview_material"
+    scene._check_name(material_label)
+    scene._check_name("preview_camera")
+    preview = _native.load_material_preview(scene._native, desc, os.fspath(scene_file) if scene_file else "",
+                                            _time(time))
+    scene._register("material", preview.material, desc, material_label)
+    scene._register("camera", preview.camera, preview.camera_desc, "preview_camera")
+    return preview
+
+
+def preview_material(material, *, material_name: str | None = None, width: int = 512, height: int = 512,
+                     samples: int | None = None, device="auto", renderer=None, search_path=None,
+                     aovs=("color",), progress=None, **kwargs):
+    """Renders ``material`` (a .mtlx path, MaterialX XML text or a
+    ``MaterialX.Document``) on the built-in shaderball and returns the
+    RenderResult: ``PrismRT --material`` in Python, with the CLI's defaults
+    (sample clamp 10). ``renderer``: a Renderer to reuse (default: a new one
+    from the environment). Other keywords are create_session's
+    (``seed=1, adaptive_threshold=0``, ...)."""
+    from ._api import Renderer
+    renderer = renderer if renderer is not None else Renderer()
+    scene = renderer.create_scene()
+    preview = load_material_preview(scene, material, material_name=material_name, search_path=search_path)
+    scene.commit()
+    kwargs.setdefault("sample_clamp", 10.0)  # the CLI's --max-sample-radiance default
+    if samples is not None:
+        kwargs["samples"] = samples
+    session = renderer.create_session(scene, device=device, width=width, height=height, camera=preview.camera,
+                                      aovs=list(aovs), **kwargs)
+    return session.render(progress)
 
 
 def load_cached(scene: Scene, stage_id, **kwargs) -> "LoadResult":

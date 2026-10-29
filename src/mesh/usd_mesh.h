@@ -541,8 +541,22 @@ public:
     // prototype per radius). The scene's commit converts them as this loader
     // did: polygon meshes baked into world space, refined, displaced and
     // instanced meshes as prototypes placed by Embree instances.
-    void emit(prism::Scene& scene, LinkCategories const& categories)
+    // `overrides`: scene materials that replace the bound ones of the
+    // placements at or under a prim path (prism::usd::LoadOptions::
+    // materialOverrides; the longest matching path wins).
+    void emit(prism::Scene& scene, LinkCategories const& categories,
+              std::vector<std::pair<pxr::SdfPath, prism::MaterialId>> const& overrides = {})
     {
+        auto overrideOf = [&](pxr::SdfPath const& path) {
+            prism::MaterialId found;
+            size_t depth = 0;
+            for (auto const& [root, material] : overrides)
+                if (path.HasPrefix(root) && root.GetPathElementCount() + 1 > depth) {
+                    found = material;
+                    depth = root.GetPathElementCount() + 1;
+                }
+            return found;
+        };
         std::map<Material const*, prism::MaterialId> ids;
         auto idOf = [&](Material* material) -> prism::MaterialId {
             if (!material) return {};
@@ -585,6 +599,11 @@ public:
             if (!meshes[placement.shape]) continue;
             prism::InstanceDesc instance = instanceOf(placement.ids, placement.world, placement.instancePrimvars);
             instance.prototype = meshes[placement.shape];
+            if (const prism::MaterialId forced = overrideOf(placement.ids.path)) {
+                instance.materials.push_back(forced);
+                scene.addInstance(instance);
+                continue;
+            }
             instance.materials.push_back(idOf(material_override ? material_override : placement.material));
             if (!material_override)
                 for (auto const& cover : m_shapes[placement.shape]->coverSets) {
@@ -612,7 +631,9 @@ public:
             }
             prism::InstanceDesc instance = instanceOf(placement.ids, placement.world, placement.instancePrimvars);
             instance.prototype = prototype;
-            instance.materials.push_back(idOf(material_override ? material_override : placement.material));
+            const prism::MaterialId forced = overrideOf(placement.ids.path);
+            instance.materials.push_back(forced ? forced
+                                                : idOf(material_override ? material_override : placement.material));
             scene.addInstance(instance);
         }
     }

@@ -262,7 +262,7 @@ LoadResult Load(Scene& scene, UsdStageRefPtr const& stage, LoadOptions const& op
     reader.emit(scene, links.active() ? USDMesh::LinkCategories(
         [&](SdfPath const& path, std::vector<std::string>* light, std::vector<std::string>* shadow) {
             links.categories(path, light, shadow);
-        }) : USDMesh::LinkCategories());
+        }) : USDMesh::LinkCategories(), options.materialOverrides);
 
     for (auto const& light : lights) scene.addLight(light);
     for (auto const& dome : domes) scene.addEnvironment(dome);

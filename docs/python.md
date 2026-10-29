@@ -338,6 +338,42 @@ CLI lights scenes without lights with usdview's default dome
 and the same settings, Python and CLI images are bit-identical
 (`prism_python_render`).
 
+## Material preview
+
+```python
+result = prism.preview_material("look.mtlx", width=512, height=512, samples=256)   # PrismRT --material
+result = prism.preview_material(mx_document, material_name="Gold", device="cpu", seed=1, adaptive_threshold=0)
+
+scene = renderer.create_scene()                         # or into a scene of your own
+preview = prism.usd.load_material_preview(scene, "look.mtlx")
+preview.material_name, preview.document_materials      # "Marble_3D", ["Marble_3D"]
+scene.commit()
+session = renderer.create_session(scene, camera=preview.camera, width=512, height=512, sample_clamp=10.0)
+scene.update_material("preview_material", kind="materialx_file", path="other.mtlx", material_name="")
+```
+
+- `preview_material(material, *, material_name=None, width=512, height=512,
+  samples=None, device="auto", renderer=None, search_path=None,
+  aovs=("color",), progress=None, **session_kwargs)` renders a material on
+  the built-in shaderball (the USD-WG StandardShaderBall, subdivision
+  surfaces, in its own lit box; `docs/material_preview.md`) and returns the
+  `RenderResult`. It loads `prismrt.usd` on first use (the scene is USD) and
+  uses the CLI's sample clamp (10) unless `sample_clamp=` says otherwise, so
+  it matches `PrismRT --material` bit for bit with the same settings
+  (`prism_python_preview`).
+- `material`: a `.mtlx` path, MaterialX XML text (a string starting with
+  `<`) or a `MaterialX.Document` (serialised; textures resolve beside its
+  source file, else `search_path`).
+- `prismrt.usd.load_material_preview(scene, material, *, material_name=None,
+  search_path=None, scene_file=None, time=None, name=None)` adds the preview
+  to a scene: the material (named `preview_material`, or `name`), the
+  asset's camera (`preview_camera`) and the stage's lights and geometry.
+  `material_preview_scene()` is the shipped stage's path.
+- Without `material_name` the document's first material is previewed
+  (`document_materials` lists them all); a missing file or an unknown
+  `material_name` raises `NotFoundError` (with the document's materials), a
+  document that cannot be read or has none `InvalidArgumentError`.
+
 ## Errors and logging
 
 | Exception | Also a | C++ `ErrorCode` |

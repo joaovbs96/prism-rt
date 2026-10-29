@@ -84,6 +84,8 @@ For standalone rendering, initialize the same environment with `. ./prism_env.ps
 ./build/RelWithDebInfo/PrismRT.exe --scene assets/scenes/InOneWeekend.usda --camera /World/Camera --spp 256 --output render.exr
 # or every RenderProduct of the scene's RenderSettings, with its RenderVars as EXR layers:
 ./build/RelWithDebInfo/PrismRT.exe --scene scene.usda --output-dir renders
+# or a MaterialX document on the built-in shaderball (docs/material_preview.md):
+./build/RelWithDebInfo/PrismRT.exe --material assets/materials/standard_surface_marble_solid.mtlx --output marble.png
 ```
 
 On macOS, use the `prism-hydra-mac` preset (`cmake --preset prism-hydra-mac`, `cmake --build --preset prism-hydra-mac`), `. ./prism_env.sh` for the environment, and `./run_usdview.sh scene.usda` for usdview. Pick a device for usdview with `PRISM_DEVICE`:
@@ -108,4 +110,6 @@ No arguments display CLI help. USD, glTF/GLB and OBJ scene files are supported; 
 ---------------------------------------
 
 This project is licensed under the Apache License, Version 2.0. Please see the file [LICENSE](./LICENSE) for the full license text and [NOTICE](./NOTICE) for the copyright notice.
+
+The material preview's scene in `resources/shaderball` is the [Standard Shader Ball](https://github.com/usd-wg/assets/tree/main/full_assets/StandardShaderBall) of the USD Working Group's assets (geometry and textures by Chris Rydalch, specification and validation by André Mazzone, after Thomas Anagnostou's original scene), used unchanged under the [Creative Commons Attribution 4.0 International licence](https://creativecommons.org/licenses/by/4.0/) (`resources/shaderball/LICENCE`, `resources/shaderball/ATTRIBUTION.md`).
 
