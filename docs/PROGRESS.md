@@ -2,6 +2,10 @@
 
 Phase reports, newest first. Detailed reports live in `local/reports/` (git-ignored).
 
+## 2026-10-29 - Fix: spare-bank edit check missed a legal ordering
+- `prism_hydra_scene_bridge_test` failed about 1 run in 50-100 with "spare job interrupted by an edit was not accounted for" (case C). The edit's cancel races the small spare-bank job: usually the cancel lands first (spare discarded, the edit rebuilds and installs its own spare: 1 discarded + 1 installed), but sometimes the spare finishes first and is installed, and the edit is replayed on it (0 discarded + 1 installed, one reused build). The delegate handles both as designed (case F covers the second); the test only accepted the first. Not a product bug: the edit was displayed and the following edit reused a bank in the failing runs.
+- Case C now accepts either ordering, with the exact counters of each, and runs a second pass that waits for the spare first (fails 5/5 with the old check). New CTest `prism_hydra_spare_bank_edit` (`prism_hydra_scene_bridge_test spare-bank-edit cpu`) runs case C alone. CPU: 2/200 failures before, 0/200 after. Details in `local/reports/spare_bank_flake.md`.
+
 ## 2026-10-28 — Free camera with a huge far clip converges
 - A host camera set with `SetCameraState` and a far clip of 1e30 restarted the accumulation on every `Render()` (0 samples after 60 s; present since v0.1.0). Cause: Hydra derives the camera's clipping range from the matrices, and the far comes back as -inf, so the projection Hydra builds has NaN depth terms; NaN never equals itself, so `Prepare` saw a new camera each frame (and the rays came from a NaN projection).
 - Fix: `CameraFromPass` repairs an unbounded far plane (far set to 1e30, depth terms rebuilt; sane cameras untouched), and `Prepare` compares camera states bitwise (`CameraStatesIdentical`), so the camera counts as changed only when the host's input changed. Test: free cameras with far 1e30 and an infinite-far projection in `prism_hydra_pass_camera_test` (failed before: no convergence, revision above 6000; passes now with finite pixels).
