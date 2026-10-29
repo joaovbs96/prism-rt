@@ -39,3 +39,8 @@ endif()
 if(DEFINED ENV{PRISM_VK_OIDN_ROOT})
     set(vk_oidn_DIR "$ENV{PRISM_VK_OIDN_ROOT}/lib/cmake/vk_oidn" CACHE PATH "vk_oidn package config")
 endif()
+# Optional: the Python package prismrt (PRISM_BUILD_PYTHON; docs/python.md): nanobind from
+# `pip install --no-deps --target <prefix> nanobind==<tools/deps.json version>`.
+if(DEFINED ENV{PRISM_NANOBIND_ROOT})
+    set(nanobind_DIR "$ENV{PRISM_NANOBIND_ROOT}/nanobind/cmake" CACHE PATH "nanobind package config")
+endif()

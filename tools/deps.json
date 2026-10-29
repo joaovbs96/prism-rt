@@ -33,7 +33,11 @@
   },
   "python": {
     "version": "3.11",
-    "packages": { "PySide6": "6.7.2", "PyOpenGL": "3.1.7", "numpy": "2.2.6", "opencolorio": "2.6.0" }
+    "packages": { "PySide6": "6.7.2", "PyOpenGL": "3.1.7", "numpy": "2.2.6", "opencolorio": "2.6.0", "pytest": "9.1.1" }
+  },
+  "nanobind": {
+    "_comment": "Python bindings (python/, docs/python.md): pip install --no-deps --target <prefix> nanobind==<version>, then nanobind_DIR=<prefix>/nanobind/cmake. The wheel carries robin_map. vcpkg's port of the same version builds its own CPython, so it is not used.",
+    "version": "3.1.0"
   },
   "vulkan_sdk": { "version": "1.4.321.0" },
   "vcpkg": {

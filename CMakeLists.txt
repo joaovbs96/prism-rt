@@ -2106,6 +2106,9 @@ if(PRISM_BUILD_HYDRA)
     endif()
 endif()
 
+# The Python package and its tests (docs/python.md).
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/PrismPython.cmake")
+
 # Every test is labelled cpu or gpu. GPU tests are those that may open a render
 # device (the Hydra delegate's default "auto" picks Vulkan or Metal when one
 # is available), plus the comparisons whose fixtures are GPU renders, since
@@ -2125,7 +2128,8 @@ set(_prism_gpu_test_regex
     "|^prism_denoise_metal_.*$"
     "|^prism_light_shaping_.*_vulkan$"
     "|^prism_textured_emitters?(_glass)?_vulkan_(render|parity)$"
-    "|^prism_thin_walled_glass_vulkan_(render|parity)$")
+    "|^prism_thin_walled_glass_vulkan_(render|parity)$"
+    "|^prism_python_render_vulkan$")
 string(JOIN "" _prism_gpu_test_regex ${_prism_gpu_test_regex})
 get_property(_prism_tests DIRECTORY PROPERTY TESTS)
 foreach(_test IN LISTS _prism_tests)
@@ -2135,10 +2139,12 @@ foreach(_test IN LISTS _prism_tests)
     if(NOT _prism_timeout)
         set_tests_properties(${_test} PROPERTIES TIMEOUT 600)
     endif()
+    # Appended: some tests carry another label too (python).
     if(_test MATCHES "${_prism_gpu_test_regex}")
-        set_tests_properties(${_test} PROPERTIES LABELS gpu RESOURCE_LOCK gpu)
+        set_property(TEST ${_test} APPEND PROPERTY LABELS gpu)
+        set_tests_properties(${_test} PROPERTIES RESOURCE_LOCK gpu)
     else()
-        set_tests_properties(${_test} PROPERTIES LABELS cpu)
+        set_property(TEST ${_test} APPEND PROPERTY LABELS cpu)
     endif()
 endforeach()
 

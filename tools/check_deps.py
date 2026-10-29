@@ -19,7 +19,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-DOCS = ["docs/windows_vulkan.md", "docs/deployment.md", "docs/hydra.md",
+DOCS = ["docs/windows_vulkan.md", "docs/deployment.md", "docs/hydra.md", "docs/python.md",
         "README.md", "tools/package/README.txt"]
 HISTORICAL = "<!-- deps: historical -->"
 
@@ -42,6 +42,8 @@ def expected_versions(deps):
         "PyOpenGL": packages["PyOpenGL"],
         "numpy": packages["numpy"],
         "PyOpenColorIO": packages["opencolorio"],
+        "pytest": packages["pytest"],
+        "nanobind": deps["nanobind"]["version"],
         "Vulkan SDK": deps["vulkan_sdk"]["version"],
         "OpenImageIO": deps["vcpkg"]["openimageio"],
         "OpenColorIO": deps["vcpkg"]["opencolorio"],
