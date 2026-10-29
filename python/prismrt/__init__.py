@@ -23,8 +23,7 @@ import os as _os
 import sys as _sys
 
 from . import _dll  # noqa: F401 - DLL directories before the extension loads
-
-__version__ = "0.2.0.dev0"
+from ._version import __version__  # noqa: F401
 
 
 def _check_runtime() -> None:

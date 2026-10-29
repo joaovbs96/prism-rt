@@ -18,7 +18,7 @@ from typing import Any, Callable, Iterable, Mapping
 
 import numpy as np
 
-from . import _prism
+from . import _dll, _prism
 from .errors import InvalidArgumentError, NotFoundError
 
 __all__ = ["Renderer", "Scene", "Session", "render", "devices", "buffer"]
@@ -202,6 +202,10 @@ class Renderer:
                  sss_fallback: bool | None = None):
         if options is None:
             options = _prism.RendererOptions.from_environment() if env else _prism.RendererOptions()
+            if _dll.PACKAGED and not options.materials.materialx_libraries:
+                # A wheel's own MaterialX libraries (env=False, or the variable set empty).
+                options.materials.materialx_libraries = _dll.package_path("materialx/libraries")
+                options.materials.materialx_mdl_path = _dll.package_path("materialx/libraries/mdl")
         if working_space is not None:
             options.color.working_space = working_space
         if color_config is not None:

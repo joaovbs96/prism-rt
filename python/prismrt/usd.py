@@ -17,6 +17,9 @@ another USD build would crash rather than fail: importing this module checks
 that an already-imported ``pxr`` reports the version prismrt.usd was built
 with and loaded the same ``usd_usd`` library, and raises ImportError
 otherwise. Import ``pxr`` before PySide6 (PySide6 ships an old msvcp140.dll).
+
+The wheel carries its own USD build (not namespaced yet; docs/python.md):
+pass file paths, and do not import another ``pxr`` in the same process.
 """
 
 from __future__ import annotations
@@ -24,7 +27,7 @@ from __future__ import annotations
 import os
 import sys
 
-from . import _dll  # noqa: F401 - DLL directories first
+from . import _dll  # DLL directories first
 from ._api import Scene
 
 __all__ = ["load", "load_cached", "load_camera", "default_dome_texture", "check_pxr", "LoadResult"]
@@ -75,6 +78,7 @@ def check_pxr() -> None:
             f"{'.'.join(map(str, found))} ({os.path.dirname(sys.modules['pxr'].__file__)}): both must be the "
             "same USD build in one process (docs/python.md)")
     library = getattr(_build_config, "USD_LIBRARY", "")
+    library = _dll.package_path(library) if library else ""
     loaded = _loaded_module(os.path.basename(library)) if library else None
     if library and loaded and not _same_file(loaded, library):
         raise ImportError(
@@ -82,7 +86,18 @@ def check_pxr() -> None:
             "build in one process (docs/python.md)")
 
 
+def _add_usd_directories() -> None:
+    """A wheel's private USD (its DLLs and plug-in resources) is found only
+    once prismrt.usd is imported, so ``import prismrt`` loads no USD."""
+    try:
+        from . import _build_config
+    except ImportError:
+        return
+    _dll.add_directories(getattr(_build_config, "USD_DLL_DIRECTORIES", ()))
+
+
 check_pxr()  # before prism_usd.dll loads (it would reuse an already-loaded usd_usd.dll)
+_add_usd_directories()
 from . import _prism_usd as _native  # noqa: E402
 
 LoadResult = _native.LoadResult
