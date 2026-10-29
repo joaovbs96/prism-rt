@@ -4,6 +4,7 @@
 #include "../materialx/material_service.h"
 #include "environment_cache.h"
 #include "render_buffer.h"
+#include "../scene/revision_parts.h"
 #include "../session/session_internal.h"
 #include "../mesh/mesh_conversion.h"
 #include "../usd/usd_mesh_source.h"
@@ -577,7 +578,7 @@ struct Snapshot {
     // With several domes: each of them; `environment` is then their composite.
     std::vector<std::unique_ptr<Environment>> domeEnvironments;
     // Light/shadow-link categories of the lights, as bits (SceneLight).
-    std::unordered_map<TfToken, uint32_t, TfToken::HashFunctor> lightLinkBits, shadowLinkBits;
+    prism::revision::LinkCategories<TfToken, TfToken::HashFunctor> lightLinkBits, shadowLinkBits;
     std::unordered_map<unsigned int, int> geomToPrimId;
     std::unordered_map<unsigned int, SharedFaceTable> geomToCoarseFaces;
     std::unordered_map<unsigned int, int> geomToInstanceId;
@@ -864,32 +865,15 @@ unsigned int _AttachPrototype(Snapshot *snapshot, SdfPath const &path,
                               GfMatrix4d const &world)
 {
     const auto commitStart = std::chrono::steady_clock::now();
-    RTCGeometry instance = rtcNewGeometry(snapshot->device,
-                                           RTC_GEOMETRY_TYPE_INSTANCE);
-    rtcSetGeometryInstancedScene(instance, prototype.scene);
-    float transform[16];
-    // GfMatrix uses row-vector notation; transpose into Embree's column-major
-    // affine convention.
-    for (int column = 0; column < 4; ++column)
-        for (int row = 0; row < 4; ++row)
-            transform[column * 4 + row] = static_cast<float>(world[column][row]);
-    rtcSetGeometryTransform(instance, 0, RTC_FORMAT_FLOAT4X4_COLUMN_MAJOR,
-                            transform);
-    rtcCommitGeometry(instance);
-    const unsigned int id = rtcAttachGeometry(snapshot->scene->scene, instance);
-    rtcReleaseGeometry(instance);
+    // As the public scene places its instances (src/scene/revision_parts.h);
+    // Embree numbers the delegate's placements.
+    const prism::Matrix4d matrix = prism::usd::ToMatrix4d(world);
+    const unsigned int id = prism::revision::AttachInstance(
+        snapshot->device, snapshot->scene->scene, prototype.scene, matrix);
     snapshot->scene->geometry.emplace(id, prototype.geometry);
     snapshot->scene->intersection_geometry.emplace(id, prototype.geometry->geom);
-    SceneManager::PlacementTransform placement;
-    const GfMatrix4d normal = world.GetInverse().GetTranspose();
-    for (int row = 0; row < 3; ++row) for (int column = 0; column < 3; ++column) {
-        placement.normal[row * 3 + column] = static_cast<float>(normal[row][column]);
-        placement.tangent[row * 3 + column] = static_cast<float>(world[row][column]);
-    }
-    placement.mirrored = world.GetDeterminant() < 0.0;
-    placement.flipOrientation = placement.mirrored &&
-        prototype.geometry->type == RTC_GEOMETRY_TYPE_TRIANGLE;
-    snapshot->scene->placement_transforms.emplace(id, placement);
+    snapshot->scene->placement_transforms.emplace(id, prism::revision::PlacementTransformOf(
+        matrix, prototype.geometry->type == RTC_GEOMETRY_TYPE_TRIANGLE));
     snapshot->scene->placement_materials.emplace(id, prototype.binding);
     snapshot->scene->disabled_placements.erase(id);
     snapshot->placementEnabled[id] = true;
@@ -909,28 +893,10 @@ void _SetInstanceTransform(Snapshot *snapshot, unsigned int id,
 {
     auto const previous = snapshot->placementMatrices.find(id);
     if (previous != snapshot->placementMatrices.end() && previous->second == world) return;
-    RTCGeometry instance = rtcGetGeometry(snapshot->scene->scene, id);
-    if (!instance) return;
-    float transform[16];
-    for (int column = 0; column < 4; ++column)
-        for (int row = 0; row < 4; ++row)
-            transform[column * 4 + row] = static_cast<float>(world[column][row]);
-    rtcSetGeometryTransform(instance, 0, RTC_FORMAT_FLOAT4X4_COLUMN_MAJOR,
-                            transform);
-    rtcCommitGeometry(instance);
-    SceneManager::PlacementTransform placement;
-    GfMatrix4d const normal = world.GetInverse().GetTranspose();
-    for (int row = 0; row < 3; ++row)
-        for (int column = 0; column < 3; ++column) {
-            placement.normal[row * 3 + column] =
-                static_cast<float>(normal[row][column]);
-            placement.tangent[row * 3 + column] =
-                static_cast<float>(world[row][column]);
-        }
-    placement.mirrored = world.GetDeterminant() < 0.0;
-    placement.flipOrientation = placement.mirrored &&
-        prototype.geometry->type == RTC_GEOMETRY_TYPE_TRIANGLE;
-    snapshot->scene->placement_transforms[id] = placement;
+    const prism::Matrix4d matrix = prism::usd::ToMatrix4d(world);
+    if (!prism::revision::MoveInstance(snapshot->scene->scene, id, matrix)) return;
+    snapshot->scene->placement_transforms[id] = prism::revision::PlacementTransformOf(
+        matrix, prototype.geometry->type == RTC_GEOMETRY_TYPE_TRIANGLE);
     snapshot->placementMatrices[id] = world;
     ++snapshot->lastPlacementTransformsUpdated;
 }
@@ -2642,16 +2608,9 @@ void _AddAnalyticLight(HdSceneIndexBaseRefPtr const &scene,
     // Light linking (HdsiLightLinkingSceneIndex): a category per non-trivial
     // collection, at most 32 of each kind.
     auto categoryBit = [&](TfToken const &category, auto &bits) -> uint32_t {
-        if (category.IsEmpty()) return 0u;
-        auto found = bits.find(category);
-        if (found != bits.end()) return found->second;
-        if (bits.size() >= 32) {
-            if (snapshot->warnedFeatures.insert("linkCategories").second)
-                TF_WARN("PrismRT: more than 32 light or shadow link collections; further ones are ignored");
-            return 0u;
-        }
-        const uint32_t bit = 1u << bits.size();
-        bits.emplace(category, bit);
+        const uint32_t bit = bits.bit(category, !category.IsEmpty());
+        if (bits.overflowed && snapshot->warnedFeatures.insert("linkCategories").second)
+            TF_WARN("PrismRT: more than 32 light or shadow link collections; further ones are ignored");
         return bit;
     };
     result.lightLinkBit = categoryBit(_ContainerValue(light, HdTokens->lightLink, TfToken()),
@@ -3947,10 +3906,9 @@ void _ApplyLinkMasks(HdSceneIndexBaseRefPtr const &index, Snapshot *snapshot)
             std::pair<uint32_t, uint32_t> masks{0u, 0u};
             HdCategoriesSchema categories = HdCategoriesSchema::GetFromParent(index->GetPrim(path).dataSource);
             if (categories) {
-                for (auto const &[category, bit] : snapshot->lightLinkBits)
-                    if (categories.IsIncludedInCategory(category)) masks.first |= bit;
-                for (auto const &[category, bit] : snapshot->shadowLinkBits)
-                    if (categories.IsIncludedInCategory(category)) masks.second |= bit;
+                auto included = [&](TfToken const &category) { return categories.IsIncludedInCategory(category); };
+                masks.first = snapshot->lightLinkBits.mask(included);
+                masks.second = snapshot->shadowLinkBits.mask(included);
             }
             cached = byPath.emplace(path, masks).first;
         }
@@ -4510,7 +4468,7 @@ public:
         // immutable. Policy changes wait for an exclusive inactive bank.
         const auto budget = prototypePool->hiddenGeometryBudgetBytes.load();
         const auto revision = prototypePool->residencyClock.load();
-        if (!budget || !inactiveSnapshot || inactiveSnapshot.use_count() != 1 ||
+        if (!budget || !prism::revision::Exclusive(inactiveSnapshot) ||
             (hiddenMaintenanceBank == inactiveSnapshot.get() &&
              hiddenMaintenanceBudget == budget && hiddenMaintenanceRevision == revision)) return;
         if (_ApplyHiddenGeometryBudget(inactiveSnapshot.get(), true)) {
@@ -5564,7 +5522,7 @@ bool SceneBridge::Prepare(CameraState const &camera,
                 _impl->inactiveSnapshot);
             std::shared_ptr<const PickingTable> publishedPicking =
                 _impl->snapshot ? _impl->snapshot->picking : nullptr;
-            const bool pinnedBankFallback = bank && bank.use_count() > 1;
+            const bool pinnedBankFallback = bank && !prism::revision::Exclusive(bank);
             if (pinnedBankFallback) bank.reset();
             // A bank loaded in another working space or with another SSS
             // fallback or binding purposes cannot be updated.

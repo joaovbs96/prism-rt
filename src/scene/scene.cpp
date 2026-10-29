@@ -10,6 +10,7 @@
 #include <prism/renderer.h>
 #include <prism/scene.h>
 
+#include "revision_parts.h"
 #include "scene_internal.h"
 
 #include "../batched_spheres.h"
@@ -542,40 +543,9 @@ std::array<double, 16> Flat(Matrix4d const& m)
     return result;
 }
 
-SceneManager::PlacementTransform PlacementOf(Matrix4d const& world, bool flipWithMirror)
-{
-    SceneManager::PlacementTransform placement;
-    const Matrix4d normal = world.inverse().transpose();
-    for (int r = 0; r < 3; ++r)
-        for (int c = 0; c < 3; ++c) {
-            placement.normal[size_t(r * 3 + c)] = float(normal[size_t(r)][c]);
-            placement.tangent[size_t(r * 3 + c)] = float(world[size_t(r)][c]);
-        }
-    placement.mirrored = world.determinant() < 0.0;
-    placement.flipOrientation = flipWithMirror && placement.mirrored;
-    return placement;
-}
-
-// An instance's transform (row vectors) in Embree's column-major affine
-// convention.
-void SetInstanceTransform(RTCGeometry instance, Matrix4d const& world)
-{
-    float matrix[16];
-    for (int c = 0; c < 4; ++c)
-        for (int r = 0; r < 4; ++r) matrix[c * 4 + r] = float(world[size_t(c)][r]);
-    rtcSetGeometryTransform(instance, 0, RTC_FORMAT_FLOAT4X4_COLUMN_MAJOR, matrix);
-}
-
-// An Embree instance of `prototype` at `world`, geometry `id` of `target`.
-void AttachInstance(RTCDevice device, RTCScene target, RTCScene prototype, Matrix4d const& world, unsigned id)
-{
-    RTCGeometry instance = rtcNewGeometry(device, RTC_GEOMETRY_TYPE_INSTANCE);
-    rtcSetGeometryInstancedScene(instance, prototype);
-    SetInstanceTransform(instance, world);
-    rtcCommitGeometry(instance);
-    rtcAttachGeometryByID(target, instance, id);
-    rtcReleaseGeometry(instance);
-}
+// Placements become Embree instances as the delegate's do (revision_parts.h).
+using revision::AttachInstance;
+using revision::PlacementTransformOf;
 
 bool SameBits(Matrix4d const& a, Matrix4d const& b) { return std::memcmp(a.m, b.m, sizeof(a.m)) == 0; }
 
@@ -681,7 +651,7 @@ struct EnvironmentStorage {
 
 struct LightStorage {
     std::vector<SceneLight> lights;
-    std::vector<std::string> lightCategories, shadowCategories;
+    revision::LinkCategories<std::string> lightCategories, shadowCategories;
 };
 
 struct DefaultDomeStorage {
@@ -942,21 +912,14 @@ std::shared_ptr<EnvironmentStorage> Scene::Impl::buildEnvironment(
 std::shared_ptr<LightStorage> Scene::Impl::buildLights(color::ColorManagement const& colorManagement)
 {
     auto storage = std::make_shared<LightStorage>();
-    std::vector<std::string>& lightCategories = storage->lightCategories;
-    std::vector<std::string>& shadowCategories = storage->shadowCategories;
     bool warnedCategories = false;
-    auto bit = [&](std::vector<std::string>& categories, std::string const& name) -> uint32_t {
-        if (name.empty()) return 0u;
-        for (size_t i = 0; i < categories.size(); ++i)
-            if (categories[i] == name) return 1u << i;
-        if (categories.size() >= 32) {
-            if (!warnedCategories)
-                diagnose(DiagnosticLevel::Warning, "light", "more than 32 light or shadow link collections; further ones are ignored");
+    auto bit = [&](revision::LinkCategories<std::string>& categories, std::string const& name) -> uint32_t {
+        const uint32_t bit = categories.bit(name, !name.empty());
+        if (categories.overflowed && !warnedCategories) {
+            diagnose(DiagnosticLevel::Warning, "light", "more than 32 light or shadow link collections; further ones are ignored");
             warnedCategories = true;
-            return 0u;
         }
-        categories.push_back(name);
-        return 1u << (categories.size() - 1);
+        return bit;
     };
     std::shared_ptr<const color::ColorManagement> textures = context->colorManagement();
     lights.forEach([&](uint64_t, LightDesc& desc) {
@@ -987,8 +950,8 @@ std::shared_ptr<LightStorage> Scene::Impl::buildLights(color::ColorManagement co
             else WarnUnresolvedIesProfile(desc.shaping.iesFile);
         }
         SceneLight light = MakeSceneLight(params, Flat(Nearest(desc.transform)), colorManagement);
-        light.lightLinkBit = bit(lightCategories, desc.lightLinkCategory);
-        light.shadowLinkBit = bit(shadowCategories, desc.shadowLinkCategory);
+        light.lightLinkBit = bit(storage->lightCategories, desc.lightLinkCategory);
+        light.shadowLinkBit = bit(storage->shadowCategories, desc.shadowLinkCategory);
         if (desc.shape == LightDesc::Shape::Rect && !desc.texture.empty())
             light.texture = std::make_shared<ImageTexture<Color3>>(desc.texture, desc.textureColorSpace, textures);
         storage->lights.push_back(std::move(light));
@@ -1023,7 +986,7 @@ void Scene::Impl::attach(Revision& revision, unsigned id, RTCDevice device)
         } else {
             AttachInstance(device, top, shape.scene, placed.world, id);
             manager.intersection_geometry[key] = mesh->geom;
-            manager.placement_transforms[key] = PlacementOf(placed.world, true);
+            manager.placement_transforms[key] = PlacementTransformOf(placed.world, true);
         }
         manager.geometry[key] = mesh;
         manager.placement_materials[key] = BindingOf(&shape, placed.materials);
@@ -1035,7 +998,7 @@ void Scene::Impl::attach(Revision& revision, unsigned id, RTCDevice device)
         manager.geometry[key] = spheres.geometry.get();
         manager.intersection_geometry[key] = spheres.geometry->geom;
         // Reflection changes the UV frame's handedness, not sphere winding.
-        manager.placement_transforms[key] = PlacementOf(placed.world, false);
+        manager.placement_transforms[key] = PlacementTransformOf(placed.world, false);
         manager.placement_materials[key] = BindingOf(nullptr, placed.materials);
     }
     if (placed.primvars) manager.placement_primvars[key] = placed.primvars;
@@ -1476,7 +1439,7 @@ CommitResult Scene::Impl::commit(ProgressCallback const& progress)
         next->placements = committed->placements;
         next->materials = committed->materials;
         result.accelerationShared = true;
-    } else if (spare && spare.use_count() == 1 && spare->top && spare->top.use_count() == 1 && sameInstances(*spare)) {
+    } else if (revision::Exclusive(spare) && revision::Exclusive(spare->top) && sameInstances(*spare)) {
         next = std::move(spare);
         result.revisionReused = true;
         SceneManager& manager = *next->manager;
@@ -1506,11 +1469,8 @@ CommitResult Scene::Impl::commit(ProgressCallback const& progress)
             if (!SameBits(old.world, now.world)) {
                 // Only Embree instances move here: a world-space conversion
                 // has its world in its key, so it is another conversion.
-                if (RTCGeometry instance = rtcGetGeometry(next->top->scene, id)) {
-                    SetInstanceTransform(instance, now.world);
-                    rtcCommitGeometry(instance);
-                }
-                manager.placement_transforms[int(id)] = PlacementOf(now.world, bool(now.shape));
+                revision::MoveInstance(next->top->scene, id, now.world);
+                manager.placement_transforms[int(id)] = PlacementTransformOf(now.world, bool(now.shape));
                 changed = true;
             }
             if (old.materials != now.materials) {
@@ -1557,11 +1517,10 @@ CommitResult Scene::Impl::commit(ProgressCallback const& progress)
     manager.lightLinking = !lightStorage->lightCategories.empty() || !lightStorage->shadowCategories.empty();
     manager.placement_link_masks.clear();
     if (manager.lightLinking) {
-        auto mask = [](std::vector<std::string> const& categories, std::vector<std::string> const& names) {
-            uint32_t bits = 0;
-            for (size_t i = 0; i < categories.size(); ++i)
-                if (std::find(names.begin(), names.end(), categories[i]) != names.end()) bits |= 1u << i;
-            return bits;
+        auto mask = [](revision::LinkCategories<std::string> const& categories, std::vector<std::string> const& names) {
+            return categories.mask([&](std::string const& category) {
+                return std::find(names.begin(), names.end(), category) != names.end();
+            });
         };
         for (size_t i = 0; i < next->placed.size(); ++i) {
             if (!next->placed[i].visible) continue;
