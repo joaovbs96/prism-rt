@@ -1,0 +1,23 @@
+<?xml version="1.0"?>
+<!-- A document-level colorspace (lin_rec709) that a USD stage referencing
+     this file must honour (tests/hydra/fixtures/mtlx_document_colorspace.usda):
+     the untagged tint and the shader's untagged specular colour are
+     lin_rec709 values; the multiplier keeps its own acescg tag. -->
+<materialx version="1.39" colorspace="lin_rec709">
+  <nodegraph name="NG_tint">
+    <input name="tint" type="color3" value="0.9, 0.05, 0.05" />
+    <multiply name="tinted" type="color3">
+      <input name="in1" type="color3" interfacename="tint" />
+      <input name="in2" type="color3" value="0.8, 0.9, 0.3" colorspace="acescg" />
+    </multiply>
+    <output name="out" type="color3" nodename="tinted" />
+  </nodegraph>
+  <standard_surface name="SR_tinted" type="surfaceshader">
+    <input name="base_color" type="color3" nodegraph="NG_tint" output="out" />
+    <input name="specular_color" type="color3" value="0.1, 0.9, 0.9" />
+    <input name="specular_roughness" type="float" value="0.35" />
+  </standard_surface>
+  <surfacematerial name="Tinted" type="material">
+    <input name="surfaceshader" type="surfaceshader" nodename="SR_tinted" />
+  </surfacematerial>
+</materialx>

@@ -1,0 +1,52 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    upAxis = "Y"
+    metersPerUnit = 1
+    subLayers = [
+        @./scene.usda@
+    ]
+)
+
+# tinted.mtlx's network authored in UsdShade, each colour tagged with USD
+# colorSpace metadata (the document's lin_rec709, or the input's own acescg):
+# the reference for ../mtlx_document_colorspace.usda.
+over "World"
+{
+    def Scope "Looks"
+    {
+        def Material "Tinted"
+        {
+            token outputs:mtlx:surface.connect = </World/Looks/Tinted/SR_tinted.outputs:out>
+
+            def Shader "SR_tinted"
+            {
+                uniform token info:id = "ND_standard_surface_surfaceshader"
+                color3f inputs:base_color.connect = </World/Looks/Tinted/NG_tint.outputs:out>
+                color3f inputs:specular_color = (0.1, 0.9, 0.9) (
+                    colorSpace = "lin_rec709"
+                )
+                float inputs:specular_roughness = 0.35
+                token outputs:out
+            }
+
+            def NodeGraph "NG_tint"
+            {
+                color3f inputs:tint = (0.9, 0.05, 0.05) (
+                    colorSpace = "lin_rec709"
+                )
+                color3f outputs:out.connect = </World/Looks/Tinted/NG_tint/tinted.outputs:out>
+
+                def Shader "tinted"
+                {
+                    uniform token info:id = "ND_multiply_color3"
+                    color3f inputs:in1.connect = </World/Looks/Tinted/NG_tint.inputs:tint>
+                    color3f inputs:in2 = (0.8, 0.9, 0.3) (
+                        colorSpace = "acescg"
+                    )
+                    color3f outputs:out
+                }
+            }
+        }
+    }
+}

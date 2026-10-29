@@ -12,6 +12,10 @@
             "bases": ["HdRendererPlugin"],
             "displayName": "PrismRT",
             "priority": 0
+          },
+          "PrismMtlxColorSpaceAdapter": {
+            "bases": ["UsdImagingAPISchemaAdapter"],
+            "apiSchemaName": "MaterialXConfigAPI"
           }
         }
       }

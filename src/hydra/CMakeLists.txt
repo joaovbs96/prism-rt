@@ -5,7 +5,8 @@ set(PRISM_HYDRA_SOURCES
     scene_bridge.cpp
     task_delegate.cpp
     transport_filter.cpp
-    native_tasks.cpp)
+    native_tasks.cpp
+    mtlx_color_space_adapter.cpp)
 
 add_library(hdPrism SHARED ${PRISM_HYDRA_SOURCES})
 target_link_libraries(hdPrism PRIVATE prism prism_usd hd hdx ${PXR_LIBRARIES})

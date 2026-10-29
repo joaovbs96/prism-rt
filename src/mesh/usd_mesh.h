@@ -115,6 +115,7 @@ namespace mx = MaterialX;
 #include "../scene/scene_internal.h"
 #include "../usd/gf_convert.h"
 #include "../usd/usd_mesh_source.h"
+#include "../usd/mtlx_color_space.h"
 
 // ============================================================================
 // MaterialX material recovery from USD stages
@@ -246,8 +247,16 @@ UsdMaterialDataSource(const UsdShadeMaterial& material, UsdTimeCode time)
     if (terminal == networkMap.map.end() || terminal->second.nodes.empty()) return nullptr;
     const HdDataSourceBaseHandle network =
         HdUtils::ConvertHdMaterialNetworkToHdMaterialNetworkSchema(networkMap);
-    return HdRetainedContainerDataSource::New(HdMaterialSchemaTokens->material,
-        HdMaterialSchema::BuildRetained(1, &mtlxContext, &network));
+    const HdDataSourceBaseHandle schema = HdMaterialSchema::BuildRetained(1, &mtlxContext, &network);
+    // A referenced .mtlx document's colorspace, as the delegate's
+    // MaterialXConfigAPI adapter publishes it (src/usd/mtlx_color_space.h).
+    if (auto document = prism::usd::MtlxDocumentDataSource(
+            prism::usd::MtlxDocumentColorSpace(material.GetPrim()))) {
+        const TfToken names[] = {HdMaterialSchemaTokens->material, prism::usd::MtlxDocumentToken()};
+        const HdDataSourceBaseHandle values[] = {schema, document};
+        return HdRetainedContainerDataSource::New(2, names, values);
+    }
+    return HdRetainedContainerDataSource::New(HdMaterialSchemaTokens->material, schema);
 }
 
 static std::map<SdfPath, UsdMaterialSource>

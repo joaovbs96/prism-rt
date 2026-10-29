@@ -1,0 +1,26 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    upAxis = "Y"
+    metersPerUnit = 1
+    subLayers = [
+        @./mtlx_document_colorspace/scene.usda@
+    ]
+)
+
+# A .mtlx document with colorspace="lin_rec709" referenced into the stage
+# (usdMtlx). usdMtlx keeps the document's colour space only as layer
+# metadata, which composition drops; both loaders must still read the
+# document's untagged colours as lin_rec709 (src/usd/mtlx_color_space.h).
+# Rendered alike by the CLI and Hydra (prism_parity_mtlx_document_colorspace)
+# and like mtlx_document_colorspace/tagged.usda, the same network authored in
+# UsdShade with colorSpace metadata on each input
+# (prism_mtlx_document_colorspace_matches_tagged).
+over "World"
+{
+    def Scope "Looks" (
+        prepend references = @./mtlx_document_colorspace/tinted.mtlx@</MaterialX/Materials>
+    )
+    {
+    }
+}

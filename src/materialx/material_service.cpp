@@ -6,6 +6,7 @@
 #include "../materialx/resolved_resource.h"
 #include "../materialx/prepared_template.h"
 #include "../materialx/preview_surface.h"
+#include "../usd/mtlx_color_space.h"
 #include "../mdl_material.h"
 #include "../resource_limits.h"
 #include "../load_profile.h"
@@ -866,6 +867,11 @@ public:
 
         HdDataSourceMaterialNetworkInterface netInterface(
             materialPath, network.GetContainer(), primDataSource);
+        // A referenced .mtlx document's colorspace, which composition drops
+        // (src/usd/mtlx_color_space.h): tag before capture so the captured
+        // network, and every cache key built from it, carries it.
+        prism::usd::ApplyMtlxDocumentColorSpace(netInterface,
+            prism::usd::MtlxDocumentColorSpace(primDataSource));
         result.network = CaptureNetwork(netInterface, contextName, materialPath);
         result.conversionNetwork = result.network;
         result.resolverContext = ArGetResolver().GetCurrentContext();

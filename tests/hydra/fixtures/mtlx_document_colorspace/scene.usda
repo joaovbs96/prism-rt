@@ -1,0 +1,43 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    upAxis = "Y"
+    metersPerUnit = 1
+)
+
+# The camera, geometry and lights of the document colour space fixtures
+# (../mtlx_document_colorspace.usda, tagged.usda); they add
+# /World/Looks/Tinted.
+def Xform "World"
+{
+    def Camera "Camera"
+    {
+        float focalLength = 35
+        float horizontalAperture = 20
+        float verticalAperture = 20
+        double3 xformOp:translate = (0, 0, 4)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+
+    def Cube "Box" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        double size = 1.2
+        float3 xformOp:rotateXYZ = (30, 40, 0)
+        uniform token[] xformOpOrder = ["xformOp:rotateXYZ"]
+        rel material:binding = </World/Looks/Tinted>
+    }
+
+    def DomeLight "Dome"
+    {
+        float inputs:intensity = 0.5
+    }
+
+    def DistantLight "Sun"
+    {
+        float inputs:intensity = 2
+        float3 xformOp:rotateXYZ = (-40, 20, 0)
+        uniform token[] xformOpOrder = ["xformOp:rotateXYZ"]
+    }
+}

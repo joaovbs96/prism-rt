@@ -1035,6 +1035,21 @@ if(PRISM_BUILD_HYDRA)
         add_test(NAME prism_hydra_material_loading_test COMMAND prism_hydra_material_loading_test)
         set_tests_properties(prism_hydra_material_loading_test PROPERTIES ENVIRONMENT "${_prism_test_environment}")
     endif()
+    # A referenced .mtlx document's colorspace reaches both loaders' material
+    # networks (src/usd/mtlx_color_space.h; the Hydra side through hdPrism's
+    # MaterialXConfigAPI adapter, found on PXR_PLUGINPATH_NAME).
+    add_executable(prism_mtlx_colorspace_test tests/hydra/mtlx_colorspace_test.cpp)
+    target_link_libraries(prism_mtlx_colorspace_test PRIVATE usdImaging hd ${PXR_LIBRARIES})
+    target_include_directories(prism_mtlx_colorspace_test PRIVATE ${PXR_INCLUDE_DIRS})
+    if(MSVC)
+        target_compile_options(prism_mtlx_colorspace_test PRIVATE "/Zc:preprocessor")
+        # windows.h's COM headers define `interface`, a token Hd's schemas use.
+        target_compile_definitions(prism_mtlx_colorspace_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endif()
+    add_dependencies(prism_mtlx_colorspace_test hdPrism)
+    add_test(NAME prism_mtlx_colorspace_test
+        COMMAND prism_mtlx_colorspace_test "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures")
+    set_tests_properties(prism_mtlx_colorspace_test PROPERTIES ENVIRONMENT "${_prism_test_environment}")
 endif()
 
 # Test resources stay inside the build tree, independent of user cache state.
@@ -1204,6 +1219,26 @@ if(TARGET prism_hydra_render AND TARGET prism_compare_images)
     # the CLI leaves the emitter out of its light table.
     prism_add_parity_fixture(NAME mtlx_emission SCENE tests/hydra/fixtures/mtlx_emission.usda
         ENV PRISM_MAX_VARYING_EMITTER_TRIANGLES=100)
+    # A .mtlx document with colorspace="lin_rec709" referenced into a stage:
+    # both loaders read its untagged colours as lin_rec709
+    # (src/usd/mtlx_color_space.h), as the same network authored in UsdShade
+    # with colorSpace metadata (tagged.usda) renders. Before the fix the
+    # loaders agreed with each other but differed from tagged.usda by 0.104
+    # normalized RMSE (1.0% mean); now all three are bit-identical (the
+    # tolerance allows for float noise); see docs/materialx_compatibility.md.
+    prism_add_parity_fixture(NAME mtlx_document_colorspace SCENE tests/hydra/fixtures/mtlx_document_colorspace.usda)
+    add_test(NAME prism_mtlx_document_colorspace_tagged
+        COMMAND PrismRT --scene "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/mtlx_document_colorspace/tagged.usda"
+            --camera /World/Camera --width 64 --height 64 --spp 16 --device cpu ${_prism_fixed_sampling}
+            --output "${prism_parity_mtlx_document_colorspace_dir}/tagged/image.exr")
+    set_tests_properties(prism_mtlx_document_colorspace_tagged PROPERTIES
+        ENVIRONMENT "${_prism_test_environment};PRISM_DEVICE=cpu"
+        FIXTURES_SETUP prism_mtlx_document_colorspace_tagged)
+    add_test(NAME prism_mtlx_document_colorspace_matches_tagged
+        COMMAND prism_compare_images "${prism_parity_mtlx_document_colorspace_dir}/cli/image.exr"
+            "${prism_parity_mtlx_document_colorspace_dir}/tagged/image.exr" --tolerance 0.0001)
+    set_tests_properties(prism_mtlx_document_colorspace_matches_tagged PROPERTIES
+        FIXTURES_REQUIRED "prism_parity_mtlx_document_colorspace;prism_mtlx_document_colorspace_tagged")
     prism_add_parity_fixture(NAME cornell_box SCENE assets/scenes/CornellBox.usda)
     prism_add_parity_fixture(NAME quad_test SCENE assets/scenes/QuadTest.usda)
     prism_add_parity_fixture(NAME in_one_weekend SCENE assets/scenes/InOneWeekend.usda)
@@ -1228,14 +1263,15 @@ if(TARGET prism_hydra_render AND TARGET prism_compare_images)
             --output "${_prism_preview_out}/marble.exr")
     set_tests_properties(prism_material_preview_render PROPERTIES
         ENVIRONMENT "${_prism_preview_env}" FIXTURES_SETUP prism_material_preview)
-    # Not bit-identical (0.006 normalized RMSE, 0.0005 mean): the stage's
-    # material comes through usdMtlx and the material service, which drop the
-    # document's colorspace="lin_rec709" (its colours are read as working-space
-    # values); --material's MaterialDesc converts them. With colorspace="acescg"
-    # the two agree (2.7e-7); see docs/material_preview.md.
+    # The stage's material comes through usdMtlx and the material service,
+    # --material's through MaterialDesc; both read the document's
+    # colorspace="lin_rec709" (src/usd/mtlx_color_space.h) and agree to 3.5e-6
+    # normalized RMSE (7.5e-8 mean). Before that fix the stage lost the
+    # document colour space: 0.006 (0.0005 mean) here, 0.20 for
+    # two_materials.mtlx's red; see docs/material_preview.md.
     add_test(NAME prism_material_preview_matches_stage
         COMMAND prism_compare_images "${prism_parity_material_preview_dir}/cli/image.exr"
-            "${_prism_preview_out}/marble.exr" --tolerance 0.02 --mean-tolerance 0.005)
+            "${_prism_preview_out}/marble.exr" --tolerance 0.0001 --mean-tolerance 0.0001)
     set_tests_properties(prism_material_preview_matches_stage PROPERTIES
         FIXTURES_REQUIRED "prism_material_preview;prism_parity_material_preview")
     # Noise floor: two seeds differ by 0.089 normalized RMSE and 0.002 mean
