@@ -1312,6 +1312,36 @@ that boundary (`docs/DECISIONS.md`, 2026-10-29). What landed:
   first are listed in `docs/DECISIONS.md`. Render settings stay on
   `SceneManager`.
 
+**Step 5b follow-up (2026-10-29)**: instead of stages 2-4 (the translator
+of Hydra edits into `Scene` edits), Hydra renders through `Session` and
+shares the revision mechanics, keeping its own scene path
+(`docs/DECISIONS.md`, 2026-10-29). What landed:
+- A hosted session (`src/session/session_internal.h`, internal):
+  `detail::SessionAccess::createHosted` makes a `Session` without a public
+  `Scene`; each run renders the `SceneManager` the delegate builds into the
+  delegate's `ProgressiveTarget`, on Hydra's render thread. The session owns
+  the render device (its creation job moved from the delegate), the
+  progressive loop and the session state; `SceneBridge::Render` calls
+  `acquireDevice`, `noteScene` and `runHosted`, and its statistics come from
+  the session (`counters`, `stats`, `ProgressFraction`). `ProgressiveEngine` is
+  no longer exported; the target types are in `progressive_target.h`. This
+  replaces 5a's deviation "Hydra drives the session's engine".
+- The revision layer (`src/scene/revision_parts.h`,
+  `src/scene/environment_cache.h`): placing, moving and shading-transforming
+  Embree instances, light and shadow link category bits, the in-place rule
+  for spare revisions, and the domes' importance-table cache, used by
+  `Scene::commit()` and the delegate's banks alike. The scene's domes now
+  reuse their tables across revisions and moves, as the delegate's did.
+  The conversion pools' keys, the spare's update (placement diff against the
+  delegate's journal replay), visibility (detach/attach against
+  `rtcDisableGeometry`) and the lighting update model stay per front end.
+- `prism_hydra_edit_fuzz`: a seeded random edit sequence through the
+  delegate and through `Scene`; each front end bit for bit against a fresh
+  build after every update, the two within the noise floor (not bit for bit
+  across: instanced against world-space meshes).
+- Images bit-identical to the previous build (17 Hydra cases, edit and
+  camera sequences included, and 9 CLI cases: 28 EXRs, every channel).
+
 **Step 6 status (2026-10-29)**: done. `prism` and `prism_usd` are shared
 libraries; the CLI, hdPrism and the tests link them. What landed:
 - Exports: `include/prism/export.h` (`PRISM_API`, `PRISM_USD_API`, and the

@@ -1207,6 +1207,25 @@ called done there.
   - Runs: `ctest -R "scene_incremental|scene_api|session"` with
     `prism_scene_incremental_test`'s renders on `DevicePreference::Metal`
     against the CPU (the dirty-kinds case compares edits with fresh scenes).
+- **Hydra through a hosted session; shared revision layer** ([sdk_design.md](sdk_design.md),
+  section 7, step 5b follow-up; written on Windows, the Metal device unbuilt):
+  - Shared host code: `src/hydra/scene_bridge.cpp` renders through a hosted
+    `prism::Session` (`src/session/session_internal.h`): the device is
+    created by the session's job (`DevicePreference::Metal` as before; a
+    failure falls back to the CPU), the device sees the snapshot through
+    `noteScene` (`SceneChanged` as before) and the run is the same
+    `ProgressiveEngine`. `src/scene/revision_parts.h` places the delegate's
+    and the scene's Embree instances (same calls; the shading transform now
+    from `Matrix4d`, bit-identical to Gf). `src/scene/environment_cache.h`
+    (moved from `src/hydra/`, namespace `prism::revision`): the public
+    scene's domes are now `CachedTransformedEnvironment`s, which
+    `src/device/gpu/gpu_scene.cpp` already mirrors (its include and
+    namespace changed). No shader or device change.
+  - Runs: `ctest -R "prism_hydra_scene_bridge_test|adaptive_publication|session|edit_fuzz"`
+    on the Mac; the CLI on `tests/hydra/fixtures/env_dome.usda` with
+    `--device metal` against the previous build's Metal render (a scene dome
+    is now a cached environment on the GPU); `PRISM_DEVICE=metal`
+    `prism_hydra_render` on `parity.usda` bit-identical to the previous build.
 
 ## Diagnostics
 

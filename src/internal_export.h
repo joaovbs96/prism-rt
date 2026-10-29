@@ -2,10 +2,10 @@
 
 // Internal symbols exported from the shared libraries (include/prism/export.h)
 // because the front ends and tests still use them: hdPrism builds its own
-// SceneManager and drives the progressive engine, the CLI parses device and
-// denoise names, and the tests reach into materials, devices and caches.
-// They are not API: this header is not installed, and the list shrinks as
-// Hydra moves onto the public Session (docs/DECISIONS.md, 2026-10-29).
+// SceneManager and renders it through a hosted session
+// (src/session/session_internal.h), the CLI parses device and denoise names,
+// and the tests reach into materials, devices and caches. They are not API:
+// this header is not installed (docs/DECISIONS.md, 2026-10-29).
 //
 // Header-only code that holds state (function-local statics, inline or
 // thread_local variables) must not live in these headers: each module would
