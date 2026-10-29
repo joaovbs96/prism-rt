@@ -101,7 +101,8 @@ struct PRISM_INTERNAL_API SessionAccess {
     static void noteScene(Session& session, SceneManager& scene, uint64_t generation);
     // Renders the accumulation (resuming one a stop interrupted) on the
     // current device until it converges (true) or the target stops it
-    // (false). The target is called on this thread only.
+    // (false), on the calling thread (the target's writes also come from
+    // the passes' TBB workers, as with the public session's films).
     static bool runHosted(Session& session, HostedRun const& run, session::ProgressiveTarget& target);
     // The next run starts a new accumulation.
     static void restartAccumulation(Session& session);
