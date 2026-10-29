@@ -719,8 +719,10 @@ Hydra (`src/hydra/`):
 | `_prism` (Python extension) | nanobind bindings | `prism`, `prism_io`, loaders; `prism_usd` optional | |
 
 `prism` must be a shared library:
-- Today `prism` (formerly `prism_core`) is static and linked into both
-  `PrismRT` and `hdPrism` (`src/hydra/CMakeLists.txt`), as are its modules.
+- Until step 6 `prism` (formerly `prism_core`) was static and linked into
+  both `PrismRT` and `hdPrism` (`src/hydra/CMakeLists.txt`), as were its
+  modules. Since step 6 `prism` and `prism_usd` are shared (status in
+  section 7).
 - A Python process that loads `hdPrism` (usdview, or `UsdImagingGL` from a
   script) and `_prism` would hold two copies of every global of section 2,
   including two owners of the one `INeuray`.
@@ -1309,6 +1311,35 @@ that boundary (`docs/DECISIONS.md`, 2026-10-29). What landed:
   moving it is a rewrite of the delegate's scene path. The gaps to close
   first are listed in `docs/DECISIONS.md`. Render settings stay on
   `SceneManager`.
+
+**Step 6 status (2026-10-29)**: done. `prism` and `prism_usd` are shared
+libraries; the CLI, hdPrism and the tests link them. What landed:
+- Exports: `include/prism/export.h` (`PRISM_API`, `PRISM_USD_API`, and the
+  narrow C4251/C4275 suppression), `src/internal_export.h` (not installed:
+  `PRISM_INTERNAL_API`, `PRISM_USD_INTERNAL_API`) on exactly what the
+  consumers link against; hidden visibility otherwise. `prism.dll` exports
+  98 public and 408 internal symbols, `prism_usd.dll` 12 and 35
+  (`local/reports/prism_exports.txt`). `PRISM_STATIC` empties the macros for
+  sources compiled into a test directly (the MaterialX loader tests).
+- One copy of every process global: header-only singletons, thread-locals
+  and counters moved into `src/module_state.cpp` (core) and
+  `src/usd/usd_module_state.cpp` (`prism_usd`), behind exported functions
+  (`docs/DECISIONS.md`, 2026-10-29). `prism::Error` is exported with an
+  out-of-line destructor, so clients catch it across the boundary.
+- `prism_io`, `prism_gltf` and `prism_obj` stay static (no state).
+- Deployment: the DLLs sit beside every consumer (the configuration
+  directory, a post-build copy into `hydra/plugin`), are installed into
+  `bin` and packaged.
+- `prism_single_runtime_test`: `PrismRT.exe`, `hdPrism.dll` and
+  `prism_usd.dll` import `prism.dll`; the MDL runtime's code is in
+  `prism.dll` only (the main build's `PrismRT.exe` and `hdPrism.dll` both
+  carry it) and the material service in `prism_usd.dll` only; a process that
+  links the core and loads `hdPrism.dll` has one `prism.dll`, one
+  `prism_usd.dll` and one exporter of `SharedMdlContext`.
+- Images bit-identical to the previous build (Hydra and CLI, every EXR
+  channel). macOS/Linux not built: the CMake is portable (visibility presets,
+  position-independent static modules), the plugin's rpath is in the Metal
+  checklist (`docs/gpu_devices.md`).
 
 Notes:
 - Step 6 is mechanical and can move earlier if the CLI/Hydra double copy of

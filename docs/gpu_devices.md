@@ -544,6 +544,26 @@ Changes to code the Metal device shares, to verify on a Mac (build, then the
 listed runs on `--device metal` against `--device cpu`) before the change is
 called done there.
 
+- **Shared core library** (SDK step 6, [sdk_design.md](sdk_design.md)):
+  `prism` and `prism_usd` are shared libraries with hidden default
+  visibility; only `PRISM_API`/`PRISM_INTERNAL_API` (and the USD ones)
+  symbols are visible. Not built on macOS yet. Check on the Mac:
+  - Build: `libprism.dylib` and `libprism_usd.dylib` link; no undefined
+    symbols in `hdPrism` (a missing `PRISM_INTERNAL_API` shows as a link
+    error, as on Windows). The Metal device (`src/device/metal/*.mm`) is in
+    the core; nothing outside it calls into it, so it needs no exports.
+  - Run time: `otool -L build/hydra/plugin/hdPrism.dylib` lists
+    `@rpath/libprism.dylib`; `otool -l` shows an `LC_RPATH` that finds it
+    from the build tree, and after `cmake --install` from
+    `lib/usd/plugins/prism/plugin` (the install rpath is
+    `@loader_path/../lib`, which does not reach `<prefix>/lib` from there:
+    add `@loader_path/../../../../lib` or install the dylibs beside the
+    plugin). usdview loads the plugin and renders on Metal.
+  - `prism_single_runtime_test` skips (Windows PE checks); instead check
+    with `nm -gU libprism.dylib | grep SharedMdlContext` and that
+    `nm hdPrism.dylib` has no `SharedMdlContext` definition.
+  - `catch (prism::Error const&)` in a client works (typeinfo is exported
+    with the class, anchored by its destructor).
 - **Colour management** ([color_management.md](color_management.md)):
   - Build: OpenColorIO 2.6 must be found (`find_package(OpenColorIO CONFIG)`;
     Homebrew's `opencolorio` or vcpkg), and `prism` (formerly `prism_core`) links it.
