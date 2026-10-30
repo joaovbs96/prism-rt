@@ -7,10 +7,13 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -405,6 +408,123 @@ void checkSdkDfData()
     }
     require(checked>0,"installed MDL SDK exposed no BSDF data tables");
 }
+
+// The BSDF table lookup as it was before its fast path (texture_runtime.cpp):
+// eight bounds-checked corners, four channels blended. The fast path must
+// return the same bits.
+namespace reference {
+bool CropAxis(float const crop[2],size_t size,size_t* offset,size_t* resolution)
+{
+    if(!crop || !std::isfinite(crop[0]) || !std::isfinite(crop[1]) ||
+       crop[0]<0.0f || crop[1]>1.0f || crop[1]<crop[0] || !size)return false;
+    *offset=static_cast<size_t>(float(size-1)*crop[0]);
+    *resolution=std::max<size_t>(static_cast<size_t>(float(size)*(crop[1]-crop[0])),1);
+    if(*offset>=size)*offset=size-1;
+    *resolution=std::min(*resolution,size-*offset);
+    return true;
+}
+bool RemapTexel(float coordinate,size_t size,mi::neuraylib::Tex_wrap_mode mode,
+                size_t offset,int64_t* lower,int64_t* upper,float* fraction)
+{
+    using M=mi::neuraylib::Tex_wrap_mode;
+    if(!std::isfinite(coordinate) || !size)return false;
+    if(mode==M::TEX_WRAP_CLIP && (coordinate<0.0f || coordinate>=1.0f))return false;
+    const double tex=double(coordinate)*double(size)-0.5;
+    if(tex<double(std::numeric_limits<int64_t>::min()+2) ||
+       tex>double(std::numeric_limits<int64_t>::max()-2))return false;
+    const auto base=static_cast<int64_t>(std::floor(tex));
+    *fraction=static_cast<float>(tex-std::floor(tex));
+    auto map=[&](int64_t value)->int64_t {
+        const int64_t n=static_cast<int64_t>(size);
+        if(mode==M::TEX_WRAP_CLAMP || mode==M::TEX_WRAP_CLIP)
+            return std::clamp<int64_t>(value,0,n-1)+static_cast<int64_t>(offset);
+        int64_t cell=value/n;
+        int64_t local=value%n;
+        if(local<0){local+=n;--cell;}
+        if(mode==M::TEX_WRAP_MIRRORED_REPEAT && (std::abs(cell)%2)==1)
+            local=n-1-local;
+        return local+static_cast<int64_t>(offset);
+    };
+    *lower=map(base);*upper=map(base+1);return true;
+}
+void LoadDfTexel(const float* values,size_t width,size_t height,size_t depth,
+                 size_t components,int64_t x,int64_t y,int64_t z,float out[4])
+{
+    out[0]=out[1]=out[2]=0.0f;out[3]=1.0f;
+    if(x<0||y<0||z<0||size_t(x)>=width||size_t(y)>=height||size_t(z)>=depth)return;
+    const size_t index=((size_t(z)*height+size_t(y))*width+size_t(x))*components;
+    if(components==1)out[0]=out[1]=out[2]=values[index];
+    else {out[0]=values[index];out[1]=values[index+1];out[2]=values[index+2];}
+}
+void Lookup(const float* values,size_t width,size_t height,size_t depth,size_t components,
+            float const coord[3],mi::neuraylib::Tex_wrap_mode wrap,float const crop[3][2],float out[4])
+{
+    out[0]=out[1]=out[2]=out[3]=0.0f;
+    size_t ox=0,oy=0,oz=0,nx=0,ny=0,nz=0;
+    if(!CropAxis(crop[0],width,&ox,&nx) || !CropAxis(crop[1],height,&oy,&ny) ||
+       !CropAxis(crop[2],depth,&oz,&nz))return;
+    int64_t x0=0,x1=0,y0=0,y1=0,z0=0,z1=0;float fx=0,fy=0,fz=0;
+    if(!RemapTexel(coord[0],nx,wrap,ox,&x0,&x1,&fx) || !RemapTexel(coord[1],ny,wrap,oy,&y0,&y1,&fy) ||
+       !RemapTexel(coord[2],nz,wrap,oz,&z0,&z1,&fz))return;
+    float corners[8][4];
+    const int64_t xs[2]={x0,x1},ys[2]={y0,y1},zs[2]={z0,z1};
+    for(int i=0;i<8;++i)
+        LoadDfTexel(values,width,height,depth,components,xs[i&1],ys[(i>>1)&1],zs[i>>2],corners[i]);
+    auto lerp=[](float a,float b,float t){return (1.0f-t)*a+t*b;};
+    for(int c=0;c<4;++c) {
+        const float a=lerp(lerp(corners[0][c],corners[1][c],fx),lerp(corners[2][c],corners[3][c],fx),fy);
+        const float b=lerp(lerp(corners[4][c],corners[5][c],fx),lerp(corners[6][c],corners[7][c],fx),fy);
+        out[c]=lerp(a,b,fz);
+    }
+}
+} // namespace reference
+
+// The fast BSDF table lookup returns the reference's bits for scalar and RGB
+// tables, every wrap mode, full and partial crops, inside and outside [0, 1].
+void checkDfLookupMatchesReference()
+{
+    mdl::Context context;
+    require(context.is_valid(),"cannot initialize MDL SDK for BSDF tables: "+context.get_error());
+    mi::base::Handle<mi::neuraylib::IMdl_backend_api> api(
+        context.get_neuray()->get_api_component<mi::neuraylib::IMdl_backend_api>());
+    require(bool(api),"cannot access MDL backend API for BSDF tables");
+    const mi::neuraylib::Tex_wrap_mode wraps[]={mi::neuraylib::TEX_WRAP_CLAMP,mi::neuraylib::TEX_WRAP_REPEAT,
+        mi::neuraylib::TEX_WRAP_MIRRORED_REPEAT,mi::neuraylib::TEX_WRAP_CLIP};
+    const float crops[3][3][2]={{{0,1},{0,1},{0,1}},{{.25f,.75f},{0,1},{.5f,1}},{{0,.3f},{.1f,.9f},{.6f,.6f}}};
+    uint32_t state=12345u;
+    auto next=[&]{state=state*1664525u+1013904223u;return float(state>>8)/float(1u<<24);};
+    size_t checked=0,scalar=0;
+    for(auto kind:{mi::neuraylib::DFK_SIMPLE_GLOSSY_MULTISCATTER,mi::neuraylib::DFK_GGX_SMITH_MULTISCATTER,
+                   mi::neuraylib::DFK_SHEEN_MULTISCATTER,mi::neuraylib::DFK_MICROFLAKE_SHEEN_GENERAL,
+                   mi::neuraylib::DFK_MICROFLAKE_SHEEN_MULTISCATTER}) {
+        mi::Size width=0,height=0,depth=0;const char* pixelType=nullptr;
+        const float* source=api->get_df_data_texture(kind,width,height,depth,pixelType);
+        if(!source)continue;
+        auto runtime=Runtime::CreateDfDataForTesting(kind,width,height,depth,pixelType,source);
+        require(bool(runtime),"native runtime rejected an SDK BSDF data table");
+        auto* handler=reinterpret_cast<Handler*>(runtime->handler());
+        auto const* base=reinterpret_cast<Base const*>(handler);
+        const size_t components=std::string(pixelType)=="Float32"?1:3;
+        scalar+=components==1;
+        for(auto wrap:wraps)
+            for(auto const& crop:crops)
+                for(int i=0;i<2000;++i) {
+                    const float coord[3]={next()*1.6f-.3f,next()*1.6f-.3f,next()*1.6f-.3f};
+                    float expected[4],fast4[4],fast3[3];
+                    reference::Lookup(source,width,height,depth,components,coord,wrap,crop,expected);
+                    handler->vtable->m_tex_lookup_float4_3d(fast4,base,1,coord,wrap,wrap,wrap,
+                                                            crop[0],crop[1],crop[2],0.0f);
+                    handler->vtable->m_tex_lookup_float3_3d(fast3,base,1,coord,wrap,wrap,wrap,
+                                                            crop[0],crop[1],crop[2],0.0f);
+                    require(std::memcmp(expected,fast4,sizeof(fast4))==0,
+                            "BSDF table float4 lookup differs from the reference");
+                    require(std::memcmp(expected,fast3,sizeof(fast3))==0,
+                            "BSDF table float3 lookup differs from the reference");
+                    ++checked;
+                }
+    }
+    require(checked>0 && scalar>0,"installed MDL SDK exposed no scalar and RGB BSDF data tables");
+}
 }
 
 int main()
@@ -448,6 +568,7 @@ int main()
         checkDiscreteCrop(cropPath, cropCanvas, cropWidth, cropHeight);
         checkSyntheticDfData();
         checkSdkDfData();
+        checkDfLookupMatchesReference();
 
         auto runtime = Runtime::CreateForTesting(rgba);
         require(bool(runtime), "cannot prepare filtered lookup fixture");

@@ -133,6 +133,59 @@ void LoadDfTexel(const float* values,size_t width,size_t height,size_t depth,
     if(components==1)out[0]=out[1]=out[2]=values[index];
     else {out[0]=values[index];out[1]=values[index+1];out[2]=values[index+2];}
 }
+
+inline float Lerp(float a,float b,float t){return (1.0f-t)*a+t*b;}
+
+// The trilinear blend of eight corner values, in the order of the per-channel
+// loop it replaces (same operations, so the same float result).
+inline float Trilerp(float const c[8],float fx,float fy,float fz)
+{
+    const float a=Lerp(Lerp(c[0],c[1],fx),Lerp(c[2],c[3],fx),fy);
+    const float b=Lerp(Lerp(c[4],c[5],fx),Lerp(c[6],c[7],fx),fy);
+    return Lerp(a,b,fz);
+}
+
+// A BSDF data table's filtered lookup (the native ABI's 3D lookups, which
+// layered BSDFs call at every layer, per sample and per evaluate). The same
+// arithmetic as reading the eight corners with LoadDfTexel and blending four
+// channels, channel by channel, so the results are bit-identical; faster in
+// three ways: the wrapped and cropped texel coordinates are always inside
+// the table (CropAxis keeps offset + resolution <= size and RemapTexel stays
+// in [offset, offset + n)), so texels are read without bounds checks; a
+// scalar table's channel is blended once and copied; and `channels` 3 (the
+// float3 entry) skips the alpha, the blend of eight ones. out keeps its
+// zeros where the lookup fails.
+void LookupDfTable(const float* values,size_t width,size_t height,size_t depth,size_t components,
+                   float const coord[3],mi::neuraylib::Tex_wrap_mode wu,mi::neuraylib::Tex_wrap_mode wv,
+                   mi::neuraylib::Tex_wrap_mode ww,float const cu[2],float const cv[2],float const cw[2],
+                   int channels,float out[4])
+{
+    size_t ox=0,oy=0,oz=0,nx=0,ny=0,nz=0;
+    if(!CropAxis(cu,width,&ox,&nx) || !CropAxis(cv,height,&oy,&ny) || !CropAxis(cw,depth,&oz,&nz))return;
+    int64_t x0=0,x1=0,y0=0,y1=0,z0=0,z1=0;float fx=0,fy=0,fz=0;
+    if(!RemapTexel(coord[0],nx,wu,ox,&x0,&x1,&fx) ||
+       !RemapTexel(coord[1],ny,wv,oy,&y0,&y1,&fy) ||
+       !RemapTexel(coord[2],nz,ww,oz,&z0,&z1,&fz))return;
+    auto at=[&](int64_t x,int64_t y,int64_t z){
+        return values+((size_t(z)*height+size_t(y))*width+size_t(x))*components;
+    };
+    float const* corner[8]={at(x0,y0,z0),at(x1,y0,z0),at(x0,y1,z0),at(x1,y1,z0),
+                            at(x0,y0,z1),at(x1,y0,z1),at(x0,y1,z1),at(x1,y1,z1)};
+    float c[8];
+    if(components==1) {
+        for(int i=0;i<8;++i)c[i]=corner[i][0];
+        out[0]=out[1]=out[2]=Trilerp(c,fx,fy,fz);
+    } else {
+        for(int channel=0;channel<3;++channel) {
+            for(int i=0;i<8;++i)c[i]=corner[i][channel];
+            out[channel]=Trilerp(c,fx,fy,fz);
+        }
+    }
+    if(channels==4) {
+        for(int i=0;i<8;++i)c[i]=1.0f;
+        out[3]=Trilerp(c,fx,fy,fz);
+    }
+}
 }
 
 NativeTextureRuntime::NativeTextureRuntime()
@@ -591,48 +644,22 @@ mi::neuraylib::Texture_handler_deriv_vtable const &NativeTextureRuntime::Vtable(
             out[0]=out[1]=out[2]=out[3]=0.0f;
             auto const *self=Self(base);
             if(!self || !coord || index>=self->m_textures.size())return;
-            auto const& table=self->m_textures[index].dfData;
+            auto const* table=self->m_textures[index].dfData.get();
             if(!table)return;
-            size_t ox=0,oy=0,oz=0,nx=0,ny=0,nz=0;
-            if(!CropAxis(cu,table->width,&ox,&nx) ||
-               !CropAxis(cv,table->height,&oy,&ny) ||
-               !CropAxis(cw,table->depth,&oz,&nz))return;
-            int64_t x0=0,x1=0,y0=0,y1=0,z0=0,z1=0;float fx=0,fy=0,fz=0;
-            if(!RemapTexel(coord[0],nx,wu,ox,&x0,&x1,&fx) ||
-               !RemapTexel(coord[1],ny,wv,oy,&y0,&y1,&fy) ||
-               !RemapTexel(coord[2],nz,ww,oz,&z0,&z1,&fz))return;
-            float corners[8][4];
-            LoadDfTexel(table->values.data(),table->width,table->height,table->depth,
-                        table->components,x0,y0,z0,corners[0]);
-            LoadDfTexel(table->values.data(),table->width,table->height,table->depth,
-                        table->components,x1,y0,z0,corners[1]);
-            LoadDfTexel(table->values.data(),table->width,table->height,table->depth,
-                        table->components,x0,y1,z0,corners[2]);
-            LoadDfTexel(table->values.data(),table->width,table->height,table->depth,
-                        table->components,x1,y1,z0,corners[3]);
-            LoadDfTexel(table->values.data(),table->width,table->height,table->depth,
-                        table->components,x0,y0,z1,corners[4]);
-            LoadDfTexel(table->values.data(),table->width,table->height,table->depth,
-                        table->components,x1,y0,z1,corners[5]);
-            LoadDfTexel(table->values.data(),table->width,table->height,table->depth,
-                        table->components,x0,y1,z1,corners[6]);
-            LoadDfTexel(table->values.data(),table->width,table->height,table->depth,
-                        table->components,x1,y1,z1,corners[7]);
-            auto lerp=[](float a,float b,float t){return (1.0f-t)*a+t*b;};
-            for(int c=0;c<4;++c) {
-                const float a=lerp(lerp(corners[0][c],corners[1][c],fx),
-                                   lerp(corners[2][c],corners[3][c],fx),fy);
-                const float b=lerp(lerp(corners[4][c],corners[5][c],fx),
-                                   lerp(corners[6][c],corners[7][c],fx),fy);
-                out[c]=lerp(a,b,fz);
-            }
+            LookupDfTable(table->values.data(),table->width,table->height,table->depth,table->components,
+                          coord,wu,wv,ww,cu,cv,cw,4,out);
         };
         v.m_tex_lookup_float3_3d=[](float out[3],Base const *base,unsigned index,
             float const coord[3],mi::neuraylib::Tex_wrap_mode wu,
             mi::neuraylib::Tex_wrap_mode wv,mi::neuraylib::Tex_wrap_mode ww,
-            float const cu[2],float const cv[2],float const cw[2],float frame) {
+            float const cu[2],float const cv[2],float const cw[2],float) {
+            prism::profiling::Scope timer(prism::profiling::BsdfDataLookup);
             float value[4]{};
-            Vtable().m_tex_lookup_float4_3d(value,base,index,coord,wu,wv,ww,cu,cv,cw,frame);
+            auto const *self=Self(base);
+            if(self && coord && index<self->m_textures.size())
+                if(auto const* table=self->m_textures[index].dfData.get())
+                    LookupDfTable(table->values.data(),table->width,table->height,table->depth,
+                                  table->components,coord,wu,wv,ww,cu,cv,cw,3,value);
             out[0]=value[0];out[1]=value[1];out[2]=value[2];
         };
         v.m_tex_texel_float4_3d=[](float out[4],Base const *base,unsigned index,
