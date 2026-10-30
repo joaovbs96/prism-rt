@@ -1366,6 +1366,7 @@ called done there.
   ([memory placement](#vulkan-memory-placement)); `TextureBudget` and
   `FitImages` are unchanged. Check on the Mac: the build, and
   `ctest -R texture_streaming`.
+- **Material networks keep their order after edits** (`src/materialx/ordered_network_interface.h`, used by the material service): the converted MaterialX document, and so the generated MDL, no longer depends on TfToken addresses. Shared by every device; no shader or GPU code change. Check on the Mac: the MaterialEggs countertop rendered on `--device metal` several times (each with a fresh `PRISM_CACHE_DIR`) is bit-identical run to run, and `ctest -R ordered_network_interface`.
 
 ## Diagnostics
 
