@@ -165,6 +165,47 @@ for `ND_UsdPrimvarReader_matrix` and writes a `surface` node of type
 with a `constant` matrix44 of its `fallback` (the identity unless authored),
 as when the primvar is missing, and warns: matrix primvars are not read.
 
+## What the log shows
+
+Assets written for older MaterialX versions or by Houdini (the MaterialEggs
+countertop: `unifiednoise3d.clampoutput` authored as an integer, `freq` and
+`hsvadjust.amount` as vector3, color3 `fractal3d` outputs into vector3 `add`
+inputs) need hundreds of the repairs above. The log stays short; the details
+are the renderer's "mdl" debug output (`PRISM_MDL_VERBOSE=1`, or the "mdl"
+debug category of the renderer's options):
+
+- hdMtlx validates the document it builds from a USD network and posts what
+  MaterialX finds as one warning ("Validation warnings for generated MaterialX
+  file", a line per input). The material service converts under a
+  `TfDiagnosticTrap` (`src/materialx/hdmtlx_document.h`, for the surface and
+  the displacement terminal) and drops that warning; with "mdl" debug output
+  it prints it as `[Hydra Material] <material>: hdMtlx reported N MaterialX
+  validation issue(s), repaired when the document loads:` and the lines. The
+  document is unchanged. Everything else hdMtlx posts (definitions not found,
+  unsupported parameter types, errors) is posted as before, and what the
+  loader cannot repair is still reported when it validates the final
+  document (`[WARN] Document validation issues: ...`).
+- The loader prints one line per material it repaired, `[MaterialX]
+  <material>: 7 type repairs, 2 clamps`: the `extract`/`convert` nodes it
+  inserted between outputs and inputs of other types, and the conductor clamps
+  below. The per-repair lines (`... feeds vector3 input ...; inserted
+  convert`, `Clamped '...'`, `Inserted clamp node on ...`) are debug output.
+  Warnings that mean a visible difference stay warnings (`layered
+  transmission only partly repaired`, dropped inputs, unconvertible colour
+  spaces).
+- The MDL compiler's warnings about generated code that is never used (C181
+  unused variable, C183 unused parameter, C350 unused let temporary) are debug
+  output (`src/mdl/messages.h`). Its other messages print once: the SDK sends
+  core compiler errors and warnings to Prism's receiving logger (`warn : ...`)
+  and to the execution context, and only the logger's copy is printed.
+- Textures published into the material cache are named in the generated
+  module as absolute MDL paths (`/<hash>.exr`) relative to the document's
+  directory. `MaterialCompiler` registers that directory as an MDL search path
+  as well as a resource path, as the MDL SDK expects (resource search paths
+  for module resources are deprecated: C295 "only found via the resource
+  search paths"). The texture files, the generated MDL and the cache keys are
+  unchanged.
+
 ## One output colour transform per node
 
 MaterialX 1.39.5's shader generator converts the colour output of a node

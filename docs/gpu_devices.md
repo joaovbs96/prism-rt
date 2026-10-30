@@ -1239,6 +1239,21 @@ called done there.
     (hdPrism's adapter must load from the build's `plugInfo.json`); the CLI
     on `tests/hydra/fixtures/mtlx_document_colorspace.usda` with
     `--device metal` against `--device cpu`.
+- **Quieter material log** ([materialx_compatibility.md](materialx_compatibility.md#what-the-log-shows);
+  written on Windows, the Metal device unbuilt):
+  - Shared host code only: `src/materialx/hdmtlx_document.h` captures
+    hdMtlx's validation warning (a `TfDiagnosticTrap` around the conversion
+    in `material_service.cpp` and `preview_surface.h`; the document is
+    unchanged); `src/materialx/loader.cpp` prints one repair summary per
+    material; `src/mdl/` filters C181/C183/C350, prints each core compiler
+    message once and registers a document's directory as an MDL search path
+    when its module names textures relative to it (no C295). Generated MDL,
+    cache keys and images are unchanged (CPU renders bit-identical). No
+    shader or device change.
+  - Check on the Mac: `ctest -R "mdl_messages|hdmtlx_validation|mdl_texture_target"`;
+    the countertop scene of the MaterialEggs on `--device metal` with a cold
+    cache renders as before and logs no C295 (the textures resolve through
+    the MDL search path).
 
 ## Diagnostics
 
