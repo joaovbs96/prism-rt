@@ -76,31 +76,39 @@ struct CpuBackend {
     }
 
     bool mayHaveCutouts() { return !opaqueScene; }
+    // A shadow ray's next crossing. When it is on a material that always
+    // blocks, visible() reads nothing of the hit but that (with every surface
+    // casting shadows, which holds without light linking), so the hit is not
+    // prepared: same blockers, same random numbers, same image. Culled back
+    // faces need the prepared hit's side, so culling takes the full path.
     CpuHit intersectNonOpaque(::PathRay const& ray)
     {
         profiling::ShadowScope shadowScope;
-        return intersect(ray);
+        if (culling || scene->lightLinking) return intersect(ray);
+        const prism::PathRay query = ToQuery(ray);
+        const RTCRayHit raw = scene->intersectRaw(query);
+        if (raw.hit.geomID == RTC_INVALID_GEOMETRY_ID) return Prepared(scene->prepareHit(raw, query));
+        ::Material* material = scene->getMaterial(raw);
+        if (!material || !material->provenOpaque()) return Prepared(scene->prepareHit(raw, query), material);
+        CpuHit hit;
+        hit.surface.valid = true;
+        hit.surface.t = raw.ray.tfar;
+        hit.surface.instance = raw.hit.instID[0] != RTC_INVALID_GEOMETRY_ID ? raw.hit.instID[0] : raw.hit.geomID;
+        hit.surface.primitive = raw.hit.primID;
+        hit.material = material;
+        return hit;
     }
 
-    CpuHit intersect(::PathRay const& ray)
+    CpuHit intersect(::PathRay const& ray) { return Prepared(scene->castRayCulled(ToQuery(ray), culling)); }
+
+    // `material`: the hit's material when already looked up.
+    CpuHit Prepared(RayHit const& rh, ::Material* material = nullptr)
     {
-        prism::PathRay query;
-        query.ray.org_x = ray.ray.origin.x;
-        query.ray.org_y = ray.ray.origin.y;
-        query.ray.org_z = ray.ray.origin.z;
-        query.ray.dir_x = ray.ray.direction.x;
-        query.ray.dir_y = ray.ray.direction.y;
-        query.ray.dir_z = ray.ray.direction.z;
-        query.ray.tnear = ray.ray.tnear;
-        query.ray.tfar = ray.ray.tfar;
-        query.ray.mask = -1;
-        query.footprint = ToFootprint(ray.footprint);
-        const RayHit rh = scene->castRayCulled(query, culling);
         CpuHit hit;
         hit.surface = FromRayHit(rh);
         hit.primvarMesh = rh.primvarMesh;
         hit.instancePrimvars = rh.instancePrimvars;
-        if (hit.surface.valid) hit.material = scene->getMaterial(rh);
+        if (hit.surface.valid) hit.material = material ? material : scene->getMaterial(rh);
         return hit;
     }
 
