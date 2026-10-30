@@ -3,6 +3,7 @@
 #include "native_tasks.h"
 #include "task_delegate.h"
 #include "transport_filter.h"
+#include "../renderer/install_paths.h"
 
 #include "pxr/imaging/hd/renderDelegateInfo.h"
 #include "pxr/imaging/hd/renderer.h"
@@ -24,7 +25,17 @@ TF_REGISTRY_FUNCTION(TfType)
 }
 
 HdRenderDelegate *HdPrismRendererPlugin::CreateRenderDelegate()
-{ return new PrismTaskDelegate(); }
+{
+    // An install path past Windows' 260-character limit breaks material loading
+    // (docs/deployment.md, "Path length"): say so once, early and clearly.
+    static const bool checked = [] {
+        const std::string problem = prism::CheckInstallPathLength(/*includeAll=*/true);
+        if (!problem.empty()) TF_RUNTIME_ERROR("%s", problem.c_str());
+        return true;
+    }();
+    (void)checked;
+    return new PrismTaskDelegate();
+}
 void HdPrismRendererPlugin::DeleteRenderDelegate(HdRenderDelegate *d) { delete d; }
 
 bool HdPrismRendererPlugin::IsSupported(HdRendererCreateArgsSchema const &,

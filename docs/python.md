@@ -138,6 +138,19 @@ Metal shader converter's licence (open). The rest is portable: the package
 code reads only `_build_config.py`, and the CMake changes add a test only
 under `WIN32`.
 
+### Path length
+
+The wheel's files live under `site-packages\prismrt`, so a deep virtual
+environment can push the MaterialX libraries and USD resources past Windows'
+260-character path limit. `import prismrt` checks this once (it reads
+`prismrt\bin\prism_paths.txt`, written by `tools/build_wheel.py`; no directory
+walk) and raises an `ImportError` that says the install path is too long, with
+the two fixes: create the environment in a shorter folder (for example
+`py -3.11 -m venv C:\venvs\prism`), or enable Windows long paths
+(`HKLM\SYSTEM\CurrentControlSet\Control\FileSystem\LongPathsEnabled` = 1;
+Python's own `python.exe` is long-path aware). `PRISM_SKIP_PATH_CHECK=1` skips
+the check. Details: [deployment.md](deployment.md#path-length).
+
 ## A first render
 
 ```python

@@ -71,7 +71,11 @@ The dependency roots default from the same `PRISM_*` variables as
 `build\prism-runtime.json`. Each can be overridden with a parameter
 (`-UsdRoot`, `-MaterialXRoot`, `-TbbRuntime`, `-EmbreeRuntime`, `-MdlSdkRoot`,
 `-VcpkgBin`, `-PythonRoot`, `-DxcDir`, `-VulkanLoader`, `-UsdviewScript`).
-`-SkipPip` and `-SkipZip` shorten local iterations.
+`-SkipPip` and `-SkipZip` shorten local iterations. The zip and `VERSION.txt`
+are named after `-Commit <rev>` (default `HEAD`): the package is built from the
+working tree and the existing build, so pass the commit that build was made
+from (for example the last commit that changed code, when `HEAD` only touches
+docs) instead of renaming the zip by hand.
 
 The package contains `cmake --install` output (`PrismRT.exe`, the Hydra
 delegate, the usdview extension, the sample scenes), the runtime DLLs of
@@ -109,6 +113,53 @@ a minimal `PATH`:
 `list_devices.bat` (must list `vulkan` and `cpu`), `prism_render.bat` (writes
 `cornell_box.png`) and `usdview.bat --quitAfterStartup` (logs "rendering on
 vulkan device").
+
+### Path length
+
+Windows limits a path to 260 characters (`MAX_PATH`) unless long paths are on.
+The package and the wheel carry files whose paths grow with the folder they are
+extracted to, and a process that is not long-path aware cannot open them.
+MaterialX reads its libraries with `std::ifstream`, so the visible failure is
+material loading: `Failed to open file for reading: ...\usd\lib\usd\usdMtlx\resources\libraries\bxdf\lama\...mtlx`
+(reproduced with the package extracted 188 characters deep; the scene file and
+the DLLs, which are shorter, still load).
+
+The longest file the renderer needs is 93 characters below the package root
+(`\usd\lib\usd\usdMtlx\resources\libraries\stdlib\genglsl\mx_creatematrix_vector3_matrix44.glsl`),
+the longest `.mtlx` 91, and 114 with the private Python's PySide6. So the
+package must be extracted to a folder of at most about 166 characters (145 for
+usdview), e.g. `C:\PrismRT`; a `Downloads` folder under a long user name or a
+OneDrive path usually fits, a deeply nested project folder may not.
+
+What PrismRT does about it:
+
+- **Check at start.** `PrismRT.exe`, the Python package (`import prismrt`) and
+  the Hydra delegate (when usdview creates it) compare the install path with
+  the limit and, when it would be exceeded and long paths are not available to
+  the process, stop (the delegate: log an error) with one message: the install
+  path is too long; move the folder to a shorter path or enable long paths.
+  The check reads `bin\prism_paths.txt` (`root`, `required`, `all`: the longest
+  relative paths, written by `package_windows.ps1` and `build_wheel.py`), so it
+  costs one small file read and no directory walk. Build trees and plain
+  `cmake --install` prefixes have no such file and are not checked.
+  `PRISM_SKIP_PATH_CHECK=1` turns it off.
+- **Manifest.** `PrismRT.exe` and `prism_hydra_render.exe` carry a
+  `longPathAware` application manifest (`resources/windows/prism.manifest`,
+  `cmake/PrismLongPaths.cmake`), so with long paths enabled they open
+  long paths. The bundled `python.exe` has its own.
+
+To enable long paths (administrator, then restart or sign out): set the DWORD
+`HKLM\SYSTEM\CurrentControlSet\Control\FileSystem\LongPathsEnabled` to 1, from
+an elevated PowerShell:
+
+```powershell
+Set-ItemProperty HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem LongPathsEnabled 1
+```
+
+or with the group policy "Enable Win32 long paths". The setting only takes
+effect for executables whose manifest says `longPathAware`; `cmd.exe` and
+Explorer's zip extraction are not, so extract with `tar -xf` or 7-Zip when the
+zip's own paths are long.
 
 ## Python wheel
 

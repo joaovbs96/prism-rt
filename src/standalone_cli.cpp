@@ -16,6 +16,7 @@
 #include "device/device.h"
 #include "color/color_management.h"
 #include "renderer/renderer_context.h"
+#include "renderer/install_paths.h"
 #include "output/render_products.h"
 #include <pxr/usd/usdGeom/tokens.h>
 #include <pxr/usd/usdRender/settings.h>
@@ -651,6 +652,10 @@ int runStandaloneCli(int argc, char** argv) {
             help();
             return 0;
         }
+        // An install path past Windows' 260-character limit: one clear message
+        // instead of material loading failures (docs/deployment.md).
+        if (std::string problem = prism::CheckInstallPathLength(); !problem.empty())
+            throw std::runtime_error(problem);
         // The renderer's options: the environment's (OCIO, PRISM_*), which
         // flags and render settings override below.
         prism::RendererOptions rendererOptions = prism::RendererOptions::FromEnvironment();

@@ -925,6 +925,8 @@ void BindModule(nb::module_& m)
                                nb::call_guard<nb::gil_scoped_release>());
     }
     m.def("default_cache_directory", &DefaultCacheDirectory);
+    m.def("check_install_path_length", &CheckInstallPathLength, "include_all"_a = false,
+          "An empty string, or the message saying that the install path is too long for Windows' 260-character limit.");
 
     // ── Renderer information
     Struct<DeviceInfo>(m, "DeviceInfo")

@@ -8,6 +8,8 @@ PrismRT is a path tracer for OpenUSD, glTF and OBJ files with MaterialX material
 
 The optional PrismRT Hydra plugin renders in stock OpenUSD 26.08 usdview. Both frontends use the same render devices and MaterialX-to-MDL shading backend. See [Hydra usage](docs/hydra.md), [material support](docs/hydra_materials.md), and [Windows deployment](docs/deployment.md).
 
+Windows limits paths to 260 characters: extract the demo package (or create the Python environment) in a short folder such as `C:\PrismRT`, or enable long paths; PrismRT checks at start and says so ([path length](docs/deployment.md#path-length)).
+
 See [texture cache configuration](docs/texture_service.md) and the
 [validation report](docs/round3_validation.md) for measured performance,
 standalone/Hydra image comparisons, and remaining acceptance work.

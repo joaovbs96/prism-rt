@@ -144,4 +144,11 @@ struct PRISM_API RendererOptions {
 // else the temporary directory's PrismRT/cache.
 PRISM_API std::filesystem::path DefaultCacheDirectory();
 
+// Windows' 260-character path limit: an empty string when the installation
+// (Windows package, Python wheel) can open all its files, otherwise one message
+// saying the install path is too long and how to fix it (move the folder, or
+// enable LongPathsEnabled). Reads a small file written by the packaging scripts;
+// empty for build trees, other platforms, and PRISM_SKIP_PATH_CHECK=1.
+// `includeAll` also counts files only usdview needs (the package's Python).
+PRISM_API std::string CheckInstallPathLength(bool includeAll = false);
 } // namespace prism

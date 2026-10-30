@@ -1254,6 +1254,12 @@ called done there.
     the countertop scene of the MaterialEggs on `--device metal` with a cold
     cache renders as before and logs no C295 (the textures resolve through
     the MDL search path).
+- **Install path length check** ([deployment.md](deployment.md#path-length);
+  written on Windows): `src/renderer/install_paths.{h,cpp}` (core) is a no-op
+  off Windows; `src/hydra/plugin.cpp` calls `CheckInstallPathLength` once when
+  the delegate is created (a `TF_RUNTIME_ERROR` only when a Windows
+  `prism_paths.txt` marker exists). Nothing in shaders or devices. Check on
+  the Mac: build, `ctest -R prism_install_paths_test`.
 
 ## Diagnostics
 

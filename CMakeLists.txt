@@ -468,6 +468,9 @@ add_library(PrismRT::core ALIAS prism_frontend)
 
 add_executable(PrismRT src/main.cpp src/standalone_cli.cpp)
 target_link_libraries(PrismRT PRIVATE prism_gltf prism_obj prism prism_io prism_usd)
+# longPathAware manifest (docs/deployment.md, "Path length").
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/PrismLongPaths.cmake")
+prism_enable_long_paths(PrismRT)
 
 if(PRISM_COPY_ASSETS)
     add_custom_target(copy_assets ALL
@@ -522,6 +525,7 @@ if(PRISM_BUILD_HYDRA)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/render.cpp")
         add_executable(prism_hydra_render tests/hydra/render.cpp)
+        prism_enable_long_paths(prism_hydra_render)
         target_include_directories(prism_hydra_render PRIVATE ${PXR_INCLUDE_DIRS})
         target_link_libraries(prism_hydra_render PRIVATE
             PrismRT::core usdImagingGL hd ${PXR_LIBRARIES} OpenImageIO::OpenImageIO)
@@ -819,6 +823,21 @@ if(PRISM_BUILD_HYDRA)
     add_executable(prism_renderer_options_test tests/renderer_options.cpp)
     target_link_libraries(prism_renderer_options_test PRIVATE PrismRT::core)
     add_test(NAME prism_renderer_options_test COMMAND prism_renderer_options_test)
+
+    # Windows' 260-character path limit: the start-up check's decision, and
+    # the longPathAware manifest of the shipped executables.
+    add_executable(prism_install_paths_test tests/install_paths.cpp)
+    target_link_libraries(prism_install_paths_test PRIVATE PrismRT::core)
+    add_test(NAME prism_install_paths_test COMMAND prism_install_paths_test)
+    if(MSVC AND Python3_EXECUTABLE)
+        set(_prism_manifest_exes $<TARGET_FILE:PrismRT>)
+        if(TARGET prism_hydra_render)
+            list(APPEND _prism_manifest_exes $<TARGET_FILE:prism_hydra_render>)
+        endif()
+        add_test(NAME prism_long_path_manifest_test
+            COMMAND "${Python3_EXECUTABLE}" -I "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_manifest.py"
+                ${_prism_manifest_exes})
+    endif()
 
     add_executable(prism_ray_footprint_test tests/ray_footprint.cpp)
     target_link_libraries(prism_ray_footprint_test PRIVATE PrismRT::core)

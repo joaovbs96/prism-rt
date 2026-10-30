@@ -83,6 +83,13 @@ from .errors import (ERRORS as _ERRORS, CancelledError, DeviceLostError, Error, 
 
 _prism._set_error_classes(dict(_ERRORS))
 
+# Windows' 260-character path limit (docs/python.md): fail here, clearly,
+# rather than when the first material cannot open the MaterialX libraries.
+_path_problem = _prism.check_install_path_length()
+if _path_problem:
+    raise ImportError(_path_problem)
+del _path_problem
+
 from ._prism import (  # noqa: E402
     Aov, BufferView, CameraDesc, CameraId, Capabilities, ColorInfo, ColorOptions, CommitResult, CompileMode,
     ConformPolicy, DataType, DenoiseQuality, DenoiseSettings, DeviceInfo, DeviceKind, DeviceOptions,
