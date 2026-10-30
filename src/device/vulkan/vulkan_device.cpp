@@ -2126,6 +2126,12 @@ bool VulkanDevice::Impl::flushUploads(std::string* error)
                          &barrier, 0, nullptr, 0, nullptr);
     // submit waits for the copies, so the staging buffers can go.
     const bool ok = submit(commands, error);
+    if (gpu::GpuVerbose()) {
+        VkDeviceSize total = 0;
+        for (PendingUpload const& pending : pendingUploads) total += pending.staging.size;
+        std::cerr << std::format("PrismRT Vulkan: {} scene buffers ({:.1f} MiB) in device-local memory\n",
+                                 pendingUploads.size(), double(total) / 1048576.0);
+    }
     for (PendingUpload& pending : pendingUploads) destroyBuffer(pending.staging);
     pendingUploads.clear();
     return ok;
