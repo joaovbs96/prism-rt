@@ -1,7 +1,8 @@
 # Motion blur plan (Phase 8b)
 
-Status: planned, not started (2026-10-29). Decisions marked *proposed* await
-João's review. File references are as of `7e80fb7`.
+Status: planned, not started. Decisions accepted by João on 2026-10-30; the work
+starts after the performance work (docs/PLAN.md). The stages below are to be
+regrouped into fewer, larger merges before starting. File references are as of `7e80fb7`.
 
 ## Starting point
 
@@ -171,7 +172,7 @@ Each stage is one worktree and one merge, after the full serial ctest.
 - Hydra's behaviour once the motion support flags are on needs checking on
   USD 26.08 (a velocity-motion scene index may do part of the work).
 
-## Decisions (proposed, awaiting review)
+## Decisions (accepted 2026-10-30)
 
 1. Default shutter when none is authored: [0,0], USD's camera default (no
    blur unless asked for). The alternative is a Karma-style [-0.25, 0.25].

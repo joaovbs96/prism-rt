@@ -89,7 +89,7 @@ The handover for the main (orchestrating) session. Subagents don't read this fil
 - Reserve motion in the design even though motion blur comes later: time-sampled transforms and attributes (or velocity/acceleration) in the scene-building API, a shutter interval in the render settings, a per-sample time in the render path (`Ray.time` exists), so motion blur doesn't break the API or the Python bindings.
 
 ### After the SDK: motion blur (Phase 8b), in stages
-Detailed plan, file references and proposed decisions (awaiting João's review): [motion_blur.md](motion_blur.md).
+Detailed plan, file references and decisions (accepted 2026-10-30): [motion_blur.md](motion_blur.md). Starts after the performance work (batch 1 and the render profiler, then batch 3 after profiling), with the stages regrouped into fewer, larger merges.
 1. A time per sample within the shutter; both loaders read the shutter and time samples.
 2. CPU camera and transform motion (Embree time steps).
 3. CPU deformation and velocities (time-sampled points, PointInstancer/mesh velocities); memory for the extra samples.
