@@ -596,6 +596,14 @@ each storage-buffer slot by who touches it after the upload:
 Before this, every slot used the first `HOST_VISIBLE | HOST_COHERENT` type,
 which on NVIDIA/Windows (RTX 4070 Ti, driver memory types 0-4) is type 2 in
 the system-memory heap, so every shading read on an L2 miss crossed PCIe.
+Measured on that machine (ReBAR, `auto` against `host`, 3 alternating
+rounds, `--adaptive-threshold 0`, images bit-identical): OpenChessSet
+(`local/chess/chess_scene.usda`, 1280x720, 256 spp) render 6.7 s against
+12.7-14.7 s (0.52x; buffers 298 MiB of VRAM); MaterialEggs countertop
+(640x360, 512 spp) 23.2 s against 24.3-29.1 s (0.91x; 1562 MiB). With
+`--gpu-texture-budget-mib 64` the countertop's streamed textures are
+reduced identically in both modes (0.86x); with a 10000 MiB texture budget
+`auto` keeps the buffers in system memory.
 Metal's buffers are shared
 storage on unified memory and are unaffected.
 
