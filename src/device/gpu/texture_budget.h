@@ -38,6 +38,19 @@ inline uint64_t TextureBudget(uint64_t available, int budgetMiB, double fraction
     return uint64_t(double(available) * fraction);
 }
 
+// One device-local budget for the textures and the scene buffers (Vulkan):
+// the read-only scene buffers (`bufferBytes`) may take device-local memory
+// only when, after them and the acceleration structures built from them
+// (`structureBytes`), the rest of the texture budget still fits in what the
+// heap has `available`. `resident`: texture memory already in the heap's
+// usage. Textures never shrink for the buffers.
+inline bool SceneBuffersFit(uint64_t available, uint64_t textureBudget, uint64_t resident, uint64_t bufferBytes,
+                            uint64_t structureBytes)
+{
+    const uint64_t textures = textureBudget - std::min(textureBudget, resident);
+    return bufferBytes + structureBytes + textures <= available;
+}
+
 // Per image, how many times to halve its resolution (0: full resolution).
 inline std::vector<int> FitImages(std::vector<ImageFootprint> const& images, uint64_t budget,
                                   int minimumSize = 256)

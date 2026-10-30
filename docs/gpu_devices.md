@@ -543,34 +543,61 @@ they change the image, not just its noise.
 `VulkanDevice::Impl::upload` (`src/device/vulkan/vulkan_device.cpp`) places
 each storage-buffer slot by who touches it after the upload:
 
-- **Device-local** (`VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT`, VRAM on a discrete
-  GPU): every slot only the kernels and the acceleration-structure builds
-  read: positions, normals, texcoords, tangents, indices, prototypes,
-  instances, primitive materials, materials, legacy textures, spheres,
-  environment and its alias tables, lights and their alias table, primvars,
-  MDL argument blocks, read-only data, texture records and tiles, BSDF data.
-  `ensureScene` fills them from host-visible staging buffers with one batch
-  of `vkCmdCopyBuffer` (`flushUploads`), followed by a transfer-write →
-  all-commands memory barrier, before the images, the AS builds and any
-  dispatch; the staging buffers are freed once that submission's fence
-  signals. A scene edit re-uploads every slot this way (`ensureScene` runs
-  after `vkDeviceWaitIdle`).
-- **Host-visible** (as before): the frame parameters, the pixel list, the
-  RNG, the output and the accumulation (the host writes or reads them every
+- **Host-visible**, always: the frame parameters, the pixel list, the RNG,
+  the output and the accumulation (the host writes or reads them every
   dispatch; the last three host-cached), and the image records
   (`kSlotImages`, which texture streaming rewrites in place).
-- **Fallback.** A device-local slot goes host-visible when its buffer or
-  staging cannot be allocated, or when it would take the device-local heap's
-  usage past half its `VK_EXT_memory_budget` budget (the textures, 45% of the
-  heap, and the AS upload after the buffers). Images are identical either
-  way; only the shading reads' latency changes.
+- **Read-only scene slots** (positions, normals, texcoords, tangents,
+  indices, prototypes, instances, primitive materials, materials, legacy
+  textures, spheres, environment and its alias tables, lights and their
+  alias table, primvars, MDL argument blocks, read-only data, texture
+  records and tiles, BSDF data; only the kernels and the AS builds read
+  them) go where `ensureScene`'s `choosePlacement` says, for the whole
+  scene, in this order:
+  1. **ReBAR** — a `DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT` memory type
+     on the largest device-local heap (RTX 4070 Ti / Windows: type 4, heap
+     0; the 256 MiB BAR window that drivers without resizable BAR expose is
+     a heap of its own and does not count). The host maps the buffer and
+     `memcpy`s into it, exactly as into system memory; no copy commands or
+     barriers: host writes to host-coherent memory made before a queue
+     submission are visible to that submission's commands (the submission's
+     implicit host-write memory dependency).
+  2. **Staging copies** (no ReBAR) — a `DEVICE_LOCAL` buffer filled from a
+     host-visible staging buffer by one batch of `vkCmdCopyBuffer`
+     (`flushUploads`), then a transfer-write → all-commands memory barrier,
+     before the images, the AS builds and any dispatch; the staging buffers
+     go once that submission's fence signals.
+  3. **Host-visible** system memory, as before (the first
+     `HOST_VISIBLE | HOST_COHERENT` type: type 2, heap 1 on the 4070 Ti).
+     Also the fallback of any slot whose device-local (or staging)
+     allocation fails.
+- **One budget with the textures.** By default (`auto`) the scene slots
+  take device-local memory only when, after them and an estimate of the
+  acceleration structures built from them (the positions' and indices'
+  size), the heap's `VK_EXT_memory_budget` budget still holds the rest of
+  the texture budget (`prism:gpuTextureBudgetMiB`, by default 45% of the
+  heap; resident images count once). Otherwise they stay in system memory
+  (`gpu::SceneBuffersFit`, `src/device/gpu/texture_budget.h`). Textures
+  never shrink for the buffers: the texture budget, and so every image, is
+  the same whatever the placement, which changes only where shading reads
+  its data from. Without `VK_EXT_memory_budget`, `auto` keeps them in
+  system memory. A scene edit re-uploads every slot the same way
+  (`ensureScene` runs after `vkDeviceWaitIdle`); the device's own
+  device-local scene buffers are counted as freed.
+- **`PRISM_GPU_SCENE_BUFFERS`** = `auto` (default, above) | `device`
+  (ReBAR or staging, ignoring the budget) | `staging` (staging copies even
+  with ReBAR; for testing) | `host` (system memory, the behavior before
+  device-local placement). `PRISM_GPU_VERBOSE=1` prints the decision
+  (`scene buffers N MiB (+M MiB for structures), A MiB available, texture
+  budget T MiB (R resident): device-local|host memory`) and the result
+  (`N scene buffers (X MiB) in device-local memory (ReBAR, written
+  directly|staging copies|none: host memory)`).
 
 Before this, every slot used the first `HOST_VISIBLE | HOST_COHERENT` type,
 which on NVIDIA/Windows (RTX 4070 Ti, driver memory types 0-4) is type 2 in
-the system-memory heap, so every shading read on an L2 miss crossed PCIe. The
-same machine also exposes a ReBAR type (`DEVICE_LOCAL | HOST_VISIBLE`, type
-4); the staging path does not rely on it. Metal's buffers are shared storage
-on unified memory and are unaffected.
+the system-memory heap, so every shading read on an L2 miss crossed PCIe.
+Metal's buffers are shared
+storage on unified memory and are unaffected.
 
 ## Metal checklist
 
@@ -1325,10 +1352,18 @@ called done there.
     (`--spp 512 --adaptive-threshold 0.02 --seed 0`) on `--device metal`
     is bit-identical (`prism_compare_images --exact`) to the build before
     the change; `ctest -R "gpu|adaptive"`.
+- **Scene buffers in the GPU memory budget** (written on Windows, the Metal
+  device unbuilt): `src/device/gpu/texture_budget.h` gains
+  `SceneBuffersFit`, which only the Vulkan device calls
+  ([memory placement](#vulkan-memory-placement)); `TextureBudget` and
+  `FitImages` are unchanged. Check on the Mac: the build, and
+  `ctest -R texture_streaming`.
 
 ## Diagnostics
 
 - `PRISM_GPU_VERBOSE=1`: compile and upload timings.
+- `PRISM_GPU_SCENE_BUFFERS=auto|device|staging|host` (Vulkan): where the
+  read-only scene buffers go; see [memory placement](#vulkan-memory-placement).
 - `PRISM_GPU_DEBUG=1|2|3|4`: GPU primary-hit views (normal, texture
   coordinates, material, distance).
 - `PRISM_SHADER_DIR=<repo>/shaders`: load shader sources from disk instead

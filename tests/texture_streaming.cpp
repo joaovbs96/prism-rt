@@ -2,6 +2,7 @@
 // budgeting, priority between requests, levels kept while an image
 // converges, and least-recently-requested eviction. No GPU needed.
 
+#include "../src/device/gpu/texture_budget.h"
 #include "../src/device/gpu/texture_streaming.h"
 
 #include <cstdint>
@@ -185,6 +186,18 @@ int main()
         Feed(partial, {kNoRequest, 1});
         const auto kept = partial.plan();
         check(kept[1] == 1 && kept[0] == 1, "eviction keeps the coarser levels that fit: " + Levels(kept));
+    }
+
+    // Scene buffers share the device-local budget with the textures: they go
+    // there only when the remaining texture budget still fits after them.
+    {
+        constexpr uint64_t MiB = 1ull << 20;
+        check(SceneBuffersFit(10000 * MiB, 5000 * MiB, 0, 1500 * MiB, 1500 * MiB), "buffers that leave the texture budget");
+        check(!SceneBuffersFit(10000 * MiB, 5000 * MiB, 0, 3000 * MiB, 2500 * MiB), "buffers that would squeeze textures");
+        check(SceneBuffersFit(10000 * MiB, 5000 * MiB, 4000 * MiB, 4000 * MiB, 4000 * MiB),
+              "resident textures count in the usage, not twice");
+        check(SceneBuffersFit(1000 * MiB, 512 * MiB, 0, 400 * MiB, 0), "an explicit texture budget reserves only itself");
+        check(!SceneBuffersFit(1000 * MiB, 512 * MiB, 0, 400 * MiB, 100 * MiB), "the structures count too");
     }
 
     if (failures) {

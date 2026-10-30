@@ -196,6 +196,22 @@ bool StreamingEnabled()
     return GpuCopiesEnabled() && (!value || std::string_view(value) != "0");
 }
 
+// PRISM_GPU_SCENE_BUFFERS: where the read-only scene buffers go (auto:
+// device-local when the GPU memory budget allows; device: device-local
+// regardless of the budget; staging: device-local through staging copies even
+// with ReBAR, for testing; host: system memory). docs/gpu_devices.md,
+// "Vulkan memory placement".
+enum class SceneBuffers { Auto, Device, Staging, Host };
+SceneBuffers SceneBuffersSetting()
+{
+    const char* value = std::getenv("PRISM_GPU_SCENE_BUFFERS");
+    const std::string_view v = value ? value : "";
+    if (v == "device") return SceneBuffers::Device;
+    if (v == "staging") return SceneBuffers::Staging;
+    if (v == "host") return SceneBuffers::Host;
+    return SceneBuffers::Auto;
+}
+
 uint32_t StreamingSetting(const char* name, uint32_t fallback, uint32_t minimum = 0)
 {
     const char* value = std::getenv(name);
@@ -332,6 +348,7 @@ struct Buffer {
     void* mapped = nullptr;
     VkDeviceSize size = 0;
     VkDeviceAddress address = 0;
+    bool deviceLocal = false; // a read-only scene slot in device-local memory
 };
 
 struct Image {
@@ -813,14 +830,22 @@ struct VulkanDevice::Impl {
     ~Impl();
     bool initialize(std::string* reason);
     uint32_t memoryType(uint32_t bits, VkMemoryPropertyFlags flags) const;
+    // `type`: a specific memory type instead of the first matching one.
     bool createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, Buffer* buffer, bool hostVisible = true,
-                      bool hostCached = false);
+                      bool hostCached = false, uint32_t type = ~0u);
     void destroyBuffer(Buffer& buffer);
+    // Where upload() puts the read-only scene slots: host-visible system
+    // memory, device-local memory the host maps (ReBAR) and writes directly,
+    // or device-local memory filled from staging copies (flushUploads).
+    enum class Placement { Host, Mapped, Staged };
+    Placement placement = Placement::Host;
+    uint32_t localHeap = 0;     // the largest device-local heap
+    uint32_t rebarType = ~0u;   // a DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT type on it
+    Placement choosePlacement(uint64_t bufferBytes, uint64_t structureBytes);
     // Uploads a slot: host-visible for the slots the host touches per pass,
-    // otherwise device-local through a staging copy that flushUploads runs.
+    // otherwise as `placement` says.
     bool upload(int slot, const void* bytes, size_t size);
     bool flushUploads(std::string* error);
-    bool deviceLocalFits(VkDeviceSize bytes) const;
     void destroyStructure(AccelerationStructure& structure);
     VkCommandBuffer beginCommands();
     bool submit(VkCommandBuffer commands, std::string* error);
@@ -1151,6 +1176,20 @@ bool VulkanDevice::Impl::initialize(std::string* reason)
         return fail(std::string("cannot create the Vulkan device (") + ResultText(r) + ")");
     vkGetDeviceQueue(device, queueFamily, 0, &queue);
     vkGetPhysicalDeviceMemoryProperties(physical, &memoryProperties);
+    for (uint32_t h = 0; h < memoryProperties.memoryHeapCount; ++h)
+        if ((memoryProperties.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) &&
+            memoryProperties.memoryHeaps[h].size > memoryProperties.memoryHeaps[localHeap].size)
+            localHeap = h;
+    // ReBAR: a host-visible type covering the device-local heap (not the
+    // 256 MiB BAR window, which drivers expose as a heap of its own).
+    for (uint32_t i = 0; i < memoryProperties.memoryTypeCount && rebarType == ~0u; ++i) {
+        const VkMemoryPropertyFlags needed = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        if ((memoryProperties.memoryTypes[i].propertyFlags & needed) == needed &&
+            memoryProperties.memoryTypes[i].heapIndex == localHeap &&
+            (memoryProperties.memoryHeaps[localHeap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT))
+            rebarType = i;
+    }
     accelerationProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_PROPERTIES_KHR;
     VkPhysicalDeviceProperties2 properties2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
     properties2.pNext = &accelerationProperties;
@@ -2000,7 +2039,7 @@ uint32_t VulkanDevice::Impl::memoryType(uint32_t bits, VkMemoryPropertyFlags fla
 }
 
 bool VulkanDevice::Impl::createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, Buffer* buffer, bool hostVisible,
-                                      bool hostCached)
+                                      bool hostCached, uint32_t type)
 {
     *buffer = {};
     buffer->size = std::max<VkDeviceSize>(16, (size + 15) & ~VkDeviceSize(15));
@@ -2017,11 +2056,16 @@ bool VulkanDevice::Impl::createBuffer(VkDeviceSize size, VkBufferUsageFlags usag
     allocation.allocationSize = requirements.size;
     const VkMemoryPropertyFlags hostFlags =
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-    allocation.memoryTypeIndex = ~0u;
+    allocation.memoryTypeIndex = type != ~0u && (requirements.memoryTypeBits & (1u << type)) ? type : ~0u;
+    if (type != ~0u && allocation.memoryTypeIndex == ~0u) {
+        vkDestroyBuffer(device, buffer->buffer, nullptr);
+        *buffer = {};
+        return false;
+    }
     // The host reads results back from these buffers every pass. Uncached
     // (write-combined) memory makes those reads several times slower than
     // the dispatch itself, so prefer a cached type when one exists.
-    if (hostVisible && hostCached)
+    if (hostVisible && hostCached && type == ~0u)
         allocation.memoryTypeIndex = memoryType(requirements.memoryTypeBits,
             hostFlags | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
     if (allocation.memoryTypeIndex == ~0u)
@@ -2059,19 +2103,51 @@ static bool HostVisibleSlot(int slot)
            slot == kSlotAccumulation || slot == kSlotImages;
 }
 
-bool VulkanDevice::Impl::deviceLocalFits(VkDeviceSize bytes) const
+VulkanDevice::Impl::Placement VulkanDevice::Impl::choosePlacement(uint64_t bufferBytes, uint64_t structureBytes)
 {
-    if (!memoryBudget) return true;
-    const uint32_t type = memoryType(~0u, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    if (type == ~0u) return false;
-    const uint32_t heap = memoryProperties.memoryTypes[type].heapIndex;
+    const SceneBuffers setting = SceneBuffersSetting();
+    if (setting == SceneBuffers::Host) return Placement::Host;
+    const Placement local =
+        rebarType != ~0u && setting != SceneBuffers::Staging ? Placement::Mapped : Placement::Staged;
+    if (setting != SceneBuffers::Auto) return local;
+    // One budget with the textures: the buffers go to device-local memory
+    // only when the whole texture budget still fits after them (the placement
+    // never changes an image; a smaller texture budget would).
+    if (!memoryBudget) return Placement::Host;
     VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
     VkPhysicalDeviceMemoryProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
     properties.pNext = &budget;
     vkGetPhysicalDeviceMemoryProperties2(physical, &properties);
-    // Half the heap's budget at most: the textures (gpu::TextureBudget, 45%
-    // of the heap) and the acceleration structures upload after the buffers.
-    return budget.heapUsage[heap] + bytes <= budget.heapBudget[heap] / 2;
+    // The usage includes this device's current scene buffers (the upload
+    // replaces them) and its resident images (part of the texture budget).
+    uint64_t own = 0, resident = 0;
+    for (Buffer const& buffer : buffers)
+        if (buffer.deviceLocal) own += buffer.size;
+    for (auto const& [key, cached] : imageCache) resident += cached.image.bytes;
+    {
+        std::lock_guard lock(earlyMutex);
+        resident += earlyBytes;
+    }
+    const uint64_t limit = budget.heapBudget[localHeap] + own;
+    const uint64_t available = limit - std::min(limit, budget.heapUsage[localHeap]);
+    const uint64_t textures = gpu::TextureBudget(memoryProperties.memoryHeaps[localHeap].size, sceneTextureBudgetMiB);
+    const bool fits = gpu::SceneBuffersFit(available, textures, resident, bufferBytes, structureBytes);
+    if (gpu::GpuVerbose())
+        std::cerr << std::format("PrismRT Vulkan: scene buffers {:.1f} MiB (+{:.1f} MiB for structures), "
+                                 "{:.1f} MiB available, texture budget {:.1f} MiB ({:.1f} resident): {}\n",
+                                 double(bufferBytes) / 1048576.0, double(structureBytes) / 1048576.0,
+                                 double(available) / 1048576.0, double(textures) / 1048576.0,
+                                 double(resident) / 1048576.0, fits ? "device-local" : "host memory");
+    return fits ? local : Placement::Host;
+}
+
+// Writes `size` bytes (none when `bytes` is null) and zeroes the rest of a
+// mapped buffer of `capacity` bytes.
+static void Fill(void* mapped, const void* bytes, size_t size, size_t capacity)
+{
+    const size_t copied = bytes ? size : 0;
+    if (copied) std::memcpy(mapped, bytes, copied);
+    std::memset(static_cast<uint8_t*>(mapped) + copied, 0, capacity - copied);
 }
 
 bool VulkanDevice::Impl::upload(int slot, const void* bytes, size_t size)
@@ -2087,23 +2163,29 @@ bool VulkanDevice::Impl::upload(int slot, const void* bytes, size_t size)
         }
     const VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
         VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
-    if (!HostVisibleSlot(slot) && deviceLocalFits(size)) {
-        // Device-local, filled from a staging buffer by flushUploads. The
-        // staging covers the whole (padded) buffer, zeroing the padding.
+    const Placement where = HostVisibleSlot(slot) ? Placement::Host : placement;
+    if (where == Placement::Mapped && createBuffer(size, usage, &buffers[slot], true, false, rebarType)) {
+        // ReBAR: written like host memory. Host writes to host-coherent
+        // memory made before a queue submission are visible to its commands.
+        Fill(buffers[slot].mapped, bytes, size, size_t(buffers[slot].size));
+        buffers[slot].deviceLocal = true;
+        return true;
+    }
+    if (where == Placement::Staged) {
+        // Filled from a staging buffer of the whole (padded) size by
+        // flushUploads.
         PendingUpload pending{slot};
         if (createBuffer(size, usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT, &buffers[slot], false)) {
             if (createBuffer(buffers[slot].size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &pending.staging, true)) {
-                auto* mapped = static_cast<uint8_t*>(pending.staging.mapped);
-                if (bytes && size) std::memcpy(mapped, bytes, size);
-                const size_t copied = bytes ? size : 0;
-                std::memset(mapped + copied, 0, size_t(pending.staging.size) - copied);
+                Fill(pending.staging.mapped, bytes, size, size_t(pending.staging.size));
+                buffers[slot].deviceLocal = true;
                 pendingUploads.push_back(pending);
                 return true;
             }
             destroyBuffer(buffers[slot]);
         }
-        // No device-local memory (or staging) left: host-visible as before.
     }
+    // Host-visible (also when no device-local memory is left).
     const bool readBack = slot == kSlotRng || slot == kSlotOutput || slot == kSlotAccumulation;
     if (!createBuffer(size, usage, &buffers[slot], true, readBack)) return false;
     if (bytes && size) std::memcpy(buffers[slot].mapped, bytes, size);
@@ -2126,12 +2208,6 @@ bool VulkanDevice::Impl::flushUploads(std::string* error)
                          &barrier, 0, nullptr, 0, nullptr);
     // submit waits for the copies, so the staging buffers can go.
     const bool ok = submit(commands, error);
-    if (gpu::GpuVerbose()) {
-        VkDeviceSize total = 0;
-        for (PendingUpload const& pending : pendingUploads) total += pending.staging.size;
-        std::cerr << std::format("PrismRT Vulkan: {} scene buffers ({:.1f} MiB) in device-local memory\n",
-                                 pendingUploads.size(), double(total) / 1048576.0);
-    }
     for (PendingUpload& pending : pendingUploads) destroyBuffer(pending.staging);
     pendingUploads.clear();
     return ok;
@@ -3299,35 +3375,47 @@ bool VulkanDevice::Impl::ensureScene(SceneManager& scene, std::string* error)
     } join{compiled};
     GpuSceneData const& d = *data;
     progress::Detail(Phase::Upload, "buffers");
-    auto bytes = [](auto const& v) { return v.size() * sizeof(v[0]); };
-    upload(kSlotPositions, d.positions.data(), bytes(d.positions));
-    upload(kSlotNormals, d.normals.data(), bytes(d.normals));
-    upload(kSlotTexcoords, d.texcoords.data(), bytes(d.texcoords));
-    upload(kSlotTangents, d.tangents.data(), bytes(d.tangents));
-    upload(kSlotIndices, d.indices.data(), bytes(d.indices));
-    upload(kSlotPrototypes, d.prototypes.data(), bytes(d.prototypes));
-    upload(kSlotInstances, d.instances.data(), bytes(d.instances));
-    upload(kSlotPrimitiveMaterials, d.primitiveMaterials.data(), bytes(d.primitiveMaterials));
-    upload(kSlotMaterials, d.materials.data(), bytes(d.materials));
-    upload(kSlotLegacyTextures, d.legacyTextures.data(), bytes(d.legacyTextures));
-    upload(kSlotSpheres, d.spheres.data(), bytes(d.spheres));
-    upload(kSlotEnvironment, d.environments.data(), bytes(d.environments));
-    upload(kSlotLights, d.lights.data(), bytes(d.lights));
-    upload(kSlotLightAlias, d.lightAlias.data(), bytes(d.lightAlias));
-    upload(kSlotPrimvarValues, d.primvarValues.data(), bytes(d.primvarValues));
-    upload(kSlotPrimvarDirectory, d.primvars.data(), bytes(d.primvars));
+    struct SlotData {
+        int slot;
+        const void* data;
+        size_t bytes;
+    };
+    auto of = [](int slot, auto const& v) { return SlotData{slot, v.data(), v.size() * sizeof(v[0])}; };
     static const GpuSceneData::EnvironmentTables noTables;
     auto const& tables = d.environmentTables ? *d.environmentTables : noTables;
-    upload(kSlotEnvTexelPdf, tables.texelPdf.data(), bytes(tables.texelPdf));
-    upload(kSlotEnvAliasProbability, tables.aliasProbability.data(), bytes(tables.aliasProbability));
-    upload(kSlotEnvAlias, tables.alias.data(), bytes(tables.alias));
-    upload(kSlotMdlTextures, d.mdlTextures.data(), bytes(d.mdlTextures));
-    upload(kSlotMdlTiles, d.mdlTiles.data(), bytes(d.mdlTiles));
-    upload(kSlotBsdfData, d.bsdfData.data(), bytes(d.bsdfData));
+    const SlotData slots[] = {
+        of(kSlotPositions, d.positions), of(kSlotNormals, d.normals), of(kSlotTexcoords, d.texcoords),
+        of(kSlotTangents, d.tangents), of(kSlotIndices, d.indices), of(kSlotPrototypes, d.prototypes),
+        of(kSlotInstances, d.instances), of(kSlotPrimitiveMaterials, d.primitiveMaterials),
+        of(kSlotMaterials, d.materials), of(kSlotLegacyTextures, d.legacyTextures), of(kSlotSpheres, d.spheres),
+        of(kSlotEnvironment, d.environments), of(kSlotLights, d.lights), of(kSlotLightAlias, d.lightAlias),
+        of(kSlotPrimvarValues, d.primvarValues), of(kSlotPrimvarDirectory, d.primvars),
+        of(kSlotEnvTexelPdf, tables.texelPdf), of(kSlotEnvAliasProbability, tables.aliasProbability),
+        of(kSlotEnvAlias, tables.alias), of(kSlotMdlTextures, d.mdlTextures), of(kSlotMdlTiles, d.mdlTiles),
+        of(kSlotBsdfData, d.bsdfData)};
+    // The acceleration structures built from the positions and indices are
+    // estimated at their size.
+    uint64_t sceneBytes = 0;
+    for (SlotData const& s : slots) sceneBytes += s.bytes;
+    placement = choosePlacement(sceneBytes, slots[0].bytes + slots[4].bytes); // positions, indices
+    for (SlotData const& s : slots) upload(s.slot, s.data, s.bytes);
     if (!buffers[kSlotFrame].buffer) upload(kSlotFrame, nullptr, sizeof(GpuFrame));
     for (int slot : {kSlotPixels, kSlotRng, kSlotOutput, kSlotAccumulation})
         if (!buffers[slot].buffer) upload(slot, nullptr, 16);
     if (!flushUploads(error)) return fail();
+    if (gpu::GpuVerbose()) {
+        uint64_t local = 0;
+        int count = 0;
+        for (Buffer const& buffer : buffers)
+            if (buffer.deviceLocal) {
+                local += buffer.size;
+                ++count;
+            }
+        std::cerr << std::format("PrismRT Vulkan: {} scene buffers ({:.1f} MiB) in device-local memory ({})\n",
+                                 count, double(local) / 1048576.0,
+                                 placement == Placement::Mapped ? "ReBAR, written directly"
+                                 : placement == Placement::Staged ? "staging copies" : "none: host memory");
+    }
     auto const uploaded = Clock::now();
     if (!uploadImages(error)) return fail();
     if (!createFeedbackBuffers(streaming.sources.empty() ? 0u : uint32_t(d.images.size()), error)) return fail();
