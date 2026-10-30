@@ -9,9 +9,19 @@ These rules apply to every session in this repo. The first half is how we work; 
 ### Role: orchestrator
 - The main session orchestrates; its context is the expensive resource.
 - Delegate execution to subagents. Keep raw logs, JSON and images out of the main context.
-- Subagents do NOT read the handover (`docs/PLAN.md`). Give each a self-contained brief: goal, exact commands or files, the constraints that apply (copy the relevant rules from this file), definition of done, return format.
+- Subagents do NOT read the handover (`docs/PLAN.md`). Give each a self-contained brief: goal, exact commands or files, definition of done, return format, and the task-specific constraints. Subagents load this file themselves, so a brief names the sections that apply (e.g. "Machine safety, Git") instead of copying them.
+- Every brief also states: GPU allowed or CPU only (`--device cpu`, `ctest -LE gpu`; CPU only whenever João may have usdview open); read-only, or code changes in a worktree (`isolation: worktree`); and whether to commit.
 - Subagents write details to `local/reports/<topic>.md` (git-ignored; a worktree agent writes into its own worktree's `local/reports/` and the main session copies the file over) and return at most ~150 words: verdict, key numbers, evidence paths, anything unverified or odd.
 - Treat reports as evidence, not truth: spot-check anything surprising before acting.
+- Independent audits or investigations run as parallel subagents, one per component, each with its own report.
+
+### Subagent standards
+- **Worktrees.** The git-ignored local files are not in a new worktree: copy `cmake/PrismLocalDependencies.cmake` and `prism_local_env.ps1` from the main checkout before configuring. `local\alab\run_capped.ps1` exists only in the main checkout; call it from there.
+- **Builds and tests to a log.** Every `cmake --build` and `ctest` writes its full output to a log file (`*> <log>`); record the exit code, then grep the log (` error |error MSB|fatal error`, `tests failed`). Never filter the live stream. Use a bounded `--parallel 8` when other work runs.
+- **No leftover processes.** An agent that starts `PrismRT`/`prism_*` processes lists them at the end and confirms none remain. A process hung in `ExitProcess` ignores `Stop-Process`; terminate its remaining thread (`OpenThread(THREAD_TERMINATE)` + `TerminateThread`). Static objects in `prism.dll` whose destructors touch threads (TBB, OIDN, MDL) are leaked on purpose.
+- **Image checks.** Changes that should not alter images: `prism_compare_images --exact` against the previous build, cold and warm cache (`PRISM_CACHE_DIR` per run).
+- **Benchmarks.** Timings on this machine vary about 2x with other use. Never compare with an earlier number: alternate baseline and candidate binaries in one session and report ratios.
+- **Merging (main session).** Spot-check the report and diff, merge, build to a log, run the merge gate, then report; push only per Git below.
 
 ### Model selection
 - Haiku: very simple or mechanical tasks.
@@ -24,17 +34,19 @@ These rules apply to every session in this repo. The first half is how we work; 
 - No speculative fixes.
 
 ### Machine safety (GPU faults have frozen this PC)
-- One GPU process at a time across the whole machine (renders, usdview, Vulkan tests); check for other `PrismRT`/`prism_*`/`usdview`/`ctest` processes first (ones running with `--device cpu` don't count).
+- One GPU process at a time across the whole machine (renders, usdview, Vulkan tests); check for other `PrismRT`/`prism_*`/`usdview`/`ctest` processes first (`Get-CimInstance Win32_Process` and their command lines; ones running with `--device cpu` or `ctest -LE gpu` don't count).
 - Renders go through `local\alab\run_capped.ps1 -LimitGB <n> -Exe <exe> -Arguments "..."` (a job-object memory cap). Never wrap powershell/cmd/python in the cap; no retry loops.
 - No GPU performance loops or A/B matrices without João's OK. New Vulkan paths run first under `VK_LAYER_KHRONOS_validation` (+ GPU-AV) on a small scene.
 - On a device-lost, TDR, hang, empty log or a slow system: stop all GPU work and wait for João before restarting anything.
 - Keep C: above 60 GB free. D: is a slow USB HDD: fine for builds and dependency installs, not for shader or texture caches.
 
 ### Git
-- Agents commit small local commits freely, with short imperative subjects in the existing style.
+- Agents commit small local commits freely, with short imperative subjects in the existing style. Subjects say what changed, never plan step numbers ("SDK step 2").
 - Never push, merge into `main` or open PRs without João's explicit approval.
-- Commits and PR descriptions carry no attribution or co-author lines for Claude or any code agent.
-- Stage explicit paths (`git add <path>`); never `git commit -a` and never override `core.autocrlf`. Check `git diff --cached --stat` before committing and `git diff --stat origin/main..HEAD` before pushing: the file count must match the intended change (a past commit rewrote 365 files' line endings).
+- Commits, PR descriptions, code comments and docs carry no attribution, co-author lines or mentions of Claude or any code agent.
+- Stage explicit paths (`git add <path>`); never `git commit -a` and never override `core.autocrlf`. Check `git diff --cached --stat` before committing and `git diff --stat origin/main..HEAD` before pushing: the file count must match the intended change (a past commit rewrote 365 files' line endings). PowerShell `Set-Content`/`WriteAllText` and `sed -i` can change line endings too.
+- Conflicts: resolve in one command, verify in a separate one (`git diff --check`, no `^(<<<<<<<|>>>>>>>) ` markers; tracked files use CRLF, match `\r?\n`), and only then `git add` and continue. Never chain the continue after a resolution script.
+- Tags (`v0.2.0-alpha.N` per landed step) are signed by João; give him the exact `git tag -s` command, never create tags.
 - Don't touch João's untracked files in the checkout (`HYDRA_DELEGATE_PLAN.md`, `USD-EXPORT-FINDINGS.md`, `analytic-spheres.usda`, `docs/gpu_backend.md`). Never rewrite source asset files.
 
 ### Communication
@@ -88,6 +100,10 @@ Each test is its own executable (`materialx_loader_*`); these compile `src/mater
 Two front ends load scenes into a `SceneManager` and hand it to a render device (`src/device/device.h`):
 - the standalone CLI (`main.cpp` → `runStandaloneCli` in `src/standalone_cli.cpp`): one USD (`USDMesh`), glTF (`glTFMesh`) or OBJ (`ObjMesh`) file, a USD camera or `--camera-position/--camera-target`, render settings and products, output through OpenImageIO, a progress line, and USD's default dome for scenes with no light;
 - the Hydra delegate (`src/hydra/`, `scene_bridge.cpp`): usdview and `prism_hydra_render`.
+
+**SDK and Python** (docs/sdk_design.md, docs/python.md). The core is the shared library `prism.dll` (public headers `include/prism/`: `Renderer`, `Scene` with incremental `commit` in `src/scene/`, `Session` with progressive rendering in `src/session/`, per-renderer state in `src/renderer/`); `prism_usd.dll` adds the USD loader (`src/usd/`, including the built-in material preview on the shaderball in `resources/`). The CLI, the Hydra delegate (through a hosted `Session`) and the Python package `prismrt` (nanobind, `python/`; examples in `examples/python/`; wheel from `tools/build_wheel.py`) all use it. Exported symbols carry `PRISM_API` / `PRISM_INTERNAL_API`.
+
+**Caches** live in `%LOCALAPPDATA%\PrismRT\cache` (`PRISM_CACHE_DIR` moves it): prepared textures (`*.tx.exr`, `*.gpu`), published material sources and converted documents (`materials/`), generated MDL and GPU programs; the Vulkan shader and pipeline caches are in `%LOCALAPPDATA%\PrismRT\vulkan`. Tests use their own cache directories.
 
 There are no hard-coded C++ scenes; `assets/scenes` holds USD scenes (InOneWeekend, CornellBox, QuadTest).
 
