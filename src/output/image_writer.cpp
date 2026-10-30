@@ -54,17 +54,18 @@ void SetWindow(OIIO::ImageSpec &spec, Image const &image)
     spec.full_height = image.fullHeight;
 }
 
-void Write(std::string const &path, OIIO::ImageSpec const &spec, std::vector<float> const &pixels)
+// Writes interleaved float pixels straight from `pixels` (no ImageBuf copy).
+void Write(std::string const &path, OIIO::ImageSpec const &spec, float const *pixels)
 {
-    OIIO::ImageBuf buffer(spec);
-    if (!buffer.set_pixels(OIIO::ROI::All(), OIIO::TypeDesc::FLOAT, pixels.data()))
-        throw std::runtime_error("Cannot store image pixels: " + buffer.geterror());
     const auto parent = std::filesystem::path(path).parent_path();
     if (!parent.empty()) {
         std::error_code ignored;
         std::filesystem::create_directories(parent, ignored);
     }
-    if (!buffer.write(path)) throw std::runtime_error("Cannot write image " + path + ": " + buffer.geterror());
+    auto output = OIIO::ImageOutput::create(path);
+    if (!output) throw std::runtime_error("Cannot write image " + path + ": " + OIIO::geterror());
+    if (!output->open(path, spec) || !output->write_image(OIIO::TypeDesc::FLOAT, pixels) || !output->close())
+        throw std::runtime_error("Cannot write image " + path + ": " + output->geterror());
 }
 
 // The EXR header of channels `names`: alpha and depth channels, the data
@@ -164,6 +165,11 @@ void WriteImage(std::string const &path, Image const &image,
             return;
         }
         const OIIO::ImageSpec spec = ExrSpec(image, names, color);
+        // One layer is already interleaved: written from its own pixels.
+        if (image.layers.size() == 1) {
+            Write(path, spec, image.layers.front().pixels.data());
+            return;
+        }
         std::vector<float> interleaved(pixels * names.size());
         size_t offset = 0;
         for (auto const &layer : image.layers) {
@@ -173,7 +179,7 @@ void WriteImage(std::string const &path, Image const &image,
                             interleaved.data() + p * names.size() + offset);
             offset += count;
         }
-        Write(path, spec, interleaved);
+        Write(path, spec, interleaved.data());
         return;
     }
     // Display-encoded through the view, exactly once: the colour layer only.
@@ -204,7 +210,7 @@ void WriteImage(std::string const &path, Image const &image,
         spec.alpha_channel = 3;
         spec.attribute("oiio:UnassociatedAlpha", 1);
     }
-    Write(path, spec, encoded);
+    Write(path, spec, encoded.data());
 }
 
 } // namespace prism::output
