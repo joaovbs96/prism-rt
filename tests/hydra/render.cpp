@@ -14,6 +14,7 @@
 #include "../../src/renderer/renderer_options.h"
 #include "../../src/output/render_products.h"
 #include "../../src/render_defaults.h"
+#include "../../src/render_profile.h"
 #include <pxr/usd/usd/editContext.h>
 #include <pxr/usd/usdGeom/tokens.h>
 #include <pxr/imaging/cameraUtil/framing.h>
@@ -331,6 +332,14 @@ void overrideAuthoredSettings(const UsdStageRefPtr& stage, SdfPath const& settin
 }
 
 int main(int argc, char** argv) {
+    // PRISM_RENDER_PROFILE: the render profile of every render, at exit.
+    struct PrintRenderProfile {
+        ~PrintRenderProfile()
+        {
+            const std::string report = prism::profiling::Report();
+            if (!report.empty()) std::cout << report << std::flush;
+        }
+    } printRenderProfile;
     try {
         if (argc == 3 && std::string(argv[1]) == "--check-transparent-alpha") {
             OIIO::ImageBuf saved(argv[2]);

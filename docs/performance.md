@@ -316,6 +316,43 @@ reduction does not; Teapot's textures barely show at this view either way.
 Runs at a constrained budget are deterministic: residency is planned from
 the requests alone while settling.
 
+## Render profile
+
+`PRISM_RENDER_PROFILE=1` times the stages of the CPU render loops
+(`src/render_profile.h`) and prints a table when the render ends: the CLI
+after its `[PrismProfile]` line, `prism_hydra_render` at exit (every render
+of the process). Each row is a stage's calls, summed worker elapsed time,
+time per call and share of the `sample (total)` row:
+
+| Stage | What it times |
+| --- | --- |
+| sample (total) | one path sample of a pixel; everything below except film, adaptive check and denoise |
+| intersection, hit preparation | the closest-hit Embree query of a path segment and the `RayHit` built from it |
+| NEE light choice | the light pick and light sample of next-event estimation (includes `emitter radiance`) |
+| NEE shadow ray | the whole shadow test (`visible`), including the shadow rows below |
+| shadow intersection, shadow hit preparation, shadow cutout | the Embree queries, hit preparation and cutout opacity of shadow-ray crossings |
+| MDL prepare (init) | `perturbNormal` and the material's `init` (all texture results) at a vertex |
+| MDL sample, MDL evaluate, MDL medium | the BSDF sample (with cutout, thin-walled and emission), evaluate, volume coefficients |
+| emitter radiance | a textured emitter's emission at a light sample |
+| texture lookup, BSDF table lookup | the MDL texture runtime's 2D (OIIO) and BSDF data-table lookups |
+| environment | dome radiance, sampling, pdf and lobes |
+| film | accumulating the samples into the image (CLI: the final resolve; Hydra: each pass's commit) |
+| adaptive check | the convergence checks of adaptive sampling |
+| denoise | the denoiser (CLI: the final denoise; Hydra: the denoise worker's jobs) |
+
+The sums are worker elapsed time, not CPU or wall time: with 28 threads a
+1 s render sums to about 28 s. Stages nest (a texture lookup inside an MDL
+prepare counts in both), so shares do not add up to 100%. The clocks cost
+about 20-40 ns per timed call, which inflates the short stages (BSDF table
+and texture lookups are called tens of millions of times); compare the
+shares of one build's profile, and measure gains with wall time and
+alternating runs. Profiling off, each timed scope is one thread-local null
+check: images are bit-identical with it on or off, and render times are
+within run-to-run noise of a build without it. Only the CPU device is timed
+(the GPU devices' kernels run on the GPU); the shared integrator's two hooks
+(`PRISM_PROFILE` in `shaders/integrator/path_tracer.h`) expand to nothing
+in HLSL.
+
 ## Interpretation limits
 
 MDL variants remain cached for the renderer process lifetime, affecting warm-recreation results. Historical InOneWeekend measurements used coarse tessellated spheres; the current implementation uses analytic spheres. Report this representation change when comparing geometry memory and rendering results. See [Hydra scope and costs](hydra.md) for rendering limitations and supported geometry behavior.

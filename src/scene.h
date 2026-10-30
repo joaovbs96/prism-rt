@@ -73,8 +73,8 @@ public:
             id = RTC_INVALID_GEOMETRY_ID;
 
         // intersect a single ray with the scene
-        prism::profiling::Scope intersectionTimer(prism::profiling::shadow
-            ? prism::profiling::ShadowIntersection : prism::profiling::Intersection);
+        prism::profiling::Scope intersectionTimer(prism::profiling::Intersection,
+                                                  prism::profiling::ShadowIntersection);
         rtcIntersect1(scene, &e_rayhit);
         intersectionTimer.stop();
         return e_rayhit;
@@ -83,8 +83,8 @@ public:
     RayHit prepareHit(RTCRayHit e_rayhit,
                       prism::PathRay const &pathRay)
     {
-        prism::profiling::Scope hitTimer(prism::profiling::shadow
-            ? prism::profiling::ShadowHitPreparation : prism::profiling::HitPreparation);
+        prism::profiling::Scope hitTimer(prism::profiling::HitPreparation,
+                                         prism::profiling::ShadowHitPreparation);
 
         if (e_rayhit.hit.geomID == RTC_INVALID_GEOMETRY_ID) {
             RayHit miss(e_rayhit);

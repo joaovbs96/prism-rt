@@ -39,6 +39,7 @@
 #include <mutex>
 #include <thread>
 #include "progress.h"
+#include "render_profile.h"
 PXR_NAMESPACE_USING_DIRECTIVE
 
 #ifdef _WIN32
@@ -1031,6 +1032,9 @@ int runStandaloneCli(int argc, char** argv) {
                   << ",\"textureSourceBytesHashed\":" << stats.textureSourceBytesHashed
                   << ",\"texturePreparationWorkerSeconds\":" << stats.texturePreparationNanoseconds / 1e9
                   << "}\n";
+        // PRISM_RENDER_PROFILE: where the render's time went.
+        if (const std::string report = prism::profiling::Report(renderSeconds); !report.empty())
+            std::cout << report;
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "PrismRT: " << error.what() << '\n';

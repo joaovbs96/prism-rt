@@ -8,6 +8,9 @@
 // The light AOVs are compiled in and gathered when a render asks for them
 // (CpuPathTracer::aovs).
 #define PRISM_LIGHT_AOVS 1
+// The integrator's stages in the render profile (PRISM_RENDER_PROFILE).
+#include "../render_profile.h"
+#define PRISM_PROFILE(stage) ::prism::profiling::Scope prismProfileScope(::prism::profiling::stage)
 #include "../../shaders/integrator/path_tracer.h"
 #include "light_table.h"
 #include "../camera_rays.h"
@@ -73,7 +76,11 @@ struct CpuBackend {
     }
 
     bool mayHaveCutouts() { return !opaqueScene; }
-    CpuHit intersectNonOpaque(::PathRay const& ray) { return intersect(ray); }
+    CpuHit intersectNonOpaque(::PathRay const& ray)
+    {
+        profiling::ShadowScope shadowScope;
+        return intersect(ray);
+    }
 
     CpuHit intersect(::PathRay const& ray)
     {
@@ -99,6 +106,7 @@ struct CpuBackend {
 
     CpuShading prepare(CpuHit const& hit)
     {
+        profiling::Scope timer(profiling::MaterialPrepare);
         CpuShading shading;
         shading.hit = ToRayHit(hit.surface);
         shading.hit->primvarMesh = hit.primvarMesh;
@@ -111,6 +119,7 @@ struct CpuBackend {
 
     BsdfSample sample(CpuShading const& shading, float4 xi)
     {
+        profiling::Scope timer(profiling::MaterialSample);
         shading.prepared.hasXi = true;
         shading.prepared.xi[0] = xi.x;
         shading.prepared.xi[1] = xi.y;
@@ -124,6 +133,7 @@ struct CpuBackend {
 
     MediumCoefficients medium(CpuShading const& shading)
     {
+        profiling::Scope timer(profiling::MaterialMedium);
         MediumCoefficients result = {float3(0.0f), float3(0.0f), 0.0f, false};
         const auto medium = shading.material->medium(*shading.hit, shading.prepared);
         if (!medium) return result;
@@ -136,6 +146,7 @@ struct CpuBackend {
 
     BsdfEvaluation evaluate(CpuShading const& shading, float3 wi)
     {
+        profiling::Scope timer(profiling::MaterialEvaluate);
         const BRDFEvaluation e = shading.material->evaluatePrepared(*shading.hit, ToFloat3(wi), shading.prepared);
         const BsdfEvaluation result = {FromFloat3(e.value), e.pdf, e.valid, FromFloat3(e.diffuse)};
         return result;
@@ -162,6 +173,7 @@ struct CpuBackend {
     bool provenOpaque(CpuHit const& hit) { return hit.material->provenOpaque(); }
     float cutoutOpacity(CpuHit const& hit)
     {
+        profiling::Scope timer(profiling::Cutout);
         RayHit rh = ToRayHit(hit.surface);
         rh.primvarMesh = hit.primvarMesh;
         rh.instancePrimvars = hit.instancePrimvars;
@@ -170,12 +182,14 @@ struct CpuBackend {
 
     float3 environmentRadiance(float3 direction, float angular)
     {
+        profiling::Scope timer(profiling::Environment);
         return FromFloat3(scene->environment->radiance(
             ToFloat3(direction), prism::DirectionFootprint{angular, scene->textureFiltering}));
     }
 
     EnvironmentLightSample sampleEnvironment(float4 u, float angular)
     {
+        profiling::Scope timer(profiling::Environment);
         const float point[4] = {u.x, u.y, u.z, u.w};
         const ::EnvironmentSample s = scene->environment->sampleDirectionUniform(
             point, prism::DirectionFootprint{angular, scene->textureFiltering});
@@ -183,11 +197,16 @@ struct CpuBackend {
         return result;
     }
 
-    float environmentPdf(float3 direction) { return scene->environment->directionPdf(ToFloat3(direction)); }
+    float environmentPdf(float3 direction)
+    {
+        profiling::Scope timer(profiling::Environment);
+        return scene->environment->directionPdf(ToFloat3(direction));
+    }
 
     bool lightLobes() { return lobes; }
     EnvironmentLobes environmentLobes(float3 direction, float angular)
     {
+        profiling::Scope timer(profiling::Environment);
         Color3 diffuse, specular;
         EnvironmentRadianceLobes(scene->environment, ToFloat3(direction),
                                  prism::DirectionFootprint{angular, scene->textureFiltering}, &diffuse, &specular);
@@ -240,6 +259,7 @@ struct CpuBackend {
     // material at the hit `ray` makes there.
     float3 emitterRadiance(LightRecord const& light, float2 barycentrics, ::PathRay const& ray, float distance)
     {
+        profiling::Scope timer(profiling::Emission);
         using namespace light_table_detail;
         const int placement = int(asuint(light.p0.w));
         auto found = scene->geometry.find(placement);

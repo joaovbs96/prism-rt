@@ -1031,6 +1031,26 @@ if(PRISM_BUILD_HYDRA)
         set_tests_properties(prism_cli_gpu_failure_vulkan PROPERTIES
             ENVIRONMENT "${_prism_test_environment}")
     endif()
+    # PRISM_RENDER_PROFILE prints the stages of a CPU render and leaves its
+    # image unchanged (docs/performance.md, "Render profile").
+    foreach(_profile 0 1)
+        add_test(NAME prism_render_profile_${_profile}
+            COMMAND PrismRT --scene "${CMAKE_CURRENT_SOURCE_DIR}/assets/scenes/CornellBox.usda"
+                --camera /World/Camera --width 48 --height 32 --spp 4 ${_prism_fixed_sampling} --device cpu
+                --output "${CMAKE_BINARY_DIR}/render_profile_${_profile}.exr")
+        set_tests_properties(prism_render_profile_${_profile} PROPERTIES
+            ENVIRONMENT "${_prism_test_environment};PRISM_RENDER_PROFILE=${_profile}"
+            FIXTURES_SETUP prism_render_profile)
+    endforeach()
+    set_tests_properties(prism_render_profile_1 PROPERTIES
+        PASS_REGULAR_EXPRESSION "Render profile .*sample \\(total\\) +6144 .*MDL prepare")
+    set_tests_properties(prism_render_profile_0 PROPERTIES FAIL_REGULAR_EXPRESSION "Render profile")
+    if(TARGET prism_compare_images)
+        add_test(NAME prism_render_profile_image_test
+            COMMAND prism_compare_images "${CMAKE_BINARY_DIR}/render_profile_0.exr"
+                "${CMAKE_BINARY_DIR}/render_profile_1.exr" --exact)
+        set_tests_properties(prism_render_profile_image_test PROPERTIES FIXTURES_REQUIRED prism_render_profile)
+    endif()
     # --time-limit / prism:timeLimitSeconds: a sample count no render reaches
     # stops at the limit, in both frontends (docs/hydra.md).
     add_test(NAME prism_cli_time_limit

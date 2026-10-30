@@ -1260,6 +1260,16 @@ called done there.
   the delegate is created (a `TF_RUNTIME_ERROR` only when a Windows
   `prism_paths.txt` marker exists). Nothing in shaders or devices. Check on
   the Mac: build, `ctest -R prism_install_paths_test`.
+- **CPU render profile** ([performance.md](performance.md#render-profile);
+  written on Windows, the Metal device unbuilt):
+  - Shared shader code: `shaders/integrator/path_tracer.h` gains a
+    `PRISM_PROFILE(stage)` hook (at the top of `visible` and `chooseLight`)
+    that expands to nothing unless the CPU backend defines it. The HLSL after
+    preprocessing is unchanged (an empty statement); the embedded source
+    text changes, so shader caches keyed by source recompile once.
+  - Check on the Mac: the build compiles the kernel (`prism_gpu_shader_compile_test`);
+    `ctest -R render_profile`; a CPU render with `PRISM_RENDER_PROFILE=1`
+    prints the table and is bit-identical to one without.
 
 ## Diagnostics
 

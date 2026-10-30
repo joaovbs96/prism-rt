@@ -7,6 +7,7 @@
 #include "../camera_ray_diagnostics.h"
 #include "../load_profile.h"
 #include "../progress.h"
+#include "../render_profile.h"
 #include "../renderer/renderer_context.h"
 #include "../scene.h"
 
@@ -271,7 +272,11 @@ private:
                 if (m_stop) return;
                 job = std::move(m_pending);
             }
-            ExecuteDenoise(*job);
+            {
+                profiling::Attach profile;
+                profiling::Scope timer(profiling::Denoise);
+                ExecuteDenoise(*job);
+            }
             job->done.store(true, std::memory_order_release);
         }
     }
@@ -860,6 +865,7 @@ ProgressiveEngine::Outcome ProgressiveEngine::Run(ProgressiveRun const &run, Pro
         timeMark = now;
         return timeLimit > 0.0 ? m_accumulationSeconds / timeLimit : 0.0;
     };
+    profiling::Attach profile;
     for (int sample = firstSample; sample < sampleCount; ++sample) {
         if (adaptive.Enabled() && m_adaptiveActive.Count() == 0) break;
         if (timeLimit > 0.0 && sample > 0) {
@@ -1073,6 +1079,7 @@ ProgressiveEngine::Outcome ProgressiveEngine::Run(ProgressiveRun const &run, Pro
         worker.get();
         if (target.StopRequested()) return Outcome::Stopped;
         const auto commitStart = std::chrono::steady_clock::now();
+        profiling::Scope filmTimer(profiling::Film);
         // Release previous raw image references so publication can recycle
         // their storage.
         if (presenting) target.EndPresentation();
@@ -1143,6 +1150,7 @@ ProgressiveEngine::Outcome ProgressiveEngine::Run(ProgressiveRun const &run, Pro
             if (outputs[index].bound) target.Publish(index, frame);
         }
         target.FramePublished(frame);
+        filmTimer.stop();
         {
             std::lock_guard lock(m_mutex);
             m_stats.lastPassTraceMilliseconds = std::chrono::duration<double, std::milli>(commitStart - traceStart).count();
@@ -1183,6 +1191,7 @@ ProgressiveEngine::Outcome ProgressiveEngine::Run(ProgressiveRun const &run, Pro
                 sums[7 * pixel + 6] += 1.0f;
             });
             if (sample + 1 < sampleCount && adaptive.CheckAfter(sample + 1)) {
+                profiling::Scope checkTimer(profiling::AdaptiveCheck);
                 const float scale = device::ImageScale(passColors.size(), [&](size_t pixel) {
                     const float *p = sums + 7 * pixel;
                     return p[6] > 0.0f ? (p[0] + p[1] + p[2]) / p[6] : 0.0f;

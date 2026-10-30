@@ -1,5 +1,6 @@
 #include "texture_runtime.h"
 #include "../renderer/logger.h"
+#include "../render_profile.h"
 
 #include <mi/neuraylib/iimage.h>
 #include <mi/neuraylib/itexture.h>
@@ -515,6 +516,7 @@ mi::neuraylib::Texture_handler_deriv_vtable const &NativeTextureRuntime::Vtable(
         v.m_tex_lookup_float4_2d=[](float out[4],Base const *base,unsigned index,
             Deriv2 const *coord,mi::neuraylib::Tex_wrap_mode wu,
             mi::neuraylib::Tex_wrap_mode wv,float const cu[2],float const cv[2],float) {
+            prism::profiling::Scope timer(prism::profiling::TextureLookup);
             out[0]=out[1]=out[2]=out[3]=0.0f;
             auto const *self=Self(base);
             if (!self || index>=self->m_textures.size() || !coord) return;
@@ -568,6 +570,7 @@ mi::neuraylib::Texture_handler_deriv_vtable const &NativeTextureRuntime::Vtable(
             float const coord[3],mi::neuraylib::Tex_wrap_mode wu,
             mi::neuraylib::Tex_wrap_mode wv,mi::neuraylib::Tex_wrap_mode ww,
             float const cu[2],float const cv[2],float const cw[2],float) {
+            prism::profiling::Scope timer(prism::profiling::BsdfDataLookup);
             out[0]=out[1]=out[2]=out[3]=0.0f;
             auto const *self=Self(base);
             if(!self || !coord || index>=self->m_textures.size())return;

@@ -79,6 +79,13 @@
 #define PRISM_LIGHT_AOVS 0
 #endif
 
+// The CPU backend's render profile (src/render_profile.h) times a stage from
+// here to the end of the enclosing block; it expands to nothing elsewhere, so
+// the GPU kernels' source is unchanged after preprocessing.
+#ifndef PRISM_PROFILE
+#define PRISM_PROFILE(stage)
+#endif
+
 // Light reaching the camera (PathTracer::gather).
 #if PRISM_LIGHT_AOVS
 #define PRISM_GATHER(c) gather(c)
@@ -388,6 +395,7 @@ struct PathTracer {
     // surfaces) let its light through.
     bool visible(PathRay shadow, uint shadowBit)
     {
+        PRISM_PROFILE(ShadowRay);
         if (backend.occludedByOpaque(shadow)) return false;
         if (!backend.mayHaveCutouts()) return true;
         const float3 direction = shadow.ray.direction;
@@ -832,6 +840,7 @@ struct PathTracer {
     // nothing from the material but whether it supports NEE (canNee).
     SurfaceVertex chooseLight(Hit hit, bool canNee)
     {
+        PRISM_PROFILE(LightChoice);
         SurfaceVertex vertex;
         vertex.receiver = backend.lightLinkMask(hit);
         vertex.samplerDimension = path.sampler.dimension;

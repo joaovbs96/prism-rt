@@ -99,6 +99,7 @@ SampleResult TraceSample(SceneManager& scene, CpuSceneState const& state, Camera
     tracer.backend.culling = state.culling;
     tracer.backend.rng.state = seed;
     tracer.path.sampler = {sample, pixelSeed, 0u};
+    profiling::Scope timer(profiling::Sample);
     const SampleResult result = tracer.renderSample(camera, x, y, width, height, settings);
     seed = tracer.backend.rng.state;
     return result;
@@ -171,6 +172,7 @@ std::vector<float> CpuDevice::RenderImage(SceneManager& scene, ImageRequest cons
     }
     const CameraParams camera = ToCameraParams(request.camera);
     const auto state = PreparedScene(scene);
+    profiling::Attach profile;
     const SampleSettings settings = {request.sampleClamp, 1.0f, false, request.contributions,
         request.nee.probabilityMin, request.nee.fromDepth, request.nee.spatialLights, WorkingLuminance(scene)};
     const AdaptiveSettings& adaptive = request.adaptive;
@@ -209,6 +211,7 @@ std::vector<float> CpuDevice::RenderImage(SceneManager& scene, ImageRequest cons
         std::atomic<uint64_t> roundDone{0};
         tbb::parallel_for(0, height, [&](int y) {
             if (cancelled()) return;
+            profiling::Attach rowProfile;
             uint64_t rowWork = 0;
             for (int x = 0; x < width; ++x) {
                 const size_t pixel = size_t(y) * width + x;
@@ -239,6 +242,7 @@ std::vector<float> CpuDevice::RenderImage(SceneManager& scene, ImageRequest cons
         done = next;
         if (progress) progress->samples.store(double(done), std::memory_order_relaxed);
         if (done < request.samples && adaptive.CheckAfter(done)) {
+            profiling::Scope checkTimer(profiling::AdaptiveCheck);
             const float scale = ImageScale(count, [&](size_t pixel) {
                 return (sums[pixel].x() + sums[pixel].y() + sums[pixel].z()) / float(samples[pixel]);
             });
@@ -251,6 +255,7 @@ std::vector<float> CpuDevice::RenderImage(SceneManager& scene, ImageRequest cons
             if (active.Count() == 0) break;
         }
     }
+    profiling::Scope filmTimer(profiling::Film);
     double total = 0.0;
     size_t atMax = 0;
     for (size_t pixel = 0; pixel < count; ++pixel) {
@@ -271,7 +276,11 @@ std::vector<float> CpuDevice::RenderImage(SceneManager& scene, ImageRequest cons
     }
     if (request.meanSamples) *request.meanSamples = total / double(count);
     if (request.fractionAtMaxSamples) *request.fractionAtMaxSamples = count ? double(atMax) / double(count) : 0.0;
-    DenoiseRenderedImage(*this, request, pixels, aovSums);
+    filmTimer.stop();
+    {
+        profiling::Scope denoiseTimer(profiling::Denoise);
+        DenoiseRenderedImage(*this, request, pixels, aovSums);
+    }
     if (request.lightAovs) *request.lightAovs = std::move(aovSums);
     return pixels;
 }
@@ -298,6 +307,7 @@ void CpuDevice::RenderPass(SceneManager& scene, PassRequest const& request)
     renderArena.execute([&] {
         tbb::parallel_for(tbb::blocked_range<size_t>(0, request.tiles.size(), 1),
             [&](tbb::blocked_range<size_t> const &range) {
+                profiling::Attach profile;
                 WorkCounter colorWork{request.colorPixels};
                 WorkCounter geometricWork{request.geometricOnlyPixels};
                 WorkCounter rayTime{request.rayNanoseconds};
@@ -397,6 +407,7 @@ bool CpuDevice::RenderPreview(SceneManager& scene, PreviewRequest const& request
             0, previewHeight, 4, 0, previewWidth, 8),
         [&](tbb::blocked_range2d<unsigned int> const &range) {
     WorkCounter colorWork{request.colorPixels};
+    profiling::Attach profile;
     if (cancelled.load(std::memory_order_relaxed)) return;
     for (unsigned int py = range.rows().begin();
          py != range.rows().end(); ++py) {
