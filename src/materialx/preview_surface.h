@@ -5,7 +5,7 @@
 // (src/materialx/material_service.cpp), which both front ends compile through.
 
 #include <pxr/imaging/hd/materialNetworkInterface.h>
-#include <pxr/imaging/hdMtlx/hdMtlx.h>
+#include "hdmtlx_document.h"
 #include <pxr/base/tf/diagnostic.h>
 #include <pxr/base/tf/token.h>
 
@@ -34,7 +34,8 @@ inline PXR_NS::TfToken SurfaceTerminalName(PXR_NS::HdMaterialNetworkInterface& n
 // own and merged into the surface document, its shader bound to the
 // material's displacementshader input.
 inline void AddDisplacementShader(PXR_NS::HdMaterialNetworkInterface& net, const MaterialX::DocumentPtr& doc,
-                                  const MaterialX::DocumentPtr& library)
+                                  const MaterialX::DocumentPtr& library,
+                                  HdMtlxValidationReport* report = nullptr)
 {
     PXR_NS::TfToken terminal;
     for (const PXR_NS::TfToken& name : net.GetTerminalNames())
@@ -43,9 +44,9 @@ inline void AddDisplacementShader(PXR_NS::HdMaterialNetworkInterface& net, const
     const auto connection = net.GetTerminalConnection(terminal);
     if (!connection.first) return;
     PXR_NS::HdMtlxTexturePrimvarData data;
-    MaterialX::DocumentPtr displacement = PXR_NS::HdMtlxCreateMtlxDocumentFromHdMaterialNetworkInterface(
+    MaterialX::DocumentPtr displacement = CreateHdMtlxDocument(
         &net, connection.second.upstreamNodeName,
-        net.GetNodeInputConnectionNames(connection.second.upstreamNodeName), library, &data);
+        net.GetNodeInputConnectionNames(connection.second.upstreamNodeName), library, &data, report);
     if (!displacement) return;
     auto sourceMaterials = displacement->getMaterialNodes();
     auto materials = doc->getMaterialNodes();

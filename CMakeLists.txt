@@ -1035,6 +1035,12 @@ if(PRISM_BUILD_HYDRA)
         add_test(NAME prism_hydra_material_loading_test COMMAND prism_hydra_material_loading_test)
         set_tests_properties(prism_hydra_material_loading_test PROPERTIES ENVIRONMENT "${_prism_test_environment}")
     endif()
+    # hdMtlx's validation warning is captured for the material service, the
+    # document and DocumentLoader's repairs unchanged (hdmtlx_document.h).
+    add_executable(prism_hdmtlx_validation_test tests/hydra/hdmtlx_validation_test.cpp)
+    target_link_libraries(prism_hdmtlx_validation_test PRIVATE PrismRT::core ${PXR_LIBRARIES})
+    add_test(NAME prism_hdmtlx_validation_test COMMAND prism_hdmtlx_validation_test)
+    set_tests_properties(prism_hdmtlx_validation_test PROPERTIES ENVIRONMENT "${_prism_test_environment}")
     # A referenced .mtlx document's colorspace reaches both loaders' material
     # networks (src/usd/mtlx_color_space.h; the Hydra side through hdPrism's
     # MaterialXConfigAPI adapter, found on PXR_PLUGINPATH_NAME).

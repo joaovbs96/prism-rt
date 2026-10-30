@@ -44,6 +44,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <future>
 #include <iostream>
@@ -1050,13 +1051,15 @@ public:
         const mx::DocumentPtr& library = HdMtlxStdLibraries();
         mx::DocumentPtr doc = prism::materialx::SimpleOpenPbrDocument(netInterface, terminal.second.upstreamNodeName, library);
         const bool simpleDocument = bool(doc);
+        // hdMtlx's validation report (DocumentLoader repairs what it lists).
+        prism::materialx::HdMtlxValidationReport validation;
         if (!doc) {
             prism::materialx::CapturedMaterialRegistry::Shared().recordStockConversion();
-            doc = HdMtlxCreateMtlxDocumentFromHdMaterialNetworkInterface(
+            doc = prism::materialx::CreateHdMtlxDocument(
                 &netInterface,
                 terminal.second.upstreamNodeName,
                 netInterface.GetNodeInputConnectionNames(terminal.second.upstreamNodeName),
-                library, &mtlxData);
+                library, &mtlxData, &validation);
         }
         if (!doc) {
             TF_WARN("[Hydra Material] MaterialX conversion failed at %s",
@@ -1064,7 +1067,12 @@ public:
             return result;
         }
         if (previewSurface) FixPreviewSurfaceNormalOutput(doc);
-        else AddDisplacementShader(netInterface, doc, library);
+        else AddDisplacementShader(netInterface, doc, library, &validation);
+        if (validation.issues && prism::logging::Debug("mdl"))
+            prism::logging::Current().debug("mdl", std::format(
+                "[Hydra Material] {}: hdMtlx reported {} MaterialX validation issue(s), "
+                "repaired when the document loads:\n{}",
+                materialPath.GetString(), validation.issues, validation.text));
         prism::materialx::ShortenHdMtlxNodeNames(doc,
             prism::materialx::ShortHdMtlxNodeNames(netInterface.GetNodeNames()));
         profileDetail += (simpleDocument ? " simple_ms=" : " hdmtlx_ms=") + profileLap();
