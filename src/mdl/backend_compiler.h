@@ -116,6 +116,9 @@ struct CompiledProgram {
     // geometry.cutout_opacity depends only on the arguments (no state or
     // textures): each binding can evaluate it once.
     bool uniform_cutout = false;
+    // thin_walled depends only on the arguments: each binding can evaluate
+    // it once (MDLMaterial::evaluateUniformThinWalled).
+    bool uniform_thin_walled = false;
     // surface.emission is a diffuse EDF and intensity depending only on the
     // arguments: the front-face radiance is one constant per binding.
     bool uniform_emission = false;

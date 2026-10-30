@@ -548,6 +548,8 @@ TargetCode BackendCompiler::generate_target_code(const CompiledMaterial& compile
     if (VerboseMdl()) std::cout << std::format("  thin_walled: {}\n", binding->is_thin_walled ? "true" : "false");
     const bool uniformCutout = cutoutExpr && !binding->constant_cutout_opacity &&
         IsUniformExpression(cutoutExpr.get(), compiled.compiled_material.get(), compiled.transaction.get());
+    const bool uniformThinWalled = thin_walled_expr &&
+        IsUniformExpression(thin_walled_expr.get(), compiled.compiled_material.get(), compiled.transaction.get());
 
     // Displacement other than the constant zero.
     bool hasDisplacement = false;
@@ -1014,6 +1016,7 @@ TargetCode BackendCompiler::generate_target_code(const CompiledMaterial& compile
             program->compiled_material_name = std::move(name);
     }
     program->uniform_cutout = uniformCutout;
+    program->uniform_thin_walled = uniformThinWalled;
     program->uniform_emission = uniformEmission;
     program->directional_emission = uniformEmission && directionalEmission;
     program->emission_zero = emissionZero;

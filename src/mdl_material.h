@@ -69,6 +69,8 @@ public:
     explicit MDLMaterial(mdl::TargetCode boundTarget, prism::VaryingEmitterSignal* varyingEmitters = nullptr)
         : m_target(std::move(boundTarget)), m_valid(m_target.success)
     {
+        evaluateEmittingSides();
+        evaluateUniformThinWalled();
         evaluateUniformCutout();
         evaluateUniformEmission();
         if (m_varyingEmission && varyingEmitters) varyingEmitters->Note();
@@ -216,6 +218,8 @@ public:
         // retaining one SDK transaction for every live scene material.
         m_compiled.release();
         m_valid = true;
+        evaluateEmittingSides();
+        evaluateUniformThinWalled();
         evaluateUniformCutout();
         evaluateUniformEmission();
         if (m_varyingEmission && settings.varyingEmitters) settings.varyingEmitters->Note();
@@ -341,7 +345,7 @@ private:
         // transmissive material runs Snell's law backwards
         // (1.0 -> ior instead of ior -> 1.0), breaking glass entirely.
         // ------------------------------------------------------------
-        const bool thinWalled = get_thin_walled(ss.base());
+        const bool thinWalled = get_thin_walled(ss);
         if (!backface || thinWalled) {
             sd.ior1 = mi::Float32_3(1.0f, 1.0f, 1.0f);
             sd.ior2 = mi::Float32_3(MI_NEURAYLIB_BSDF_USE_MATERIAL_IOR);
@@ -373,7 +377,7 @@ private:
             s.scattered = false;
             s.color = Color3(0.0f);
             s.wi = Float3(0.0f);
-            s.emission = get_emission(ss.base(), wo, backface);
+            s.emission = get_emission(ss, wo, backface);
             return s;
         }
 
@@ -387,7 +391,7 @@ private:
         // Crossing the interface enters or leaves the material's volume.
         s.transmitted = (sd.event_type & mi::neuraylib::BSDF_EVENT_TRANSMISSION) != 0;
 
-        s.emission = get_emission(ss.base(), wo, backface);
+        s.emission = get_emission(ss, wo, backface);
         return s;
     }
 
@@ -415,7 +419,7 @@ private:
         if(!prepared) build_shading_state(ray_hit,ss);
         if (!prepared && m_target.program->target_code->execute_init(m_target.program->functions.init_function_index,
             ss.base(), m_target.texture_handler(), m_target.argument_data()) != 0) return result;
-        const bool thinWalled = get_thin_walled(ss.base());
+        const bool thinWalled = get_thin_walled(ss);
         const mi::Size index = backface && thinWalled
             ? m_target.program->functions.backface_bsdf_function_index
             : m_target.program->functions.surface_bsdf_function_index;
@@ -507,7 +511,7 @@ public:
                     m_target.texture_handler(), m_target.argument_data()) != 0) return std::nullopt;
             ss = &local;
         }
-        if (get_thin_walled(ss->base())) return std::nullopt;
+        if (get_thin_walled(*ss)) return std::nullopt;
         auto color = [&](mi::Size index) {
             mi::Float32_3 value(0.0f, 0.0f, 0.0f);
             if (index == ~mi::Size(0) || m_target.program->target_code->execute(index, ss->base(),
@@ -563,11 +567,19 @@ public:
         mi::Float32_3 wo(-d_normalized.x(), -d_normalized.y(), -d_normalized.z());
 
         // Deterministic evaluation returns expected emission over surface coverage.
-        return get_opacity(ss.base()) * get_emission(ss.base(), wo, backface);
+        return get_opacity(ss.base()) * get_emission(ss, wo, backface);
     }
 
 private:
-    bool get_thin_walled(mi::neuraylib::Shading_state_material& state) const {
+    // thin_walled at a shading point: the material's constant when it depends
+    // only on the arguments (m_uniformThinWalled), else evaluated once per
+    // shading state (sample, evaluate, medium and emission share it).
+    bool get_thin_walled(ShadingStateData& ss) const {
+        if (m_uniformThinWalled) return *m_uniformThinWalled;
+        if (ss.thinWalled == 0) ss.thinWalled = evaluate_thin_walled(ss.base()) ? 2 : 1;
+        return ss.thinWalled == 2;
+    }
+    bool evaluate_thin_walled(mi::neuraylib::Shading_state_material& state) const {
         bool value = false;
         const auto index = m_target.program->functions.thin_walled_function_index;
         if (index == ~mi::Size(0)) return false;
@@ -600,6 +612,10 @@ private:
         mi::Float32_3 tangent_u;
         mi::Float32_3 tangent_v;
         MdlStateMatrixRow identity[4];
+        // get_thin_walled's value at this state: 0 not evaluated, 1 false, 2 true.
+        int thinWalled;
+        // Written by init before any read (MDL's single-init mode), so
+        // build_shading_state leaves them uncleared.
         alignas(16) MdlStateFloat4 text_results[128];
         mi::neuraylib::Shading_state_material &base() {
             return reinterpret_cast<mi::neuraylib::Shading_state_material &>(state);
@@ -624,7 +640,9 @@ private:
     // degenerates (poles, broken UVs).
     void build_shading_state(const RayHit& hit, ShadingStateData& ss) const
     {
-        memset(&ss, 0, sizeof(ss));
+        // Everything but the texture results (2 KB of the 2.4 KB): init
+        // writes every result the material's functions read.
+        memset(&ss, 0, size_t(reinterpret_cast<char const*>(ss.text_results) - reinterpret_cast<char const*>(&ss)));
         auto& shading = mdl::NativeTextureRuntime::Thread();
         shading.viewOrigin[0] = hit.o.x();
         shading.viewOrigin[1] = hit.o.y();
@@ -727,12 +745,15 @@ private:
     // backface.*). Since RayHit flips normals toward
     // the ray, evaluating the surface EDF on a backface hit would make
     // the inside of an emissive shell glow — return black instead.
-    Color3 get_emission(mi::neuraylib::Shading_state_material& state,
+    Color3 get_emission(ShadingStateData& ss,
                         const mi::Float32_3& wo,
                         bool backface) const
     {
-        if (backface && !get_thin_walled(state))
+        // A side whose emission is provably zero (the program's analysis, as
+        // in evaluateUniformEmission) runs neither its intensity nor its EDF.
+        if (backface ? !m_backEmits || !get_thin_walled(ss) : !m_surfaceEmits)
             return Color3(0.0f);
+        auto& state = ss.base();
 
         mi::Float32_3 ei(0.0f, 0.0f, 0.0f);
         const mi::Size intensity_index = backface
@@ -760,6 +781,41 @@ private:
             return Color3(1.0f, 0.0f, 1.0f);
 
         return Color3(ei.x * ed.edf.x, ei.y * ed.edf.y, ei.z * ed.edf.z);
+    }
+
+    // Which sides may emit (evaluateUniformEmission's predicates).
+    void evaluateEmittingSides() {
+        m_surfaceEmits = m_backEmits = false;
+        if (!m_valid || !m_target.program) return;
+        auto const& program = *m_target.program;
+        m_surfaceEmits = !program.emission_zero &&
+            program.functions.surface_edf_function_index != ~mi::Size(0);
+        m_backEmits = program.backface_emission &&
+            program.functions.backface_edf_function_index != ~mi::Size(0);
+    }
+
+    // thin_walled depending only on the arguments is evaluated once, at an
+    // arbitrary shading point.
+    void evaluateUniformThinWalled() {
+        m_uniformThinWalled.reset();
+        if (!m_valid || !m_target.program) return;
+        if (m_target.program->functions.thin_walled_function_index == ~mi::Size(0)) {
+            m_uniformThinWalled = false;
+            return;
+        }
+        if (!m_target.program->uniform_thin_walled) return;
+        RTCRayHit miss{};
+        miss.hit.geomID = RTC_INVALID_GEOMETRY_ID;
+        RayHit hit(miss);
+        hit.n = hit.n_g = Float3(0.0f, 0.0f, 1.0f);
+        hit.tangent = Float3(1.0f, 0.0f, 0.0f);
+        hit.u = hit.v = 0.0f;
+        hit.front_face = true;
+        ShadingStateData ss;
+        build_shading_state(hit, ss);
+        if (m_target.program->target_code->execute_init(m_target.program->functions.init_function_index,
+                ss.base(), m_target.texture_handler(), m_target.argument_data()) != 0) return;
+        m_uniformThinWalled = evaluate_thin_walled(ss.base());
     }
 
     // A cutout depending only on the arguments is evaluated once, at an
@@ -865,7 +921,7 @@ private:
             return std::isfinite(c.x()) && std::isfinite(c.y()) && std::isfinite(c.z());
         };
         auto positive = [](Color3 const& c) { return c.x() > 0.0f || c.y() > 0.0f || c.z() > 0.0f; };
-        const Color3 radiance = get_emission(ss.base(), mi::Float32_3(0.0f, 0.0f, 1.0f), false) * cutout;
+        const Color3 radiance = get_emission(ss, mi::Float32_3(0.0f, 0.0f, 1.0f), false) * cutout;
         if (!finite(radiance)) return false;
         // A df::directional_factor (OpenPBR and standard_surface layer their
         // emission under the coat this way) is isotropic when its tints agree,
@@ -874,7 +930,7 @@ private:
         if (m_target.program->directional_emission) {
             for (const float angle : {0.5f, 1.0f, 1.3f, 1.5f}) {
                 const mi::Float32_3 wo(std::sin(angle), 0.0f, std::cos(angle));
-                const Color3 other = get_emission(ss.base(), wo, false) * cutout;
+                const Color3 other = get_emission(ss, wo, false) * cutout;
                 for (int c = 0; c < 3; ++c)
                     if (!(std::abs(other[c] - radiance[c]) <= 1.0e-4f * std::max(radiance[c], 1.0e-6f))) {
                         m_directionalEmission = true;
@@ -888,6 +944,9 @@ private:
     }
 
     std::optional<float> m_uniformCutout;
+    std::optional<bool> m_uniformThinWalled;
+    bool m_surfaceEmits = false;
+    bool m_backEmits = false;
     std::optional<ConstantEmission> m_uniformEmission;
     bool m_varyingEmission = false;
     bool m_directionalEmission = false;
