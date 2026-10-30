@@ -68,6 +68,12 @@ void ExpandChannels(int channels, float out[4])
     else if (channels == 3) out[3]=1.0f;
 }
 
+// The whole image: croppedResource returns the source itself.
+bool FullCrop(float const cropS[2],float const cropT[2])
+{
+    return cropS[0]==0 && cropS[1]==1 && cropT[0]==0 && cropT[1]==1;
+}
+
 bool CheckedMultiply(size_t a,size_t b,size_t* result)
 {
     if(a && b>std::numeric_limits<size_t>::max()/a)return false;
@@ -299,7 +305,7 @@ std::shared_ptr<const prism::TextureResource> NativeTextureRuntime::croppedResou
     std::shared_ptr<const prism::TextureResource> const& source,
     float const cropS[2],float const cropT[2]) const
 {
-    if (cropS[0]==0 && cropS[1]==1 && cropT[0]==0 && cropT[1]==1) return source;
+    if (FullCrop(cropS,cropT)) return source;
     if (!std::isfinite(cropS[0]) || !std::isfinite(cropS[1]) ||
         !std::isfinite(cropT[0]) || !std::isfinite(cropT[1])) return {};
     // MDL defines cropping as an integer texel rectangle, not a continuous
@@ -534,11 +540,22 @@ mi::neuraylib::Texture_handler_deriv_vtable const &NativeTextureRuntime::Vtable(
             float dsdx=coord->dx.x,dsdy=coord->dy.x;
             float dtdx=coord->dx.y,dtdy=coord->dy.y;
             if (!Remap(s,dsdx,dsdy,wu) || !Remap(t,dtdx,dtdy,wv)) return;
-            std::shared_ptr<const prism::TextureResource> resource;
-            try { resource=self->croppedResource(found->second,cu,cv); }
-            catch(std::exception const& error) {
-                if(!self->m_reportedLookupFailure.exchange(true))
-                    std::cerr << "MDL texture crop preparation failed: " << error.what() << '\n';
+            // The uncropped image (the common case) is read through a raw
+            // pointer: m_textures owns it for the runtime's lifetime, and the
+            // runtime outlives every call of its materials' code (the bound
+            // target holds it). Copying the shared_ptr here cost two atomic
+            // operations on one control block per lookup from every thread.
+            // A crop's resource is pinned by `cropped` for the lookup, since
+            // the crop cache may evict it meanwhile.
+            prism::TextureResource const* resource=found->second.get();
+            std::shared_ptr<const prism::TextureResource> cropped;
+            if (!FullCrop(cu,cv)) {
+                try { cropped=self->croppedResource(found->second,cu,cv); }
+                catch(std::exception const& error) {
+                    if(!self->m_reportedLookupFailure.exchange(true))
+                        std::cerr << "MDL texture crop preparation failed: " << error.what() << '\n';
+                }
+                resource=cropped.get();
             }
             if(!resource) { out[0]=out[2]=out[3]=1.0f; return; }
             prism::TextureLookup q;
