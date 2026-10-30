@@ -43,6 +43,8 @@ int run() {
     DocumentLoader loader(library, /*clamp=*/true);
     auto doc = loader.load(path.string());
     require(bool(doc), "load failed");
+    // Each in-place clamp and clamp node is counted for the summary line.
+    require(loader.repairs().clamps > 0, "clamps not counted");
 
     // Working-space constants are clamped in place.
     auto gold = doc->getNode("gold");

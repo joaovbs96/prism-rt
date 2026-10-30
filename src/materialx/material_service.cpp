@@ -1288,7 +1288,7 @@ public:
         try {
             candidate = std::make_shared<MDLMaterial>(
                 prepared.mtlxPath.string(), *context, libraries, mdlPath,
-                materials, prepared.materialName, &timings, select);
+                materials, prepared.materialName, &timings, select, prepared.path.GetString());
         } catch (const std::exception& error) {
             {
                 std::lock_guard<std::mutex> cacheLock(gMaterialCacheMutex);

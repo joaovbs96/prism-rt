@@ -83,6 +83,7 @@ public:
     //                      space colours convert into) and SSS fallback
     //   material_name:     name of the material node (empty = use first material found)
     //   select:            which class parameters to fold (empty = none)
+    //   log_label:         the material's name in the log (empty = mtlx_path)
     MDLMaterial(const std::string& mtlx_path,
                 mdl::Context& mdl_context,
                 const std::string& mx_libraries_path,
@@ -90,7 +91,8 @@ public:
                 const prism::MaterialSettings& settings,
                 const std::string& material_name = "",
                 CompilationTimings* timings = nullptr,
-                const CompileSelector& select = {})
+                const CompileSelector& select = {},
+                const std::string& log_label = "")
     {
         if (!settings.color) throw std::invalid_argument("MDLMaterial needs a colour management");
         // The compile reports to the renderer's logger (the calling thread's
@@ -108,6 +110,7 @@ public:
         MDLGenerator& generator = *MDLGenerator::workerLocal(mx_libraries_path, settings.color.get());
         DocumentLoader doc_loader(generator.get_stdlib(), true, settings.sssFallback);
         doc_loader.setVerbose(PrismMdlVerbose());
+        doc_loader.setLabel(log_label);
         {
             const auto color = settings.color;
             doc_loader.setUniformColorConversion({color->materialXSpace(),

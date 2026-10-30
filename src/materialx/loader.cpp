@@ -27,6 +27,10 @@ struct VerboseScope {
     ~VerboseScope() { tVerbose = previous; }
 };
 
+// What the DocumentLoader::load running on this thread repaired, for its
+// one-line summary (the details are verbose output).
+thread_local DocumentLoader::RepairCounts tRepairs;
+
 void AttachLibrary(const MaterialX::DocumentPtr& doc,
                    const MaterialX::DocumentPtr& library)
 {
@@ -273,6 +277,7 @@ void FixDeclaredInputTypes(const MaterialX::DocumentPtr& doc, const MaterialX::D
                 if (!adapter) continue;
                 output->setNodeName(adapter->getName());
                 output->setType(to);
+                ++tRepairs.connectionTypes;
             } else if (input->hasNodeName()) {
                 // Connected within the graph: FixConnectionTypes then adapts
                 // an upstream of another type.
@@ -320,9 +325,11 @@ void FixConnectionTypes(const MaterialX::DocumentPtr& doc)
                                   fix.upstream->getName());
         if (!adapter) continue;
         fix.input->setNodeName(adapter->getName());
-        std::cerr << "[MaterialX] " << from << " output of " << fix.upstream->getNamePath() << " feeds "
-                  << to << " input " << fix.input->getNamePath() << "; inserted " << adapter->getCategory()
-                  << "\n";
+        ++tRepairs.connectionTypes;
+        if (VerboseMdl())
+            std::cout << "[MaterialX] " << from << " output of " << fix.upstream->getNamePath() << " feeds "
+                      << to << " input " << fix.input->getNamePath() << "; inserted " << adapter->getCategory()
+                      << "\n";
     }
 }
 
@@ -1746,6 +1753,8 @@ DocumentLoader::DocumentLoader(MaterialX::DocumentPtr stdlib, bool clamp,
 MaterialX::DocumentPtr DocumentLoader::load(const std::string& filepath)
 {
     VerboseScope verbose(m_verbose);
+    tRepairs = {};
+    m_repairs = {};
     MaterialX::DocumentPtr doc = MaterialX::createDocument();
 
     try {
@@ -1836,9 +1845,11 @@ MaterialX::DocumentPtr DocumentLoader::load(const std::string& filepath)
                             c[i] = std::clamp(c[i], 0.0f, 0.9999f);
                         if (c != orig) {
                             input->setValue(c);
-                            std::cout << std::format(
-                                "[MaterialX] Clamped '{}.{}': ({:.4f},{:.4f},{:.4f}) -> ({:.4f},{:.4f},{:.4f})\n",
-                                node->getNamePath(), name, orig[0], orig[1], orig[2], c[0], c[1], c[2]);
+                            ++tRepairs.clamps;
+                            if (VerboseMdl())
+                                std::cout << std::format(
+                                    "[MaterialX] Clamped '{}.{}': ({:.4f},{:.4f},{:.4f}) -> ({:.4f},{:.4f},{:.4f})\n",
+                                    node->getNamePath(), name, orig[0], orig[1], orig[2], c[0], c[1], c[2]);
                         }
                         continue;
                     }
@@ -1860,8 +1871,10 @@ MaterialX::DocumentPtr DocumentLoader::load(const std::string& filepath)
                     }
                     clamp->setInputValue("high", MaterialX::Color3(0.9999f));
                     input->setNodeName(clamp->getName());
-                    std::cout << "[MaterialX] Inserted clamp node on "
-                              << node->getNamePath() << "." << name << "\n";
+                    ++tRepairs.clamps;
+                    if (VerboseMdl())
+                        std::cout << "[MaterialX] Inserted clamp node on "
+                                  << node->getNamePath() << "." << name << "\n";
                 }
             }
         }
@@ -1882,6 +1895,18 @@ MaterialX::DocumentPtr DocumentLoader::load(const std::string& filepath)
         std::string validation_errors;
         if (!doc->validate(&validation_errors)) {
             std::cerr << "[WARN] Document validation issues: " << validation_errors << "\n";
+        }
+        m_repairs = tRepairs;
+        if (m_repairs.connectionTypes || m_repairs.clamps) {
+            std::string summary;
+            if (m_repairs.connectionTypes)
+                summary = std::to_string(m_repairs.connectionTypes) + " type repair" +
+                    (m_repairs.connectionTypes == 1 ? "" : "s");
+            if (m_repairs.clamps)
+                summary += (summary.empty() ? "" : ", ") + std::to_string(m_repairs.clamps) + " clamp" +
+                    (m_repairs.clamps == 1 ? "" : "s");
+            std::cout << "[MaterialX] " << (m_label.empty() ? filepath : m_label) << ": " << summary
+                      << (m_verbose ? "\n" : " (details: PRISM_MDL_VERBOSE=1)\n");
         }
         return doc;
     } catch (const std::exception& e) {

@@ -5,10 +5,13 @@
 
 #include "../src/materialx/loader.h"
 #include <MaterialXCore/Node.h>
+#include <MaterialXFormat/XmlIo.h>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <sstream>
 #include <stdexcept>
+#include <string>
 
 void require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
@@ -72,8 +75,37 @@ int main() {
     library->addNodeDef("ND_convert_float_vector3", "vector3", "convert")->addInput("in", "float");
     library->addNodeDef("ND_convert_color3_vector3", "vector3", "convert")->addInput("in", "color3");
     DocumentLoader loader(library, false, false);
+    loader.setLabel("/Looks/Fixture");
+    // The repairs are counted and summarised on one line; the per-repair
+    // lines are verbose output (setVerbose).
+    std::ostringstream log;
+    auto* out = std::cout.rdbuf(log.rdbuf());
+    auto* err = std::cerr.rdbuf(log.rdbuf());
     auto doc = loader.load(path.string());
+    std::cout.rdbuf(out);
+    std::cerr.rdbuf(err);
     require(bool(doc), "load failed");
+    // color_image -> direct.opacity, and the graph output -> retyped.opacity.
+    require(loader.repairs().connectionTypes == 2, "type repairs not counted");
+    require(loader.repairs().clamps == 0, "clamps counted without the clamp");
+    const std::string text = log.str();
+    require(text.find("inserted extract") == std::string::npos, "per-repair line printed without verbose output");
+    const size_t summary = text.find("[MaterialX] /Looks/Fixture: 2 type repairs");
+    require(summary != std::string::npos, "no repair summary");
+    require(text.find("/Looks/Fixture:", summary + 20) == std::string::npos, "more than one summary line");
+
+    // Verbose output prints each repair, and the same document.
+    DocumentLoader verbose(library, false, false);
+    verbose.setVerbose(true);
+    std::ostringstream verboseLog;
+    out = std::cout.rdbuf(verboseLog.rdbuf());
+    err = std::cerr.rdbuf(verboseLog.rdbuf());
+    auto verboseDoc = verbose.load(path.string());
+    std::cout.rdbuf(out);
+    std::cerr.rdbuf(err);
+    require(verboseLog.str().find("inserted extract") != std::string::npos, "verbose output lacks the repair");
+    require(verboseDoc && MaterialX::writeToXmlString(verboseDoc) == MaterialX::writeToXmlString(doc),
+            "verbose output changed the document");
 
     require(doc->getColorSpace() == "acescg", "document color space not canonical");
     require(doc->getNode("color_image")->getInput("file")->getColorSpace() == "srgb_texture",

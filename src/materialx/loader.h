@@ -38,6 +38,20 @@ public:
     // Prints what load() repairs (the renderer's "mdl" debug output,
     // PRISM_MDL_VERBOSE). Off by default.
     void setVerbose(bool verbose) { m_verbose = verbose; }
+    // The material name load()'s summary line shows (default: the file).
+    void setLabel(std::string label) { m_label = std::move(label); }
+
+    // The repairs load() counts. Without verbose output, it prints one line
+    // with their counts instead of one per repair.
+    struct RepairCounts {
+        // convert/extract nodes inserted where an output feeds an input of
+        // another type (old MaterialX and Houdini assets)
+        int connectionTypes = 0;
+        // standard_surface base_color / specular_color clamps (see clamp)
+        int clamps = 0;
+    };
+    // The last load()'s repairs.
+    RepairCounts const& repairs() const { return m_repairs; }
 
     MaterialX::DocumentPtr load(const std::string& filepath);
     MaterialX::DocumentPtr create_empty();
@@ -48,5 +62,7 @@ private:
     bool m_clamp;
     bool m_fallback_sss_to_diffuse;
     bool m_verbose = false;
+    std::string m_label;
+    RepairCounts m_repairs;
     UniformColorConversion m_uniformColors;
 };
