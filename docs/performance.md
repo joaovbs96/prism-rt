@@ -353,6 +353,52 @@ within run-to-run noise of a build without it. Only the CPU device is timed
 (`PRISM_PROFILE` in `shaders/integrator/path_tracer.h`) expand to nothing
 in HLSL.
 
+## CPU shadow rays through cutouts (October 2026)
+
+Two changes to shadow rays in scenes with cutouts (glTF MASK/BLEND, alpha
+cards, `displayOpacity`), measured on the CPU at 256 spp against the previous
+build, alternating, median of 3 (`--adaptive-threshold 0`):
+
+- **Opaque primitives first** (`src/device/opaque_occluders.h`). Each
+  placement is classified when the CPU device prepares a scene: opaque,
+  not opaque (a cutout, or outside a linked light's shadow-link categories),
+  or mixed with a flag per primitive (the merged mesh of a glTF or OBJ file).
+  A shadow ray's closest hit decides most rays (a miss is visible, an opaque
+  primitive blocks); after a cutout hit, an Embree any-hit query with an
+  argument filter looks for an opaque primitive behind it before any cutout
+  is evaluated. Culled back faces (`prism:honorDoubleSided`) are skipped by
+  the filter. Scenes with no cutouts keep the plain `rtcOccluded1`
+  (bit-identical). Images: same expectation, other noise (cutouts in front of
+  an opaque blocker no longer draw random numbers), as on the GPU.
+- **A cutout's own init** (`mdl::MaterialFunctions::cutout_init_function_index`).
+  Programs whose cutout varies over the surface get a second single-init
+  group of the material, `init` and `geometry.cutout_opacity` only: a shadow
+  crossing runs the lookups the cutout reads (and the shading normal, as the
+  shared init computes it) instead of every texture of the material.
+  Bit-identical images; native JIT time unchanged within noise (foliage
+  fixture, 0.23-0.27 s either way).
+
+| Scene | Render time, new / old | NEE shadow ray share (old -> new) | Cutout per crossing |
+| --- | --- | --- | --- |
+| `tests/hydra/fixtures/foliage_cards.usda` (40 textured leaf cards, wall) | 0.87 | 23.3% -> 12.5% | 5.4 -> 1.6 us |
+| the same with an opaque awning over half of it (not in the repo) | 0.82 | 21.0% -> 4.7% | 0.6 M of 4.9 M crossings left |
+| `tests/gltf/features.gltf` (dome only) | 1.04 (noise) | 1.8% -> 2.1% | - |
+| `tests/obj/textured.obj` (dome only) | 0.99 | 2.1% -> 2.4% | - |
+| CornellBox (no cutouts, unchanged code path) | 0.95 (noise) | - | - |
+
+Run-to-run noise was about 5% (CornellBox runs the same code in both).
+Where shadow rays are a few percent of the frame (the glTF and OBJ
+fixtures), nothing changes measurably; the gains are in scenes whose shadow
+rays cross cutouts. The opaque-first query alone gave the awning variant
+0.76 and the foliage fixture nothing (its shadow rays have no opaque blocker
+behind the leaves); the cutout's own init gave the foliage fixture 0.85.
+Convergence (1024 spp, two seeds of each build): the cross NRMSE between the
+builds equals the noise floor of either (ratio 0.999-1.000 on the foliage,
+awning, glTF and cutout fixtures), the mean luminance agrees to 1e-5, and the
+mean over the cutout edges (the 10% largest image gradients) differs by less
+than the two seeds of the old build do. CPU-vs-Vulkan NRMSE is unchanged
+(foliage 0.0196, awning 0.0019, glTF 0.0100 for old and new).
+
 ## Interpretation limits
 
 MDL variants remain cached for the renderer process lifetime, affecting warm-recreation results. Historical InOneWeekend measurements used coarse tessellated spheres; the current implementation uses analytic spheres. Report this representation change when comparing geometry memory and rendering results. See [Hydra scope and costs](hydra.md) for rendering limitations and supported geometry behavior.
