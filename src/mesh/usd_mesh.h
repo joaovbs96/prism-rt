@@ -121,16 +121,41 @@ namespace mx = MaterialX;
 // MaterialX material recovery from USD stages
 // ============================================================================
 
+// Binding resolution caches for the prims of one stage, which USD
+// recommends when resolving the bindings of many prims
+// (UsdShadeMaterialBindingAPI::ComputeBoundMaterial): each ancestor's direct
+// and collection bindings are read once, and each collection's membership
+// query is built once, instead of again for every prim below them. A
+// BindingsCache entry holds one purpose's bindings, so there is one cache
+// per purpose; the collection queries do not depend on the purpose. Valid
+// while the stage is not edited (the loader only reads it).
+struct UsdBindingCaches {
+    std::map<TfToken, std::unique_ptr<UsdShadeMaterialBindingAPI::BindingsCache>> bindings;
+    UsdShadeMaterialBindingAPI::CollectionQueryCache collections;
+
+    UsdShadeMaterialBindingAPI::BindingsCache* For(TfToken const& purpose)
+    {
+        auto& cache = bindings[purpose];
+        if (!cache) cache = std::make_unique<UsdShadeMaterialBindingAPI::BindingsCache>();
+        return cache.get();
+    }
+};
+
 // The material bound for the first of `purposes` with a binding (the empty
 // token is allPurpose), as Hydra resolves UsdRenderSettings
 // materialBindingPurposes. Empty `purposes`: full, then allPurpose.
+// `caches` (optional): the stage's binding caches, for resolving many prims.
 inline UsdShadeMaterial ComputeBoundMaterialFor(UsdPrim const& prim,
-                                                std::vector<TfToken> const& purposes)
+                                                std::vector<TfToken> const& purposes,
+                                                UsdBindingCaches* caches = nullptr)
 {
     static const std::vector<TfToken> defaults{UsdShadeTokens->full, UsdShadeTokens->allPurpose};
     for (TfToken const& purpose : purposes.empty() ? defaults : purposes) {
         UsdRelationship binding;
-        UsdShadeMaterial material = UsdShadeMaterialBindingAPI(prim).ComputeBoundMaterial(purpose, &binding);
+        const UsdShadeMaterialBindingAPI api(prim);
+        UsdShadeMaterial material = caches
+            ? api.ComputeBoundMaterial(caches->For(purpose), &caches->collections, purpose, &binding)
+            : api.ComputeBoundMaterial(purpose, &binding);
         if (!material) continue;
         if (purpose.IsEmpty()) return material;
         // ComputeBoundMaterial falls back to allPurpose bindings; here only
@@ -262,7 +287,8 @@ UsdMaterialDataSource(const UsdShadeMaterial& material, UsdTimeCode time)
 static std::map<SdfPath, UsdMaterialSource>
 CollectBoundMaterials(const UsdStageRefPtr& stage,
                       std::vector<TfToken> const& bindingPurposes = {},
-                      UsdTimeCode time = UsdTimeCode::Default())
+                      UsdTimeCode time = UsdTimeCode::Default(),
+                      UsdBindingCaches* bindingCaches = nullptr)
 {
     std::map<SdfPath, UsdMaterialSource> result;
 
@@ -274,7 +300,7 @@ CollectBoundMaterials(const UsdStageRefPtr& stage,
         if (!geometry.IsA<UsdGeomMesh>() && !geometry.IsA<UsdGeomSphere>() && !geometry.IsA<UsdGeomCube>() &&
             !geometry.IsA<UsdGeomCylinder>() && !geometry.IsA<UsdGeomCone>() && !geometry.IsA<UsdGeomCapsule>() &&
             !geometry.IsA<UsdGeomPlane>() && !geometry.IsA<UsdGeomSubset>()) continue;
-        if (auto material = ComputeBoundMaterialFor(geometry, bindingPurposes))
+        if (auto material = ComputeBoundMaterialFor(geometry, bindingPurposes, bindingCaches))
             required.insert(material.GetPath());
     }
     for (const SdfPath& materialPath : required) {
@@ -716,7 +742,7 @@ private:
             // Loads the MaterialX and MDL libraries while bindings are read.
             service.Prewarm();
             std::cout << "[USDMesh] Scanning for MaterialX materials...\n";
-            auto sources = CollectBoundMaterials(stage, m_bindingPurposes, m_options.time);
+            auto sources = CollectBoundMaterials(stage, m_bindingPurposes, m_options.time, &m_bindingCaches);
             std::vector<prism::materials::MaterialService::Request> requests;
             for (auto const& [path, source] : sources)
                 if (source.dataSource) requests.push_back({source.dataSource, path});
@@ -1085,7 +1111,7 @@ private:
     Material* boundMaterial(pxr::UsdPrim const& prim)
     {
         if (m_mdl_material_lookup.empty()) return nullptr;
-        pxr::UsdShadeMaterial bound = ComputeBoundMaterialFor(prim, m_bindingPurposes);
+        pxr::UsdShadeMaterial bound = ComputeBoundMaterialFor(prim, m_bindingPurposes, &m_bindingCaches);
         if (!bound) return nullptr;
         auto it = m_mdl_material_lookup.find(bound.GetPrim().GetPath());
         return it == m_mdl_material_lookup.end() ? nullptr : materials.at(it->second);
@@ -1444,6 +1470,9 @@ private:
     std::map<SdfPath, int>                    m_mdl_material_lookup;
     std::map<SdfPath, int>                    m_fallbackByPath;
     std::vector<pxr::TfToken>                 m_bindingPurposes;
+    // The loaded stage's binding caches: the material scan and the
+    // placements resolve the same prims' bindings.
+    UsdBindingCaches                          m_bindingCaches;
     LoadOptions                               m_options;
     std::unique_ptr<pxr::UsdGeomXformCache>   m_xformCache;
     std::vector<std::unique_ptr<Shape>>       m_shapes;

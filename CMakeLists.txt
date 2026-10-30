@@ -985,6 +985,15 @@ if(PRISM_BUILD_HYDRA)
             COMMAND prism_standalone_material_reuse_test)
         set_tests_properties(prism_standalone_material_reuse_test PROPERTIES
             ENVIRONMENT "${_prism_test_environment}" SKIP_RETURN_CODE 77)
+        # The CLI loader's USD binding caches resolve as the uncached API.
+        add_executable(prism_usd_binding_cache_test tests/usd_binding_cache.cpp)
+        target_link_libraries(prism_usd_binding_cache_test PRIVATE PrismRT::core ${PXR_LIBRARIES})
+        add_test(NAME prism_usd_binding_cache_test COMMAND prism_usd_binding_cache_test
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/render_settings_binding.usda"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/native_instance_bindings.usda"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/overlapping_subsets.usda"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/parity.usda")
+        set_tests_properties(prism_usd_binding_cache_test PROPERTIES ENVIRONMENT "${_prism_test_environment}")
         add_executable(prism_openpbr_transmission_test tests/openpbr_transmission.cpp)
         target_link_libraries(prism_openpbr_transmission_test PRIVATE PrismRT::core)
         add_test(NAME prism_openpbr_transmission_test COMMAND prism_openpbr_transmission_test)
