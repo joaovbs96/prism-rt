@@ -635,6 +635,12 @@ struct VulkanDevice::Impl {
     uint32_t mdlTextureCount = 1;
 
     Buffer buffers[kSlotCount];
+    // Device-local slots waiting for their staging copy (flushUploads).
+    struct PendingUpload {
+        int slot = 0;
+        Buffer staging;
+    };
+    std::vector<PendingUpload> pendingUploads;
     std::vector<VkImageView> imageViews;
     struct CachedImage {
         std::weak_ptr<const prism::TextureResource> resource;
@@ -810,7 +816,11 @@ struct VulkanDevice::Impl {
     bool createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, Buffer* buffer, bool hostVisible = true,
                       bool hostCached = false);
     void destroyBuffer(Buffer& buffer);
+    // Uploads a slot: host-visible for the slots the host touches per pass,
+    // otherwise device-local through a staging copy that flushUploads runs.
     bool upload(int slot, const void* bytes, size_t size);
+    bool flushUploads(std::string* error);
+    bool deviceLocalFits(VkDeviceSize bytes) const;
     void destroyStructure(AccelerationStructure& structure);
     VkCommandBuffer beginCommands();
     bool submit(VkCommandBuffer commands, std::string* error);
@@ -948,6 +958,7 @@ VulkanDevice::Impl::~Impl()
         vkFreeMemory(device, cached.image.memory, nullptr);
     }
     for (auto& buffer : buffers) destroyBuffer(buffer);
+    for (auto& pending : pendingUploads) destroyBuffer(pending.staging);
     if (timestamps) vkDestroyQueryPool(device, timestamps, nullptr);
     if (fence) vkDestroyFence(device, fence, nullptr);
     if (commandPool) vkDestroyCommandPool(device, commandPool, nullptr);
@@ -2037,15 +2048,87 @@ void VulkanDevice::Impl::destroyBuffer(Buffer& buffer)
     buffer = {};
 }
 
+// Slots the host writes or reads after their upload: the per-dispatch frame
+// and pixel list, the RNG, output and accumulation, and the image records
+// (texture streaming rewrites their levels). They stay host-visible; every
+// other slot is read only by the kernels and the AS builds, and lives in
+// device-local memory (docs/gpu_devices.md, "Vulkan memory placement").
+static bool HostVisibleSlot(int slot)
+{
+    return slot == kSlotFrame || slot == kSlotPixels || slot == kSlotRng || slot == kSlotOutput ||
+           slot == kSlotAccumulation || slot == kSlotImages;
+}
+
+bool VulkanDevice::Impl::deviceLocalFits(VkDeviceSize bytes) const
+{
+    if (!memoryBudget) return true;
+    const uint32_t type = memoryType(~0u, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (type == ~0u) return false;
+    const uint32_t heap = memoryProperties.memoryTypes[type].heapIndex;
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    VkPhysicalDeviceMemoryProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
+    properties.pNext = &budget;
+    vkGetPhysicalDeviceMemoryProperties2(physical, &properties);
+    // Half the heap's budget at most: the textures (gpu::TextureBudget, 45%
+    // of the heap) and the acceleration structures upload after the buffers.
+    return budget.heapUsage[heap] + bytes <= budget.heapBudget[heap] / 2;
+}
+
 bool VulkanDevice::Impl::upload(int slot, const void* bytes, size_t size)
 {
     destroyBuffer(buffers[slot]);
+    // A slot uploaded again before the copies ran drops its earlier copy.
+    for (auto it = pendingUploads.begin(); it != pendingUploads.end();)
+        if (it->slot == slot) {
+            destroyBuffer(it->staging);
+            it = pendingUploads.erase(it);
+        } else {
+            ++it;
+        }
     const VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
         VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
+    if (!HostVisibleSlot(slot) && deviceLocalFits(size)) {
+        // Device-local, filled from a staging buffer by flushUploads. The
+        // staging covers the whole (padded) buffer, zeroing the padding.
+        PendingUpload pending{slot};
+        if (createBuffer(size, usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT, &buffers[slot], false)) {
+            if (createBuffer(buffers[slot].size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &pending.staging, true)) {
+                auto* mapped = static_cast<uint8_t*>(pending.staging.mapped);
+                if (bytes && size) std::memcpy(mapped, bytes, size);
+                const size_t copied = bytes ? size : 0;
+                std::memset(mapped + copied, 0, size_t(pending.staging.size) - copied);
+                pendingUploads.push_back(pending);
+                return true;
+            }
+            destroyBuffer(buffers[slot]);
+        }
+        // No device-local memory (or staging) left: host-visible as before.
+    }
     const bool readBack = slot == kSlotRng || slot == kSlotOutput || slot == kSlotAccumulation;
     if (!createBuffer(size, usage, &buffers[slot], true, readBack)) return false;
     if (bytes && size) std::memcpy(buffers[slot].mapped, bytes, size);
     return true;
+}
+
+bool VulkanDevice::Impl::flushUploads(std::string* error)
+{
+    if (pendingUploads.empty()) return true;
+    VkCommandBuffer commands = beginCommands();
+    for (PendingUpload const& pending : pendingUploads) {
+        const VkBufferCopy region{0, 0, pending.staging.size};
+        vkCmdCopyBuffer(commands, pending.staging.buffer, buffers[pending.slot].buffer, 1, &region);
+    }
+    // The kernels and the AS builds of later submissions read the copies.
+    VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1,
+                         &barrier, 0, nullptr, 0, nullptr);
+    // submit waits for the copies, so the staging buffers can go.
+    const bool ok = submit(commands, error);
+    for (PendingUpload& pending : pendingUploads) destroyBuffer(pending.staging);
+    pendingUploads.clear();
+    return ok;
 }
 
 void VulkanDevice::Impl::destroyStructure(AccelerationStructure& structure)
@@ -3238,6 +3321,7 @@ bool VulkanDevice::Impl::ensureScene(SceneManager& scene, std::string* error)
     if (!buffers[kSlotFrame].buffer) upload(kSlotFrame, nullptr, sizeof(GpuFrame));
     for (int slot : {kSlotPixels, kSlotRng, kSlotOutput, kSlotAccumulation})
         if (!buffers[slot].buffer) upload(slot, nullptr, 16);
+    if (!flushUploads(error)) return fail();
     auto const uploaded = Clock::now();
     if (!uploadImages(error)) return fail();
     if (!createFeedbackBuffers(streaming.sources.empty() ? 0u : uint32_t(d.images.size()), error)) return fail();
