@@ -159,8 +159,13 @@ and then passes them as clean (`cleanAux`), OIDN's recommendation for final
 frames with noisy guides (depth of field, rough glass); false passes them as
 they are with `cleanAux` off. Prefiltering costs about six times the plain
 denoise on the CPU (1080p, high: 3.1 s against 0.5 s) for about 10% less
-error on the test room; at high resolutions in usdview, turn it off (or use
-`fast`) for quicker interval denoises.
+error on the test room. The delegate's (and the progressive Session's)
+interval denoises, previews while the render goes on, never prefilter: the
+guides are means that barely change between intervals, and on the CPU the
+prefilter took most of the render's threads every interval. The final
+denoise (when the render converges) and the paused one use the setting, so
+the finished image is the same; only the interval previews differ from
+before, as unprefiltered denoises do (slightly noisier guides behind them).
 
 ## Settings and outputs
 
@@ -188,7 +193,8 @@ camera; render products take their `denoised` vars.
 In the delegate (usdview), with `prism:denoise` or a bound `denoised` AOV:
 - the render worker accumulates the colour and the guides; every
   `prism:denoiseInterval` passes it hands a copy of the means to a denoise
-  worker thread and goes on rendering. A finished denoise is published at
+  worker thread and goes on rendering (without the guide prefilter, above).
+  A finished denoise is published at
   the next pass boundary (or while waiting for a pass): the `denoised` AOV's
   buffers, and with `prism:denoise` the colour buffers' display, which then
   shows the denoised image (no progressive tiles) until the next one;

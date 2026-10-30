@@ -743,7 +743,13 @@ ProgressiveEngine::Outcome ProgressiveEngine::Run(ProgressiveRun const &run, Pro
         resolvedOutputs.push_back({output.bound, kind, plane});
     }
     // Starts a denoise of the accumulation so far on the denoise worker.
-    auto launchDenoise = [&] {
+    // `interval`: a preview while the render goes on (every denoiseInterval
+    // passes), denoised without the guides' prefilter: the guides are means
+    // that barely change between intervals, and on the CPU the prefilter
+    // took about 6 times the plain denoise's time from the render's threads
+    // (docs/denoising.md). The final and paused denoises keep the settings,
+    // so the finished image is unchanged.
+    auto launchDenoise = [&](bool interval) {
         const size_t count = static_cast<size_t>(width) * height;
         auto job = std::make_shared<DenoiseJob>();
         job->width = width;
@@ -751,6 +757,7 @@ ProgressiveEngine::Outcome ProgressiveEngine::Run(ProgressiveRun const &run, Pro
         job->samples = samples.load();
         job->frame = frame;
         job->settings = settings.denoiseSettings;
+        if (interval) job->settings.prefilter = false;
         std::string error;
         job->denoiser = renderDevice->CreateDenoiser(&error);
         if (!job->denoiser && !m_denoiserWarned) {
@@ -768,9 +775,11 @@ ProgressiveEngine::Outcome ProgressiveEngine::Run(ProgressiveRun const &run, Pro
         });
         if (!m_denoiseWorker) m_denoiseWorker = std::make_unique<DenoiseWorker>();
         m_denoiseWorker->Submit(job);
+        // What was denoised: an interval denoise does not stand for the
+        // final one (the final loop below compares these settings).
+        m_denoisedSettings = job->settings;
         m_denoiseJob = std::move(job);
         m_denoisedSamples = samples.load();
-        m_denoisedSettings = settings.denoiseSettings;
     };
     // Publishes a finished denoise of this accumulation: the denoised AOVs,
     // and with `denoise` the colour's display. True when one was.
@@ -883,8 +892,9 @@ ProgressiveEngine::Outcome ProgressiveEngine::Run(ProgressiveRun const &run, Pro
             // Paused: show the accumulation so far denoised.
             if (denoising) {
                 publishDenoise();
-                if (!denoiseInFlight() && samples.load() > m_denoisedSamples && samples.load() > 0)
-                    launchDenoise();
+                if (!denoiseInFlight() && samples.load() > 0 &&
+                    (samples.load() > m_denoisedSamples || !(m_denoisedSettings == settings.denoiseSettings)))
+                    launchDenoise(false);
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
@@ -1222,7 +1232,7 @@ ProgressiveEngine::Outcome ProgressiveEngine::Run(ProgressiveRun const &run, Pro
             if (!denoiseInFlight() && sample + 1 < sampleCount &&
                 static_cast<uint64_t>(sample + 1) >=
                     m_denoisedSamples + static_cast<uint64_t>(std::max(1, settings.denoiseInterval)))
-                launchDenoise();
+                launchDenoise(true);
         }
         if (sample == 0 && !restarted) {
             std::vector<AovPlane>().swap(primaryPlanes);
@@ -1239,7 +1249,7 @@ ProgressiveEngine::Outcome ProgressiveEngine::Run(ProgressiveRun const &run, Pro
             if (!denoiseInFlight()) {
                 const bool current = m_denoiseJob && m_denoisedSamples == samples.load() &&
                     m_denoisedSettings == settings.denoiseSettings;
-                if (!current) launchDenoise();
+                if (!current) launchDenoise(false);
                 else if (m_denoiseJob->published) break;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
