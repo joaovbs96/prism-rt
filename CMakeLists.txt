@@ -1096,6 +1096,12 @@ if(PRISM_BUILD_HYDRA)
     target_link_libraries(prism_hdmtlx_validation_test PRIVATE PrismRT::core ${PXR_LIBRARIES})
     add_test(NAME prism_hdmtlx_validation_test COMMAND prism_hdmtlx_validation_test)
     set_tests_properties(prism_hdmtlx_validation_test PROPERTIES ENVIRONMENT "${_prism_test_environment}")
+    # Edited material networks convert in the network's order, not in token
+    # hash order (src/materialx/ordered_network_interface.h).
+    add_executable(prism_ordered_network_interface_test tests/hydra/ordered_network_interface_test.cpp)
+    target_link_libraries(prism_ordered_network_interface_test PRIVATE PrismRT::core ${PXR_LIBRARIES})
+    add_test(NAME prism_ordered_network_interface_test COMMAND prism_ordered_network_interface_test)
+    set_tests_properties(prism_ordered_network_interface_test PROPERTIES ENVIRONMENT "${_prism_test_environment}")
     # A referenced .mtlx document's colorspace reaches both loaders' material
     # networks (src/usd/mtlx_color_space.h; the Hydra side through hdPrism's
     # MaterialXConfigAPI adapter, found on PXR_PLUGINPATH_NAME).

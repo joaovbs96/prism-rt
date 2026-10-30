@@ -6,6 +6,7 @@
 #include "../materialx/resolved_resource.h"
 #include "../materialx/prepared_template.h"
 #include "../materialx/preview_surface.h"
+#include "../materialx/ordered_network_interface.h"
 #include "../usd/mtlx_color_space.h"
 #include "../mdl_material.h"
 #include "../resource_limits.h"
@@ -866,7 +867,8 @@ public:
         }
         if (!network) return result;
 
-        HdDataSourceMaterialNetworkInterface netInterface(
+        // Edits below must not reorder what hdMtlx reads (ordered_network_interface.h).
+        prism::materialx::OrderedMaterialNetworkInterface netInterface(
             materialPath, network.GetContainer(), primDataSource);
         // A referenced .mtlx document's colorspace, which composition drops
         // (src/usd/mtlx_color_space.h): tag before capture so the captured
