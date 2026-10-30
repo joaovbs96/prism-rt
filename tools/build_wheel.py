@@ -324,6 +324,21 @@ MSVC_RUNTIME_MINIMUM = {msvc_minimum!r}
 '''
 
 
+def write_path_marker(stage: Path, marker: Path) -> None:
+    """prism_paths.txt beside prism.dll: the longest path of the wheel's files
+    relative to site-packages (the stage), with its leading separator. The
+    install root is two levels above bin (site-packages)."""
+    longest_required = longest_all = 0
+    for path in stage.rglob("*"):
+        if not path.is_file():
+            continue
+        relative = "\\" + path.relative_to(stage).as_posix().replace("/", "\\")
+        longest_all = max(longest_all, len(relative))
+        if not relative.startswith("\\prismrt\\licenses\\"):
+            longest_required = max(longest_required, len(relative))
+    marker.write_text(f"root=..\\..\nrequired={longest_required}\nall={longest_all}\n", encoding="ascii")
+
+
 def metadata(version: str) -> str:
     readme = (
         "PrismRT is a physically based path tracer (CPU, Vulkan, Metal). This package is its Python API:\n"
@@ -513,6 +528,10 @@ def main() -> int:
     # 6. Licences.
     vcpkg_bin = Path(cache.get("PRISM_VCPKG_BIN") or runtime["vcpkgRuntime"])
     absent = licenses(stage, runtime, cache, vcpkg_bin, with_usd)
+
+    # 7. The longest installed paths, read by prismrt at import against Windows'
+    #    260-character limit (src/renderer/install_paths.h, docs/python.md).
+    write_path_marker(stage, package / "bin" / "prism_paths.txt")
 
     tag = f"{python_tag}-{python_tag}-{TAG_PLATFORM}"
     wheel = write_wheel(stage, out, version, tag, source_date_epoch())

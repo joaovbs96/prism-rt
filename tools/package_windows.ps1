@@ -32,6 +32,11 @@ param(
     [string] $PythonRoot = "",
     [string] $DxcDir = "",
     [string] $VulkanLoader = "",
+    # The commit the zip and VERSION.txt name (any revision git rev-parse
+    # accepts); default HEAD. The package is always built from the working tree
+    # and the existing build: pass the commit that build corresponds to, e.g.
+    # the last commit that touched code when HEAD only changed docs.
+    [string] $Commit = "HEAD",
     [switch] $SkipPip,
     [switch] $SkipZip
 )
@@ -116,8 +121,8 @@ $mdlBin = @("bin", "nt-x86-64\lib") | ForEach-Object { Join-Path $MdlSdkRoot $_ 
     Where-Object { Test-Path -LiteralPath (Join-Path $_ "libmdl_sdk.dll") } | Select-Object -First 1
 if (-not $mdlBin) { throw "libmdl_sdk.dll not found under MDL SDK root '$MdlSdkRoot'." }
 
-$sha = (& git -C $root rev-parse --short HEAD).Trim()
-if ($LASTEXITCODE) { throw "git rev-parse failed" }
+$sha = (& git -C $root rev-parse --short "$Commit^{commit}").Trim()
+if ($LASTEXITCODE -or -not $sha) { throw "git rev-parse failed for -Commit $Commit" }
 $pkg = Join-Path $OutputDir "PrismRT"
 $zip = Join-Path $OutputDir "PrismRT-windows-x64-$sha.zip"
 Write-Host "Packaging PrismRT $sha into $pkg"
@@ -357,6 +362,24 @@ if (-not $SkipPip) {
         }
     }
 }
+
+# 5b. The longest installed paths, for the start-up check against Windows'
+#     260-character limit (docs/deployment.md, "Path length"; src/renderer/
+#     install_paths.h). "required" covers what the renderer opens (not the
+#     private Python, licenses or .pyc caches); "all" everything but .pyc caches.
+$pkgFull = (Resolve-Path -LiteralPath $pkg).Path.TrimEnd('\')
+$longestRequired = 0; $longestAll = 0
+Get-ChildItem -LiteralPath "\\?\$pkgFull" -Recurse -File | ForEach-Object {
+    $rel = $_.FullName.Substring(4 + $pkgFull.Length)   # "\bin\prism.dll"
+    if ($rel -like "*\__pycache__\*") { return }
+    $longestAll = [Math]::Max($longestAll, $rel.Length)
+    if ($rel -notlike "\python\*" -and $rel -notlike "\licenses\*") {
+        $longestRequired = [Math]::Max($longestRequired, $rel.Length)
+    }
+}
+[IO.File]::WriteAllText((Join-Path $pkg "bin\prism_paths.txt"),
+    "root=..`r`nrequired=$longestRequired`r`nall=$longestAll`r`n", (New-Object Text.UTF8Encoding($false)))
+Write-Host "Longest installed path: $longestRequired characters (renderer), $longestAll (with Python)"
 
 # 6. Zip. tar handles archives above 2 GB, unlike Compress-Archive.
 $size = (Get-ChildItem -LiteralPath $pkg -Recurse -File | Measure-Object Length -Sum).Sum
