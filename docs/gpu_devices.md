@@ -538,6 +538,40 @@ group, and Russian roulette from depth 2 (worse) or 8 (CornellBox -14% MSE,
 OpenChessSet +18% time). Pixel filters other than the box were not tried:
 they change the image, not just its noise.
 
+## Vulkan memory placement
+
+`VulkanDevice::Impl::upload` (`src/device/vulkan/vulkan_device.cpp`) places
+each storage-buffer slot by who touches it after the upload:
+
+- **Device-local** (`VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT`, VRAM on a discrete
+  GPU): every slot only the kernels and the acceleration-structure builds
+  read: positions, normals, texcoords, tangents, indices, prototypes,
+  instances, primitive materials, materials, legacy textures, spheres,
+  environment and its alias tables, lights and their alias table, primvars,
+  MDL argument blocks, read-only data, texture records and tiles, BSDF data.
+  `ensureScene` fills them from host-visible staging buffers with one batch
+  of `vkCmdCopyBuffer` (`flushUploads`), followed by a transfer-write →
+  all-commands memory barrier, before the images, the AS builds and any
+  dispatch; the staging buffers are freed once that submission's fence
+  signals. A scene edit re-uploads every slot this way (`ensureScene` runs
+  after `vkDeviceWaitIdle`).
+- **Host-visible** (as before): the frame parameters, the pixel list, the
+  RNG, the output and the accumulation (the host writes or reads them every
+  dispatch; the last three host-cached), and the image records
+  (`kSlotImages`, which texture streaming rewrites in place).
+- **Fallback.** A device-local slot goes host-visible when its buffer or
+  staging cannot be allocated, or when it would take the device-local heap's
+  usage past half its `VK_EXT_memory_budget` budget (the textures, 45% of the
+  heap, and the AS upload after the buffers). Images are identical either
+  way; only the shading reads' latency changes.
+
+Before this, every slot used the first `HOST_VISIBLE | HOST_COHERENT` type,
+which on NVIDIA/Windows (RTX 4070 Ti, driver memory types 0-4) is type 2 in
+the system-memory heap, so every shading read on an L2 miss crossed PCIe. The
+same machine also exposes a ReBAR type (`DEVICE_LOCAL | HOST_VISIBLE`, type
+4); the staging path does not rely on it. Metal's buffers are shared storage
+on unified memory and are unaffected.
+
 ## Metal checklist
 
 Changes to code the Metal device shares, to verify on a Mac (build, then the
@@ -1277,6 +1311,20 @@ called done there.
   of the serial scan. Check on the Mac: an adaptive CLI render on
   `--device metal` (`--adaptive-threshold 0.02`) bit-identical to the
   previous build's, and `ctest -R adaptive_publication`.
+- **Parallel replica reduction in `RenderImage`** (written on Windows, the
+  Metal device unbuilt): `src/device/gpu/gpu_device.cpp` sums the adaptive
+  phase's replica outputs into the accumulation with `tbb::parallel_for`
+  over the pixel list (each pixel's replicas still add in order, so the sums
+  are bit-identical), and writes the pixel list into `kSlotPixels` only when
+  an adaptive check changed it (the buffer keeps it between dispatches; it
+  only shrinks). Metal's `RenderBuffer` keeps a buffer's contents unless it
+  grows, as Vulkan's does. No shader change. The Vulkan-only move of the
+  scene buffers to device-local memory ([memory placement](#vulkan-memory-placement))
+  does not touch Metal.
+  - Check on the Mac: a CornellBox render with adaptive sampling on
+    (`--spp 512 --adaptive-threshold 0.02 --seed 0`) on `--device metal`
+    is bit-identical (`prism_compare_images --exact`) to the build before
+    the change; `ctest -R "gpu|adaptive"`.
 
 ## Diagnostics
 

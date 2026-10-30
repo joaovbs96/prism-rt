@@ -160,6 +160,7 @@ std::vector<float> GpuRenderDevice::RenderImage(SceneManager& scene, ImageReques
     // Pixels left active by adaptive sampling get several samples in
     // parallel, so the dispatch still fills the GPU.
     constexpr int maxReplicas = 16;
+    bool listChanged = true;
     for (int sample = 0; sample < request.samples && !list.empty();) {
         // Cancelled (ImageRequest::cancel): stop at this sample boundary.
         if (request.cancel && request.cancel->load(std::memory_order_relaxed)) return {};
@@ -177,7 +178,12 @@ std::vector<float> GpuRenderDevice::RenderImage(SceneManager& scene, ImageReques
         }
         const uint32_t threads = uint32_t(list.size()) * uint32_t(replicas);
         const size_t outputBytes = size_t(threads) * (32 + (lightAovs ? 16 * kAovEntries : 0));
-        std::memcpy(RenderBuffer(kSlotPixels, list.size() * 4), list.data(), list.size() * 4);
+        // The list changes only at adaptive checks; the buffer keeps it
+        // between dispatches (it only shrinks, so it is never reallocated).
+        if (listChanged) {
+            std::memcpy(RenderBuffer(kSlotPixels, list.size() * 4), list.data(), list.size() * 4);
+            listChanged = false;
+        }
         if (replicas > 1) RenderBuffer(kSlotOutput, outputBytes);
         GpuFrame f = frame;
         f.work = {threads, replicas > 1 ? uint32_t(list.size()) : 0u, kModeImage, 0};
@@ -194,18 +200,27 @@ std::vector<float> GpuRenderDevice::RenderImage(SceneManager& scene, ImageReques
         if (replicas > 1) {
             auto const* out = static_cast<const float*>(RenderBuffer(kSlotOutput, outputBytes));
             auto* sums = static_cast<float*>(RenderBuffer(kSlotAccumulation, accumulationBytes));
-            for (uint32_t t = 0; t < threads; ++t) {
-                const uint32_t p = list[t % list.size()];
-                for (int c = 0; c < 3; ++c) {
-                    sums[8 * p + c] += out[8 * t + c];
-                    sums[8 * p + 4 + c] += out[8 * t + 4 + c];
+            // Thread t = r * size + i is replica r of list entry i. Each
+            // pixel is in the list once, so the entries reduce in parallel;
+            // a pixel's replicas still add in order r = 0, 1, ... as in a
+            // serial loop over t, keeping the sums bit-identical.
+            const size_t size = list.size();
+            tbb::parallel_for(tbb::blocked_range<size_t>(0, size, 1024), [&](tbb::blocked_range<size_t> const& range) {
+                for (size_t i = range.begin(); i != range.end(); ++i) {
+                    const size_t p = list[i];
+                    for (size_t t = i; t < threads; t += size) {
+                        for (int c = 0; c < 3; ++c) {
+                            sums[8 * p + c] += out[8 * t + c];
+                            sums[8 * p + 4 + c] += out[8 * t + 4 + c];
+                        }
+                        // The light AOVs follow the 2 * threads colour entries.
+                        if (lightAovs)
+                            for (size_t k = 0; k < 4 * kAovEntries; ++k)
+                                sums[8 * size_t(count) + 4 * kAovEntries * p + k] +=
+                                    out[8 * size_t(threads) + 4 * kAovEntries * t + k];
+                    }
                 }
-                // The light AOVs follow the 2 * threads colour entries.
-                if (lightAovs)
-                    for (size_t i = 0; i < 4 * kAovEntries; ++i)
-                        sums[8 * size_t(count) + 4 * kAovEntries * p + i] +=
-                            out[8 * size_t(threads) + 4 * kAovEntries * t + i];
-            }
+            });
         }
         sample += replicas;
         for (uint32_t p : list) samples[p] = sample;
@@ -221,6 +236,7 @@ std::vector<float> GpuRenderDevice::RenderImage(SceneManager& scene, ImageReques
             list.clear();
             for (uint32_t p = 0; p < count; ++p)
                 if (active.Active(p)) list.push_back(p);
+            listChanged = true;
             if (progress)
                 progress->activeFraction.store(double(list.size()) / double(count), std::memory_order_relaxed);
         }
