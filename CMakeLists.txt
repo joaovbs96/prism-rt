@@ -839,6 +839,10 @@ if(PRISM_BUILD_HYDRA)
                 ${_prism_manifest_exes})
     endif()
 
+    add_executable(prism_opaque_occluders_test tests/opaque_occluders_test.cpp)
+    target_link_libraries(prism_opaque_occluders_test PRIVATE PrismRT::core)
+    add_test(NAME prism_opaque_occluders_test COMMAND prism_opaque_occluders_test)
+
     add_executable(prism_ray_footprint_test tests/ray_footprint.cpp)
     target_link_libraries(prism_ray_footprint_test PRIVATE PrismRT::core)
     add_test(NAME prism_ray_footprint_test COMMAND prism_ray_footprint_test)
@@ -1278,6 +1282,9 @@ if(TARGET prism_hydra_render AND TARGET prism_compare_images)
         TOLERANCE 0.1 MEAN_TOLERANCE 0.01)
     prism_add_parity_fixture(NAME cutout_clear SCENE tests/hydra/fixtures/cutout_clear.usda)
     prism_add_parity_fixture(NAME cutout_medium SCENE tests/hydra/fixtures/cutout_medium.usda)
+    # Overlapping alpha-cutout cards in front of an opaque wall (OpaqueOccluders,
+    # MDLMaterial::cutoutOpacity).
+    prism_add_parity_fixture(NAME foliage_cards SCENE tests/hydra/fixtures/foliage_cards.usda)
     prism_add_parity_fixture(NAME sss_furnace SCENE tests/hydra/fixtures/sss_furnace.usda)
     prism_add_parity_fixture(NAME preview_mtlx SCENE tests/hydra/fixtures/preview_mtlx_parity.usda)
     # A referenced .mtlx whose emission is a texture behind a remap, and a

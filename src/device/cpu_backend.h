@@ -13,6 +13,7 @@
 #define PRISM_PROFILE(stage) ::prism::profiling::Scope prismProfileScope(::prism::profiling::stage)
 #include "../../shaders/integrator/path_tracer.h"
 #include "light_table.h"
+#include "opaque_occluders.h"
 #include "../camera_rays.h"
 #include "../scene.h"
 
@@ -44,8 +45,9 @@ struct CpuBackend {
     SceneManager* scene = nullptr;
     LightTable const* lights = nullptr;
     Rng rng = {0u};
-    // Every material of the scene always blocks shadow rays (no cutouts).
-    bool opaqueScene = false;
+    // The primitives that always block shadow rays (CpuSceneState::occluders;
+    // null: none known, every shadow ray takes the per-hit path).
+    OpaqueOccluders const* occluders = nullptr;
     // LightTable::lobes
     bool lobes = false;
     // CpuSceneState::culling
@@ -67,15 +69,35 @@ struct CpuBackend {
         return query;
     }
 
+    // Whether a primitive that always blocks (OpaqueOccluders) lies on the
+    // shadow ray. Without culling, one closest-hit query answers most rays:
+    // a miss is visible, an opaque first hit blocks; only a cutout first hit
+    // asks the opaque primitives behind it (an any-hit query). The closest
+    // hit is kept for visible()'s first intersectNonOpaque (same ray), so an
+    // unblocked ray is traced once, as before. With culling, the any-hit
+    // query (which skips culled back faces) comes first.
     bool occludedByOpaque(::PathRay const& ray)
     {
-        if (!opaqueScene) return false;
+        pending = false;
+        if (!occluders) return false;
         RTCRay query = ToQuery(ray).ray;
-        rtcOccluded1(scene->scene, &query);
-        return query.tfar < 0.0f;
+        if (occluders->allOpaque() || culling) return occluders->occluded(*scene, query);
+        profiling::ShadowScope shadowScope;
+        const RTCRayHit raw = scene->intersectRaw(ToQuery(ray));
+        if (raw.hit.geomID != RTC_INVALID_GEOMETRY_ID) {
+            const unsigned placement = raw.hit.instID[0] != RTC_INVALID_GEOMETRY_ID ? raw.hit.instID[0]
+                                                                                   : raw.hit.geomID;
+            if (occluders->opaquePrimitive(int(placement), raw.hit.primID)) return true;
+            query.tnear = raw.ray.tfar;
+            if (occluders->occluded(*scene, query)) return true;
+        }
+        pending = true;
+        pendingRay = ray.ray;
+        pendingHit = raw;
+        return false;
     }
 
-    bool mayHaveCutouts() { return !opaqueScene; }
+    bool mayHaveCutouts() { return !occluders || occluders->mayHaveCutouts(); }
     // A shadow ray's next crossing. When it is on a material that always
     // blocks, visible() reads nothing of the hit but that (with every surface
     // casting shadows, which holds without light linking), so the hit is not
@@ -84,10 +106,13 @@ struct CpuBackend {
     CpuHit intersectNonOpaque(::PathRay const& ray)
     {
         profiling::ShadowScope shadowScope;
-        if (culling || scene->lightLinking) return intersect(ray);
+        const bool cached = pending && SameRay(pendingRay, ray.ray);
+        pending = false;
+        if (culling) return intersect(ray);
         const prism::PathRay query = ToQuery(ray);
-        const RTCRayHit raw = scene->intersectRaw(query);
-        if (raw.hit.geomID == RTC_INVALID_GEOMETRY_ID) return Prepared(scene->prepareHit(raw, query));
+        const RTCRayHit raw = cached ? pendingHit : scene->intersectRaw(query);
+        if (raw.hit.geomID == RTC_INVALID_GEOMETRY_ID || scene->lightLinking)
+            return Prepared(scene->prepareHit(raw, query));
         ::Material* material = scene->getMaterial(raw);
         if (!material || !material->provenOpaque()) return Prepared(scene->prepareHit(raw, query), material);
         CpuHit hit;
@@ -97,6 +122,17 @@ struct CpuBackend {
         hit.surface.primitive = raw.hit.primID;
         hit.material = material;
         return hit;
+    }
+
+    // occludedByOpaque's closest hit, for the next intersectNonOpaque of its ray.
+    bool pending = false;
+    ::Ray pendingRay;
+    RTCRayHit pendingHit;
+    static bool SameRay(::Ray const& a, ::Ray const& b)
+    {
+        return a.origin.x == b.origin.x && a.origin.y == b.origin.y && a.origin.z == b.origin.z &&
+            a.direction.x == b.direction.x && a.direction.y == b.direction.y && a.direction.z == b.direction.z &&
+            a.tnear == b.tnear && a.tfar == b.tfar;
     }
 
     CpuHit intersect(::PathRay const& ray) { return Prepared(scene->castRayCulled(ToQuery(ray), culling)); }

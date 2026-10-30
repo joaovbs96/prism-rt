@@ -1,0 +1,881 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    upAxis = "Y"
+    metersPerUnit = 1
+)
+
+# Foliage-like shadows: 40 overlapping alpha-cutout cards (a textured leaf
+# mask on open_pbr geometry_opacity, with base colour, roughness and normal
+# maps) in front of an opaque wall, lit by a small sphere light and a dim
+# dome. Shadow rays to the wall cross cutouts in front of, or instead of, an
+# opaque blocker (OpaqueOccluders, MDLMaterial::cutoutOpacity).
+# Generated (positions from a fixed seed); textures in ./foliage.
+def Xform "World"
+{
+    def Mesh "Wall" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 1, 2, 3]
+        point3f[] points = [(-3, -3, 0), (3, -3, 0), (3, 3, 0), (-3, 3, 0)]
+        uniform token subdivisionScheme = "none"
+        rel material:binding = </World/Looks/Wall>
+    }
+
+    def Xform "Cards"
+    {
+
+        def Mesh "Card00" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            uniform bool doubleSided = 1
+            int[] faceVertexCounts = [4]
+            int[] faceVertexIndices = [0, 1, 2, 3]
+            point3f[] points = [(-0.5, -0.5, 0), (0.5, -0.5, 0), (0.5, 0.5, 0), (-0.5, 0.5, 0)]
+            texCoord2f[] primvars:st = [(0, 0), (1, 0), (1, 1), (0, 1)] (
+                interpolation = "vertex"
+            )
+            uniform token subdivisionScheme = "none"
+            double3 xformOp:translate = (-0.634, -1.257, 1.407)
+            float3 xformOp:rotateXYZ = (-25.7, 2.9, 131.6)
+            float3 xformOp:scale = (0.629, 0.629, 0.629)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
+            rel material:binding = </World/Looks/Leaf>
+        }
+
+        def Mesh "Card01" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            uniform bool doubleSided = 1
+            int[] faceVertexCounts = [4]
+            int[] faceVertexIndices = [0, 1, 2, 3]
+            point3f[] points = [(-0.5, -0.5, 0), (0.5, -0.5, 0), (0.5, 0.5, 0), (-0.5, 0.5, 0)]
+            texCoord2f[] primvars:st = [(0, 0), (1, 0), (1, 1), (0, 1)] (
+                interpolation = "vertex"
+            )
+            uniform token subdivisionScheme = "none"
+            double3 xformOp:translate = (0.027, -1.665, 1.037)
+            float3 xformOp:rotateXYZ = (-25.8, -32.7, 152.8)
+            float3 xformOp:scale = (1.013, 1.013, 1.013)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
+            rel material:binding = </World/Looks/Leaf>
+        }
+
+        def Mesh "Card02" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            uniform bool doubleSided = 1
+            int[] faceVertexCounts = [4]
+            int[] faceVertexIndices = [0, 1, 2, 3]
+            point3f[] points = [(-0.5, -0.5, 0), (0.5, -0.5, 0), (0.5, 0.5, 0), (-0.5, 0.5, 0)]
+            texCoord2f[] primvars:st = [(0, 0), (1, 0), (1, 1), (0, 1)] (
+                interpolation = "vertex"
+            )
+            uniform token subdivisionScheme = "none"
+            double3 xformOp:translate = (-1.354, -0.996, 1.367)
+            float3 xformOp:rotateXYZ = (26.9, 6.2, 142.8)
+            float3 xformOp:scale = (1.088, 1.088, 1.088)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
+            rel material:binding = </World/Looks/Leaf>
+        }
+
+        def Mesh "Card03" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            uniform bool doubleSided = 1
+            int[] faceVertexCounts = [4]
+            int[] faceVertexIndices = [0, 1, 2, 3]
+            point3f[] points = [(-0.5, -0.5, 0), (0.5, -0.5, 0), (0.5, 0.5, 0), (-0.5, 0.5, 0)]
+            texCoord2f[] primvars:st = [(0, 0), (1, 0), (1, 1), (0, 1)] (
+                interpolation = "vertex"
+            )
+            uniform token subdivisionScheme = "none"
+            double3 xformOp:translate = (-1.632, 1.290, 0.792)
+            float3 xformOp:rotateXYZ = (-21.3, -30.6, 111.1)
+            float3 xformOp:scale = (1.008, 1.008, 1.008)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
+            rel material:binding = </World/Looks/Leaf>
+        }
+
+        def Mesh "Card04" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            uniform bool doubleSided = 1
+            int[] faceVertexCounts = [4]
+            int[] faceVertexIndices = [0, 1, 2, 3]
+            point3f[] points = [(-0.5, -0.5, 0), (0.5, -0.5, 0), (0.5, 0.5, 0), (-0.5, 0.5, 0)]
+            texCoord2f[] primvars:st = [(0, 0), (1, 0), (1, 1), (0, 1)] (
+                interpolation = "vertex"
+            )
+            uniform token subdivisionScheme = "none"
+            double3 xformOp:translate = (-1.149, 0.294, 1.386)
+            float3 xformOp:rotateXYZ = (-7.7, 3.8, 22.6)
+            float3 xformOp:scale = (0.630, 0.630, 0.630)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
+            rel material:binding = </World/Looks/Leaf>
+        }
+
+        def Mesh "Card05" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            uniform bool doubleSided = 1
+            int[] faceVertexCounts = [4]
+            int[] faceVertexIndices = [0, 1, 2, 3]
+            point3f[] points = [(-0.5, -0.5, 0), (0.5, -0.5, 0), (0.5, 0.5, 0), (-0.5, 0.5, 0)]
+            texCoord2f[] primvars:st = [(0, 0), (1, 0), (1, 1), (0, 1)] (
+                interpolation = "vertex"
+            )
+            uniform token subdivisionScheme = "none"
+            double3 xformOp:translate = (-1.059, 0.649, 1.027)
+            float3 xformOp:rotateXYZ = (-11.2, 6.8, 163.1)
+            float3 xformOp:scale = (0.750, 0.750, 0.750)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
+            rel material:binding = </World/Looks/Leaf>
+        }
+
+        def Mesh "Card06" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            uniform bool doubleSided = 1
+            int[] faceVertexCounts = [4]
+            int[] faceVertexIndices = [0, 1, 2, 3]
+            point3f[] points = [(-0.5, -0.5, 0), (0.5, -0.5, 0), (0.5, 0.5, 0), (-0.5, 0.5, 0)]
+            texCoord2f[] primvars:st = [(0, 0), (1, 0), (1, 1), (0, 1)] (
+                interpolation = "vertex"
+            )
+            uniform token subdivisionScheme = "none"
+            double3 xformOp:translate = (1.060, 0.716, 0.715)
+            float3 xformOp:rotateXYZ = (4.5, 2.0, 315.0)
+            float3 xformOp:scale = (0.965, 0.965, 0.965)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
+            rel material:binding = </World/Looks/Leaf>
+        }
+
+        def Mesh "Card07" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            uniform bool doubleSided = 1
+            int[] faceVertexCounts = [4]
+            int[] faceVertexIndices = [0, 1, 2, 3]
+            point3f[] points = [(-0.5, -0.5, 0), (0.5, -0.5, 0), (0.5, 0.5, 0), (-0.5, 0.5, 0)]
+            texCoord2f[] primvars:st = [(0, 0), (1, 0), (1, 1), (0, 1)] (
+                interpolation = "vertex"
+            )
+            uniform token subdivisionScheme = "none"
+            double3 xformOp:translate = (-0.763, 1.729, 0.501)
+            float3 xformOp:rotateXYZ = (-4.9, 20.6, 54.7)
+            float3 xformOp:scale = (0.844, 0.844, 0.844)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
+            rel material:binding = </World/Looks/Leaf>
+        }
+
+        def Mesh "Card08" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            uniform bool doubleSided = 1
+            int[] faceVertexCounts = [4]
+            int[] faceVertexIndices = [0, 1, 2, 3]
+            point3f[] points = [(-0.5, -0.5, 0), (0.5, -0.5, 0), (0.5, 0.5, 0), (-0.5, 0.5, 0)]
+            texCoord2f[] primvars:st = [(0, 0), (1, 0), (1, 1), (0, 1)] (
+                interpolation = "vertex"
+            )
+            uniform token subdivisionScheme = "none"
+            double3 xformOp:translate = (-1.659, 0.606, 1.600)
+            float3 xformOp:rotateXYZ = (4.4, 30.0, 112.9)
+            float3 xformOp:scale = (0.948, 0.948, 0.948)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
+            rel material:binding = </World/Looks/Leaf>
+        }
+
+        def Mesh "Card09" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            uniform bool doubleSided = 1
+            int[] faceVertexCounts = [4]
+            int[] faceVertexIndices = [0, 1, 2, 3]
+            point3f[] points = [(-0.5, -0.5, 0), (0.5, -0.5, 0), (0.5, 0.5, 0), (-0.5, 0.5, 0)]
+            texCoord2f[] primvars:st = [(0, 0), (1, 0), (1, 1), (0, 1)] (
+                interpolation = "vertex"
+            )
+            uniform token subdivisionScheme = "none"
+            double3 xformOp:translate = (0.340, 0.288, 1.076)
+            float3 xformOp:rotateXYZ = (20.4, 35.6, 170.7)
+            float3 xformOp:scale = (0.932, 0.932, 0.932)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
+            rel material:binding = </World/Looks/Leaf>
+        }
+
+        def Mesh "Card10" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            uniform bool doubleSided = 1
+            int[] faceVertexCounts = [4]
+            int[] faceVertexIndices = [0, 1, 2, 3]
+            point3f[] points = [(-0.5, -0.5, 0), (0.5, -0.5, 0), (0.5, 0.5, 0), (-0.5, 0.5, 0)]
+            texCoord2f[] primvars:st = [(0, 0), (1, 0), (1, 1), (0, 1)] (
+                interpolation = "vertex"
+            )
+            uniform token subdivisionScheme = "none"
+            double3 xformOp:translate = (-1.582, 0.725, 1.400)
+            float3 xformOp:rotateXYZ = (29.6, 25.8, 102.5)
+            float3 xformOp:scale = (0.793, 0.793, 0.793)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
+            rel material:binding = </World/Looks/Leaf>
+        }
+
+        def Mesh "Card11" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            uniform bool doubleSided = 1
+            int[] faceVertexCounts = [4]
+            int[] faceVertexIndices = [0, 1, 2, 3]
+            point3f[] points = [(-0.5, -0.5, 0), (0.5, -0.5, 0), (0.5, 0.5, 0), (-0.5, 0.5, 0)]
+            texCoord2f[] primvars:st = [(0, 0), (1, 0), (1, 1), (0, 1)] (
+                interpolation = "vertex"
+            )
+            uniform token subdivisionScheme = "none"
+            double3 xformOp:translate = (0.607, -1.719, 1.085)
+            float3 xformOp:rotateXYZ = (-19.9, -30.6, 21.2)
+            float3 xformOp:scale = (0.984, 0.984, 0.984)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
+            rel material:binding = </World/Looks/Leaf>
+        }
+
+        def Mesh "Card12" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            uniform bool doubleSided = 1
+            int[] faceVertexCounts = [4]
+            int[] faceVertexIndices = [0, 1, 2, 3]
+            point3f[] points = [(-0.5, -0.5, 0), (0.5, -0.5, 0), (0.5, 0.5, 0), (-0.5, 0.5, 0)]
+            texCoord2f[] primvars:st = [(0, 0), (1, 0), (1, 1), (0, 1)] (
+                interpolation = "vertex"
+            )
+            uniform token subdivisionScheme = "none"
+            double3 xformOp:translate = (-1.334, -0.909, 0.965)
+            float3 xformOp:rotateXYZ = (22.3, -33.6, 161.7)
+            float3 xformOp:scale = (0.875, 0.875, 0.875)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
+            rel material:binding = </World/Looks/Leaf>
+        }
+
+        def Mesh "Card13" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            uniform bool doubleSided = 1
+            int[] faceVertexCounts = [4]
+            int[] faceVertexIndices = [0, 1, 2, 3]
+            point3f[] points = [(-0.5, -0.5, 0), (0.5, -0.5, 0), (0.5, 0.5, 0), (-0.5, 0.5, 0)]
+            texCoord2f[] primvars:st = [(0, 0), (1, 0), (1, 1), (0, 1)] (
+                interpolation = "vertex"
+            )
+            uniform token subdivisionScheme = "none"
+            double3 xformOp:translate = (1.380, 1.149, 1.769)
+            float3 xformOp:rotateXYZ = (-13.3, -6.8, 129.2)
+            float3 xformOp:scale = (1.042, 1.042, 1.042)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
+            rel material:binding = </World/Looks/Leaf>
+        }
+
+        def Mesh "Card14" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            uniform bool doubleSided = 1
+            int[] faceVertexCounts = [4]
+            int[] faceVertexIndices = [0, 1, 2, 3]
+            point3f[] points = [(-0.5, -0.5, 0), (0.5, -0.5, 0), (0.5, 0.5, 0), (-0.5, 0.5, 0)]
+            texCoord2f[] primvars:st = [(0, 0), (1, 0), (1, 1), (0, 1)] (
+                interpolation = "vertex"
+            )
+            uniform token subdivisionScheme = "none"
+            double3 xformOp:translate = (1.648, -1.257, 0.600)
+            float3 xformOp:rotateXYZ = (-16.1, -21.3, 174.6)
+            float3 xformOp:scale = (0.895, 0.895, 0.895)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
+            rel material:binding = </World/Looks/Leaf>
+        }
+
+        def Mesh "Card15" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            uniform bool doubleSided = 1
+            int[] faceVertexCounts = [4]
+            int[] faceVertexIndices = [0, 1, 2, 3]
+            point3f[] points = [(-0.5, -0.5, 0), (0.5, -0.5, 0), (0.5, 0.5, 0), (-0.5, 0.5, 0)]
+            texCoord2f[] primvars:st = [(0, 0), (1, 0), (1, 1), (0, 1)] (
+                interpolation = "vertex"
+            )
+            uniform token subdivisionScheme = "none"
+            double3 xformOp:translate = (-0.854, -1.785, 1.012)
+            float3 xformOp:rotateXYZ = (-7.8, 5.3, 343.1)
+            float3 xformOp:scale = (0.945, 0.945, 0.945)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
+            rel material:binding = </World/Looks/Leaf>
+        }
+
+        def Mesh "Card16" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            uniform bool doubleSided = 1
+            int[] faceVertexCounts = [4]
+            int[] faceVertexIndices = [0, 1, 2, 3]
+            point3f[] points = [(-0.5, -0.5, 0), (0.5, -0.5, 0), (0.5, 0.5, 0), (-0.5, 0.5, 0)]
+            texCoord2f[] primvars:st = [(0, 0), (1, 0), (1, 1), (0, 1)] (
+                interpolation = "vertex"
+            )
+            uniform token subdivisionScheme = "none"
+            double3 xformOp:translate = (0.056, 0.423, 1.450)
+            float3 xformOp:rotateXYZ = (-26.8, 32.0, 280.8)
+            float3 xformOp:scale = (1.037, 1.037, 1.037)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
+            rel material:binding = </World/Looks/Leaf>
+        }
+
+        def Mesh "Card17" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            uniform bool doubleSided = 1
+            int[] faceVertexCounts = [4]
+            int[] faceVertexIndices = [0, 1, 2, 3]
+            point3f[] points = [(-0.5, -0.5, 0), (0.5, -0.5, 0), (0.5, 0.5, 0), (-0.5, 0.5, 0)]
+            texCoord2f[] primvars:st = [(0, 0), (1, 0), (1, 1), (0, 1)] (
+                interpolation = "vertex"
+            )
+            uniform token subdivisionScheme = "none"
+            double3 xformOp:translate = (1.072, -0.387, 0.978)
+            float3 xformOp:rotateXYZ = (-23.8, 10.7, 22.4)
+            float3 xformOp:scale = (0.634, 0.634, 0.634)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
+            rel material:binding = </World/Looks/Leaf>
+        }
+
+        def Mesh "Card18" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            uniform bool doubleSided = 1
+            int[] faceVertexCounts = [4]
+            int[] faceVertexIndices = [0, 1, 2, 3]
+            point3f[] points = [(-0.5, -0.5, 0), (0.5, -0.5, 0), (0.5, 0.5, 0), (-0.5, 0.5, 0)]
+            texCoord2f[] primvars:st = [(0, 0), (1, 0), (1, 1), (0, 1)] (
+                interpolation = "vertex"
+            )
+            uniform token subdivisionScheme = "none"
+            double3 xformOp:translate = (-1.048, -1.216, 0.878)
+            float3 xformOp:rotateXYZ = (-26.8, -40.0, 54.5)
+            float3 xformOp:scale = (0.651, 0.651, 0.651)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
+            rel material:binding = </World/Looks/Leaf>
+        }
+
+        def Mesh "Card19" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            uniform bool doubleSided = 1
+            int[] faceVertexCounts = [4]
+            int[] faceVertexIndices = [0, 1, 2, 3]
+            point3f[] points = [(-0.5, -0.5, 0), (0.5, -0.5, 0), (0.5, 0.5, 0), (-0.5, 0.5, 0)]
+            texCoord2f[] primvars:st = [(0, 0), (1, 0), (1, 1), (0, 1)] (
+                interpolation = "vertex"
+            )
+            uniform token subdivisionScheme = "none"
+            double3 xformOp:translate = (-0.491, -1.708, 1.786)
+            float3 xformOp:rotateXYZ = (6.8, -28.1, 90.8)
+            float3 xformOp:scale = (0.774, 0.774, 0.774)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
+            rel material:binding = </World/Looks/Leaf>
+        }
+
+        def Mesh "Card20" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            uniform bool doubleSided = 1
+            int[] faceVertexCounts = [4]
+            int[] faceVertexIndices = [0, 1, 2, 3]
+            point3f[] points = [(-0.5, -0.5, 0), (0.5, -0.5, 0), (0.5, 0.5, 0), (-0.5, 0.5, 0)]
+            texCoord2f[] primvars:st = [(0, 0), (1, 0), (1, 1), (0, 1)] (
+                interpolation = "vertex"
+            )
+            uniform token subdivisionScheme = "none"
+            double3 xformOp:translate = (-0.489, -1.358, 1.743)
+            float3 xformOp:rotateXYZ = (29.6, -2.7, 174.2)
+            float3 xformOp:scale = (0.643, 0.643, 0.643)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
+            rel material:binding = </World/Looks/Leaf>
+        }
+
+        def Mesh "Card21" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            uniform bool doubleSided = 1
+            int[] faceVertexCounts = [4]
+            int[] faceVertexIndices = [0, 1, 2, 3]
+            point3f[] points = [(-0.5, -0.5, 0), (0.5, -0.5, 0), (0.5, 0.5, 0), (-0.5, 0.5, 0)]
+            texCoord2f[] primvars:st = [(0, 0), (1, 0), (1, 1), (0, 1)] (
+                interpolation = "vertex"
+            )
+            uniform token subdivisionScheme = "none"
+            double3 xformOp:translate = (-1.432, -0.567, 0.750)
+            float3 xformOp:rotateXYZ = (19.7, -27.1, 8.3)
+            float3 xformOp:scale = (1.075, 1.075, 1.075)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
+            rel material:binding = </World/Looks/Leaf>
+        }
+
+        def Mesh "Card22" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            uniform bool doubleSided = 1
+            int[] faceVertexCounts = [4]
+            int[] faceVertexIndices = [0, 1, 2, 3]
+            point3f[] points = [(-0.5, -0.5, 0), (0.5, -0.5, 0), (0.5, 0.5, 0), (-0.5, 0.5, 0)]
+            texCoord2f[] primvars:st = [(0, 0), (1, 0), (1, 1), (0, 1)] (
+                interpolation = "vertex"
+            )
+            uniform token subdivisionScheme = "none"
+            double3 xformOp:translate = (0.102, -1.272, 1.223)
+            float3 xformOp:rotateXYZ = (-28.4, 2.2, 352.3)
+            float3 xformOp:scale = (1.032, 1.032, 1.032)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
+            rel material:binding = </World/Looks/Leaf>
+        }
+
+        def Mesh "Card23" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            uniform bool doubleSided = 1
+            int[] faceVertexCounts = [4]
+            int[] faceVertexIndices = [0, 1, 2, 3]
+            point3f[] points = [(-0.5, -0.5, 0), (0.5, -0.5, 0), (0.5, 0.5, 0), (-0.5, 0.5, 0)]
+            texCoord2f[] primvars:st = [(0, 0), (1, 0), (1, 1), (0, 1)] (
+                interpolation = "vertex"
+            )
+            uniform token subdivisionScheme = "none"
+            double3 xformOp:translate = (0.706, -0.860, 0.923)
+            float3 xformOp:rotateXYZ = (-20.0, 21.8, 191.7)
+            float3 xformOp:scale = (0.990, 0.990, 0.990)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
+            rel material:binding = </World/Looks/Leaf>
+        }
+
+        def Mesh "Card24" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            uniform bool doubleSided = 1
+            int[] faceVertexCounts = [4]
+            int[] faceVertexIndices = [0, 1, 2, 3]
+            point3f[] points = [(-0.5, -0.5, 0), (0.5, -0.5, 0), (0.5, 0.5, 0), (-0.5, 0.5, 0)]
+            texCoord2f[] primvars:st = [(0, 0), (1, 0), (1, 1), (0, 1)] (
+                interpolation = "vertex"
+            )
+            uniform token subdivisionScheme = "none"
+            double3 xformOp:translate = (-0.613, -0.997, 1.680)
+            float3 xformOp:rotateXYZ = (29.1, 28.2, 290.2)
+            float3 xformOp:scale = (1.009, 1.009, 1.009)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
+            rel material:binding = </World/Looks/Leaf>
+        }
+
+        def Mesh "Card25" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            uniform bool doubleSided = 1
+            int[] faceVertexCounts = [4]
+            int[] faceVertexIndices = [0, 1, 2, 3]
+            point3f[] points = [(-0.5, -0.5, 0), (0.5, -0.5, 0), (0.5, 0.5, 0), (-0.5, 0.5, 0)]
+            texCoord2f[] primvars:st = [(0, 0), (1, 0), (1, 1), (0, 1)] (
+                interpolation = "vertex"
+            )
+            uniform token subdivisionScheme = "none"
+            double3 xformOp:translate = (0.864, -0.984, 1.180)
+            float3 xformOp:rotateXYZ = (-8.7, -37.7, 10.1)
+            float3 xformOp:scale = (0.740, 0.740, 0.740)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
+            rel material:binding = </World/Looks/Leaf>
+        }
+
+        def Mesh "Card26" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            uniform bool doubleSided = 1
+            int[] faceVertexCounts = [4]
+            int[] faceVertexIndices = [0, 1, 2, 3]
+            point3f[] points = [(-0.5, -0.5, 0), (0.5, -0.5, 0), (0.5, 0.5, 0), (-0.5, 0.5, 0)]
+            texCoord2f[] primvars:st = [(0, 0), (1, 0), (1, 1), (0, 1)] (
+                interpolation = "vertex"
+            )
+            uniform token subdivisionScheme = "none"
+            double3 xformOp:translate = (-0.867, 0.693, 1.926)
+            float3 xformOp:rotateXYZ = (-3.2, 35.0, 355.7)
+            float3 xformOp:scale = (1.078, 1.078, 1.078)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
+            rel material:binding = </World/Looks/Leaf>
+        }
+
+        def Mesh "Card27" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            uniform bool doubleSided = 1
+            int[] faceVertexCounts = [4]
+            int[] faceVertexIndices = [0, 1, 2, 3]
+            point3f[] points = [(-0.5, -0.5, 0), (0.5, -0.5, 0), (0.5, 0.5, 0), (-0.5, 0.5, 0)]
+            texCoord2f[] primvars:st = [(0, 0), (1, 0), (1, 1), (0, 1)] (
+                interpolation = "vertex"
+            )
+            uniform token subdivisionScheme = "none"
+            double3 xformOp:translate = (-0.487, -1.006, 0.686)
+            float3 xformOp:rotateXYZ = (-18.2, -23.7, 224.7)
+            float3 xformOp:scale = (1.050, 1.050, 1.050)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
+            rel material:binding = </World/Looks/Leaf>
+        }
+
+        def Mesh "Card28" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            uniform bool doubleSided = 1
+            int[] faceVertexCounts = [4]
+            int[] faceVertexIndices = [0, 1, 2, 3]
+            point3f[] points = [(-0.5, -0.5, 0), (0.5, -0.5, 0), (0.5, 0.5, 0), (-0.5, 0.5, 0)]
+            texCoord2f[] primvars:st = [(0, 0), (1, 0), (1, 1), (0, 1)] (
+                interpolation = "vertex"
+            )
+            uniform token subdivisionScheme = "none"
+            double3 xformOp:translate = (1.226, -0.074, 1.410)
+            float3 xformOp:rotateXYZ = (18.0, -33.2, 237.8)
+            float3 xformOp:scale = (1.055, 1.055, 1.055)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
+            rel material:binding = </World/Looks/Leaf>
+        }
+
+        def Mesh "Card29" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            uniform bool doubleSided = 1
+            int[] faceVertexCounts = [4]
+            int[] faceVertexIndices = [0, 1, 2, 3]
+            point3f[] points = [(-0.5, -0.5, 0), (0.5, -0.5, 0), (0.5, 0.5, 0), (-0.5, 0.5, 0)]
+            texCoord2f[] primvars:st = [(0, 0), (1, 0), (1, 1), (0, 1)] (
+                interpolation = "vertex"
+            )
+            uniform token subdivisionScheme = "none"
+            double3 xformOp:translate = (1.016, 0.901, 1.113)
+            float3 xformOp:rotateXYZ = (-19.3, 23.1, 119.7)
+            float3 xformOp:scale = (1.000, 1.000, 1.000)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
+            rel material:binding = </World/Looks/Leaf>
+        }
+
+        def Mesh "Card30" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            uniform bool doubleSided = 1
+            int[] faceVertexCounts = [4]
+            int[] faceVertexIndices = [0, 1, 2, 3]
+            point3f[] points = [(-0.5, -0.5, 0), (0.5, -0.5, 0), (0.5, 0.5, 0), (-0.5, 0.5, 0)]
+            texCoord2f[] primvars:st = [(0, 0), (1, 0), (1, 1), (0, 1)] (
+                interpolation = "vertex"
+            )
+            uniform token subdivisionScheme = "none"
+            double3 xformOp:translate = (1.698, -0.375, 0.982)
+            float3 xformOp:rotateXYZ = (26.8, 18.0, 61.2)
+            float3 xformOp:scale = (0.664, 0.664, 0.664)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
+            rel material:binding = </World/Looks/Leaf>
+        }
+
+        def Mesh "Card31" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            uniform bool doubleSided = 1
+            int[] faceVertexCounts = [4]
+            int[] faceVertexIndices = [0, 1, 2, 3]
+            point3f[] points = [(-0.5, -0.5, 0), (0.5, -0.5, 0), (0.5, 0.5, 0), (-0.5, 0.5, 0)]
+            texCoord2f[] primvars:st = [(0, 0), (1, 0), (1, 1), (0, 1)] (
+                interpolation = "vertex"
+            )
+            uniform token subdivisionScheme = "none"
+            double3 xformOp:translate = (-1.256, 1.457, 1.671)
+            float3 xformOp:rotateXYZ = (-21.2, 26.1, 352.9)
+            float3 xformOp:scale = (0.929, 0.929, 0.929)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
+            rel material:binding = </World/Looks/Leaf>
+        }
+
+        def Mesh "Card32" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            uniform bool doubleSided = 1
+            int[] faceVertexCounts = [4]
+            int[] faceVertexIndices = [0, 1, 2, 3]
+            point3f[] points = [(-0.5, -0.5, 0), (0.5, -0.5, 0), (0.5, 0.5, 0), (-0.5, 0.5, 0)]
+            texCoord2f[] primvars:st = [(0, 0), (1, 0), (1, 1), (0, 1)] (
+                interpolation = "vertex"
+            )
+            uniform token subdivisionScheme = "none"
+            double3 xformOp:translate = (-0.539, 0.175, 0.523)
+            float3 xformOp:rotateXYZ = (-29.1, 37.7, 233.9)
+            float3 xformOp:scale = (0.863, 0.863, 0.863)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
+            rel material:binding = </World/Looks/Leaf>
+        }
+
+        def Mesh "Card33" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            uniform bool doubleSided = 1
+            int[] faceVertexCounts = [4]
+            int[] faceVertexIndices = [0, 1, 2, 3]
+            point3f[] points = [(-0.5, -0.5, 0), (0.5, -0.5, 0), (0.5, 0.5, 0), (-0.5, 0.5, 0)]
+            texCoord2f[] primvars:st = [(0, 0), (1, 0), (1, 1), (0, 1)] (
+                interpolation = "vertex"
+            )
+            uniform token subdivisionScheme = "none"
+            double3 xformOp:translate = (1.561, -0.238, 1.782)
+            float3 xformOp:rotateXYZ = (19.6, -23.1, 90.7)
+            float3 xformOp:scale = (0.746, 0.746, 0.746)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
+            rel material:binding = </World/Looks/Leaf>
+        }
+
+        def Mesh "Card34" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            uniform bool doubleSided = 1
+            int[] faceVertexCounts = [4]
+            int[] faceVertexIndices = [0, 1, 2, 3]
+            point3f[] points = [(-0.5, -0.5, 0), (0.5, -0.5, 0), (0.5, 0.5, 0), (-0.5, 0.5, 0)]
+            texCoord2f[] primvars:st = [(0, 0), (1, 0), (1, 1), (0, 1)] (
+                interpolation = "vertex"
+            )
+            uniform token subdivisionScheme = "none"
+            double3 xformOp:translate = (-0.934, 0.311, 0.741)
+            float3 xformOp:rotateXYZ = (-4.9, -29.5, 327.6)
+            float3 xformOp:scale = (0.777, 0.777, 0.777)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
+            rel material:binding = </World/Looks/Leaf>
+        }
+
+        def Mesh "Card35" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            uniform bool doubleSided = 1
+            int[] faceVertexCounts = [4]
+            int[] faceVertexIndices = [0, 1, 2, 3]
+            point3f[] points = [(-0.5, -0.5, 0), (0.5, -0.5, 0), (0.5, 0.5, 0), (-0.5, 0.5, 0)]
+            texCoord2f[] primvars:st = [(0, 0), (1, 0), (1, 1), (0, 1)] (
+                interpolation = "vertex"
+            )
+            uniform token subdivisionScheme = "none"
+            double3 xformOp:translate = (-0.151, 0.300, 1.837)
+            float3 xformOp:rotateXYZ = (-4.8, 33.4, 180.6)
+            float3 xformOp:scale = (0.866, 0.866, 0.866)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
+            rel material:binding = </World/Looks/Leaf>
+        }
+
+        def Mesh "Card36" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            uniform bool doubleSided = 1
+            int[] faceVertexCounts = [4]
+            int[] faceVertexIndices = [0, 1, 2, 3]
+            point3f[] points = [(-0.5, -0.5, 0), (0.5, -0.5, 0), (0.5, 0.5, 0), (-0.5, 0.5, 0)]
+            texCoord2f[] primvars:st = [(0, 0), (1, 0), (1, 1), (0, 1)] (
+                interpolation = "vertex"
+            )
+            uniform token subdivisionScheme = "none"
+            double3 xformOp:translate = (0.085, -1.733, 1.048)
+            float3 xformOp:rotateXYZ = (-19.0, -39.7, 287.7)
+            float3 xformOp:scale = (0.686, 0.686, 0.686)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
+            rel material:binding = </World/Looks/Leaf>
+        }
+
+        def Mesh "Card37" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            uniform bool doubleSided = 1
+            int[] faceVertexCounts = [4]
+            int[] faceVertexIndices = [0, 1, 2, 3]
+            point3f[] points = [(-0.5, -0.5, 0), (0.5, -0.5, 0), (0.5, 0.5, 0), (-0.5, 0.5, 0)]
+            texCoord2f[] primvars:st = [(0, 0), (1, 0), (1, 1), (0, 1)] (
+                interpolation = "vertex"
+            )
+            uniform token subdivisionScheme = "none"
+            double3 xformOp:translate = (-0.095, 0.811, 1.246)
+            float3 xformOp:rotateXYZ = (-10.4, 1.5, 200.0)
+            float3 xformOp:scale = (0.992, 0.992, 0.992)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
+            rel material:binding = </World/Looks/Leaf>
+        }
+
+        def Mesh "Card38" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            uniform bool doubleSided = 1
+            int[] faceVertexCounts = [4]
+            int[] faceVertexIndices = [0, 1, 2, 3]
+            point3f[] points = [(-0.5, -0.5, 0), (0.5, -0.5, 0), (0.5, 0.5, 0), (-0.5, 0.5, 0)]
+            texCoord2f[] primvars:st = [(0, 0), (1, 0), (1, 1), (0, 1)] (
+                interpolation = "vertex"
+            )
+            uniform token subdivisionScheme = "none"
+            double3 xformOp:translate = (-1.418, 0.217, 0.722)
+            float3 xformOp:rotateXYZ = (-13.4, 21.8, 182.8)
+            float3 xformOp:scale = (0.881, 0.881, 0.881)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
+            rel material:binding = </World/Looks/Leaf>
+        }
+
+        def Mesh "Card39" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            uniform bool doubleSided = 1
+            int[] faceVertexCounts = [4]
+            int[] faceVertexIndices = [0, 1, 2, 3]
+            point3f[] points = [(-0.5, -0.5, 0), (0.5, -0.5, 0), (0.5, 0.5, 0), (-0.5, 0.5, 0)]
+            texCoord2f[] primvars:st = [(0, 0), (1, 0), (1, 1), (0, 1)] (
+                interpolation = "vertex"
+            )
+            uniform token subdivisionScheme = "none"
+            double3 xformOp:translate = (0.936, 1.485, 1.054)
+            float3 xformOp:rotateXYZ = (6.8, 0.4, 184.4)
+            float3 xformOp:scale = (0.946, 0.946, 0.946)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
+            rel material:binding = </World/Looks/Leaf>
+        }
+    }
+
+    def Scope "Looks"
+    {
+        def Material "Wall"
+        {
+            token outputs:mtlx:surface.connect = </World/Looks/Wall/Surface.outputs:out>
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_open_pbr_surface_surfaceshader"
+                color3f inputs:base_color = (0.8, 0.78, 0.75)
+                float inputs:specular_weight = 0
+                token outputs:out
+            }
+        }
+
+        def Material "Leaf"
+        {
+            token outputs:mtlx:surface.connect = </World/Looks/Leaf/Surface.outputs:out>
+
+            def Shader "Color"
+            {
+                uniform token info:id = "ND_image_color3"
+                asset inputs:file = @./foliage/leaf_color.png@
+                color3f outputs:out
+            }
+
+            def Shader "Mask"
+            {
+                uniform token info:id = "ND_image_float"
+                asset inputs:file = @./foliage/leaf_mask.png@
+                float outputs:out
+            }
+
+            def Shader "Roughness"
+            {
+                uniform token info:id = "ND_image_float"
+                asset inputs:file = @../../obj/roughness.png@
+                float outputs:out
+            }
+
+            def Shader "NormalImage"
+            {
+                uniform token info:id = "ND_image_vector3"
+                asset inputs:file = @../../obj/normal.png@
+                float3 outputs:out
+            }
+
+            def Shader "Normal"
+            {
+                uniform token info:id = "ND_normalmap_float"
+                float3 inputs:in.connect = </World/Looks/Leaf/NormalImage.outputs:out>
+                float3 outputs:out
+            }
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_open_pbr_surface_surfaceshader"
+                color3f inputs:base_color.connect = </World/Looks/Leaf/Color.outputs:out>
+                float inputs:specular_roughness.connect = </World/Looks/Leaf/Roughness.outputs:out>
+                float inputs:geometry_opacity.connect = </World/Looks/Leaf/Mask.outputs:out>
+                float3 inputs:geometry_normal.connect = </World/Looks/Leaf/Normal.outputs:out>
+                bool inputs:geometry_thin_walled = 1
+                token outputs:out
+            }
+        }
+    }
+
+    def SphereLight "Sun"
+    {
+        float inputs:radius = 0.25
+        float inputs:intensity = 600
+        double3 xformOp:translate = (2.5, 3, 6)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+
+    def DomeLight "Sky"
+    {
+        color3f inputs:color = (0.6, 0.7, 1)
+        float inputs:intensity = 0.15
+    }
+
+    def Camera "Camera"
+    {
+        float focalLength = 30
+        float horizontalAperture = 36
+        float verticalAperture = 36
+        float2 clippingRange = (0.1, 100)
+        double3 xformOp:translate = (0, 0, 7)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+}

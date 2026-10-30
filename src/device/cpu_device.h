@@ -9,11 +9,12 @@
 namespace prism::device {
 
 struct LightTable;
+class OpaqueOccluders;
 
 // Per-scene state of the CPU device, rebuilt when the scene changes.
 struct CpuSceneState {
-    // Every material of the scene always blocks shadow rays.
-    bool opaque = false;
+    // The primitives that always block shadow rays.
+    std::shared_ptr<const OpaqueOccluders> occluders;
     // Back faces of single-sided geometry are culled (SceneManager::cullsBackFaces).
     bool culling = false;
     std::shared_ptr<const LightTable> lights;

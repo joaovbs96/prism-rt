@@ -3,10 +3,8 @@
 
 #include "cpu_device.h"
 #include "cpu_backend.h"
-#include "../batched_spheres.h"
+#include "opaque_occluders.h"
 #include "../color/color_management.h"
-#include "../hydra/fallback_material.h"
-#include "../mdl_material.h"
 
 #include "../rng.h"
 #include "../scene.h"
@@ -19,7 +17,6 @@
 #include <algorithm>
 #include <chrono>
 #include <thread>
-#include <unordered_set>
 
 namespace prism::device {
 
@@ -42,47 +39,6 @@ struct WorkCounter {
     }
 };
 
-// A material whose cutout opacity is 1 everywhere: shadow rays stop at it.
-bool AlwaysBlocks(Material* material)
-{
-    if (!material) return true;
-    if (auto* mdl = dynamic_cast<MDLMaterial*>(material)) {
-        const auto cutout = mdl->constant_cutout();
-        return !mdl->is_valid() || (cutout && *cutout >= 1.0f);
-    }
-    if (auto* fallback = dynamic_cast<prism::hydra::FallbackMaterial*>(material))
-        return fallback->provenOpaque();
-    return true; // Material::cutoutOpacity is 1
-}
-
-bool AllMaterialsBlock(SceneManager& scene)
-{
-    std::unordered_set<Material*> checked;
-    auto blocks = [&](Material* material) {
-        return !checked.insert(material).second || AlwaysBlocks(material);
-    };
-    for (auto const& [id, geometry] : scene.geometry) {
-        if (auto binding = scene.placement_materials.find(id); binding != scene.placement_materials.end()) {
-            if (!blocks(binding->second.fallback)) return false;
-            for (auto const& [primitive, material] : binding->second.triangles)
-                if (!blocks(material)) return false;
-        }
-        if (auto* mesh = dynamic_cast<Mesh*>(geometry)) {
-            if (!blocks(mesh->material_override)) return false;
-            for (auto const& [index, material] : mesh->materials)
-                if (!blocks(material)) return false;
-        } else if (auto* sphere = dynamic_cast<Sphere*>(geometry)) {
-            if (!blocks(sphere->material)) return false;
-        } else if (auto* batch = dynamic_cast<BatchedSpheres*>(geometry)) {
-            for (auto const& entry : batch->entries)
-                if (!blocks(entry.material)) return false;
-        } else {
-            return false; // unknown geometry: keep the general shadow loop
-        }
-    }
-    return true;
-}
-
 // One sample of the shared path tracer; seed carries the pixel's random state.
 // The sampler's sequence is indexed by `sample`, scrambled per pixel.
 SampleResult TraceSample(SceneManager& scene, CpuSceneState const& state, CameraParams const& camera,
@@ -93,7 +49,7 @@ SampleResult TraceSample(SceneManager& scene, CpuSceneState const& state, Camera
     CpuPathTracer tracer;
     tracer.aovs = lightAovs;
     tracer.backend.scene = &scene;
-    tracer.backend.opaqueScene = state.opaque;
+    tracer.backend.occluders = state.occluders.get();
     tracer.backend.lights = state.lights.get();
     tracer.backend.lobes = state.lights && state.lights->lobes;
     tracer.backend.culling = state.culling;
@@ -134,13 +90,10 @@ std::shared_ptr<const CpuSceneState> CpuDevice::PreparedScene(SceneManager& scen
     std::lock_guard lock(m_stateMutex);
     if (m_stateOf != &scene || !m_state) {
         auto state = std::make_shared<CpuSceneState>();
-        // Shadow links let some surfaces pass some lights: every shadow
-        // ray then takes the per-hit path.
-        bool shadowLinks = false;
-        for (auto const& light : scene.lights) shadowLinks |= light.shadowLinkBit != 0u;
         state->culling = scene.cullsBackFaces();
-        // Culled back faces let shadow rays through: they take the per-hit path.
-        state->opaque = !(scene.lightLinking && shadowLinks) && !state->culling && AllMaterialsBlock(scene);
+        // Cutouts, shadow links and culled back faces let shadow rays
+        // through some primitives: OpaqueOccluders tells them apart.
+        state->occluders = std::make_shared<const OpaqueOccluders>(OpaqueOccluders::Build(scene, state->culling));
         state->lights = std::make_shared<LightTable>(BuildLightTable(scene));
         m_state = std::move(state);
         m_stateOf = &scene;
