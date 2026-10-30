@@ -1270,6 +1270,13 @@ called done there.
   - Check on the Mac: the build compiles the kernel (`prism_gpu_shader_compile_test`);
     `ctest -R render_profile`; a CPU render with `PRISM_RENDER_PROFILE=1`
     prints the table and is bit-identical to one without.
+- **Parallel adaptive convergence checks** (written on Windows, the Metal
+  device unbuilt): `ActivePixels::Update` (`src/device/adaptive_sampling.h`,
+  which `GpuRenderDevice::RenderImage` and the progressive engine also call)
+  runs its two passes over rows with oneTBB; the flags and count are those
+  of the serial scan. Check on the Mac: an adaptive CLI render on
+  `--device metal` (`--adaptive-threshold 0.02`) bit-identical to the
+  previous build's, and `ctest -R adaptive_publication`.
 
 ## Diagnostics
 

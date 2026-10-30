@@ -8,6 +8,10 @@
 // converged pixel never becomes active again, so every active pixel has the
 // same sample count (and sampler index).
 
+#include <tbb/blocked_range.h>
+#include <tbb/parallel_for.h>
+#include <tbb/parallel_reduce.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -72,25 +76,37 @@ public:
     uint8_t const* Mask() const { return m_active.data(); }
 
     // Deactivates converged pixels; error(pixel) is evaluated for active
-    // pixels only. Returns the number of pixels still active.
+    // pixels only (from several threads: it must only read). Returns the
+    // number of pixels still active. Rows run in parallel: the first pass
+    // reads only the flags before the update, the second only the first's
+    // results and each pixel's own flag, so the flags and the (integer)
+    // count are those of a serial scan.
     template <typename Error>
     size_t Update(float threshold, Error&& error)
     {
         std::vector<uint8_t> unconverged(m_active.size(), 0);
-        for (size_t p = 0; p < m_active.size(); ++p)
-            unconverged[p] = m_active[p] && !(error(p) < threshold);
-        m_count = 0;
-        for (unsigned y = 0; y < m_height; ++y)
-            for (unsigned x = 0; x < m_width; ++x) {
-                const size_t p = size_t(y) * m_width + x;
-                if (!m_active[p]) continue;
-                bool keep = false;
-                for (unsigned ny = y > 0 ? y - 1 : 0; !keep && ny <= std::min(y + 1, m_height - 1); ++ny)
-                    for (unsigned nx = x > 0 ? x - 1 : 0; !keep && nx <= std::min(x + 1, m_width - 1); ++nx)
-                        keep = unconverged[size_t(ny) * m_width + nx] != 0;
-                m_active[p] = keep;
-                m_count += keep;
-            }
+        const tbb::blocked_range<unsigned> rows(0, m_height);
+        tbb::parallel_for(rows, [&](tbb::blocked_range<unsigned> const& range) {
+            for (unsigned y = range.begin(); y != range.end(); ++y)
+                for (size_t p = size_t(y) * m_width, end = p + m_width; p < end; ++p)
+                    unconverged[p] = m_active[p] && !(error(p) < threshold);
+        });
+        m_count = tbb::parallel_reduce(rows, size_t(0),
+            [&](tbb::blocked_range<unsigned> const& range, size_t count) {
+                for (unsigned y = range.begin(); y != range.end(); ++y)
+                    for (unsigned x = 0; x < m_width; ++x) {
+                        const size_t p = size_t(y) * m_width + x;
+                        if (!m_active[p]) continue;
+                        bool keep = false;
+                        for (unsigned ny = y > 0 ? y - 1 : 0; !keep && ny <= std::min(y + 1, m_height - 1); ++ny)
+                            for (unsigned nx = x > 0 ? x - 1 : 0; !keep && nx <= std::min(x + 1, m_width - 1); ++nx)
+                                keep = unconverged[size_t(ny) * m_width + nx] != 0;
+                        m_active[p] = keep;
+                        count += keep;
+                    }
+                return count;
+            },
+            [](size_t a, size_t b) { return a + b; });
         return m_count;
     }
 
