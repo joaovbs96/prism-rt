@@ -834,6 +834,13 @@ if(PRISM_BUILD_HYDRA)
     add_test(NAME prism_mdl_texture_target_test COMMAND prism_mdl_texture_target_test)
     set_tests_properties(prism_mdl_texture_target_test PROPERTIES ENVIRONMENT "${_prism_test_environment}")
 
+    # MDL compiler messages: unused-code warnings are verbose only, each
+    # message prints once, published textures resolve without C295.
+    add_executable(prism_mdl_messages_test tests/mdl_messages.cpp)
+    target_link_libraries(prism_mdl_messages_test PRIVATE PrismRT::core)
+    add_test(NAME prism_mdl_messages_test COMMAND prism_mdl_messages_test)
+    set_tests_properties(prism_mdl_messages_test PROPERTIES ENVIRONMENT "${_prism_test_environment}")
+
     add_executable(prism_texture_service_test tests/texture_service.cpp)
     target_link_libraries(prism_texture_service_test PRIVATE PrismRT::core)
     add_test(NAME prism_texture_service_test COMMAND prism_texture_service_test)

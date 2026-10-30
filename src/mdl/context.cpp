@@ -1,6 +1,7 @@
 #include "context.h"
 #include "../renderer/logger.h"
 #include "backend_compiler.h"
+#include "messages.h"
 
 #include <format>
 #include <iostream>
@@ -42,7 +43,7 @@ private:
         const std::string_view text = message ? message : "";
         if (!VerboseMdl()) {
             if (level > mi::base::MESSAGE_SEVERITY_WARNING) return;
-            if (text.find("C183 unused parameter") != std::string_view::npos) return;
+            if (IsUnusedCodeMessage(text)) return;
         }
         if (VerboseMdl() && category && *category)
             std::cerr << '[' << category << "] ";

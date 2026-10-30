@@ -1,4 +1,5 @@
 #include "material_compiler.h"
+#include "messages.h"
 #include "../renderer/logger.h"
 
 #include <cstdint>
@@ -173,9 +174,15 @@ void MaterialCompiler::print_context_messages(mi::neuraylib::IMdl_execution_cont
     for (mi::Size i = 0; i < context->get_messages_count(); ++i) {
         mi::base::Handle<const mi::neuraylib::IMessage> msg(context->get_message(i));
         const std::string_view text = msg->get_string() ? msg->get_string() : "";
+        // The SDK has already sent the MDL core compiler's errors and
+        // warnings to the receiving logger (src/mdl/context.cpp: "warn : ..."
+        // in category MDLC:COMPILER), which prints them; print each message
+        // once. (Its infos, such as "Loading module", only reach the context.)
+        if (msg->get_kind() == mi::neuraylib::IMessage::MSG_COMPILER_CORE &&
+            msg->get_severity() <= mi::base::MESSAGE_SEVERITY_WARNING) continue;
         if (!verbose_mdl()) {
             if (msg->get_severity() > mi::base::MESSAGE_SEVERITY_WARNING) continue;
-            if (text.find("C183 unused parameter") != std::string_view::npos) continue;
+            if (IsUnusedCodeMessage(text)) continue;
         }
         
         const char* severity_str = "INFO";
@@ -580,6 +587,14 @@ CompiledMaterial MaterialCompiler::compile(const GeneratedMDL& generated_mdl,
             if (m_ctx.add_resource_path(doc_dir.string())) {
                 if (verbose_mdl()) std::cout << "[OK] Added document resource path: " << doc_dir.string() << "\n";
             }
+            // MDL resolves an absolute MDL file path ("/<hash>.exr", a
+            // texture published next to the document in the material cache)
+            // against the MDL search paths; finding it only through the
+            // resource paths is deprecated (C295). Register the directory as
+            // an MDL search path too when the module refers to such paths.
+            if (HasSearchPathTexture(generated_mdl.texture_paths) &&
+                m_ctx.add_mdl_path(doc_dir.string()) && verbose_mdl())
+                std::cout << "[OK] Added document MDL path: " << doc_dir.string() << "\n";
         }
     }
 
