@@ -206,6 +206,29 @@ bool IsUniformExpression(const mi::neuraylib::IExpression* expression,
     }
 }
 
+// Whether the functions of a second group of a material read their
+// arguments from the same argument block as the first group's, or from an
+// identical one (same layout and bytes).
+bool SameArgumentBlocks(const mi::neuraylib::ITarget_code* code,
+                        std::vector<mi::neuraylib::Target_function_description> const& first,
+                        std::vector<mi::neuraylib::Target_function_description> const& second)
+{
+    auto blockOf = [](std::vector<mi::neuraylib::Target_function_description> const& descs) {
+        mi::Size block = ~mi::Size(0);
+        for (auto const& desc : descs)
+            if (desc.argument_block_index != ~mi::Size(0)) block = desc.argument_block_index;
+        return block;
+    };
+    const mi::Size a = blockOf(first), b = blockOf(second);
+    if (b == ~mi::Size(0) || a == b) return true;
+    if (a == ~mi::Size(0) || a >= code->get_argument_block_count() || b >= code->get_argument_block_count())
+        return false;
+    mi::base::Handle<const mi::neuraylib::ITarget_argument_block> x(code->get_argument_block(a));
+    mi::base::Handle<const mi::neuraylib::ITarget_argument_block> y(code->get_argument_block(b));
+    return x && y && x->get_size() == y->get_size() &&
+        (x->get_size() == 0 || std::memcmp(x->get_data(), y->get_data(), x->get_size()) == 0);
+}
+
 // True if a type is or holds an EDF (edf, edf_component, arrays of them).
 bool ContainsEdf(const mi::neuraylib::IType* type, int depth = 0)
 {
@@ -604,7 +627,7 @@ TargetCode BackendCompiler::generate_target_code(const CompiledMaterial& compile
                                                    compiled.transaction.get());
     const std::string materialHash = std::format("{}:{}", static_cast<const void*>(&m_ctx), classHash) +
         ":native-deriv-textures-v3:mdl-" MI_NEURAYLIB_PRODUCT_VERSION_STRING
-        ":callables-init-bsdf-edf-cutout-thin-volume-displacement-v4:spaces-1:results-128";
+        ":callables-init-bsdf-edf-cutout-thin-volume-displacement-cutoutinit-v5:spaces-1:results-128";
     if (VerboseMdl())
         std::cout << "  class cache key: " << materialHash
                   << " reusable=" << compiled.allowTargetCodeReuse << "\n";
@@ -836,12 +859,34 @@ TargetCode BackendCompiler::generate_target_code(const CompiledMaterial& compile
 
     if (VerboseMdl()) std::cout << std::format("  Registering {} sub-expressions with link unit\n", descs.size());
 
+    // A cutout that varies over the surface gets its own init and function
+    // (MaterialFunctions::cutout_init_function_index), added as a second
+    // group of the same material: a second single-init group computes only
+    // what its functions read.
+    const bool cutoutGroup = cutoutExpr && !binding->constant_cutout_opacity && !uniformCutout;
+    std::vector<mi::neuraylib::Target_function_description> cutoutDescs;
+    if (cutoutGroup) {
+        cutoutDescs.push_back(mi::neuraylib::Target_function_description("init", "prism_cutout_init"));
+        cutoutDescs.push_back(mi::neuraylib::Target_function_description("geometry.cutout_opacity",
+                                                                         "prism_cutout_opacity"));
+    }
+    auto addMaterial = [&](mi::neuraylib::ILink_unit* unit) -> mi::Sint32 {
+        const mi::Sint32 added = unit->add_material(compiled.compiled_material.get(), descs.data(), descs.size(),
+                                                    context.get());
+        if (added != 0 || cutoutDescs.empty()) return added;
+        // Without it the shared init serves the cutout, as before.
+        if (unit->add_material(compiled.compiled_material.get(), cutoutDescs.data(), cutoutDescs.size(),
+                               context.get()) != 0) {
+            if (VerboseMdl()) print_context_messages(context.get());
+            cutoutDescs.clear();
+            program->functions.cutout_init_function_index = ~mi::Size(0);
+            program->functions.cutout_only_function_index = ~mi::Size(0);
+        }
+        return 0;
+    };
+
     // Add the compiled material with all sub-expressions to the link unit
-    mi::Sint32 add_result = link_unit->add_material(
-        compiled.compiled_material.get(),
-        descs.data(),
-        descs.size(),
-        context.get());
+    mi::Sint32 add_result = addMaterial(link_unit.get());
 
     if (add_result != 0) {
         result.error_message = std::format("add_material failed (code: {})", add_result);
@@ -869,6 +914,11 @@ TargetCode BackendCompiler::generate_target_code(const CompiledMaterial& compile
     if (volume_anisotropy_idx)
         program->functions.volume_anisotropy_function_index = descs[volume_anisotropy_idx].function_index;
     program->functions.displacement_function_index = descs[displacement_idx].function_index;
+
+    if (!cutoutDescs.empty()) {
+        program->functions.cutout_init_function_index = cutoutDescs[0].function_index;
+        program->functions.cutout_only_function_index = cutoutDescs[1].function_index;
+    }
 
     if (has_backface) {
         program->functions.backface_bsdf_function_index = descs[backface_bsdf_idx].function_index;
@@ -943,8 +993,7 @@ TargetCode BackendCompiler::generate_target_code(const CompiledMaterial& compile
         backend->set_option("use_builtin_resource_handler", "on");
         link_unit = mi::base::Handle<mi::neuraylib::ILink_unit>(
             backend->create_link_unit(compiled.transaction.get(), context.get()));
-        if (!link_unit || link_unit->add_material(compiled.compiled_material.get(),
-                descs.data(), descs.size(), context.get()) != 0) {
+        if (!link_unit || addMaterial(link_unit.get()) != 0) {
             result.error_message = "builtin-resource fallback link unit failed";
             return result;
         }
@@ -965,6 +1014,21 @@ TargetCode BackendCompiler::generate_target_code(const CompiledMaterial& compile
     if (program->target_code->get_argument_block_count() > 0)
         binding->argument_block = mi::base::Handle<const mi::neuraylib::ITarget_argument_block>(
             program->target_code->get_argument_block(0));
+    // The cutout group's functions read the material's arguments through the
+    // argument block of its first group (the only one a binding creates): it
+    // must be the same block or an identical one.
+    if (program->functions.cutout_only_function_index != ~mi::Size(0) &&
+        !SameArgumentBlocks(program->target_code.get(), descs, cutoutDescs)) {
+        if (VerboseMdl()) std::cout << "  cutout group: argument blocks differ; using the shared init\n";
+        program->functions.cutout_init_function_index = ~mi::Size(0);
+        program->functions.cutout_only_function_index = ~mi::Size(0);
+    }
+    if (VerboseMdl() && !cutoutDescs.empty())
+        std::cout << std::format("  cutout group: init {} cutout {} (argument blocks {} and {}, {} in all)\n",
+            static_cast<size_t>(program->functions.cutout_init_function_index),
+            static_cast<size_t>(program->functions.cutout_only_function_index),
+            static_cast<size_t>(descs[4].argument_block_index), static_cast<size_t>(cutoutDescs[1].argument_block_index),
+            static_cast<size_t>(program->target_code->get_argument_block_count()));
 
     if (context->get_messages_count() > 0) {
         if (VerboseMdl()) std::cout << "  Messages from translate_link_unit:\n";

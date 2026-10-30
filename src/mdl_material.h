@@ -447,13 +447,24 @@ private:
 public:
     bool supportsNee(const RayHit&) const override { return m_valid; }
 
+    // A shadow ray's crossing: the cutout's own init and function when the
+    // program has them (mdl::MaterialFunctions::cutout_init_function_index),
+    // which compute the same value from the same lookups without the shared
+    // init's other texture results.
     float cutoutOpacity(const RayHit& ray_hit) override {
         if (!m_valid) return 1.0f;
         if (auto constant = constant_cutout()) return *constant;
+        auto const& functions = m_target.program->functions;
+        const bool own = functions.cutout_only_function_index != ~mi::Size(0);
         ShadingStateData ss; build_shading_state(ray_hit, ss);
-        if (m_target.program->target_code->execute_init(m_target.program->functions.init_function_index,
-            ss.base(), m_target.texture_handler(), m_target.argument_data()) != 0) return 1.0f;
-        return get_opacity(ss.base());
+        if (m_target.program->target_code->execute_init(
+                own ? functions.cutout_init_function_index : functions.init_function_index,
+                ss.base(), m_target.texture_handler(), m_target.argument_data()) != 0) return 1.0f;
+        if (!own) return get_opacity(ss.base());
+        mi::Float32 opacity = 1.0f;
+        const mi::Sint32 result = m_target.program->target_code->execute(functions.cutout_only_function_index,
+            ss.base(), m_target.texture_handler(), m_target.argument_data(), &opacity);
+        return result == 0 && std::isfinite(opacity) ? std::clamp(opacity, 0.0f, 1.0f) : 1.0f;
     }
     bool provenOpaque() const override {
         const auto constant = constant_cutout();

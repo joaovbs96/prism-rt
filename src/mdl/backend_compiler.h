@@ -67,6 +67,14 @@ struct MaterialFunctions {
     // geometry.cutout_opacity (scalar, no offsets)
     mi::Size cutout_opacity_function_index = ~mi::Size(0);
 
+    // geometry.cutout_opacity on its own: an init of its own (the texture
+    // results the cutout reads, and the shading normal, as the shared init
+    // computes them) and the cutout after it. Generated for cutouts that vary
+    // over the surface, so a shadow ray crossing one does not run the shared
+    // init's every texture lookup (MDLMaterial::cutoutOpacity).
+    mi::Size cutout_init_function_index = ~mi::Size(0);
+    mi::Size cutout_only_function_index = ~mi::Size(0);
+
     // thin_walled (scalar bool, no offsets)
     mi::Size thin_walled_function_index = ~mi::Size(0);
 
