@@ -73,6 +73,7 @@ public:
 
 private:
     void _SyncAuthoredSettings();
+    prism::hydra::RenderSettings _CurrentSettings() const;
     void _RefreshRenderSettingsPaths();
     std::vector<size_t> _GetSceneIndexOrder(SdfPath const &path) const;
 
@@ -80,6 +81,8 @@ private:
     std::unique_ptr<HdRenderThread> _renderThread;
     std::unique_ptr<prism::hydra::SceneBridge> _ownedBridge;
     prism::hydra::SceneBridge *_bridge = nullptr;
+    // Settings set before SetTerminalSceneIndex created the bridge.
+    std::unique_ptr<prism::hydra::RenderSettings> _pendingSettings;
     HdRenderThread *_thread = nullptr;
     std::shared_ptr<prism::hydra::TaskContext> _taskContext;
     std::shared_ptr<prism::hydra::SelectionSettings> _selectionSettings;

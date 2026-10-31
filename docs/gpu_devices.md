@@ -1427,6 +1427,13 @@ called done there.
   passes, and an edit sequence on InOneWeekend (`prism_hydra_render ...
   --edit-sequence 3 /World/Geometry/Object_1`) on `--device metal` is
   bit-identical to the previous build's.
+- **Render settings set before the render index** (`PrismTaskDelegate` in
+  `src/hydra/task_delegate.cpp`): settings a host sets before
+  `SetTerminalSceneIndex` creates the bridge are kept and applied to it;
+  nothing device-specific. Check on the Mac: the host-contract tests
+  (`ctest -R prism_hydra_host_`) pass, and `prism_hydra_host_contract_test
+  stop-latency tests/hydra/fixtures/host_contract.usda /World/Camera metal
+  256 256 10 250` passes (Stop latency on Metal).
 
 ## Diagnostics
 

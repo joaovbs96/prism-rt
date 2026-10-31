@@ -137,6 +137,10 @@ void PrismTaskDelegate::SetTerminalSceneIndex(
     _ownedBridge = std::make_unique<prism::hydra::SceneBridge>(
         _sourceSceneIndex, _renderThread.get());
     _bridge = _ownedBridge.get();
+    if (_pendingSettings) {
+        _bridge->SetSettings(*_pendingSettings);
+        _pendingSettings.reset();
+    }
     _taskContext->bridge.store(_bridge);
     _renderThread->SetRenderCallback([this] { _bridge->Render(); });
     _renderThread->StartThread();
@@ -286,8 +290,7 @@ HdRenderSettingDescriptorList PrismTaskDelegate::GetRenderSettingDescriptors() c
 
 VtValue PrismTaskDelegate::GetRenderSetting(TfToken const &key) const
 {
-    prism::hydra::RenderSettings s = _bridge
-        ? _bridge->GetSettings() : prism::hydra::RenderSettings{};
+    prism::hydra::RenderSettings s = _CurrentSettings();
     if (key == _samples) return VtValue(s.samples);
     if (key == _maxDepth) return VtValue(s.maxDepth);
     if (key == _rouletteDepth) return VtValue(s.rouletteDepth);
@@ -408,8 +411,7 @@ void PrismTaskDelegate::SetRenderSetting(TfToken const &key, VtValue const &valu
         _selectionSettings->revision.fetch_add(1);
         return;
     }
-    prism::hydra::RenderSettings s = _bridge
-        ? _bridge->GetSettings() : prism::hydra::RenderSettings{};
+    prism::hydra::RenderSettings s = _CurrentSettings();
     if (key == _samples) s.samples = std::max(1, _Get(value, s.samples));
     else if (key == _maxDepth) s.maxDepth = std::max(1, _Get(value, s.maxDepth));
     else if (key == _rouletteDepth) s.rouletteDepth = std::max(0, _Get(value, s.rouletteDepth));
@@ -559,7 +561,16 @@ void PrismTaskDelegate::SetRenderSetting(TfToken const &key, VtValue const &valu
         else s.color.view = text;
     }
     else return;
+    // A host may set settings before its render index exists (no bridge
+    // yet); they apply when the bridge is created.
     if (_bridge) _bridge->SetSettings(s);
+    else _pendingSettings = std::make_unique<prism::hydra::RenderSettings>(s);
+}
+
+prism::hydra::RenderSettings PrismTaskDelegate::_CurrentSettings() const
+{
+    if (_bridge) return _bridge->GetSettings();
+    return _pendingSettings ? *_pendingSettings : prism::hydra::RenderSettings{};
 }
 
 VtDictionary PrismTaskDelegate::GetRenderStats() const
