@@ -6,8 +6,9 @@ converted into it once; linear outputs stay in it, and 8-bit outputs go
 through a display and view (ACES 2.0 SDR on an sRGB display by default).
 
 The code is `src/color/color_management.{h,cpp}` (`prism::color`). The
-colour management is process-wide (`prism::color::Active()`): both loaders,
-the texture service, the MaterialX generator and the render devices read it.
+colour management belongs to each renderer (`prism::RendererContext::setColor`,
+`src/renderer/renderer_context.h`): both loaders, the texture service, the
+MaterialX generator and the render devices read their renderer's.
 
 ## Config, working space and view
 
@@ -72,8 +73,9 @@ the texture service, the MaterialX generator and the render devices read it.
 - In Hydra, changing the config or working space rebuilds the scene
   (materials, lights, domes and their textures convert again). Display and
   view are only recorded there: the colour AOV is linear.
-- The colour management is per process. Two Hydra delegates in one process
-  with different working spaces are not supported; a new delegate starts from
+- Each Hydra delegate has its own colour management (its renderer's). Two
+  delegates in one process with different working spaces each render their
+  own exactly (`prism_hydra_host_working_spaces`); a new delegate starts from
   the defaults (or its render settings).
 
 ### Linear Rec.709 (the renderer before colour management)

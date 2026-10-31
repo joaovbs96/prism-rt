@@ -648,6 +648,43 @@ if(PRISM_BUILD_HYDRA)
     set_tests_properties(prism_hydra_pass_camera_test PROPERTIES
         ENVIRONMENT "${_prism_test_environment}")
 
+    # hdPrism in a third-party Hydra 1 host (HdRenderIndex, HdxTaskController,
+    # HdEngine; docs/hydra.md, "Third-party hosts"). CPU device except the
+    # Vulkan Stop latency.
+    add_executable(prism_hydra_host_contract_test tests/hydra/host_contract_test.cpp)
+    prism_enable_long_paths(prism_hydra_host_contract_test)
+    target_include_directories(prism_hydra_host_contract_test PRIVATE ${PXR_INCLUDE_DIRS})
+    target_link_libraries(prism_hydra_host_contract_test PRIVATE
+        hd hdx usdImaging ${PXR_LIBRARIES} OpenImageIO::OpenImageIO
+        $<$<PLATFORM_ID:Windows>:psapi>)
+    set_target_properties(prism_hydra_host_contract_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "$<1:${CMAKE_BINARY_DIR}/hydra/plugin>")
+    set(_prism_host_scene "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/host_contract.usda")
+    add_dependencies(prism_hydra_host_contract_test hdPrism)
+    set(_prism_host_env ${_prism_test_environment} "PRISM_DISABLE_VULKAN=1")
+    foreach(_mode alpha settings-before-index converge-without-execute repeated-execute
+            two-delegates create-destroy)
+        string(REPLACE "-" "_" _name "${_mode}")
+        add_test(NAME prism_hydra_host_${_name}
+            COMMAND prism_hydra_host_contract_test ${_mode} "${_prism_host_scene}")
+        set_tests_properties(prism_hydra_host_${_name} PROPERTIES ENVIRONMENT "${_prism_host_env}")
+    endforeach()
+    add_test(NAME prism_hydra_host_working_spaces
+        COMMAND prism_hydra_host_contract_test working-spaces
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/color_management.usda")
+    add_test(NAME prism_hydra_host_textures
+        COMMAND prism_hydra_host_contract_test textures "${CMAKE_BINARY_DIR}/hydra/host_textures")
+    add_test(NAME prism_hydra_host_stop_latency_cpu
+        COMMAND prism_hydra_host_contract_test stop-latency "${_prism_host_scene}"
+            /World/Camera cpu 256 256 10 250)
+    set_tests_properties(prism_hydra_host_working_spaces prism_hydra_host_textures
+        prism_hydra_host_stop_latency_cpu PROPERTIES ENVIRONMENT "${_prism_host_env}")
+    add_test(NAME prism_hydra_host_stop_latency_vulkan
+        COMMAND prism_hydra_host_contract_test stop-latency "${_prism_host_scene}"
+            /World/Camera vulkan 256 256 10 250)
+    set_tests_properties(prism_hydra_host_stop_latency_vulkan PROPERTIES
+        ENVIRONMENT "${_prism_test_environment}")
+
     add_executable(prism_hydra_pick_bounds_test tests/hydra/pick_bounds_test.cpp)
     target_link_libraries(prism_hydra_pick_bounds_test PRIVATE PrismRT::core)
     add_test(NAME prism_hydra_pick_bounds_test COMMAND prism_hydra_pick_bounds_test)
@@ -2399,7 +2436,7 @@ include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/PrismPython.cmake")
 # excluded. GPU tests share RESOURCE_LOCK gpu, so `ctest -LE gpu -j N` can run
 # beside GPU work and a parallel run never puts two GPU tests on the device.
 set(_prism_gpu_test_regex
-    "^prism_hydra_(adaptive_publication_vulkan|render_exercise|transparent_background_export|depth1_render|depth_change_render|setting_change_test|cutout_(medium|clear)_render|cutout_medium_test|animation_exercise|pass_camera_test|scene_bridge_test|streaming_(cold|warm|whole)|streaming_.*_matches_.*)$"
+    "^prism_hydra_(adaptive_publication_vulkan|host_stop_latency_vulkan|render_exercise|transparent_background_export|depth1_render|depth_change_render|setting_change_test|cutout_(medium|clear)_render|cutout_medium_test|animation_exercise|pass_camera_test|scene_bridge_test|streaming_(cold|warm|whole)|streaming_.*_matches_.*)$"
     "|^prism_(gpu_shader_compile_test|device_selection_test|cli_clean_exit_vulkan|cli_gpu_failure_vulkan)$"
     "|^prism_(gltf|obj)_.*_vulkan_(render|parity|test)$"
     "|^prism_parity_.*_(vulkan|metal)_(cli|hydra|match)$"

@@ -688,6 +688,67 @@ parity fixture each and a check in `prism_scene_features_test`:
   (`id_aovs.usda`): element and instance ids agree exactly; prim ids agree up
   to a renumbering (each loader numbers its prims; `--relabel`).
 
+## Third-party hosts
+
+What an application that embeds hdPrism can rely on. Tested by
+`prism_hydra_host_contract_test` (`ctest -R prism_hydra_host_`), which acts
+as a plain Hydra 1 host: it creates the delegate by plugin id
+(`HdPrismRendererPlugin`), builds its own `HdRenderIndex` fed by the
+UsdImaging scene indices, runs an `HdxTaskController` through `HdEngine`, and
+talks to the delegate only through `HdRenderDelegate` and
+`HdRenderPass::IsConverged`.
+
+- **Render settings** come only through `SetRenderSetting`; the host need not
+  author anything into the stage. Settings set before the host creates its
+  render index are kept and applied when it does (`settings-before-index`).
+- **Alpha.** With the colour AOV cleared to (0,0,0,0) and
+  `domeLightCameraVisibility` false, background pixels are exactly
+  (0,0,0,0), so the host's own background shows through. The colour AOV is
+  premultiplied (edge pixels' colour scales with their coverage), which is
+  what Hydra composites: HgiInterop blends the AOV with
+  `GL_ONE, GL_ONE_MINUS_SRC_ALPHA` ("pre-multiplied alpha scaling factors").
+  (`alpha`)
+- **Convergence without `Execute`.** Hydra syncs the scene in `Execute`, and
+  hdPrism also captures the scene and publishes the converted snapshot
+  there (`SceneBridge::Prepare`). A host therefore calls `Execute` until the
+  first samples show (`numCompletedSamples` above 0); from then on the
+  render thread refines on its own, `IsConverged()` turns true while nothing
+  calls `Execute`, and the buffers hold the same pixels as an
+  `Execute`-driven render. A single `Execute` followed by polling only never
+  starts the render. (`converge-without-execute`)
+- **Repeated `Execute`** with nothing changed costs about 0.03 ms per call
+  while rendering and 0.005 ms once converged (CPU device, 128x128), and
+  never restarts the accumulation. (`repeated-execute`)
+- **Stop, Restart, Pause.** `IsStopSupported` and `IsPauseSupported` are
+  true. `Stop` blocks until the render thread is idle; as Hydra defines it,
+  rendering then stays stopped (later `Execute` calls do not resume it) until
+  `Restart`, which begins a new accumulation. `Pause`/`Resume` keep it.
+  `IsStopped`/`IsPaused` are not implemented (the base class's false).
+  Measured on the chess set (1280x720): `Stop` while rendering takes 1.7 ms
+  median, 2.6 ms at most on the CPU and 11 ms median, 19 ms at most on
+  Vulkan. Deleting the delegate right after `Stop` takes about 50 ms on the
+  CPU and 0.2-1.4 s on Vulkan; deleting it while the scene still prepares
+  waits for the preparation (0.2 s on the CPU, 15 s on Vulkan, cold GPU
+  programs). (`stop-latency`)
+- **Several delegates in one process** render independently: two live
+  delegates give the same pixels as one alone; 24 create/render/stop/destroy
+  cycles (every other one torn down while rendering) grow private memory by
+  well under 1 MiB per cycle; two delegates with different working spaces
+  each render their own working space exactly (the colour management is per
+  renderer), and a new delegate starts from the defaults.
+  (`two-delegates`, `create-destroy`, `working-spaces`)
+- **Textures.** The delegate holds no open handle on source texture files:
+  while it lives, a host can rename them and overwrite them in place. An
+  overwritten texture at the same path is picked up when the host re-syncs
+  the material (Hydra dirties the material prim, for example when the host's
+  scene index or the stage reports the material changed): the texture
+  fingerprint includes the file's size and modification time, so the
+  changed file is prepared again. Nothing is reloaded without a re-sync, as
+  in Storm, which reloads a texture only when asked
+  (`HdResourceRegistry::ReloadResource`); hdPrism's resource registry does
+  not implement `ReloadResource`. `prism:resourceRevision` still forces every
+  material and dome to reload. (`textures`)
+
 ## Scope and costs
 
 ### Interactive display and noisy HDR lighting
