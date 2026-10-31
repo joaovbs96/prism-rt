@@ -399,6 +399,49 @@ mean over the cutout edges (the 10% largest image gradients) differs by less
 than the two seeds of the old build do. CPU-vs-Vulkan NRMSE is unchanged
 (foliage 0.0196, awning 0.0019, glTF 0.0100 for old and new).
 
+## Scene loading, batch 3 (October 2026)
+
+CPU only (`PRISM_DISABLE_VULKAN=1`), 320x180, 4 spp, `--seed 0
+--adaptive-threshold 0`, each run under a 24 GB job cap. The previous build
+and the new one ran in alternating rounds in one session; medians, 2 cold
+rounds (a fresh `PRISM_CACHE_DIR` per run) and 5 warm. Hydra times are
+`prism_hydra_render` with `PRISM_LOAD_PROFILE=1`; CLI times are the
+`[PrismProfile]` `loadSeconds` and `renderSeconds` (the render includes the
+CPU device's scene preparation). Every image of the new build is
+bit-identical to the old build's (104 EXR comparisons, the countertop 7 times
+in each loader).
+
+- **Dense per-triangle material tables** (item A). A per-triangle hash map,
+  copied per placement, became a table shared by a prototype's placements.
+- **Parallel MaterialX compiles in the SDK** (item C): glTF, OBJ and
+  API/Python scenes.
+- Memoised ancestor walks in the Hydra snapshot build (item B) were not
+  done: the whole walk was under 2% of the load on 4,096 and 16,384 mesh
+  prims (0.15 s of 22 s, 0.74 s of 44 s); the scene capture took 7.7 s and
+  30 s there (about 1.8 ms per prim).
+
+| Scene | Measure | Cold, new / old | Warm, new / old |
+| --- | --- | ---: | ---: |
+| 16 instances of a 980k-triangle mesh with a GeomSubset (synthetic) | Hydra first preview | 0.36 (3.13 -> 1.11 s) | 0.34 (3.60 -> 1.24 s) |
+| | Hydra walk / device prepare / spare bank | 0.02 / 0.02 / - | 0.03 / 0.02 / 0.04 |
+| | CLI load / render | 0.50 / 0.03 | 0.55 / 0.02 |
+| MaterialEggs countertop (14 GeomSubsets) | Hydra walk / spare bank | 0.77 / - | 0.68 / 0.34 |
+| | Hydra first preview, CLI load | 0.98, 0.95 | 1.00, 0.97 |
+| | CLI render | 0.81 | 0.90 |
+| `tests/gltf/features.gltf` (11 materials) | CLI load | 0.43 (11.5 -> 5.0 s) | 0.43 (12.6 -> 5.4 s) |
+| 48-material OBJ, 6 structures (synthetic) | CLI load | 0.73 | 0.83 |
+| `tests/gltf/metal_rough_spheres.gltf` (8 materials, one class) | CLI load | 0.99 | 0.95 |
+| Chess (no subsets, USD materials) | Hydra first preview, CLI load | 0.97, 1.02 | 1.10, 0.97 (noise) |
+
+On the countertop the material phase dominates the load (about 25 s), so the
+walk's 0.7-0.9 s saving and the occluder/light-table scans of the device
+preparation (0.07 s -> 0.002 s) stay within the run-to-run noise of the first
+preview. Glossy materials of one class (metal_rough_spheres) share one
+program, so they compiled quickly already; the gain is with several
+structures (features.gltf). The first MaterialX material of a commit still
+compiles alone, since it loads the MDL modules every generated material
+imports.
+
 ## Interpretation limits
 
 MDL variants remain cached for the renderer process lifetime, affecting warm-recreation results. Historical InOneWeekend measurements used coarse tessellated spheres; the current implementation uses analytic spheres. Report this representation change when comparing geometry memory and rendering results. See [Hydra scope and costs](hydra.md) for rendering limitations and supported geometry behavior.

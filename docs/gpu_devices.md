@@ -1367,6 +1367,7 @@ called done there.
   `FitImages` are unchanged. Check on the Mac: the build, and
   `ctest -R texture_streaming`.
 - **Material networks keep their order after edits** (`src/materialx/ordered_network_interface.h`, used by the material service): the converted MaterialX document, and so the generated MDL, no longer depends on TfToken addresses. Shared by every device; no shader or GPU code change. Check on the Mac: the MaterialEggs countertop rendered on `--device metal` several times (each with a fresh `PRISM_CACHE_DIR`) is bit-identical run to run, and `ctest -R ordered_network_interface`.
+- **Dense per-triangle material tables** (`TriangleMaterials` in `src/scene.h`; written on Windows, the Metal device unbuilt): `PlacementMaterialBinding::triangles` is a table indexed by primitive (null: the fallback) shared by a prototype's placements, filled by `src/hydra/scene_bridge.cpp` (GeomSubsets, sphere batches) and the SDK. `src/device/gpu/gpu_scene.cpp` reads it with `triangles.at(prim)` when it builds the per-primitive material table; the resolved materials are the same, no shader change. Check on the Mac: the MaterialEggs countertop (GeomSubsets) and a scene with batched spheres on `--device metal` bit-identical to the build before, in the CLI and usdview, and `ctest -R "parity|subset|sphere"`.
 
 ## Diagnostics
 
