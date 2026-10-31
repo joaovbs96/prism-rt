@@ -671,6 +671,11 @@ struct VulkanDevice::Impl {
     std::unordered_map<const prism::TextureResource*, CachedImage> imageCache;
     size_t reportedReducedImages = 0;
     std::vector<AccelerationStructure> bottomLevel;
+    // The bottom-level structure of each prototype (~0u: none).
+    std::vector<uint32_t> structureOfPrototype;
+    // The geometry buffers and `bottomLevel` hold `data`'s geometry, so an
+    // edit that keeps it (gpu::SameGeometry) rebuilds only the top level.
+    bool geometryCurrent = false;
     AccelerationStructure topLevel;
     VkSampler samplers[kSamplerCount] = {};
     VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
@@ -867,7 +872,8 @@ struct VulkanDevice::Impl {
     // Creates the image of `prepared`, recording its upload and mipmaps.
     bool recordImage(VkCommandBuffer commands, PreparedImage const& prepared, Buffer const& staging, Image* image);
     void destroyImage(Image& image);
-    bool buildAccelerationStructures(std::string* error);
+    // With `keepBottomLevel`, only the top level is rebuilt.
+    bool buildAccelerationStructures(bool keepBottomLevel, std::string* error);
     bool writeDescriptors(std::string* error);
     void* renderBuffer(int slot, size_t bytes);
     bool dispatch(GpuFrame const& frame, uint32_t threads, double* gpuSeconds, std::string* error);
@@ -3097,11 +3103,13 @@ bool VulkanDevice::Impl::uploadImages(std::string* error)
     return upload(kSlotImages, info.data(), info.size() * sizeof(GpuImage));
 }
 
-bool VulkanDevice::Impl::buildAccelerationStructures(std::string* error)
+bool VulkanDevice::Impl::buildAccelerationStructures(bool keepBottomLevel, std::string* error)
 {
     GpuSceneData const& d = *data;
-    for (auto& structure : bottomLevel) destroyStructure(structure);
-    bottomLevel.clear();
+    if (!keepBottomLevel) {
+        for (auto& structure : bottomLevel) destroyStructure(structure);
+        bottomLevel.clear();
+    }
     destroyStructure(topLevel);
     const VkDeviceSize scratchAlignment =
         std::max<VkDeviceSize>(accelerationProperties.minAccelerationStructureScratchOffsetAlignment, 256);
@@ -3114,10 +3122,12 @@ bool VulkanDevice::Impl::buildAccelerationStructures(std::string* error)
         VkDeviceSize scratchOffset = 0;
     };
     std::vector<Build> builds;
-    std::vector<uint32_t> structureOfPrototype(d.prototypes.size(), ~0u);
+    // Kept bottom levels keep their prototype map (the prototypes are part
+    // of the geometry SameGeometry compares).
+    if (!keepBottomLevel) structureOfPrototype.assign(d.prototypes.size(), ~0u);
     std::vector<VkAabbPositionsKHR> boxes;
     std::vector<size_t> boxOffsets(d.prototypes.size(), 0);
-    for (size_t p = 0; p < d.prototypes.size(); ++p) {
+    for (size_t p = 0; !keepBottomLevel && p < d.prototypes.size(); ++p) {
         GpuPrototype const& proto = d.prototypes[p];
         if (proto.info.x != kProtoSpheres || proto.info.w == 0) continue;
         boxOffsets[p] = boxes.size();
@@ -3134,7 +3144,7 @@ bool VulkanDevice::Impl::buildAccelerationStructures(std::string* error)
 
     VkDeviceSize scratchSize = 0;
     builds.reserve(d.prototypes.size());
-    for (size_t p = 0; p < d.prototypes.size(); ++p) {
+    for (size_t p = 0; !keepBottomLevel && p < d.prototypes.size(); ++p) {
         GpuPrototype const& proto = d.prototypes[p];
         if (proto.info.w == 0) continue;
         Build build;
@@ -3342,7 +3352,13 @@ bool VulkanDevice::Impl::ensureScene(SceneManager& scene, std::string* error)
     boundScene = &scene;
     progress::Scope uploadPhase(Phase::Upload);
     progress::Detail(Phase::Upload, "converting the scene");
+    auto previous = std::move(data);
     data = std::make_unique<GpuSceneData>(gpu::BuildGpuScene(scene));
+    // Edits that keep the geometry (placements, materials, lights) keep the
+    // geometry buffers and the bottom-level structures, as on Metal.
+    const bool sameGeometry = previous && geometryCurrent && gpu::SameGeometry(*previous, *data);
+    previous.reset();
+    geometryCurrent = false;
     auto const sceneBuilt = Clock::now();
     for (auto const& warning : data->warnings) std::cerr << "PrismRT Vulkan: " << warning << '\n';
     // The pipeline compiles while the scene uploads: it needs only the
@@ -3398,7 +3414,12 @@ bool VulkanDevice::Impl::ensureScene(SceneManager& scene, std::string* error)
     uint64_t sceneBytes = 0;
     for (SlotData const& s : slots) sceneBytes += s.bytes;
     placement = choosePlacement(sceneBytes, slots[0].bytes + slots[4].bytes); // positions, indices
-    for (SlotData const& s : slots) upload(s.slot, s.data, s.bytes);
+    auto geometrySlot = [](int slot) {
+        return slot == kSlotPositions || slot == kSlotNormals || slot == kSlotTexcoords || slot == kSlotTangents ||
+               slot == kSlotIndices || slot == kSlotPrototypes || slot == kSlotSpheres;
+    };
+    for (SlotData const& s : slots)
+        if (!sameGeometry || !geometrySlot(s.slot)) upload(s.slot, s.data, s.bytes);
     if (!buffers[kSlotFrame].buffer) upload(kSlotFrame, nullptr, sizeof(GpuFrame));
     for (int slot : {kSlotPixels, kSlotRng, kSlotOutput, kSlotAccumulation})
         if (!buffers[slot].buffer) upload(slot, nullptr, 16);
@@ -3422,7 +3443,8 @@ bool VulkanDevice::Impl::ensureScene(SceneManager& scene, std::string* error)
     auto const imaged = Clock::now();
     progress::SetTotal(Phase::Upload, 0);
     progress::Detail(Phase::Upload, "acceleration structures");
-    if (!buildAccelerationStructures(error)) return fail();
+    if (!buildAccelerationStructures(sameGeometry, error)) return fail();
+    geometryCurrent = true;
     auto const structured = Clock::now();
     progress::Detail(Phase::Upload, "waiting for the shaders");
     if (compiled.valid() && !compiled.get()) {
@@ -3442,19 +3464,21 @@ bool VulkanDevice::Impl::ensureScene(SceneManager& scene, std::string* error)
     if (streaming.active) resumeStreaming();
     prism::load_profile::Mark("vulkan.scene",
         std::format("total_s={:.3f} gpu_scene_s={:.3f} mdl_code_s={:.3f} buffers_s={:.3f} images_s={:.3f} "
-                    "acceleration_s={:.3f} shader_wait_s={:.3f} images={}",
+                    "acceleration_s={:.3f} shader_wait_s={:.3f} images={} geometry_kept={}",
                     SecondsSince(sceneStart), std::chrono::duration<double>(sceneBuilt - sceneStart).count(),
                     std::chrono::duration<double>(piped - sceneBuilt).count(),
                     std::chrono::duration<double>(uploaded - piped).count(),
                     std::chrono::duration<double>(imaged - uploaded).count(),
                     std::chrono::duration<double>(structured - imaged).count(),
-                    std::chrono::duration<double>(shadersReady - structured).count(), d.images.size()));
+                    std::chrono::duration<double>(shadersReady - structured).count(), d.images.size(),
+                    sameGeometry ? 1 : 0));
     if (gpu::GpuVerbose())
         std::cerr << std::format("PrismRT Vulkan: scene {:.3f} s (buffers {:.3f}, images {:.3f}, "
-                                 "acceleration structures {:.3f}; {} prototypes, {} instances)\n",
+                                 "acceleration structures {:.3f}; {} prototypes, {} instances{})\n",
                                  SecondsSince(sceneStart), std::chrono::duration<double>(uploaded - sceneStart).count(),
                                  std::chrono::duration<double>(imaged - uploaded).count(), SecondsSince(imaged),
-                                 d.prototypes.size(), d.instances.size());
+                                 d.prototypes.size(), d.instances.size(),
+                                 sameGeometry ? "; geometry kept" : "");
     return true;
 }
 
