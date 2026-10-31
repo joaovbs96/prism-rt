@@ -14,7 +14,8 @@ the texture service, the MaterialX generator and the render devices read it.
 | Setting | CLI | Hydra render setting | Default |
 | --- | --- | --- | --- |
 | Config | `--ocio-config FILE\|URI` | `prism:colorManagement:ocioConfig` | `$OCIO`, else `ocio://studio-config-latest` |
-| Working space | `--working-space NAME` | `prism:colorManagement:workingSpace`, else the settings prim's `renderingColorSpace` | `ACEScg` (the config's `scene_linear` role if it has no ACEScg) |
+| Working space | `--working-space NAME` | `prism:colorManagement:workingSpace`, else the settings prim's `renderingColorSpace`, else the `renderingColorSpace` render setting | `$PRISM_WORKING_SPACE`, else `ACEScg` (the config's `scene_linear` role if it has no ACEScg) |
+| Output space (Hydra only) | none | `prism:colorManagement:outputSpace` | the `renderingColorSpace`, else linear Rec.709 ([Output space](#output-space)) |
 | Display | `--display NAME` | `prism:colorManagement:display` | the config's default display |
 | View | `--view NAME` | `prism:colorManagement:view` | the display's default view |
 
@@ -34,10 +35,16 @@ the texture service, the MaterialX generator and the render devices read it.
 - **`renderingColorSpace`**, the standard `UsdRenderSettings` attribute
   ("the rendering color space the renderer should use for internal color
   calculations"), is the working space when neither `--working-space` nor
-  `prism:colorManagement:workingSpace` names one. Precedence: flag >
-  `prism:colorManagement:workingSpace` > `renderingColorSpace` > ACEScg. Both
-  loaders read it from the active settings prim (the CLI through
-  `ResolveRenderJob`, the delegate from the Hydra render settings schema).
+  `prism:colorManagement:workingSpace` (nor `PRISM_WORKING_SPACE`) names one.
+  Precedence: flag > `prism:colorManagement:workingSpace` >
+  `PRISM_WORKING_SPACE` (the setting's environment default) >
+  `renderingColorSpace` > ACEScg. Both loaders read it from the active
+  settings prim (the CLI through `ResolveRenderJob`, the delegate from the
+  Hydra render settings schema). The delegate also takes it as the
+  unnamespaced render setting `renderingColorSpace`
+  (`HdRenderSettingsPrimTokens->renderingColorSpace`, as Typhoon does), for
+  hosts that do not author into the stage; the prim's attribute comes first
+  ([hydra.md](hydra.md)).
   `prism::color::RenderingColorSpaceWorkingSpace` maps its token:
   - USD's names (`GfColorSpaceNames`: `lin_rec709_scene`, `lin_ap1_scene`,
     `lin_p3d65_scene`, `lin_rec2020_scene`, `lin_adobergb_scene`, ...)
@@ -163,16 +170,107 @@ sampling weights only; any weights give the same expected image.
   Display P3 and Adobe RGB primaries).
 - **CLI 8-bit formats** (PNG, JPEG, ...): the linear image through the view,
   clamped to [0, 1], exactly once. This replaces the earlier gamma 2.2.
-- **Hydra colour AOV**: linear in the working space. PrismRT's presentation
-  (`PresentationCompositor`) applies no view; the host does.
+- **Hydra colour AOV**: linear in the delegate's **output space** (below),
+  linear Rec.709 by default. PrismRT's presentation applies no view; the
+  host does.
+
+### Output space
+
+A Hydra host cannot tell the delegate which colour space it expects:
+`HdAovDescriptor` carries a format but no colour space, and the delegate
+never sees the host's colour correction task. Stock `HdxColorCorrectionTask`
+in `sRGB` mode applies only the sRGB transfer curve, so it reads the colour
+AOV as linear Rec.709, as Storm and Typhoon write it. The delegate therefore
+renders in the working space but presents its AOVs in a separate output
+space, `prism:colorManagement:outputSpace` ([hydra.md](hydra.md)):
+
+- empty (default): the `renderingColorSpace` when one is set (the active
+  settings prim's, else the `renderingColorSpace` render setting; `data`,
+  `raw` and `identity` are linear Rec.709), else **linear Rec.709**. A host
+  that knows nothing of PrismRT shows the right colours; a stage that asks
+  for a rendering colour space gets its AOVs in it, as Typhoon does;
+- `working`: the working space, as before the output space existed (the
+  AOVs are then bit-identical to earlier builds);
+- any scene-linear OCIO name or alias of the config. A name the config lacks
+  or a space that is not scene-linear warns and takes the default.
+
+The conversion is a 3x3 matrix (working space to output space, from OCIO) in
+the render buffers (`PrismRenderBuffer::SetOutputTransform`), applied when a
+pixel is encoded: after the accumulation (the buffers accumulate
+working-space samples and convert the mean), to previews, refinement tiles
+and the denoised colour (the denoiser runs on working-space data). When the
+output space is the working space nothing converts.
+
+- **Which AOVs:** `color`, `denoised` and the light AOVs `albedo`, `diffuse`,
+  `specular`, `emission` all convert, so `diffuse + specular + emission =
+  color` still holds and the denoiser's guides stay consistent with what a
+  host composites. Data AOVs (depth, normals, positions, ids, `primvars:st`)
+  do not.
+- **Out of gamut:** colours outside the output gamut (ACEScg colours outside
+  Rec.709) become negative components. Float AOVs keep them (as Storm's do);
+  8-bit (`UNorm8`) AOVs clamp to [0, 1], 16-bit floats keep them.
+- **Clear values** are the host's and are not converted.
+- **Changing** the output space restarts the accumulation; it does not
+  rebuild the scene.
+- **Read back:** `GetRenderSetting("prism:colorManagement:aovColorSpace")`
+  returns the OCIO name of the resolved output space (the `prismUsdview`
+  extension sets usdview's OCIO input colour space from it), and the render
+  stats `prismOutputColorSpace` and `prismWorkingColorSpace` report both.
+- **Not affected:** the CLI's outputs, the SDK and Python (their films are in
+  the working space), and `prism_hydra_render`, which sets `working` (its
+  images are tagged in the working space, like the CLI's) unless given
+  `--output-space` or `--host-srgb`.
+- Rejected: defaulting the delegate's working space to linear Rec.709. It is
+  simpler but changes the rendered image, not only its presentation
+  (docs/DECISIONS.md, 2026-10-31).
+
+Test: `prism_color_host_srgb_*` renders `tests/hydra/fixtures/color_macbeth.usda`
+(the 24 ColorChecker patches) through `prism_hydra_render --host-srgb`, which
+behaves like a stock Hdx host in `sRGB` mode (no Prism settings; the colour
+AOV through the sRGB curve into an 8-bit PNG), and compares it with the CLI's
+`--working-space lin_rec709` EXR through the same curve; and
+`prism_color_output_space_matrix` checks that the default output is the
+`working` output times the ACEScg-to-Rec.709 matrix.
+
+### Failures never reach the host
+
+The delegate creates its colour management with
+`ColorManagement::CreateOrFallback`: an unreadable config, a working space
+the config lacks or that is not scene-linear, or a config without linear
+Rec.709 warns (`TF_WARN`) and falls back to the built-in config with the same
+working space, then to the built-in defaults, and finally to a pass-through
+colour management (linear Rec.709, nothing converts, no config), so an
+exception never reaches Hydra. Linear Rec.709 is found by name or alias
+(`lin_rec709`, `lin_rec709_scene`, `Linear Rec.709 (sRGB)`, `lin_srgb`,
+`srgb_linear`, `Utility - Linear - sRGB`, ...) before a config counts as
+lacking it; this applies to the CLI too. The delegate builds no view
+processor (`Create(options, false)`), so unknown display and view names are
+only recorded. A render setting that names an unusable config or working
+space later keeps the previous colour management, with a warning. Tests:
+`prism_hydra_color_fallback_*` (`$OCIO` naming a missing file or
+`tests/hydra/fixtures/ocio_no_rec709.ocio`: a warning and the same image as
+the built-in config; unknown display and view names) and
+`prism_color_management_test` (aliases, fallbacks, pass-through).
 
 ### usdview
 
-usdview colour-corrects the colour AOV itself (Hdx's colour correction task)
-with OpenColorIO, from the config's `scene_linear` role (ACEScg, PrismRT's
-default working space), through the config's default display and view: with
-the studio config `sRGB - Display` / `ACES 2.0 - SDR 100 nits (Rec.709)`,
-like the CLI's 8-bit outputs. That needs PrismRT's OpenUSD patch (below).
+usdview colour-corrects the colour AOV itself (Hdx's colour correction task).
+In its `openColorIO` mode it converts from its OCIO input colour space
+(without one, the config's `scene_linear` role, ACEScg) through the config's
+default display and view: with the studio config `sRGB - Display` /
+`ACES 2.0 - SDR 100 nits (Rec.709)`, like the CLI's 8-bit outputs. That needs
+PrismRT's OpenUSD patch (below). The `prismUsdview` extension sets the input
+colour space to the delegate's output space
+(`prism:colorManagement:aovColorSpace`, `Linear Rec.709 (sRGB)` by default)
+when it first reports one and whenever it changes; a space picked in
+usdview's *OCIO Config* menu stays until then. In `sRGB` mode usdview applies
+the sRGB curve to the AOV, which is right for the default linear Rec.709
+output (not tone mapped). So both modes show the right colours; the forced
+`openColorIO` start-up mode is kept for the ACES view (the look of the CLI's
+PNGs). Storm and Typhoon also write linear Rec.709, so the input colour space
+the extension leaves set is right for them too (unless
+`prism:colorManagement:outputSpace` is `working` with an ACEScg working
+space).
 
 - The OpenUSD stack (`tools/ci/build_usd_stack.ps1`, local and CI) is built
   with `PXR_BUILD_OPENCOLORIO_PLUGIN=ON` against vcpkg's OpenColorIO 2.6.0,
@@ -248,16 +346,24 @@ like the CLI's 8-bit outputs. That needs PrismRT's OpenUSD patch (below).
   `OCIO_ACTIVE_DISPLAYS`/`OCIO_ACTIVE_VIEWS` (these also change the CLI's
   defaults, as they act on the config). The package ships the wheel without
   its `bin` directory, so it holds exactly one OpenColorIO DLL.
-- `sRGB` only applies the sRGB curve: an ACEScg render then shows ACEScg
-  values as Rec.709 (less saturated, not tone mapped). It matches the CLI's
-  `Un-tone-mapped` sRGB view when rendering with
-  `prism:colorManagement:workingSpace = lin_rec709`.
+- `sRGB` only applies the sRGB curve: with the default output space (linear
+  Rec.709) it shows the right colours, not tone mapped, like the CLI's
+  `Un-tone-mapped` sRGB view. With `prism:colorManagement:outputSpace =
+  working` and an ACEScg working space it would show ACEScg values as
+  Rec.709 (less saturated), as every build did before the output space.
+- How to check by hand: `.\run_usdview.ps1 tests\hydra\fixtures\color_macbeth.usda`,
+  then View > Color Correction > `sRGB` and `openColorIO`: the patches keep
+  their hues in both (the ACES view is a little darker and desaturates the
+  brightest ones); the *OCIO Config* menu's input colour space reads
+  `Linear Rec.709 (sRGB)`.
 - `usdrecord --colorCorrectionMode openColorIO --renderer PrismRT` uses the
   config's default view (with `$OCIO` set): ACES 2.0 SDR with the studio
   config, like the CLI. `OCIO_ACTIVE_VIEWS` chooses another.
 
 ## Tests
 
+- Output space and fallbacks: see [Output space](#output-space) and
+  [Failures never reach the host](#failures-never-reach-the-host).
 - `prism_color_management_test`: matrices (against the ACES Rec.709-to-AP1
   matrix), luminance weights, the views (gamma 2.2 to 2e-6 of `pow`), texel
   conversion and its cache key, light colours, and the generated MaterialX

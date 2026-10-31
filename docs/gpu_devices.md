@@ -633,6 +633,17 @@ called done there.
     `nm hdPrism.dylib` has no `SharedMdlContext` definition.
   - `catch (prism::Error const&)` in a client works (typeinfo is exported
     with the class, anchored by its destructor).
+- **Hydra output space** (`src/hydra/`, 2026-10-31;
+  [color_management.md](color_management.md#output-space)): the delegate
+  presents the colour, `denoised` and light AOVs in an output space (linear
+  Rec.709 by default) with a 3x3 matrix in `PrismRenderBuffer`, after the
+  device's accumulation and denoising; no shader or device code changed, so
+  Metal gets it through the same render buffers. Check on the Mac:
+  `prism_color_host_srgb_*`, `prism_color_output_space_matrix` and
+  `prism_hydra_color_fallback_*` pass with `PRISM_DEVICE=metal` instead of
+  `cpu`, and `prism_hydra_render tests/hydra/fixtures/color_macbeth.usda
+  /World/Camera out.png 192 128 16 --max-depth 2 --adaptive-threshold 0
+  --host-srgb` on `metal` matches `cpu` within the noise floor.
 - **Colour management** ([color_management.md](color_management.md)):
   - Build: OpenColorIO 2.6 must be found (`find_package(OpenColorIO CONFIG)`;
     Homebrew's `opencolorio` or vcpkg), and `prism` (formerly `prism_core`) links it.
