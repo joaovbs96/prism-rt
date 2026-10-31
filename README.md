@@ -67,7 +67,7 @@ The GPU devices compile a kernel for each new set of materials and cache it, so 
 ---------------------------------------
 
 * Windows x64 with Visual Studio 2022, or macOS on Apple silicon with Xcode or the Command Line Tools. PrismRT is written in C++20; the CMake presets need CMake 3.21+.
-* OpenUSD 26.08 (with Python, imaging and GL for usdview), MaterialX, OpenSubdiv, Embree 4, oneTBB, OpenImageIO, OpenColorIO, Open Image Denoise and the [NVIDIA MDL SDK](https://github.com/NVIDIA/MDL-SDK) (open source; a build without CUDA is enough). [`tools/deps.json`](tools/deps.json) holds every dependency version.
+* OpenUSD 26.08 (with Python, imaging and GL for usdview), MaterialX, OpenSubdiv, Embree 4, oneTBB, OpenImageIO, OpenColorIO, Open Image Denoise and the [NVIDIA MDL SDK](https://github.com/NVIDIA/MDL-SDK) (open source; a build without CUDA is enough). [`tools/deps.json`](tools/deps.json) holds every dependency version. Older OpenImageIO, TBB and MaterialX builds are best effort ([docs/deployment.md](docs/deployment.md#older-dependency-stacks-best-effort)).
 * For the GPU devices: DXC and the Vulkan SDK; the Metal device also needs Apple's Metal shader converter.
 * Python 3.11 for usdview and the `prismrt` package.
 

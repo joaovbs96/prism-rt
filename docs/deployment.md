@@ -332,3 +332,73 @@ CTest labels every test `cpu` or `gpu`; GPU tests also share
 `RESOURCE_LOCK gpu`. `ctest -LE gpu` runs only the CPU tests, so it can run
 beside GPU work; within one ctest run the lock keeps GPU tests from overlapping.
 Keep `-j 1` for full runs, since some Hydra tests share temporary file names.
+
+## Older dependency stacks (best effort)
+
+A host application (a DCC tool that loads its own USD, TBB and OpenImageIO
+into one process) may force hdPrism onto older libraries than `tools/deps.json`
+names. Only the `deps.json` versions are tested by CI and by
+`tools/validate_install.ps1`. The older ones below build with
+`-DPRISM_STRICT_DEPENDENCY_VERSIONS=OFF` (the configure then warns about each
+mismatch instead of stopping) and are checked as stated; nothing here is run in
+CI.
+
+| Dependency | Tested (`deps.json`) | Best effort | What was checked |
+|---|---|---|---|
+| OpenImageIO | the vcpkg version | 2.5.x (source compatible, gated on `OIIO_VERSION`) | every translation unit of the core library compiled (`/Zs`) against the 2.5.18 headers, before and after the change; the unchanged sources fail to compile there. Not linked or run: building OIIO 2.5 itself needs Boost, which this stack does not have. <!-- deps: historical --> |
+| oneTBB | the `deps.json` version | classic TBB 2020.x (headers) | every translation unit compiled against the official 2020.3 Windows release headers with no source change. Not linked, and not built against USD. <!-- deps: historical --> |
+| OpenColorIO | the vcpkg version | 2.2.x | `src/color/color_management.cpp` compiled against the 2.2.1 headers. <!-- deps: historical --> |
+| MaterialX | the `deps.json` version | none: other versions run with a warning | the `materialx_loader_*` tests pass on the tested version only (below). <!-- deps: historical --> |
+| Open Image Denoise | the `deps.json` version | 2.3.x | `src/device/denoiser.cpp` compiled against the 2.3.3 headers. The Vulkan denoiser carries its own weights and is independent. <!-- deps: historical --> |
+
+### Older OpenImageIO (2.5)
+
+The changes are in `src/texture_service.cpp` and `src/texture_writer.cpp`.
+The version boundaries come from the OIIO headers of 2.5.19.1 (the last 2.5)
+and of 3.0.0.0-beta1 to 3.0.0.3: `TextureSystem::create` returns a shared
+pointer and `IOProxy::tell()` becomes `const` (and `flush()` non-`const`)
+from 3.0.0.0-beta1 on, and there is no 2.6 or 2.7. `texture.h` defines
+`OIIO_TEXTURESYSTEM_CREATE_SHARED` for the first change; the second uses
+`OIIO_VERSION >= OIIO_MAKE_VERSION(3, 0, 0)`. `TextureOpt::WrapPeriodicPow2`
+exists in both generations, so it needs no gate. Versions older than 2.5 are
+not checked.
+
+### Classic TBB
+
+Prism's TBB use (`parallel_for`, `parallel_reduce`, `blocked_range`,
+`task_arena`, `task_group`) is in classic TBB too. Its headers include
+`windows.h`, so Prism defines `NOMINMAX` for every target on Windows (without
+it `std::min`/`std::max` break across Prism, USD and OpenImageIO headers).
+
+To point the build at classic TBB, use the shim in `cmake/compat/classic-tbb`.
+It loads the `TBBConfig.cmake` that ships with the classic release and adds
+`NOMINMAX` to `TBB::tbb`:
+
+```
+cmake -B build -DPRISM_STRICT_DEPENDENCY_VERSIONS=OFF ^
+  -DTBB_DIR=<prism>/cmake/compat/classic-tbb -DPRISM_CLASSIC_TBB_ROOT=<tbb-2020.3>/tbb ...
+```
+
+`<tbb-2020.3>/tbb` is the directory of the official `oneapi-src/oneTBB`
+v2020.3 Windows zip that holds `include/`, `bin/` and `cmake/`. A host that
+already has its own TBB package config can use that instead; any config that
+defines `TBB::tbb` works. Set `PRISM_TBB_REDIST` to the classic `bin/intel64/vc14`
+directory so the runtime is found.
+
+USD's exported `TBB::tbb` sets `TBB_USE_DEBUG=1` for `RelWithDebInfo`, which
+classic TBB's headers turn into a link to the debug runtime. A stack built on
+classic TBB therefore has to build USD and Prism as `Release`.
+
+### MaterialX
+
+`DocumentLoader` (`src/materialx/loader.cpp`) repairs graphs as the 1.39.5
+library writes them. The range it was tested against is
+`DocumentLoader::kTestedMaterialXMin`/`kTestedMaterialXMax`, one place in
+`loader.h`. Outside it, the first load in the process prints one
+`[MaterialX] WARNING` saying the repairs may not apply or may apply wrongly;
+nothing else changes. The range is the single version 1.39.5: the standalone
+`tests/` project (the `materialx_loader_*` tests) was also built against
+1.39.3 and 1.39.4. On 1.39.3 `materialx_loader_dielectric` fails (no Fresnel
+layer found on glTF clearcoat) and on 1.39.4 `materialx_loader_dielectric`
+and `materialx_loader_eon` fail, so neither is in the range. Renders on those
+versions were not compared.
