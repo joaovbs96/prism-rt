@@ -319,13 +319,12 @@ std::string &lookupError() noexcept
 
 OIIO::TextureOpt::Wrap wrap(TextureWrap value)
 {
-    using W = OIIO::TextureOpt::Wrap;
     switch (value) {
     case TextureWrap::Black: return OIIO::TextureOpt::WrapBlack;
     case TextureWrap::Clamp: return OIIO::TextureOpt::WrapClamp;
     case TextureWrap::Periodic: return OIIO::TextureOpt::WrapPeriodic;
     case TextureWrap::Mirror: return OIIO::TextureOpt::WrapMirror;
-    case TextureWrap::PeriodicPow2: return W::PeriodicPow2;
+    case TextureWrap::PeriodicPow2: return OIIO::TextureOpt::WrapPeriodicPow2;
     case TextureWrap::Shadow: return OIIO::TextureOpt::WrapBlack;
     default: return OIIO::TextureOpt::WrapDefault;
     }
@@ -1005,7 +1004,13 @@ TextureService::TextureService(TextureServiceOptions options) : m_impl(std::make
 {
     m_impl->options = std::move(options);
     m_impl->writers.maxThreads = WriterThreads(m_impl->options.writerThreads);
+#ifdef OIIO_TEXTURESYSTEM_CREATE_SHARED
     m_impl->system = OIIO::TextureSystem::create(false);
+#else
+    // OIIO before 3.0 returns a raw pointer that TextureSystem::destroy frees.
+    m_impl->system = std::shared_ptr<OIIO::TextureSystem>(
+        OIIO::TextureSystem::create(false), [](OIIO::TextureSystem *system) { OIIO::TextureSystem::destroy(system); });
+#endif
     if (!m_impl->system) throw std::runtime_error("cannot create OIIO TextureSystem");
     if (!m_impl->system->attribute("max_memory_MB", static_cast<int>(memoryBudgetMB(m_impl->options.memoryMiB))))
         throw std::runtime_error("cannot configure OIIO texture cache budget");

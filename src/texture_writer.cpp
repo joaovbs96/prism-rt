@@ -55,7 +55,11 @@ public:
 #endif
     }
     bool opened() const override { return !m_failed; }
+#if OIIO_VERSION >= OIIO_MAKE_VERSION(3, 0, 0)
     int64_t tell() const override { return m_pos; }
+#else
+    int64_t tell() override { return m_pos; }
+#endif
     bool seek(int64_t offset) override
     {
         m_pos = offset;
@@ -100,7 +104,11 @@ public:
         return size;
     }
     size_t size() const override { return static_cast<size_t>(m_size); }
+#if OIIO_VERSION >= OIIO_MAKE_VERSION(3, 0, 0)
     void flush() override {}
+#else
+    void flush() const override {}
+#endif
     // Makes the written bytes durable; false if any write failed.
     bool finish()
     {

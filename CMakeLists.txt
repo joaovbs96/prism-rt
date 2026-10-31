@@ -38,6 +38,10 @@ if(MSVC)
     # USD template-heavy sources exceed the default object section limit.
     add_compile_options(/bigobj)
 endif()
+if(WIN32)
+    # windows.h (pulled in by classic TBB and others) must not define min/max macros.
+    add_compile_definitions(NOMINMAX)
+endif()
 if(NOT MSVC)
     # System packages such as Apple's OpenGL framework only provide a
     # configuration-less location; an empty entry selects it as last resort.
