@@ -387,6 +387,17 @@ struct PrimKeyHash {
 
 using CanonicalPrimIds = std::unordered_map<PrimKey, int, PrimKeyHash>;
 
+// The paths of an unordered set in path order. SdfPath hashes come from the
+// path pool's handles, so a set lists its paths in an order that changes from
+// process to process; work that attaches placements (their Embree ids order
+// the light table's emitters) walks the paths in this order instead.
+std::vector<SdfPath> _SortedPaths(std::unordered_set<SdfPath, SdfPath::Hash> const &paths)
+{
+    std::vector<SdfPath> result(paths.begin(), paths.end());
+    std::sort(result.begin(), result.end());
+    return result;
+}
+
 struct InstanceLevel {
     SdfPath instancerPath;
     int sourceIndex = -1;
@@ -3356,7 +3367,7 @@ bool _UpdatePlacements(HdSceneIndexBaseRefPtr const &index, Snapshot *snapshot,
     }
 
     bool changedTopology = false;
-    for (auto const &path : prototypes) {
+    for (auto const &path : _SortedPaths(prototypes)) {
         if (cancelled && cancelled()) return false;
         auto prototype = snapshot->prototypes.find(path);
         // Evicted prototypes have logical records but no physical placements;
@@ -3694,7 +3705,7 @@ bool _UpdateStructuralLeaves(HdSceneIndexBaseRefPtr const &retained,
         }
     }
     for (auto const &path : paths) externalPrototypes.erase(path);
-    for (auto const &path : paths) {
+    for (auto const &path : _SortedPaths(paths)) {
         if (cancel && cancel()) return false;
         ++snapshot->lastStructuralPathsUpdated;
         snapshot->evictedPrototypes.erase(path);
@@ -5397,7 +5408,9 @@ bool SceneBridge::Prepare(CameraState const &camera,
                 _impl->captureQueued.insert(SdfPath::AbsoluteRootPath());
             } else {
                 _impl->captureScene = _impl->retainedSceneCache;
-                for (SdfPath const &path : _impl->dirtyPaths)
+                // In path order: the retained index lists new children in
+                // the order they are added, and later builds walk it.
+                for (SdfPath const &path : _SortedPaths(_impl->dirtyPaths))
                     if (_impl->captureQueued.insert(path).second)
                         _impl->captureQueue.push_back(path);
             }

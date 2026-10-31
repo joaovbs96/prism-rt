@@ -704,6 +704,7 @@ if(PRISM_BUILD_HYDRA)
             tests/hydra/visibility_retention_test.cpp
             tests/hydra/dependency_updates_test.cpp
             tests/hydra/structural_updates_test.cpp
+            tests/hydra/hash_order_test.cpp
             tests/hydra/accumulation_integration_test.cpp
             tests/hydra/adaptive_publication_integration_test.cpp
         tests/hydra/progressive_integration_test.cpp
@@ -732,6 +733,12 @@ if(PRISM_BUILD_HYDRA)
             COMMAND prism_hydra_scene_bridge_test progress-status)
         set_tests_properties(prism_hydra_progress_status PROPERTIES
             ENVIRONMENT "${_prism_test_environment}")
+        # Edits give the same image whatever the hash order of the edited
+        # paths (placement updates, structural additions), on the CPU.
+        add_test(NAME prism_hydra_hash_order
+            COMMAND prism_hydra_scene_bridge_test hash-order)
+        set_tests_properties(prism_hydra_hash_order PROPERTIES
+            ENVIRONMENT "${_prism_test_environment};PRISM_DISABLE_VULKAN=1")
         # The edit racing the spare-bank job (both orderings) alone, on the CPU.
         add_test(NAME prism_hydra_spare_bank_edit
             COMMAND prism_hydra_scene_bridge_test spare-bank-edit cpu)

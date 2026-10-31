@@ -63,6 +63,7 @@ int RunB3FallbackOpacityIntegrationTests();
 int RunC2GeometricAovIntegrationTests();
 int RunSnapshotScalingTests();
 int RunCachedCountTests();
+int RunHashOrderTests();
 
 namespace {
 
@@ -1166,6 +1167,9 @@ int main(int argc, char **argv)
     // `progress-status` runs only the progress statistics check.
     if (argc == 2 && std::string(argv[1]) == "progress-status")
         return RunProgressStatusTests();
+    // `hash-order` runs only the hash-order checks (CPU device).
+    if (argc == 2 && std::string(argv[1]) == "hash-order")
+        return RunHashOrderTests();
     // `spare-bank-edit auto|cpu|vulkan|metal` runs only the edit-during-spare-job
     // check (case C) on that device.
     prism::device::DevicePreference spareDevice{};
