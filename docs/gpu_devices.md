@@ -1401,6 +1401,12 @@ called done there.
   the Mac: a Hydra render at 1920x1080 (several chunks) on `--device metal`
   is bit-identical to the previous build's, and an edit sequence
   (`prism_hydra_render ... --edit-sequence 3 <prim>`) still converges.
+- **Parallel Hydra scene capture** (`src/hydra/scene_bridge.cpp`, written on
+  Windows, the Metal device unbuilt): Prepare reads and copies a batch of
+  prims in parallel and skips containers no converter reads; nothing
+  device-specific. Check on the Mac: a usdview session on a many-prim stage
+  stays responsive while it loads and during edits, and a Hydra render on
+  `--device metal` is bit-identical to the previous build's.
 
 ## Diagnostics
 

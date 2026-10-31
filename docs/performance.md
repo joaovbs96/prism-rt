@@ -441,6 +441,40 @@ program, so they compiled quickly already; the gain is with several
 structures (features.gltf). The first MaterialX material of a commit still
 compiles alone, since it loads the MDL modules every generated material
 imports.
+## Hydra scene capture (2026-10-31)
+
+CPU only (`PRISM_DISABLE_VULKAN=1`), `prism_hydra_render` at 160x90, 4 spp,
+`--seed 0 --adaptive-threshold 0`, each run under a 24 GB job cap,
+`PRISM_LOAD_PROFILE=1`. The previous build (main) and the new one ran in
+alternating rounds in one session; medians of 3. Synthetic stages: N cube
+meshes (one Xform each, under two group levels, 8 UsdPreviewSurface
+materials), and N instanceable Xforms of a two-mesh class. Capture is the
+`capture_ms` of the `capture.done` mark (time inside Prepare); wall is
+`capture.start` to `capture.done`, which also counts the host's render calls
+and 10 ms polls between slices.
+
+| Scene | Hydra prims | Capture ms, old -> new | Ratio | Capture wall, s | First preview, s |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1,024 meshes | 2,132 | 264 -> 23 | 0.09 | 0.32 -> 0.02 | 1.27 -> 1.41 (noise) |
+| 4,096 meshes | 8,480 | 1,030 -> 89 | 0.09 | 1.24 -> 0.10 | 2.43 -> 1.45 |
+| 16,384 meshes | 33,872 | 8,974 -> 350 | 0.04 | 10.87 -> 0.43 | 14.19 -> 2.79 |
+| 1,024 instances | 1,115 | 51 -> 15 | 0.29 | 0.06 -> 0.02 | 1.15 -> 1.10 |
+| 4,096 instances | 4,391 | 206 -> 53 | 0.26 | 0.25 -> 0.06 | 1.27 -> 1.19 |
+| 16,384 instances | 17,495 | 888 -> 201 | 0.23 | 1.06 -> 0.22 | 2.84 -> 1.97 |
+| MaterialEggs countertop | 274 | 597 -> 184 | 0.31 | 0.70 -> 0.21 | material-bound (~23-28 s, noise) |
+| Chess | 151 | 272 -> 84 | 0.31 | 0.33 -> 0.10 | 3.53 -> 4.08 (noise) |
+
+The old capture grew faster than the prim count (0.12 ms per prim at 8k,
+0.27 ms at 34k); the new one stays about 0.01 ms per prim. A per-name timer
+of the old capture (16,384 meshes) put the time in UsdImaging's data sources
+during the copy: `primvars` 1.3 s, `usdMaterialBindings` 1.35 s,
+`materialBindings` 1.2 s, `mesh` 0.9 s, `__usdPrimInfo` 0.34 s, the rest under
+0.2 s each; the queue, record map and retained-index inserts were under 0.1 s.
+One chess round of the new build took 591 ms while the MDL prewarm held the
+workers. Every image (36 synthetic, 12 countertop/chess with a cold first
+round, and 3-step transform edit sequences on 4,096 meshes, 4,096 instances
+and a countertop egg) is bit-identical to the old build's.
+
 ## GPU pass pipeline, guides and edits (2026-10-31)
 
 Performance batch 3, GPU part (Vulkan, RTX 4070 Ti, 1920x1080 unless noted,
