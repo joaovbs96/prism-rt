@@ -127,9 +127,12 @@ void PrismTaskDelegate::SetTerminalSceneIndex(
         _taskContext = _transport->GetTaskContext();
         _sourceSceneIndex = _transport->GetSourceSceneIndex();
         _selectionSettings = _taskContext->selectionSettings;
-    } else {
-        // Also keep the legacy CreateDelegate/HdRenderIndex path functional.
-        _sourceSceneIndex = terminalSceneIndex;
+    } else if (terminalSceneIndex) {
+        // A host that builds its own HdRenderIndex for the delegate
+        // (HdRenderIndex::New, as Hydra 1 hosts do) bypasses the plugin's
+        // _CreateRenderer and its filters: apply them here, so implicit
+        // surfaces, light linking and render settings work in such hosts too.
+        _sourceSceneIndex = PrismAppendSceneFilters(terminalSceneIndex);
     }
     if (!_sourceSceneIndex)
         return;
@@ -173,8 +176,13 @@ HdResourceRegistrySharedPtr PrismTaskDelegate::GetResourceRegistry() const
 HdRenderPassSharedPtr PrismTaskDelegate::CreateRenderPass(
     HdRenderIndex *index, HdRprimCollection const &collection)
 { return std::make_shared<PrismRenderPass>(index, collection, _bridge, _thread); }
-HdInstancer *PrismTaskDelegate::CreateInstancer(HdSceneDelegate *, SdfPath const &)
-{ return nullptr; }
+// The bridge reads instancers from the scene index, but a host's own render
+// index (HdRenderIndex::New) inserts every instancer it is given and later
+// marks it dirty: without an instancer to track, its change tracker reports a
+// coding error for each one. A plain HdInstancer, never synced, keeps the
+// tracker consistent.
+HdInstancer *PrismTaskDelegate::CreateInstancer(HdSceneDelegate *delegate, SdfPath const &id)
+{ return new HdInstancer(delegate, id); }
 void PrismTaskDelegate::DestroyInstancer(HdInstancer *p) { delete p; }
 HdRprim *PrismTaskDelegate::CreateRprim(TfToken const &, SdfPath const &)
 { return nullptr; }

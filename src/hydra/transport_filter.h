@@ -4,6 +4,15 @@
 #include <cstdint>
 namespace prism::hydra { struct TaskContext; }
 PXR_NAMESPACE_OPEN_SCOPE
+// The scene index filters hdPrism's converters rely on: implicit surfaces
+// (cube, cone, cylinder, capsule, plane) as meshes, CPU-computed primvars as
+// values, light/shadow-link collections as categories, and render settings
+// prims with their `active` flag and only prism:* settings. The plugin's
+// _CreateRenderer applies them before the transport filter; a host that gives
+// the delegate its own render index (HdRenderIndex::New) gets them in
+// SetTerminalSceneIndex. Applying them to a scene that has them already
+// changes nothing.
+HdSceneIndexBaseRefPtr PrismAppendSceneFilters(HdSceneIndexBaseRefPtr const& input);
 // Only presentation/control data enters the private legacy task index.
 class PrismTransportFilter final : public HdSingleInputFilteringSceneIndexBase {
 public:

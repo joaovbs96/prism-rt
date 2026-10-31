@@ -7,7 +7,37 @@
 #include <pxr/imaging/hd/selectionsSchema.h>
 #include <pxr/imaging/hd/tokens.h>
 #include <pxr/imaging/hdx/colorizeSelectionTask.h>
+#include <pxr/imaging/hdsi/implicitSurfaceSceneIndex.h>
+#include <pxr/imaging/hdsi/lightLinkingSceneIndex.h>
+#include <pxr/imaging/hdsi/extComputationPrimvarPruningSceneIndex.h>
+#include <pxr/imaging/hdsi/renderSettingsFilteringSceneIndex.h>
 PXR_NAMESPACE_OPEN_SCOPE
+HdSceneIndexBaseRefPtr PrismAppendSceneFilters(HdSceneIndexBaseRefPtr const& input)
+{
+    const auto toMesh = HdRetainedTypedSampledDataSource<TfToken>::New(
+        HdsiImplicitSurfaceSceneIndexTokens->toMesh);
+    const auto conversion = HdRetainedContainerDataSource::New(
+        HdPrimTypeTokens->cube, toMesh,
+        HdPrimTypeTokens->cone, toMesh,
+        HdPrimTypeTokens->cylinder, toMesh,
+        HdPrimTypeTokens->capsule, toMesh,
+        HdPrimTypeTokens->plane, toMesh);
+    auto converted = HdsiImplicitSurfaceSceneIndex::New(input, conversion);
+    // Pull CPU-computed primvars as ordinary values before owner-thread
+    // snapshot capture severs their live data-source handles.
+    auto computed = HdSiExtComputationPrimvarPruningSceneIndex::New(converted);
+    // Light/shadow-link collections become categories on lights and geometry.
+    auto linked = HdsiLightLinkingSceneIndex::New(computed, nullptr);
+    // Render settings prims get their `active` flag (from the scene globals'
+    // active render settings path) and only prism:* namespaced settings
+    // (docs/hydra.md, "Render settings and products").
+    VtArray<TfToken> prefixes{TfToken("prism:")};
+    return HdsiRenderSettingsFilteringSceneIndex::New(linked,
+        HdRetainedContainerDataSource::New(
+            HdsiRenderSettingsFilteringSceneIndexTokens->namespacePrefixes,
+            HdRetainedTypedSampledDataSource<VtArray<TfToken>>::New(prefixes)));
+}
+
 namespace {
 bool IsTransport(HdSceneIndexPrim const& p) {
     return p.primType == HdPrimTypeTokens->camera ||
