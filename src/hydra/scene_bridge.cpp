@@ -1527,12 +1527,14 @@ bool _AppendMesh(HdSceneIndexBaseRefPtr const &sceneIndex,
     placementBinding.fallback = material;
     // Storage may be shared with other snapshots, so materials live only in
     // this placement binding, never on the mesh.
+    // Triangles outside the subsets keep the fallback (a null entry).
     if (!faceMaterials.empty()) {
+        std::vector<Material *> table(info.coarseFaces.size(), nullptr);
         for (size_t triangle = 0; triangle < info.coarseFaces.size(); ++triangle) {
             auto const found = faceMaterials.find(info.coarseFaces[triangle]);
-            placementBinding.triangles.emplace(static_cast<int>(triangle),
-                found == faceMaterials.end() ? material : found->second);
+            if (found != faceMaterials.end()) table[triangle] = found->second;
         }
+        placementBinding.triangles = TriangleMaterials(std::move(table));
     }
 
     std::shared_ptr<PrototypeStorage> storage = prepared->storage;
@@ -1701,14 +1703,15 @@ void _FlushSphereBatches(Snapshot *snapshot)
         const size_t batchIndex = snapshot->sphereBatches.size();
         snapshot->scene->geometry.emplace(record.geomId, batch.get());
         snapshot->sphereBatchPrimIds.emplace(record.geomId, record.primIds);
-        auto &binding = snapshot->scene->placement_materials[record.geomId];
+        std::vector<Material *> table(batch->entries.size(), nullptr);
         for (size_t entry = 0; entry < batch->entries.size(); ++entry) {
-            binding.triangles[static_cast<unsigned int>(entry)] =
-                batch->entries[entry].material;
+            table[entry] = batch->entries[entry].material;
             snapshot->sphereBatchLocations[record.paths[entry]] =
                 {batchIndex, entry};
             _IndexSphereBatchDependency(snapshot, record.paths[entry], batchIndex);
         }
+        snapshot->scene->placement_materials[record.geomId].triangles =
+            TriangleMaterials(std::move(table));
         snapshot->estimatedGeometryBytes +=
             batch->entries.size() * 4 * sizeof(float);
         snapshot->geometries.emplace_back(batch);
@@ -1887,8 +1890,7 @@ bool _RefreshSphereBatches(
             Material *material = _BaseMaterial(
                 index, path, prim, materials, snapshot);
             record.geometry->entries[entry] = {center, worldRadius, material};
-            snapshot->scene->placement_materials[record.geomId].triangles[
-                static_cast<unsigned int>(entry)] = material;
+            snapshot->scene->placement_materials[record.geomId].triangles.set(entry, material);
             ++snapshot->sphereBatchEntriesUpdated;
         }
         float *vertices = static_cast<float *>(rtcGetGeometryBufferData(
@@ -1923,10 +1925,11 @@ void _AttachSphereBatches(Snapshot *snapshot)
             snapshot->scene->scene, record.geometry->geom);
         snapshot->scene->geometry[record.geomId] = record.geometry.get();
         snapshot->sphereBatchPrimIds[record.geomId] = record.primIds;
-        auto &binding = snapshot->scene->placement_materials[record.geomId];
+        std::vector<Material *> table(record.geometry->entries.size(), nullptr);
         for (size_t entry = 0; entry < record.geometry->entries.size(); ++entry)
-            binding.triangles[static_cast<unsigned int>(entry)] =
-                record.geometry->entries[entry].material;
+            table[entry] = record.geometry->entries[entry].material;
+        snapshot->scene->placement_materials[record.geomId].triangles =
+            TriangleMaterials(std::move(table));
     }
 }
 
@@ -4028,8 +4031,8 @@ void _RefreshMaterials(HdSceneIndexBaseRefPtr const &index,
             _RecordMaterialUser(snapshot, materialPath, path);
         Material *material = _BaseMaterial(index, path, prim, materials, snapshot);
         batch.geometry->entries[location->second.entry].material = material;
-        snapshot->scene->placement_materials[batch.geomId].triangles[
-            static_cast<unsigned int>(location->second.entry)] = material;
+        snapshot->scene->placement_materials[batch.geomId].triangles.set(
+            location->second.entry, material);
         ++snapshot->materialBindingsUpdated;
         ++snapshot->sphereBatchEntriesUpdated;
     };
@@ -4073,12 +4076,12 @@ void _RefreshMaterials(HdSceneIndexBaseRefPtr const &index,
         if (faceMaterials.empty()) {
             return;
         }
+        std::vector<Material *> table(prototype.coarseFaces.size(), nullptr);
         for (size_t triangle = 0; triangle < prototype.coarseFaces.size(); ++triangle) {
             auto material = faceMaterials.find(prototype.coarseFaces[triangle]);
-            if (material != faceMaterials.end())
-                prototype.binding.triangles.emplace(
-                    static_cast<int>(triangle), material->second);
+            if (material != faceMaterials.end()) table[triangle] = material->second;
         }
+        prototype.binding.triangles = TriangleMaterials(std::move(table));
     };
     if (paths.empty()) {
         for (auto &[path, prototype] : snapshot->prototypes)

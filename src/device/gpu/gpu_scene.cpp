@@ -467,9 +467,8 @@ GpuSceneData BuildGpuScene(SceneManager& scene)
             Material* material = nullptr;
             bool resolved = false;
             if (binding != scene.placement_materials.end()) {
-                auto triangle = binding->second.triangles.find(int(prim));
-                if (triangle != binding->second.triangles.end()) {
-                    material = triangle->second;
+                if (Material* triangle = binding->second.triangles.at(size_t(prim))) {
+                    material = triangle;
                     resolved = true;
                 } else if (binding->second.fallback) {
                     material = binding->second.fallback;

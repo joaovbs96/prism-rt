@@ -114,7 +114,7 @@ void ForEachPlacementMaterial(SceneManager& scene, int id, Geometry* geometry, F
 {
     if (auto binding = scene.placement_materials.find(id); binding != scene.placement_materials.end()) {
         if (binding->second.fallback) visit(binding->second.fallback);
-        for (auto const& [primitive, material] : binding->second.triangles) visit(material);
+        binding->second.triangles.forEach(visit);
     }
     if (auto* mesh = dynamic_cast<Mesh*>(geometry)) {
         if (mesh->material_override) visit(mesh->material_override);
@@ -126,8 +126,7 @@ inline Material* PrimitiveMaterial(SceneManager& scene, int id, Geometry* geomet
                                    bool instanced)
 {
     if (auto binding = scene.placement_materials.find(id); binding != scene.placement_materials.end()) {
-        auto triangle = binding->second.triangles.find(int(primitive));
-        if (triangle != binding->second.triangles.end()) return triangle->second;
+        if (Material* triangle = binding->second.triangles.at(size_t(primitive))) return triangle;
         if (binding->second.fallback) return binding->second.fallback;
     }
     try {

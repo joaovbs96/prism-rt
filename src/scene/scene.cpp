@@ -601,6 +601,11 @@ struct ShapeStorage {
     // The materials of the key, alive while the entry is: their addresses
     // are part of the key.
     std::vector<std::shared_ptr<Material>> keyMaterials;
+    // The last per-triangle binding made (BindingOf) and its slot materials:
+    // placements of the shape with the same materials share the table.
+    std::vector<Material*> bindingMaterials;
+    TriangleMaterials bindingTriangles;
+    bool bindingMade = false;
 
     ~ShapeStorage()
     {
@@ -687,14 +692,19 @@ struct Revision {
 // A placement's materials: slot 0 for the placement, and per triangle the
 // materials of the other slots (face slots, or the triangle slots of a
 // displaced triangle list).
-static SceneManager::PlacementMaterialBinding BindingOf(ShapeStorage const* shape, std::vector<Material*> const& materials)
+static SceneManager::PlacementMaterialBinding BindingOf(ShapeStorage* shape, std::vector<Material*> const& materials)
 {
     SceneManager::PlacementMaterialBinding binding;
     binding.fallback = materials[0];
     if (!shape) return binding;
     BufferView const& faceSlots = shape->faceSlots;
     if (!faceSlots.empty() || !shape->triangleSlots.empty()) {
+        if (shape->bindingMade && shape->bindingMaterials == materials) {
+            binding.triangles = shape->bindingTriangles;
+            return binding;
+        }
         const size_t triangles = shape->mesh->indices.size() / 3;
+        std::vector<Material*> table(triangles, nullptr);
         for (size_t t = 0; t < triangles; ++t) {
             int slot = 0;
             if (!shape->triangleSlots.empty()) {
@@ -705,8 +715,12 @@ static SceneManager::PlacementMaterialBinding BindingOf(ShapeStorage const* shap
             }
             if (slot <= 0) continue;
             Material* material = size_t(slot) < materials.size() ? materials[size_t(slot)] : nullptr;
-            binding.triangles[int(t)] = material ? material : materials[0];
+            table[t] = material ? material : materials[0];
         }
+        binding.triangles = TriangleMaterials(std::move(table));
+        shape->bindingMaterials = materials;
+        shape->bindingTriangles = binding.triangles;
+        shape->bindingMade = true;
     }
     return binding;
 }

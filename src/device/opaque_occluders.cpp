@@ -83,7 +83,7 @@ OpaqueOccluders OpaqueOccluders::Build(SceneManager& scene, bool culling)
         auto see = [&](Material* material) { (blocks(material) ? anyBlocks : anyPasses) = true; };
         if (bound) {
             if (bound->fallback) see(bound->fallback); // null: the geometry's own
-            for (auto const& [primitive, material] : bound->triangles) see(material);
+            bound->triangles.forEach(see);
         }
         size_t primitives = 0;
         if (auto* mesh = dynamic_cast<Mesh*>(geometry)) {
@@ -117,8 +117,7 @@ OpaqueOccluders OpaqueOccluders::Build(SceneManager& scene, bool culling)
                 Material* material = nullptr;
                 bool resolved = false;
                 if (bound) {
-                    auto triangle = bound->triangles.find(int(p));
-                    if (triangle != bound->triangles.end()) material = triangle->second, resolved = true;
+                    if (Material* triangle = bound->triangles.at(size_t(p))) material = triangle, resolved = true;
                     else if (bound->fallback) material = bound->fallback, resolved = true;
                 }
                 if (!resolved) {

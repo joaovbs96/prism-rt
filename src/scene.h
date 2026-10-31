@@ -5,8 +5,10 @@
 #include <array>
 #include <algorithm>
 #include <cmath>
+#include <memory>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 #include <embree4/rtcore.h>
 #include <embree4/rtcore_common.h>
@@ -29,6 +31,51 @@
 // We need to add these, regardless, so it's better to do the two things at once.
 // We can, then, add the transforms at a certain timestep, which will create the additional
 // buffers, if the timestep is different than 0.
+
+// The materials of a placement's triangles that differ from its fallback: a
+// dense table indexed by primitive id, null where the fallback applies. The
+// placements of one prototype share the table; set() copies it first when
+// another binding still uses it.
+class TriangleMaterials
+{
+public:
+    TriangleMaterials() = default;
+    explicit TriangleMaterials(std::vector<Material *> table)
+    {
+        if (std::any_of(table.begin(), table.end(), [](Material *m) { return m != nullptr; }))
+            m_table = std::make_shared<std::vector<Material *>>(std::move(table));
+    }
+
+    // The primitive's own material, or null (the binding's fallback applies).
+    Material *at(size_t primitive) const
+    {
+        return m_table && primitive < m_table->size() ? (*m_table)[primitive] : nullptr;
+    }
+    Material *at(int primitive) const { return primitive < 0 ? nullptr : at(size_t(primitive)); }
+    bool empty() const { return !m_table; }
+    // The table's length (primitives past it have no material of their own).
+    size_t size() const { return m_table ? m_table->size() : 0; }
+
+    void set(size_t primitive, Material *material)
+    {
+        if (!m_table) m_table = std::make_shared<std::vector<Material *>>();
+        else if (m_table.use_count() > 1) m_table = std::make_shared<std::vector<Material *>>(*m_table);
+        if (primitive >= m_table->size()) m_table->resize(primitive + 1, nullptr);
+        (*m_table)[primitive] = material;
+    }
+
+    // Each material of the table once per run of equal entries.
+    template <class F> void forEach(F const &visit) const
+    {
+        if (!m_table) return;
+        Material *last = nullptr;
+        for (Material *material : *m_table)
+            if (material && material != last) visit(material), last = material;
+    }
+
+private:
+    std::shared_ptr<std::vector<Material *>> m_table;
+};
 
 class SceneManager
 {
@@ -292,8 +339,7 @@ public:
     {
         auto binding = placement_materials.find(hit.geomid);
         if (binding != placement_materials.end()) {
-            auto triangle = binding->second.triangles.find(hit.primid);
-            if (triangle != binding->second.triangles.end()) return triangle->second;
+            if (Material *triangle = binding->second.triangles.at(hit.primid)) return triangle;
             if (binding->second.fallback) return binding->second.fallback;
         }
         return geometry.at(hit.geomid)->getMaterial(hit.primid, hit.instid);
@@ -306,9 +352,8 @@ public:
                 ? hit.hit.instID[0] : hit.hit.geomID;
         auto binding = placement_materials.find(placementId);
         if (binding != placement_materials.end()) {
-            auto primitive = binding->second.triangles.find(hit.hit.primID);
-            if (primitive != binding->second.triangles.end())
-                return primitive->second;
+            if (Material *primitive = binding->second.triangles.at(size_t(hit.hit.primID)))
+                return primitive;
             if (binding->second.fallback) return binding->second.fallback;
         }
         const unsigned int instanceId =
@@ -342,7 +387,7 @@ public:
     std::unordered_map<int, PlacementTransform> placement_transforms;
     struct PlacementMaterialBinding {
         Material *fallback = nullptr;
-        std::unordered_map<int, Material *> triangles;
+        TriangleMaterials triangles;
     };
     std::unordered_map<int, PlacementMaterialBinding> placement_materials;
     // Placements disabled in the Embree scene (Hydra visibility). Embree
@@ -404,8 +449,8 @@ public:
         Material* material = nullptr;
         auto binding = placement_materials.find(placement);
         if (binding != placement_materials.end()) {
-            auto triangle = binding->second.triangles.find(primitive);
-            material = triangle != binding->second.triangles.end() ? triangle->second : binding->second.fallback;
+            material = binding->second.triangles.at(primitive);
+            if (!material) material = binding->second.fallback;
         }
         if (!material) {
             const unsigned instance = intersection_geometry.contains(placement) ? unsigned(placement)
