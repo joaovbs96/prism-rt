@@ -373,6 +373,8 @@ std::unique_ptr<UsdImagingGLEngine> MakeEngine()
     set("prism:adaptiveThreshold", VtValue(0.0f));
     set("prism:maxSampleRadiance", VtValue(0.0f));
     set("prism:lightSelection", VtValue(TfToken("spatial")));
+    // The public Scene's films are in the working space.
+    set("prism:colorManagement:outputSpace", VtValue(std::string("working")));
     engine->SetEnablePresentation(false);
     engine->SetRendererAovs({HdAovTokens->color});
     return engine;
