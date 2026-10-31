@@ -406,7 +406,7 @@ static std::filesystem::path TooLargeMarker(std::string const& source)
 }
 
 bool CompileVulkanKernel(std::string const& mdlCode, std::vector<uint32_t>* spirv, std::string* error,
-                         uint32_t programCount, bool lightAovs)
+                         uint32_t programCount, bool lightAovs, std::atomic<bool> const* cancel)
 {
     std::string source;
     if (!AssembleVulkanKernel(mdlCode, &source, error, lightAovs)) return false;
@@ -444,7 +444,12 @@ bool CompileVulkanKernel(std::string const& mdlCode, std::vector<uint32_t>* spir
         progress::Detail(Phase::Kernel, std::format("DXC to SPIR-V, {} MDL programs, {} KB HLSL",
                                                     programCount, source.size() >> 10));
         std::string reason;
-        if (!gpu::CompileHlsl(source, gpu::HlslTarget::Spirv, cacheDirectory, &bytes, &reason)) {
+        if (!gpu::CompileHlsl(source, gpu::HlslTarget::Spirv, cacheDirectory, &bytes, &reason, {}, nullptr, cancel)) {
+            // A cancelled compile says nothing about the kernel: not remembered.
+            if (gpu::HlslCancelled(reason)) {
+                if (error) *error = reason;
+                return false;
+            }
             if (gpu::HlslTooLarge(reason)) std::ofstream(tooLarge) << reason << '\n';
             if (error) *error = reason;
             std::lock_guard lock(failedMutex);
@@ -625,6 +630,8 @@ struct CallableSpeculation {
 };
 
 struct VulkanDevice::Impl {
+    // CancelPreparation: the device is about to go; preparation fails fast.
+    std::atomic<bool> cancelled{false};
     VkInstance instance = VK_NULL_HANDLE;
     VkPhysicalDevice physical = VK_NULL_HANDLE;
     VkDevice device = VK_NULL_HANDLE;
@@ -966,6 +973,7 @@ std::shared_ptr<vulkan::VulkanDenoiser> VulkanDevice::Impl::gpuDenoiser()
 
 VulkanDevice::Impl::~Impl()
 {
+    prism::load_profile::Scope profile("vulkan.destroy");
     if (!device) {
         if (instance) vkDestroyInstance(instance, nullptr);
         return;
@@ -2364,6 +2372,10 @@ bool VulkanDevice::Impl::compilePipeline(std::shared_ptr<const gpu::MdlShaderCod
     progress::Scope kernelPhase(Phase::Kernel);
     gpu::MdlShaderCode const& code = *shared;
     auto const generated = start;
+    if (cancelled.load()) {
+        if (error) *error = "preparation cancelled";
+        return false;
+    }
     if (code.perProgram) return buildCallablePipeline(shared, perProgramReason, error);
     // All but the smallest material sets use the callable pipeline: above the
     // size threshold (vulkan_material_calls.h), when DXC was found unable to
@@ -2386,7 +2398,7 @@ bool VulkanDevice::Impl::compilePipeline(std::shared_ptr<const gpu::MdlShaderCod
     }
     std::vector<uint32_t> spirv;
     progress::Detail(Phase::Kernel, "SPIR-V kernel");
-    if (!CompileVulkanKernel(code.code, &spirv, error, code.programCount, code.lightAovs)) {
+    if (!CompileVulkanKernel(code.code, &spirv, error, code.programCount, code.lightAovs, &cancelled)) {
         if (callableMode == vulkan::CallableMode::Auto && error && gpu::HlslTooLarge(*error))
             return buildCallablePipeline(shared, "the kernel is too large for DXC", error);
         return false;
@@ -2402,6 +2414,11 @@ bool VulkanDevice::Impl::compilePipeline(std::shared_ptr<const gpu::MdlShaderCod
         pipeline = found->second;
         pipelineCode = shared;
         return true;
+    }
+    // The driver's compile below cannot be interrupted: not started once cancelled.
+    if (cancelled.load()) {
+        if (error) *error = "preparation cancelled";
+        return false;
     }
     progress::Detail(Phase::Kernel, "creating the Vulkan pipeline");
     VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
@@ -3375,6 +3392,10 @@ bool VulkanDevice::Impl::ensureScene(SceneManager& scene, std::string* error)
         if (error) *error = failedError;
         return false;
     }
+    if (cancelled.load()) {
+        if (error) *error = "preparation cancelled";
+        return false;
+    }
     failedScene = nullptr;
     // Streaming stops while the scene's images change (and resumes for a
     // scene that streams).
@@ -3413,7 +3434,15 @@ bool VulkanDevice::Impl::ensureScene(SceneManager& scene, std::string* error)
     };
     std::shared_ptr<const gpu::MdlShaderCode> code;
     bool compile = false;
+    // Between steps, a cancel (teardown) ends the preparation; the scene is
+    // left unprepared (it would be prepared again, but the device goes).
+    auto stop = [&] {
+        if (!cancelled.load()) return false;
+        if (error) *error = "preparation cancelled";
+        return true;
+    };
     if (!prepareMaterials(&code, &compile, error)) return fail();
+    if (stop()) return fail();
     auto const piped = Clock::now();
     if (compile)
         compiled = std::async(std::launch::async, [this, code, &compileError,
@@ -3461,7 +3490,7 @@ bool VulkanDevice::Impl::ensureScene(SceneManager& scene, std::string* error)
     if (!buffers[kSlotFrame].buffer) upload(kSlotFrame, nullptr, sizeof(GpuFrame));
     for (int slot : {kSlotPixels, kSlotRng, kSlotOutput, kSlotAccumulation})
         if (!buffers[slot].buffer) upload(slot, nullptr, 16);
-    if (!flushUploads(error)) return fail();
+    if (!flushUploads(error) || stop()) return fail();
     if (gpu::GpuVerbose()) {
         uint64_t local = 0;
         int count = 0;
@@ -3476,12 +3505,12 @@ bool VulkanDevice::Impl::ensureScene(SceneManager& scene, std::string* error)
                                  : placement == Placement::Staged ? "staging copies" : "none: host memory");
     }
     auto const uploaded = Clock::now();
-    if (!uploadImages(error)) return fail();
+    if (!uploadImages(error) || stop()) return fail();
     if (!createFeedbackBuffers(streaming.sources.empty() ? 0u : uint32_t(d.images.size()), error)) return fail();
     auto const imaged = Clock::now();
     progress::SetTotal(Phase::Upload, 0);
     progress::Detail(Phase::Upload, "acceleration structures");
-    if (!buildAccelerationStructures(sameGeometry, error)) return fail();
+    if (stop() || !buildAccelerationStructures(sameGeometry, error)) return fail();
     geometryCurrent = true;
     auto const structured = Clock::now();
     progress::Detail(Phase::Upload, "waiting for the shaders");
@@ -3892,6 +3921,8 @@ bool VulkanDevice::RendersOnCpu(SceneManager& scene)
         m_cpuReason.clear();
         return false;
     }
+    // A cancelled preparation (the device goes away) is not a GPU failure.
+    if (m_impl->cancelled.load()) return true;
     if (error != m_cpuReason) {
         progress::Device("cpu (Vulkan fallback: " + FallbackSummary(error) + ")");
         std::cerr << LogPrefix() << error << '\n'
@@ -3922,7 +3953,16 @@ bool VulkanDevice::RenderPreview(SceneManager& scene, PreviewRequest const& requ
 
 void VulkanDevice::Prepare(SceneManager& scene)
 {
-    if (RendersOnCpu(scene)) m_cpu.Prepare(scene);
+    if (RendersOnCpu(scene) && !m_impl->cancelled.load()) m_cpu.Prepare(scene);
+}
+
+void VulkanDevice::CancelPreparation()
+{
+    m_impl->cancelled.store(true);
+    // Thread safe; the device and its shader set outlive this call (the
+    // caller holds the device).
+    if (m_impl->callableShaders) m_impl->callableShaders->cancel();
+    m_cpu.CancelPreparation();
 }
 
 bool VulkanDevice::AccumulationOutdated(SceneManager& scene)

@@ -4,6 +4,7 @@
 // Metal shader converter) and to SPIR-V for the Vulkan device.
 
 #include "../../internal_export.h"
+#include <atomic>
 #include <cstdint>
 #include <filesystem>
 #include <string>
@@ -34,10 +35,14 @@ struct HlslCompileStats {
 };
 
 // Compiles `stage` of `source`. The source and the output pass through
-// `workDirectory`.
+// `workDirectory`. When `cancel` turns true, DXC is stopped (Windows) and
+// the compile fails with an error HlslCancelled recognises; nothing is kept.
 PRISM_INTERNAL_API bool CompileHlsl(std::string const& source, HlslTarget target, std::filesystem::path const& workDirectory,
                  std::vector<char>* binary, std::string* error, HlslStage const& stage = {},
-                 HlslCompileStats* stats = nullptr);
+                 HlslCompileStats* stats = nullptr, std::atomic<bool> const* cancel = nullptr);
+
+// Whether a CompileHlsl error means it was cancelled.
+PRISM_INTERNAL_API bool HlslCancelled(std::string const& error);
 
 // The DXC executable, options and memory limit CompileHlsl uses for `target`
 // and `stage`, for keys of results cached by callers.

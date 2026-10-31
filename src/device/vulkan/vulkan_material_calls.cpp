@@ -915,6 +915,17 @@ MaterialCallShaders::~MaterialCallShaders()
     }
 }
 
+void MaterialCallShaders::cancel()
+{
+    m_cancel.store(true);
+    {
+        std::lock_guard lock(m_queueMutex);
+        m_stopping = true;
+        m_queue.clear();
+    }
+    m_queueReady.notify_all();
+}
+
 void MaterialCallShaders::prewarmRaygen(bool varyingEmitters)
 {
     if (!m_libraries) return;
@@ -1027,6 +1038,10 @@ std::shared_ptr<ShaderBuild> MaterialCallShaders::compile(std::string const& sou
         (gpu::SourceDigest(source + gpu::HlslCompilerSignature(gpu::HlslTarget::Spirv, kLibraryStage)) + ".spv");
     std::vector<char> bytes = ReadCacheFile(cached);
     if (!PlausibleSpirv(bytes)) {
+        if (m_cancel.load()) {
+            built->error = "cancelled";
+            return built;
+        }
         gpu::HlslCompileStats stats;
         std::string reason;
         bool ok;
@@ -1036,7 +1051,8 @@ std::shared_ptr<ShaderBuild> MaterialCallShaders::compile(std::string const& sou
             CompileMemorySlot memory(DxcCompileBytes(source.size(), raygen ? MaterialCallPart::Whole
                                                                            : CallablePart(source)));
             Dxc().acquire();
-            ok = gpu::CompileHlsl(source, gpu::HlslTarget::Spirv, directory, &bytes, &reason, kLibraryStage, &stats);
+            ok = gpu::CompileHlsl(source, gpu::HlslTarget::Spirv, directory, &bytes, &reason, kLibraryStage, &stats,
+                                  &m_cancel);
             Dxc().release();
         }
         built->dxcCompiled = true;
@@ -1061,6 +1077,11 @@ std::shared_ptr<ShaderBuild> MaterialCallShaders::compile(std::string const& sou
         return built;
     }
     if (!m_libraries) return built;
+    // Nobody waits for the library of a cancelled device.
+    if (m_cancel.load()) {
+        built->error = "cancelled";
+        return built;
+    }
 
     // The library: one stage, one general group.
     VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};

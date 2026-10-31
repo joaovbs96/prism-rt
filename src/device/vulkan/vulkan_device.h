@@ -4,6 +4,7 @@
 #include "../cpu_device.h"
 #include "../gpu/gpu_device.h"
 
+#include <atomic>
 #include <iosfwd>
 #include <memory>
 #include <string>
@@ -29,6 +30,7 @@ public:
     void RenderPass(SceneManager& scene, PassRequest const& request) override;
     bool RenderPreview(SceneManager& scene, PreviewRequest const& request) override;
     void Prepare(SceneManager& scene) override;
+    void CancelPreparation() override;
     bool AccumulationOutdated(SceneManager& scene) override;
     bool SettleTextures(SceneManager& scene, PassRequest const& request) override;
     TextureStreamingStats TextureStreaming() const override;
@@ -74,7 +76,8 @@ private:
 // The Vulkan kernel for the given MDL code, as SPIR-V (exposed for the shader compile test).
 // With lightAovs, the variant that also writes the light AOVs (PRISM_LIGHT_AOVS).
 PRISM_INTERNAL_API bool CompileVulkanKernel(std::string const& mdlCode, std::vector<uint32_t>* spirv, std::string* error,
-                         uint32_t programCount = 0, bool lightAovs = false);
+                         uint32_t programCount = 0, bool lightAovs = false,
+                         std::atomic<bool> const* cancel = nullptr);
 
 // Diagnostics without a Vulkan device: the GPU programs of the scene's materials and their SPIR-V sizes.
 void ReportVulkanPrograms(SceneManager& scene, std::ostream& out,

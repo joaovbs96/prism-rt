@@ -88,6 +88,8 @@ public:
     ProgressiveStats Stats() const;
     // Waits for device jobs (device preparation) to finish.
     void WaitForJobs();
+    // Asks the device a preparation job prepares to end early (teardown).
+    void CancelJobs();
 
     // The accumulation's completed passes; zero starts over at the next Run.
     std::atomic<uint64_t> samples{0};
@@ -145,6 +147,8 @@ private:
     uint64_t m_deviceSceneEpoch = 1;
     uint64_t m_devicePreparedEpoch = 0;
     std::future<void> m_devicePreparation;
+    // The device m_devicePreparation prepares (under m_mutex).
+    std::weak_ptr<device::RenderDevice> m_preparingDevice;
     uint64_t m_devicePreparationEpoch = 0;
     std::chrono::steady_clock::time_point m_devicePreparationStart;
     std::shared_ptr<device::RenderDevice> m_previewDevice;

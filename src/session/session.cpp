@@ -289,6 +289,9 @@ struct Session::Impl {
         std::string note;
     };
     std::future<CreatedDevice> deviceCreation;
+    // SessionAccess::cancelJobs ran: a device the creation job still delivers
+    // is cancelled too before it is dropped.
+    std::atomic<bool> jobsCancelled{false};
     device::DevicePreference deviceCreationPreference = device::DevicePreference::Auto;
     // What the device last saw: the scene revision and the generation of the
     // scene's render settings (another session may have changed them since).
@@ -1509,12 +1512,29 @@ HostedCounters SessionAccess::counters(Session const& session)
 
 session::ProgressiveStats SessionAccess::stats(Session const& session) { return session.m_impl->engine->Stats(); }
 
+void SessionAccess::cancelJobs(Session& session)
+{
+    Session::Impl& impl = *session.m_impl;
+    std::shared_ptr<device::RenderDevice> current;
+    {
+        std::lock_guard lock(impl.deviceMutex);
+        current = impl.device;
+    }
+    impl.jobsCancelled.store(true);
+    if (current) current->CancelPreparation();
+    impl.engine->CancelJobs();
+}
+
 void SessionAccess::waitForJobs(Session& session)
 {
     Session::Impl& impl = *session.m_impl;
     if (impl.deviceCreation.valid()) {
-        try { (void)impl.deviceCreation.get(); }
-        catch (...) {}
+        try {
+            // Dropping a new device here destroys it: its own background
+            // compiles (raygen prewarm, callables) end first when cancelled.
+            auto created = impl.deviceCreation.get();
+            if (created.device && impl.jobsCancelled.load()) created.device->CancelPreparation();
+        } catch (...) {}
     }
     impl.engine->WaitForJobs();
 }

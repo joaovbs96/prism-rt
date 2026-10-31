@@ -42,9 +42,10 @@ uint64_t DxcMemoryLimit()
 // Runs a command line (no shell) in a job limited to `memoryLimit` bytes,
 // capturing its output. Returns the exit code, or -1 if it did not start.
 int RunLimited(std::string command, uint64_t memoryLimit, std::string* log, bool* overMemory,
-               uint64_t* peakBytes)
+               uint64_t* peakBytes, std::atomic<bool> const* cancel, bool* cancelled)
 {
     *overMemory = false;
+    *cancelled = false;
     *peakBytes = 0;
     SECURITY_ATTRIBUTES inherit{sizeof(inherit), nullptr, TRUE};
     HANDLE readEnd = nullptr, writeEnd = nullptr;
@@ -90,6 +91,24 @@ int RunLimited(std::string command, uint64_t memoryLimit, std::string* log, bool
     ResumeThread(process.hThread);
     char buffer[4096];
     DWORD bytes = 0;
+    if (cancel) {
+        // Read what is there while waiting for the exit, so a cancel stops
+        // DXC within a few milliseconds (the exit itself wakes the wait).
+        for (;;) {
+            DWORD available = 0;
+            while (PeekNamedPipe(readEnd, nullptr, 0, nullptr, &available, nullptr) && available > 0 &&
+                   ReadFile(readEnd, buffer, std::min<DWORD>(sizeof(buffer), available), &bytes, nullptr) &&
+                   bytes > 0)
+                log->append(buffer, bytes);
+            if (WaitForSingleObject(process.hProcess, 5) == WAIT_OBJECT_0) break;
+            if (cancel->load(std::memory_order_relaxed)) {
+                *cancelled = true;
+                TerminateProcess(process.hProcess, 1);
+                WaitForSingleObject(process.hProcess, INFINITE);
+                break;
+            }
+        }
+    }
     while (ReadFile(readEnd, buffer, sizeof(buffer), &bytes, nullptr) && bytes > 0) log->append(buffer, bytes);
     WaitForSingleObject(process.hProcess, INFINITE);
     DWORD code = DWORD(-1);
@@ -190,10 +209,21 @@ std::string HlslCompilerSignature(HlslTarget target, HlslStage const& stage)
 
 bool HlslTooLarge(std::string const& error) { return error.find(kTooLarge) != std::string::npos; }
 
+namespace {
+constexpr const char* kCancelled = "DXC compile cancelled";
+}
+
+bool HlslCancelled(std::string const& error) { return error == kCancelled; }
+
 bool CompileHlsl(std::string const& source, HlslTarget target, std::filesystem::path const& workDirectory,
-                 std::vector<char>* binary, std::string* error, HlslStage const& stage, HlslCompileStats* stats)
+                 std::vector<char>* binary, std::string* error, HlslStage const& stage, HlslCompileStats* stats,
+                 std::atomic<bool> const* cancel)
 {
     const auto start = std::chrono::steady_clock::now();
+    if (cancel && cancel->load(std::memory_order_relaxed)) {
+        if (error) *error = kCancelled;
+        return false;
+    }
     const std::string stem = SourceDigest(source) +
         std::format(".{}", std::hash<std::thread::id>{}(std::this_thread::get_id()));
     const auto input = workDirectory / (stem + ".hlsl");
@@ -205,9 +235,18 @@ bool CompileHlsl(std::string const& source, HlslTarget target, std::filesystem::
     std::string log;
 #ifdef _WIN32
     const uint64_t memoryLimit = DxcMemoryLimit();
-    bool overMemory = false;
+    bool overMemory = false, cancelled = false;
     uint64_t peakBytes = 0;
-    const int status = RunLimited(command, memoryLimit, &log, &overMemory, &peakBytes);
+    const int status = RunLimited(command, memoryLimit, &log, &overMemory, &peakBytes, cancel, &cancelled);
+    if (cancelled) {
+        // Neither the partial output nor the source is kept.
+        std::error_code ignored;
+        std::filesystem::remove(output, ignored);
+        std::filesystem::remove(input, ignored);
+        binary->clear();
+        if (error) *error = kCancelled;
+        return false;
+    }
     if (stats) stats->peakBytes = peakBytes;
     if (overMemory)
         log = std::format("DXC {} of {} MiB (PRISM_DXC_MEMORY_MIB): the kernel of this scene's materials is "

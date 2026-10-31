@@ -111,6 +111,11 @@ struct PRISM_INTERNAL_API SessionAccess {
     static session::ProgressiveStats stats(Session const& session);
     // Waits for device jobs (creation, preparation) to finish.
     static void waitForJobs(Session& session);
+    // Before a teardown: asks the device being prepared to end its
+    // preparation early (RenderDevice::CancelPreparation), so that
+    // waitForJobs returns soon. The device is left unprepared; only
+    // destroying it follows.
+    static void cancelJobs(Session& session);
 };
 
 // The fraction of a progressive render that is done (SessionStatus::fraction,

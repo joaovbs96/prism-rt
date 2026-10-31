@@ -225,6 +225,11 @@ public:
     // Callables prefetched, and those of them finished (statistics).
     uint32_t prefetched() const { return m_prefetched.load(); }
     uint32_t prefetchedDone() const { return m_prefetchedDone.load(); }
+    // The device goes away (VulkanDevice::CancelPreparation): queued compiles
+    // are dropped, running DXC processes stopped, and every later compile
+    // fails at once; a driver compile already running finishes.
+    void cancel();
+    bool cancelled() const { return m_cancel.load(); }
 
 private:
     std::shared_ptr<ShaderBuild> compile(std::string const& source, bool raygen);
@@ -251,6 +256,7 @@ private:
     std::deque<std::string> m_queue;
     std::vector<std::thread> m_workers;
     bool m_stopping = false;
+    std::atomic<bool> m_cancel{false};
     uint32_t m_busy = 0;
     std::atomic<uint32_t> m_prefetched{0}, m_prefetchedDone{0};
 };

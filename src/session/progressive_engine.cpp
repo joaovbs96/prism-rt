@@ -302,6 +302,16 @@ ProgressiveEngine::~ProgressiveEngine()
     WaitForJobs();
 }
 
+void ProgressiveEngine::CancelJobs()
+{
+    std::shared_ptr<device::RenderDevice> device;
+    {
+        std::lock_guard lock(m_mutex);
+        device = m_preparingDevice.lock();
+    }
+    if (device) device->CancelPreparation();
+}
+
 void ProgressiveEngine::WaitForJobs()
 {
     // A preparation job owns its device and scene; let it finish.
@@ -423,6 +433,10 @@ bool ProgressiveEngine::AdvanceDevicePreparation(std::shared_ptr<device::RenderD
     }
     m_devicePreparationEpoch = epoch;
     m_devicePreparationStart = std::chrono::steady_clock::now();
+    {
+        std::lock_guard lock(m_mutex);
+        m_preparingDevice = device;
+    }
     // The job owns the scene (its holder's snapshot), so a published
     // replacement cannot free or edit the scene it is reading.
     m_devicePreparation = std::async(std::launch::async, [this, device, prepared] {

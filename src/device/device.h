@@ -262,6 +262,13 @@ public:
     // thread it can stop waiting for. Not concurrent with rendering calls;
     // SceneChanged may be called while it runs.
     virtual void Prepare(SceneManager& scene) { (void)scene; }
+    // Before the device is destroyed (a front end's teardown): ends running
+    // preparation work early (shader compiles, uploads; a single driver call
+    // already running finishes) and makes later preparation fail at once, so
+    // that destroying the device does not wait for work nobody will use. Any
+    // thread; the device renders nothing afterwards. Caches it writes are
+    // complete files or none.
+    virtual void CancelPreparation() {}
 
     virtual std::vector<float> RenderImage(SceneManager& scene, ImageRequest const& request) = 0;
     virtual void RenderPass(SceneManager& scene, PassRequest const& request) = 0;
