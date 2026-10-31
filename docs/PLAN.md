@@ -88,13 +88,17 @@ The handover for the main (orchestrating) session. Subagents don't read this fil
 - Now: steps 1a–1e (make global state explicit: context object, colour management, options, runtime caches, progress/logging), one phase, one commit series per step.
 - Reserve motion in the design even though motion blur comes later: time-sampled transforms and attributes (or velocity/acceleration) in the scene-building API, a shutter interval in the render settings, a per-sample time in the render path (`Ray.time` exists), so motion blur doesn't break the API or the Python bindings.
 
-### After the SDK: motion blur (Phase 8b), in stages
-Detailed plan, file references and decisions (accepted 2026-10-30): [motion_blur.md](motion_blur.md). Starts after the performance work (batch 1 and the render profiler, then batch 3 after profiling), with the stages regrouped into fewer, larger merges.
-1. A time per sample within the shutter; both loaders read the shutter and time samples.
-2. CPU camera and transform motion (Embree time steps).
-3. CPU deformation and velocities (time-sampled points, PointInstancer/mesh velocities); memory for the extra samples.
-4. GPU (Vulkan) minimum: one instant per pass, stratified across passes, acceleration-structure refit with interpolated transforms, compute-interpolated vertices for deformation (no NVIDIA-only motion extension). Decide after seeing the CPU result.
-5. Metal with its native motion blur, later.
+### Before motion blur: three smaller fixes (decided 2026-10-31)
+The performance work (batches 1–3 and the render profiler) is done and pushed. Motion blur waits until these are sorted out:
+1. Hydra scene capture costs about 1.8 ms per prim (30 s at 16k prims).
+2. The MaterialEggs countertop differs between the CLI and Hydra (NRMSE 0.037).
+3. An audit of Hydra code whose results depend on unordered-container order (the countertop's nondeterminism came from one).
+
+### Then: motion blur (Phase 8b), two merges
+Detailed plan, file references and decisions (accepted 2026-10-30): [motion_blur.md](motion_blur.md).
+- A. CPU motion blur, complete: a time per sample within the shutter, both loaders reading the shutter and time samples, camera and transform motion (Embree time steps), deformation and velocities (time-sampled points, PointInstancer/mesh velocities, UsdSkel).
+- B. GPU (Vulkan) minimum: one instant per pass, stratified across passes, acceleration-structure refit with interpolated transforms, interpolated vertices for deformation (no NVIDIA-only motion extension). Decided after seeing A's result.
+- Metal with its native motion blur, later.
 
 ### Later (from the original plan; see docs/feature_roadmap.md)
 - Curves; volumes (`docs/volumes.md`); tile texture streaming; the ALab GPU work (parked branch).

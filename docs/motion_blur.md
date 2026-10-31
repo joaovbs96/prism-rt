@@ -1,8 +1,9 @@
 # Motion blur plan (Phase 8b)
 
-Status: planned, not started. Decisions accepted by João on 2026-10-30; the work
-starts after the performance work (docs/PLAN.md). The stages below are to be
-regrouped into fewer, larger merges before starting. File references are as of `7e80fb7`.
+Status: planned, not started. Decisions accepted by João on 2026-10-30; the
+performance work is done (2026-10-31). The work starts after three smaller fixes
+(Hydra scene-capture cost, countertop CLI/Hydra difference, Hydra order audit)
+and lands as two merges (see "Merges"). File references are as of `7e80fb7`.
 
 ## Starting point
 
@@ -95,9 +96,19 @@ regrouped into fewer, larger merges before starting. File references are as of `
 - **Metal.** Renders one instant and reports `motionBlur = false` until its
   own stage.
 
-## Stages
+## Merges
 
-Each stage is one worktree and one merge, after the full serial ctest.
+The stages below land as two merges, each one worktree with a commit series per
+stage and the full serial ctest at the end (regrouped 2026-10-31):
+
+- **A. CPU motion blur, complete: stages 1–3.** Time plumbing, camera and
+  transform motion, deformation, velocities, PointInstancer and UsdSkel at each
+  time, in both loaders with their parity fixtures. Motion off stays
+  bit-identical.
+- **B. Vulkan: stage 4.** Starts after João has seen A's result (decision 4).
+- Metal (stage 5) stays for later.
+
+## Stages
 
 1. **Time plumbing (S, 2–3 days).**
    - Work:
