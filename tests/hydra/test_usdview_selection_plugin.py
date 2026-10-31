@@ -228,6 +228,42 @@ class UsdviewSelectionPluginTest(unittest.TestCase):
             bridge.deleteLater()
             window.close()
 
+    def test_ocio_input_follows_the_reported_aov_space(self):
+        update = prismUsdview.ocio_input_update
+        self.assertIsNone(update(None, "", ""))
+        self.assertEqual(update("Linear Rec.709 (sRGB)", "", ""), "Linear Rec.709 (sRGB)")
+        # Already set, or already followed (the user's menu choice stays).
+        self.assertIsNone(update("ACEScg", "", "ACEScg"))
+        self.assertIsNone(update("ACEScg", "ACEScg", "Raw"))
+        self.assertEqual(update("ACEScg", "Linear Rec.709 (sRGB)", "Raw"), "ACEScg")
+
+        class ViewSettings:
+            def __init__(self):
+                self.ocioSettings = type("OCIOSettings", (), {"colorSpace": ""})()
+                self.calls = []
+
+            def setOcioSettings(self, colorSpace="", display="", view=""):
+                self.calls.append((colorSpace, display, view))
+                self.ocioSettings.colorSpace = colorSpace
+
+        window = QtWidgets.QWidget()
+        api = _Api(window, {})
+        api.dataModel.viewSettings = ViewSettings()
+        prism_view = _FakeStageView(window, prismUsdview.RENDERER)
+        prism_view.settings[prismUsdview.AOV_COLOR_SPACE] = "Linear Rec.709 (sRGB)"
+        with mock.patch.object(prismUsdview, "StageView", _FakeStageView):
+            bridge = prismUsdview._SelectionBridge(api)
+            bridge._timer.stop()
+            bridge.sync()
+            bridge.sync()
+            # Only the input colour space: display and view stay usdview's.
+            self.assertEqual(api.dataModel.viewSettings.calls, [("Linear Rec.709 (sRGB)", "", "")])
+            prism_view.settings[prismUsdview.AOV_COLOR_SPACE] = "ACEScg"
+            bridge.sync()
+            self.assertEqual(api.dataModel.viewSettings.ocioSettings.colorSpace, "ACEScg")
+            bridge.deleteLater()
+            window.close()
+
     def test_first_empty_sync_writes_authoritative_empty_array(self):
         window = QtWidgets.QWidget()
         api = _Api(window, {Sdf.Path.absoluteRootPath: -1})

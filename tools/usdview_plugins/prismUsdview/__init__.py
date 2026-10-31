@@ -18,10 +18,14 @@ convergence). usdview stops
 repainting once the renderer converges, so the overlay runs on its own timer.
 It follows the HUD toggle and hides while the renderer is paused or stopped.
 
-Colour correction: PrismRT's colour AOV is linear in its working space (ACEScg
-by default), so usdview starts in its openColorIO mode when $OCIO is set (the
-launchers set ocio://studio-config-latest), from the config's scene_linear
-role (ACEScg). usdview saves the mode in its state file and starts in sRGB
+Colour correction: PrismRT's colour AOV is linear in its output space (linear
+Rec.709 by default, docs/color_management.md "Output space"), which usdview's
+sRGB mode shows correctly. usdview starts in its openColorIO mode when $OCIO
+is set (the launchers set ocio://studio-config-latest), for the config's view
+(ACES 2.0 SDR, like the CLI's 8-bit images); the extension sets its OCIO input
+colour space to the colour space PrismRT reports for the AOV
+(prism:colorManagement:aovColorSpace) whenever that changes, so both modes are
+right. usdview saves the mode in its state file and starts in sRGB
 otherwise. Set PRISM_USDVIEW_COLOR_CORRECTION to sRGB, disabled or
 openColorIO to choose another start-up mode, or to "saved" to keep usdview's
 saved one. The view is the config's default (for the studio config ACES 2.0
@@ -53,6 +57,21 @@ from . import environment
 
 SETTING = "prism:usdviewSelection"
 RENDERER = "HdPrismRendererPlugin"
+# Read-only: the OCIO name of the colour space the colour AOV is in.
+AOV_COLOR_SPACE = "prism:colorManagement:aovColorSpace"
+
+
+def ocio_input_update(reported, last_synced, current):
+    """The OCIO input colour space to set in usdview, or None to leave it.
+
+    The extension follows the space PrismRT reports only when that changes
+    (or at the first report), so a space chosen in usdview's OCIO menu stays
+    until the renderer's output space changes.
+    """
+    reported = str(reported or "")
+    if not reported or reported == last_synced:
+        return None
+    return reported if reported != current else None
 
 # usdview's ColorCorrectionModes (HdxColorCorrectionTokens).
 _COLOR_MODES = ("disabled", "sRGB", "openColorIO")
@@ -160,6 +179,8 @@ class _SelectionBridge(QtCore.QObject):
         super().__init__(api.qMainWindow)
         self._api = api
         self._views = set()
+        self._ocio_synced = ""
+        self._ocio_warned = False
         api.dataModel.selection.signalPrimSelectionChanged.connect(self.sync)
         # Plugins load before the viewport is constructed. This also discovers
         # a replacement viewport without retaining a renderer or patching it.
@@ -185,6 +206,26 @@ class _SelectionBridge(QtCore.QObject):
         # recreating it with the same ID) cannot leave stale selection state.
         if view.GetRendererSetting(SETTING) != value:
             view.SetRendererSetting(SETTING, value)
+        self._sync_ocio_input(view)
+
+    def _sync_ocio_input(self, view):
+        # usdview's openColorIO mode reads the AOV as the config's scene_linear
+        # role (ACEScg) unless an input colour space is set.
+        try:
+            reported = view.GetRendererSetting(AOV_COLOR_SPACE)
+            if not reported:
+                return
+            settings = self._api.dataModel.viewSettings
+            space = ocio_input_update(reported, self._ocio_synced,
+                                      settings.ocioSettings.colorSpace)
+            if reported:
+                self._ocio_synced = str(reported)
+            if space:
+                settings.setOcioSettings(colorSpace=space)
+        except Exception as error:  # Never break the selection bridge.
+            if not self._ocio_warned:
+                self._ocio_warned = True
+                Tf.Warn("prismUsdview OCIO input colour space: %s" % error)
 
     def eventFilter(self, watched, event):
         if event.type() == QtCore.QEvent.Paint:
