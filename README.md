@@ -4,114 +4,116 @@
 👋 Introduction
 ---------------------------------------
 
-PrismRT is a path tracer for OpenUSD, glTF and OBJ files with MaterialX materials (through NVIDIA MDL). It renders on the CPU (Embree, oneTBB) or on the GPU with hardware ray tracing (Metal on macOS, Vulkan on Windows/Linux), all running the same path tracer.
+PrismRT is a physically based path tracer for OpenUSD, glTF and OBJ scenes with MaterialX materials, compiled through NVIDIA MDL. It renders on the CPU (Embree, oneTBB) or on the GPU with hardware ray tracing (Vulkan on Windows, Metal on macOS), and every device runs the same path tracer.
 
-The optional PrismRT Hydra plugin renders in stock OpenUSD 26.08 usdview. Both frontends use the same render devices and MaterialX-to-MDL shading backend. See [Hydra usage](docs/hydra.md), [material support](docs/hydra_materials.md), and [Windows deployment](docs/deployment.md).
+You can use it through:
 
-Windows limits paths to 260 characters: extract the demo package (or create the Python environment) in a short folder such as `C:\PrismRT`, or enable long paths; PrismRT checks at start and says so ([path length](docs/deployment.md#path-length)).
+* **usdview and other Hydra hosts**, with the hdPrism render delegate ([Hydra usage](docs/hydra.md), [material support](docs/hydra_materials.md));
+* **the `PrismRT` command line**, for USD, glTF and OBJ files;
+* **C++**, through the `prism` library: public headers in `include/prism/` (`Renderer`, `Scene`, `Session`), design and API notes in [docs/sdk_design.md](docs/sdk_design.md);
+* **Python**, with the `prismrt` package: NumPy arrays in and out, progressive rendering, AOVs, USD loading ([docs/python.md](docs/python.md), [examples](examples/python)). For now it is built from source; see [docs/python.md](docs/python.md#wheel) for a Windows wheel.
 
-See [texture cache configuration](docs/texture_service.md) and the
-[validation report](docs/round3_validation.md) for measured performance,
-standalone/Hydra image comparisons, and remaining acceptance work.
+PrismRT is in active development, and its API may still change before 1.0. Builds and pre-releases are on the [Releases](https://github.com/joaovbs96/prism-rt/releases) page.
 
 
-✅ Feature List
+✅ Features
 ---------------------------------------
 
-* Render devices: CPU (Intel Embree, oneTBB) and GPU with hardware ray tracing (Metal, Vulkan), running one shared path tracer (see Render Devices below).
-* MaterialX materials compiled through NVIDIA MDL, on the CPU (native code) and on the GPU (HLSL).
-* 3D Model Mesh importer:
-    * OpenUSD (.usd, .usdz, .usda, .usdc) files
-    * glTF (.gltf, .glb) files
-    * .obj files
-* Analytical Geometry:
-    * Spheres
-    * Quads
-* OpenImageIO image loading and saving.
+**Rendering**
+* Unidirectional path tracing with next-event estimation and multiple importance sampling over a light table.
+* UsdLux lights (dome, distant, rect, disk, sphere, cylinder), `ShapingAPI` spotlights and IES profiles, textured emissive surfaces sampled as lights, light and shadow linking.
+* Random-walk subsurface scattering and absorbing transmission from the materials' volume coefficients.
+* Adaptive sampling, and denoising with Intel Open Image Denoise (on the CPU and Metal) or vk_oidn (on Vulkan), using albedo and normal guides ([denoising](docs/denoising.md)).
+* Colour management with OpenColorIO: an ACEScg working space by default, and the ACES 2.0 SDR view for 8-bit outputs ([colour management](docs/color_management.md)).
+
+**Materials**
+* Every material is MaterialX compiled through MDL, to native code on the CPU and to HLSL on the GPU: `standard_surface`, OpenPBR, `UsdPreviewSurface`, glTF PBR ([glTF](docs/gltf.md)), and OBJ/MTL as `open_pbr_surface` ([OBJ](docs/obj.md)).
+* Known MaterialX/MDL problems are repaired in memory at load time, never in your files ([compatibility notes](docs/materialx_compatibility.md)).
+* `PrismRT --material look.mtlx` renders a document on the USD Working Group's Standard Shader Ball ([material preview](docs/material_preview.md)).
+
+**Geometry and scenes**
+* Meshes with OpenSubdiv subdivision, load-time displacement, primvars, GeomSubsets, holes and left-handed orientation; analytic USD spheres.
+* Native instancing and PointInstancer, UsdSkel skinning, mesh purpose and visibility, `--time` for animated stages.
+* Incremental edits in Hydra and in the SDK's `Scene::commit`.
+
+**Output**
+* AOVs: albedo, normal, depth, position, diffuse, specular and emission lighting, and object/instance ids for masks and picking.
+* Multi-part EXR through OpenImageIO, and every RenderProduct of a scene's RenderSettings with its RenderVars as layers.
+
 
 🖥️ Render Devices
 ---------------------------------------
 
-Every device runs the same path tracer, [`shaders/integrator/path_tracer.h`](shaders/integrator/path_tracer.h): a C++ template that also compiles as HLSL, against a small per-device backend.
+The shared path tracer, [`shaders/integrator/path_tracer.h`](shaders/integrator/path_tracer.h), is a C++ template that also compiles as HLSL, on top of a small backend for each device.
 
-| Device | Platforms | Ray tracing | Shading |
+| Device | Platforms | Ray tracing | Status |
 | --- | --- | --- | --- |
-| `metal` | macOS on Apple GPUs (M1 and newer; hardware ray tracing from M3) | Metal acceleration structures, inline ray queries | HLSL kernel: DXC to DXIL, Metal shader converter; MDL materials in HLSL |
-| `vulkan` | Windows and Linux with `VK_KHR_ray_query` (NVIDIA RTX, AMD RX 6000+, Intel Arc) | Vulkan acceleration structures, inline ray queries | The same HLSL kernel, compiled to SPIR-V by DXC. Builds and compiles on macOS; not yet run-tested |
-| `cpu` | All | Embree | The path tracer as C++, the CPU materials and native MDL code |
+| `cpu` | Windows, macOS | Embree | The reference device. |
+| `vulkan` | Windows with `VK_KHR_ray_query` (NVIDIA RTX, AMD RX 6000+, Intel Arc) | Inline ray queries; the HLSL kernel compiled to SPIR-V by DXC | Tested on NVIDIA. |
+| `metal` | macOS on Apple silicon (M1 and newer; ray-tracing hardware from M3) | Inline ray queries; DXC to DXIL, then Apple's Metal shader converter | Tested on an M5. |
 
-The default `auto` picks Metal on macOS and Vulkan elsewhere, and falls back to `cpu` when no GPU device is usable. Choose a device with:
+The default `auto` picks Metal on macOS and Vulkan elsewhere, and falls back to `cpu` when no GPU device is usable. To choose a device:
 
-* the standalone renderer: `--device auto|cpu|vulkan|metal` (`PrismRT --list-devices` lists the available ones);
-* Hydra/usdview: the `PRISM_DEVICE` environment variable or the `prism:device` render setting.
+* command line: `--device auto|cpu|vulkan|metal` (`PrismRT --list-devices` lists them);
+* Hydra and usdview: the `PRISM_DEVICE` environment variable or the `prism:device` render setting.
 
-The GPU devices compile a kernel per scene material set the first time it is seen (about 30 s for the OpenChessSet scene) and cache it; later runs start in a few seconds. Primary AOVs and picking are traced on the CPU scene in every device.
-
-Mac GPU vs CPU on an Apple M5 (10 CPU threads, 8 GPU cores), warm shader caches. "Noise floor" is the CPU against itself with another seed: GPU differences below it are sampling noise.
-
-| Scene | Size, spp | CPU | Metal | Speed-up | Metal vs CPU NRMSE | Noise floor NRMSE |
-| --- | --- | --- | --- | --- | --- | --- |
-| OpenChessSet, standalone | 1280x720, 256 | 221.3 s | 21.4 s | 10.4x | 0.068 | 0.109 |
-| OpenChessSet, Hydra | 1280x720, 256 | 221.9 s | 16.9 s | 13.2x | 0.068 | — |
-| CornellBox | 640x360, 128 | 28.6 s | 1.5 s | 18.8x | 0.036 | 0.118 |
-| QuadTest | 640x360, 128 | 11.0 s | 1.1 s | 10.4x | 0.0001 | 0.017 |
-| InOneWeekend (analytic spheres) | 640x360, 128 | 31.1 s | 11.3 s | 2.7x | 0.015 | 0.042 |
-| Environment-map fixture | 256x256, 256 | 9.2 s | 3.1 s | 3.0x | 0.00008 | 0.010 |
-
-Mean luminance differs by at most 0.05 %. Details, images and diagnostics: [docs/gpu_devices.md](docs/gpu_devices.md).
+The GPU devices compile a kernel for each new set of materials and cache it, so later runs start in a few seconds. Measurements and CPU/GPU image comparisons: [docs/gpu_devices.md](docs/gpu_devices.md) and [docs/performance.md](docs/performance.md).
 
 
-⚠️ System Requirements
+⚠️ Requirements
 ---------------------------------------
 
-* Windows x64 with Visual Studio 2022, or macOS on Apple silicon with Xcode (or the Command Line Tools); a C++20 compiler.
-* One stock OpenUSD 26.08 installation, with Python, imaging and GL enabled for usdview. `tools/deps.json` lists every dependency version; `tools/build_deps_local.ps1` builds OpenUSD, MaterialX and OpenSubdiv like CI does (see [deployment](docs/deployment.md#dependency-versions)).
-* Embree 4, oneTBB, OpenImageIO, MaterialX and the NVIDIA MDL SDK.
-* Matching development packages for dependencies required by the selected USD build, including OpenSubdiv.
-* GPU devices: DXC (in the Vulkan SDK); the Metal device also needs Apple's Metal shader converter, the Vulkan device the Vulkan SDK.
+* Windows x64 with Visual Studio 2022, or macOS on Apple silicon with Xcode or the Command Line Tools. PrismRT is written in C++20; the CMake presets need CMake 3.21+.
+* OpenUSD 26.08 (with Python, imaging and GL for usdview), MaterialX, OpenSubdiv, Embree 4, oneTBB, OpenImageIO, OpenColorIO, Open Image Denoise and the [NVIDIA MDL SDK](https://github.com/NVIDIA/MDL-SDK) (open source; a build without CUDA is enough). [`tools/deps.json`](tools/deps.json) holds every dependency version.
+* For the GPU devices: DXC and the Vulkan SDK; the Metal device also needs Apple's Metal shader converter.
+* Python 3.11 for usdview and the `prismrt` package.
 
 
-🛠️ Build Instructions (WIP)
+🛠️ Building
 ---------------------------------------
 
-1. Clone this repository recursively to fetch the importer dependencies.
-2. Build or select the dependency installations. PrismRT does not bundle SDKs or patch USD.
-3. Copy `cmake/PrismLocalDependencies.cmake.example` to `cmake/PrismLocalDependencies.cmake` and fill in package roots, or use standard `CMAKE_PREFIX_PATH` discovery.
-4. Run `cmake --preset prism-hydra`, then `cmake --build --preset prism-hydra`.
-5. Launch `powershell -ExecutionPolicy Bypass -File run_usdview.ps1 path/to/scene.usda` and select **PrismRT**.
+The full Windows walkthrough is in [docs/windows_vulkan.md](docs/windows_vulkan.md). In short:
 
-For standalone rendering, initialize the same environment with `. ./prism_env.ps1`, then run:
+1. Clone with submodules: `git clone --recursive https://github.com/joaovbs96/prism-rt.git`.
+2. Build the dependencies or point to your own. On Windows, `tools/build_deps_local.ps1` builds OpenUSD, MaterialX and OpenSubdiv at the versions in `tools/deps.json`, and vcpkg provides OpenImageIO and OpenColorIO ([deployment](docs/deployment.md#dependency-versions)).
+3. Copy `cmake/PrismLocalDependencies.cmake.example` to `cmake/PrismLocalDependencies.cmake` and fill in the package roots (or use `CMAKE_PREFIX_PATH`). On Windows, also copy `prism_local_env.ps1.example` to `prism_local_env.ps1` for the runtime paths.
+4. Configure and build: `cmake --preset prism-hydra`, then `cmake --build --preset prism-hydra`. On macOS, use the `prism-hydra-mac` preset.
+5. Set up the environment before running anything: `. ./prism_env.ps1` on Windows, `. ./prism_env.sh` on macOS.
+
+Render from the command line:
 
 ```powershell
 ./build/RelWithDebInfo/PrismRT.exe --scene assets/scenes/InOneWeekend.usda --camera /World/Camera --spp 256 --output render.exr
-# or every RenderProduct of the scene's RenderSettings, with its RenderVars as EXR layers:
+# every RenderProduct of the scene's RenderSettings, with its RenderVars as EXR layers:
 ./build/RelWithDebInfo/PrismRT.exe --scene scene.usda --output-dir renders
-# or a MaterialX document on the built-in shaderball (docs/material_preview.md):
+# a MaterialX document on the built-in shader ball:
 ./build/RelWithDebInfo/PrismRT.exe --material assets/materials/standard_surface_marble_solid.mtlx --output marble.png
 ```
 
-On macOS, use the `prism-hydra-mac` preset (`cmake --preset prism-hydra-mac`, `cmake --build --preset prism-hydra-mac`), `. ./prism_env.sh` for the environment, and `./run_usdview.sh scene.usda` for usdview. Pick a device for usdview with `PRISM_DEVICE`:
+Open usdview with PrismRT (select **PrismRT** in the renderer menu):
 
-```bash
-PRISM_DEVICE=cpu ./run_usdview.sh scene.usda --renderer PrismRT
-PRISM_DEVICE=metal ./run_usdview.sh scene.usda --renderer PrismRT
+```powershell
+powershell -ExecutionPolicy Bypass -File run_usdview.ps1 path/to/scene.usda   # Windows
+./run_usdview.sh path/to/scene.usda --renderer PrismRT                      # macOS
 ```
 
-No arguments display CLI help. USD, glTF/GLB and OBJ scene files are supported; rendering requires an explicit camera source. EXRs retain linear HDR values after the configurable sample clamp. Use `--max-sample-radiance 0` for energy/variance measurements. Local asset launchers belong in ignored `local/`; a template is provided under `tools/templates/`.
+Running `PrismRT` with no arguments prints the command-line help. Tests run with `ctest --test-dir build -C RelWithDebInfo` (the `gpu` label marks the tests that may open a GPU device).
+
+On Windows, keep the install or extract folder short (such as `C:\PrismRT`) or enable long paths: PrismRT checks the path length at start and tells you if it is too long ([path length](docs/deployment.md#path-length)).
 
 
-🐛 Known Issues & Limitations
+🐛 Known Limitations
 ---------------------------------------
 
-* Curves, VDB volumes, motion blur, light shaping/IES and an ACEScg rendering space are not implemented; see [the feature roadmap](docs/feature_roadmap.md).
-* Every material is MaterialX through MDL, apart from the built-in fallback (`displayColor`) and the magenta error material. glTF materials load as MaterialX `gltf_pbr` ([docs/gltf.md](docs/gltf.md)) and OBJ/MTL materials as `open_pbr_surface` ([docs/obj.md](docs/obj.md)); Hydra/usdview cannot open glTF or OBJ files.
-* The setPosition method of AABBs doesn't set correctly the position, if it's not initially in zero.
+* Motion blur is in progress ([plan](docs/motion_blur.md)). Curves and OpenVDB volumes are not implemented yet ([volumes](docs/volumes.md), [roadmap](docs/feature_roadmap.md)).
+* Linux is not built or tested yet, though the Vulkan device and the CMake are meant to be portable. The Python wheel is Windows-only for now.
+* The Vulkan device has only been tested on NVIDIA GPUs.
+* Hydra and usdview open USD files only; glTF and OBJ load through the command line, the SDK and Python.
 
 
 ⚖️ Licensing
 ---------------------------------------
 
-This project is licensed under the Apache License, Version 2.0. Please see the file [LICENSE](./LICENSE) for the full license text and [NOTICE](./NOTICE) for the copyright notice.
+PrismRT is licensed under the Apache License, Version 2.0. See [LICENSE](./LICENSE) for the full text and [NOTICE](./NOTICE) for the copyright notice.
 
 The material preview's scene in `resources/shaderball` is the [Standard Shader Ball](https://github.com/usd-wg/assets/tree/main/full_assets/StandardShaderBall) of the USD Working Group's assets (geometry and textures by Chris Rydalch, specification and validation by André Mazzone, after Thomas Anagnostou's original scene), used unchanged under the [Creative Commons Attribution 4.0 International licence](https://creativecommons.org/licenses/by/4.0/) (`resources/shaderball/LICENCE`, `resources/shaderball/ATTRIBUTION.md`).
-
