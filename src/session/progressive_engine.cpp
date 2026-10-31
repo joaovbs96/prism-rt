@@ -551,6 +551,8 @@ ProgressiveEngine::Outcome ProgressiveEngine::Run(ProgressiveRun const &run, Pro
     // AOV. Its albedo and normal guides come with the light AOVs; without it
     // nothing below changes.
     const bool denoising = hasColor && (settings.denoise || hasDenoised);
+    // Denoising alone reads only the albedo and normal of the light AOVs.
+    const bool guidesOnly = denoising && !hasLight;
     hasLight |= denoising;
     const int sampleCount = hasColor ? std::max(1, settings.samples) : 1;
     // Render progress timing: a new accumulation starts over; the time
@@ -983,6 +985,7 @@ ProgressiveEngine::Outcome ProgressiveEngine::Run(ProgressiveRun const &run, Pro
         passRequest.colors = passColors.data();
         passRequest.coverage = passCoverage.data();
         passRequest.lightAovs = hasLight ? passLightAovs.data() : nullptr;
+        passRequest.lightAovGuidesOnly = guidesOnly;
         passRequest.abandoned = [&] {
             return abandonPass.load(std::memory_order_relaxed) || target.StopRequested();
         };
