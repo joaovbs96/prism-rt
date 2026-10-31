@@ -170,6 +170,21 @@ Scenes: **Eggs** (MaterialEggs), **OpenPBR** (OpenPBRShaderPlayground),
 
 ## Scale and performance
 
+- **Zero-copy data paths (parked 2026-11-01).** In order of value:
+  1. GPU-side render output for Hydra: share the render buffers with the
+     host as GPU resources (Vulkan external memory and USD's Hgi interop,
+     Metal textures) instead of reading the image back and letting the host
+     upload it again every frame.
+  2. Metal no-copy buffers on Apple silicon (`newBufferWithBytesNoCopy` on
+     page-aligned caller memory): free on unified memory.
+  3. GPU AOVs to PyTorch through DLPack/external memory, if synthetic-data
+     pipelines need it.
+  4. SDK meshes shared with Embree (`rtcSetSharedGeometryBuffer`), opt-in per
+     mesh, CPU device only; worth it when memory or commit time of large or
+     animated meshes becomes the bottleneck.
+  - Not planned: zero-copy inputs on discrete GPUs. Host memory read over
+    PCIe made the chess set 1.9x slower than device-local buffers
+    (docs/gpu_devices.md), and acceleration structures are copies anyway.
 - **Out-of-core textures for the GPU.** *Whole-mip-level streaming on
   Vulkan: done* (see [texture service](texture_service.md#gpu-texture-streaming)).
   Still open: tile-granularity streaming, Metal (whole uploads), GPU levels
