@@ -167,7 +167,8 @@ void help() {
         "                 environment is lit by USD's default dome, as in usdview)\n"
         "  --device auto|cpu|vulkan|metal (default auto: GPU if available, else CPU)\n"
         "  --ocio-config FILE|URI (default $OCIO, else ocio://studio-config-latest)\n"
-        "  --working-space NAME (default the render settings' renderingColorSpace, else ACEScg;\n"
+        "  --working-space NAME (default $PRISM_WORKING_SPACE, else the render settings'\n"
+        "                 renderingColorSpace, else ACEScg;\n"
         "                 lin_rec709 renders in linear Rec.709 as before)\n"
         "  --display NAME --view NAME (8-bit outputs; default the config's: sRGB - Display and\n"
         "                 ACES 2.0 - SDR 100 nits (Rec.709). The earlier gamma 2.2 output is\n"
@@ -745,6 +746,8 @@ int runStandaloneCli(int argc, char** argv) {
         // Colour options from the flags and render settings; the config
         // defaults to the renderer's ($OCIO).
         if (o.color.config.empty()) o.color.config = rendererOptions.color.config;
+        // PRISM_WORKING_SPACE: below --working-space and prism:colorManagement:workingSpace.
+        if (o.color.workingSpace.empty()) o.color.workingSpace = rendererOptions.color.workingSpace;
         rendererOptions.color = o.color;
         // Every loader takes its MDL modules from the MaterialX libraries'
         // mdl directory.

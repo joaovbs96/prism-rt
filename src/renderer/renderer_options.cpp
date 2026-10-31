@@ -67,6 +67,9 @@ RendererOptions RendererOptions::FromEnvironment()
 {
     RendererOptions options;
     if (const char* value = Text("OCIO")) options.color.config = value;
+    // The default of the working space options (flags and prism:colorManagement:workingSpace
+    // override it; it takes precedence over renderingColorSpace).
+    if (const char* value = Text("PRISM_WORKING_SPACE")) options.color.workingSpace = value;
 
     auto& materials = options.materials;
     if (const char* value = std::getenv("PRISM_MATERIALX_LIBRARY_PATH")) materials.materialxLibraries = value;

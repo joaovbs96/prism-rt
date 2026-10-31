@@ -37,13 +37,26 @@ std::shared_ptr<const color::ColorManagement> RendererContext::colorManagement()
     return m_color;
 }
 
-std::shared_ptr<const color::ColorManagement> RendererContext::setColor(color::Options const& options)
+std::shared_ptr<const color::ColorManagement> RendererContext::setColor(color::Options const& options, bool view)
 {
     {
         std::lock_guard lock(m_mutex);
         if (m_color && m_color->requested() == options) return m_color;
     }
-    auto created = color::ColorManagement::Create(options);
+    auto created = color::ColorManagement::Create(options, view);
+    std::lock_guard lock(m_mutex);
+    m_color = std::move(created);
+    return m_color;
+}
+
+std::shared_ptr<const color::ColorManagement> RendererContext::setColorOrFallback(
+    color::Options const& options, bool view, std::function<void(std::string const&)> const& warn)
+{
+    {
+        std::lock_guard lock(m_mutex);
+        if (m_color && m_color->requested() == options) return m_color;
+    }
+    auto created = color::ColorManagement::CreateOrFallback(options, view, warn);
     std::lock_guard lock(m_mutex);
     m_color = std::move(created);
     return m_color;

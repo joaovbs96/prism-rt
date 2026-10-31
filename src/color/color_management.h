@@ -16,6 +16,7 @@
 
 #include <array>
 #include <cstddef>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -45,8 +46,31 @@ using Options = prism::ColorOptions;
 class PRISM_INTERNAL_API ColorManagement {
 public:
     // Throws std::runtime_error for an unreadable config, an unknown or
-    // non-linear working space, or an unknown display/view.
-    static std::shared_ptr<const ColorManagement> Create(Options const &options);
+    // non-linear working space, a config without linear Rec.709 (looked up
+    // by name and its usual aliases), or, with `view`, an unknown
+    // display/view. Without `view` no view processor is built: display() and
+    // view() are the requested names and ApplyView only clamps (hosts that
+    // apply their own view, the Hydra delegate).
+    static std::shared_ptr<const ColorManagement> Create(Options const &options, bool view = true);
+    // Never throws: Create(options, view), else with the built-in config
+    // (kDefaultConfig) and the same working space, else the built-in config's
+    // defaults, else PassThrough(options). Each failure goes to `warn`.
+    // requested() is `options` whichever succeeded.
+    static std::shared_ptr<const ColorManagement> CreateOrFallback(
+        Options const &options, bool view, std::function<void(std::string const &)> const &warn);
+    // Linear Rec.709 working space without a config: nothing converts,
+    // every colour space name resolves to itself, ApplyView only clamps.
+    static std::shared_ptr<const ColorManagement> PassThrough(Options const &requested);
+    bool passThrough() const noexcept;
+
+    // The matrix from the working space to the scene-linear colour space
+    // `space` (an OCIO name or alias, a renderingColorSpace token such as
+    // lin_rec709_scene; data, raw and identity are linear Rec.709), with the
+    // config's name of that space in *name. False, with a message in *error,
+    // when the config has no such space or it is not scene-linear.
+    bool OutputMatrix(std::string const &space, Matrix3 *matrix, std::string *name, std::string *error) const;
+    // The config's name of linear Rec.709.
+    std::string const &rec709Space() const noexcept;
 
     Options const &requested() const noexcept;
     std::string const &config() const noexcept;       // the config loaded (path or URI)

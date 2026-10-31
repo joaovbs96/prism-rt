@@ -17,8 +17,10 @@
 
 #include <embree4/rtcore_device.h>
 
+#include <functional>
 #include <memory>
 #include <mutex>
+#include <string>
 
 namespace prism {
 
@@ -39,8 +41,14 @@ public:
     // one was made from the same options, and returns it. What was loaded
     // before keeps its colour management: callers reload it (the Hydra
     // delegate rebuilds its scene). Throws std::runtime_error for unusable
-    // options and keeps the current one.
-    std::shared_ptr<const color::ColorManagement> setColor(color::Options const& options);
+    // options and keeps the current one. Without `view` no view processor
+    // is built (ColorManagement::Create).
+    std::shared_ptr<const color::ColorManagement> setColor(color::Options const& options, bool view = true);
+    // Like setColor, but never throws: unusable options warn through `warn`
+    // and fall back (ColorManagement::CreateOrFallback). For hosts an
+    // exception must not reach (the Hydra delegate).
+    std::shared_ptr<const color::ColorManagement> setColorOrFallback(
+        color::Options const& options, bool view, std::function<void(std::string const&)> const& warn);
 
     // Whether subsurface scattering renders its diffuse lobe (initially
     // options().materials.sssFallback; the Hydra delegate's prism:sssFallback

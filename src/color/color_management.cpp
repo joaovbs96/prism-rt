@@ -93,14 +93,43 @@ std::string LoadedConfig(std::string const &requested)
     return requested.empty() ? kDefaultConfig : requested;
 }
 
+// Names configs give linear Rec.709 (the studio config's name and ASWF
+// interop alias, ACES 1.x and other configs' names); OCIO also resolves the
+// config's own aliases of each.
+constexpr const char *kRec709Names[] = {
+    "lin_rec709", "lin_rec709_scene", "Linear Rec.709 (sRGB)", "lin_rec709_srgb", "lin_srgb",
+    "srgb_linear", "linear_srgb", "Linear sRGB", "Utility - Linear - sRGB", "scene-linear Rec.709-sRGB",
+    "Linear BT.709"};
+
+bool IsRec709Name(std::string const &space)
+{
+    const std::string lower = Lower(space);
+    for (const char *name : kRec709Names)
+        if (lower == Lower(name)) return true;
+    return false;
+}
+
+OCIO::ConstColorSpaceRcPtr FindRec709(OCIO::ConstConfigRcPtr const &config)
+{
+    for (const char *name : kRec709Names)
+        if (auto space = config->getColorSpace(name); space && !space->isData()) return space;
+    return nullptr;
+}
+
+bool DataToken(std::string const &token)
+{
+    return token == "data" || token == "raw" || token == "identity";
+}
+
 std::string RenderingSpace(OCIO::ConstConfigRcPtr const &config, std::string const &token, std::string *warning)
 {
     if (warning) warning->clear();
     if (token.empty() || token == "unknown") return {};
     // No source colour transforms: colours are used as authored, which USD
     // authors in linear Rec.709 when untagged.
-    const std::string name = token == "data" || token == "raw" || token == "identity" ? kLightColorSpace : token;
-    auto space = config->getColorSpace(name.c_str());
+    OCIO::ConstColorSpaceRcPtr space;
+    if (DataToken(token) || IsRec709Name(token)) space = FindRec709(config);
+    if (!space) space = config->getColorSpace(token.c_str());
     if (space && !space->isData() && config->isColorSpaceLinear(space->getName(), OCIO::REFERENCE_SPACE_SCENE))
         return space->getName();
     if (warning)
@@ -129,15 +158,76 @@ struct ColorManagement::Impl {
     std::array<float, 3> luminance = kRec709Luminance;
     OCIO::ConstConfigRcPtr ocio;
     OCIO::ConstCPUProcessorRcPtr viewProcessor;
+    // The config's linear Rec.709.
+    std::string rec709Name = kLightColorSpace;
+    bool passThrough = false;
     mutable std::mutex mutex;
     mutable std::map<std::string, OCIO::ConstCPUProcessorRcPtr> toWorking;
 };
 
 ColorManagement::ColorManagement(std::shared_ptr<Impl> impl) : m_impl(std::move(impl)) {}
 
-std::shared_ptr<const ColorManagement> ColorManagement::Create(Options const &options)
+namespace {
+
+std::shared_ptr<ColorManagement::Impl> Build(Options const &options, bool buildView);
+
+} // namespace
+
+std::shared_ptr<const ColorManagement> ColorManagement::Create(Options const &options, bool view)
+{
+    return std::make_shared<const ColorManagement>(Build(options, view));
+}
+
+std::shared_ptr<const ColorManagement> ColorManagement::PassThrough(Options const &requested)
 {
     auto impl = std::make_shared<Impl>();
+    impl->requested = requested;
+    impl->passThrough = true;
+    impl->workingSpace = kLightColorSpace;
+    impl->materialXSpace = "lin_rec709";
+    impl->rec709 = true;
+    impl->display = requested.display;
+    impl->view = requested.view;
+    impl->identity = "pass-through|lin_rec709|";
+    return std::make_shared<const ColorManagement>(std::move(impl));
+}
+
+std::shared_ptr<const ColorManagement> ColorManagement::CreateOrFallback(
+    Options const &options, bool view, std::function<void(std::string const &)> const &warn)
+{
+    std::vector<Options> attempts{options};
+    Options builtIn = options;
+    builtIn.config = kDefaultConfig;
+    if (LoadedConfig(options.config) != kDefaultConfig) attempts.push_back(builtIn);
+    Options defaults;
+    defaults.config = kDefaultConfig;
+    if (!(defaults == builtIn)) attempts.push_back(defaults);
+    for (size_t i = 0; i < attempts.size(); ++i) {
+        try {
+            auto impl = Build(attempts[i], view);
+            impl->requested = options;
+            return std::make_shared<const ColorManagement>(std::move(impl));
+        } catch (std::exception const &error) {
+            if (warn) {
+                const bool last = i + 1 == attempts.size();
+                const bool sameWorking = i + 1 < attempts.size() &&
+                    attempts[i + 1].workingSpace == attempts[i].workingSpace &&
+                    attempts[i + 1].renderingColorSpace == attempts[i].renderingColorSpace;
+                warn(std::string(error.what()) +
+                     (last ? "; colour management falls back to pass-through linear Rec.709 (no conversions)"
+                           : sameWorking ? "; using the built-in OpenColorIO config (" + std::string(kDefaultConfig) + ")"
+                                         : "; using the built-in OpenColorIO config's defaults"));
+            }
+        }
+    }
+    return PassThrough(options);
+}
+
+namespace {
+
+std::shared_ptr<ColorManagement::Impl> Build(Options const &options, bool buildView)
+try {
+    auto impl = std::make_shared<ColorManagement::Impl>();
     impl->requested = options;
     impl->config = LoadedConfig(options.config);
     try {
@@ -159,6 +249,7 @@ std::shared_ptr<const ColorManagement> ColorManagement::Create(Options const &op
         else if (auto role = config->getColorSpace(OCIO::ROLE_SCENE_LINEAR)) working = role->getName();
     }
     auto space = working.empty() ? nullptr : config->getColorSpace(working.c_str());
+    if (!space && IsRec709Name(working)) space = FindRec709(config);
     if (!space)
         throw std::runtime_error("the OpenColorIO config '" + impl->config +
                                  "' has no colour space '" + working + "' for the working space");
@@ -167,10 +258,12 @@ std::shared_ptr<const ColorManagement> ColorManagement::Create(Options const &op
         throw std::runtime_error("the working space must be scene-linear: " + impl->workingSpace);
     impl->materialXSpace = MaterialXName(space);
 
-    auto rec709 = config->getColorSpace(kLightColorSpace);
+    auto rec709 = FindRec709(config);
     if (!rec709)
-        throw std::runtime_error("the OpenColorIO config '" + impl->config + "' has no linear Rec.709 space (lin_rec709)");
-    impl->rec709 = std::string(rec709->getName()) == impl->workingSpace;
+        throw std::runtime_error("the OpenColorIO config '" + impl->config +
+                                 "' has no linear Rec.709 space (lin_rec709 or a known alias)");
+    impl->rec709Name = rec709->getName();
+    impl->rec709 =std::string(rec709->getName()) == impl->workingSpace;
     if (!impl->rec709) {
         impl->fromRec709 = MatrixOf(CpuProcessor(config->getProcessor(rec709->getName(), impl->workingSpace.c_str())));
         impl->toRec709 = MatrixOf(CpuProcessor(config->getProcessor(impl->workingSpace.c_str(), rec709->getName())));
@@ -183,6 +276,21 @@ std::shared_ptr<const ColorManagement> ColorManagement::Create(Options const &op
         }
     }
 
+    impl->identity = impl->configName + "|" + impl->workingSpace + "|" + Digits(impl->fromRec709);
+    if (impl->materialXSpace == "prism_working") {
+        // MaterialX caches node implementations by name: one name per matrix.
+        uint32_t hash = 2166136261u;
+        for (unsigned char c : Digits(impl->fromRec709)) hash = (hash ^ c) * 16777619u;
+        char suffix[16];
+        std::snprintf(suffix, sizeof(suffix), "_%08x", hash);
+        impl->materialXSpace += suffix;
+    }
+    if (!buildView) {
+        // Recorded only (the host applies its own view).
+        impl->display = options.display;
+        impl->view = options.view;
+        return impl;
+    }
     impl->display = options.display.empty() ? config->getDefaultDisplay() : options.display;
     bool displayFound = false;
     for (int i = 0; i < config->getNumDisplays(); ++i) displayFound |= impl->display == config->getDisplay(i);
@@ -210,16 +318,48 @@ std::shared_ptr<const ColorManagement> ColorManagement::Create(Options const &op
     } catch (OCIO::Exception const &error) {
         throw std::runtime_error("cannot build the view '" + impl->view + "': " + error.what());
     }
-    impl->identity = impl->configName + "|" + impl->workingSpace + "|" + Digits(impl->fromRec709);
-    if (impl->materialXSpace == "prism_working") {
-        // MaterialX caches node implementations by name: one name per matrix.
-        uint32_t hash = 2166136261u;
-        for (unsigned char c : Digits(impl->fromRec709)) hash = (hash ^ c) * 16777619u;
-        char suffix[16];
-        std::snprintf(suffix, sizeof(suffix), "_%08x", hash);
-        impl->materialXSpace += suffix;
+    return impl;
+} catch (OCIO::Exception const &error) {
+    // Any other OpenColorIO failure (a malformed config, a processor).
+    throw std::runtime_error(std::string("OpenColorIO: ") + error.what());
+}
+
+} // namespace
+
+bool ColorManagement::passThrough() const noexcept { return m_impl->passThrough; }
+std::string const &ColorManagement::rec709Space() const noexcept { return m_impl->rec709Name; }
+
+bool ColorManagement::OutputMatrix(std::string const &space, Matrix3 *matrix, std::string *name,
+                                   std::string *error) const
+{
+    auto fail = [&](std::string const &message) {
+        if (error) *error = message;
+        return false;
+    };
+    const bool rec709 = space.empty() || DataToken(space) || IsRec709Name(space);
+    if (m_impl->passThrough) {
+        if (!rec709) return fail("'" + space + "' is not available without an OpenColorIO config");
+        if (matrix) *matrix = kIdentity;
+        if (name) *name = m_impl->workingSpace;
+        return true;
     }
-    return std::make_shared<const ColorManagement>(std::move(impl));
+    try {
+        auto const &config = m_impl->ocio;
+        OCIO::ConstColorSpaceRcPtr found = rec709 ? config->getColorSpace(m_impl->rec709Name.c_str())
+                                                  : config->getColorSpace(space.c_str());
+        if (!found || found->isData() || !config->isColorSpaceLinear(found->getName(), OCIO::REFERENCE_SPACE_SCENE))
+            return fail("'" + space + "' is not a scene-linear colour space of the OpenColorIO config");
+        const std::string resolved = found->getName();
+        Matrix3 m = kIdentity;
+        if (resolved == m_impl->workingSpace) m = kIdentity;
+        else if (resolved == m_impl->rec709Name) m = m_impl->toRec709;
+        else m = MatrixOf(CpuProcessor(config->getProcessor(m_impl->workingSpace.c_str(), resolved.c_str())));
+        if (matrix) *matrix = m;
+        if (name) *name = resolved;
+        return true;
+    } catch (std::exception const &failure) {
+        return fail("'" + space + "': " + failure.what());
+    }
 }
 
 Options const &ColorManagement::requested() const noexcept { return m_impl->requested; }
@@ -249,12 +389,17 @@ float ColorManagement::Luminance(Float3 const &c) const
 std::string ColorManagement::Resolve(std::string const &space) const
 {
     if (space.empty()) return {};
+    if (m_impl->passThrough) return space;
     auto found = m_impl->ocio->getColorSpace(space.c_str());
-    return found ? found->getName() : std::string{};
+    if (found) return found->getName();
+    // Linear Rec.709 under another of its names (kLightColorSpace in a config
+    // without that alias).
+    return IsRec709Name(space) ? m_impl->rec709Name : std::string{};
 }
 
 bool ColorManagement::NeedsConversion(std::string const &space) const
 {
+    if (m_impl->passThrough) return false;
     const std::string name = Resolve(space);
     if (name.empty() || name == m_impl->workingSpace) return false;
     return !m_impl->ocio->getColorSpace(name.c_str())->isData();
@@ -294,7 +439,8 @@ void ColorManagement::ApplyView(float *pixels, size_t count, int channels) const
         OCIO::PackedImageDesc image(pixels + begin * channels, static_cast<long>(n), 1, 3, OCIO::BIT_DEPTH_F32,
                                     sizeof(float), static_cast<ptrdiff_t>(channels * sizeof(float)),
                                     static_cast<ptrdiff_t>(n * channels * sizeof(float)));
-        m_impl->viewProcessor->apply(image);
+        // Without a view (Create(options, false), PassThrough) only the clamp.
+        if (m_impl->viewProcessor) m_impl->viewProcessor->apply(image);
         for (size_t p = begin; p < begin + n; ++p)
             for (int c = 0; c < 3; ++c) {
                 float &v = pixels[p * channels + c];
