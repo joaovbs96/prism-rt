@@ -12,11 +12,13 @@
 #include "../src/scene.h"
 #include "../src/scene/scene_internal.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <functional>
 #include <iostream>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -352,6 +354,73 @@ void materials(prism::Renderer const& renderer)
     check(throws(prism::ErrorCode::NotFound, [&] { scene.commit(); }), "a missing MaterialX file throws NotFound");
 }
 
+// Several MaterialX materials compile on the material workers: each
+// placement gets its own material, failures are diagnosed in the materials'
+// order, and progress reaches every material on the committing thread.
+void parallelMaterials(prism::Renderer const& renderer)
+{
+    if (renderer.context()->options().materials.materialxLibraries.empty()) return;
+    prism::Scene scene = renderer.createScene();
+    auto document = [](int i) {
+        const std::string value = std::to_string(0.1 * (i + 1));
+        const std::string model = i % 2 ? "open_pbr_surface" : "standard_surface";
+        return "<?xml version=\"1.0\"?>\n<materialx version=\"1.39\">\n  <" + model +
+               " name=\"surface\" type=\"surfaceshader\">\n    <input name=\"base_color\" type=\"color3\" value=\"" + value + ", 0.2, 0.3\" />\n  </" + model +
+               ">\n  <surfacematerial name=\"M\" type=\"material\">\n    <input name=\"surfaceshader\" "
+               "type=\"surfaceshader\" nodename=\"surface\" />\n  </surfacematerial>\n</materialx>";
+    };
+    const int count = 7;
+    const auto mesh = scene.addMesh(quad(false));
+    for (int i = 0; i < count; ++i) {
+        prism::MaterialDesc desc;
+        desc.kind = prism::MaterialDesc::Kind::MaterialXString;
+        desc.name = "parallel " + std::to_string(i);
+        // The second and the sixth are broken.
+        desc.document = i == 1 || i == 5 ? "<materialx version=\"1.39\"><surfacematerial name=" : document(i);
+        prism::InstanceDesc instance;
+        instance.prototype = mesh;
+        instance.materials = {scene.addMaterial(desc)};
+        instance.transform = prism::Constant(translate(5.0 * i, 0, 0));
+        scene.addInstance(instance);
+    }
+    // A cancelled commit while materials compile leaves the edits pending.
+    check(throws(prism::ErrorCode::Cancelled, [&] {
+              scene.commit([](prism::ProgressInfo const& info) {
+                  return !(info.phase == "materials" && info.done == 2);
+              });
+          }),
+          "a commit cancelled during the materials throws Cancelled");
+    check(scene.pendingEdits() != 0, "the cancelled commit's edits stay pending");
+    size_t last = 0, total = 0;
+    bool monotonic = true;
+    scene.commit([&](prism::ProgressInfo const& info) {
+        if (info.phase == "materials") {
+            monotonic = monotonic && info.done >= last;
+            last = info.done;
+            total = info.total;
+        }
+        return true;
+    });
+    check(monotonic && total == size_t(count) && last == total, "material progress counts every material in order");
+    SceneManager& manager = prism::detail::SceneAccess::committed(scene);
+    std::vector<Material*> seen;
+    for (int i = 0; i < count; ++i) {
+        Material* material = manager.getMaterial(cast(manager, Float3(5.0f * i, 0, 2), Float3(0, 0, -1)));
+        const bool broken = i == 1 || i == 5;
+        check(broken ? material == ErrorMaterial::Shared()
+                     : material && dynamic_cast<ErrorMaterial*>(material) == nullptr &&
+                           std::find(seen.begin(), seen.end(), material) == seen.end(),
+              "parallel material " + std::to_string(i) + " is its own");
+        seen.push_back(material);
+    }
+    std::vector<std::string> failed;
+    for (auto const& diagnostic : scene.diagnostics())
+        if (diagnostic.category == "material") failed.push_back(diagnostic.message);
+    check(failed.size() == 2 && failed[0].find("parallel 1") != std::string::npos &&
+              failed[1].find("parallel 5") != std::string::npos,
+          "material failures are diagnosed in the materials' order");
+}
+
 void misuse(prism::Renderer const& renderer)
 {
     prism::Scene scene = renderer.createScene();
@@ -437,6 +506,7 @@ int main(int argc, char** argv)
         geometry(renderer);
         environments(renderer, argc > 1 ? argv[1] : "");
         materials(renderer);
+        parallelMaterials(renderer);
         misuse(renderer);
     } catch (std::exception const& error) {
         std::cerr << "FAILED with an exception: " << error.what() << '\n';
