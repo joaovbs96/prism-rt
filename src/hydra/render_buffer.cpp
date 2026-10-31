@@ -385,9 +385,7 @@ void PrismRenderBuffer::PublishPreviewFloat(
          pixel < static_cast<size_t>(previewWidth) * previewHeight; ++pixel) {
         uint8_t *dst = encoded.data() + pixel * stride;
         const float *src = values.data() + pixel * components;
-        for (size_t c = 0; c < arity; ++c)
-            _StoreComponent(_format, dst, c,
-                c < components ? src[c] : (c == 3 ? 1.0f : 0.0f));
+        _Encode(dst, src, components, true);
     }
     if (smooth) {
         // Bilinear magnification between preview pixel centers.
@@ -413,9 +411,7 @@ void PrismRenderBuffer::PublishPreviewFloat(
                     value[c] = std::lerp(top, bottom, ty);
                 }
                 uint8_t *dst = published->data() + (static_cast<size_t>(y) * _width + x) * stride;
-                for (size_t c = 0; c < arity; ++c)
-                    _StoreComponent(_format, dst, c,
-                        c < components ? value[c] : (c == 3 ? 1.0f : 0.0f));
+                _Encode(dst, value.data(), components, true);
             }
         });
         std::lock_guard lock(_mutex);
@@ -498,8 +494,32 @@ void PrismRenderBuffer::PublishPreviewInt(
     _hasPublished = true;
 }
 
+void PrismRenderBuffer::SetOutputTransform(OutputTransform const &transform)
+{
+    std::lock_guard lock(_mutex);
+    _hasOutputTransform = transform.has_value();
+    _outputTransform = transform.value_or(std::array<float, 9>{});
+}
+
+void PrismRenderBuffer::_Encode(uint8_t *dst, const float *value, size_t n, bool convert) const
+{
+    const size_t arity = std::min<size_t>(HdGetComponentCount(_format), 4);
+    float v[4];
+    for (size_t c = 0; c < arity; ++c)
+        v[c] = c < n ? value[c] : (c == 3 ? 1.0f : 0.0f);
+    if (convert && _hasOutputTransform && arity >= 3) {
+        // Working space to output space (alpha and other components kept).
+        auto const &m = _outputTransform;
+        const float r = v[0], g = v[1], b = v[2];
+        v[0] = m[0] * r + m[1] * g + m[2] * b;
+        v[1] = m[3] * r + m[4] * g + m[5] * b;
+        v[2] = m[6] * r + m[7] * g + m[8] * b;
+    }
+    for (size_t c = 0; c < arity; ++c) _StoreComponent(_format, dst, c, v[c]);
+}
+
 void PrismRenderBuffer::_Write(unsigned int x, unsigned int y,
-                               const float *value, size_t n, bool accumulate)
+                               const float *value, size_t n, bool accumulate, bool convert)
 {
     if (x >= _width || y >= _height || _format == HdFormatInvalid) return;
     const size_t pixel = static_cast<size_t>(y) * _width + x;
@@ -507,17 +527,17 @@ void PrismRenderBuffer::_Write(unsigned int x, unsigned int y,
     uint8_t *dst = _workingPixels.data() +
         pixel * HdDataSizeOfFormat(_format);
     if (accumulate) {
+        // The accumulation stays in the working space; its mean converts.
         const uint32_t count = ++_sampleCounts[pixel];
+        float mean[4];
         for (size_t c = 0; c < arity; ++c) {
             float &sum = _accumulation[pixel * arity + c];
             sum += c < n ? value[c] : (c == 3 ? 1.0f : 0.0f);
-            _StoreComponent(_format, dst, c, sum / static_cast<float>(count));
+            mean[c] = sum / static_cast<float>(count);
         }
+        _Encode(dst, mean, arity, convert);
     } else {
-        for (size_t c = 0; c < arity; ++c) {
-            _StoreComponent(_format, dst, c,
-                            c < n ? value[c] : (c == 3 ? 1.0f : 0.0f));
-        }
+        _Encode(dst, value, n, convert);
     }
 }
 
@@ -536,9 +556,10 @@ void PrismRenderBuffer::KeepAccumulated(unsigned int x, unsigned int y)
     const size_t arity = HdGetComponentCount(_format);
     uint8_t *dst = _workingPixels.data() + pixel * HdDataSizeOfFormat(_format);
     // The same value _Write stored when the pixel was last traced.
+    float mean[4];
     for (size_t c = 0; c < arity; ++c)
-        _StoreComponent(_format, dst, c,
-                        _accumulation[pixel * arity + c] / static_cast<float>(count));
+        mean[c] = _accumulation[pixel * arity + c] / static_cast<float>(count);
+    _Encode(dst, mean, arity, true);
 }
 
 void PrismRenderBuffer::WriteInt(unsigned int x, unsigned int y,
@@ -579,7 +600,7 @@ void PrismRenderBuffer::Clear(VtValue const &value)
                 (static_cast<size_t>(y) * _width + x) * HdDataSizeOfFormat(_format);
             for (size_t c = 0; c < HdGetComponentCount(_format); ++c)
                 _StoreIntComponent(_format, dst, c, c < n ? i[c] : 0);
-        } else _Write(x, y, f, n, false);
+        } else _Write(x, y, f, n, false, false);
         }
     };
     clearWorking();

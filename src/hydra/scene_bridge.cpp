@@ -4285,6 +4285,50 @@ bool _TracedAov(AovKind kind)
     return kind == AovKind::Color || _LightAov(kind) || kind == AovKind::Denoised;
 }
 
+// The output space of the presented AOVs (docs/color_management.md, "Output
+// space"): the traced AOVs (colour, light AOVs, denoised) convert from the
+// working space with `transform` (empty: the output space is the working
+// space, nothing converts); `space` is its OCIO name.
+struct OutputState {
+    PrismRenderBuffer::OutputTransform transform;
+    std::string space;
+    bool operator==(OutputState const &) const = default;
+};
+
+// prism:colorManagement:outputSpace; empty: the renderingColorSpace (the
+// settings prim's, else the render setting's), else linear Rec.709;
+// "working": the working space. `warn`: report an unusable output space.
+OutputState _ResolveOutput(RenderSettings const &settings, prism::color::ColorManagement const &color, bool warn)
+{
+    OutputState result;
+    result.space = color.workingSpace();
+    auto use = [&](std::string const &space, std::string *error) {
+        prism::color::Matrix3 matrix = prism::color::kIdentity;
+        std::string name;
+        if (!color.OutputMatrix(space, &matrix, &name, error)) return false;
+        result.space = name;
+        if (name != color.workingSpace() && matrix != prism::color::kIdentity) result.transform = matrix;
+        return true;
+    };
+    std::string requested = settings.outputSpace;
+    std::transform(requested.begin(), requested.end(), requested.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (requested == "working") return result;
+    std::string error;
+    if (!settings.outputSpace.empty()) {
+        if (use(settings.outputSpace, &error)) return result;
+        if (warn)
+            TF_WARN("PrismRT: prism:colorManagement:outputSpace %s; using the default output space",
+                    error.c_str());
+    }
+    const std::string &rendering = !settings.color.renderingColorSpace.empty()
+        ? settings.color.renderingColorSpace : settings.renderingColorSpaceSetting;
+    // An unusable renderingColorSpace already warned as the working space.
+    if (!rendering.empty() && rendering != "unknown" && use(rendering, &error)) return result;
+    if (use(prism::color::kLightColorSpace, &error)) return result;
+    return OutputState{{}, color.workingSpace()};
+}
+
 // Convert while the center-ray hit is local; only requested final outputs are
 // retained. Preview and full resolution deliberately share these semantics.
 void _ResolvePrimaryAov(AovKind kind, RayHit const &hit, CameraState const &camera,
@@ -4405,6 +4449,8 @@ public:
             settings.gpuPreparationPreview = std::strcmp(value, "0") != 0;
         if (const char *value = std::getenv("PRISM_GPU_PREPARATION_PREVIEW_MAX_MIB"); value && *value)
             settings.gpuPreparationPreviewMaxMiB = std::max(0, std::atoi(value));
+        // Before the material service, which reads the colour management.
+        InitialColor();
         try {
             mdl::Context &context = SharedMdlContext();
             if (context.is_valid()) {
@@ -4420,12 +4466,29 @@ public:
         }
     }
 
-    // The colour options of render settings: an empty config is the
-    // renderer's ($OCIO).
-    prism::color::Options ColorOptions(prism::color::Options options) const
+    // The colour options of render settings (docs/hydra.md): an empty config
+    // is the renderer's ($OCIO), an empty working space the renderer's
+    // (PRISM_WORKING_SPACE), and the settings prim's renderingColorSpace
+    // comes before the renderingColorSpace render setting.
+    prism::color::Options ColorOptions(RenderSettings const &settings) const
     {
+        prism::color::Options options = settings.color;
         if (options.config.empty()) options.config = renderer->options().color.config;
+        if (options.workingSpace.empty()) options.workingSpace = renderer->options().color.workingSpace;
+        if (options.renderingColorSpace.empty()) options.renderingColorSpace = settings.renderingColorSpaceSetting;
         return options;
+    }
+
+    // The delegate's colour management, never throwing into the host: an
+    // unusable config or working space warns and falls back
+    // (ColorManagement::CreateOrFallback). No view processor: the host
+    // applies the view.
+    void InitialColor()
+    {
+        renderer->setColorOrFallback(ColorOptions(settings), false, [](std::string const &message) {
+            TF_WARN("PrismRT: %s", message.c_str());
+        });
+        if (auto color = renderer->colorManagement()) output = _ResolveOutput(settings, *color, true);
     }
 
     // Loading is active from the first scene edit until its snapshot is
@@ -4573,6 +4636,9 @@ public:
     unsigned int dirtyKinds = static_cast<unsigned int>(SceneDirtyKind::Unknown);
     std::unordered_set<SdfPath, SdfPath::Hash> dirtyPaths;
     RenderSettings settings;
+    // The output space of the presented AOVs (settings and the colour
+    // management; _ResolveOutput).
+    OutputState output;
     CameraState camera;
     HdRenderPassAovBindingVector bindings;
     std::vector<uint64_t> bindingAllocationRevisions;
@@ -4700,13 +4766,9 @@ bool CameraStatesIdentical(CameraState const &a, CameraState const &b)
 SceneBridge::SceneBridge(HdSceneIndexBaseRefPtr sceneIndex, HdRenderThread *thread)
     : _impl(std::make_unique<Impl>(std::move(sceneIndex), thread))
 {
-    // The delegate's colour management (its renderer's): the default settings'.
-    try {
-        _impl->renderer->setColor(_impl->ColorOptions(_impl->settings.color));
-    } catch (std::exception const &error) {
-        TF_WARN("PrismRT: %s", error.what());
-    }
-    // Likewise the SSS fallback (prism:sssFallback).
+    // The delegate's colour management (its renderer's) is the default
+    // settings' (Impl::InitialColor). Likewise the SSS fallback
+    // (prism:sssFallback).
     _impl->renderer->setSssFallback(_impl->settings.sssFallback);
 }
 SceneBridge::~SceneBridge()
@@ -4857,15 +4919,20 @@ void SceneBridge::SetSettings(RenderSettings const &requested)
         // The renderer's colour management: an unusable config, working space
         // or view keeps the previous one.
         RenderSettings const previous = GetSettings();
-        if (settings.color != previous.color) {
+        if (_impl->ColorOptions(settings) != _impl->ColorOptions(previous)) {
             try {
-                _impl->renderer->setColor(_impl->ColorOptions(settings.color));
+                _impl->renderer->setColor(_impl->ColorOptions(settings), false);
             } catch (std::exception const &error) {
                 TF_WARN("PrismRT: %s; retaining the previous colour management", error.what());
                 settings.color = previous.color;
+                settings.renderingColorSpaceSetting = previous.renderingColorSpaceSetting;
             }
         }
     }
+    // The output space follows the settings and the colour management.
+    OutputState output;
+    if (auto color = _impl->renderer->colorManagement())
+        output = _ResolveOutput(settings, *color, settings.outputSpace != GetSettings().outputSpace);
     bool imageChanged = false;
     bool budgetChanged = false;
     bool colorChanged = false;
@@ -4909,6 +4976,8 @@ void SceneBridge::SetSettings(RenderSettings const &requested)
             current.gpuPreparationPreview == settings.gpuPreparationPreview &&
             current.gpuPreparationPreviewMaxMiB == settings.gpuPreparationPreviewMaxMiB &&
             current.device == settings.device && current.color == settings.color &&
+            current.renderingColorSpaceSetting == settings.renderingColorSpaceSetting &&
+            current.outputSpace == settings.outputSpace && _impl->output == output &&
             current.denoise == settings.denoise &&
             current.denoiseInterval == settings.denoiseInterval &&
             current.denoiseSettings == settings.denoiseSettings &&
@@ -4918,9 +4987,13 @@ void SceneBridge::SetSettings(RenderSettings const &requested)
         geometryChanged = _SubdivisionSettingsFrom(current) != _SubdivisionSettingsFrom(settings);
         sssChanged = current.sssFallback != settings.sssFallback;
         // Display and view do not touch the linear colour AOV.
-        colorChanged = current.color.config != settings.color.config ||
-            current.color.workingSpace != settings.color.workingSpace ||
-            current.color.renderingColorSpace != settings.color.renderingColorSpace;
+        {
+            const auto before = _impl->ColorOptions(current), after = _impl->ColorOptions(settings);
+            colorChanged = before.config != after.config || before.workingSpace != after.workingSpace ||
+                before.renderingColorSpace != after.renderingColorSpace;
+        }
+        // A new output space converts the presented AOVs differently.
+        const bool outputChanged = !(_impl->output == output);
         imageChanged = current.maxDepth != settings.maxDepth ||
             current.rouletteDepth != settings.rouletteDepth ||
             current.seed != settings.seed ||
@@ -4938,7 +5011,7 @@ void SceneBridge::SetSettings(RenderSettings const &requested)
             current.gpuTextureBudgetMiB != settings.gpuTextureBudgetMiB ||
             current.environmentSampling != settings.environmentSampling ||
             current.domeLightCameraVisibility != settings.domeLightCameraVisibility ||
-            current.device != settings.device || colorChanged || bindingsChanged ||
+            current.device != settings.device || colorChanged || outputChanged || bindingsChanged ||
             geometryChanged || sssChanged ||
             // Denoising needs its guides from the accumulation's first sample.
             current.denoise != settings.denoise;
@@ -5083,6 +5156,7 @@ void SceneBridge::SetSettings(RenderSettings const &requested)
         _impl->lastRebuildReason = "honorDoubleSided changed";
     }
     _impl->settings = settings;
+    _impl->output = std::move(output);
     _impl->prototypePool->hiddenGeometryBudgetBytes.store(
         static_cast<uint64_t>(settings.hiddenGeometryBudgetMiB) * 1024u * 1024u);
     _impl->MaintainHiddenGeometryLocked();
@@ -5100,6 +5174,12 @@ RenderSettings SceneBridge::GetSettings() const
 {
     std::lock_guard lock(_impl->mutex);
     return _impl->settings;
+}
+
+std::string SceneBridge::GetOutputColorSpace() const
+{
+    std::lock_guard lock(_impl->mutex);
+    return _impl->output.space;
 }
 
 bool SceneBridge::Prepare(CameraState const &camera,
@@ -6156,6 +6236,7 @@ void SceneBridge::Render()
     CameraState camera;
     HdRenderPassAovBindingVector bindings;
     RenderSettings settings;
+    OutputState output;
     bool preparing = false;
     uint64_t generation = 0;
     uint64_t cameraRevision = 0;
@@ -6173,6 +6254,7 @@ void SceneBridge::Render()
         std::lock_guard lock(_impl->mutex);
         snapshot = _impl->snapshot; camera = _impl->camera;
         bindings = _impl->bindings; settings = _impl->settings;
+        output = _impl->output;
         // Published edits replace the snapshot or advance its generation;
         // camera changes do neither.
         if (snapshot && snapshot->scene)
@@ -6227,15 +6309,34 @@ void SceneBridge::Render()
         };
         std::vector<DisplayTarget> displays;
         uint64_t presentationRevision = 0;
+        // Working space to output space (empty: none), for the traced AOVs.
+        PrismRenderBuffer::OutputTransform transform;
 
         BufferTarget(Impl &impl, HdRenderPassAovBindingVector const &bindings, std::shared_ptr<Snapshot> snapshot,
                      CameraState const &camera, unsigned int width, unsigned int height, uint64_t generation,
-                     uint64_t cameraRevision)
+                     uint64_t cameraRevision, PrismRenderBuffer::OutputTransform transform)
             : impl(impl), bindings(bindings), snapshot(std::move(snapshot)), camera(camera), width(width),
-              height(height), generation(generation), cameraRevision(cameraRevision)
+              height(height), generation(generation), cameraRevision(cameraRevision), transform(std::move(transform))
         {
-            for (auto const &binding : bindings)
-                buffers.push_back(dynamic_cast<PrismRenderBuffer *>(binding.renderBuffer));
+            for (auto const &binding : bindings) {
+                auto *buffer = dynamic_cast<PrismRenderBuffer *>(binding.renderBuffer);
+                buffers.push_back(buffer);
+                // The colour, denoised and light AOVs follow the output
+                // space; data AOVs do not.
+                if (buffer)
+                    buffer->SetOutputTransform(_TracedAov(_AovKind(binding.aovName))
+                        ? this->transform : PrismRenderBuffer::OutputTransform{});
+            }
+        }
+        // Converts `rgb` in place to the output space.
+        void ToOutput(float *rgb) const
+        {
+            if (!transform) return;
+            auto const &m = *transform;
+            const float r = rgb[0], g = rgb[1], b = rgb[2];
+            rgb[0] = m[0] * r + m[1] * g + m[2] * b;
+            rgb[1] = m[3] * r + m[4] * g + m[5] * b;
+            rgb[2] = m[6] * r + m[7] * g + m[8] * b;
         }
         static PrismRenderBuffer::Frame Published(Frame const &frame)
         {
@@ -6332,12 +6433,18 @@ void SceneBridge::Render()
         void PresentDenoisedColor(std::vector<float> const &rgba, unsigned width, unsigned height,
                                   Frame const &frame) override
         {
-            // Render-buffer rows are bottom-up float4, as the colour's.
+            // Render-buffer rows are bottom-up float4, as the colour's; the
+            // denoiser ran in the working space.
             auto bytes = std::make_shared<std::vector<uint8_t>>(rgba.size() * sizeof(float));
             const size_t rowBytes = static_cast<size_t>(width) * 4 * sizeof(float);
             for (unsigned int y = 0; y < height; ++y)
                 std::memcpy(bytes->data() + static_cast<size_t>(height - 1 - y) * rowBytes,
                             rgba.data() + static_cast<size_t>(y) * width * 4, rowBytes);
+            if (transform) {
+                float *pixels = reinterpret_cast<float *>(bytes->data());
+                tbb::parallel_for(size_t(0), static_cast<size_t>(width) * height,
+                    [&](size_t pixel) { ToOutput(pixels + pixel * 4); });
+            }
             std::shared_ptr<const std::vector<uint8_t>> shown = std::move(bytes);
             for (size_t i = 0; i < bindings.size(); ++i)
                 if (_AovKind(bindings[i].aovName) == AovKind::Color && buffers[i] &&
@@ -6381,7 +6488,8 @@ void SceneBridge::Render()
                             const size_t offset = (static_cast<size_t>(height - 1 - tile.y - y) * width + tile.x + x) * 4;
                             float *dst = payload->rgba.data() + (static_cast<size_t>(tile.height - 1 - y) * tile.width + x) * 4;
                             auto const &c = pass.colors[pixel];
-                            const float values[4] = {c.x(), c.y(), c.z(), pass.coverage[pixel]};
+                            float values[4] = {c.x(), c.y(), c.z(), pass.coverage[pixel]};
+                            ToOutput(values);
                             const bool fresh = pass.traced(pixel);
                             for (size_t component = 0; component < 4; ++component)
                                 dst[component] = !fresh ? previous[offset + component] :
@@ -6417,7 +6525,7 @@ void SceneBridge::Render()
                 if (buffer) buffer->ClearPresentationPixels();
             displays.clear();
         }
-    } target(*_impl, bindings, snapshot, camera, width, height, generation, cameraRevision);
+    } target(*_impl, bindings, snapshot, camera, width, height, generation, cameraRevision, output.transform);
 
     prism::detail::HostedRun run;
     run.preference = settings.device;
@@ -6567,6 +6675,10 @@ VtDictionary SceneBridge::GetStats() const
     // limit). With adaptive sampling, pixels that stopped count as done and
     // the others by their samples, so the estimate keeps moving while the
     // last pixels refine; with a time limit, at least the elapsed fraction.
+    // Colour: the working space and the presented AOVs' output space.
+    if (auto color = _impl->renderer->colorManagement())
+        result["prismWorkingColorSpace"] = VtValue(color->workingSpace());
+    result["prismOutputColorSpace"] = VtValue(_impl->output.space);
     const int targetSamples = std::max(1, _impl->settings.samples);
     result["numCompletedSamples"] = VtValue(static_cast<int>(
         std::min<int64_t>(completed, std::numeric_limits<int>::max())));

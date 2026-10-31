@@ -106,8 +106,17 @@ struct RenderSettings {
     // active render settings prim's renderingColorSpace (the working space
     // when workingSpace is empty); empty fields take the defaults
     // (docs/color_management.md). The colour AOV is
-    // linear in the working space; display and view only record the request.
+    // linear in the output space (below); display and view only record the
+    // request. color.renderingColorSpace is the settings prim's.
     prism::color::Options color;
+    // The renderingColorSpace render setting (SetRenderSetting, for hosts
+    // that do not author into the stage): below the settings prim's.
+    std::string renderingColorSpaceSetting;
+    // prism:colorManagement:outputSpace (docs/color_management.md, "Output
+    // space"): the colour space of the presented colour, denoised and light
+    // AOVs. Empty: the renderingColorSpace, else linear Rec.709; "working":
+    // the working space.
+    std::string outputSpace;
     // The active render settings prim's materialBindingPurposes: a prim's
     // material is its binding for the first of these purposes that it has
     // (the empty token is allPurpose). Process-wide, like the colour
@@ -199,6 +208,8 @@ public:
     void RestartAccumulation();
     void SetSettings(RenderSettings const &settings);
     RenderSettings GetSettings() const;
+    // The OCIO name of the colour space the colour AOV is presented in.
+    std::string GetOutputColorSpace() const;
     bool Prepare(CameraState const &camera,
                  pxr::HdRenderPassAovBindingVector const &bindings,
                  pxr::TfTokenVector const &renderTags,

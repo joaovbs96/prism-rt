@@ -79,6 +79,9 @@ TfToken const _colorConfig("prism:colorManagement:ocioConfig");
 TfToken const _colorWorkingSpace("prism:colorManagement:workingSpace");
 TfToken const _colorDisplay("prism:colorManagement:display");
 TfToken const _colorView("prism:colorManagement:view");
+TfToken const _colorOutputSpace("prism:colorManagement:outputSpace");
+// Read-only: the OCIO name of the colour space the colour AOV is in.
+TfToken const _colorAovSpace("prism:colorManagement:aovColorSpace");
 
 template<class T>
 T _Get(VtValue const &v, T fallback)
@@ -274,7 +277,11 @@ HdRenderSettingDescriptorList PrismTaskDelegate::GetRenderSettingDescriptors() c
             {"OpenColorIO config (empty: $OCIO, else the studio config)", _colorConfig, VtValue(std::string())},
             {"Working space (empty: ACEScg)", _colorWorkingSpace, VtValue(std::string())},
             {"Display (empty: the config's default; recorded only)", _colorDisplay, VtValue(std::string())},
-            {"View (empty: the display's default; recorded only)", _colorView, VtValue(std::string())}};
+            {"View (empty: the display's default; recorded only)", _colorView, VtValue(std::string())},
+            {"AOV output space (empty: renderingColorSpace, else lin_rec709; working: the working space)",
+             _colorOutputSpace, VtValue(std::string())},
+            {"Rendering color space (below the settings prim's; empty: ACEScg)",
+             HdRenderSettingsPrimTokens->renderingColorSpace, VtValue(std::string())}};
 }
 
 VtValue PrismTaskDelegate::GetRenderSetting(TfToken const &key) const
@@ -328,6 +335,11 @@ VtValue PrismTaskDelegate::GetRenderSetting(TfToken const &key) const
     if (key == _colorWorkingSpace) return VtValue(s.color.workingSpace);
     if (key == _colorDisplay) return VtValue(s.color.display);
     if (key == _colorView) return VtValue(s.color.view);
+    if (key == _colorOutputSpace) return VtValue(s.outputSpace);
+    if (key == HdRenderSettingsPrimTokens->renderingColorSpace)
+        return VtValue(s.renderingColorSpaceSetting);
+    if (key == _colorAovSpace)
+        return VtValue(_bridge ? _bridge->GetOutputColorSpace() : std::string());
     if (key == _selectionOutline)
         return VtValue(_selectionSettings->enableOutline.load());
     if (key == _selectionOutlineRadius)
@@ -528,7 +540,8 @@ void PrismTaskDelegate::SetRenderSetting(TfToken const &key, VtValue const &valu
         }
     }
     else if ((key == _colorConfig || key == _colorWorkingSpace || key == _colorDisplay ||
-              key == _colorView) &&
+              key == _colorView || key == _colorOutputSpace ||
+              key == HdRenderSettingsPrimTokens->renderingColorSpace) &&
              (value.IsHolding<std::string>() || value.IsHolding<TfToken>() ||
               value.IsHolding<SdfAssetPath>())) {
         std::string text;
@@ -541,6 +554,8 @@ void PrismTaskDelegate::SetRenderSetting(TfToken const &key, VtValue const &valu
         if (key == _colorConfig) s.color.config = text;
         else if (key == _colorWorkingSpace) s.color.workingSpace = text;
         else if (key == _colorDisplay) s.color.display = text;
+        else if (key == _colorOutputSpace) s.outputSpace = text;
+        else if (key == HdRenderSettingsPrimTokens->renderingColorSpace) s.renderingColorSpaceSetting = text;
         else s.color.view = text;
     }
     else return;

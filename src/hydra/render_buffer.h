@@ -3,8 +3,10 @@
 #include "pxr/imaging/hd/renderBuffer.h"
 #include "pxr/base/gf/vec4f.h"
 
+#include <array>
 #include <atomic>
 #include <cstdint>
+#include <optional>
 #include <mutex>
 #include <memory>
 #include <vector>
@@ -116,6 +118,14 @@ public:
     // older storage, or starts a zero-filled one while a host maps the
     // published pixels, so an unwritten pixel would not keep its value.
     void KeepAccumulated(unsigned int x, unsigned int y);
+    // The output transform (docs/color_management.md, "Output space"): a
+    // row-major 3x3 matrix applied to the first three components of every
+    // float pixel this buffer encodes (accumulated means, plain writes,
+    // previews), so the accumulation itself stays in the working space.
+    // Clear values are not converted. Empty: none (the bits as before). Set
+    // by the render thread before it writes.
+    using OutputTransform = std::optional<std::array<float, 9>>;
+    void SetOutputTransform(OutputTransform const &transform);
     void SetConverged(bool value) { _converged.store(value); }
     void ResetSamples();
     uint64_t GetAllocationRevision() const { return _allocationRevision.load(); }
@@ -136,7 +146,10 @@ protected:
 
 private:
     void _Write(unsigned int x, unsigned int y, const float *value,
-                size_t components, bool accumulate);
+                size_t components, bool accumulate, bool convert = true);
+    // Encodes one pixel of `n` floats into `dst` (missing components: 0,
+    // alpha 1), through the output transform when `convert`.
+    void _Encode(uint8_t *dst, const float *value, size_t n, bool convert) const;
     // Replicates one encoded clear pixel over the whole working image.
     void _FillWorking(VtValue const &clearValue);
     void _ClearRefinement();
@@ -145,6 +158,8 @@ private:
     unsigned int _height = 0;
     HdFormat _format = HdFormatInvalid;
     bool _multiSampled = false;
+    bool _hasOutputTransform = false;
+    std::array<float, 9> _outputTransform{};
     // Mappers pin one published generation until the last Unmap. Publication
     // never modifies that generation or waits for an application to unmap it.
     std::shared_ptr<std::vector<uint8_t>> _pixels;
