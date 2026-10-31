@@ -2,11 +2,13 @@
 #include <MaterialXFormat/XmlIo.h>
 #include <MaterialXFormat/Util.h>
 #include <MaterialXCore/Traversal.h>
+#include <MaterialXCore/Util.h>
 #include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <format>
 #include <iostream>
+#include <mutex>
 #include <set>
 #include <tuple>
 #include <vector>
@@ -1750,8 +1752,39 @@ DocumentLoader::DocumentLoader(MaterialX::DocumentPtr stdlib, bool clamp,
       m_fallback_sss_to_diffuse(fallback_sss_to_diffuse)
 {}
 
+std::string DocumentLoader::materialXVersionWarning(int major, int minor, int patch)
+{
+    using Version = std::tuple<int, int, int>;
+    const Version version{major, minor, patch};
+    const Version lo{kTestedMaterialXMin[0], kTestedMaterialXMin[1], kTestedMaterialXMin[2]};
+    const Version hi{kTestedMaterialXMax[0], kTestedMaterialXMax[1], kTestedMaterialXMax[2]};
+    if (version >= lo && version <= hi) return {};
+    auto text = [](Version const& v) { return std::format("{}.{}.{}", std::get<0>(v), std::get<1>(v), std::get<2>(v)); };
+    std::string range = text(lo);
+    if (hi != lo) range += " to " + text(hi);
+    return std::format("[MaterialX] WARNING: MaterialX {} is outside the tested range ({}); the compatibility "
+                       "repairs target that version's graphs and may not apply or may apply wrongly\n",
+                       text(version), range);
+}
+
+bool DocumentLoader::warnOnceIfUntestedMaterialX()
+{
+    static std::once_flag once;
+    bool printed = false;
+    std::call_once(once, [&] {
+        const auto [major, minor, patch] = MaterialX::getVersionIntegers();
+        const std::string warning = materialXVersionWarning(major, minor, patch);
+        if (!warning.empty()) {
+            std::cerr << warning;
+            printed = true;
+        }
+    });
+    return printed;
+}
+
 MaterialX::DocumentPtr DocumentLoader::load(const std::string& filepath)
 {
+    warnOnceIfUntestedMaterialX();
     VerboseScope verbose(m_verbose);
     tRepairs = {};
     m_repairs = {};

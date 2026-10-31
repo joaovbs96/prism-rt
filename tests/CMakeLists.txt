@@ -67,3 +67,7 @@ set_tests_properties(materialx_loader_eon PROPERTIES SKIP_RETURN_CODE 77)
 # CPU-only; see the labels in the top-level CMakeLists.txt.
 get_property(_prism_materialx_tests DIRECTORY PROPERTY TESTS)
 set_tests_properties(${_prism_materialx_tests} PROPERTIES LABELS cpu)
+add_executable(materialx_loader_version materialx_loader_version.cpp ../src/materialx/loader.cpp)
+target_compile_features(materialx_loader_version PRIVATE cxx_std_20)
+target_link_libraries(materialx_loader_version PRIVATE MaterialXCore MaterialXFormat)
+add_test(NAME materialx_loader_version COMMAND materialx_loader_version)

@@ -53,6 +53,17 @@ public:
     // The last load()'s repairs.
     RepairCounts const& repairs() const { return m_repairs; }
 
+    // The MaterialX versions the repairs were written and tested against
+    // (inclusive, major.minor.patch). Their graph patterns follow 1.39.5's
+    // library; other versions may not match, or may match wrongly.
+    static constexpr int kTestedMaterialXMin[3] = {1, 39, 5};
+    static constexpr int kTestedMaterialXMax[3] = {1, 39, 5};
+    // Empty when the version is inside the tested range, else the warning text.
+    static std::string materialXVersionWarning(int major, int minor, int patch);
+    // Prints materialXVersionWarning for the linked MaterialX library, at most
+    // once per process (load() calls it). Returns whether it printed.
+    static bool warnOnceIfUntestedMaterialX();
+
     MaterialX::DocumentPtr load(const std::string& filepath);
     MaterialX::DocumentPtr create_empty();
     MaterialX::DocumentPtr get_stdlib() const { return m_stdlib; }
