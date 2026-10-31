@@ -39,6 +39,10 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
+#include <exception>
+#include <functional>
+#include <mutex>
 #include <cstring>
 #include <iostream>
 #include <map>
@@ -786,6 +790,26 @@ struct Scene::Impl {
     void edited(uint32_t kinds) { dirty |= kinds; }
 
     std::shared_ptr<Material> compile(MaterialEntry& entry);
+    // compile() in three steps, so that commit() compiles MaterialX materials
+    // on workers: prepareCompile on the committing thread (built-in
+    // materials, the document, the MDL SDK's resource paths), runCompile on
+    // any thread (the MDL compilation), finishCompile again on the committing
+    // thread in the materials' order (diagnostics, errors).
+    struct CompileJob {
+        std::string label;
+        std::string path;  // the MaterialX document
+        std::string materialName;
+        std::string libraries, mdlPath;
+        MaterialSettings settings;
+        mdl::Context* mdlContext = nullptr;
+        std::string failure;              // set: failed before or while compiling
+        std::exception_ptr notFound;      // an Error(NotFound) to rethrow
+        std::shared_ptr<Material> material;
+    };
+    std::shared_ptr<Material> prepareCompile(MaterialEntry& entry, CompileJob& job);
+    static void runCompile(CompileJob& job) noexcept;
+    std::shared_ptr<Material> finishCompile(CompileJob& job);
+    void compileAll(std::vector<CompileJob>& jobs, std::function<void(size_t)> const& finished);
     CommitResult commit(ProgressCallback const& progress);
     std::shared_ptr<EnvironmentStorage> buildEnvironment(std::shared_ptr<const color::ColorManagement> const& color);
     std::shared_ptr<LightStorage> buildLights(color::ColorManagement const& color);
@@ -794,6 +818,14 @@ struct Scene::Impl {
 };
 
 std::shared_ptr<Material> Scene::Impl::compile(MaterialEntry& entry)
+{
+    CompileJob job;
+    if (auto material = prepareCompile(entry, job)) return material;
+    runCompile(job);
+    return finishCompile(job);
+}
+
+std::shared_ptr<Material> Scene::Impl::prepareCompile(MaterialEntry& entry, CompileJob& job)
 {
     MaterialDesc const& desc = entry.desc;
     // A material with its texture (Diffuse and Emissive keep a pointer).
@@ -808,6 +840,7 @@ std::shared_ptr<Material> Scene::Impl::compile(MaterialEntry& entry)
         return std::shared_ptr<Material>(owned, owned->material.get());
     };
     const std::string label = desc.name.empty() ? std::string("(unnamed)") : desc.name;
+    job.label = label;
     switch (desc.kind) {
     case MaterialDesc::Kind::Diffuse:
         return own(std::make_unique<ColorTexture>(desc.color), [&](Texture<Color3>* texture) -> std::unique_ptr<Material> {
@@ -825,40 +858,136 @@ std::shared_ptr<Material> Scene::Impl::compile(MaterialEntry& entry)
     case MaterialDesc::Kind::MaterialXString:
         break;
     }
-    std::string failure;
     try {
         RendererOptions const& options = context->options();
-        const std::string libraries = options.materials.materialxLibraries;
-        const std::string mdlPath = options.materials.materialxMdlPath.empty() ? libraries + "/mdl"
-                                                                               : options.materials.materialxMdlPath;
-        if (libraries.empty()) {
-            failure = "no MaterialX libraries (PRISM_MATERIALX_LIBRARY_PATH)";
+        job.libraries = options.materials.materialxLibraries;
+        job.mdlPath = options.materials.materialxMdlPath.empty() ? job.libraries + "/mdl"
+                                                                 : options.materials.materialxMdlPath;
+        if (job.libraries.empty()) {
+            job.failure = "no MaterialX libraries (PRISM_MATERIALX_LIBRARY_PATH)";
         } else {
             mdl::Context& mdlContext = materials::SharedMdlContext();
             if (!mdlContext.is_valid()) throw std::runtime_error(mdlContext.get_error());
-            const MaterialSettings settings = context->materialSettings();
-            std::string path = desc.path;
+            job.mdlContext = &mdlContext;
+            job.settings = context->materialSettings();
+            job.path = desc.path;
+            job.materialName = desc.materialName;
             if (desc.kind == MaterialDesc::Kind::MaterialXString)
-                path = materialx::PublishMaterialXDocument(desc.document, settings.cacheDirectory / "materials", "api_")
-                           .string();
-            else if (!std::filesystem::exists(path))
-                Throw(ErrorCode::NotFound, "MaterialX document '" + path + "' does not exist");
+                job.path = materialx::PublishMaterialXDocument(desc.document,
+                                                               job.settings.cacheDirectory / "materials", "api_")
+                               .string();
+            else if (!std::filesystem::exists(job.path))
+                Throw(ErrorCode::NotFound, "MaterialX document '" + job.path + "' does not exist");
+            // The MDL SDK's configuration changes here, before any worker
+            // compiles (as MaterialService::Prefetch).
             if (!desc.searchPath.empty()) mdlContext.add_resource_path(desc.searchPath);
-            auto material = std::make_shared<MDLMaterial>(path, mdlContext, libraries, mdlPath, settings,
-                                                          desc.materialName);
-            if (material->is_valid()) return material;
-            failure = "MDL compilation failed (" + path + ")";
         }
     } catch (Error const& error) {
         if (error.code() == ErrorCode::NotFound) throw;
-        failure = error.what();
+        job.failure = error.what();
     } catch (std::exception const& error) {
-        failure = error.what();
+        job.failure = error.what();
     }
-    diagnose(DiagnosticLevel::Error, "material", "material " + label + " failed to load (" +
-             (failure.empty() ? std::string("unknown error") : failure) +
+    if (job.failure.empty() && !job.mdlContext) job.failure = "unknown error";
+    return nullptr;
+}
+
+void Scene::Impl::runCompile(CompileJob& job) noexcept
+{
+    if (!job.failure.empty() || !job.mdlContext) return;
+    try {
+        auto material = std::make_shared<MDLMaterial>(job.path, *job.mdlContext, job.libraries, job.mdlPath,
+                                                      job.settings, job.materialName);
+        if (material->is_valid()) job.material = std::move(material);
+        else job.failure = "MDL compilation failed (" + job.path + ")";
+    } catch (Error const& error) {
+        if (error.code() == ErrorCode::NotFound) job.notFound = std::current_exception();
+        job.failure = error.what();
+    } catch (std::exception const& error) {
+        job.failure = error.what();
+    } catch (...) {
+        job.failure = "unknown error";
+    }
+}
+
+std::shared_ptr<Material> Scene::Impl::finishCompile(CompileJob& job)
+{
+    if (job.notFound) std::rethrow_exception(job.notFound);
+    if (job.material) return std::move(job.material);
+    diagnose(DiagnosticLevel::Error, "material", "material " + job.label + " failed to load (" +
+             (job.failure.empty() ? std::string("unknown error") : job.failure) +
              "); rendering it with the magenta error material");
     return std::shared_ptr<Material>(std::shared_ptr<Material>(), ErrorMaterial::Shared());
+}
+
+// Runs the jobs' MDL compilations, the first alone (it loads the MDL modules
+// every generated material imports) and the others on up to
+// Limits::MaterialWorkers threads, as MaterialService's compile pool: each
+// worker has its own generator (MDLGenerator::workerLocal) and MDL
+// transactions, and a material's result does not depend on which worker
+// compiled it or when. `finished(n)` reports n jobs done, on this thread.
+void Scene::Impl::compileAll(std::vector<CompileJob>& jobs, std::function<void(size_t)> const& finished)
+{
+    if (jobs.empty()) return;
+    runCompile(jobs[0]);
+    finished(1);
+    const size_t rest = jobs.size() - 1;
+    const unsigned workers = unsigned(std::min<size_t>(context->options().limits.MaterialWorkers(), rest));
+    if (workers <= 1) {
+        for (size_t i = 1; i < jobs.size(); ++i) {
+            runCompile(jobs[i]);
+            finished(i + 1);
+        }
+        return;
+    }
+    for (CompileJob const& job : jobs)
+        if (job.failure.empty() && job.mdlContext) {
+            MDLGenerator::reserveWorkers(job.libraries, workers, job.settings.color.get());
+            break;
+        }
+    prism::Progress* const progressModel = prism::Progress::Current();
+    Logger const* const logger = &context->logger();
+    std::atomic<size_t> next{1};
+    std::atomic<bool> stop{false};
+    std::mutex mutex;
+    std::condition_variable done;
+    size_t completed = 1;
+    std::vector<std::thread> pool;
+    // Joins the workers however this returns (a cancelled report throws).
+    struct Join {
+        std::vector<std::thread>& pool;
+        std::atomic<bool>& stop;
+        ~Join()
+        {
+            stop = true;
+            for (std::thread& worker : pool) worker.join();
+        }
+    } join{pool, stop};
+    pool.reserve(workers);
+    for (unsigned w = 0; w < workers; ++w)
+        pool.emplace_back([&] {
+            prism::progress::Bind progressBinding(progressModel);
+            prism::logging::Bind logBinding(logger);
+            for (;;) {
+                if (stop) break;
+                const size_t index = next.fetch_add(1);
+                if (index >= jobs.size()) break;
+                runCompile(jobs[index]);
+                {
+                    std::lock_guard lock(mutex);
+                    ++completed;
+                }
+                done.notify_one();
+            }
+        });
+    size_t reported = 1;
+    while (reported < jobs.size()) {
+        std::unique_lock lock(mutex);
+        done.wait(lock, [&] { return completed > reported; });
+        const size_t now = completed;
+        lock.unlock();
+        while (reported < now) finished(++reported);
+    }
 }
 
 // Environments, in order; several add up.
@@ -1097,18 +1226,41 @@ CommitResult Scene::Impl::commit(ProgressCallback const& progress)
     diagnostics.clear();
 
     // ── Materials: compiled once per description (load time only).
-    size_t materialCount = 0, materialsDone = 0;
-    materials.forEach([&](uint64_t, MaterialEntry&) { ++materialCount; });
+    std::vector<MaterialEntry*> entries;
+    materials.forEach([&](uint64_t, MaterialEntry& entry) { entries.push_back(&entry); });
+    const size_t materialCount = entries.size();
+    size_t materialsDone = 0;
     report("materials", 0, materialCount);
-    std::vector<std::shared_ptr<Material>> used;
-    materials.forEach([&](uint64_t, MaterialEntry& entry) {
-        if (!entry.compiled) {
-            entry.compiled = compile(entry);
+    {
+        // MaterialX materials compile in parallel (compileAll); the rest,
+        // and every result, in the materials' order.
+        std::vector<MaterialEntry*> pending;
+        std::vector<CompileJob> jobs;
+        for (MaterialEntry* entry : entries) {
+            if (entry->compiled) {
+                report("materials", ++materialsDone, materialCount);
+                continue;
+            }
+            CompileJob job;
+            if (auto material = prepareCompile(*entry, job)) {
+                entry->compiled = std::move(material);
+                ++result.materialsCompiled;
+                report("materials", ++materialsDone, materialCount);
+                continue;
+            }
+            pending.push_back(entry);
+            jobs.push_back(std::move(job));
+        }
+        const size_t before = materialsDone;
+        compileAll(jobs, [&](size_t finished) { report("materials", before + finished, materialCount); });
+        for (size_t i = 0; i < jobs.size(); ++i) {
+            pending[i]->compiled = finishCompile(jobs[i]);
             ++result.materialsCompiled;
         }
-        used.push_back(entry.compiled);
-        report("materials", ++materialsDone, materialCount);
-    });
+    }
+    std::vector<std::shared_ptr<Material>> used;
+    used.reserve(entries.size());
+    for (MaterialEntry* entry : entries) used.push_back(entry->compiled);
     result.materials = used.size();
     // Geometry without a material: the delegate's fallback grey (one for
     // the scene's lifetime, so revisions agree on it).
