@@ -481,6 +481,48 @@ the CLI keeps polygon meshes in world space and their vertex-interpolated
 attributes per point (smoothed tangent frames), where the delegate places
 prototypes and keeps per-triangle tangents.
 
+The harness passes `--seed 0` to both frontends (it is also both defaults;
+`ARGS` may name another seed).
+
+### Comparing the frontends on a production scene
+
+The same seed draws the same random numbers in both frontends, but the
+loaders' last-bit differences (world-space versus prototype vertices, tangent
+frames, object-space shading positions) send some paths elsewhere, and refractive
+or subsurface materials then decorrelate those pixels. A same-seed NRMSE
+is therefore not zero, and alone it does not tell noise from a loader bug. To
+tell them apart:
+
+1. Render both on the CPU with everything pinned: `--device cpu --seed S --spp N
+   --adaptive-threshold 0`, the same size and camera (`prism_hydra_render
+   scene /cam out W H N --seed S --adaptive-threshold 0`).
+2. Noise floor: each frontend with seeds 0 and 1. The CLI-vs-Hydra NRMSE at
+   the same seed should stay well below it.
+3. Two sample counts (say 16 and 256): noise falls as 1/sqrt(spp) in both
+   the floor and the CLI-vs-Hydra NRMSE; a loader difference stops falling.
+4. Bias: per block (10x10 pixels), the CLI-minus-Hydra mean of seed 0 and of
+   seed 1 should not correlate (a bias correlates near +1); the whole-image
+   mean difference should be far below the floor's.
+5. To localise a real difference: `--max-depth 2` (first hit and direct light),
+   a wrapper layer that deactivates prims or unbinds materials, and the
+   published `.mtlx` documents in each run's `PRISM_CACHE_DIR/materials`.
+
+MaterialEggs countertop (320x180, CPU, 2026-10-31):
+
+| Check | 16 spp | 256 spp |
+| --- | --- | --- |
+| CLI seed 0 vs seed 1 (floor) | 0.332 | 0.079 |
+| Hydra seed 0 vs seed 1 (floor) | 0.331 | 0.079 |
+| CLI vs Hydra, seed 0 / seed 1 | 0.037 / 0.038 | 0.0097 / 0.0096 |
+| CLI vs Hydra, mean luminance | 1.4e-4 / 1e-5 | 5e-5 / 6e-5 |
+
+The CLI-vs-Hydra NRMSE falls by 3.8x for 16x the samples (the floor by 4.2x),
+and the per-block differences of the two seeds correlate at -0.26: noise, no
+bias. Most of it comes from the glass of the geode and marbles eggs. Without
+materials, 92% of the countertop's pixels match exactly at depth 2; the
+published documents differ only in hdMtlx's nodegraph name and render the
+same on the shaderball.
+
 `tests/hydra/validate.py` and `validate_exports.py` also run under CTest, on
 the CPU device (`--device cpu`), as `prism_hydra_validate_script` and
 `prism_hydra_validate_exports_script`. They need no display or GPU.

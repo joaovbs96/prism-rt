@@ -15,7 +15,8 @@
 # the Hydra delegate (prism_hydra_render), then compares the two with
 # prism_compare_images: normalized RMSE within TOLERANCE and relative mean
 # luminance within MEAN_TOLERANCE (default: TOLERANCE). Both render a fixed
-# number of samples (no adaptive sampling: _prism_fixed_sampling). Without PRODUCTS both
+# number of samples (no adaptive sampling: _prism_fixed_sampling) with the same
+# seed (0; ARGS may name another). Without PRODUCTS both
 # render one image from CAMERA; with PRODUCTS both write the RenderProducts of
 # the stage's render settings and each listed file is compared. LAYERS
 # compares those layers too, within the tolerances (light AOVs); EXACT_LAYERS
@@ -55,17 +56,17 @@ function(prism_add_parity_fixture)
     set(_prefix prism_parity_${P_NAME})
     if(P_PRODUCTS)
         add_test(NAME ${_prefix}_cli
-            COMMAND PrismRT --scene "${_scene}" --device ${P_CLI_DEVICE} --output-dir "${_dir}/cli" ${_prism_fixed_sampling} ${P_ARGS} ${P_CLI_ARGS})
+            COMMAND PrismRT --scene "${_scene}" --device ${P_CLI_DEVICE} --output-dir "${_dir}/cli" ${_prism_fixed_sampling} --seed 0 ${P_ARGS} ${P_CLI_ARGS})
         add_test(NAME ${_prefix}_hydra
-            COMMAND prism_hydra_render "${_scene}" --render-settings default "${_dir}/hydra" ${_prism_fixed_sampling} ${P_ARGS} ${P_HYDRA_ARGS})
+            COMMAND prism_hydra_render "${_scene}" --render-settings default "${_dir}/hydra" ${_prism_fixed_sampling} --seed 0 ${P_ARGS} ${P_HYDRA_ARGS})
         set(_outputs ${P_PRODUCTS})
     else()
         add_test(NAME ${_prefix}_cli
             COMMAND PrismRT --scene "${_scene}" --camera ${P_CAMERA} --width ${P_WIDTH} --height ${P_HEIGHT}
-                --spp ${P_SPP} --device ${P_CLI_DEVICE} ${_prism_fixed_sampling} ${P_ARGS} ${P_CLI_ARGS} --output "${_dir}/cli/image.exr")
+                --spp ${P_SPP} --device ${P_CLI_DEVICE} ${_prism_fixed_sampling} --seed 0 ${P_ARGS} ${P_CLI_ARGS} --output "${_dir}/cli/image.exr")
         add_test(NAME ${_prefix}_hydra
             COMMAND prism_hydra_render "${_scene}" ${P_CAMERA} "${_dir}/hydra/image.exr"
-                ${P_WIDTH} ${P_HEIGHT} ${P_SPP} ${_prism_fixed_sampling} ${P_ARGS} ${P_HYDRA_ARGS})
+                ${P_WIDTH} ${P_HEIGHT} ${P_SPP} ${_prism_fixed_sampling} --seed 0 ${P_ARGS} ${P_HYDRA_ARGS})
         set(_outputs image.exr)
     endif()
     # The CPU device in both frontends unless CLI_DEVICE says otherwise.
