@@ -1407,6 +1407,15 @@ called done there.
   device-specific. Check on the Mac: a usdview session on a many-prim stage
   stays responsive while it loads and during edits, and a Hydra render on
   `--device metal` is bit-identical to the previous build's.
+- **Pooled Hydra spheres carry no material** (`_AppendSphere` in
+  `src/hydra/scene_bridge.cpp`, `OpaqueOccluders::Build` in
+  `src/device/opaque_occluders.cpp`): a pooled `Sphere` is built with a null
+  material and each placement's `binding.fallback` holds its bank's
+  material, as before. The GPU scene (`gpu_scene.cpp`) already resolved the
+  binding first; no shader change. Check on the Mac: `prism_hydra_type_change`
+  passes, and an edit sequence on InOneWeekend (`prism_hydra_render ...
+  --edit-sequence 3 /World/Geometry/Object_1`) on `--device metal` is
+  bit-identical to the previous build's.
 
 ## Diagnostics
 

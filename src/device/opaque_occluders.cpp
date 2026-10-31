@@ -91,7 +91,8 @@ OpaqueOccluders OpaqueOccluders::Build(SceneManager& scene, bool culling)
             for (auto const& [index, material] : mesh->materials) see(material);
             primitives = mesh->indices.size() / 3;
         } else if (auto* sphere = dynamic_cast<Sphere*>(geometry)) {
-            see(sphere->material);
+            // null: none (the delegate's pooled spheres; the binding has it)
+            if (sphere->material) see(sphere->material);
             primitives = 1;
         } else if (auto* batch = dynamic_cast<BatchedSpheres*>(geometry)) {
             for (auto const& entry : batch->entries) see(entry.material);

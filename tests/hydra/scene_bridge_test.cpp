@@ -36,6 +36,7 @@
 #include <pxr/imaging/hd/xformSchema.h>
 
 #include <cstdint>
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -64,6 +65,7 @@ int RunC2GeometricAovIntegrationTests();
 int RunSnapshotScalingTests();
 int RunCachedCountTests();
 int RunHashOrderTests();
+int RunTypeChangeTests(int rounds);
 
 namespace {
 
@@ -1170,6 +1172,9 @@ int main(int argc, char **argv)
     // `hash-order` runs only the hash-order checks (CPU device).
     if (argc == 2 && std::string(argv[1]) == "hash-order")
         return RunHashOrderTests();
+    // `type-change [rounds]` runs only the prim type change checks (CPU device).
+    if ((argc == 2 || argc == 3) && std::string(argv[1]) == "type-change")
+        return RunTypeChangeTests(argc == 3 ? std::max(1, std::atoi(argv[2])) : 3);
     // `spare-bank-edit auto|cpu|vulkan|metal` runs only the edit-during-spare-job
     // check (case C) on that device.
     prism::device::DevicePreference spareDevice{};

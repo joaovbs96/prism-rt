@@ -2067,7 +2067,10 @@ bool _AppendSphere(HdSceneIndexBaseRefPtr const &sceneIndex,
     }
     if (!storage) {
         storage=std::make_shared<PrototypeStorage>();
-        auto sphere=std::make_unique<Sphere>(Float3(0.0f),sphereRadius,material);
+        // Pooled storage outlives this bank (later banks reuse it), so the
+        // sphere keeps no material: each bank's placements bind theirs
+        // (binding.fallback below).
+        auto sphere=std::make_unique<Sphere>(Float3(0.0f),sphereRadius,nullptr);
         storage->scene=rtcNewScene(snapshot->device);
         sphere->setupEmbree(*snapshot->scene->device,storage->scene);
         rtcCommitScene(storage->scene);
