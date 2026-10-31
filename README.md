@@ -6,6 +6,9 @@
 
 PrismRT is a physically based path tracer for OpenUSD, glTF and OBJ scenes with MaterialX materials, compiled through NVIDIA MDL. It renders on the CPU (Embree, oneTBB) or on the GPU with hardware ray tracing (Vulkan on Windows, Metal on macOS), and every device runs the same path tracer.
 
+![The MaterialEggs countertop scene rendered by PrismRT](docs/images/materialeggs_countertop.jpg)
+<sub>The countertop scene of [MaterialEggs](https://github.com/stehrani3d/MaterialEggs) by stehrani3d (MIT licence), rendered by PrismRT on Vulkan.</sub>
+
 You can use it through:
 
 * **usdview and other Hydra hosts**, with the hdPrism render delegate ([Hydra usage](docs/hydra.md), [material support](docs/hydra_materials.md));
@@ -115,5 +118,7 @@ On Windows, keep the install or extract folder short (such as `C:\PrismRT`) or e
 ---------------------------------------
 
 PrismRT is licensed under the Apache License, Version 2.0. See [LICENSE](./LICENSE) for the full text and [NOTICE](./NOTICE) for the copyright notice.
+
+The image at the top shows the [MaterialEggs](https://github.com/stehrani3d/MaterialEggs) assets (© 2024 stehrani3d, MIT licence), with an HDRI courtesy of [Poly Haven](https://polyhaven.com/) (CC0; credit to Sergej Majboroda and Greg Zaal, as the MaterialEggs README gives it); the assets are not included in this repository.
 
 The material preview's scene in `resources/shaderball` is the [Standard Shader Ball](https://github.com/usd-wg/assets/tree/main/full_assets/StandardShaderBall) of the USD Working Group's assets (geometry and textures by Chris Rydalch, specification and validation by André Mazzone, after Thomas Anagnostou's original scene), used unchanged under the [Creative Commons Attribution 4.0 International licence](https://creativecommons.org/licenses/by/4.0/) (`resources/shaderball/LICENCE`, `resources/shaderball/ATTRIBUTION.md`).
