@@ -215,16 +215,44 @@ _LightTokenSet const &_LightTokens()
     return tokens;
 }
 
+// Top-level prim containers that the snapshot never reads: UsdImaging's own
+// bookkeeping (prim info, up axis, unresolved USD bindings, prim origin, xform
+// op vectors, model/geomModel, skeleton and coordinate-system bindings) and
+// Storm's display data (extent and displayStyle, whose notices the delegate
+// already ignores). Copying them cost about a third of the capture time on
+// many-prim stages. A converter that starts reading one of these must remove
+// it from this list.
+bool _SkipCapturedContainer(TfToken const &name)
+{
+    static const TfToken skipped[] = {
+        TfToken("__usdPrimInfo"), TfToken("__usdUpAxis"),
+        TfToken("usdMaterialBindings"), TfToken("primOrigin"),
+        TfToken("geomXformVectors"), TfToken("model"), TfToken("geomModel"),
+        TfToken("skelBinding"), TfToken("coordSysBinding"),
+        TfToken("extent"), TfToken("displayStyle")};
+    return std::find(std::begin(skipped), std::end(skipped), name) != std::end(skipped);
+}
+
 HdContainerDataSourceHandle _MakeStaticPrimCopy(
     TfToken const &primType, HdContainerDataSourceHandle const &source)
 {
-    if (!source || !HdPrimTypeIsLight(primType))
-        return HdContainerDataSource::Cast(_MakeStaticCopy(source));
+    if (!source) return {};
+    if (!HdPrimTypeIsLight(primType)) {
+        TfTokenVector names = source->GetNames();
+        std::erase_if(names, _SkipCapturedContainer);
+        std::vector<HdDataSourceBaseHandle> values;
+        values.reserve(names.size());
+        for (TfToken const &name : names)
+            values.push_back(_MakeStaticCopy(source->Get(name)));
+        return HdRetainedContainerDataSource::New(
+            names.size(), names.data(), values.data());
+    }
 
     // The legacy light data source resolves authored shader inputs from
     // Get(name), but intentionally omits them from GetNames(). Preserve the
     // inputs consumed by _SetDomeEnvironment while we still own the live DS.
     TfTokenVector names = source->GetNames();
+    std::erase_if(names, _SkipCapturedContainer);
     if (std::find(names.begin(), names.end(), HdLightSchemaTokens->light) ==
         names.end())
         names.push_back(HdLightSchemaTokens->light);
@@ -5428,8 +5456,64 @@ bool SceneBridge::Prepare(CameraState const &camera,
         }
         _impl->RefreshLoadingPhaseLocked();
     }
+    // Prims are captured in batches taken from the queue front. Reading and
+    // copying a batch runs in parallel outside the lock (scene index reads
+    // are thread-safe, Hydra syncs prims in parallel); lights copy serially,
+    // since their legacy data sources may read a host scene delegate. The
+    // results are then applied in queue order, as one prim at a time did, so
+    // the retained scene and the queue order are unchanged. The first batch
+    // holds one prim per thread; later ones fill the remaining budget at the
+    // measured cost per prim.
+    struct CapturedPrim {
+        SdfPath path;
+        HdSceneIndexPrim prim;
+        HdContainerDataSourceHandle copy;
+        SdfPathVector children;
+        bool keep = false;
+    };
+    std::vector<CapturedPrim> batch;
+    const size_t threads = size_t(std::max(1, tbb::this_task_arena::max_concurrency()));
+    size_t batchSize = threads;
     auto const captureStart = std::chrono::steady_clock::now();
     for (;;) {
+        bool walkChildren = false;
+        {
+            std::lock_guard lock(_impl->mutex);
+            if (!_impl->captureActive) break;
+            if (_impl->captureGeneration != _impl->requestedGeneration) {
+                _impl->captureActive = false;
+                _impl->captureScene.Reset();
+                _impl->captureQueue.clear();
+                _impl->captureQueued.clear();
+                break;
+            }
+            if (_impl->captureQueue.empty()) break;
+            captureWorked = true;
+            batch.clear();
+            while (batch.size() < batchSize && !_impl->captureQueue.empty()) {
+                batch.push_back({_impl->captureQueue.front()});
+                _impl->captureQueue.pop_front();
+            }
+            walkChildren = _impl->captureFull ||
+                (_impl->captureDirtyKinds & static_cast<unsigned int>(SceneDirtyKind::Structure));
+        }
+        auto const batchStart = std::chrono::steady_clock::now();
+        HdSceneIndexBaseRefPtr const &source = _impl->sceneIndex;
+        auto read = [&](CapturedPrim &item) {
+            item.prim = source->GetPrim(item.path);
+            item.keep = _CapturePrimData(item.prim.primType) &&
+                (!item.prim.primType.IsEmpty() || item.prim.dataSource);
+            if (item.keep && !HdPrimTypeIsLight(item.prim.primType))
+                item.copy = _MakeStaticPrimCopy(item.prim.primType, item.prim.dataSource);
+            if (walkChildren) item.children = source->GetChildPrimPaths(item.path);
+        };
+        if (batch.size() == 1) read(batch.front());
+        else tbb::this_task_arena::isolate([&] {
+            tbb::parallel_for(size_t(0), batch.size(), [&](size_t i) { read(batch[i]); });
+        });
+        for (CapturedPrim &item : batch)
+            if (item.keep && HdPrimTypeIsLight(item.prim.primType))
+                item.copy = _MakeStaticPrimCopy(item.prim.primType, item.prim.dataSource);
         std::lock_guard lock(_impl->mutex);
         if (!_impl->captureActive) break;
         if (_impl->captureGeneration != _impl->requestedGeneration) {
@@ -5439,11 +5523,9 @@ bool SceneBridge::Prepare(CameraState const &camera,
             _impl->captureQueued.clear();
             break;
         }
-        if (!_impl->captureQueue.empty()) {
-            captureWorked = true;
-            SdfPath const path = _impl->captureQueue.front();
-            _impl->captureQueue.pop_front();
-            HdSceneIndexPrim const prim = _impl->sceneIndex->GetPrim(path);
+        for (CapturedPrim &item : batch) {
+            SdfPath const &path = item.path;
+            HdSceneIndexPrim const &prim = item.prim;
             auto prior = _impl->staticPrims.find(path);
             if (prim.primType == HdPrimTypeTokens->instancer ||
                 HdInstancedBySchema::GetFromParent(prim.dataSource) ||
@@ -5451,11 +5533,8 @@ bool SceneBridge::Prepare(CameraState const &camera,
                  (prior->second.primType == HdPrimTypeTokens->instancer ||
                   HdInstancedBySchema::GetFromParent(prior->second.dataSource))))
                 _impl->captureNativeRootsDirty = true;
-            if (_CapturePrimData(prim.primType) &&
-                (!prim.primType.IsEmpty() || prim.dataSource)) {
-                _impl->staticPrims[path] = {
-                    prim.primType,
-                    _MakeStaticPrimCopy(prim.primType, prim.dataSource)};
+            if (item.keep) {
+                _impl->staticPrims[path] = {prim.primType, std::move(item.copy)};
                 auto const &record = _impl->staticPrims[path];
                 _impl->captureScene->AddPrims({{
                     path, record.primType, record.dataSource}});
@@ -5470,17 +5549,17 @@ bool SceneBridge::Prepare(CameraState const &camera,
                 // visible to the background converter.
                 _impl->captureScene->RemovePrims({path});
             }
-            if (_impl->captureFull ||
-                (_impl->captureDirtyKinds & static_cast<unsigned int>(SceneDirtyKind::Structure))) {
-                for (SdfPath const &child :
-                     _impl->sceneIndex->GetChildPrimPaths(path))
-                    if (_impl->captureQueued.insert(child).second)
-                        _impl->captureQueue.push_back(child);
-            }
-        } else break;
-        if (std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - captureStart).count() >= captureBudget)
-            break;
+            for (SdfPath const &child : item.children)
+                if (_impl->captureQueued.insert(child).second)
+                    _impl->captureQueue.push_back(child);
+        }
+        auto const now = std::chrono::steady_clock::now();
+        const double elapsed = std::chrono::duration<double, std::milli>(now - captureStart).count();
+        if (elapsed >= captureBudget) break;
+        const double perPrim = std::chrono::duration<double, std::milli>(now - batchStart).count() /
+            double(batch.size());
+        const double fit = perPrim > 0.0 ? (captureBudget - elapsed) / perPrim : double(8 * threads);
+        batchSize = std::clamp(size_t(std::min(fit, double(8 * threads))), size_t(1), 8 * threads);
     }
     {
         std::lock_guard lock(_impl->mutex);
