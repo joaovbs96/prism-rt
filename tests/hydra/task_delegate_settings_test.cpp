@@ -1,5 +1,7 @@
 #include "../../src/hydra/task_delegate.h"
 #include "../../src/hydra/scene_bridge.h"
+#include "../../src/hydra/native_tasks.h"
+#include "../../src/hydra/transport_filter.h"
 
 #include <pxr/imaging/hd/renderSettingsSchema.h>
 #include <pxr/imaging/hd/materialBindingsSchema.h>
@@ -93,6 +95,16 @@ public:
     std::map<SdfPath, SdfPathVector> children;
 };
 
+// The terminal scene index the plugin gives the delegate (plugin.cpp): its
+// transport filter over the source scene. The mock's render settings prims
+// carry their own `active` flag, which the plugin's settings filter computes
+// from the scene globals, so the filters stay out (a plain terminal scene index
+// gets them, PrismAppendSceneFilters).
+HdSceneIndexBaseRefPtr AsPlugin(HdSceneIndexBaseRefPtr const &source)
+{
+    return PrismTransportFilter::New(source, std::make_shared<prism::hydra::TaskContext>());
+}
+
 } // namespace
 
 int RunAuthoredSettingsTests()
@@ -129,7 +141,7 @@ int RunAuthoredSettingsTests()
                 TfToken("Noise" + std::to_string(i))));
 
         PrismTaskDelegate delegate;
-        delegate.SetTerminalSceneIndex(index);
+        delegate.SetTerminalSceneIndex(AsPlugin(index));
         const TfToken hiddenBudget("prism:hiddenGeometryBudgetMiB");
         Require(delegate.GetRenderSetting(hiddenBudget).UncheckedGet<int>() == 0,
                 "Hidden geometry budget must default to unlimited");
@@ -237,7 +249,7 @@ int RunAuthoredSettingsTests()
         dirtyIndex->Add(SdfPath("/Mesh/Subset"), HdPrimTypeTokens->geomSubset,
                         HdRetainedContainerDataSource::New());
         PrismTaskDelegate dirtyDelegate;
-        dirtyDelegate.SetTerminalSceneIndex(dirtyIndex);
+        dirtyDelegate.SetTerminalSceneIndex(AsPlugin(dirtyIndex));
         auto stat = [](VtDictionary const &stats, char const *name) {
             auto const found = stats.find(name);
             return found != stats.end() && found->second.IsHolding<int64_t>()
@@ -325,7 +337,7 @@ int RunAuthoredSettingsTests()
             colorIndex->Add(SdfPath("/Settings"), HdPrimTypeTokens->renderSettings,
                             SettingsData(8, TfToken("lin_ap1_scene")));
             PrismTaskDelegate colorDelegate;
-            colorDelegate.SetTerminalSceneIndex(colorIndex);
+            colorDelegate.SetTerminalSceneIndex(AsPlugin(colorIndex));
             colorDelegate.SetRenderSetting(rendering, VtValue(TfToken("lin_rec709_scene")));
             colorDelegate.Update();
             Require(text(colorDelegate.GetRenderStats(), "prismWorkingColorSpace") == "ACEScg" &&

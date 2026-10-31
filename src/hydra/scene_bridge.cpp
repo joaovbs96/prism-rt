@@ -4427,9 +4427,10 @@ public:
         return options;
     }
 
-    Impl(HdSceneIndexBaseRefPtr index, HdRenderThread *thread)
+    Impl(HdSceneIndexBaseRefPtr index, HdRenderThread *thread, std::shared_ptr<RenderDrive> sharedDrive)
         : sceneIndex(std::move(index)), renderThread(thread), device(rtcNewDevice(nullptr))
     {
+        drive = sharedDrive ? std::move(sharedDrive) : std::make_shared<RenderDrive>();
         if (device)
             rtcSetDeviceMemoryMonitorFunction(device, &Impl::MemoryMonitor, this);
         // PRISM_DEVICE selects the initial device; a prism:device render setting
@@ -4588,19 +4589,59 @@ public:
         hiddenMaintenanceRevision = prototypePool->residencyClock.load();
     }
 
+    // How long a teardown waits for a cancelled conversion job before
+    // leaving it to finish on its own thread (~Impl).
+    static constexpr auto kTeardownBuildWait = std::chrono::milliseconds(150);
+
+    // Teardown: the conversion job and the device's preparation end early.
+    void CancelPreparationJobs()
+    {
+        {
+            std::lock_guard lock(mutex);
+            if (buildCancel) buildCancel->store(true, std::memory_order_relaxed);
+        }
+        SessionAccess::cancelJobs(session);
+    }
+
     ~Impl()
     {
-        // Device jobs own their device and snapshot; let them finish before
-        // the snapshots' shared Embree device is released.
-        SessionAccess::waitForJobs(session);
-        if (buildCancel) buildCancel->store(true, std::memory_order_relaxed);
+        // Device jobs own their device and snapshot; let them finish (early:
+        // cancelled first) before the snapshots' shared Embree device is
+        // released.
+        CancelPreparationJobs();
+        {
+            prism::load_profile::Scope profile("teardown.device_jobs");
+            SessionAccess::waitForJobs(session);
+        }
         if (buildFuture.valid()) {
-            try { (void)buildFuture.get(); }
-            catch (...) {}
+            prism::load_profile::Scope profile("teardown.build");
+            // The cancelled job returns at its next check, but a material
+            // compile already running (one MDL SDK call) cannot be stopped
+            // and takes seconds for some materials. After a short wait the
+            // job finishes on its own thread: it owns its inputs (retained
+            // scene, prototype pool, renderer context) and keeps the Embree
+            // device alive; nothing it does reaches this bridge, whose memory
+            // monitor is removed first. Its result is discarded.
+            if (buildFuture.wait_for(kTeardownBuildWait) == std::future_status::ready) {
+                try { (void)buildFuture.get(); }
+                catch (...) {}
+            } else {
+                if (device) {
+                    rtcSetDeviceMemoryMonitorFunction(device, nullptr, nullptr);
+                    rtcRetainDevice(device);
+                }
+                std::thread([job = std::move(buildFuture), retainedDevice = device]() mutable {
+                    try { (void)job.get(); }
+                    catch (...) {}
+                    if (retainedDevice) rtcReleaseDevice(retainedDevice);
+                }).detach();
+                profile.detail("detached");
+            }
         }
         // A retained published pick frame can outlive this bridge. Remove the
         // callback's Impl userdata after all bridge workers have quiesced.
         if (device) rtcSetDeviceMemoryMonitorFunction(device, nullptr, nullptr);
+        prism::load_profile::Scope releaseProfile("teardown.snapshots");
         snapshot.reset();
         inactiveSnapshot.reset();
         // PrototypeStorage releases Embree scenes/geometries. Expire every
@@ -4746,7 +4787,46 @@ public:
     uint64_t prototypeUpdateFallbacks = 0;
     uint64_t placementTopologyFallbacks = 0;
     std::string lastRebuildReason = "initial population";
+
+    // The preparation worker (SceneBridge::_PreparationWorker) advances the
+    // scene's preparation while the host does not call Execute, so that one
+    // Execute starts the render. Prepare releases `mutex` between its steps;
+    // the drive (render_drive.h, taken before `mutex`) serialises Prepare's
+    // work with the worker's, and host calls that stop the render thread and
+    // change what it reads hold it too, so the worker cannot restart the
+    // render thread in between. Shared with the delegate's render buffers.
+    std::shared_ptr<RenderDrive> drive;
+    std::thread worker;
+    std::condition_variable workerWake;
+    // Under `mutex`.
+    bool workerStop = false;
+    bool hostPrepared = false;   // a host Prepare gave the frame's state
+    bool hostStopped = false;    // the host's Stop, until its next start or Restart
+    // The host's last Execute, scene notice or settings change: the worker
+    // waits for the host to be quiet, so the notices of one host update are
+    // prepared together, as under Execute.
+    std::chrono::steady_clock::time_point lastHostActivity{};
+    // The resolver context the host had bound in its last Prepare, which the
+    // worker binds for the capture (asset paths resolve as in Execute).
+    ArResolverContext hostResolverContext;
+    uint64_t backgroundSteps = 0;
+    uint64_t backgroundStarts = 0;
+
+    // Holds the drive for a host call.
+    class HostDrive : public RenderDrive::HostLock {
+    public:
+        explicit HostDrive(Impl &impl) : RenderDrive::HostLock(impl.drive.get()) {}
+    };
 };
+
+namespace {
+// The host has been quiet (no Execute, scene notice or settings change) for
+// this long while preparation is pending: the worker continues it. Hosts that drive Execute every frame
+// (usdview while it renders) never wait that long.
+constexpr auto kBackgroundIdle = std::chrono::milliseconds(100);
+// The worker's poll interval while a conversion job runs.
+constexpr auto kBackgroundPoll = std::chrono::milliseconds(5);
+}
 
 bool CameraStatesIdentical(CameraState const &a, CameraState const &b)
 {
@@ -4763,8 +4843,9 @@ bool CameraStatesIdentical(CameraState const &a, CameraState const &b)
         sameBits(a.linearExposureScale, b.linearExposureScale);
 }
 
-SceneBridge::SceneBridge(HdSceneIndexBaseRefPtr sceneIndex, HdRenderThread *thread)
-    : _impl(std::make_unique<Impl>(std::move(sceneIndex), thread))
+SceneBridge::SceneBridge(HdSceneIndexBaseRefPtr sceneIndex, HdRenderThread *thread,
+                         std::shared_ptr<RenderDrive> drive)
+    : _impl(std::make_unique<Impl>(std::move(sceneIndex), thread, std::move(drive)))
 {
     // The delegate's colour management (its renderer's) is the default
     // settings' (Impl::InitialColor). Likewise the SSS fallback
@@ -4773,12 +4854,38 @@ SceneBridge::SceneBridge(HdSceneIndexBaseRefPtr sceneIndex, HdRenderThread *thre
 }
 SceneBridge::~SceneBridge()
 {
+    Shutdown();
     // Render() retains a local snapshot but continues to read Impl state and
     // buffers throughout the callback. Quiesce it before Impl tears either
     // down, including for owners other than PrismTaskDelegate.
     if (_impl && _impl->renderThread)
         _impl->renderThread->StopRender();
+    prism::load_profile::Scope profile("teardown.bridge");
     _impl.reset();
+}
+
+void SceneBridge::Shutdown()
+{
+    if (!_impl) return;
+    {
+        std::lock_guard lock(_impl->mutex);
+        _impl->workerStop = true;
+        if (_impl->buildCancel)
+            _impl->buildCancel->store(true, std::memory_order_relaxed);
+    }
+    _impl->workerWake.notify_all();
+    if (_impl->worker.joinable()) _impl->worker.join();
+    _impl->CancelPreparationJobs();
+}
+
+void SceneBridge::Stop()
+{
+    Impl::HostDrive drive(*_impl);
+    {
+        std::lock_guard lock(_impl->mutex);
+        _impl->hostStopped = true;
+    }
+    _impl->renderThread->StopRender();
 }
 
 void SceneBridge::MarkSceneDirty()
@@ -4820,8 +4927,12 @@ void SceneBridge::MarkSceneDirtyBatch(std::vector<SceneDirtyNotice> const &notic
                 (notice.paths.empty() ? "unknown dirty locator" :
                                        notice.paths.front().GetString());
     }
+    Impl::HostDrive drive(*_impl);
     _impl->renderThread->StopRender();
     std::lock_guard lock(_impl->mutex);
+    // A sleeping preparation worker has work again, once the host is quiet.
+    _impl->lastHostActivity = std::chrono::steady_clock::now();
+    _impl->workerWake.notify_all();
     if (_impl->buildCancel)
         _impl->buildCancel->store(true, std::memory_order_relaxed);
     _impl->sceneDirty = true;
@@ -4896,8 +5007,13 @@ void SceneBridge::MarkSceneDirtyBatch(std::vector<SceneDirtyNotice> const &notic
 
 void SceneBridge::RestartAccumulation()
 {
+    Impl::HostDrive drive(*_impl);
     _impl->renderThread->StopRender();
     std::lock_guard lock(_impl->mutex);
+    // The host's Restart ends its Stop.
+    _impl->hostStopped = false;
+    _impl->lastHostActivity = std::chrono::steady_clock::now();
+    _impl->workerWake.notify_all();
     SessionAccess::restartAccumulation(_impl->session);
     _impl->stateDirty = true;
     for (HdRenderPassAovBinding const &binding : _impl->bindings)
@@ -4914,6 +5030,8 @@ void SceneBridge::SetSettings(RenderSettings const &requested)
         TF_WARN("PrismRT: hidden geometry budget must be non-negative; retaining the previous settings");
         return;
     }
+    // The render thread stops below while the settings change.
+    Impl::HostDrive drive(*_impl);
     RenderSettings settings = requested;
     {
         // The renderer's colour management: an unusable config, working space
@@ -4975,6 +5093,7 @@ void SceneBridge::SetSettings(RenderSettings const &requested)
             current.environmentSampling == settings.environmentSampling &&
             current.gpuPreparationPreview == settings.gpuPreparationPreview &&
             current.gpuPreparationPreviewMaxMiB == settings.gpuPreparationPreviewMaxMiB &&
+            current.backgroundPreparation == settings.backgroundPreparation &&
             current.device == settings.device && current.color == settings.color &&
             current.renderingColorSpaceSetting == settings.renderingColorSpaceSetting &&
             current.outputSpace == settings.outputSpace && _impl->output == output &&
@@ -5162,6 +5281,8 @@ void SceneBridge::SetSettings(RenderSettings const &requested)
     _impl->MaintainHiddenGeometryLocked();
     _impl->stateDirty |= imageChanged;
     _impl->resumeRequested |= budgetChanged;
+    _impl->lastHostActivity = std::chrono::steady_clock::now();
+    _impl->workerWake.notify_all();
     if (imageChanged || budgetChanged) {
         for (auto const &binding : _impl->bindings)
             if (auto *buffer = dynamic_cast<PrismRenderBuffer *>(binding.renderBuffer))
@@ -5187,12 +5308,112 @@ bool SceneBridge::Prepare(CameraState const &camera,
                           TfTokenVector const &renderTags,
                           unsigned int width, unsigned int height)
 {
+    Impl::HostDrive drive(*_impl);
+    {
+        std::lock_guard lock(_impl->mutex);
+        _impl->lastHostActivity = std::chrono::steady_clock::now();
+        _impl->hostPrepared = true;
+        _impl->hostResolverContext = ArGetResolver().GetCurrentContext();
+    }
+    bool advanced = false;
+    const bool start = _Prepare(&camera, &bindings, &renderTags, width, height, false, &advanced);
+    std::lock_guard lock(_impl->mutex);
+    // The caller restarts the render thread: a Stop before ends.
+    if (start) _impl->hostStopped = false;
+    if (!_impl->worker.joinable() && !_impl->workerStop)
+        _impl->worker = std::thread([this] { _PreparationWorker(); });
+    _impl->workerWake.notify_all();
+    return start;
+}
+
+void SceneBridge::_PreparationWorker()
+{
+    // The delegate's diagnostics and progress on this thread, as its jobs'.
+    prism::logging::Bind logBinding(&_impl->renderer->logger());
+    prism::progress::Bind progressBinding(&_impl->progress);
+    std::unique_lock lock(_impl->mutex);
+    while (!_impl->workerStop) {
+        const bool pending = _impl->settings.backgroundPreparation && _impl->hostPrepared &&
+            !_impl->hostStopped &&
+            (_impl->sceneDirty || _impl->captureActive || _impl->buildFuture.valid());
+        if (!pending) {
+            _impl->workerWake.wait(lock);
+            continue;
+        }
+        // The host drives preparation while it calls Execute.
+        const auto now = std::chrono::steady_clock::now();
+        const auto due = _impl->lastHostActivity + kBackgroundIdle;
+        if (now < due || _impl->drive->HostWaiting()) {
+            _impl->workerWake.wait_until(lock, std::max(due, now + std::chrono::milliseconds(1)));
+            continue;
+        }
+        lock.unlock();
+        bool advanced = false;
+        try {
+            advanced = _BackgroundStep();
+        } catch (std::exception const &e) {
+            TF_WARN("PrismRT: background scene preparation failed: %s", e.what());
+        } catch (...) {
+            TF_WARN("PrismRT: background scene preparation failed");
+        }
+        lock.lock();
+        if (!advanced && !_impl->workerStop)
+            _impl->workerWake.wait_for(lock, kBackgroundPoll);
+    }
+}
+
+bool SceneBridge::_BackgroundStep()
+{
+    auto drive = _impl->drive->WorkerLock();
+    ArResolverContext context;
+    {
+        std::lock_guard lock(_impl->mutex);
+        if (_impl->workerStop || _impl->hostStopped || _impl->drive->HostWaiting() ||
+            !_impl->settings.backgroundPreparation)
+            return false;
+        context = _impl->hostResolverContext;
+    }
+    // Asset paths resolve as in the host's Execute.
+    ArResolverContextBinder binder(context);
+    bool advanced = false;
+    const bool start = _Prepare(nullptr, nullptr, nullptr, 0, 0, true, &advanced);
+    bool restart = false;
+    {
+        std::lock_guard lock(_impl->mutex);
+        if (advanced) ++_impl->backgroundSteps;
+        // Never restart into render buffers the host reallocated since its
+        // last Execute (its next Prepare sees the new allocation first).
+        restart = start && !_impl->hostStopped && !_impl->workerStop;
+        for (size_t i = 0; restart && i < _impl->bindings.size(); ++i) {
+            auto *buffer = dynamic_cast<PrismRenderBuffer *>(_impl->bindings[i].renderBuffer);
+            restart = i < _impl->bindingAllocationRevisions.size() &&
+                (buffer ? buffer->GetAllocationRevision() : 0) == _impl->bindingAllocationRevisions[i];
+        }
+        if (restart) ++_impl->backgroundStarts;
+    }
+    // Still under the drive: no host call that stops the render thread runs
+    // in between.
+    if (restart) _impl->renderThread->StartRender();
+    return advanced;
+}
+
+bool SceneBridge::_Prepare(CameraState const *cameraInput,
+                           HdRenderPassAovBindingVector const *bindingsInput,
+                           TfTokenVector const *renderTagsInput,
+                           unsigned int width, unsigned int height,
+                           bool background, bool *advancedOut)
+{
     auto const prepareStart = std::chrono::steady_clock::now();
     bool cameraChanged = false;
     bool bindingsChanged = false;
     bool renderTagsChanged = false;
     bool stateChanged = false;
     bool resumeRequested = false;
+    *advancedOut = false;
+    // A background step keeps the frame's state as the host gave it.
+    static const HdRenderPassAovBindingVector noBindings;
+    static const TfTokenVector noTags;
+    HdRenderPassAovBindingVector const &bindings = background ? noBindings : *bindingsInput;
     std::vector<uint64_t> allocationRevisions;
     for (auto const &binding : bindings) {
         auto *buffer = dynamic_cast<PrismRenderBuffer *>(binding.renderBuffer);
@@ -5209,22 +5430,26 @@ bool SceneBridge::Prepare(CameraState const &camera,
     {
         std::lock_guard lock(_impl->mutex);
         _impl->MaintainHiddenGeometryLocked();
-        cameraChanged = !CameraStatesIdentical(_impl->camera, camera) ||
-            _impl->width != width || _impl->height != height;
-        auto renderBindings = bindings;
-        auto previousBindings = _impl->bindings;
-        // Color clear values belong to viewport presentation, not traced RGBA.
-        for (auto &b : renderBindings) if (b.aovName == HdAovTokens->color) b.clearValue = VtValue();
-        for (auto &b : previousBindings) if (b.aovName == HdAovTokens->color) b.clearValue = VtValue();
-        bindingsChanged = previousBindings != renderBindings ||
-            _impl->bindingAllocationRevisions != allocationRevisions;
-        renderTagsChanged = _impl->renderTags != renderTags;
+        if (!background) {
+            CameraState const &camera = *cameraInput;
+            cameraChanged = !CameraStatesIdentical(_impl->camera, camera) ||
+                _impl->width != width || _impl->height != height;
+            auto renderBindings = bindings;
+            auto previousBindings = _impl->bindings;
+            // Color clear values belong to viewport presentation, not traced RGBA.
+            for (auto &b : renderBindings) if (b.aovName == HdAovTokens->color) b.clearValue = VtValue();
+            for (auto &b : previousBindings) if (b.aovName == HdAovTokens->color) b.clearValue = VtValue();
+            bindingsChanged = previousBindings != renderBindings ||
+                _impl->bindingAllocationRevisions != allocationRevisions;
+            renderTagsChanged = _impl->renderTags != *renderTagsInput;
+        }
         stateChanged = _impl->stateDirty;
         resumeRequested = _impl->resumeRequested;
         hasPreparationWork = _impl->sceneDirty || _impl->captureActive ||
             _impl->buildFuture.valid();
         spareOnly = !_impl->sceneDirty && !_impl->captureActive &&
             _impl->buildFuture.valid() && _impl->buildIsSpare;
+        if (background && !hasPreparationWork) return false;
         if (!_impl->sceneDirty && !_impl->stateDirty && !resumeRequested && !cameraChanged &&
             !bindingsChanged && !renderTagsChanged && !hasPreparationWork &&
             !clearNeeded)
@@ -5250,7 +5475,9 @@ bool SceneBridge::Prepare(CameraState const &camera,
             if (auto *buffer = dynamic_cast<PrismRenderBuffer *>(binding.renderBuffer))
                 buffer->ApplyInitialClear(binding.clearValue);
 
-    {
+    if (!background) {
+        CameraState const &camera = *cameraInput;
+        TfTokenVector const &renderTags = *renderTagsInput;
         std::lock_guard lock(_impl->mutex);
         if (renderTagsChanged && _impl->snapshot) {
             if (_impl->buildCancel)
@@ -6183,6 +6410,7 @@ bool SceneBridge::Prepare(CameraState const &camera,
 
     std::lock_guard lock(_impl->mutex);
     _impl->RefreshLoadingPhaseLocked();
+    *advancedOut = hasCompleted || published || captureWorked;
     if (spareOnly && !stateChanged && !resumeRequested && !cameraChanged && !bindingsChanged &&
         !renderTagsChanged && !clearNeeded && !published && !captureWorked &&
         !_impl->sceneDirty && !_impl->captureActive) {
@@ -6604,6 +6832,8 @@ std::vector<PrismRenderBuffer *> SceneBridge::GetRenderBuffers() const
 void SceneBridge::RemoveRenderBuffer(HdRenderBuffer *buffer)
 {
     if (!buffer) return;
+    // The worker must not restart the render thread before the binding goes.
+    Impl::HostDrive drive(*_impl);
     _impl->renderThread->StopRender();
     std::lock_guard lock(_impl->mutex);
     _impl->bindings.erase(std::remove_if(
@@ -6857,6 +7087,9 @@ VtDictionary SceneBridge::GetStats() const
     result["preparationPending"] = VtValue(
         _impl->sceneDirty || _impl->captureActive ||
         _impl->buildFuture.valid());
+    // Preparation steps the background worker took, and render starts it made.
+    result["backgroundPreparationSteps"] = VtValue(static_cast<int64_t>(_impl->backgroundSteps));
+    result["backgroundRenderStarts"] = VtValue(static_cast<int64_t>(_impl->backgroundStarts));
     result["preparationGeneration"] = VtValue(static_cast<int64_t>(
         _impl->requestedGeneration));
     result["displayedGeneration"] = VtValue(static_cast<int64_t>(

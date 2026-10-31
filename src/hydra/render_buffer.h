@@ -11,7 +11,7 @@
 #include <memory>
 #include <vector>
 
-namespace prism::hydra { struct PublishedFrame; }
+namespace prism::hydra { struct PublishedFrame; class RenderDrive; }
 
 PXR_NAMESPACE_OPEN_SCOPE
 class HdRenderThread;
@@ -19,7 +19,10 @@ class HdRenderThread;
 class PrismRenderBuffer final : public HdRenderBuffer
 {
 public:
-    PrismRenderBuffer(SdfPath const &id, HdRenderThread *renderThread);
+    // drive: the delegate's (render_drive.h), held while the buffer stops the
+    // render thread and reallocates; may be null.
+    PrismRenderBuffer(SdfPath const &id, HdRenderThread *renderThread,
+                      std::shared_ptr<prism::hydra::RenderDrive> drive = nullptr);
     ~PrismRenderBuffer() override;
 
     bool Allocate(GfVec3i const &dimensions, HdFormat format,
@@ -193,6 +196,7 @@ private:
     mutable std::shared_ptr<const std::vector<uint8_t>> _materializedPixels;
     mutable std::atomic<uint64_t> _presentationCopyBytes{0};
     HdRenderThread *_renderThread;
+    std::shared_ptr<prism::hydra::RenderDrive> _drive;
 };
 
 PXR_NAMESPACE_CLOSE_SCOPE

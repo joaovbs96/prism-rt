@@ -7,6 +7,7 @@
 #include "native_tasks.h"
 #include "transport_filter.h"
 #include "../output/aov.h"
+#include "../load_profile.h"
 
 #include "pxr/imaging/hd/camera.h"
 #include "pxr/imaging/hd/instancer.h"
@@ -70,6 +71,7 @@ TfToken const _denoiseQuality("prism:denoiseQuality");
 TfToken const _denoisePrefilter("prism:denoisePrefilter");
 TfToken const _gpuPreparationPreview("prism:gpuPreparationPreview");
 TfToken const _gpuPreparationPreviewMaxMiB("prism:gpuPreparationPreviewMaxMiB");
+TfToken const _backgroundPreparation("prism:backgroundPreparation");
 TfToken const _resourceRevision("prism:resourceRevision");
 TfToken const _selectionOutline("prism:selectionOutline");
 TfToken const _selectionOutlineRadius("prism:selectionOutlineRadius");
@@ -101,6 +103,7 @@ T _Number(VtValue const &v, T fallback)
 PrismTaskDelegate::PrismTaskDelegate()
     : _renderThread(std::make_unique<HdRenderThread>()),
       _thread(_renderThread.get()),
+      _drive(std::make_shared<prism::hydra::RenderDrive>()),
       _taskContext(std::make_shared<prism::hydra::TaskContext>()),
       _selectionSettings(_taskContext->selectionSettings),
       _resources(std::make_shared<HdResourceRegistry>())
@@ -113,8 +116,14 @@ PrismTaskDelegate::~PrismTaskDelegate()
         _sourceSceneIndex->RemoveObserver(HdSceneIndexObserverPtr(this));
     if (_taskContext)
         _taskContext->bridge.store(nullptr);
-    if (_renderThread)
+    // The preparation worker and running preparation first, so neither the
+    // render thread nor the teardown waits for them.
+    if (_bridge)
+        _bridge->Shutdown();
+    if (_renderThread) {
+        prism::load_profile::Scope profile("teardown.render_thread");
         _renderThread->StopThread();
+    }
     _ownedBridge.reset();
     _bridge = nullptr;
 }
@@ -138,7 +147,7 @@ void PrismTaskDelegate::SetTerminalSceneIndex(
         return;
 
     _ownedBridge = std::make_unique<prism::hydra::SceneBridge>(
-        _sourceSceneIndex, _renderThread.get());
+        _sourceSceneIndex, _renderThread.get(), _drive);
     _bridge = _ownedBridge.get();
     if (_pendingSettings) {
         _bridge->SetSettings(*_pendingSettings);
@@ -193,10 +202,10 @@ HdSprim *PrismTaskDelegate::CreateFallbackSprim(TfToken const &type)
 { return type == HdPrimTypeTokens->camera ? new HdCamera(SdfPath::EmptyPath()) : nullptr; }
 void PrismTaskDelegate::DestroySprim(HdSprim *p) { delete p; }
 HdBprim *PrismTaskDelegate::CreateBprim(TfToken const &type, SdfPath const &id)
-{ return type == HdPrimTypeTokens->renderBuffer ? new PrismRenderBuffer(id, _thread) : nullptr; }
+{ return type == HdPrimTypeTokens->renderBuffer ? new PrismRenderBuffer(id, _thread, _drive) : nullptr; }
 HdBprim *PrismTaskDelegate::CreateFallbackBprim(TfToken const &type)
 { return type == HdPrimTypeTokens->renderBuffer
-    ? new PrismRenderBuffer(SdfPath::EmptyPath(), _thread) : nullptr; }
+    ? new PrismRenderBuffer(SdfPath::EmptyPath(), _thread, _drive) : nullptr; }
 void PrismTaskDelegate::DestroyBprim(HdBprim *p)
 {
     if (_bridge)
@@ -281,6 +290,7 @@ HdRenderSettingDescriptorList PrismTaskDelegate::GetRenderSettingDescriptors() c
              VtValue(std::string(prism::device::ToString(d.denoiseSettings.quality)))},
             {"Denoise the albedo and normal first", _denoisePrefilter, VtValue(d.denoiseSettings.prefilter)},
             {"CPU preview while the GPU prepares", _gpuPreparationPreview, VtValue(true)},
+            {"Prepare the scene without Execute calls", _backgroundPreparation, VtValue(true)},
             {"CPU preview scene limit (MiB, 0 unlimited)", _gpuPreparationPreviewMaxMiB, VtValue(8192)},
             {"Resource revision", _resourceRevision, VtValue(0)},
             {"Selection outline", _selectionOutline, VtValue(true)},
@@ -334,6 +344,7 @@ VtValue PrismTaskDelegate::GetRenderSetting(TfToken const &key) const
     if (key == _textureStreaming) return VtValue(s.textureStreaming);
     if (key == _textureStreamingPrepass) return VtValue(s.textureStreamingPrepass);
     if (key == _gpuPreparationPreview) return VtValue(s.gpuPreparationPreview);
+    if (key == _backgroundPreparation) return VtValue(s.backgroundPreparation);
     if (key == _gpuPreparationPreviewMaxMiB) return VtValue(s.gpuPreparationPreviewMaxMiB);
     if (key == _resourceRevision) return VtValue(s.resourceRevision);
     if (key == _device) return VtValue(std::string(prism::device::ToString(s.device)));
@@ -510,6 +521,8 @@ void PrismTaskDelegate::SetRenderSetting(TfToken const &key, VtValue const &valu
         s.textureStreamingPrepass = _Get(value, s.textureStreamingPrepass);
     else if (key == _gpuPreparationPreview)
         s.gpuPreparationPreview = _Get(value, s.gpuPreparationPreview);
+    else if (key == _backgroundPreparation)
+        s.backgroundPreparation = _Get(value, s.backgroundPreparation);
     else if (key == _gpuPreparationPreviewMaxMiB)
         s.gpuPreparationPreviewMaxMiB = std::max(0, _Get(value, s.gpuPreparationPreviewMaxMiB));
     else if (key == _resourceRevision)
@@ -618,7 +631,9 @@ bool PrismTaskDelegate::Pause() { _thread->PauseRender(); return true; }
 bool PrismTaskDelegate::Resume() { _thread->ResumeRender(); return true; }
 bool PrismTaskDelegate::Stop(bool) {
     // HdRenderThread exposes only the blocking StopRender operation here.
-    _thread->StopRender();
+    // The bridge also keeps its preparation worker from restarting it.
+    if (_bridge) _bridge->Stop();
+    else _thread->StopRender();
     return true;
 }
 bool PrismTaskDelegate::Restart()

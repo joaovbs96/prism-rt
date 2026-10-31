@@ -88,6 +88,7 @@ running delegate.
 | `prism:refinementDelayMs` | 100 | Hydra only (interactive) | next preview | Quiet interval before refinement, clamped to 0-2000 ms |
 | `prism:gpuPreparationPreview` | true | Hydra only (interactive) | next preparation | While a GPU device (Vulkan, Metal) is still preparing the scene after one second, render progressively on the CPU and continue on the GPU from the same sample once it is ready; env `PRISM_GPU_PREPARATION_PREVIEW=0` sets the initial value, see [CPU preview while the GPU prepares](#cpu-preview-while-the-gpu-prepares) |
 | `prism:gpuPreparationPreviewMaxMiB` | 8192 | Hydra only (interactive) | next preparation | Skip that preview when the scene's Embree memory exceeds this many MiB (0 never skips); env `PRISM_GPU_PREPARATION_PREVIEW_MAX_MIB` |
+| `prism:backgroundPreparation` | true | Hydra only | at once | When the host has been quiet for 100 ms (no `Execute`, scene notice or setting change) while the scene still prepares, the delegate continues the capture and publishes the converted scene on its own worker and starts the render, so one `Execute` is enough; false: only `Execute` advances preparation. See [Third-party hosts](#third-party-hosts) |
 | `prism:resourceRevision` | 0 | Hydra only (interactive) | materials and domes reload | Increment to invalidate cached material and external texture fingerprints and reload dome resources without rebuilding geometry (a CLI run always reads its files afresh) |
 | `prism:selectionOutline` | true | Hydra only (interactive) | presentation only | Draw selection as an outline; false uses filled highlighting |
 | `prism:selectionOutlineRadius` | 2 | Hydra only (interactive) | presentation only | Outline thickness in pixels |
@@ -709,13 +710,23 @@ talks to the delegate only through `HdRenderDelegate` and
   `GL_ONE, GL_ONE_MINUS_SRC_ALPHA` ("pre-multiplied alpha scaling factors").
   (`alpha`)
 - **Convergence without `Execute`.** Hydra syncs the scene in `Execute`, and
-  hdPrism also captures the scene and publishes the converted snapshot
-  there (`SceneBridge::Prepare`). A host therefore calls `Execute` until the
-  first samples show (`numCompletedSamples` above 0); from then on the
-  render thread refines on its own, `IsConverged()` turns true while nothing
-  calls `Execute`, and the buffers hold the same pixels as an
-  `Execute`-driven render. A single `Execute` followed by polling only never
-  starts the render. (`converge-without-execute`)
+  hdPrism captures the scene and publishes the converted snapshot there
+  (`SceneBridge::Prepare`, in 3 ms slices once an image shows, 50 ms before,
+  so `Execute` never blocks). When the host has been quiet for 100 ms (no
+  `Execute`, scene notice or setting change) while the scene still prepares, the delegate's preparation worker continues the same
+  steps and starts the render thread itself: one `Execute` followed by
+  polling `IsConverged()` alone renders to convergence, with the same pixels
+  as an `Execute`-driven render (64x64 fixture: converged 0.27 s after the
+  single `Execute`). Hosts that call `Execute` every frame (usdview) never
+  wait that long, so the worker stays idle. Scene notices that arrive
+  meanwhile cancel and restart the preparation as under `Execute`. The
+  worker reads the host's scene index (with the resolver context of the last
+  `Execute`) while the host is not in `Execute`: a host that edits its stage
+  on another thread without calling `Execute` should set
+  `prism:backgroundPreparation` to false, and then calls `Execute` until the
+  first samples show (about 40 calls on the small fixture).
+  `backgroundPreparationSteps` and `backgroundRenderStarts` in the render
+  statistics count the worker's work. (`converge-without-execute`)
 - **Repeated `Execute`** with nothing changed costs about 0.03 ms per call
   while rendering and 0.005 ms once converged (CPU device, 128x128), and
   never restarts the accumulation. (`repeated-execute`)
@@ -727,9 +738,17 @@ talks to the delegate only through `HdRenderDelegate` and
   Measured on the chess set (1280x720): `Stop` while rendering takes 1.7 ms
   median, 2.6 ms at most on the CPU and 11 ms median, 19 ms at most on
   Vulkan. Deleting the delegate right after `Stop` takes about 50 ms on the
-  CPU and 0.2-1.4 s on Vulkan; deleting it while the scene still prepares
-  waits for the preparation (0.2 s on the CPU, 15 s on Vulkan, cold GPU
-  programs). (`stop-latency`)
+  CPU and 0.2-1.4 s on Vulkan. Deleting it while the scene still prepares
+  cancels the preparation: the scene conversion stops at its next check,
+  running DXC processes are stopped, and the device's preparation fails at
+  its next step (no half-written cache file: caches are written to a
+  temporary file and renamed). What cannot be interrupted is bounded: a
+  material compile already running (one MDL SDK call) gets 150 ms, then
+  finishes on its own thread and is discarded; a Vulkan driver compile
+  already running (one pipeline library) and the device's creation (0.2-0.5 s)
+  are waited for. Measured on the chess set with cold caches: 0.23-0.26 s
+  (was 1.5-2.5 s, and 15 s with cold GPU programs); 0.1 s on a small scene
+  while DXC compiles the kernel. (`stop-latency`, `teardown-preparing`)
 - **Several delegates in one process** render independently: two live
   delegates give the same pixels as one alone; 24 create/render/stop/destroy
   cycles (every other one torn down while rendering) grow private memory by
@@ -748,6 +767,20 @@ talks to the delegate only through `HdRenderDelegate` and
   (`HdResourceRegistry::ReloadResource`); hdPrism's resource registry does
   not implement `ReloadResource`. `prism:resourceRevision` still forces every
   material and dome to reload. (`textures`)
+- **A host's own render index.** A host that creates the delegate and builds
+  its own `HdRenderIndex` (`HdRenderIndex::New`, Hydra 1 hosts) bypasses the
+  plugin's `_CreateRenderer`, which applies the scene filters the converters
+  rely on (implicit surfaces as meshes, computed primvars, light and shadow
+  linking, render settings filtering). The delegate applies the same filters
+  in `SetTerminalSceneIndex` then, so cubes, cones, cylinders, capsules,
+  planes and light linking render as in usdview (`filters`: bit-identical
+  to a host that applies them itself). Hosts using `UsdImagingGLEngine`
+  (usdview, 26.08) create the renderer through `CreateRenderer` and get the
+  plugin's filters. The render index inserts every instancer it sees; the
+  delegate gives it a plain `HdInstancer` (never synced; the converters read
+  instancers from the scene index), so its change tracker no longer reports
+  `_MarkInstancerDirty` coding errors (10 on the instancing fixture, 8 on
+  the chess set before). (`instancers`)
 
 ## Scope and costs
 

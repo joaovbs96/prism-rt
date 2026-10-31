@@ -13,6 +13,7 @@ class SceneBridge;
 struct RenderSettings;
 struct SelectionSettings;
 struct TaskContext;
+class RenderDrive;
 }
 
 PXR_NAMESPACE_OPEN_SCOPE
@@ -84,6 +85,7 @@ private:
     // Settings set before SetTerminalSceneIndex created the bridge.
     std::unique_ptr<prism::hydra::RenderSettings> _pendingSettings;
     HdRenderThread *_thread = nullptr;
+    std::shared_ptr<prism::hydra::RenderDrive> _drive;
     std::shared_ptr<prism::hydra::TaskContext> _taskContext;
     std::shared_ptr<prism::hydra::SelectionSettings> _selectionSettings;
     PrismTransportFilter *_transport = nullptr;

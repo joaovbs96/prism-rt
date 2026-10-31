@@ -43,6 +43,11 @@
 #include <pxr/imaging/hd/tokens.h>
 #include <pxr/imaging/hdx/renderTask.h>
 #include <pxr/imaging/hdx/taskController.h>
+#include <pxr/imaging/hd/retainedDataSource.h>
+#include <pxr/imaging/hdsi/implicitSurfaceSceneIndex.h>
+#include <pxr/imaging/hdsi/lightLinkingSceneIndex.h>
+#include <pxr/imaging/hdsi/extComputationPrimvarPruningSceneIndex.h>
+#include <pxr/imaging/hdsi/renderSettingsFilteringSceneIndex.h>
 #include <pxr/usd/usd/stage.h>
 #include <pxr/usdImaging/usdImaging/sceneIndices.h>
 #include <pxr/usdImaging/usdImaging/stageSceneIndex.h>
@@ -81,7 +86,10 @@ class WarningCapture final : public TfDiagnosticMgr::Delegate {
 public:
     WarningCapture() { TfDiagnosticMgr::GetInstance().AddDelegate(this); }
     ~WarningCapture() override { TfDiagnosticMgr::GetInstance().RemoveDelegate(this); }
-    void IssueError(TfError const &) override {}
+    void IssueError(TfError const &error) override {
+        std::lock_guard lock(_mutex);
+        _errors.push_back(error.GetCommentary());
+    }
     void IssueFatalError(TfCallContext const &, std::string const &) override {}
     void IssueStatus(TfStatus const &) override {}
     void IssueWarning(TfWarning const &warning) override {
@@ -92,9 +100,14 @@ public:
         std::lock_guard lock(_mutex);
         return _warnings;
     }
+    // Errors, coding errors among them.
+    std::vector<std::string> Errors() const {
+        std::lock_guard lock(_mutex);
+        return _errors;
+    }
 private:
     mutable std::mutex _mutex;
-    std::vector<std::string> _warnings;
+    std::vector<std::string> _warnings, _errors;
 };
 
 // A pass-through scene index the host uses to re-sync a prim (what a host's
@@ -130,6 +143,9 @@ struct Options {
     double cameraZ = 4.0;
     std::string workingSpace;    // empty: the default
     bool settingsBeforeIndex = false;
+    bool backgroundPreparation = true;
+    // The host applies the plugin's scene filters itself (filters mode).
+    bool hostFilters = false;
 };
 
 int64_t StatInt(VtDictionary const &stats, char const *name)
@@ -149,6 +165,24 @@ double StatDouble(VtDictionary const &stats, char const *name)
     return -1;
 }
 
+// What the plugin's _CreateRenderer applies before its renderer sees the
+// scene (PrismAppendSceneFilters in src/hydra/transport_filter.cpp).
+HdSceneIndexBaseRefPtr HostFilters(HdSceneIndexBaseRefPtr const &input)
+{
+    const auto toMesh = HdRetainedTypedSampledDataSource<TfToken>::New(
+        HdsiImplicitSurfaceSceneIndexTokens->toMesh);
+    auto converted = HdsiImplicitSurfaceSceneIndex::New(input, HdRetainedContainerDataSource::New(
+        HdPrimTypeTokens->cube, toMesh, HdPrimTypeTokens->cone, toMesh,
+        HdPrimTypeTokens->cylinder, toMesh, HdPrimTypeTokens->capsule, toMesh,
+        HdPrimTypeTokens->plane, toMesh));
+    auto computed = HdSiExtComputationPrimvarPruningSceneIndex::New(converted);
+    auto linked = HdsiLightLinkingSceneIndex::New(computed, nullptr);
+    VtArray<TfToken> prefixes{TfToken("prism:")};
+    return HdsiRenderSettingsFilteringSceneIndex::New(linked, HdRetainedContainerDataSource::New(
+        HdsiRenderSettingsFilteringSceneIndexTokens->namespacePrefixes,
+        HdRetainedTypedSampledDataSource<VtArray<TfToken>>::New(prefixes)));
+}
+
 class Host {
 public:
     Host(UsdStageRefPtr const &stage, Options const &options) : _options(options) {
@@ -163,7 +197,8 @@ public:
         UsdImagingCreateSceneIndicesInfo info;
         auto scenes = UsdImagingCreateSceneIndices(info);
         _stageScene = scenes.stageSceneIndex;
-        _resync = Resync::New(scenes.finalSceneIndex);
+        _resync = Resync::New(options.hostFilters ? HostFilters(scenes.finalSceneIndex)
+                                                  : scenes.finalSceneIndex);
         _index->InsertSceneIndex(_resync, SdfPath::AbsoluteRootPath());
         _stageScene->SetStage(stage);
         _stageScene->SetTime(UsdTimeCode::Default());
@@ -206,6 +241,8 @@ public:
         Set("domeLightCameraVisibility", VtValue(false));
         if (!_options.workingSpace.empty())
             Set("prism:colorManagement:workingSpace", VtValue(_options.workingSpace));
+        if (!_options.backgroundPreparation)
+            Set("prism:backgroundPreparation", VtValue(false));
     }
     void Set(char const *key, VtValue const &value)
     { _delegate->SetRenderSetting(TfToken(key), value); }
@@ -396,10 +433,20 @@ void SettingsBeforeIndex(std::string const &scene)
     std::cout << "settings-before-index: honoured\n";
 }
 
-// 2. IsConverged turns true while nothing calls Execute, once the render has
-// started (its first samples are displayed). Hydra syncs the scene in
-// Execute; hdPrism also publishes the converted scene there (docs/hydra.md,
-// "Third-party hosts"), so a host executes until the first samples.
+// 2. IsConverged turns true while nothing calls Execute. Hydra syncs the
+// scene in Execute; the delegate continues capturing and publishing the
+// converted scene on its own worker when Execute calls stop (docs/hydra.md,
+// "Third-party hosts"), so one Execute starts the render.
+void PollToConvergence(Host &host, char const *what)
+{
+    const auto start = Clock::now();
+    while (!host.PassConverged()) {
+        Require(Clock::now() - start < std::chrono::seconds(120),
+                std::string(what) + ": not converged after 120 s of polling:" + Describe(host.Stats()));
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+}
+
 void ConvergeWithoutExecute(std::string const &scene)
 {
     Options options; options.width = options.height = 64; options.spp = 64;
@@ -409,18 +456,41 @@ void ConvergeWithoutExecute(std::string const &scene)
         host.RenderToConvergence();
         reference = host.Color();
     }
-    // A single Execute, then polling only (reported, not required).
+    // A single Execute, then polling only.
     {
         Host host(Open(scene), options);
         host.Execute();
         const auto start = Clock::now();
-        while (!host.PassConverged() && Clock::now() - start < std::chrono::seconds(5))
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
-        std::cout << "converge-without-execute: after a single Execute, "
-                  << (host.PassConverged() ? "converged" : "not converged after 5 s:")
-                  << (host.PassConverged() ? std::string() : Describe(host.Stats())) << "\n";
+        PollToConvergence(host, "single Execute");
+        const double ms = Milliseconds(Clock::now() - start);
+        Require(StatInt(host.Stats(), "numCompletedSamples") == options.spp,
+                "Converged after a single Execute before reaching the sample count");
+        const auto d = Compare(host.Color(), reference);
+        std::cout << "converge-without-execute: a single Execute, then converged after " << ms
+                  << " ms of polling (background preparation steps "
+                  << StatInt(host.Stats(), "backgroundPreparationSteps") << ", render starts "
+                  << StatInt(host.Stats(), "backgroundRenderStarts")
+                  << "); differing values vs Execute-driven render " << d.differing << "\n";
+        Require(d.differing == 0, "A single-Execute render differs from the Execute-driven render");
     }
-    Host host(Open(scene), options);
+    // An edit while the delegate prepares on its own: the host re-syncs a prim
+    // (a notice, no Execute), and polling still converges to the same image.
+    {
+        Host host(Open(scene), options);
+        host.Execute();
+        std::this_thread::sleep_for(std::chrono::milliseconds(120));
+        host.Dirty(SdfPath("/World/Triangle"), HdDataSourceLocatorSet{HdDataSourceLocator::EmptyLocator()});
+        PollToConvergence(host, "edit during background preparation");
+        const auto d = Compare(host.Color(), reference);
+        std::cout << "converge-without-execute: edit during background preparation, differing values "
+                  << d.differing << "\n";
+        Require(d.differing == 0, "An edit during background preparation changed the image");
+    }
+    // With prism:backgroundPreparation off, a host executes until the first
+    // samples (the earlier contract), and the image is the same.
+    Options driven = options;
+    driven.backgroundPreparation = false;
+    Host host(Open(scene), driven);
     const auto deadline = Clock::now() + std::chrono::seconds(120);
     int executes = 0;
     while (StatInt(host.Stats(), "completedSamples") <= 0) {
@@ -791,6 +861,79 @@ void StopLatency(std::string const &scene, std::string const &camera, std::strin
         Require(*std::max_element(stops.begin(), stops.end()) <= maxMs,
                 "Stop took longer than the limit");
 }
+// 7. Instancers in a host's own render index: no change tracker errors.
+void Instancers(std::string const &scene, std::string const &camera)
+{
+    Options options; options.width = options.height = 48; options.spp = 4;
+    options.camera = SdfPath(camera);
+    WarningCapture diagnostics;
+    {
+        Host host(Open(scene), options);
+        host.RenderToConvergence();
+    }
+    size_t instancerErrors = 0;
+    for (auto const &error : diagnostics.Errors())
+        if (error.find("instancer") != std::string::npos || error.find("Instancer") != std::string::npos) {
+            ++instancerErrors;
+            std::cout << "  error: " << error << "\n";
+        }
+    std::cout << "instancers: " << diagnostics.Errors().size() << " errors, " << instancerErrors
+              << " about instancers\n";
+    Require(instancerErrors == 0, "The render index reported instancer errors");
+}
+
+// 8. The plugin's scene filters apply in a host's own render index: the
+// same image as a host that applies them itself (implicit surfaces, light
+// linking).
+void Filters(std::string const &scene, std::string const &camera)
+{
+    Options options; options.width = 96; options.height = 64; options.spp = 8;
+    options.camera = SdfPath(camera);
+    std::vector<float> plain, filtered;
+    { Host host(Open(scene), options); host.RenderToConvergence(); plain = host.Color(); }
+    options.hostFilters = true;
+    { Host host(Open(scene), options); host.RenderToConvergence(); filtered = host.Color(); }
+    size_t covered = 0;
+    for (size_t i = 3; i < plain.size(); i += 4) covered += plain[i] > 0.0f;
+    const auto d = Compare(plain, filtered);
+    std::cout << "filters: " << covered << " covered pixels; differing values vs host-filtered "
+              << d.differing << " (max " << d.maxAbs << ")\n";
+    Require(covered > 0, "Nothing rendered");
+    Require(d.differing == 0, "The delegate's own filters give another image than the plugin's");
+}
+
+// 9. Deleting the delegate while it prepares the scene (materials, GPU
+// shaders) returns within MAX_MS. Run with an empty PRISM_CACHE_DIR, so the
+// preparation compiles: the test empties it first when its name says so.
+void TeardownPreparing(std::string const &scene, std::string const &camera, std::string const &device,
+                       int waitMs, double maxMs)
+{
+    if (const char *cache = std::getenv("PRISM_CACHE_DIR");
+        cache && std::string(cache).find("teardown_cache") != std::string::npos) {
+        std::error_code ignored;
+        std::filesystem::remove_all(cache, ignored);
+        std::filesystem::create_directories(cache, ignored);
+    }
+    Options options; options.device = device; options.width = 320; options.height = 180;
+    options.spp = 1 << 20; options.camera = SdfPath(camera);
+    std::vector<double> teardowns;
+    for (int round = 0; round < 2; ++round) {
+        auto host = std::make_unique<Host>(Open(scene), options);
+        host->Execute();
+        std::this_thread::sleep_for(std::chrono::milliseconds(waitMs * (round + 1) / 2));
+        const auto stats = host->Stats();
+        const int64_t samples = StatInt(stats, "completedSamples");
+        std::cout << "teardown-preparing (" << device << ") round " << round << " after " << waitMs * (round + 1) / 2
+                  << " ms:" << Describe(stats) << "\n";
+        const auto t0 = Clock::now();
+        host.reset();
+        teardowns.push_back(Milliseconds(Clock::now() - t0));
+        std::cout << "teardown-preparing (" << device << ") round " << round << ": teardown "
+                  << teardowns.back() << " ms" << (samples > 0 ? " (the render had started)" : "") << "\n";
+    }
+    const double worst = *std::max_element(teardowns.begin(), teardowns.end());
+    Require(worst <= maxMs, "Teardown while preparing took " + std::to_string(worst) + " ms");
+}
 } // namespace
 
 int main(int argc, char **argv)
@@ -811,6 +954,15 @@ int main(int argc, char **argv)
             Require(argc >= 7, "stop-latency SCENE CAMERA DEVICE WIDTH HEIGHT [REPEATS] [MAX_MS]");
             StopLatency(argv[2], argv[3], argv[4], std::atoi(argv[5]), std::atoi(argv[6]),
                         argc > 7 ? std::atoi(argv[7]) : 10, argc > 8 ? std::atof(argv[8]) : 0.0);
+        } else if (mode == "instancers") {
+            Require(argc >= 4, "instancers SCENE CAMERA");
+            Instancers(argv[2], argv[3]);
+        } else if (mode == "filters") {
+            Require(argc >= 4, "filters SCENE CAMERA");
+            Filters(argv[2], argv[3]);
+        } else if (mode == "teardown-preparing") {
+            Require(argc >= 7, "teardown-preparing SCENE CAMERA DEVICE WAIT_MS MAX_MS");
+            TeardownPreparing(argv[2], argv[3], argv[4], std::atoi(argv[5]), std::atof(argv[6]));
         } else throw std::runtime_error("Unknown mode " + mode);
     } catch (std::exception const &error) {
         std::cerr << "FAILED: " << error.what() << '\n';

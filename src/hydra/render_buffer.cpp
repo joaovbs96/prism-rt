@@ -1,4 +1,5 @@
 #include "render_buffer.h"
+#include "render_drive.h"
 
 #include "pxr/base/gf/half.h"
 #include "pxr/base/gf/vec3f.h"
@@ -19,16 +20,20 @@
 PXR_NAMESPACE_OPEN_SCOPE
 
 PrismRenderBuffer::PrismRenderBuffer(SdfPath const &id,
-                                     HdRenderThread *renderThread)
-    : HdRenderBuffer(id), _renderThread(renderThread) {}
+                                     HdRenderThread *renderThread,
+                                     std::shared_ptr<prism::hydra::RenderDrive> drive)
+    : HdRenderBuffer(id), _renderThread(renderThread), _drive(std::move(drive)) {}
 PrismRenderBuffer::~PrismRenderBuffer()
 {
+    prism::hydra::RenderDrive::HostLock drive(_drive.get());
     if (_renderThread) _renderThread->StopRender();
     _Deallocate();
 }
 
 bool PrismRenderBuffer::Allocate(GfVec3i const &d, HdFormat format, bool ms)
 {
+    // The preparation worker must not restart the render thread meanwhile.
+    prism::hydra::RenderDrive::HostLock drive(_drive.get());
     if (_renderThread) _renderThread->StopRender();
     std::lock_guard lock(_mutex);
     if (d[0] < 0 || d[1] < 0 || d[2] != 1 || format == HdFormatInvalid) {
@@ -72,6 +77,7 @@ bool PrismRenderBuffer::Allocate(GfVec3i const &d, HdFormat format, bool ms)
 
 void PrismRenderBuffer::_Deallocate()
 {
+    prism::hydra::RenderDrive::HostLock drive(_drive.get());
     if (_renderThread) _renderThread->StopRender();
     std::lock_guard lock(_mutex);
     _width = _height = 0;

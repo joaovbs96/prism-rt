@@ -655,7 +655,7 @@ if(PRISM_BUILD_HYDRA)
     prism_enable_long_paths(prism_hydra_host_contract_test)
     target_include_directories(prism_hydra_host_contract_test PRIVATE ${PXR_INCLUDE_DIRS})
     target_link_libraries(prism_hydra_host_contract_test PRIVATE
-        hd hdx usdImaging ${PXR_LIBRARIES} OpenImageIO::OpenImageIO
+        hd hdx hdsi usdImaging ${PXR_LIBRARIES} OpenImageIO::OpenImageIO
         $<$<PLATFORM_ID:Windows>:psapi>)
     set_target_properties(prism_hydra_host_contract_test PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "$<1:${CMAKE_BINARY_DIR}/hydra/plugin>")
@@ -679,6 +679,31 @@ if(PRISM_BUILD_HYDRA)
             /World/Camera cpu 256 256 10 250)
     set_tests_properties(prism_hydra_host_working_spaces prism_hydra_host_textures
         prism_hydra_host_stop_latency_cpu PROPERTIES ENVIRONMENT "${_prism_host_env}")
+    # Instancers and the plugin's scene filters in a host's own render index.
+    add_test(NAME prism_hydra_host_instancers
+        COMMAND prism_hydra_host_contract_test instancers
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/instances.usda" /World/Camera)
+    add_test(NAME prism_hydra_host_filters_implicit
+        COMMAND prism_hydra_host_contract_test filters
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/implicit_surfaces.usda" /World/Camera)
+    add_test(NAME prism_hydra_host_filters_linking
+        COMMAND prism_hydra_host_contract_test filters
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/linking.usda" /World/Camera)
+    set_tests_properties(prism_hydra_host_instancers prism_hydra_host_filters_implicit
+        prism_hydra_host_filters_linking PROPERTIES ENVIRONMENT "${_prism_host_env}")
+    # Deleting the delegate while it prepares (cold caches: material and
+    # shader compiles) returns within a second.
+    add_test(NAME prism_hydra_host_teardown_preparing_cpu
+        COMMAND prism_hydra_host_contract_test teardown-preparing
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/preview_parity.usda" /World/Camera cpu 600 1000)
+    set_tests_properties(prism_hydra_host_teardown_preparing_cpu PROPERTIES ENVIRONMENT
+        "${_prism_host_env};PRISM_CACHE_DIR=${CMAKE_BINARY_DIR}/hydra/teardown_cache_cpu")
+    add_test(NAME prism_hydra_host_teardown_preparing_vulkan
+        COMMAND prism_hydra_host_contract_test teardown-preparing
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/preview_parity.usda" /World/Camera vulkan 1500 1000)
+    set_tests_properties(prism_hydra_host_teardown_preparing_vulkan PROPERTIES
+        ENVIRONMENT "${_prism_test_environment};PRISM_CACHE_DIR=${CMAKE_BINARY_DIR}/hydra/teardown_cache_vulkan"
+        LABELS gpu RESOURCE_LOCK gpu TIMEOUT 600)
     add_test(NAME prism_hydra_host_stop_latency_vulkan
         COMMAND prism_hydra_host_contract_test stop-latency "${_prism_host_scene}"
             /World/Camera vulkan 256 256 10 250)

@@ -6,6 +6,7 @@
 #include "../render_defaults.h"
 #include "../texture_service.h"
 #include "published_pick_scene.h"
+#include "render_drive.h"
 
 #include "pxr/base/gf/matrix4d.h"
 #include "pxr/base/gf/vec4f.h"
@@ -99,6 +100,11 @@ struct RenderSettings {
     // While a GPU device prepares the scene (kernel compile, upload), render
     // progressively on the CPU device and hand over when the GPU is ready.
     bool gpuPreparationPreview = true;
+    // Scene preparation (capture, publishing the converted snapshot)
+    // continues on a worker of the delegate when the host has not called
+    // Execute for a while, so one Execute is enough to start the render
+    // (prism:backgroundPreparation; docs/hydra.md, "Third-party hosts").
+    bool backgroundPreparation = true;
     // The preview is skipped for scenes whose Embree memory exceeds this
     // many MiB (0 never skips).
     int gpuPreparationPreviewMaxMiB = 8192;
@@ -194,8 +200,11 @@ struct PublishedFrame {
 class SceneBridge final
 {
 public:
+    // `drive`: the delegate's (render_drive.h), shared with its render
+    // buffers; null: the bridge's own.
     SceneBridge(pxr::HdSceneIndexBaseRefPtr sceneIndex,
-                pxr::HdRenderThread *renderThread);
+                pxr::HdRenderThread *renderThread,
+                std::shared_ptr<RenderDrive> drive = nullptr);
     ~SceneBridge();
 
     SceneBridge(const SceneBridge &) = delete;
@@ -210,10 +219,20 @@ public:
     RenderSettings GetSettings() const;
     // The OCIO name of the colour space the colour AOV is presented in.
     std::string GetOutputColorSpace() const;
+    // The host's Execute: takes the frame's state and advances the scene's
+    // preparation within a time budget. True when the render thread should
+    // (re)start.
     bool Prepare(CameraState const &camera,
                  pxr::HdRenderPassAovBindingVector const &bindings,
                  pxr::TfTokenVector const &renderTags,
                  unsigned int width, unsigned int height);
+    // The host's Stop: stops the render thread, and the preparation worker
+    // does not restart it until the host's next Execute or Restart.
+    void Stop();
+    // Ends the preparation worker and cancels running preparation (scene
+    // conversion, device jobs), so destruction does not wait for them.
+    // Called by the destructor; idempotent.
+    void Shutdown();
     void Render();
     bool IsConverged() const { return _converged.load(); }
     pxr::SdfPath GetPrimPath(int primId) const;
@@ -228,6 +247,17 @@ public:
 
 private:
     class Impl;
+    // Prepare's work. `background`: the preparation worker's step, which
+    // takes the frame's state the host gave last (no camera, binding or
+    // render buffer changes) and only advances the scene's preparation;
+    // *advanced tells whether it did any.
+    bool _Prepare(CameraState const *camera,
+                  pxr::HdRenderPassAovBindingVector const *bindings,
+                  pxr::TfTokenVector const *renderTags,
+                  unsigned int width, unsigned int height,
+                  bool background, bool *advanced);
+    void _PreparationWorker();
+    bool _BackgroundStep();
     std::unique_ptr<Impl> _impl;
     std::atomic<bool> _converged{true};
 };

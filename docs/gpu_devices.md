@@ -613,6 +613,16 @@ Changes to code the Metal device shares, to verify on a Mac (build, then the
 listed runs on `--device metal` against `--device cpu`) before the change is
 called done there.
 
+- **Cancelled preparation and the delegate's preparation worker**
+  (`src/hydra/`, `src/device/`, 2026-10-31; [hydra.md](hydra.md#third-party-hosts)):
+  `RenderDevice::CancelPreparation` is a no-op on Metal (the default); the
+  delegate still cancels its scene conversion and bounds a running material
+  compile. On the Mac: `prism_hydra_host_teardown_preparing_*` with
+  `metal` in place of `vulkan` reports the teardown time; if Metal's
+  shader library compile makes it long, implement `CancelPreparation` (the
+  DXC cancel in `CompileHlsl` is Windows only: `popen` is not interrupted).
+  `prism_hydra_host_converge_without_execute`, `_instancers` and
+  `_filters_*` must pass unchanged (no device code).
 - **Shared core library** (SDK step 6, [sdk_design.md](sdk_design.md)):
   `prism` and `prism_usd` are shared libraries with hidden default
   visibility; only `PRISM_API`/`PRISM_INTERNAL_API` (and the USD ones)
