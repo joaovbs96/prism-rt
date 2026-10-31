@@ -1,5 +1,6 @@
 // A seeded random sequence of scene edits (transforms, visibility, material
-// rebinds, light changes; sometimes two in one update) applied through the
+// rebinds, light changes, a prim that turns from a mesh into a sphere and
+// back; sometimes two in one update) applied through the
 // Hydra delegate (a USD stage rendered by UsdImagingGLEngine with hdPrism)
 // and through the public Scene (its edit calls and commit), with a CPU image
 // after every update:
@@ -27,6 +28,7 @@
 #include <pxr/usd/usd/stage.h>
 #include <pxr/usd/usdGeom/camera.h>
 #include <pxr/usd/usdGeom/mesh.h>
+#include <pxr/usd/usdGeom/sphere.h>
 #include <pxr/usd/usdGeom/metrics.h>
 #include <pxr/usd/usdGeom/xformable.h>
 #include <pxr/usd/usdLux/lightAPI.h>
@@ -104,7 +106,12 @@ struct Light {
 struct State {
     std::array<Box, kBoxes> boxes;
     std::array<Light, kLights> lights;
+    // The shape: a box mesh or a sphere of the box's size, at a fixed place
+    // with material 1. Its type changes (a USD resync).
+    bool shapeIsSphere = false;
 };
+constexpr double kShapeX = 0.2, kShapeZ = 2.0;
+constexpr float kShapeRadius = 0.5f;
 
 const std::array<GfVec3f, kMaterials> kPalette{GfVec3f(0.8f, 0.2f, 0.15f), GfVec3f(0.2f, 0.7f, 0.3f),
                                                GfVec3f(0.25f, 0.35f, 0.85f)};
@@ -161,9 +168,12 @@ std::string Edit(State& state, Random& random)
     const int edits = random.below(3) == 0 ? 2 : 1;
     for (int e = 0; e < edits; ++e) {
         if (!done.empty()) done += " + ";
-        const int kind = random.below(4);
+        const int kind = random.below(5);
         const int i = random.below(kind == 3 ? kLights : kBoxes);
-        if (kind == 0) {
+        if (kind == 4) {
+            state.shapeIsSphere = !state.shapeIsSphere;
+            done += state.shapeIsSphere ? "turn the shape into a sphere" : "turn the shape into a mesh";
+        } else if (kind == 0) {
             Box& box = state.boxes[size_t(i)];
             box.x = std::clamp(box.x + random.between(-0.5, 0.5), -3.2, 3.2);
             box.z = std::clamp(box.z + random.between(-0.5, 0.5), -2.0, 1.5);
@@ -220,12 +230,51 @@ std::string MaterialDocument(int index)
 SdfPath BoxPath(int i) { return SdfPath("/World/Box" + std::to_string(i)); }
 SdfPath LightPath(int i) { return SdfPath("/World/Light" + std::to_string(i)); }
 SdfPath MaterialPath(int i) { return SdfPath("/World/Looks/M" + std::to_string(i)); }
+const SdfPath kShapePath("/World/Shape");
+
+GfMatrix4d ShapeWorld(bool sphere)
+{
+    GfMatrix4d translate;
+    translate.SetTranslate(GfVec3d(kShapeX, sphere ? kShapeRadius : 0.0, kShapeZ));
+    return translate;
+}
 
 void SetTransform(UsdPrim const& prim, GfMatrix4d const& world)
 {
     UsdGeomXformable xformable(prim);
     xformable.ClearXformOpOrder();
     xformable.AddTransformOp().Set(world);
+}
+
+UsdGeomMesh DefineMesh(UsdStageRefPtr const& stage, SdfPath const& path, std::vector<GfVec3f> const& points,
+                       std::vector<int> const& indices)
+{
+    UsdGeomMesh mesh = UsdGeomMesh::Define(stage, path);
+    mesh.CreatePointsAttr(VtValue(VtVec3fArray(points.begin(), points.end())));
+    mesh.CreateFaceVertexCountsAttr(VtValue(VtIntArray(indices.size() / 4, 4)));
+    mesh.CreateFaceVertexIndicesAttr(VtValue(VtIntArray(indices.begin(), indices.end())));
+    mesh.CreateSubdivisionSchemeAttr(VtValue(UsdGeomTokens->none));
+    UsdShadeMaterialBindingAPI::Apply(mesh.GetPrim());
+    return mesh;
+}
+
+// The shape as the state has it: a type change replaces the prim.
+void DefineShape(UsdStageRefPtr const& stage, bool sphere)
+{
+    UsdPrim existing = stage->GetPrimAtPath(kShapePath);
+    if (existing && existing.IsA<UsdGeomSphere>() == sphere) return;
+    if (existing) stage->RemovePrim(kShapePath);
+    UsdPrim prim;
+    if (sphere) {
+        UsdGeomSphere shape = UsdGeomSphere::Define(stage, kShapePath);
+        shape.CreateRadiusAttr(VtValue(double(kShapeRadius)));
+        UsdShadeMaterialBindingAPI::Apply(shape.GetPrim());
+        prim = shape.GetPrim();
+    } else {
+        prim = DefineMesh(stage, kShapePath, kBoxPoints, kBoxIndices).GetPrim();
+    }
+    UsdGeomXformable(prim).AddTransformOp().Set(ShapeWorld(sphere));
+    UsdShadeMaterialBindingAPI(prim).Bind(UsdShadeMaterial(stage->GetPrimAtPath(MaterialPath(1))));
 }
 
 void Apply(UsdStageRefPtr const& stage, State const& state)
@@ -247,6 +296,7 @@ void Apply(UsdStageRefPtr const& stage, State const& state)
         UsdShadeMaterial material(stage->GetPrimAtPath(MaterialPath(box.material)));
         if (binding.ComputeBoundMaterial().GetPath() != material.GetPath()) binding.Bind(material);
     }
+    DefineShape(stage, state.shapeIsSphere);
     for (int i = 0; i < kLights; ++i) {
         Light const& light = state.lights[size_t(i)];
         UsdPrim prim = stage->GetPrimAtPath(LightPath(i));
@@ -284,13 +334,7 @@ UsdStageRefPtr BuildStage(State const& state)
         material.CreateSurfaceOutput().ConnectToSource(shader.CreateOutput(TfToken("surface"), SdfValueTypeNames->Token));
     }
     auto mesh = [&](SdfPath const& path, std::vector<GfVec3f> const& points, std::vector<int> const& indices) {
-        UsdGeomMesh mesh = UsdGeomMesh::Define(stage, path);
-        mesh.CreatePointsAttr(VtValue(VtVec3fArray(points.begin(), points.end())));
-        mesh.CreateFaceVertexCountsAttr(VtValue(VtIntArray(indices.size() / 4, 4)));
-        mesh.CreateFaceVertexIndicesAttr(VtValue(VtIntArray(indices.begin(), indices.end())));
-        mesh.CreateSubdivisionSchemeAttr(VtValue(UsdGeomTokens->none));
-        UsdShadeMaterialBindingAPI::Apply(mesh.GetPrim());
-        return mesh;
+        return DefineMesh(stage, path, points, indices);
     };
     UsdGeomMesh ground = mesh(SdfPath("/World/Ground"), kGroundPoints, kGroundIndices);
     UsdShadeMaterialBindingAPI(ground.GetPrim()).Bind(UsdShadeMaterial(stage->GetPrimAtPath(MaterialPath(0))));
@@ -368,6 +412,10 @@ struct Built {
     std::array<prism::MaterialId, kMaterials> materials;
     std::array<prism::InstanceId, kBoxes> boxes;
     std::array<prism::LightId, kLights> lights;
+    prism::MeshId shapeMesh;
+    prism::SpheresId shapeSphere;
+    prism::InstanceId shape;
+    bool shapeIsSphere = false;
 };
 
 prism::MeshDesc MeshOf(std::vector<GfVec3f> const& points, std::vector<int> const& indices)
@@ -395,6 +443,27 @@ prism::LightDesc LightOf(Light const& light)
     desc.intensity = light.intensity;
     desc.color = Color3(light.color[0], light.color[1], light.color[2]);
     desc.transform = prism::Constant(ToPrism(LightWorld(light)));
+    return desc;
+}
+
+prism::SpheresDesc SphereOf(float radius)
+{
+    auto centers = std::make_shared<std::vector<float>>(std::vector<float>{0, 0, 0});
+    auto radii = std::make_shared<std::vector<float>>(std::vector<float>{radius});
+    prism::SpheresDesc desc;
+    desc.centers = prism::Constant(prism::BufferView::Of(std::shared_ptr<const std::vector<float>>(centers), 3,
+                                                         prism::DataType::Float32));
+    desc.radii = prism::BufferView::Of(std::shared_ptr<const std::vector<float>>(radii), 1, prism::DataType::Float32);
+    return desc;
+}
+
+prism::InstanceDesc ShapeOf(Built const& built, bool sphere)
+{
+    prism::InstanceDesc desc;
+    if (sphere) desc.prototype = built.shapeSphere;
+    else desc.prototype = built.shapeMesh;
+    desc.transform = prism::Constant(ToPrism(ShapeWorld(sphere)));
+    desc.materials = {built.materials[1]};
     return desc;
 }
 
@@ -427,6 +496,10 @@ Built BuildScene(prism::Renderer const& renderer, State const& state)
     for (int i = 0; i < kBoxes; ++i)
         built.boxes[size_t(i)] =
             scene.addInstance(BoxOf(built, scene.addMesh(MeshOf(kBoxPoints, kBoxIndices)), state.boxes[size_t(i)]));
+    built.shapeMesh = scene.addMesh(MeshOf(kBoxPoints, kBoxIndices));
+    built.shapeSphere = scene.addSpheres(SphereOf(kShapeRadius));
+    built.shapeIsSphere = state.shapeIsSphere;
+    built.shape = scene.addInstance(ShapeOf(built, state.shapeIsSphere));
     for (int i = 0; i < kLights; ++i) built.lights[size_t(i)] = scene.addLight(LightOf(state.lights[size_t(i)]));
     scene.commit();
     return built;
@@ -440,6 +513,10 @@ void ApplyScene(Built& built, State const& state)
         built.scene.setTransform(id, prism::Constant(ToPrism(BoxWorld(box))));
         built.scene.setVisible(id, box.visible);
         built.scene.setMaterials(id, {built.materials[size_t(box.material)]});
+    }
+    if (built.shapeIsSphere != state.shapeIsSphere) {
+        built.shapeIsSphere = state.shapeIsSphere;
+        built.scene.updateInstance(built.shape, ShapeOf(built, state.shapeIsSphere));
     }
     for (int i = 0; i < kLights; ++i) built.scene.updateLight(built.lights[size_t(i)], LightOf(state.lights[size_t(i)]));
     built.scene.commit();
