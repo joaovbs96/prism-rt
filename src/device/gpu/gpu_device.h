@@ -57,6 +57,24 @@ protected:
     // Runs the kernel over `threads` threads and waits for completion.
     virtual bool Dispatch(GpuFrame const& frame, uint32_t threads, double* gpuSeconds,
                           std::string* error) = 0;
+    // RenderPass's chunks: SubmitChunk runs the kernel over the `count`
+    // pixels of `list` (entry `offset` of the pass's list) and may return
+    // before it finishes; WaitChunk waits for the oldest chunk not yet waited
+    // for. Up to ChunksInFlight() chunks are submitted ahead, so the device
+    // traces one while the host reads the previous one back (chunks write
+    // disjoint pixels). BeginChunks precedes a pass's first SubmitChunk, with
+    // the most entries its list can have. The defaults run each chunk at
+    // submission, one at a time (Metal).
+    virtual int ChunksInFlight() const { return 1; }
+    virtual bool BeginChunks(size_t entries, std::string* error)
+    {
+        (void)entries;
+        (void)error;
+        return true;
+    }
+    virtual bool SubmitChunk(GpuFrame const& frame, uint32_t const* list, uint32_t count, size_t offset,
+                             std::string* error);
+    virtual bool WaitChunk(double* gpuSeconds, std::string* error);
     virtual const char* LogPrefix() const = 0;
     // Denoises a whole-image render where its accumulation lives
     // (kSlotAccumulation: the colour sums, then the light AOV sums, in the
@@ -74,6 +92,8 @@ protected:
     std::mutex m_renderMutex; // one render at a time
     // RenderImage's accumulation holds the guides only (GuidesOnlyAovs).
     bool m_accumulationGuidesOnly = false;
+    // The default SubmitChunk's GPU time, for WaitChunk.
+    double m_chunkSeconds = 0.0;
 
 private:
     GpuFrame BaseFrame(prism::CameraRayParameters const& camera, unsigned width,

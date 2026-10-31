@@ -11,8 +11,10 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <format>
 #include <iostream>
+#include <numeric>
 #include <stdexcept>
 #include <thread>
 
@@ -354,8 +356,37 @@ void GpuRenderDevice::RenderPass(SceneManager& scene, PassRequest const& request
     }
 
     // Tiles are dispatched in chunks so callers see progress and can stop.
+    // Up to ChunksInFlight() chunks are submitted ahead: the device traces
+    // the next chunk while the host reads this one back.
     constexpr size_t chunkPixels = 1u << 18;
+    const bool gpuWork = traceColor || gpuPrimary;
+    const size_t depth = size_t(std::max(1, gpuWork ? ChunksInFlight() : 1));
+    if (gpuWork && !BeginChunks(pixels, &error)) {
+        std::cerr << LogPrefix() << error << '\n';
+        return;
+    }
+    // The pass's pixel list, chunk after chunk (at most every pixel).
     std::vector<uint32_t> list;
+    list.reserve(pixels);
+    struct Chunk {
+        size_t first = 0, last = 0;  // tiles
+        size_t offset = 0, size = 0; // entries of `list`
+        bool submitted = false;
+        Clock::duration submitTime{};
+    };
+    std::deque<Chunk> queued;
+    // Every submitted chunk is waited for before the pass returns (also on
+    // early returns and exceptions): the next work reuses the buffers.
+    struct Drain {
+        GpuRenderDevice& device;
+        std::deque<Chunk>& queued;
+        ~Drain() {
+            std::string ignored;
+            for (Chunk const& chunk : queued)
+                if (chunk.submitted) (void)device.WaitChunk(nullptr, &ignored);
+            queued.clear();
+        }
+    } drain{*this, queued};
     size_t first = 0;
     auto const passStart = Clock::now();
     double passGpuSeconds = 0.0, dispatchSeconds = 0.0, readbackSeconds = 0.0;
@@ -370,44 +401,70 @@ void GpuRenderDevice::RenderPass(SceneManager& scene, PassRequest const& request
                                          dispatch * 1e3, gpu * 1e3, readback * 1e3, pixels);
         }
     } passLog{passGpuSeconds, dispatchSeconds, readbackSeconds, passPixels, passStart};
-    while (first < request.tiles.size()) {
-        while (paused()) {
+    while (first < request.tiles.size() || !queued.empty()) {
+        if (first < request.tiles.size() && queued.size() < depth) {
+            while (paused()) {
+                if (abandoned()) return;
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
             if (abandoned()) return;
-            std::this_thread::sleep_for(std::chrono::milliseconds(2));
-        }
-        if (abandoned()) return;
-        size_t last = first;
-        list.clear();
-        while (last < request.tiles.size() && (list.size() < chunkPixels || last == first)) {
-            PixelTile const& tile = request.tiles[last];
-            for (unsigned y = tile.y; y < tile.y + tile.height; ++y)
-                for (unsigned x = tile.x; x < tile.x + tile.width; ++x) {
-                    const uint32_t pixel = y * width + x;
-                    if (!request.activePixels || request.activePixels[pixel]) list.push_back(pixel);
+            Chunk chunk;
+            chunk.first = chunk.last = first;
+            chunk.offset = list.size();
+            while (chunk.last < request.tiles.size() &&
+                   (list.size() - chunk.offset < chunkPixels || chunk.last == first)) {
+                PixelTile const& tile = request.tiles[chunk.last];
+                for (unsigned y = tile.y; y < tile.y + tile.height; ++y) {
+                    const uint32_t row = y * width + tile.x;
+                    if (!request.activePixels) {
+                        const size_t at = list.size();
+                        list.resize(at + tile.width);
+                        std::iota(list.begin() + ptrdiff_t(at), list.end(), row);
+                        continue;
+                    }
+                    for (uint32_t pixel = row; pixel < row + tile.width; ++pixel)
+                        if (request.activePixels[pixel]) list.push_back(pixel);
                 }
-            ++last;
+                ++chunk.last;
+            }
+            chunk.size = list.size() - chunk.offset;
+            auto const submitStart = Clock::now();
+            if (gpuWork && chunk.size) {
+                GpuFrame f = frame;
+                f.work = {uint32_t(chunk.size), 0, traceColor ? kModePass : kModePrimary, 0};
+                if (!SubmitChunk(f, list.data() + chunk.offset, uint32_t(chunk.size), chunk.offset, &error)) {
+                    std::cerr << LogPrefix() << error << '\n';
+                    return;
+                }
+                chunk.submitted = true;
+            }
+            chunk.submitTime = Clock::now() - submitStart;
+            dispatchSeconds += std::chrono::duration<double>(chunk.submitTime).count();
+            queued.push_back(chunk);
+            first = chunk.last;
+            continue;
         }
+        const Chunk chunk = queued.front();
+        queued.pop_front();
         auto const rayStart = Clock::now();
-        if ((traceColor || gpuPrimary) && !list.empty()) {
-            std::memcpy(RenderBuffer(kSlotPixels, list.size() * 4), list.data(), list.size() * 4);
-            GpuFrame f = frame;
-            f.work = {uint32_t(list.size()), 0, traceColor ? kModePass : kModePrimary, 0};
-            if (!Dispatch(f, uint32_t(list.size()), &passGpuSeconds, &error)) {
+        if (chunk.submitted) {
+            if (!WaitChunk(&passGpuSeconds, &error)) {
                 std::cerr << LogPrefix() << error << '\n';
                 return;
             }
-            if (traceColor) passPixels += list.size();
+            if (traceColor) passPixels += chunk.size;
         }
         auto const dispatched = Clock::now();
         dispatchSeconds += std::chrono::duration<double>(dispatched - rayStart).count();
-        if (traceColor && !list.empty()) {
+        if (traceColor && chunk.submitted) {
             // Buffers may move when resized; fetch them again after the dispatch.
             rng = static_cast<uint32_t*>(RenderBuffer(kSlotRng, pixels * 4));
             output = static_cast<float*>(RenderBuffer(kSlotOutput, outputBytes));
-            tbb::parallel_for(tbb::blocked_range<size_t>(0, list.size(), 4096),
+            uint32_t const* const chunkList = list.data() + chunk.offset;
+            tbb::parallel_for(tbb::blocked_range<size_t>(0, chunk.size, 4096),
                 [&](tbb::blocked_range<size_t> const& range) {
                     for (size_t i = range.begin(); i != range.end(); ++i) {
-                        const uint32_t pixel = list[i];
+                        const uint32_t pixel = chunkList[i];
                         request.rngStates[pixel] = rng[pixel];
                         request.colors[pixel] = Color3(output[4 * pixel], output[4 * pixel + 1],
                                                        output[4 * pixel + 2]);
@@ -420,18 +477,18 @@ void GpuRenderDevice::RenderPass(SceneManager& scene, PassRequest const& request
                         }
                     }
                 });
-            if (request.colorPixels) request.colorPixels->fetch_add(list.size(), std::memory_order_relaxed);
+            if (request.colorPixels) request.colorPixels->fetch_add(chunk.size, std::memory_order_relaxed);
         }
         readbackSeconds += std::chrono::duration<double>(Clock::now() - dispatched).count();
         auto const primaryStart = Clock::now();
         if (request.rayNanoseconds)
             request.rayNanoseconds->fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                primaryStart - rayStart).count()), std::memory_order_relaxed);
+                primaryStart - rayStart + chunk.submitTime).count()), std::memory_order_relaxed);
         if (tracePrimary) {
             const bool culling = scene.cullsBackFaces();
             auto const* hits = gpuPrimary
                 ? static_cast<const float*>(RenderBuffer(kSlotAccumulation, pixels * 48)) : nullptr;
-            for (size_t t = first; t < last; ++t) {
+            for (size_t t = chunk.first; t < chunk.last; ++t) {
                 PixelTile const& tile = request.tiles[t];
                 tbb::parallel_for(tile.y, tile.y + tile.height, [&](unsigned y) {
                     for (unsigned x = tile.x; x < tile.x + tile.width; ++x) {
@@ -451,9 +508,25 @@ void GpuRenderDevice::RenderPass(SceneManager& scene, PassRequest const& request
             request.primaryNanoseconds->fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
                 Clock::now() - primaryStart).count()), std::memory_order_relaxed);
         if (request.tileFinished)
-            for (size_t t = first; t < last; ++t) request.tileFinished(t);
-        first = last;
+            for (size_t t = chunk.first; t < chunk.last; ++t) request.tileFinished(t);
     }
+}
+
+bool GpuRenderDevice::SubmitChunk(GpuFrame const& frame, uint32_t const* list, uint32_t count, size_t offset,
+                                  std::string* error)
+{
+    (void)offset;
+    std::memcpy(RenderBuffer(kSlotPixels, size_t(count) * 4), list, size_t(count) * 4);
+    m_chunkSeconds = 0.0;
+    return Dispatch(frame, count, &m_chunkSeconds, error);
+}
+
+bool GpuRenderDevice::WaitChunk(double* gpuSeconds, std::string* error)
+{
+    (void)error;
+    if (gpuSeconds) *gpuSeconds += m_chunkSeconds;
+    m_chunkSeconds = 0.0;
+    return true;
 }
 
 bool GpuRenderDevice::RenderPreview(SceneManager& scene, PreviewRequest const& request)

@@ -704,7 +704,27 @@ struct VulkanDevice::Impl {
     std::shared_ptr<const gpu::MdlShaderCode> aovBase;
     // Why the scene's materials use the per-program layout (callables), for the log.
     std::string perProgramReason;
+    // Query pairs: 0 for dispatch, then kChunkQueryPairs for pass chunks.
     VkQueryPool timestamps = VK_NULL_HANDLE;
+    // Pass chunks queued without waiting (submitChunk, waitChunk), in
+    // submission order on the one queue: each has its own command buffer,
+    // fence and timestamp pair. Chunks write disjoint pixels; the frame and
+    // pixel list they read are updated in their command buffers.
+    struct Chunk {
+        VkCommandBuffer commands = VK_NULL_HANDLE;
+        VkFence fence = VK_NULL_HANDLE;
+        uint32_t query = 0;
+        int readback = -1; // texture feedback readback (-1: none)
+        bool done = false, ok = true;
+        double seconds = 0.0;
+        std::string error;
+    };
+    static constexpr uint32_t kChunkQueryPairs = 4;
+    std::deque<Chunk> chunks;
+    std::vector<VkFence> spareFences;
+    uint32_t chunkQueries = 0;
+    // The pass's pixel list (host-visible), copied into kSlotPixels per chunk.
+    Buffer passList;
     // Early MDL translations and the callables they start (CallableSpeculation).
     std::shared_ptr<CallableSpeculation> speculation = std::make_shared<CallableSpeculation>();
     int programListener = 0;
@@ -877,6 +897,18 @@ struct VulkanDevice::Impl {
     bool writeDescriptors(std::string* error);
     void* renderBuffer(int slot, size_t bytes);
     bool dispatch(GpuFrame const& frame, uint32_t threads, double* gpuSeconds, std::string* error);
+    // Records and submits a kernel run: waiting for it (chunk null), or
+    // queued as chunk, which then reads the pass list from entry `offset`.
+    bool run(GpuFrame const& frame, uint32_t threads, Chunk* chunk, size_t offset, double* gpuSeconds,
+             std::string* error);
+    bool beginChunks(size_t entries, std::string* error);
+    bool submitChunk(GpuFrame const& frame, uint32_t threads, size_t offset, std::string* error);
+    bool waitChunk(double* gpuSeconds, std::string* error);
+    // Waits for chunk and releases its command buffer and fence.
+    void finishChunk(Chunk& chunk);
+    // Finishes every queued chunk (their results stay for waitChunk); false
+    // when one failed.
+    bool drainChunks(std::string* error);
 
 #if PRISM_HAS_VK_OIDN
     // The denoiser (vk_oidn): its features are enabled with the device when
@@ -990,6 +1022,9 @@ VulkanDevice::Impl::~Impl()
     }
     for (auto& buffer : buffers) destroyBuffer(buffer);
     for (auto& pending : pendingUploads) destroyBuffer(pending.staging);
+    for (Chunk& chunk : chunks) finishChunk(chunk);
+    for (VkFence spare : spareFences) vkDestroyFence(device, spare, nullptr);
+    destroyBuffer(passList);
     if (timestamps) vkDestroyQueryPool(device, timestamps, nullptr);
     if (fence) vkDestroyFence(device, fence, nullptr);
     if (commandPool) vkDestroyCommandPool(device, commandPool, nullptr);
@@ -1228,7 +1263,7 @@ bool VulkanDevice::Impl::initialize(std::string* reason)
     vkCreateFence(device, &fenceInfo, nullptr, &fence);
     VkQueryPoolCreateInfo queryInfo{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
     queryInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
-    queryInfo.queryCount = 2;
+    queryInfo.queryCount = 2 * (1 + kChunkQueryPairs);
     vkCreateQueryPool(device, &queryInfo, nullptr, &timestamps);
 
     // Samplers: index = wrapS * 3 + wrapT, wraps clamp / repeat / mirror.
@@ -2167,8 +2202,11 @@ bool VulkanDevice::Impl::upload(int slot, const void* bytes, size_t size)
         } else {
             ++it;
         }
+    // Pass chunks update the frame and copy the pixel list in their command
+    // buffers (run).
     const VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-        VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
+        VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
+        (slot == kSlotFrame || slot == kSlotPixels ? VK_BUFFER_USAGE_TRANSFER_DST_BIT : 0);
     const Placement where = HostVisibleSlot(slot) ? Placement::Host : placement;
     if (where == Placement::Mapped && createBuffer(size, usage, &buffers[slot], true, false, rebarType)) {
         // ReBAR: written like host memory. Host writes to host-coherent
@@ -3512,6 +3550,8 @@ bool VulkanDevice::Impl::prepareLightAovs(std::string* error)
 void* VulkanDevice::Impl::renderBuffer(int slot, size_t bytes)
 {
     if (buffers[slot].size < bytes) {
+        // Queued chunks may use the buffer (their results stay for waitChunk).
+        (void)drainChunks(nullptr);
         {
             std::lock_guard lock(queueMutex);
             vkDeviceWaitIdle(device);
@@ -3534,12 +3574,112 @@ void* VulkanDevice::Impl::renderBuffer(int slot, size_t bytes)
 bool VulkanDevice::Impl::dispatch(GpuFrame const& work, uint32_t threads, double* gpuSeconds, std::string* error)
 {
     if (threads == 0) return true;
+    // The frame is written from the host: no queued chunk may still read it.
+    if (!drainChunks(error)) return false;
+    return run(work, threads, nullptr, 0, gpuSeconds, error);
+}
+
+bool VulkanDevice::Impl::beginChunks(size_t entries, std::string* error)
+{
+    // Leftovers of a pass that ended early (an exception in a callback).
+    while (!chunks.empty()) {
+        finishChunk(chunks.front());
+        chunks.pop_front();
+    }
+    const VkDeviceSize bytes = std::max<VkDeviceSize>(16, VkDeviceSize(entries) * 4);
+    if (passList.size < bytes) {
+        destroyBuffer(passList);
+        if (!createBuffer(bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &passList, true)) {
+            if (error) *error = "cannot allocate the pass pixel list";
+            return false;
+        }
+    }
+    // Every chunk's list fits.
+    renderBuffer(kSlotPixels, size_t(bytes));
+    return true;
+}
+
+bool VulkanDevice::Impl::submitChunk(GpuFrame const& work, uint32_t threads, size_t offset, std::string* error)
+{
+    Chunk chunk;
+    if (!run(work, threads, &chunk, offset, nullptr, error)) return false;
+    chunks.push_back(std::move(chunk));
+    return true;
+}
+
+void VulkanDevice::Impl::finishChunk(Chunk& chunk)
+{
+    if (chunk.done) return;
+    chunk.done = true;
+    const VkResult result = vkWaitForFences(device, 1, &chunk.fence, VK_TRUE, UINT64_MAX);
+    if (result != VK_SUCCESS) {
+        chunk.ok = false;
+        chunk.error = std::string("Vulkan submission failed: ") + ResultText(result);
+    } else {
+        uint64_t ticks[2] = {};
+        if (vkGetQueryPoolResults(device, timestamps, chunk.query, 2, sizeof(ticks), ticks, sizeof(uint64_t),
+                                  VK_QUERY_RESULT_64_BIT) == VK_SUCCESS)
+            chunk.seconds = double(ticks[1] - ticks[0]) * timestampPeriod * 1e-9;
+    }
+    vkFreeCommandBuffers(device, commandPool, 1, &chunk.commands);
+    spareFences.push_back(chunk.fence);
+    chunk.commands = VK_NULL_HANDLE;
+    chunk.fence = VK_NULL_HANDLE;
+    if (chunk.readback >= 0) {
+        Streaming& s = streaming;
+        {
+            std::lock_guard lock(s.mutex);
+            s.readbackState[chunk.readback] = chunk.ok ? 2 : 0;
+        }
+        s.changed.notify_all();
+    }
+}
+
+bool VulkanDevice::Impl::drainChunks(std::string* error)
+{
+    bool ok = true;
+    for (Chunk& chunk : chunks) {
+        finishChunk(chunk);
+        if (!chunk.ok && ok) {
+            ok = false;
+            if (error) *error = chunk.error;
+        }
+    }
+    return ok;
+}
+
+bool VulkanDevice::Impl::waitChunk(double* gpuSeconds, std::string* error)
+{
+    if (chunks.empty()) return true;
+    Chunk chunk = std::move(chunks.front());
+    chunks.pop_front();
+    finishChunk(chunk);
+    if (!chunk.ok) {
+        if (error) *error = chunk.error;
+        return false;
+    }
+    if (gpuSeconds) *gpuSeconds += chunk.seconds;
+    return true;
+}
+
+bool VulkanDevice::Impl::run(GpuFrame const& work, uint32_t threads, Chunk* chunk, size_t offset,
+                             double* gpuSeconds, std::string* error)
+{
     GpuFrame frame = work;
     // Texture streaming: finished images swap in now, and the dispatch
     // records texture feedback into a free readback (none free: it stays in
     // the device buffer for the next copy).
     Streaming& s = streaming;
     int readback = -1;
+    if (s.active && descriptorSet) {
+        bool swaps;
+        {
+            std::lock_guard lock(s.mutex);
+            swaps = !s.ready.empty() && !s.frozen;
+        }
+        // The descriptors change only with no queued chunk using them.
+        if (swaps && chunk && !drainChunks(error)) return false;
+    }
     if (s.active) applyStreaming(false);
     // Feedback is recorded while residency can still change in this
     // accumulation (PRISM_GPU_STREAMING_FEEDBACK=1: always, for measuring
@@ -3566,8 +3706,30 @@ bool VulkanDevice::Impl::dispatch(GpuFrame const& work, uint32_t threads, double
                 s.readbackAccumulation[k] = s.accumulation;
             }
     }
-    std::memcpy(buffers[kSlotFrame].mapped, &frame, sizeof(frame));
+    const VkPipelineStageFlags shaderStages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+        (rayTracing.pipeline ? VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR : 0);
     VkCommandBuffer commands = beginCommands();
+    if (!chunk) {
+        std::memcpy(buffers[kSlotFrame].mapped, &frame, sizeof(frame));
+    } else {
+        // After the kernels queued before (which read the frame and the
+        // list, and write the same buffers at other pixels), this chunk's
+        // frame and pixels, then its kernel.
+        VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        before.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        before.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        vkCmdPipelineBarrier(commands, shaderStages, VK_PIPELINE_STAGE_TRANSFER_BIT | shaderStages, 0, 1, &before, 0,
+                             nullptr, 0, nullptr);
+        static_assert(sizeof(GpuFrame) % 4 == 0 && sizeof(GpuFrame) <= 65536);
+        vkCmdUpdateBuffer(commands, buffers[kSlotFrame].buffer, 0, sizeof(frame), &frame);
+        const VkBufferCopy region{VkDeviceSize(offset) * 4, 0, VkDeviceSize(threads) * 4};
+        vkCmdCopyBuffer(commands, passList.buffer, buffers[kSlotPixels].buffer, 1, &region);
+        VkMemoryBarrier after{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        after.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        after.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, shaderStages, 0, 1, &after, 0, nullptr, 0,
+                             nullptr);
+    }
     bool resetFeedback = false;
     if (feedback) {
         std::lock_guard lock(s.mutex);
@@ -3576,8 +3738,6 @@ bool VulkanDevice::Impl::dispatch(GpuFrame const& work, uint32_t threads, double
     if (resetFeedback) {
         // A new view: what earlier dispatches recorded without a readback goes.
         const VkDeviceSize bytes = VkDeviceSize(s.feedbackImages) * gpu::kFeedbackLevels * 4;
-        const VkPipelineStageFlags shaderStages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
-            (rayTracing.pipeline ? VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR : 0);
         VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         before.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
         before.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -3590,8 +3750,9 @@ bool VulkanDevice::Impl::dispatch(GpuFrame const& work, uint32_t threads, double
         vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, shaderStages, 0, 1, &barrier, 0, nullptr, 0,
                              nullptr);
     }
-    vkCmdResetQueryPool(commands, timestamps, 0, 2);
-    vkCmdWriteTimestamp(commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, timestamps, 0);
+    const uint32_t query = chunk ? 2 * (1 + chunkQueries++ % kChunkQueryPairs) : 0;
+    vkCmdResetQueryPool(commands, timestamps, query, 2);
+    vkCmdWriteTimestamp(commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, timestamps, query);
     // The light AOV variant (prepareLightAovs) for frames that ask for it.
     const bool aovs = (frame.settings.z & kFrameLightAovs) != 0u && aovPipeline && aovBase == pipelineCode;
     vulkan::MaterialCallPipeline const* const calls = aovs ? aovCallables : callables;
@@ -3605,10 +3766,8 @@ bool VulkanDevice::Impl::dispatch(GpuFrame const& work, uint32_t threads, double
                                 nullptr);
         vkCmdDispatch(commands, (threads + 63) / 64, 1, 1);
     }
-    vkCmdWriteTimestamp(commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, timestamps, 1);
+    vkCmdWriteTimestamp(commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, timestamps, query + 1);
     if (readback >= 0) {
-        const VkPipelineStageFlags shaderStages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
-            (rayTracing.pipeline ? VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR : 0);
         Buffer const& feedback = buffers[kSlotTextureFeedback];
         const VkDeviceSize bytes = VkDeviceSize(s.feedbackImages) * gpu::kFeedbackLevels * 4;
         VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
@@ -3629,6 +3788,45 @@ bool VulkanDevice::Impl::dispatch(GpuFrame const& work, uint32_t threads, double
         reset.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
         vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, shaderStages | VK_PIPELINE_STAGE_HOST_BIT, 0, 1,
                              &reset, 0, nullptr, 0, nullptr);
+    }
+    if (chunk) {
+        // Queued: finishChunk waits for it and hands over the readback.
+        vkEndCommandBuffer(commands);
+        VkFence chunkFence = VK_NULL_HANDLE;
+        if (!spareFences.empty()) {
+            chunkFence = spareFences.back();
+            spareFences.pop_back();
+            vkResetFences(device, 1, &chunkFence);
+        } else {
+            VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+            vkCreateFence(device, &fenceInfo, nullptr, &chunkFence);
+        }
+        VkSubmitInfo info{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        info.commandBufferCount = 1;
+        info.pCommandBuffers = &commands;
+        VkResult result;
+        {
+            std::lock_guard lock(queueMutex);
+            result = vkQueueSubmit(queue, 1, &info, chunkFence);
+        }
+        if (result != VK_SUCCESS) {
+            vkFreeCommandBuffers(device, commandPool, 1, &commands);
+            spareFences.push_back(chunkFence);
+            if (readback >= 0) {
+                {
+                    std::lock_guard lock(s.mutex);
+                    s.readbackState[readback] = 0;
+                }
+                s.changed.notify_all();
+            }
+            if (error) *error = std::string("Vulkan submission failed: ") + ResultText(result);
+            return false;
+        }
+        chunk->commands = commands;
+        chunk->fence = chunkFence;
+        chunk->query = query;
+        chunk->readback = readback;
+        return true;
     }
     const bool submitted = submit(commands, error);
     if (readback >= 0) {
@@ -3773,6 +3971,27 @@ bool VulkanDevice::Dispatch(GpuFrame const& frame, uint32_t threads, double* gpu
 {
     return m_impl->dispatch(frame, threads, gpuSeconds, error);
 }
+int VulkanDevice::ChunksInFlight() const
+{
+    // Two: one traced while the host reads the other back. Each more one
+    // delays a stop (an abandoned pass waits for its submitted chunks).
+    // PRISM_GPU_PASS_CHUNKS_IN_FLIGHT=1 (diagnostics): one at a time, as before.
+    static const int chunks = [] {
+        const char* value = std::getenv("PRISM_GPU_PASS_CHUNKS_IN_FLIGHT");
+        return value && *value ? std::clamp(std::atoi(value), 1, int(Impl::kChunkQueryPairs)) : 2;
+    }();
+    return chunks;
+}
+bool VulkanDevice::BeginChunks(size_t entries, std::string* error) { return m_impl->beginChunks(entries, error); }
+bool VulkanDevice::SubmitChunk(GpuFrame const& frame, uint32_t const* list, uint32_t count, size_t offset,
+                               std::string* error)
+{
+    if (count == 0) return true;
+    // Host-coherent: written before the submission that copies it.
+    std::memcpy(static_cast<uint32_t*>(m_impl->passList.mapped) + offset, list, size_t(count) * 4);
+    return m_impl->submitChunk(frame, count, offset, error);
+}
+bool VulkanDevice::WaitChunk(double* gpuSeconds, std::string* error) { return m_impl->waitChunk(gpuSeconds, error); }
 
 std::shared_ptr<Denoiser> VulkanDevice::CreateDenoiser(std::string* error)
 {

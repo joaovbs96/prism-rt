@@ -52,6 +52,11 @@ protected:
     bool GuidesOnlyAovs() const override;
     bool Dispatch(GpuFrame const& frame, uint32_t threads, double* gpuSeconds,
                   std::string* error) override;
+    int ChunksInFlight() const override;
+    bool BeginChunks(size_t entries, std::string* error) override;
+    bool SubmitChunk(GpuFrame const& frame, uint32_t const* list, uint32_t count, size_t offset,
+                     std::string* error) override;
+    bool WaitChunk(double* gpuSeconds, std::string* error) override;
     const char* LogPrefix() const override { return "PrismRT Vulkan: "; }
     bool DenoiseAccumulation(ImageRequest const& request, std::vector<int> const& samples) override;
 
