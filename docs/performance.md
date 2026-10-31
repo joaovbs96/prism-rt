@@ -441,6 +441,86 @@ program, so they compiled quickly already; the gain is with several
 structures (features.gltf). The first MaterialX material of a commit still
 compiles alone, since it loads the MDL modules every generated material
 imports.
+## GPU pass pipeline, guides and edits (2026-10-31)
+
+Performance batch 3, GPU part (Vulkan, RTX 4070 Ti, 1920x1080 unless noted,
+`--adaptive-threshold 0 --seed 0`). Each pair alternates the previous build
+(baseline) and the new one in one session; the per-pass numbers are
+`PRISM_GPU_VERBOSE`'s "GPU pass" lines averaged over a render's passes
+(`prism_hydra_render`). All final images are bit-identical to the previous
+build's (`prism_compare_images --exact`, colour and `denoised` layers, cold
+and warm caches), except one cold InOneWeekend pair whose baseline handed
+over from the CPU preview after one sample and the new build after none
+(timing; the new image equals the warm baseline's bit for bit).
+
+**Pipelined pass chunks** (`GpuRenderDevice::RenderPass`, Vulkan
+`submitChunk`/`waitChunk`). A pass traces 256k-pixel chunks; each used to be
+submitted, waited for and read back before the next was built, so the GPU
+idled during the readback, the list build and the submission. Profile of the
+previous build: on CornellBox a pass's wall time was about twice its GPU time
+(27 ms against 14 ms in one session, 11 ms against 5 ms in another). Now two
+chunks are in flight: each chunk's command buffer updates the frame
+(`vkCmdUpdateBuffer`) and copies its part of the pass's pixel list into
+`kSlotPixels` behind a barrier on the kernels before it, then runs the
+kernel; the host reads chunk k back while chunk k+1 runs. The pass list is
+also built by rows (`std::iota`) when no adaptive mask applies.
+`PRISM_GPU_PASS_CHUNKS_IN_FLIGHT=1` restores one at a time (diagnostics).
+
+| Scene | Pass wall, ms (old -> new) | Ratio | Render time, s (old -> new) |
+| --- | --- | --- | --- |
+| CornellBox, 64 spp | 11.24 -> 11.11, 11.84 -> 10.46 | 0.99, 0.88 | 1.50 -> 1.51, 1.61 -> 1.48 |
+| InOneWeekend, 64 spp | 31.13 -> 25.22, 30.59 -> 25.33 | 0.81, 0.83 | 3.21 -> 3.05, 3.08 -> 2.72 |
+| OpenChessSet, 32 spp (texture streaming on) | 45.01 -> 36.31, 43.44 -> 35.31 | 0.81, 0.81 | 3.18 -> 2.71, 3.12 -> 2.80 |
+| QuadTest, 64 spp (with the row-built list) | 11.01 -> 7.66 | 0.70 | 1.45 -> 1.24 |
+| QuadTest, adaptive 0.02, 128 spp | 5.89 -> 3.96 | 0.67 | 1.95 -> 1.71 |
+
+The first three rows were measured before the row-built list; on QuadTest,
+one against two chunks in flight in the new build gave 10.12 -> 7.70 ms,
+so the overlap is about 2.4 ms of the 3.4 ms gained. CornellBox's GPU work
+is about 5 ms a pass, less than the host's readback and list build, so it
+gains little: those passes are host-bound. The "GPU" time the log sums
+overlaps between chunks (the next chunk's timestamp can start before the
+barrier releases it), so it reads 10-25% higher than before.
+
+**Guides-only light AOVs** (`kFrameGuidesOnly`). Denoising needs the albedo
+and normal, but every GPU sample also wrote the diffuse, specular and
+emission AOVs to host memory, four interleaved `float4` per pixel (CLI: read
+and added in place every sample). Profile of the previous build: denoising
+raised the CLI's GPU time from 6.1 to 11.2 s (CornellBox, 128 spp) and 6.1 to
+13.1 s (InOneWeekend), and the Hydra pass wall from 27 to 58 ms (CornellBox).
+When no light AOV output is bound, the light AOV kernel variant now stores
+only the guides, in two planes of one `float4` per pixel, at a frame flag
+(no new pipeline). The first version kept the entries interleaved (two per
+pixel) and was slower than four (CornellBox CLI GPU 11.4 -> 13.9 s, and
+QuadTest 11.45 -> 13.6 s with the same binary, on against off): stores to
+host memory that a SIMD group does not write contiguously cost more than
+their size. The planes made it 0.56x.
+
+| Case | Old -> new | Ratio |
+| --- | --- | --- |
+| QuadTest CLI, 128 spp, GPU s (same binary, guides off -> on) | 11.53 -> 6.47 | 0.56 |
+| InOneWeekend CLI, 128 spp, GPU s | 12.66 -> 8.49 | 0.67 |
+| OpenChessSet CLI, 64 spp, GPU s | 6.38 -> 3.98, 6.51 -> 4.01 | 0.62, 0.62 |
+| OpenChessSet Hydra, 32 spp, pass wall ms | 72.6 -> 55.2, 66.6 -> 56.1 | 0.76, 0.84 |
+| vk_oidn accumulation resolve and filter, GPU ms (CLI) | 90 -> 74 | 0.82 |
+
+The denoised images are unchanged (the guides are the same sums). Light AOV
+outputs that are bound keep the four-entry layout. The same planar layout
+for the full light AOVs, and for the CLI's colour sums (two interleaved
+`float4` per pixel, read and written in host memory every sample), is
+likely a gain too (not done: the Metal denoiser and the accumulation layout
+would change; to measure).
+
+**Geometry kept on Vulkan edits** (`gpu::SameGeometry`, as on Metal). Edits
+that keep the geometry (transforms, materials, lights) keep the geometry buffers and bottom-level structures; only the
+other buffers and the top level are rebuilt. OpenChessSet, 960x540 4 spp,
+three transform edits of `/ChessSet/White/King` per run, `vulkan.scene`
+load-profile marks, 4 pairs (one cold): scene update 0.267 -> 0.231 s mean
+(pair ratios 0.75, 0.84, 1.03, 0.88), its geometry buffers and structures
+0.115 -> 0.061 s. CornellBox: 0.009 s either way. What remains is
+`BuildGpuScene` (0.14 s on the chess set: it converts the whole scene again)
+and the other uploads (about 0.06 s, mostly the dome's 4k importance tables,
+rebuilt and uploaded on every edit): the next candidates for edit latency.
 
 ## Interpretation limits
 

@@ -1368,6 +1368,38 @@ called done there.
   `ctest -R texture_streaming`.
 - **Material networks keep their order after edits** (`src/materialx/ordered_network_interface.h`, used by the material service): the converted MaterialX document, and so the generated MDL, no longer depends on TfToken addresses. Shared by every device; no shader or GPU code change. Check on the Mac: the MaterialEggs countertop rendered on `--device metal` several times (each with a fresh `PRISM_CACHE_DIR`) is bit-identical run to run, and `ctest -R ordered_network_interface`.
 - **Dense per-triangle material tables** (`TriangleMaterials` in `src/scene.h`; written on Windows, the Metal device unbuilt): `PlacementMaterialBinding::triangles` is a table indexed by primitive (null: the fallback) shared by a prototype's placements, filled by `src/hydra/scene_bridge.cpp` (GeomSubsets, sphere batches) and the SDK. `src/device/gpu/gpu_scene.cpp` reads it with `triangles.at(prim)` when it builds the per-primitive material table; the resolved materials are the same, no shader change. Check on the Mac: the MaterialEggs countertop (GeomSubsets) and a scene with batched spheres on `--device metal` bit-identical to the build before, in the CLI and usdview, and `ctest -R "parity|subset|sphere"`.
+- **Guides-only light AOVs** (written on Windows, the Metal device unbuilt;
+  [performance.md](performance.md#gpu-pass-pipeline-guides-and-edits-2026-10-31)):
+  - Shared shader code: `shaders/shared/prism_gpu_types.h` gains
+    `kFrameGuidesOnly` (defined for the light AOV variant only, so the other
+    kernels' HLSL is unchanged; the embedded text changes, so source-keyed
+    caches recompile once). `gpu_store_aovs` / `gpu_accumulate_aovs`
+    (`shaders/gpu/accessors.hlsl`) take a slot count and a `guides` flag;
+    `kernel.hlsl` reads the flag from the frame after the path. With the
+    flag the variant stores two planes of one `float4` per slot (albedo and
+    normal x, then normal y and z) instead of four interleaved entries.
+  - Shared host code: `GpuRenderDevice::GuidesOnlyAovs()` (default false)
+    gates it, so Metal keeps the four-entry layout: `RenderImage` and
+    `RenderPass` read either layout; `PassRequest::lightAovGuidesOnly` is set
+    by the progressive engine when denoising is the only light AOV user.
+  - To enable it on Metal: override `GuidesOnlyAovs()`, and make
+    `metal_denoiser.mm`'s accumulation resolve read the planar layout when
+    `m_accumulationGuidesOnly` (as `shaders/gpu/vulkan/denoise.hlsl` mode 3).
+  - Check on the Mac now: the build compiles both kernels
+    (`prism_gpu_shader_compile_test`); a denoised CLI render
+    (`--denoise aov`) and a Hydra `--denoise aov` render on `--device metal`
+    are bit-identical to the previous build's (colour and `denoised` layers);
+    `ctest -R "denois|light_aov"`.
+- **Pipelined pass chunks** (written on Windows, the Metal device unbuilt):
+  `GpuRenderDevice::RenderPass` (`src/device/gpu/gpu_device.cpp`) now
+  submits chunks through `SubmitChunk` / `WaitChunk` and builds the pass's
+  pixel list by rows. The defaults (`ChunksInFlight() == 1`, `SubmitChunk`
+  copies the list into `kSlotPixels` and calls `Dispatch`) keep Metal's
+  order of work: build, dispatch and wait, read back, per chunk. Only
+  Vulkan overrides them (two chunks in flight). No shader change. Check on
+  the Mac: a Hydra render at 1920x1080 (several chunks) on `--device metal`
+  is bit-identical to the previous build's, and an edit sequence
+  (`prism_hydra_render ... --edit-sequence 3 <prim>`) still converges.
 
 ## Diagnostics
 

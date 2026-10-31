@@ -378,7 +378,10 @@ restarts keep them consistent.
   to the previous build's. With the AOVs the output buffers hold four more
   `float4` per pixel (kernel.hlsl, `gpu_store_aovs` / `gpu_accumulate_aovs`);
   the denoiser's normal guide travels in the `w` of the first three
-  ([denoising.md](denoising.md)).
+  ([denoising.md](denoising.md)). When denoising is the only user (no light
+  AOV output bound), the Vulkan device stores only the guides instead, two
+  planes of one `float4` per pixel (`kFrameGuidesOnly`; Metal keeps the
+  four entries).
 
 ```powershell
 # Every product of the stage's render settings, into build/products:
