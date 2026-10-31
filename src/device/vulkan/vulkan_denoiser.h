@@ -59,10 +59,12 @@ public:
     void Denoise(DenoiseRequest const& request) override;
     // A whole-image render's accumulation, where it lives (`accumulation`,
     // a device address: GpuRenderDevice::RenderImage's sums, the light AOV
-    // sums after the colour's), averaged over each pixel's `samples` by a
+    // sums after the colour's, four entries per pixel or, with `guidesOnly`,
+    // two: kFrameGuidesOnly), averaged over each pixel's `samples` by a
     // resolve pass; *output receives width*height RGB triples.
     void DenoiseAccumulation(VkDeviceAddress accumulation, std::vector<int> const& samples, unsigned width,
-                             unsigned height, DenoiseSettings const& settings, std::vector<float>* output);
+                             unsigned height, DenoiseSettings const& settings, bool guidesOnly,
+                             std::vector<float>* output);
     // The render device is going away: frees every Vulkan object. Later
     // calls of Denoise use OIDN's CPU device.
     void Shutdown();

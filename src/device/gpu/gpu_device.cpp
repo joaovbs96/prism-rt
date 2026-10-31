@@ -78,10 +78,12 @@ GpuFrame GpuRenderDevice::BaseFrame(prism::CameraRayParameters const& camera, un
 }
 
 namespace {
-// What a failed submission most likely means, for the error message.
 // Light AOVs (kFrameLightAovs, accessors.hlsl): four float4 per slot, the
-// denoising normal in the w of the first three.
+// denoising normal in the w of the first three; with kFrameGuidesOnly two
+// planes of one float4 per slot, the albedo and the normal's x, then the
+// normal's y and z.
 constexpr size_t kAovEntries = 4;
+constexpr size_t kGuideEntries = 2;
 
 LightAovPixel ReadLightAovs(float const* entries, float scale)
 {
@@ -92,6 +94,18 @@ LightAovPixel ReadLightAovs(float const* entries, float scale)
             Float3(entries[3] * scale, entries[7] * scale, entries[11] * scale)};
 }
 
+// The guides-only layout (a slot's entry in each plane): the albedo and
+// normal; the other AOVs are zero.
+LightAovPixel ReadGuides(float const* first, float const* second, float scale)
+{
+    LightAovPixel pixel;
+    pixel.albedo = Color3(first[0] * scale, first[1] * scale, first[2] * scale);
+    pixel.diffuse = pixel.specular = pixel.emission = Color3(0.0f, 0.0f, 0.0f);
+    pixel.normal = Float3(first[3] * scale, second[0] * scale, second[1] * scale);
+    return pixel;
+}
+
+// What a failed submission most likely means, for the error message.
 std::string FailureHint(std::string const& error)
 {
     if (error.find("device lost") != std::string::npos)
@@ -120,13 +134,17 @@ std::vector<float> GpuRenderDevice::RenderImage(SceneManager& scene, ImageReques
     const bool lightAovs = request.lightAovs != nullptr || request.denoised != nullptr;
     if (lightAovs && !PrepareLightAovs(&error))
         throw std::runtime_error(std::string(LogPrefix()) + "cannot build the light AOV kernel: " + error);
+    // Denoising alone needs only the guides (GuidesOnlyAovs).
+    const bool guidesOnly = lightAovs && request.lightAovs == nullptr && GuidesOnlyAovs();
+    const size_t aovEntries = guidesOnly ? kGuideEntries : kAovEntries;
+    m_accumulationGuidesOnly = guidesOnly;
     // Test hook: fail the dispatch of this sample index.
     const char* failAt = std::getenv("PRISM_GPU_FAIL_DISPATCH_AT");
     const int failSample = failAt && *failAt ? std::atoi(failAt) : -1;
     const AdaptiveSettings& adaptive = request.adaptive;
     const uint32_t count = request.width * request.height;
     // Colour sums (two float4 per pixel), then the light AOV sums.
-    const size_t accumulationBytes = size_t(count) * (32 + (lightAovs ? 16 * kAovEntries : 0));
+    const size_t accumulationBytes = size_t(count) * (32 + (lightAovs ? 16 * aovEntries : 0));
     RenderBuffer(kSlotRng, size_t(count) * 4);
     std::memset(RenderBuffer(kSlotAccumulation, accumulationBytes), 0, accumulationBytes);
     std::vector<uint32_t> list(count);
@@ -145,6 +163,7 @@ std::vector<float> GpuRenderDevice::RenderImage(SceneManager& scene, ImageReques
         std::memset(RenderBuffer(kSlotAccumulation, accumulationBytes), 0, accumulationBytes);
     }
     if (lightAovs) frame.settings.z |= kFrameLightAovs;
+    if (guidesOnly) frame.settings.z |= kFrameGuidesOnly;
     BeginWork(kModeImage, 0);
     double gpuSeconds = 0.0;
     // The time limit counts from here: scene preparation and texture
@@ -177,7 +196,7 @@ std::vector<float> GpuRenderDevice::RenderImage(SceneManager& scene, ImageReques
             replicas = std::clamp(int(count / list.size()), 1, std::min(maxReplicas, stop - sample));
         }
         const uint32_t threads = uint32_t(list.size()) * uint32_t(replicas);
-        const size_t outputBytes = size_t(threads) * (32 + (lightAovs ? 16 * kAovEntries : 0));
+        const size_t outputBytes = size_t(threads) * (32 + (lightAovs ? 16 * aovEntries : 0));
         // The list changes only at adaptive checks; the buffer keeps it
         // between dispatches (it only shrinks, so it is never reallocated).
         if (listChanged) {
@@ -215,9 +234,14 @@ std::vector<float> GpuRenderDevice::RenderImage(SceneManager& scene, ImageReques
                         }
                         // The light AOVs follow the 2 * threads colour entries.
                         if (lightAovs)
-                            for (size_t k = 0; k < 4 * kAovEntries; ++k)
-                                sums[8 * size_t(count) + 4 * kAovEntries * p + k] +=
-                                    out[8 * size_t(threads) + 4 * kAovEntries * t + k];
+                            for (size_t k = 0; k < 4 * aovEntries; ++k) {
+                                // Guides: entry k / 4 of the slot in plane k / 4.
+                                const size_t to = guidesOnly ? (k / 4) * 4 * size_t(count) + 4 * p + k % 4
+                                                             : 4 * kAovEntries * p + k;
+                                const size_t from = guidesOnly ? (k / 4) * 4 * size_t(threads) + 4 * t + k % 4
+                                                               : 4 * kAovEntries * t + k;
+                                sums[8 * size_t(count) + to] += out[8 * size_t(threads) + from];
+                            }
                     }
                 }
             });
@@ -248,7 +272,11 @@ std::vector<float> GpuRenderDevice::RenderImage(SceneManager& scene, ImageReques
     for (size_t p = 0; p < count; ++p) {
         const float scale = samples[p] > 0 ? 1.0f / float(samples[p]) : 0.0f;
         for (int c = 0; c < 3; ++c) pixels[3 * p + c] = sums[8 * p + c] * scale;
-        if (lightAovs) aovs[p] = ReadLightAovs(sums + 8 * size_t(count) + 4 * kAovEntries * p, scale);
+        if (lightAovs) {
+            float const* aovSums = sums + 8 * size_t(count);
+            aovs[p] = guidesOnly ? ReadGuides(aovSums + 4 * p, aovSums + 4 * size_t(count) + 4 * p, scale)
+                                 : ReadLightAovs(aovSums + 4 * kAovEntries * p, scale);
+        }
         total += samples[p];
         atMax += samples[p] >= request.samples;
     }
@@ -293,10 +321,12 @@ void GpuRenderDevice::RenderPass(SceneManager& scene, PassRequest const& request
         std::cerr << LogPrefix() << "cannot build the light AOV kernel: " << error << '\n';
         lightAovs = false;
     }
+    const bool guidesOnly = lightAovs && request.lightAovGuidesOnly && GuidesOnlyAovs();
+    const size_t aovEntries = guidesOnly ? kGuideEntries : kAovEntries;
 
     const size_t pixels = size_t(width) * height;
     // Colour and coverage per pixel, then the light AOVs.
-    const size_t outputBytes = pixels * (16 + (lightAovs ? 16 * kAovEntries : 0));
+    const size_t outputBytes = pixels * (16 + (lightAovs ? 16 * aovEntries : 0));
     uint32_t* rng = nullptr;
     float* output = nullptr;
     GpuFrame frame{};
@@ -313,6 +343,7 @@ void GpuRenderDevice::RenderPass(SceneManager& scene, PassRequest const& request
         if (request.shading.transparentEscapes) frame.settings.z |= kFrameTransparentEscapes;
         if (request.sample == 0) frame.settings.z |= kFrameSeedRng;
         if (lightAovs) frame.settings.z |= kFrameLightAovs;
+        if (guidesOnly) frame.settings.z |= kFrameGuidesOnly;
         frame.settings.w = request.seed;
         frame.counts.z = uint32_t(std::max(0, request.sample));
         if (gpuPrimary) {
@@ -381,9 +412,12 @@ void GpuRenderDevice::RenderPass(SceneManager& scene, PassRequest const& request
                         request.colors[pixel] = Color3(output[4 * pixel], output[4 * pixel + 1],
                                                        output[4 * pixel + 2]);
                         request.coverage[pixel] = output[4 * pixel + 3];
-                        if (lightAovs)
-                            request.lightAovs[pixel] =
-                                ReadLightAovs(output + 4 * pixels + 4 * kAovEntries * pixel, 1.0f);
+                        if (lightAovs) {
+                            float const* aovs = output + 4 * pixels;
+                            request.lightAovs[pixel] = guidesOnly
+                                ? ReadGuides(aovs + 4 * pixel, aovs + 4 * pixels + 4 * pixel, 1.0f)
+                                : ReadLightAovs(aovs + 4 * kAovEntries * pixel, 1.0f);
+                        }
                     }
                 });
             if (request.colorPixels) request.colorPixels->fetch_add(list.size(), std::memory_order_relaxed);

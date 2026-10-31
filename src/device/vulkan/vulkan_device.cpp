@@ -3757,6 +3757,15 @@ void VulkanDevice::HoldResidency()
 
 bool VulkanDevice::PrepareScene(SceneManager& scene, std::string* error) { return m_impl->ensureScene(scene, error); }
 bool VulkanDevice::PrepareLightAovs(std::string* error) { return m_impl->prepareLightAovs(error); }
+bool VulkanDevice::GuidesOnlyAovs() const
+{
+    // PRISM_GPU_GUIDES_ONLY=0 (diagnostics): always the four-entry layout.
+    static const bool enabled = [] {
+        const char* value = std::getenv("PRISM_GPU_GUIDES_ONLY");
+        return !(value && std::string_view(value) == "0");
+    }();
+    return enabled;
+}
 GpuSceneData const& VulkanDevice::Data() const { return *m_impl->data; }
 uint32_t VulkanDevice::MdlTextureCount() const { return m_impl->mdlTextureCount; }
 void* VulkanDevice::RenderBuffer(int slot, size_t bytes) { return m_impl->renderBuffer(slot, bytes); }
@@ -3780,7 +3789,7 @@ bool VulkanDevice::DenoiseAccumulation(ImageRequest const& request, std::vector<
     auto denoiser = m_impl->gpuDenoiser();
     if (!denoiser) return false;
     denoiser->DenoiseAccumulation(m_impl->buffers[kSlotAccumulation].address, samples, request.width,
-                                  request.height, request.denoise, request.denoised);
+                                  request.height, request.denoise, m_accumulationGuidesOnly, request.denoised);
     if (request.denoiser) *request.denoiser = denoiser->Name();
     return true;
 #else

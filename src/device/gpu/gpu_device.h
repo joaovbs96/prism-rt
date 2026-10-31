@@ -48,12 +48,19 @@ protected:
     // light AOVs (PRISM_LIGHT_AOVS); Dispatch runs it for frames with
     // kFrameLightAovs. After PrepareScene.
     virtual bool PrepareLightAovs(std::string* error) = 0;
+    // The device takes kFrameGuidesOnly frames: when only the denoising
+    // guides are needed, the light AOV variant stores two entries per slot
+    // (albedo, normal) instead of four, and DenoiseAccumulation reads that
+    // layout (m_accumulationGuidesOnly). Metal does not yet (its denoiser
+    // reads the four-entry layout).
+    virtual bool GuidesOnlyAovs() const { return false; }
     // Runs the kernel over `threads` threads and waits for completion.
     virtual bool Dispatch(GpuFrame const& frame, uint32_t threads, double* gpuSeconds,
                           std::string* error) = 0;
     virtual const char* LogPrefix() const = 0;
     // Denoises a whole-image render where its accumulation lives
-    // (kSlotAccumulation: the colour sums, then the light AOV sums; `samples`
+    // (kSlotAccumulation: the colour sums, then the light AOV sums, in the
+    // guides-only layout when m_accumulationGuidesOnly; `samples`
     // per pixel) into *request.denoised, and names the denoiser in
     // *request.denoiser. False when the device has no denoiser of its own:
     // RenderImage then denoises the host images (DenoiseRenderedImage).
@@ -65,6 +72,8 @@ protected:
     }
 
     std::mutex m_renderMutex; // one render at a time
+    // RenderImage's accumulation holds the guides only (GuidesOnlyAovs).
+    bool m_accumulationGuidesOnly = false;
 
 private:
     GpuFrame BaseFrame(prism::CameraRayParameters const& camera, unsigned width,

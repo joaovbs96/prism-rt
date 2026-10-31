@@ -11,6 +11,9 @@
 //           prefilter network, which takes it like OIDN's input process
 //           (NaN to 0, clamped, then n * 0.5 + 0.5)
 //   mode 2: back to [-1, 1] in place (OIDN's output process)
+//   mode 3: as mode 0 for an accumulation of the guides only (two planes of
+//           one float4 per pixel: the albedo and the normal's x, then its y
+//           and z; kFrameGuidesOnly)
 
 struct Params {
     uint64_t source;
@@ -29,6 +32,17 @@ void main(uint3 id : SV_DispatchThreadID)
 {
     const uint i = id.x;
     if (i >= params.count) return;
+    if (params.mode == 3) {
+        const float s = vk::RawBufferLoad<float>(params.scales + 4ull * i);
+        const float4 c = vk::RawBufferLoad<float4>(params.source + 32ull * i);
+        const uint64_t aov = params.source + 32ull * params.count + 16ull * i;
+        const float4 e0 = vk::RawBufferLoad<float4>(aov);
+        const float4 e1 = vk::RawBufferLoad<float4>(aov + 16ull * params.count);
+        vk::RawBufferStore<float4>(params.color + 16ull * i, float4(c.x * s, c.y * s, c.z * s, 1.0f));
+        vk::RawBufferStore<float4>(params.albedo + 16ull * i, float4(e0.x * s, e0.y * s, e0.z * s, 1.0f));
+        vk::RawBufferStore<float4>(params.normal + 16ull * i, float4(e0.w * s, e1.x * s, e1.y * s, 1.0f));
+        return;
+    }
     if (params.mode == 0) {
         const float s = vk::RawBufferLoad<float>(params.scales + 4ull * i);
         const float4 c = vk::RawBufferLoad<float4>(params.source + 32ull * i);

@@ -84,6 +84,13 @@ static const uint kFrameLightLobes = 2048u;   // UsdLux diffuse/specular light m
 #ifndef __HLSL_VERSION
 static const uint kFrameLightAovs = 4096u;
 #endif
+// With kFrameLightAovs: only the denoising guides (albedo, normal) are
+// stored, in two planes of one entry per slot instead of four entries per
+// slot (accessors.hlsl). Defined
+// only for the light AOV variant, so the other kernels stay unchanged.
+#if !defined(__HLSL_VERSION) || PRISM_LIGHT_AOVS
+static const uint kFrameGuidesOnly = 8192u;
+#endif
 
 // Work modes.
 static const uint kModePass = 0u;      // one sample per listed pixel

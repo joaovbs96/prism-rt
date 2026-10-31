@@ -169,6 +169,10 @@ struct PassRequest {
     // When non-null, also the light AOVs of each traced pixel's sample
     // (width*height, like colors).
     LightAovPixel* lightAovs = nullptr;
+    // Only the albedo and normal of lightAovs are needed (the denoising
+    // guides, no light AOV output bound): a device may then leave the others
+    // unwritten and move less data (the Vulkan device).
+    bool lightAovGuidesOnly = false;
     // Polled between rows and tiles; returning true ends the pass early.
     std::function<bool()> abandoned;
     // While true, workers wait between tiles (unless abandoned).

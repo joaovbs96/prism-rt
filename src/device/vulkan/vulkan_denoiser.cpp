@@ -53,7 +53,7 @@ struct PassParams {
     uint32_t count = 0, mode = 0;
 };
 static_assert(sizeof(PassParams) == 48);
-enum PassMode : uint32_t { kResolve = 0, kNormalToUnit = 1, kNormalFromUnit = 2 };
+enum PassMode : uint32_t { kResolve = 0, kNormalToUnit = 1, kNormalFromUnit = 2, kResolveGuides = 3 };
 
 struct Buffer {
     VkBuffer buffer = VK_NULL_HANDLE;
@@ -665,7 +665,7 @@ void VulkanDenoiser::Denoise(DenoiseRequest const& request)
 
 void VulkanDenoiser::DenoiseAccumulation(VkDeviceAddress accumulation, std::vector<int> const& samples,
                                          unsigned width, unsigned height, DenoiseSettings const& settings,
-                                         std::vector<float>* output)
+                                         bool guidesOnly, std::vector<float>* output)
 {
     std::lock_guard lock(m_impl->mutex);
     Impl& impl = *m_impl;
@@ -690,7 +690,7 @@ void VulkanDenoiser::DenoiseAccumulation(VkDeviceAddress accumulation, std::vect
         params.albedo = impl.image(kAlbedo).address;
         params.normal = impl.image(kNormal).address;
         params.count = uint32_t(count);
-        params.mode = kResolve;
+        params.mode = guidesOnly ? kResolveGuides : kResolve;
         impl.pass(commands, params);
     });
     output->resize(3 * count);

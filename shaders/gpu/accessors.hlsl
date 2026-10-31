@@ -86,17 +86,33 @@ void gpu_accumulate(uint pixel, float3 value, bool even)
 // specular, emission; the denoising normal's x, y, z in the w of the first
 // three) after `base` entries, in the output buffer (one sample) or added up
 // in the accumulation buffer (image mode, after its 2 * pixels colour sums).
-void gpu_store_aovs(uint base, uint slot, LightAovSample a)
+// With `guides` (kFrameGuidesOnly, denoising without light AOV outputs): two
+// planes of `count` entries, the albedo and the normal's x, then the normal's
+// y and z. Planes keep each store of a SIMD group contiguous, which matters
+// for host memory written over the bus (as gpu_store_primary_hit): two
+// interleaved entries per slot were slower than the four.
+void gpu_store_aovs(uint base, uint slot, uint count, LightAovSample a, bool guides)
 {
     RWStructuredBuffer<float4> b = outputBuffer();
+    if (guides) {
+        b[base + slot] = float4(a.albedo, a.normal.x);
+        b[base + count + slot] = float4(a.normal.y, a.normal.z, 0.0f, 0.0f);
+        return;
+    }
     b[base + 4u * slot] = float4(a.albedo, a.normal.x);
     b[base + 4u * slot + 1u] = float4(a.diffuse, a.normal.y);
     b[base + 4u * slot + 2u] = float4(a.specular, a.normal.z);
     b[base + 4u * slot + 3u] = float4(a.emission, 0.0f);
 }
-void gpu_accumulate_aovs(uint base, uint pixel, LightAovSample a)
+void gpu_accumulate_aovs(uint base, uint pixel, uint count, LightAovSample a, bool guides)
 {
     RWStructuredBuffer<float4> b = accumulationBuffer();
+    if (guides) {
+        const uint i = base + pixel;
+        b[i] = b[i] + float4(a.albedo, a.normal.x);
+        b[i + count] = b[i + count] + float4(a.normal.y, a.normal.z, 0.0f, 0.0f);
+        return;
+    }
     const uint i = base + 4u * pixel;
     b[i] = b[i] + float4(a.albedo, a.normal.x);
     b[i + 1u] = b[i + 1u] + float4(a.diffuse, a.normal.y);

@@ -152,17 +152,22 @@ void renderThread(uint thread)
     } else {
         result = tracer.renderSample(camera, x, y, width, height, settings);
     }
+#if PRISM_LIGHT_AOVS
+    // Denoising without light AOV outputs stores only its guides. Read from
+    // the frame here, after the path, so it adds no state live across it.
+    const bool guides = (gpu_frame().settings.z & kFrameGuidesOnly) != 0u;
+#endif
     if (replicated) {
         gpu_store_output(2u * thread, float4(result.color, 0.0f));
         gpu_store_output(2u * thread + 1u, (sampleIndex & 1u) == 0u ? float4(result.color, 0.0f) : (float4)0.0f);
 #if PRISM_LIGHT_AOVS
-        gpu_store_aovs(2u * frame.work.x, thread, result.aovs);
+        gpu_store_aovs(2u * frame.work.x, thread, frame.work.x, result.aovs, guides);
 #endif
         return;
     }
     if (preview) gpu_store_output(thread, float4(result.color, result.coverage));
 #if PRISM_LIGHT_AOVS
-    if (preview) gpu_store_aovs(frame.size.z * frame.size.w, thread, result.aovs);
+    if (preview) gpu_store_aovs(frame.size.z * frame.size.w, thread, frame.size.z * frame.size.w, result.aovs, guides);
 #endif
     if ((preview || mode == kModePass) && (flags & kFramePrimaryHits) != 0u)
         gpu_store_primary_hit(preview ? thread : pixel, preview ? frame.size.z * frame.size.w : width * height,
@@ -172,8 +177,8 @@ void renderThread(uint thread)
     if (mode == kModeImage) gpu_accumulate(pixel, result.color, (frame.counts.z & 1u) == 0u);
     else gpu_store_output(pixel, float4(result.color, result.coverage));
 #if PRISM_LIGHT_AOVS
-    if (mode == kModeImage) gpu_accumulate_aovs(2u * width * height, pixel, result.aovs);
-    else gpu_store_aovs(width * height, pixel, result.aovs);
+    if (mode == kModeImage) gpu_accumulate_aovs(2u * width * height, pixel, width * height, result.aovs, guides);
+    else gpu_store_aovs(width * height, pixel, width * height, result.aovs, guides);
 #endif
 }
 
