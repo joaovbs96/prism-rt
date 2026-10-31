@@ -1,0 +1,23 @@
+ocio_profile_version: 2
+
+# A config without linear Rec.709 under any name (prism_hydra_color_fallback_*):
+# the delegate warns and falls back to the built-in config.
+name: prism-test-no-rec709
+roles:
+  default: ACEScg
+  scene_linear: ACEScg
+  data: Raw
+
+displays:
+  Display:
+    - !<View> {name: Raw, colorspace: Raw}
+
+colorspaces:
+  - !<ColorSpace>
+    name: ACEScg
+    encoding: scene-linear
+    isdata: false
+  - !<ColorSpace>
+    name: Raw
+    encoding: data
+    isdata: true

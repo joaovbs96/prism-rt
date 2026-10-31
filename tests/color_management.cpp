@@ -14,6 +14,14 @@
 // Diagnostics for comparing renders made in different working spaces:
 // --encode IN.exr OUT.png WORKING_SPACE DISPLAY VIEW (the CLI's 8-bit output)
 // --to-rec709 IN.exr OUT.exr WORKING_SPACE (linear Rec.709 primaries)
+//
+// Hydra output space (docs/color_management.md, "Output space"):
+// --check-host-srgb LINEAR_REC709.exr HOST.png: an image a stock Hydra host in
+// sRGB mode shows (prism_hydra_render --host-srgb) is the linear Rec.709
+// render through the sRGB curve, within the noise floor.
+// --check-output-matrix WORKING.exr OUTPUT.exr WORKING_SPACE: the delegate's
+// default output is its working-space output times the working space's
+// matrix to linear Rec.709.
 // --side-by-side OUT.png IN.png... (one row)
 
 #include "../src/color/color_management.h"
@@ -154,6 +162,80 @@ void TestRenderingColorSpace()
           "a non-linear renderingColorSpace keeps the default working space");
     options.renderingColorSpace = "data";
     Check(prism::color::ColorManagement::Create(options)->rec709(), "data renders in linear Rec.709");
+}
+
+// Output spaces, fallbacks and odd configs (the Hydra delegate's).
+void TestOutputAndFallbacks(std::filesystem::path const& directory)
+{
+    using prism::color::ColorManagement;
+    auto aces = ColorManagement::Create({});
+    prism::color::Matrix3 m{};
+    std::string name, error;
+    Check(aces->OutputMatrix("lin_rec709", &m, &name, &error) && m == aces->toRec709() &&
+              name == "Linear Rec.709 (sRGB)", "output lin_rec709 is the toRec709 matrix");
+    Check(aces->OutputMatrix("lin_rec709_scene", &m, &name, &error) && m == aces->toRec709(),
+          "USD's lin_rec709_scene");
+    Check(aces->OutputMatrix("data", &m, &name, &error) && m == aces->toRec709(), "data is linear Rec.709");
+    Check(aces->OutputMatrix("acescg", &m, &name, &error) && m == prism::color::kIdentity && name == "ACEScg",
+          "the working space is the identity");
+    Check(aces->OutputMatrix("lin_p3d65_scene", &m, &name, &error) && m != prism::color::kIdentity,
+          "another linear space: " + name + " " + error);
+    Check(!aces->OutputMatrix("srgb_texture", &m, &name, &error) && !error.empty(), "a non-linear output is refused");
+    Check(!aces->OutputMatrix("bogus", &m, &name, &error), "an unknown output is refused");
+
+    // Without a view processor an unknown view is only recorded.
+    auto noView = ColorManagement::Create({"", "", "No such display", "No such view"}, false);
+    Check(noView->view() == "No such view" && noView->workingSpace() == "ACEScg", "no view: recorded only");
+
+    std::filesystem::create_directories(directory);
+    std::vector<std::string> warnings;
+    auto warn = [&](std::string const& message) { warnings.push_back(message); };
+    // A missing config: the built-in one, same working space.
+    prism::color::Options missing{(directory / "missing.ocio").string(), "lin_rec709", "", ""};
+    auto fallback = ColorManagement::CreateOrFallback(missing, false, warn);
+    Check(warnings.size() == 1 && fallback->rec709() && !fallback->passThrough() && fallback->requested() == missing,
+          "a missing config falls back to the built-in one with the same working space");
+    // A config without linear Rec.709 under any name.
+    const auto noRec709 = directory / "no_rec709.ocio";
+    std::ofstream(noRec709) <<
+        "ocio_profile_version: 2\n\nname: prism-test-no-rec709\nroles:\n  default: ACEScg\n"
+        "  scene_linear: ACEScg\n  data: Raw\n\ndisplays:\n  Display:\n    - !<View> {name: Raw, colorspace: Raw}\n\n"
+        "colorspaces:\n  - !<ColorSpace>\n    name: ACEScg\n    encoding: scene-linear\n    isdata: false\n"
+        "  - !<ColorSpace>\n    name: Raw\n    encoding: data\n    isdata: true\n";
+    bool threw = false;
+    try { ColorManagement::Create({noRec709.string(), "", "", ""}); } catch (std::exception const&) { threw = true; }
+    Check(threw, "Create refuses a config without linear Rec.709");
+    warnings.clear();
+    fallback = ColorManagement::CreateOrFallback({noRec709.string(), "", "", ""}, false, warn);
+    Check(warnings.size() == 1 && fallback->workingSpace() == "ACEScg" && fallback->config() == prism::color::kDefaultConfig,
+          "a config without linear Rec.709 falls back to the built-in config");
+    // Linear Rec.709 under another name (an ACES 1.x style config).
+    const auto aliased = directory / "aliased_rec709.ocio";
+    std::ofstream(aliased) <<
+        "ocio_profile_version: 2\n\nname: prism-test-aliased\nroles:\n  default: ACEScg\n"
+        "  scene_linear: ACEScg\n  data: Raw\n\ndisplays:\n  Display:\n    - !<View> {name: Raw, colorspace: Raw}\n\n"
+        "colorspaces:\n  - !<ColorSpace>\n    name: ACEScg\n    encoding: scene-linear\n    isdata: false\n"
+        "  - !<ColorSpace>\n    name: Utility - Linear - sRGB\n    encoding: scene-linear\n    isdata: false\n"
+        "    from_scene_reference: !<MatrixTransform> {matrix: [1.70505, -0.62179, -0.08326, 0, -0.13026, 1.1408, "
+        "-0.01055, 0, -0.024, -0.12897, 1.15297, 0, 0, 0, 0, 1]}\n"
+        "  - !<ColorSpace>\n    name: Raw\n    encoding: data\n    isdata: true\n";
+    auto odd = ColorManagement::Create({aliased.string(), "", "", ""});
+    Check(odd->rec709Space() == "Utility - Linear - sRGB" && !odd->rec709() &&
+              odd->Resolve("lin_rec709") == "Utility - Linear - sRGB" && odd->NeedsConversion("lin_rec709"),
+          "linear Rec.709 found by its alias: " + odd->rec709Space());
+    Check(Near(odd->toRec709()[0], 1.70505f, 1e-4f), "the alias's matrix");
+    float rgb[] = {0.5f, 0.2f, 0.1f};
+    odd->ToWorkingSpace("lin_rec709", rgb, 1, 3);
+    Check(rgb[0] != 0.5f, "lin_rec709 converts through the alias");
+    // Nothing usable at all: the defaults' failure is reported too.
+    auto pass = ColorManagement::PassThrough({});
+    float same[] = {0.25f, -1.0f, 4.0f};
+    pass->ToWorkingSpace("srgb_texture", same, 1, 3);
+    Check(pass->passThrough() && pass->rec709() && !pass->NeedsConversion("srgb_texture") &&
+              same[0] == 0.25f && same[1] == -1.0f && pass->Resolve("anything") == "anything" &&
+              pass->OutputMatrix("lin_rec709", &m, &name, &error) && m == prism::color::kIdentity &&
+              !pass->OutputMatrix("acescg", &m, &name, &error),
+          "pass-through converts nothing");
 }
 
 void TestViews()
@@ -392,6 +474,62 @@ int ToRec709(std::string const& in, std::string const& out, std::string const& w
     return WriteRgb(out, pixels, width, height) ? 0 : 1;
 }
 
+int CheckHostSrgb(std::string const& linear, std::string const& host)
+{
+    std::vector<float> reference, shown;
+    int width = 0, height = 0, w2 = 0, h2 = 0;
+    if (!ReadRgb(linear, reference, width, height) || !ReadRgb(host, shown, w2, h2) || width != w2 || height != h2) {
+        std::printf("FAIL: cannot read %s and %s at one size\n", linear.c_str(), host.c_str());
+        return 1;
+    }
+    auto encode = [](float v) {
+        v = std::clamp(v, 0.0f, 1.0f);
+        return v <= 0.0031308f ? 12.92f * v : 1.055f * std::pow(v, 1.0f / 2.4f) - 0.055f;
+    };
+    double sum = 0.0, worst = 0.0;
+    size_t over = 0;
+    for (size_t i = 0; i < reference.size(); ++i) {
+        const double error = std::abs(std::round(encode(reference[i]) * 255.0f) / 255.0 - shown[i]);
+        sum += error;
+        worst = std::max(worst, error);
+        if (error > 2.5 / 255.0) ++over;
+    }
+    const double mean = sum / double(reference.size());
+    std::printf("host sRGB vs linear Rec.709: mean difference %.3f, largest %.3f code values, %zu of %zu over 2\n",
+                mean * 255.0, worst * 255.0, over, reference.size());
+    Check(mean * 255.0 <= 0.5 && over <= reference.size() / 200,
+          "a stock sRGB host shows the linear Rec.709 render");
+    return failures ? 1 : 0;
+}
+
+int CheckOutputMatrix(std::string const& working, std::string const& output, std::string const& workingSpace)
+{
+    std::vector<float> a, b;
+    int width = 0, height = 0, w2 = 0, h2 = 0;
+    if (!ReadRgb(working, a, width, height) || !ReadRgb(output, b, w2, h2) || width != w2 || height != h2) {
+        std::printf("FAIL: cannot read %s and %s at one size\n", working.c_str(), output.c_str());
+        return 1;
+    }
+    auto color = prism::color::ColorManagement::Create({"", workingSpace, "", ""});
+    double worst = 0.0, changed = 0.0;
+    for (size_t p = 0; p < size_t(width) * height; ++p) {
+        const Float3 in(a[3 * p], a[3 * p + 1], a[3 * p + 2]);
+        const Float3 expected = prism::color::Apply(color->toRec709(), in);
+        const double scale = std::max({1e-3, double(std::abs(in[0])), double(std::abs(in[1])), double(std::abs(in[2]))});
+        for (int i = 0; i < 3; ++i) {
+            // EXR halves: a few half ulps of the pixel's largest component.
+            const double error = std::abs(b[3 * p + i] - expected[i]) / scale;
+            worst = std::max(worst, error);
+            changed = std::max(changed, double(std::abs(b[3 * p + i] - in[i])));
+        }
+    }
+    std::printf("output vs working space x toRec709: largest relative difference %.6f (largest change %.4f)\n",
+                worst, changed);
+    Check(worst <= 2e-3, "the default output is the working-space output times the matrix");
+    Check(color->rec709() || changed > 1e-3, "the output was converted");
+    return failures ? 1 : 0;
+}
+
 int SideBySide(std::string const& out, std::vector<std::string> const& inputs)
 {
     std::vector<OIIO::ImageBuf> images;
@@ -423,10 +561,18 @@ int main(int argc, char** argv)
         if (argc == 7 && std::string(argv[1]) == "--encode")
             return Encode(argv[2], argv[3], {"", argv[4], argv[5], argv[6]});
         if (argc == 5 && std::string(argv[1]) == "--to-rec709") return ToRec709(argv[2], argv[3], argv[4]);
+        if (argc == 4 && std::string(argv[1]) == "--check-host-srgb") return CheckHostSrgb(argv[2], argv[3]);
+        if (argc == 5 && std::string(argv[1]) == "--check-output-matrix")
+            return CheckOutputMatrix(argv[2], argv[3], argv[4]);
         if (argc >= 4 && std::string(argv[1]) == "--side-by-side")
             return SideBySide(argv[2], std::vector<std::string>(argv + 3, argv + argc));
         TestMatrices();
         TestRenderingColorSpace();
+        {
+            const char* cache = std::getenv("PRISM_CACHE_DIR");
+            TestOutputAndFallbacks(std::filesystem::path(cache && *cache ? cache : std::filesystem::temp_directory_path().string()) /
+                                   "color_management_configs");
+        }
         TestViews();
         TestConversions();
         const char* cache = std::getenv("PRISM_CACHE_DIR");

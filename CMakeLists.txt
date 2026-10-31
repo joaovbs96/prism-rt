@@ -1256,6 +1256,63 @@ if(TARGET prism_hydra_render AND TARGET prism_compare_images AND TARGET prism_co
     set_tests_properties(prism_color_view_once_test PROPERTIES
         ENVIRONMENT "${_prism_color_env}" FIXTURES_REQUIRED "prism_color_view;prism_parity_color_acescg")
 
+    # Hydra output space (docs/color_management.md, "Output space"): a stock
+    # Hdx host in sRGB mode, with no Prism settings, shows the ColorChecker as
+    # the CLI renders it in linear Rec.709; the default output is the
+    # working-space output times the matrix; colour-management failures fall
+    # back with a warning instead of failing the render.
+    set(_prism_macbeth "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/color_macbeth.usda")
+    set(_prism_macbeth_args 192 128 16 --max-depth 2 ${_prism_fixed_sampling})
+    add_test(NAME prism_color_host_srgb_cli_render
+        COMMAND PrismRT --scene "${_prism_macbeth}" --camera /World/Camera --width 192 --height 128 --spp 16
+            --max-depth 2 ${_prism_fixed_sampling} --device cpu --working-space lin_rec709
+            --output "${_prism_color}/macbeth_cli_rec709.exr")
+    add_test(NAME prism_color_host_srgb_hydra_render
+        COMMAND prism_hydra_render "${_prism_macbeth}" /World/Camera "${_prism_color}/macbeth_host_srgb.png"
+            ${_prism_macbeth_args} --host-srgb)
+    add_test(NAME prism_color_output_working_render
+        COMMAND prism_hydra_render "${_prism_macbeth}" /World/Camera "${_prism_color}/macbeth_working.exr"
+            ${_prism_macbeth_args} --output-space working)
+    add_test(NAME prism_color_output_default_render
+        COMMAND prism_hydra_render "${_prism_macbeth}" /World/Camera "${_prism_color}/macbeth_default.exr"
+            ${_prism_macbeth_args} --output-space default)
+    set_tests_properties(prism_color_host_srgb_cli_render prism_color_host_srgb_hydra_render
+        prism_color_output_working_render prism_color_output_default_render PROPERTIES
+        ENVIRONMENT "${_prism_color_env}" FIXTURES_SETUP prism_color_output)
+    add_test(NAME prism_color_host_srgb_test
+        COMMAND prism_color_management_test --check-host-srgb "${_prism_color}/macbeth_cli_rec709.exr"
+            "${_prism_color}/macbeth_host_srgb.png")
+    add_test(NAME prism_color_output_space_matrix
+        COMMAND prism_color_management_test --check-output-matrix "${_prism_color}/macbeth_working.exr"
+            "${_prism_color}/macbeth_default.exr" ACEScg)
+    set_tests_properties(prism_color_host_srgb_test prism_color_output_space_matrix PROPERTIES
+        ENVIRONMENT "${_prism_color_env}" FIXTURES_REQUIRED prism_color_output)
+    foreach(_case missing_config:${_prism_color}/no_such_config.ocio
+            no_rec709:${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/ocio_no_rec709.ocio)
+        string(FIND "${_case}" ":" _colon)
+        string(SUBSTRING "${_case}" 0 ${_colon} _name)
+        math(EXPR _colon "${_colon} + 1")
+        string(SUBSTRING "${_case}" ${_colon} -1 _config)
+        add_test(NAME prism_hydra_color_fallback_${_name}_render
+            COMMAND prism_hydra_render "${_prism_macbeth}" /World/Camera
+                "${_prism_color}/macbeth_fallback_${_name}.png" ${_prism_macbeth_args} --host-srgb)
+        set_tests_properties(prism_hydra_color_fallback_${_name}_render PROPERTIES
+            ENVIRONMENT "${_prism_color_env};OCIO=${_config}"
+            PASS_REGULAR_EXPRESSION "using the built-in OpenColorIO config"
+            FIXTURES_SETUP prism_color_fallback_${_name})
+        # The built-in config with the default working space: the same image.
+        add_test(NAME prism_hydra_color_fallback_${_name}_test
+            COMMAND prism_compare_images "${_prism_color}/macbeth_host_srgb.png"
+                "${_prism_color}/macbeth_fallback_${_name}.png" --exact)
+        set_tests_properties(prism_hydra_color_fallback_${_name}_test PROPERTIES
+            FIXTURES_REQUIRED "prism_color_fallback_${_name};prism_color_output")
+    endforeach()
+    # Unknown display and view names are only recorded by the delegate.
+    add_test(NAME prism_hydra_color_fallback_unknown_view
+        COMMAND prism_hydra_render "${_prism_macbeth}" /World/Camera "${_prism_color}/macbeth_unknown_view.exr"
+            ${_prism_macbeth_args} --display "No such display" --view "No such view")
+    set_tests_properties(prism_hydra_color_fallback_unknown_view PROPERTIES ENVIRONMENT "${_prism_color_env}")
+
     set(_prism_legacy "${CMAKE_CURRENT_SOURCE_DIR}/tests/hydra/fixtures/legacy_rec709")
     set(_prism_legacy_view --working-space lin_rec709 --display "Gamma 2.2 Rec.709 - Display" --view Un-tone-mapped)
     foreach(_output CornellBox.png QuadTest.png QuadTest.exr)

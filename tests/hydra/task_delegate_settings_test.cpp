@@ -12,27 +12,29 @@
 #include <iostream>
 #include <map>
 #include <stdexcept>
+#include <string>
 
 PXR_NAMESPACE_USING_DIRECTIVE
 
 namespace {
 
-void Require(bool condition, char const *message)
+void Require(bool condition, std::string const &message)
 {
     if (!condition) throw std::runtime_error(message);
 }
 
-HdContainerDataSourceHandle SettingsData(int samples)
+HdContainerDataSourceHandle SettingsData(int samples, TfToken const &renderingColorSpace = TfToken())
 {
     HdContainerDataSourceHandle const namespaced =
         HdRetainedContainerDataSource::New(
             TfToken("prism:samplesPerPixel"),
             HdRetainedTypedSampledDataSource<int>::New(samples));
-    HdContainerDataSourceHandle const settings =
-        HdRenderSettingsSchema::Builder()
-            .SetNamespacedSettings(namespaced)
-            .SetActive(HdRetainedTypedSampledDataSource<bool>::New(true))
-            .Build();
+    HdRenderSettingsSchema::Builder builder;
+    builder.SetNamespacedSettings(namespaced)
+        .SetActive(HdRetainedTypedSampledDataSource<bool>::New(true));
+    if (!renderingColorSpace.IsEmpty())
+        builder.SetRenderingColorSpace(HdRetainedTypedSampledDataSource<TfToken>::New(renderingColorSpace));
+    HdContainerDataSourceHandle const settings = builder.Build();
     return HdRetainedContainerDataSource::New(
         HdRenderSettingsSchema::GetSchemaToken(), settings);
 }
@@ -282,6 +284,58 @@ int RunAuthoredSettingsTests()
         Require(stat(afterEmpty, "conservativeRebuilds") ==
                     stat(afterIgnored, "conservativeRebuilds") + 1,
                 "empty dirty locator set did not retain conservative fallback");
+
+        // Colour (docs/hydra.md): renderingColorSpace as a render setting,
+        // below the settings prim's; the AOVs' output space.
+        {
+            auto text = [](VtDictionary const &stats, char const *name) {
+                auto const found = stats.find(name);
+                return found != stats.end() && found->second.IsHolding<std::string>()
+                    ? found->second.UncheckedGet<std::string>() : std::string();
+            };
+            const TfToken rendering = HdRenderSettingsPrimTokens->renderingColorSpace;
+            const TfToken output("prism:colorManagement:outputSpace");
+            const TfToken aovSpace("prism:colorManagement:aovColorSpace");
+            auto aov = [&](PrismTaskDelegate &d) { return d.GetRenderSetting(aovSpace).UncheckedGet<std::string>(); };
+            bool described = false;
+            for (auto const &descriptor : dirtyDelegate.GetRenderSettingDescriptors())
+                described |= descriptor.key == rendering || descriptor.key == output;
+            Require(described, "renderingColorSpace and outputSpace have descriptors");
+            Require(dirtyDelegate.GetRenderSetting(rendering).UncheckedGet<std::string>().empty() &&
+                        aov(dirtyDelegate) == "Linear Rec.709 (sRGB)" &&
+                        text(dirtyDelegate.GetRenderStats(), "prismWorkingColorSpace") == "ACEScg",
+                    "Default: ACEScg working space presented in linear Rec.709");
+            dirtyDelegate.SetRenderSetting(rendering, VtValue(TfToken("lin_rec709_scene")));
+            Require(dirtyDelegate.GetRenderSetting(rendering).UncheckedGet<std::string>() == "lin_rec709_scene" &&
+                        text(dirtyDelegate.GetRenderStats(), "prismWorkingColorSpace") == "Linear Rec.709 (sRGB)",
+                    "The renderingColorSpace render setting sets the working space");
+            dirtyDelegate.SetRenderSetting(output, VtValue(std::string("working")));
+            dirtyDelegate.SetRenderSetting(rendering, VtValue(std::string("lin_ap1_scene")));
+            Require(aov(dirtyDelegate) == "ACEScg", "outputSpace working presents the working space");
+            dirtyDelegate.SetRenderSetting(output, VtValue(std::string("lin_p3d65_scene")));
+            Require(aov(dirtyDelegate) != "ACEScg" && aov(dirtyDelegate) != "Linear Rec.709 (sRGB)",
+                    "outputSpace names another linear space: " + aov(dirtyDelegate));
+            dirtyDelegate.SetRenderSetting(output, VtValue(std::string("no such space")));
+            Require(aov(dirtyDelegate) == "ACEScg", "an unknown outputSpace takes the default (renderingColorSpace)");
+            dirtyDelegate.SetRenderSetting(output, VtValue(std::string()));
+
+            // The settings prim's renderingColorSpace comes first.
+            auto colorIndex = TfCreateRefPtr(new CountingSceneIndex());
+            colorIndex->Add(root, TfToken(), HdRetainedContainerDataSource::New());
+            colorIndex->Add(SdfPath("/Settings"), HdPrimTypeTokens->renderSettings,
+                            SettingsData(8, TfToken("lin_ap1_scene")));
+            PrismTaskDelegate colorDelegate;
+            colorDelegate.SetTerminalSceneIndex(colorIndex);
+            colorDelegate.SetRenderSetting(rendering, VtValue(TfToken("lin_rec709_scene")));
+            colorDelegate.Update();
+            Require(text(colorDelegate.GetRenderStats(), "prismWorkingColorSpace") == "ACEScg" &&
+                        aov(colorDelegate) == "ACEScg",
+                    "The settings prim's renderingColorSpace wins over the render setting (and is the output space)");
+            colorDelegate.SetRenderSetting(TfToken("prism:colorManagement:workingSpace"), VtValue(std::string("lin_rec709")));
+            Require(text(colorDelegate.GetRenderStats(), "prismWorkingColorSpace") == "Linear Rec.709 (sRGB)" &&
+                        aov(colorDelegate) == "ACEScg",
+                    "prism:colorManagement:workingSpace wins; the output stays the renderingColorSpace");
+        }
     } catch (std::exception const &error) {
         std::cerr << error.what() << '\n';
         return 1;

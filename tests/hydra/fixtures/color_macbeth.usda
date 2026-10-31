@@ -1,0 +1,657 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    upAxis = "Y"
+)
+
+# Colour for stock Hydra hosts (docs/color_management.md, "Output space"): the
+# 24 ColorChecker patches (sRGB 8-bit values tagged srgb_texture) as diffuse
+# standard_surface patches seen straight on, lit by a constant white dome.
+# A host that applies only the sRGB transfer to the delegate's colour AOV
+# (stock HdxColorCorrectionTask in sRGB mode, no Prism settings) must show
+# the image the CLI renders with --working-space lin_rec709.
+def Xform "World"
+{
+    def Mesh "DarkSkin" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 1, 2, 3]
+        point3f[] points = [(-5.8, 2.2, 0), (-4.2, 2.2, 0), (-4.2, 3.8, 0), (-5.8, 3.8, 0)]
+        rel material:binding = </World/Looks/DarkSkin>
+    }
+
+    def Mesh "LightSkin" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 1, 2, 3]
+        point3f[] points = [(-3.8, 2.2, 0), (-2.2, 2.2, 0), (-2.2, 3.8, 0), (-3.8, 3.8, 0)]
+        rel material:binding = </World/Looks/LightSkin>
+    }
+
+    def Mesh "BlueSky" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 1, 2, 3]
+        point3f[] points = [(-1.8, 2.2, 0), (-0.2, 2.2, 0), (-0.2, 3.8, 0), (-1.8, 3.8, 0)]
+        rel material:binding = </World/Looks/BlueSky>
+    }
+
+    def Mesh "Foliage" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 1, 2, 3]
+        point3f[] points = [(0.2, 2.2, 0), (1.8, 2.2, 0), (1.8, 3.8, 0), (0.2, 3.8, 0)]
+        rel material:binding = </World/Looks/Foliage>
+    }
+
+    def Mesh "BlueFlower" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 1, 2, 3]
+        point3f[] points = [(2.2, 2.2, 0), (3.8, 2.2, 0), (3.8, 3.8, 0), (2.2, 3.8, 0)]
+        rel material:binding = </World/Looks/BlueFlower>
+    }
+
+    def Mesh "BluishGreen" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 1, 2, 3]
+        point3f[] points = [(4.2, 2.2, 0), (5.8, 2.2, 0), (5.8, 3.8, 0), (4.2, 3.8, 0)]
+        rel material:binding = </World/Looks/BluishGreen>
+    }
+
+    def Mesh "Orange" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 1, 2, 3]
+        point3f[] points = [(-5.8, 0.2, 0), (-4.2, 0.2, 0), (-4.2, 1.8, 0), (-5.8, 1.8, 0)]
+        rel material:binding = </World/Looks/Orange>
+    }
+
+    def Mesh "PurplishBlue" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 1, 2, 3]
+        point3f[] points = [(-3.8, 0.2, 0), (-2.2, 0.2, 0), (-2.2, 1.8, 0), (-3.8, 1.8, 0)]
+        rel material:binding = </World/Looks/PurplishBlue>
+    }
+
+    def Mesh "ModerateRed" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 1, 2, 3]
+        point3f[] points = [(-1.8, 0.2, 0), (-0.2, 0.2, 0), (-0.2, 1.8, 0), (-1.8, 1.8, 0)]
+        rel material:binding = </World/Looks/ModerateRed>
+    }
+
+    def Mesh "Purple" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 1, 2, 3]
+        point3f[] points = [(0.2, 0.2, 0), (1.8, 0.2, 0), (1.8, 1.8, 0), (0.2, 1.8, 0)]
+        rel material:binding = </World/Looks/Purple>
+    }
+
+    def Mesh "YellowGreen" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 1, 2, 3]
+        point3f[] points = [(2.2, 0.2, 0), (3.8, 0.2, 0), (3.8, 1.8, 0), (2.2, 1.8, 0)]
+        rel material:binding = </World/Looks/YellowGreen>
+    }
+
+    def Mesh "OrangeYellow" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 1, 2, 3]
+        point3f[] points = [(4.2, 0.2, 0), (5.8, 0.2, 0), (5.8, 1.8, 0), (4.2, 1.8, 0)]
+        rel material:binding = </World/Looks/OrangeYellow>
+    }
+
+    def Mesh "Blue" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 1, 2, 3]
+        point3f[] points = [(-5.8, -1.8, 0), (-4.2, -1.8, 0), (-4.2, -0.2, 0), (-5.8, -0.2, 0)]
+        rel material:binding = </World/Looks/Blue>
+    }
+
+    def Mesh "Green" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 1, 2, 3]
+        point3f[] points = [(-3.8, -1.8, 0), (-2.2, -1.8, 0), (-2.2, -0.2, 0), (-3.8, -0.2, 0)]
+        rel material:binding = </World/Looks/Green>
+    }
+
+    def Mesh "Red" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 1, 2, 3]
+        point3f[] points = [(-1.8, -1.8, 0), (-0.2, -1.8, 0), (-0.2, -0.2, 0), (-1.8, -0.2, 0)]
+        rel material:binding = </World/Looks/Red>
+    }
+
+    def Mesh "Yellow" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 1, 2, 3]
+        point3f[] points = [(0.2, -1.8, 0), (1.8, -1.8, 0), (1.8, -0.2, 0), (0.2, -0.2, 0)]
+        rel material:binding = </World/Looks/Yellow>
+    }
+
+    def Mesh "Magenta" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 1, 2, 3]
+        point3f[] points = [(2.2, -1.8, 0), (3.8, -1.8, 0), (3.8, -0.2, 0), (2.2, -0.2, 0)]
+        rel material:binding = </World/Looks/Magenta>
+    }
+
+    def Mesh "Cyan" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 1, 2, 3]
+        point3f[] points = [(4.2, -1.8, 0), (5.8, -1.8, 0), (5.8, -0.2, 0), (4.2, -0.2, 0)]
+        rel material:binding = </World/Looks/Cyan>
+    }
+
+    def Mesh "White" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 1, 2, 3]
+        point3f[] points = [(-5.8, -3.8, 0), (-4.2, -3.8, 0), (-4.2, -2.2, 0), (-5.8, -2.2, 0)]
+        rel material:binding = </World/Looks/White>
+    }
+
+    def Mesh "Neutral8" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 1, 2, 3]
+        point3f[] points = [(-3.8, -3.8, 0), (-2.2, -3.8, 0), (-2.2, -2.2, 0), (-3.8, -2.2, 0)]
+        rel material:binding = </World/Looks/Neutral8>
+    }
+
+    def Mesh "Neutral65" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 1, 2, 3]
+        point3f[] points = [(-1.8, -3.8, 0), (-0.2, -3.8, 0), (-0.2, -2.2, 0), (-1.8, -2.2, 0)]
+        rel material:binding = </World/Looks/Neutral65>
+    }
+
+    def Mesh "Neutral5" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 1, 2, 3]
+        point3f[] points = [(0.2, -3.8, 0), (1.8, -3.8, 0), (1.8, -2.2, 0), (0.2, -2.2, 0)]
+        rel material:binding = </World/Looks/Neutral5>
+    }
+
+    def Mesh "Neutral35" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 1, 2, 3]
+        point3f[] points = [(2.2, -3.8, 0), (3.8, -3.8, 0), (3.8, -2.2, 0), (2.2, -2.2, 0)]
+        rel material:binding = </World/Looks/Neutral35>
+    }
+
+    def Mesh "Black" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 1, 2, 3]
+        point3f[] points = [(4.2, -3.8, 0), (5.8, -3.8, 0), (5.8, -2.2, 0), (4.2, -2.2, 0)]
+        rel material:binding = </World/Looks/Black>
+    }
+
+    def DomeLight "Dome"
+    {
+        color3f inputs:color = (1, 1, 1)
+        float inputs:intensity = 1
+    }
+
+    def Scope "Looks"
+    {
+        def Material "DarkSkin"
+        {
+            token outputs:mtlx:surface.connect = </World/Looks/DarkSkin/Surface.outputs:out>
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_standard_surface_surfaceshader"
+                float inputs:base = 1
+                float inputs:specular = 0
+                color3f inputs:base_color = (0.45098, 0.321569, 0.266667) (
+                    colorSpace = "srgb_texture"
+                )
+                token outputs:out
+            }
+        }
+
+        def Material "LightSkin"
+        {
+            token outputs:mtlx:surface.connect = </World/Looks/LightSkin/Surface.outputs:out>
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_standard_surface_surfaceshader"
+                float inputs:base = 1
+                float inputs:specular = 0
+                color3f inputs:base_color = (0.760784, 0.588235, 0.509804) (
+                    colorSpace = "srgb_texture"
+                )
+                token outputs:out
+            }
+        }
+
+        def Material "BlueSky"
+        {
+            token outputs:mtlx:surface.connect = </World/Looks/BlueSky/Surface.outputs:out>
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_standard_surface_surfaceshader"
+                float inputs:base = 1
+                float inputs:specular = 0
+                color3f inputs:base_color = (0.384314, 0.478431, 0.615686) (
+                    colorSpace = "srgb_texture"
+                )
+                token outputs:out
+            }
+        }
+
+        def Material "Foliage"
+        {
+            token outputs:mtlx:surface.connect = </World/Looks/Foliage/Surface.outputs:out>
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_standard_surface_surfaceshader"
+                float inputs:base = 1
+                float inputs:specular = 0
+                color3f inputs:base_color = (0.341176, 0.423529, 0.262745) (
+                    colorSpace = "srgb_texture"
+                )
+                token outputs:out
+            }
+        }
+
+        def Material "BlueFlower"
+        {
+            token outputs:mtlx:surface.connect = </World/Looks/BlueFlower/Surface.outputs:out>
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_standard_surface_surfaceshader"
+                float inputs:base = 1
+                float inputs:specular = 0
+                color3f inputs:base_color = (0.521569, 0.501961, 0.694118) (
+                    colorSpace = "srgb_texture"
+                )
+                token outputs:out
+            }
+        }
+
+        def Material "BluishGreen"
+        {
+            token outputs:mtlx:surface.connect = </World/Looks/BluishGreen/Surface.outputs:out>
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_standard_surface_surfaceshader"
+                float inputs:base = 1
+                float inputs:specular = 0
+                color3f inputs:base_color = (0.403922, 0.741176, 0.666667) (
+                    colorSpace = "srgb_texture"
+                )
+                token outputs:out
+            }
+        }
+
+        def Material "Orange"
+        {
+            token outputs:mtlx:surface.connect = </World/Looks/Orange/Surface.outputs:out>
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_standard_surface_surfaceshader"
+                float inputs:base = 1
+                float inputs:specular = 0
+                color3f inputs:base_color = (0.839216, 0.494118, 0.172549) (
+                    colorSpace = "srgb_texture"
+                )
+                token outputs:out
+            }
+        }
+
+        def Material "PurplishBlue"
+        {
+            token outputs:mtlx:surface.connect = </World/Looks/PurplishBlue/Surface.outputs:out>
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_standard_surface_surfaceshader"
+                float inputs:base = 1
+                float inputs:specular = 0
+                color3f inputs:base_color = (0.313725, 0.356863, 0.65098) (
+                    colorSpace = "srgb_texture"
+                )
+                token outputs:out
+            }
+        }
+
+        def Material "ModerateRed"
+        {
+            token outputs:mtlx:surface.connect = </World/Looks/ModerateRed/Surface.outputs:out>
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_standard_surface_surfaceshader"
+                float inputs:base = 1
+                float inputs:specular = 0
+                color3f inputs:base_color = (0.756863, 0.352941, 0.388235) (
+                    colorSpace = "srgb_texture"
+                )
+                token outputs:out
+            }
+        }
+
+        def Material "Purple"
+        {
+            token outputs:mtlx:surface.connect = </World/Looks/Purple/Surface.outputs:out>
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_standard_surface_surfaceshader"
+                float inputs:base = 1
+                float inputs:specular = 0
+                color3f inputs:base_color = (0.368627, 0.235294, 0.423529) (
+                    colorSpace = "srgb_texture"
+                )
+                token outputs:out
+            }
+        }
+
+        def Material "YellowGreen"
+        {
+            token outputs:mtlx:surface.connect = </World/Looks/YellowGreen/Surface.outputs:out>
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_standard_surface_surfaceshader"
+                float inputs:base = 1
+                float inputs:specular = 0
+                color3f inputs:base_color = (0.615686, 0.737255, 0.25098) (
+                    colorSpace = "srgb_texture"
+                )
+                token outputs:out
+            }
+        }
+
+        def Material "OrangeYellow"
+        {
+            token outputs:mtlx:surface.connect = </World/Looks/OrangeYellow/Surface.outputs:out>
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_standard_surface_surfaceshader"
+                float inputs:base = 1
+                float inputs:specular = 0
+                color3f inputs:base_color = (0.878431, 0.639216, 0.180392) (
+                    colorSpace = "srgb_texture"
+                )
+                token outputs:out
+            }
+        }
+
+        def Material "Blue"
+        {
+            token outputs:mtlx:surface.connect = </World/Looks/Blue/Surface.outputs:out>
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_standard_surface_surfaceshader"
+                float inputs:base = 1
+                float inputs:specular = 0
+                color3f inputs:base_color = (0.219608, 0.239216, 0.588235) (
+                    colorSpace = "srgb_texture"
+                )
+                token outputs:out
+            }
+        }
+
+        def Material "Green"
+        {
+            token outputs:mtlx:surface.connect = </World/Looks/Green/Surface.outputs:out>
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_standard_surface_surfaceshader"
+                float inputs:base = 1
+                float inputs:specular = 0
+                color3f inputs:base_color = (0.27451, 0.580392, 0.286275) (
+                    colorSpace = "srgb_texture"
+                )
+                token outputs:out
+            }
+        }
+
+        def Material "Red"
+        {
+            token outputs:mtlx:surface.connect = </World/Looks/Red/Surface.outputs:out>
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_standard_surface_surfaceshader"
+                float inputs:base = 1
+                float inputs:specular = 0
+                color3f inputs:base_color = (0.686275, 0.211765, 0.235294) (
+                    colorSpace = "srgb_texture"
+                )
+                token outputs:out
+            }
+        }
+
+        def Material "Yellow"
+        {
+            token outputs:mtlx:surface.connect = </World/Looks/Yellow/Surface.outputs:out>
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_standard_surface_surfaceshader"
+                float inputs:base = 1
+                float inputs:specular = 0
+                color3f inputs:base_color = (0.905882, 0.780392, 0.121569) (
+                    colorSpace = "srgb_texture"
+                )
+                token outputs:out
+            }
+        }
+
+        def Material "Magenta"
+        {
+            token outputs:mtlx:surface.connect = </World/Looks/Magenta/Surface.outputs:out>
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_standard_surface_surfaceshader"
+                float inputs:base = 1
+                float inputs:specular = 0
+                color3f inputs:base_color = (0.733333, 0.337255, 0.584314) (
+                    colorSpace = "srgb_texture"
+                )
+                token outputs:out
+            }
+        }
+
+        def Material "Cyan"
+        {
+            token outputs:mtlx:surface.connect = </World/Looks/Cyan/Surface.outputs:out>
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_standard_surface_surfaceshader"
+                float inputs:base = 1
+                float inputs:specular = 0
+                color3f inputs:base_color = (0.0313725, 0.521569, 0.631373) (
+                    colorSpace = "srgb_texture"
+                )
+                token outputs:out
+            }
+        }
+
+        def Material "White"
+        {
+            token outputs:mtlx:surface.connect = </World/Looks/White/Surface.outputs:out>
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_standard_surface_surfaceshader"
+                float inputs:base = 1
+                float inputs:specular = 0
+                color3f inputs:base_color = (0.952941, 0.952941, 0.94902) (
+                    colorSpace = "srgb_texture"
+                )
+                token outputs:out
+            }
+        }
+
+        def Material "Neutral8"
+        {
+            token outputs:mtlx:surface.connect = </World/Looks/Neutral8/Surface.outputs:out>
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_standard_surface_surfaceshader"
+                float inputs:base = 1
+                float inputs:specular = 0
+                color3f inputs:base_color = (0.784314, 0.784314, 0.784314) (
+                    colorSpace = "srgb_texture"
+                )
+                token outputs:out
+            }
+        }
+
+        def Material "Neutral65"
+        {
+            token outputs:mtlx:surface.connect = </World/Looks/Neutral65/Surface.outputs:out>
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_standard_surface_surfaceshader"
+                float inputs:base = 1
+                float inputs:specular = 0
+                color3f inputs:base_color = (0.627451, 0.627451, 0.627451) (
+                    colorSpace = "srgb_texture"
+                )
+                token outputs:out
+            }
+        }
+
+        def Material "Neutral5"
+        {
+            token outputs:mtlx:surface.connect = </World/Looks/Neutral5/Surface.outputs:out>
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_standard_surface_surfaceshader"
+                float inputs:base = 1
+                float inputs:specular = 0
+                color3f inputs:base_color = (0.478431, 0.478431, 0.47451) (
+                    colorSpace = "srgb_texture"
+                )
+                token outputs:out
+            }
+        }
+
+        def Material "Neutral35"
+        {
+            token outputs:mtlx:surface.connect = </World/Looks/Neutral35/Surface.outputs:out>
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_standard_surface_surfaceshader"
+                float inputs:base = 1
+                float inputs:specular = 0
+                color3f inputs:base_color = (0.333333, 0.333333, 0.333333) (
+                    colorSpace = "srgb_texture"
+                )
+                token outputs:out
+            }
+        }
+
+        def Material "Black"
+        {
+            token outputs:mtlx:surface.connect = </World/Looks/Black/Surface.outputs:out>
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "ND_standard_surface_surfaceshader"
+                float inputs:base = 1
+                float inputs:specular = 0
+                color3f inputs:base_color = (0.203922, 0.203922, 0.203922) (
+                    colorSpace = "srgb_texture"
+                )
+                token outputs:out
+            }
+        }
+    }
+
+    def Camera "Camera"
+    {
+        token projection = "orthographic"
+        float horizontalAperture = 120
+        float verticalAperture = 80
+        float2 clippingRange = (0.1, 100)
+        double3 xformOp:translate = (0, 0, 5)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+}

@@ -406,6 +406,14 @@ int main(int argc, char** argv) {
         std::string denoise = "none";
         // prism:colorManagement:* render settings, set only when given.
         std::vector<std::pair<std::string, std::string>> colorSettings;
+        // prism:colorManagement:outputSpace: the working space by default (the
+        // images are tagged in it, like the CLI's); --output-space default
+        // leaves the delegate's default (linear Rec.709).
+        std::optional<std::string> outputSpace = std::string("working");
+        // --host-srgb: behave like a stock Hydra host in sRGB mode
+        // (HdxColorCorrectionTask): no Prism colour settings, and the colour
+        // AOV written through the sRGB transfer curve only (8-bit for PNG).
+        bool hostSrgb = false;
         // Options given (product mode sets only these renderer settings).
         std::set<std::string> given;
         // The RenderSettings prim (empty: the stage's renderSettingsPrimPath).
@@ -420,11 +428,14 @@ int main(int argc, char** argv) {
             if (option == "--hide-dome-background") { hideDomeBackground = true; continue; }
             if (option == "--no-texture-streaming") { textureStreaming = false; continue; }
             if (option == "--progressive-textures") { textureStreamingPrepass = false; continue; }
+            if (option == "--host-srgb") { hostSrgb = true; continue; }
             if (++i >= argc) throw std::runtime_error("Missing option value: " + option);
             if (option == "--working-space") colorSettings.emplace_back("workingSpace", argv[i]);
             else if (option == "--ocio-config") colorSettings.emplace_back("ocioConfig", argv[i]);
             else if (option == "--display") colorSettings.emplace_back("display", argv[i]);
             else if (option == "--view") colorSettings.emplace_back("view", argv[i]);
+            else if (option == "--output-space")
+                outputSpace = std::string(argv[i]) == "default" ? std::nullopt : std::optional<std::string>(argv[i]);
             else if (option == "--spp" && productMode) spp = std::stoi(argv[i]);
             else if (option == "--render-settings" && !productMode) settingsPath = argv[i];
             else if (option == "--environment-sampling") sampling = argv[i];
@@ -484,6 +495,10 @@ int main(int argc, char** argv) {
             throw std::runtime_error("Invalid sampling mode or sample clamp");
         if (width <= 0 || height <= 0 || spp <= 0)
             throw std::runtime_error("Dimensions and spp must be positive");
+        if (hostSrgb && (productMode || !colorSettings.empty() || given.count("--output-space") ||
+                         denoise != "none" || exercise))
+            throw std::runtime_error("--host-srgb takes an explicit camera and no colour or denoise options");
+        if (hostSrgb) outputSpace.reset();
         if (productMode && denoise != "none")
             throw std::runtime_error("--denoise takes an explicit camera and output (render products "
                                      "denoise their 'denoised' vars)");
@@ -572,8 +587,10 @@ int main(int argc, char** argv) {
         std::optional<prism::load_profile::Scope> engineProfile(std::in_place, "cli.engine_create");
         UsdImagingGLEngine engine(parameters);
         // The images' colour management: the environment's (as this tool
-        // wrote them before the delegate had its own).
-        const auto outputColor = prism::color::ColorManagement::Create(prism::RendererOptions::FromEnvironment().color);
+        // wrote them before the delegate had its own). --host-srgb needs none
+        // (its colour-management fallback tests run with unusable configs).
+        const auto outputColor = hostSrgb ? nullptr
+            : prism::color::ColorManagement::Create(prism::RendererOptions::FromEnvironment().color);
         engineProfile.reset();
         if (engine.GetCurrentRendererId() != parameters.rendererPluginId)
             throw std::runtime_error("PrismRT plugin not loaded; check PXR_PLUGINPATH_NAME and DLL paths");
@@ -605,6 +622,8 @@ int main(int argc, char** argv) {
         engine.SetRendererSetting(TfToken("prism:textureStreamingPrepass"), VtValue(textureStreamingPrepass));
         for (auto const& [name, value] : colorSettings)
             engine.SetRendererSetting(TfToken("prism:colorManagement:" + name), VtValue(value));
+        if (outputSpace)
+            engine.SetRendererSetting(TfToken("prism:colorManagement:outputSpace"), VtValue(*outputSpace));
         engine.SetEnablePresentation(false);
         // Frames a view: a plain viewport for a full window at pixel aspect
         // ratio 1 (as before render settings), else the display and data
@@ -733,7 +752,25 @@ int main(int argc, char** argv) {
                   << center<GfVec3f>(engine, HdAovTokens->normal, HdFormatFloat32Vec3)
                   << "; camera depth: "
                   << center<float>(engine, HdAovTokens->cameraDepth, HdFormatFloat32) << '\n';
-        {
+        if (hostSrgb) {
+            // What HdxColorCorrectionTask's sRGB mode shows: the sRGB curve on
+            // the clamped colour, alpha kept.
+            std::vector<float> encoded = initial;
+            for (size_t i = 0; i < encoded.size(); ++i) {
+                if (i % 4 == 3) continue;
+                const float v = std::clamp(encoded[i], 0.0f, 1.0f);
+                encoded[i] = v <= 0.0031308f ? 12.92f * v : 1.055f * std::pow(v, 1.0f / 2.4f) - 0.055f;
+            }
+            OIIO::ImageBuf image(OIIO::ImageSpec(outputWidth, outputHeight, 4, OIIO::TypeDesc::FLOAT));
+            image.set_pixels(OIIO::ROI(0, outputWidth, 0, outputHeight, 0, 1, 0, 4), OIIO::TypeDesc::FLOAT,
+                             encoded.data());
+            image.set_write_format(OIIO::TypeDesc::UINT8);
+            if (!image.write(argv[3])) throw std::runtime_error("Cannot write " + std::string(argv[3]));
+            const auto stats = engine.GetRenderStats();
+            const auto space = stats.find("prismOutputColorSpace");
+            std::cout << "Host sRGB image saved (AOV in "
+                      << (space == stats.end() ? std::string("?") : TfStringify(space->second)) << ")\n";
+        } else {
             std::vector<std::string> outputWarnings;
             std::vector<prism::output::RenderedAov> outputs{{prism::output::AovKind::Color, 4, initial}};
             auto outputView = view;
