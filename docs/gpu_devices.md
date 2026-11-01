@@ -402,15 +402,49 @@ the class compiles) and each `MDLMaterial` that classifies as a varying emitter
 (`variesEmission()`, for emission that is uniform per program but not per
 binding) call `prism::varying_emitters::Note()` (`src/varying_emitter_signal.h`);
 the Vulkan device subscribes, and on the first note (or at creation, if a note
-came earlier) it prewarms the variant with the define as well. The plain raygen is
-still prewarmed at device creation, so a scene with emitters compiles both in
-the background; a scene without emitters compiles only the plain one. Both are
-the exact sources of the scene's raygen shader (no reordering, no light AOVs),
-so the shader cache keys are those of the later compile.
-`PRISM_VULKAN_PREWARM_EMITTERS=0` turns the early variant off.
-`PRISM_GPU_PROGRAM_REPORT=1` prints `raygen_prewarm plain|plain+emitters
-covers_scene <0|1>`; `prism_raygen_prewarm_test` checks that a textured
-emitter scene notes and a scene without one does not.
+came earlier) it prewarms the variant with the define instead. The plain raygen
+is prewarmed at device creation; the variant abandons it
+(`MaterialCallShaders::abandonPrewarms`, own cancel flags per prewarm): DXC is
+stopped and the driver compile skipped, and only a driver compile already
+running finishes. Once the scene's material set commits to the compute
+kernel (`compilePipeline`), both prewarms are abandoned the same way and none
+starts later on that device, since the compute kernel uses no raygen shader.
+A request of an abandoned shader (a later scene with callables) compiles it
+anew; nothing is remembered as failed. Both prewarms are the exact sources of
+the scene's raygen shader (no reordering, no light AOVs), so the shader cache
+keys are those of the later compile. `PRISM_VULKAN_PREWARM_EMITTERS=0` turns
+the early variant off. `PRISM_LOAD_PROFILE` marks `vulkan.raygen_prewarm
+plain|emitters abandoned`. `PRISM_GPU_PROGRAM_REPORT=1` prints
+`raygen_prewarm plain|emitters covers_scene <0|1>`; `prism_raygen_prewarm_test`
+checks that a textured emitter scene notes and a scene without one does not.
+
+Cold first GPU frame (`prism_hydra_render`, `PRISM_GPU_PREPARATION_PREVIEW=0`,
+own cache directory and `PRISM_VULKAN_SHADER_SALT` per run, 128x128, RTX 4070
+Ti, 2026-11-01): on `tests/hydra/fixtures/textured_emitter.usda` (compute
+kernel) both raygen prewarms used to compile next to the kernel (driver
+24-33 s each, kernel pipeline 4.7-9.4 s); now none does. First frame after
+start, before/after in alternating pairs: 10.0/8.0, 8.4/17.1 (a busy machine:
+the process took 7 s to start), 8.9/7.3 s; device preparation 8.8/6.9,
+7.4/9.8, 8.0/6.5 s; the teardown after the render, which waited for the
+prewarm's driver compile, 12.9/0.05, 11.9/0.04, 12.4/0.04 s. On
+`textured_emitters_glass.usda` (callables) only the variant compiles now:
+first frame 21.3/23.6 s, within noise (the variant's own 18-21 s driver
+compile is the longest step either way).
+
+### GPU timeout
+
+On the Vulkan device (`VulkanDevice::Impl::waitFence`) every wait for
+a submission (kernels, pass chunks, uploads, streaming, vk_oidn) is bounded
+by `PRISM_GPU_TIMEOUT_SECONDS` (default 60 s per submission; Windows' TDR
+resets a GPU after 2 s, so this covers drivers or systems without it). A
+timeout marks the device hung: nothing is submitted again, nothing the GPU
+may still use is freed, and the device is leaked at destruction instead of
+waited for. The CLI fails like any GPU render failure ("GPU render failed
+at sample N ... the GPU did not finish a submission within 60 s", exit 1,
+no image); the delegate renders on as after a failed GPU preparation (the
+CPU device, status `cpu (Vulkan fallback: the GPU did not finish ...)`).
+`PRISM_GPU_SIMULATE_TIMEOUT=1` (test hook) reports the first kernel wait
+as timed out after it finished (`prism_cli_gpu_timeout_vulkan`).
 
 ## Mac GPU vs CPU
 
@@ -612,6 +646,17 @@ storage on unified memory and are unaffected.
 Changes to code the Metal device shares, to verify on a Mac (build, then the
 listed runs on `--device metal` against `--device cpu`) before the change is
 called done there.
+
+- **GPU timeout and raygen prewarms** (`src/device/`, 2026-11-01; [GPU
+  timeout](#gpu-timeout), [Raygen prewarm](#raygen-prewarm)): the
+  bounded fence waits, the prewarm abandonment and the teardown profile spans
+  are Vulkan-only; the shared change is one more `FailureHint` case in
+  `gpu_device.cpp` (text only). Metal's command buffer waits
+  (`waitUntilCompleted`) stay unbounded: a hung Metal kernel still blocks the
+  CLI. On the Mac: the build passes and `PRISM_GPU_FAIL_DISPATCH_AT=0
+  PrismRT --device metal ...` still exits 1 with "GPU render failed at
+  sample 1"; if a timeout is wanted on Metal, wait with
+  `addCompletedHandler` and a bounded condition wait instead.
 
 - **Repairs for MaterialX 1.39.3/1.39.4 and the lost-diffuse check**
   (`src/materialx/`, `src/mdl_material.h`, 2026-11-01;

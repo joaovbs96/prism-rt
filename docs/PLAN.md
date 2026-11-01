@@ -102,4 +102,4 @@ Detailed plan, file references and decisions (accepted 2026-10-30): [motion_blur
 
 ### Later (from the original plan; see docs/feature_roadmap.md)
 - Curves; volumes (`docs/volumes.md`); tile texture streaming; the ALab GPU work (parked branch).
-- Smaller: the OpenPBR wide-shot CPU/Vulkan brightness gap (~3–4%); a timeout on the CLI's GPU fence wait; coated OpenPBR glass reflecting twice (R 0.078 instead of 0.04); the repeated "approximate repair" log line; Hydra's cold start ~6 s slower than before Phase 5 on scenes with textured emitters (skip the unused plain raygen prewarm, or make varying emitters a runtime switch); a glTF file-format plugin for usdview; MaterialX upstream reports (held back on purpose).
+- Smaller: the OpenPBR wide-shot CPU/Vulkan brightness gap (~3–4%); coated OpenPBR glass reflecting twice (R 0.078 instead of 0.04); the repeated "approximate repair" log line; a glTF file-format plugin for usdview; MaterialX upstream reports (held back on purpose).
