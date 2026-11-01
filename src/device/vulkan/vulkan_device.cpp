@@ -509,7 +509,7 @@ void ReportVulkanPrograms(SceneManager& scene, std::ostream& out,
     // of varying emission selects PRISM_VARYING_EMITTERS), and whether one
     // of them is the scene's raygen shader.
     const bool prewarmsEmitters = varyingEmitters && varyingEmitters->Notes() > 0;
-    out << std::format("raygen_prewarm {} covers_scene {}\n", prewarmsEmitters ? "plain+emitters" : "plain",
+    out << std::format("raygen_prewarm {} covers_scene {}\n", prewarmsEmitters ? "emitters" : "plain",
                        prewarmsEmitters || !code.varyingEmitters);
     const auto cache = gpu::ShaderCacheDirectory("report");
     auto compile = [&](std::string const& label, std::string const& source, gpu::HlslStage const& stage) {
@@ -2472,6 +2472,9 @@ bool VulkanDevice::Impl::compilePipeline(std::shared_ptr<const gpu::MdlShaderCod
                 return buildCallablePipeline(shared, "the kernel was too large for DXC in an earlier run", error);
         }
     }
+    // The compute kernel: the raygen prewarms are not needed and would only
+    // compete with its compile (and hold up the device's destruction).
+    if (callableShaders) callableShaders->abandonPrewarms();
     std::vector<uint32_t> spirv;
     progress::Detail(Phase::Kernel, "SPIR-V kernel");
     if (!CompileVulkanKernel(code.code, &spirv, error, code.programCount, code.lightAovs, &cancelled)) {

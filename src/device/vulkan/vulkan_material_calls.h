@@ -193,6 +193,9 @@ struct ShaderBuild {
     // largest the driver reported for this SPIR-V, also when it was compiled
     // for an earlier run (kept with its pipeline cache file).
     uint64_t stackSize = 0;
+    // Cancelled (the device goes, or an abandoned prewarm): no result, and
+    // not remembered; a request waiting for it compiles anew.
+    bool abandoned = false;
 };
 
 // The shaders of the callable path compiled on one device, by source, shared
@@ -216,8 +219,17 @@ public:
     }
     // Starts compiling the scene-independent raygen shader on a background
     // thread: with varyingEmitters the variant for scenes of textured
-    // emitters (PRISM_VARYING_EMITTERS). Once per variant.
+    // emitters (PRISM_VARYING_EMITTERS). Once per variant. The variant
+    // abandons the plain prewarm where it has not reached the driver yet
+    // (a scene of such emitters does not use the plain shader).
     void prewarmRaygen(bool varyingEmitters = false);
+    // The scene renders with the compute kernel: no raygen shader is needed,
+    // so both prewarms stop where they have not reached the driver, and none
+    // starts later on this device (a later scene with callables compiles its
+    // raygen shader when it needs it).
+    void abandonPrewarms();
+    // Prewarms abandoned (bit 0 plain, bit 1 with varying emitters; statistics).
+    uint32_t abandonedPrewarms() const { return m_prewarmAbandoned.load(); }
     // Raygen variants prewarmed so far: bit 0 plain, bit 1 with varying emitters.
     uint32_t prewarmedVariants() const { return m_prewarmed.load(); }
     // The shader of `source` (SPIR-V and, with libraries, its library); compiles it once.
@@ -236,7 +248,9 @@ public:
     bool cancelled() const { return m_cancel.load(); }
 
 private:
-    std::shared_ptr<ShaderBuild> compile(std::string const& source, bool raygen);
+    // `cancel`: m_cancel, or a prewarm's m_prewarmCancel.
+    std::shared_ptr<const ShaderBuild> request(std::string const& source, bool raygen, std::atomic<bool> const* cancel);
+    std::shared_ptr<ShaderBuild> compile(std::string const& source, bool raygen, std::atomic<bool> const* cancel);
     void prefetchWorker();
 
     VkDevice m_device = VK_NULL_HANDLE;
@@ -261,6 +275,12 @@ private:
     std::vector<std::thread> m_workers;
     bool m_stopping = false;
     std::atomic<bool> m_cancel{false};
+    // The prewarms' cancel flags (plain, varying emitters): set by cancel(),
+    // abandonPrewarms() and (the plain one) by the varying emitter prewarm.
+    // m_prewarmsClosed: abandonPrewarms ran, no prewarm starts.
+    std::atomic<bool> m_prewarmCancel[2] = {false, false};
+    std::atomic<bool> m_prewarmsClosed{false};
+    std::atomic<uint32_t> m_prewarmAbandoned{0};
     uint32_t m_busy = 0;
     std::atomic<uint32_t> m_prefetched{0}, m_prefetchedDone{0};
 };

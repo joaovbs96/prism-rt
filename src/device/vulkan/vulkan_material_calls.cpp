@@ -4,6 +4,7 @@
 #include "../gpu/gpu_materials.h"
 #include "../gpu/hlsl_compiler.h"
 #include "../gpu/shader_sources.h"
+#include "../../load_profile.h"
 #include "../../progress.h"
 
 #include <tbb/parallel_for.h>
@@ -943,6 +944,7 @@ MaterialCallShaders::~MaterialCallShaders()
 void MaterialCallShaders::cancel()
 {
     m_cancel.store(true);
+    for (auto& flag : m_prewarmCancel) flag.store(true);
     {
         std::lock_guard lock(m_queueMutex);
         m_stopping = true;
@@ -951,13 +953,25 @@ void MaterialCallShaders::cancel()
     m_queueReady.notify_all();
 }
 
+void MaterialCallShaders::abandonPrewarms()
+{
+    std::lock_guard prewarmLock(m_prewarmMutex);
+    m_prewarmsClosed.store(true);
+    for (auto& flag : m_prewarmCancel) flag.store(true);
+}
+
 void MaterialCallShaders::prewarmRaygen(bool varyingEmitters)
 {
     if (!m_libraries) return;
     std::lock_guard prewarmLock(m_prewarmMutex);
+    if (m_prewarmsClosed.load()) return;
     auto& prewarm = m_prewarm[varyingEmitters ? 1 : 0];
     if (prewarm.valid()) return;
     m_prewarmed |= varyingEmitters ? 2u : 1u;
+    // The scene's raygen shader has the define: the plain prewarm stops
+    // (DXC is stopped, the driver compile skipped; one already running in
+    // the driver finishes). A later request of the plain shader compiles it.
+    if (varyingEmitters) m_prewarmCancel[0].store(true);
     prewarm = std::async(std::launch::async, [this, varyingEmitters] {
         prism::progress::Bind progressBinding(m_progress);
         prism::logging::Bind logBinding(m_logger ? m_logger : &prism::logging::Default());
@@ -967,7 +981,13 @@ void MaterialCallShaders::prewarmRaygen(bool varyingEmitters)
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
 #endif
         std::string source, error;
-        if (RaygenSource(false, 0, varyingEmitters, &source, &error)) (void)shader(source, true);
+        if (!RaygenSource(false, 0, varyingEmitters, &source, &error)) return;
+        const int variant = varyingEmitters ? 1 : 0;
+        if (request(source, true, &m_prewarmCancel[variant])->abandoned && !m_cancel.load()) {
+            m_prewarmAbandoned |= 1u << variant;
+            if (prism::load_profile::Enabled())
+                prism::load_profile::Mark("vulkan.raygen_prewarm", varyingEmitters ? "emitters abandoned" : "plain abandoned");
+        }
     });
 }
 
@@ -1021,41 +1041,58 @@ void MaterialCallShaders::prefetchWorker()
 
 std::shared_ptr<const ShaderBuild> MaterialCallShaders::shader(std::string const& source, bool raygen)
 {
+    return request(source, raygen, &m_cancel);
+}
+
+std::shared_ptr<const ShaderBuild> MaterialCallShaders::request(std::string const& source, bool raygen,
+                                                                std::atomic<bool> const* cancel)
+{
     const std::string key = gpu::SourceDigest(source + gpu::HlslCompilerSignature(gpu::HlslTarget::Spirv,
                                                                                   kLibraryStage));
     const auto start = Clock::now();
     // Without libraries the SPIR-V cache is enough: nothing is kept.
-    if (!m_libraries) return compile(source, raygen);
-    std::promise<std::shared_ptr<const ShaderBuild>> promise;
-    std::shared_future<std::shared_ptr<const ShaderBuild>> earlier;
-    {
-        std::lock_guard lock(m_mutex);
-        if (auto found = m_shaders.find(key); found != m_shaders.end()) earlier = found->second;
-        else m_shaders.emplace(key, promise.get_future().share());
-    }
-    if (earlier.valid()) {
-        // Compiled (or compiling) for an earlier request: no work for this one.
-        auto const& built = earlier.get();
-        auto reused = std::make_shared<ShaderBuild>();
-        reused->library = built->library;
-        reused->stackSize = built->stackSize;
-        reused->error = built->error;
-        reused->readySeconds = SecondsSince(start);
-        reused->reused = true;
-        if (!built->error.empty()) {
-            // A failed compile is tried again by the next request.
+    if (!m_libraries) return compile(source, raygen, cancel);
+    for (;;) {
+        std::promise<std::shared_ptr<const ShaderBuild>> promise;
+        std::shared_future<std::shared_ptr<const ShaderBuild>> earlier;
+        {
+            std::lock_guard lock(m_mutex);
+            if (auto found = m_shaders.find(key); found != m_shaders.end()) earlier = found->second;
+            else m_shaders.emplace(key, promise.get_future().share());
+        }
+        if (earlier.valid()) {
+            // Compiled (or compiling) for an earlier request: no work for this one.
+            auto const& built = earlier.get();
+            // An abandoned prewarm (its entry is gone): this request compiles.
+            if (built->abandoned && !cancel->load()) continue;
+            auto reused = std::make_shared<ShaderBuild>();
+            reused->library = built->library;
+            reused->stackSize = built->stackSize;
+            reused->error = built->error;
+            reused->readySeconds = SecondsSince(start);
+            reused->reused = true;
+            reused->abandoned = built->abandoned;
+            if (!built->error.empty() && !built->abandoned) {
+                // A failed compile is tried again by the next request.
+                std::lock_guard lock(m_mutex);
+                m_shaders.erase(key);
+            }
+            return reused;
+        }
+        auto built = compile(source, raygen, cancel);
+        built->readySeconds = SecondsSince(start);
+        if (built->abandoned) {
+            // Not remembered: before the waiters see it, so they compile anew.
             std::lock_guard lock(m_mutex);
             m_shaders.erase(key);
         }
-        return reused;
+        promise.set_value(built);
+        return built;
     }
-    auto built = compile(source, raygen);
-    built->readySeconds = SecondsSince(start);
-    promise.set_value(built);
-    return built;
 }
 
-std::shared_ptr<ShaderBuild> MaterialCallShaders::compile(std::string const& source, bool raygen)
+std::shared_ptr<ShaderBuild> MaterialCallShaders::compile(std::string const& source, bool raygen,
+                                                          std::atomic<bool> const* cancel)
 {
     auto built = std::make_shared<ShaderBuild>();
     const auto directory = gpu::ShaderCacheDirectory("vulkan");
@@ -1063,8 +1100,9 @@ std::shared_ptr<ShaderBuild> MaterialCallShaders::compile(std::string const& sou
         (gpu::SourceDigest(source + gpu::HlslCompilerSignature(gpu::HlslTarget::Spirv, kLibraryStage)) + ".spv");
     std::vector<char> bytes = ReadCacheFile(cached);
     if (!PlausibleSpirv(bytes)) {
-        if (m_cancel.load()) {
+        if (cancel->load()) {
             built->error = "cancelled";
+            built->abandoned = true;
             return built;
         }
         gpu::HlslCompileStats stats;
@@ -1077,7 +1115,7 @@ std::shared_ptr<ShaderBuild> MaterialCallShaders::compile(std::string const& sou
                                                                            : CallablePart(source)));
             Dxc().acquire();
             ok = gpu::CompileHlsl(source, gpu::HlslTarget::Spirv, directory, &bytes, &reason, kLibraryStage, &stats,
-                                  &m_cancel);
+                                  cancel);
             Dxc().release();
         }
         built->dxcCompiled = true;
@@ -1089,6 +1127,7 @@ std::shared_ptr<ShaderBuild> MaterialCallShaders::compile(std::string const& sou
                                      bytes.size() >> 10, ProgramTag(source));
         if (!ok || !PlausibleSpirv(bytes)) {
             built->error = (raygen ? std::string("raygen shader: ") : std::string("material callable: ")) + reason;
+            built->abandoned = !ok && gpu::HlslCancelled(reason);
             return built;
         }
         WriteCacheFile(cached, bytes.data(), bytes.size());
@@ -1102,9 +1141,10 @@ std::shared_ptr<ShaderBuild> MaterialCallShaders::compile(std::string const& sou
         return built;
     }
     if (!m_libraries) return built;
-    // Nobody waits for the library of a cancelled device.
-    if (m_cancel.load()) {
+    // Nobody waits for the library of a cancelled device (or an abandoned prewarm).
+    if (cancel->load()) {
         built->error = "cancelled";
+        built->abandoned = true;
         return built;
     }
 
