@@ -88,7 +88,7 @@ running delegate.
 | `prism:refinementDelayMs` | 100 | Hydra only (interactive) | next preview | Quiet interval before refinement, clamped to 0-2000 ms |
 | `prism:gpuPreparationPreview` | true | Hydra only (interactive) | next preparation | While a GPU device (Vulkan, Metal) is still preparing the scene after one second, render progressively on the CPU and continue on the GPU from the same sample once it is ready; env `PRISM_GPU_PREPARATION_PREVIEW=0` sets the initial value, see [CPU preview while the GPU prepares](#cpu-preview-while-the-gpu-prepares) |
 | `prism:gpuPreparationPreviewMaxMiB` | 8192 | Hydra only (interactive) | next preparation | Skip that preview when the scene's Embree memory exceeds this many MiB (0 never skips); env `PRISM_GPU_PREPARATION_PREVIEW_MAX_MIB` |
-| `prism:backgroundPreparation` | true | Hydra only | at once | When the host has been quiet for 100 ms (no `Execute`, scene notice or setting change) while the scene still prepares, the delegate continues the capture and publishes the converted scene on its own worker and starts the render, so one `Execute` is enough; false: only `Execute` advances preparation. See [Third-party hosts](#third-party-hosts) |
+| `prism:backgroundPreparation` | publish | Hydra only | at once | What the delegate's preparation worker does while the host is quiet for 100 ms (no `Execute`, scene notice or setting change) and the scene still prepares. `publish`: only steps that read no host scene, once `Execute` has captured it (the conversion job, publishing the snapshot, starting the render). `full`: also the capture, which reads the host's scene index (hence its stage) outside the host's calls: only for hosts that never edit their stage while not calling the delegate. `off`: only `Execute` prepares. A bool: false `off`, true `full`. See [Third-party hosts](#third-party-hosts) |
 | `prism:resourceRevision` | 0 | Hydra only (interactive) | materials and domes reload | Increment to invalidate cached material and external texture fingerprints and reload dome resources without rebuilding geometry (a CLI run always reads its files afresh) |
 | `prism:selectionOutline` | true | Hydra only (interactive) | presentation only | Draw selection as an outline; false uses filled highlighting |
 | `prism:selectionOutlineRadius` | 2 | Hydra only (interactive) | presentation only | Outline thickness in pixels |
@@ -710,24 +710,30 @@ talks to the delegate only through `HdRenderDelegate` and
   `GL_ONE, GL_ONE_MINUS_SRC_ALPHA` ("pre-multiplied alpha scaling factors").
   (`alpha`)
 - **Convergence without `Execute`.** Hydra syncs the scene in `Execute`, and
-  hdPrism captures the scene and publishes the converted snapshot there
-  (`SceneBridge::Prepare`, in 3 ms slices once an image shows, 50 ms before,
-  so `Execute` never blocks). When the host has been quiet for 100 ms (no
-  `Execute`, scene notice or setting change) while the scene still prepares, the delegate's preparation worker continues the same
-  steps and starts the render thread itself: one `Execute` followed by
-  polling `IsConverged()` alone renders to convergence, with the same pixels
-  as an `Execute`-driven render (64x64 fixture: converged 0.27 s after the
-  single `Execute`). Hosts that call `Execute` every frame (usdview) never
-  wait that long, so the worker stays idle. Scene notices that arrive
-  meanwhile cancel and restart the preparation as under `Execute`. The
-  worker reads the host's scene index (with the resolver context of the last
-  `Execute`) while the host is not in `Execute`: a host that edits its stage
-  on another thread without calling `Execute` should set
-  `prism:backgroundPreparation` to false, and then calls `Execute` until the
-  first samples show (about 40 calls on the small fixture).
-  `backgroundPreparationSteps` and `backgroundRenderStarts` in the render
-  statistics count the worker's work. (`converge-without-execute`)
-- **Repeated `Execute`** with nothing changed costs about 0.03 ms per call
+  hdPrism captures the scene there (`SceneBridge::Prepare`): the delegate's
+  first `Execute` captures for up to 250 ms, later ones for 50 ms until an
+  image shows and 3 ms after, so `Execute` stays bounded. By default
+  (`prism:backgroundPreparation` `publish`) everything after the capture
+  continues without `Execute`: once the host has been quiet for 100 ms (no
+  `Execute`, scene notice or setting change), the delegate's preparation
+  worker consumes the conversion job, publishes the snapshot and starts the
+  render thread. It never reads the host's scene index: the conversion reads
+  the captured copy. So a host that calls `Execute` once and then polls
+  `IsConverged()` converges when one `Execute` captured the whole scene (the
+  small fixture and the chess set, 150 prims: one `Execute`); a larger scene
+  needs an `Execute` per capture slice, and edits always need an `Execute`.
+  The statistic `preparationWaitsForExecute` says when only an `Execute` can
+  advance the preparation. Pixels are the same as an `Execute`-driven render.
+  With `full` the worker also captures (one `Execute` is enough for any
+  scene, and an edit notice is followed without `Execute`), reading the
+  scene index, and so the `UsdStage`, outside the host's calls: that is safe
+  only if the host never edits its stage concurrently, which hdPrism cannot
+  check, so `full` is opt-in. With `off`, `Execute` alone prepares (about 40
+  calls on the small fixture, 27 on the chess set with a 400 ms wait between
+  them). Hosts that call `Execute` every frame (usdview) never leave the
+  worker a quiet interval. `backgroundPreparationSteps` and
+  `backgroundRenderStarts` count the worker's work.
+  (`converge-without-execute`, `start-count`)- **Repeated `Execute`** with nothing changed costs about 0.03 ms per call
   while rendering and 0.005 ms once converged (CPU device, 128x128), and
   never restarts the accumulation. (`repeated-execute`)
 - **Stop, Restart, Pause.** `IsStopSupported` and `IsPauseSupported` are
@@ -744,7 +750,11 @@ talks to the delegate only through `HdRenderDelegate` and
   its next step (no half-written cache file: caches are written to a
   temporary file and renamed). What cannot be interrupted is bounded: a
   material compile already running (one MDL SDK call) gets 150 ms, then
-  finishes on its own thread and is discarded; a Vulkan driver compile
+  finishes on its own thread and is discarded (it owns everything it uses:
+  the captured scene copy, the prototype pool, the renderer context, a
+  reference on the Embree device and the memory counters its monitor
+  writes; it never touches the delegate, the bridge or the host's scene;
+  `detachedBuildJobsRunning` counts those still running); a Vulkan driver compile
   already running (one pipeline library) and the device's creation (0.2-0.5 s)
   are waited for. Measured on the chess set with cold caches: 0.23-0.26 s
   (was 1.5-2.5 s, and 15 s with cold GPU programs); 0.1 s on a small scene

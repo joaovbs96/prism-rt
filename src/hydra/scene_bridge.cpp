@@ -4360,21 +4360,33 @@ void _ResolvePrimaryAov(AovKind kind, RayHit const &hit, CameraState const &came
 
 } // namespace
 
+// Embree memory of a bridge's device, counted by its memory monitor.
+struct EmbreeMemory {
+    std::atomic<int64_t> live{0};
+    std::atomic<int64_t> peak{0};
+};
+
+// Conversion jobs a teardown left running (SceneBridge::Impl::~Impl).
+static std::atomic<int64_t> gDetachedBuilds{0};
+static std::atomic<int64_t> gDetachedBuildsRunning{0};
+
 class SceneBridge::Impl
 {
 public:
     static bool MemoryMonitor(void *user, ssize_t bytes, bool post)
     {
         (void)post;
-        auto *self = static_cast<Impl *>(user);
+        // The bridge's counters (EmbreeMemory), which a conversion job left
+        // running at teardown keeps alive.
+        auto *self = static_cast<EmbreeMemory *>(user);
         if (!self) return true;
         // Embree reports each allocation delta once, either before or after
         // the operation. `post` is relevant when an application rejects a
         // pre-allocation callback; Prism always permits allocations.
-        const int64_t live = self->embreeLiveBytes.fetch_add(
+        const int64_t live = self->live.fetch_add(
             static_cast<int64_t>(bytes), std::memory_order_relaxed) + bytes;
-        int64_t peak = self->embreePeakBytes.load(std::memory_order_relaxed);
-        while (live > peak && !self->embreePeakBytes.compare_exchange_weak(
+        int64_t peak = self->peak.load(std::memory_order_relaxed);
+        while (live > peak && !self->peak.compare_exchange_weak(
                    peak, live, std::memory_order_relaxed)) {}
         return true;
     }
@@ -4437,7 +4449,7 @@ public:
     {
         drive = sharedDrive ? std::move(sharedDrive) : std::make_shared<RenderDrive>();
         if (device)
-            rtcSetDeviceMemoryMonitorFunction(device, &Impl::MemoryMonitor, this);
+            rtcSetDeviceMemoryMonitorFunction(device, &Impl::MemoryMonitor, embreeMemory.get());
         // PRISM_DEVICE selects the initial device; a prism:device render setting
         // overrides it.
         if (const char *value = std::getenv("PRISM_DEVICE"); value && *value) {
@@ -4631,14 +4643,19 @@ public:
                 try { (void)buildFuture.get(); }
                 catch (...) {}
             } else {
-                if (device) {
-                    rtcSetDeviceMemoryMonitorFunction(device, nullptr, nullptr);
-                    rtcRetainDevice(device);
-                }
-                std::thread([job = std::move(buildFuture), retainedDevice = device]() mutable {
+                // The monitor's counters are the job's too (memory, below),
+                // so it stays installed: an allocation that already read it
+                // never reaches freed memory.
+                if (device) rtcRetainDevice(device);
+                ++gDetachedBuilds;
+                ++gDetachedBuildsRunning;
+                std::thread([job = std::move(buildFuture), retainedDevice = device,
+                             memory = embreeMemory]() mutable {
                     try { (void)job.get(); }
                     catch (...) {}
                     if (retainedDevice) rtcReleaseDevice(retainedDevice);
+                    memory.reset();
+                    --gDetachedBuildsRunning;
                 }).detach();
                 profile.detail("detached");
             }
@@ -4669,12 +4686,11 @@ public:
     // preparation with the GPU preparation preview, previews, passes,
     // adaptive sampling, the denoise interval), whose accumulation persists
     // across Render calls.
-    std::atomic<int64_t> embreeLiveBytes{0};
-    prism::Session session = SessionAccess::createHosted(renderer, &embreeLiveBytes);
+    std::shared_ptr<EmbreeMemory> embreeMemory = std::make_shared<EmbreeMemory>();
+    prism::Session session = SessionAccess::createHosted(renderer, &embreeMemory->live);
     HdSceneIndexBaseRefPtr sceneIndex;
     HdRenderThread *renderThread;
     RTCDevice device = nullptr;
-    std::atomic<int64_t> embreePeakBytes{0};
     mutable std::mutex mutex;
     bool sceneDirty = true;
     bool stateDirty = true;
@@ -7104,9 +7120,23 @@ VtDictionary SceneBridge::GetStats() const
     result["preparationPending"] = VtValue(
         _impl->sceneDirty || _impl->captureActive ||
         _impl->buildFuture.valid());
+    // Preparation is pending but only a host Execute can advance it (the
+    // capture, unless prism:backgroundPreparation is full).
+    {
+        using Mode = RenderSettings::BackgroundPreparation;
+        const bool pending = _impl->sceneDirty || _impl->captureActive || _impl->buildFuture.valid();
+        const Mode mode = _impl->settings.backgroundPreparation;
+        const bool workerCan = mode == Mode::Full ? pending :
+            mode == Mode::Publish && (_impl->buildFuture.valid() ||
+                (_impl->captureActive && _impl->captureQueue.empty()));
+        result["preparationWaitsForExecute"] = VtValue(pending && (!workerCan || _impl->hostStopped));
+    }
     // Preparation steps the background worker took, and render starts it made.
     result["backgroundPreparationSteps"] = VtValue(static_cast<int64_t>(_impl->backgroundSteps));
     result["backgroundRenderStarts"] = VtValue(static_cast<int64_t>(_impl->backgroundStarts));
+    // Process-wide: conversion jobs teardowns left to finish on their own.
+    result["detachedBuildJobs"] = VtValue(static_cast<int64_t>(gDetachedBuilds.load()));
+    result["detachedBuildJobsRunning"] = VtValue(static_cast<int64_t>(gDetachedBuildsRunning.load()));
     result["preparationGeneration"] = VtValue(static_cast<int64_t>(
         _impl->requestedGeneration));
     result["displayedGeneration"] = VtValue(static_cast<int64_t>(
@@ -7230,10 +7260,10 @@ VtDictionary SceneBridge::GetStats() const
     result["retainedSnapshotCount"] = VtValue(static_cast<int64_t>(
         (_impl->snapshot ? 1 : 0) + (_impl->inactiveSnapshot ? 1 : 0)));
     result["embreeLiveBytes"] = VtValue(static_cast<int64_t>(
-        std::max<int64_t>(0, _impl->embreeLiveBytes.load(
+        std::max<int64_t>(0, _impl->embreeMemory->live.load(
             std::memory_order_relaxed))));
     result["embreePeakBytes"] = VtValue(static_cast<int64_t>(
-        std::max<int64_t>(0, _impl->embreePeakBytes.load(
+        std::max<int64_t>(0, _impl->embreeMemory->peak.load(
             std::memory_order_relaxed))));
     result["placementInvalidations"] = VtValue(static_cast<int64_t>(_impl->placementInvalidations));
     result["lastPlacementDirtyPathCount"] = VtValue(static_cast<int64_t>(_impl->lastPlacementDirtyPathCount));
