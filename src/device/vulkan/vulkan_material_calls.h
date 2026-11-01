@@ -117,6 +117,10 @@ bool PipelineLibrariesSetting();
 std::string ShaderSaltDefine();
 // Whether to print the driver's per-shader statistics (PRISM_VULKAN_PIPELINE_STATS=1).
 bool PipelineStatisticsSetting();
+// How long one wait for a GPU submission may take before the device counts
+// as hung (PRISM_GPU_TIMEOUT_SECONDS, default 60 s), and the error for it.
+PRISM_INTERNAL_API uint64_t FenceTimeoutNanoseconds();
+PRISM_INTERNAL_API std::string FenceTimeoutError();
 
 // Shader cache files (SPIR-V, pipeline cache data). They are written whole
 // (a flushed temporary file renamed over the old one) with a trailer of their

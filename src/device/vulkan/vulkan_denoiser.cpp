@@ -138,6 +138,8 @@ struct VulkanDenoiser::Impl {
     VkPhysicalDeviceMemoryProperties memory{};
     std::mutex mutex; // one denoise at a time
     bool shutdown = false;
+    // A submission timed out (submit): nothing is destroyed or submitted again.
+    bool hung = false;
     std::unique_ptr<vkoidn::Context> context;
     VkCommandPool pool = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;
@@ -386,6 +388,16 @@ bool VulkanDenoiser::Impl::initialize(DenoiseDevice const& device, std::string* 
 void VulkanDenoiser::Impl::destroy()
 {
     if (!d.device) return;
+    if (hung) {
+        // Leaked with the device (VulkanDevice::Impl::hung).
+        (void)color.release();
+        (void)albedoFilter.release();
+        (void)normalFilter.release();
+        (void)context.release();
+        haveFilters = false;
+        d.device = VK_NULL_HANDLE;
+        return;
+    }
     color.reset();
     albedoFilter.reset();
     normalFilter.reset();
@@ -425,13 +437,22 @@ void VulkanDenoiser::Impl::submit(VkCommandBuffer commands)
     VkSubmitInfo info{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     info.commandBufferCount = 1;
     info.pCommandBuffers = &commands;
+    if (hung) {
+        vkFreeCommandBuffers(d.device, pool, 1, &commands);
+        throw std::runtime_error("vk_oidn denoiser: " + FenceTimeoutError());
+    }
     vkResetFences(d.device, 1, &fence);
     VkResult result;
     {
         std::lock_guard lock(*d.queueMutex);
         result = vkQueueSubmit(d.queue, 1, &info, fence);
     }
-    if (result == VK_SUCCESS) result = vkWaitForFences(d.device, 1, &fence, VK_TRUE, UINT64_MAX);
+    if (result == VK_SUCCESS) result = vkWaitForFences(d.device, 1, &fence, VK_TRUE, FenceTimeoutNanoseconds());
+    if (result == VK_TIMEOUT) {
+        // The GPU may still run it: its command buffer and every object stay.
+        hung = true;
+        throw std::runtime_error("vk_oidn denoiser: " + FenceTimeoutError());
+    }
     vkFreeCommandBuffers(d.device, pool, 1, &commands);
     CheckVk(result, "the denoise submission");
 }

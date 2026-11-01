@@ -115,6 +115,9 @@ std::string FailureHint(std::string const& error)
                "Display events in Event Viewer > Windows Logs > System). Another GPU-heavy program, an "
                "overclock or a driver problem can cause this; try again with the GPU otherwise idle, or "
                "render with --device cpu.";
+    if (error.find("did not finish a submission") != std::string::npos)
+        return " The GPU may be hung (a kernel that never ends, or a driver that does not reset the GPU). "
+               "Raise PRISM_GPU_TIMEOUT_SECONDS for very long passes, or render with --device cpu.";
     if (error.find("out of device memory") != std::string::npos)
         return " The GPU ran out of memory: close other GPU programs, lower the resolution or "
                "PRISM_GPU_TEXTURE_BUDGET_MIB, or render with --device cpu.";

@@ -685,6 +685,31 @@ bool MaterialCallSources(gpu::MdlShaderCode const& code, bool reorder, std::vect
     }
     return true;
 }
+// Windows resets a GPU that does not respond for 2 s (TDR, then the device
+// is lost); the timeout covers drivers or systems without that reset, where a
+// hung kernel would otherwise leave the process waiting forever.
+static double FenceTimeoutSeconds()
+{
+    static const double seconds = [] {
+        const char* value = Setting("PRISM_GPU_TIMEOUT_SECONDS");
+        const double parsed = value ? std::strtod(value, nullptr) : 0.0;
+        return parsed > 0.0 ? std::min(parsed, 1e6) : 60.0;
+    }();
+    return seconds;
+}
+
+uint64_t FenceTimeoutNanoseconds()
+{
+    return uint64_t(FenceTimeoutSeconds() * 1e9);
+}
+
+std::string FenceTimeoutError()
+{
+    return std::format("the GPU did not finish a submission within {:g} s (PRISM_GPU_TIMEOUT_SECONDS); "
+                       "the device is not used again",
+                       FenceTimeoutSeconds());
+}
+
 // PRISM_VULKAN_SHADER_SALT=<n> changes every module's code, so DXC and the
 // driver (which keeps its own cache) compile anew: cold measurements.
 std::string ShaderSaltDefine()

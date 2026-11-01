@@ -632,6 +632,16 @@ struct CallableSpeculation {
 struct VulkanDevice::Impl {
     // CancelPreparation: the device is about to go; preparation fails fast.
     std::atomic<bool> cancelled{false};
+    // A wait for a submission timed out (waitFence): the GPU may still run
+    // it, so nothing is submitted again and nothing it may use is freed (the
+    // destructor leaks the device instead of waiting for it).
+    std::atomic<bool> hung{false};
+    // Waits for `fence`, at most vulkan::FenceTimeoutNanoseconds() (once hung,
+    // it only polls). `kernel`: a render kernel's submission, the one
+    // PRISM_GPU_SIMULATE_TIMEOUT=1 (test hook) reports as timed out once.
+    VkResult waitFence(VkFence fence, bool kernel = false);
+    // The error of a failed submission or wait.
+    static std::string submissionError(VkResult result);
     VkInstance instance = VK_NULL_HANDLE;
     VkPhysicalDevice physical = VK_NULL_HANDLE;
     VkDevice device = VK_NULL_HANDLE;
@@ -880,7 +890,8 @@ struct VulkanDevice::Impl {
     bool flushUploads(std::string* error);
     void destroyStructure(AccelerationStructure& structure);
     VkCommandBuffer beginCommands();
-    bool submit(VkCommandBuffer commands, std::string* error);
+    // `kernel`: a render kernel run (waitFence).
+    bool submit(VkCommandBuffer commands, std::string* error, bool kernel = false);
     bool ensureScene(SceneManager& scene, std::string* error);
     // Generates the scene's MDL shader code and uploads its data; `compile`
     // tells whether its pipeline still has to be built (compilePipeline).
@@ -978,6 +989,13 @@ VulkanDevice::Impl::~Impl()
         if (instance) vkDestroyInstance(instance, nullptr);
         return;
     }
+    // Its steps, for PRISM_LOAD_PROFILE.
+    std::optional<prism::load_profile::Scope> step;
+    auto phase = [&](const char* name) {
+        step.reset();
+        if (prism::load_profile::Enabled()) step.emplace(name);
+    };
+    phase("vulkan.destroy.workers");
     if (programListener) gpu::RemoveProgramListener(programListener);
     if (emitterListener && varyingEmitters) varyingEmitters->Unsubscribe(emitterListener);
     {
@@ -999,11 +1017,26 @@ VulkanDevice::Impl::~Impl()
     streaming.changed.notify_all();
     if (streaming.worker.joinable()) streaming.worker.join();
 #if PRISM_HAS_VK_OIDN
+    phase("vulkan.destroy.denoiser");
     // A frontend may still hold the denoiser (the delegate's denoise jobs):
     // its Vulkan objects go now, later calls use the CPU device.
     if (denoiser) denoiser->Shutdown();
 #endif
+    if (hung.load()) {
+        // The GPU may still run a submission: waiting could take forever and
+        // what it uses must not be freed. The device and its objects are
+        // leaked (the driver frees them with the process).
+        if (callableShaders) {
+            callableShaders->cancel();
+            (void)callableShaders.release();
+        }
+        for (auto& [key, callablePipeline] : callablePipelines) (void)callablePipeline.release();
+        std::cerr << "PrismRT Vulkan: the device is left as it is after a GPU timeout\n";
+        return;
+    }
+    phase("vulkan.destroy.idle");
     vkDeviceWaitIdle(device);
+    phase("vulkan.destroy.images");
     for (auto& ready : streaming.ready) destroyImage(ready.image);
     streaming.ready.clear();
     for (auto& readback : streaming.readback) destroyBuffer(readback);
@@ -1013,9 +1046,11 @@ VulkanDevice::Impl::~Impl()
     earlyImages.clear();
     if (earlyFence) vkDestroyFence(device, earlyFence, nullptr);
     if (earlyPool) vkDestroyCommandPool(device, earlyPool, nullptr);
+    phase("vulkan.destroy.callables");
     callables = nullptr;
     callablePipelines.clear();
     callableShaders.reset();
+    phase("vulkan.destroy.resources");
     for (auto& [key, p] : pipelines) vkDestroyPipeline(device, p, nullptr);
     if (descriptorPool) vkDestroyDescriptorPool(device, descriptorPool, nullptr);
     if (pipelineLayout) vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
@@ -1036,7 +1071,9 @@ VulkanDevice::Impl::~Impl()
     if (timestamps) vkDestroyQueryPool(device, timestamps, nullptr);
     if (fence) vkDestroyFence(device, fence, nullptr);
     if (commandPool) vkDestroyCommandPool(device, commandPool, nullptr);
+    phase("vulkan.destroy.device");
     vkDestroyDevice(device, nullptr);
+    phase("vulkan.destroy.instance");
     vkDestroyInstance(instance, nullptr);
 }
 
@@ -1518,7 +1555,7 @@ bool VulkanDevice::Impl::earlyUpload(prism::TextureResource const& resource)
             const bool recorded = recordImage(commands, prepared, staging, &image);
             vkEndCommandBuffer(commands);
             VkResult result = VK_ERROR_UNKNOWN;
-            if (recorded) {
+            if (recorded && !hung.load()) {
                 VkSubmitInfo submitInfo{VK_STRUCTURE_TYPE_SUBMIT_INFO};
                 submitInfo.commandBufferCount = 1;
                 submitInfo.pCommandBuffers = &commands;
@@ -1527,16 +1564,18 @@ bool VulkanDevice::Impl::earlyUpload(prism::TextureResource const& resource)
                     std::lock_guard lock(queueMutex);
                     result = vkQueueSubmit(queue, 1, &submitInfo, earlyFence);
                 }
-                if (result == VK_SUCCESS) result = vkWaitForFences(device, 1, &earlyFence, VK_TRUE, UINT64_MAX);
+                if (result == VK_SUCCESS) result = waitFence(earlyFence);
             }
-            vkFreeCommandBuffers(device, earlyPool, 1, &commands);
+            // A copy the GPU may still run keeps its command buffer and staging.
+            if (result == VK_TIMEOUT) staging = {};
+            else vkFreeCommandBuffers(device, earlyPool, 1, &commands);
             ok = recorded && result == VK_SUCCESS;
         }
     }
     destroyBuffer(staging);
     std::lock_guard lock(earlyMutex);
     if (!ok) {
-        destroyImage(image);
+        if (!hung.load()) destroyImage(image);
         earlyBytes -= estimate;
         return false;
     }
@@ -1709,21 +1748,30 @@ bool VulkanDevice::Impl::createStreamedImages(std::vector<StreamJob> const& jobs
             }
         }
         vkEndCommandBuffer(commands);
+        if (ok && hung.load()) {
+            errors.push_back(vulkan::FenceTimeoutError());
+            ok = false;
+        }
+        VkResult result = VK_SUCCESS;
         if (ok) {
             VkSubmitInfo submitInfo{VK_STRUCTURE_TYPE_SUBMIT_INFO};
             submitInfo.commandBufferCount = 1;
             submitInfo.pCommandBuffers = &commands;
             vkResetFences(device, 1, &fence);
-            VkResult result;
             {
                 std::lock_guard lock(queueMutex);
                 result = vkQueueSubmit(queue, 1, &submitInfo, fence);
             }
-            if (result == VK_SUCCESS) result = vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX);
+            if (result == VK_SUCCESS) result = waitFence(fence);
             if (result != VK_SUCCESS) {
-                errors.push_back(std::string("Vulkan submission failed: ") + ResultText(result));
+                errors.push_back(submissionError(result));
                 ok = false;
             }
+        }
+        // What a copy the GPU may still run uses stays.
+        if (result == VK_TIMEOUT) {
+            if (error) *error = submissionError(result);
+            return false;
         }
         vkFreeCommandBuffers(device, pool, 1, &commands);
     }
@@ -2286,9 +2334,36 @@ VkCommandBuffer VulkanDevice::Impl::beginCommands()
     return commands;
 }
 
-bool VulkanDevice::Impl::submit(VkCommandBuffer commands, std::string* error)
+VkResult VulkanDevice::Impl::waitFence(VkFence fence, bool kernel)
+{
+    const bool wasHung = hung.load();
+    VkResult result = vkWaitForFences(device, 1, &fence, VK_TRUE, wasHung ? 0 : vulkan::FenceTimeoutNanoseconds());
+    // Test hook: the first kernel wait reports a timeout (after the real
+    // wait, so no work is left running when the process ends).
+    static std::atomic<bool> simulate = [] {
+        const char* value = std::getenv("PRISM_GPU_SIMULATE_TIMEOUT");
+        return value && std::string_view(value) == "1";
+    }();
+    if (kernel && result == VK_SUCCESS && simulate.exchange(false)) result = VK_TIMEOUT;
+    if (result == VK_TIMEOUT && !hung.exchange(true))
+        std::cerr << "PrismRT Vulkan: " << vulkan::FenceTimeoutError() << '\n';
+    return result;
+}
+
+std::string VulkanDevice::Impl::submissionError(VkResult result)
+{
+    if (result == VK_TIMEOUT) return vulkan::FenceTimeoutError();
+    return std::string("Vulkan submission failed: ") + ResultText(result);
+}
+
+bool VulkanDevice::Impl::submit(VkCommandBuffer commands, std::string* error, bool kernel)
 {
     vkEndCommandBuffer(commands);
+    if (hung.load()) {
+        vkFreeCommandBuffers(device, commandPool, 1, &commands);
+        if (error) *error = vulkan::FenceTimeoutError();
+        return false;
+    }
     VkSubmitInfo info{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     info.commandBufferCount = 1;
     info.pCommandBuffers = &commands;
@@ -2298,10 +2373,11 @@ bool VulkanDevice::Impl::submit(VkCommandBuffer commands, std::string* error)
         std::lock_guard lock(queueMutex);
         result = vkQueueSubmit(queue, 1, &info, fence);
     }
-    if (result == VK_SUCCESS) result = vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX);
-    vkFreeCommandBuffers(device, commandPool, 1, &commands);
+    if (result == VK_SUCCESS) result = waitFence(fence, kernel);
+    // A command buffer the GPU may still run stays allocated.
+    if (result != VK_TIMEOUT) vkFreeCommandBuffers(device, commandPool, 1, &commands);
     if (result != VK_SUCCESS) {
-        if (error) *error = std::string("Vulkan submission failed: ") + ResultText(result);
+        if (error) *error = submissionError(result);
         return false;
     }
     return true;
@@ -3387,6 +3463,11 @@ bool VulkanDevice::Impl::writeDescriptors(std::string* error)
 
 bool VulkanDevice::Impl::ensureScene(SceneManager& scene, std::string* error)
 {
+    // After a GPU timeout the scene renders on the CPU (RendersOnCpu).
+    if (hung.load()) {
+        if (error) *error = vulkan::FenceTimeoutError();
+        return false;
+    }
     if (boundScene == &scene && !dirty.load() && pipeline) return true;
     if (failedScene == &scene && !dirty.load()) {
         if (error) *error = failedError;
@@ -3581,7 +3662,11 @@ void* VulkanDevice::Impl::renderBuffer(int slot, size_t bytes)
     if (buffers[slot].size < bytes) {
         // Queued chunks may use the buffer (their results stay for waitChunk).
         (void)drainChunks(nullptr);
-        {
+        if (hung.load()) {
+            // Hung work may still use the old buffer: it stays (nothing runs
+            // on the device again, the new one only keeps callers going).
+            buffers[slot] = {};
+        } else {
             std::lock_guard lock(queueMutex);
             vkDeviceWaitIdle(device);
         }
@@ -3640,18 +3725,21 @@ void VulkanDevice::Impl::finishChunk(Chunk& chunk)
 {
     if (chunk.done) return;
     chunk.done = true;
-    const VkResult result = vkWaitForFences(device, 1, &chunk.fence, VK_TRUE, UINT64_MAX);
+    const VkResult result = waitFence(chunk.fence, true);
     if (result != VK_SUCCESS) {
         chunk.ok = false;
-        chunk.error = std::string("Vulkan submission failed: ") + ResultText(result);
+        chunk.error = submissionError(result);
     } else {
         uint64_t ticks[2] = {};
         if (vkGetQueryPoolResults(device, timestamps, chunk.query, 2, sizeof(ticks), ticks, sizeof(uint64_t),
                                   VK_QUERY_RESULT_64_BIT) == VK_SUCCESS)
             chunk.seconds = double(ticks[1] - ticks[0]) * timestampPeriod * 1e-9;
     }
-    vkFreeCommandBuffers(device, commandPool, 1, &chunk.commands);
-    spareFences.push_back(chunk.fence);
+    // The command buffer and fence of a submission the GPU may still run stay.
+    if (result != VK_TIMEOUT) {
+        vkFreeCommandBuffers(device, commandPool, 1, &chunk.commands);
+        spareFences.push_back(chunk.fence);
+    }
     chunk.commands = VK_NULL_HANDLE;
     chunk.fence = VK_NULL_HANDLE;
     if (chunk.readback >= 0) {
@@ -3694,6 +3782,10 @@ bool VulkanDevice::Impl::waitChunk(double* gpuSeconds, std::string* error)
 bool VulkanDevice::Impl::run(GpuFrame const& work, uint32_t threads, Chunk* chunk, size_t offset,
                              double* gpuSeconds, std::string* error)
 {
+    if (hung.load()) {
+        if (error) *error = vulkan::FenceTimeoutError();
+        return false;
+    }
     GpuFrame frame = work;
     // Texture streaming: finished images swap in now, and the dispatch
     // records texture feedback into a free readback (none free: it stays in
@@ -3848,7 +3940,7 @@ bool VulkanDevice::Impl::run(GpuFrame const& work, uint32_t threads, Chunk* chun
                 }
                 s.changed.notify_all();
             }
-            if (error) *error = std::string("Vulkan submission failed: ") + ResultText(result);
+            if (error) *error = submissionError(result);
             return false;
         }
         chunk->commands = commands;
@@ -3857,7 +3949,7 @@ bool VulkanDevice::Impl::run(GpuFrame const& work, uint32_t threads, Chunk* chun
         chunk->readback = readback;
         return true;
     }
-    const bool submitted = submit(commands, error);
+    const bool submitted = submit(commands, error, true);
     if (readback >= 0) {
         {
             std::lock_guard lock(s.mutex);

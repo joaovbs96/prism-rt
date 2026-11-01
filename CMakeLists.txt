@@ -1129,6 +1129,13 @@ if(PRISM_BUILD_HYDRA)
                 -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli_gpu_failure.cmake)
         set_tests_properties(prism_cli_gpu_failure_vulkan PROPERTIES
             ENVIRONMENT "${_prism_test_environment}")
+        add_test(NAME prism_cli_gpu_timeout_vulkan
+            COMMAND ${CMAKE_COMMAND} -DPRISMRT=$<TARGET_FILE:PrismRT>
+                -DSCENE=${CMAKE_CURRENT_SOURCE_DIR}/assets/scenes/CornellBox.usda
+                -DOUTPUT=${CMAKE_BINARY_DIR}/cli_gpu_timeout.png
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli_gpu_timeout.cmake)
+        set_tests_properties(prism_cli_gpu_timeout_vulkan PROPERTIES
+            ENVIRONMENT "${_prism_test_environment}")
     endif()
     # PRISM_RENDER_PROFILE prints the stages of a CPU render and leaves its
     # image unchanged (docs/performance.md, "Render profile").
@@ -2482,7 +2489,7 @@ include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/PrismPython.cmake")
 # beside GPU work and a parallel run never puts two GPU tests on the device.
 set(_prism_gpu_test_regex
     "^prism_hydra_(adaptive_publication_vulkan|host_stop_latency_vulkan|render_exercise|transparent_background_export|depth1_render|depth_change_render|setting_change_test|cutout_(medium|clear)_render|cutout_medium_test|animation_exercise|pass_camera_test|scene_bridge_test|streaming_(cold|warm|whole)|streaming_.*_matches_.*)$"
-    "|^prism_(gpu_shader_compile_test|device_selection_test|cli_clean_exit_vulkan|cli_gpu_failure_vulkan)$"
+    "|^prism_(gpu_shader_compile_test|device_selection_test|cli_clean_exit_vulkan|cli_gpu_failure_vulkan|cli_gpu_timeout_vulkan)$"
     "|^prism_(gltf|obj)_.*_vulkan_(render|parity|test)$"
     "|^prism_parity_.*_(vulkan|metal)_(cli|hydra|match)$"
     "|^prism_parity_.*_(vulkan|metal)_.*_(match|layer|exact)$"
