@@ -1177,6 +1177,40 @@ MaterialX::NodePtr AddedTransmission(const MaterialX::GraphElementPtr& graph, co
     return found;
 }
 
+// MaterialX 1.39.3's gltf_pbr graph writes its dielectric as a mix of two
+// layers over one base (the plain and the iridescent reflection, "the base
+// layer BSDF is duplicated" for the code generators of the time); 1.39.5's,
+// which the coupling matches, layers the mix of the two reflections over
+// the base. mix(layer(a, X), layer(b, X), m) becomes layer(mix(a, b, m), X)
+// (the mix node becomes the layer, so its consumers are unchanged) where both
+// layers feed only the mix. Graphs without the shape are unchanged.
+void FactorSharedLayerBases(const MaterialX::GraphElementPtr& graph)
+{
+    for (auto const& mix : graph->getNodes()) {
+        if (mix->getCategory() != "mix" || mix->getType() != "BSDF") continue;
+        auto fg = Producer(mix, "fg"), bg = Producer(mix, "bg");
+        if (!fg || !bg || fg == bg || fg->getCategory() != "layer" || bg->getCategory() != "layer") continue;
+        auto base = Producer(fg, "base");
+        if (!base || base != Producer(bg, "base") || SoleConsumer(fg).first != mix ||
+            SoleConsumer(bg).first != mix)
+            continue;
+        auto tops = graph->addNode("mix", graph->createValidChildName(mix->getName() + "_tops"), "BSDF");
+        tops->addInput("fg", "BSDF")->copyContentFrom(fg->getInput("top"));
+        tops->addInput("bg", "BSDF")->copyContentFrom(bg->getInput("top"));
+        if (auto weight = mix->getInput("mix")) tops->addInput("mix", "float")->copyContentFrom(weight);
+        for (const char* input : {"fg", "bg", "mix"}) mix->removeInput(input);
+        mix->setCategory("layer");
+        if (mix->hasNodeDefString()) mix->setNodeDefString("ND_layer_bsdf");
+        mix->addInput("top", "BSDF")->setNodeName(tops->getName());
+        mix->addInput("base", "BSDF")->setNodeName(base->getName());
+        graph->removeNode(fg->getName());
+        graph->removeNode(bg->getName());
+        if (VerboseMdl())
+            std::cout << "[MaterialX] " << mix->getNamePath() << ": mix of layers over one base factored\n";
+        return FactorSharedLayerBases(graph); // the node list changed
+    }
+}
+
 // Couple (and replace the smooth coat of) a surface's private graph by its
 // plan; false when the graph didn't have the expected shape. `instance` is
 // the surface node (the values of the graph's interface inputs).
@@ -1208,6 +1242,7 @@ void CoupleSurfaceTransmissionFresnel(const MaterialX::DocumentPtr& doc)
             ReportPartialRepair(name, plan);
             continue;
         }
+        FactorSharedLayerBases(clone.graph);
         const bool coupled = RepairExpandedDielectric(clone.graph, AddedTransmission(clone.graph, {}),
                                                       ExpandedSurfaces(clone.graph, OutputPorts(clone.graph)), node,
                                                       plan);
@@ -1259,6 +1294,7 @@ void LayerGltfPbrVolume(const MaterialX::DocumentPtr& doc)
             continue;
         }
         const MaterialX::NodeGraphPtr graph = clone.graph;
+        if (plan.couple) FactorSharedLayerBases(graph);
         MaterialX::NodePtr transmission, volume;
         for (auto const& added : graph->getNodes()) {
             if (added->getCategory() == "anisotropic_vdf") volume = added;
