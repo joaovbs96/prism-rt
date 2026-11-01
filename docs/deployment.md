@@ -347,7 +347,7 @@ CI.
 |---|---|---|---|
 | OpenImageIO | the vcpkg version | 2.5.x (source compatible, gated on `OIIO_VERSION`) | every translation unit of the core library compiled (`/Zs`) against the 2.5.18 headers, before and after the change; the unchanged sources fail to compile there. Not linked or run: building OIIO 2.5 itself needs Boost, which this stack does not have. <!-- deps: historical --> |
 | oneTBB | the `deps.json` version | classic TBB 2020.x (headers) | every translation unit compiled against the official 2020.3 Windows release headers with no source change. Not linked, and not built against USD. <!-- deps: historical --> |
-| OpenColorIO | the vcpkg version | 2.2.x | `src/color/color_management.cpp` compiled against the 2.2.1 headers. <!-- deps: historical --> |
+| OpenColorIO | the vcpkg version | 2.2.x | `src/color/color_management.cpp` compiled against the 2.2.1 headers, and run: `tests/ocio22` links `src/color/` alone against an OCIO 2.2.1 built from source (see below). <!-- deps: historical --> |
 | MaterialX | the `deps.json` version | 1.39.3, 1.39.4 (others run with a warning) | the `materialx_loader_*` tests and the albedo tests pass on 1.39.3 to 1.39.5; no full render on the older ones (below). <!-- deps: historical --> |
 | Open Image Denoise | the `deps.json` version | 2.3.x | `src/device/denoiser.cpp` compiled against the 2.3.3 headers. The Vulkan denoiser carries its own weights and is independent. <!-- deps: historical --> |
 
@@ -363,6 +363,45 @@ from 3.0.0.0-beta1 on, and there is no 2.6 or 2.7. `texture.h` defines
 exists in both generations, so it needs no gate. Versions older than 2.5 are
 not checked.
 
+### Older OpenColorIO (2.2)
+
+OCIO 2.2 has no `ocio://studio-config-latest`, so a host that loads
+2.2.1 (and sets no `$OCIO` that Prism may use: OpenImageIO's own conversions
+read it process-wide) used to get pass-through colour management. Now
+`ColorManagement` takes the newest built-in studio config
+(`studio-config-v1.0.0_aces-v1.3_ocio-v2.1` in 2.2.1), falls back to its
+default display and view where the ACES 2.0 view does not exist, and decodes
+sRGB textures even in pass-through ([color_management.md](color_management.md)).
+`tests/ocio22` checks this at run time against OCIO 2.2.1 built from
+source (the Prism library is not needed):
+
+```
+cmake -S <ocio-2.2.1-source> -B ocio-build -DBUILD_SHARED_LIBS=OFF -DOCIO_INSTALL_EXT_PACKAGES=ALL ^
+  -DOCIO_BUILD_APPS=OFF -DOCIO_BUILD_PYTHON=OFF -DOCIO_BUILD_TESTS=OFF -DOCIO_BUILD_GPU_TESTS=OFF ^
+  -DOCIO_BUILD_DOCS=OFF -DOCIO_BUILD_OPENFX=OFF -DCMAKE_INSTALL_PREFIX=<ocio-2.2.1> ^
+  "-DCMAKE_CXX_FLAGS=/DWIN32 /D_WINDOWS /EHsc /DYAML_CPP_STATIC_DEFINE"
+cmake --build ocio-build --config Release --target install -- /p:VcpkgEnabled=false
+cmake -S tests/ocio22 -B build/ocio22 -DOCIO_ROOT=<ocio-2.2.1> ^
+  -DOCIO_EXT_LIB_DIR=ocio-build/ext/dist/lib -DOCIO_ZLIB_IMPORT_SHIM=ON -DTBB_DIR=<oneTBB>/lib/cmake/tbb
+cmake --build build/ocio22 --config Release -- /p:VcpkgEnabled=false
+```
+
+The static build needs `YAML_CPP_STATIC_DEFINE` (2.2.1 compiles its YAML code
+for a yaml-cpp DLL otherwise) and its minizip-ng expects a zlib DLL, which
+`zlib_import_shim.c` answers from `zlibstatic.lib`; `VcpkgEnabled=false` keeps
+MSBuild's vcpkg integration from linking vcpkg's own `yaml-cpp.lib`. The run
+prints the registry, the chosen config, the working space, the default view
+and an sRGB texel decode.
+
+### Reported, not verified here
+
+A colleague's older Prism build (commit `73b601b`, plus equivalent
+OpenImageIO edits) linked against OIIO 2.5.18, classic TBB 2020.3 and a
+USD 26.08-dev fork and rendered on the CPU. That is a report; it was not
+reproduced here. The current code is still only compile-checked against those
+versions (the rows above, plus the OCIO 2.2.1 run and the TBB shim
+build) until someone runs it on that stack.
+
 ### Classic TBB
 
 Prism's TBB use (`parallel_for`, `parallel_reduce`, `blocked_range`,
@@ -371,8 +410,23 @@ Prism's TBB use (`parallel_for`, `parallel_reduce`, `blocked_range`,
 it `std::min`/`std::max` break across Prism, USD and OpenImageIO headers).
 
 To point the build at classic TBB, use the shim in `cmake/compat/classic-tbb`.
-It loads the `TBBConfig.cmake` that ships with the classic release and adds
-`NOMINMAX` to `TBB::tbb`:
+It has two modes, by what the TBB root holds, and adds `NOMINMAX` to
+`TBB::tbb` in both:
+
+- **`cmake/TBBConfig.cmake` exists** (the official release): the shim loads
+  it, reports its version and leaves the targets to it.
+- **It does not** (a repackaged TBB with only `include/`, `bin/` and `lib/`,
+  such as a host application's `tbb-2.2020.3`): the shim defines `TBB::tbb`
+  (and `TBB::tbbmalloc` when its library is there) itself, as imported
+  targets with `include/` as the include directory. It looks for `tbb.lib` and
+  `tbb_debug.lib` in `lib/`, `lib/intel64/vc14` and the like, and for the
+  DLLs in `bin/`, `bin/intel64/vc14` and the like; without a debug library
+  the Debug configuration links the release one. The version comes from
+  `include/tbb/tbb_stddef.h`.
+
+Checked with the 2020.3 release (its `cmake/` folder deleted from a copy, and
+again with `tbb*.lib` flat in `lib/`): configure, then compile, link and run a
+`parallel_for` program using `std::min` against `TBB::tbb`.
 
 ```
 cmake -B build -DPRISM_STRICT_DEPENDENCY_VERSIONS=OFF ^
@@ -380,7 +434,7 @@ cmake -B build -DPRISM_STRICT_DEPENDENCY_VERSIONS=OFF ^
 ```
 
 `<tbb-2020.3>/tbb` is the directory of the official `oneapi-src/oneTBB`
-v2020.3 Windows zip that holds `include/`, `bin/` and `cmake/`. A host that
+v2020.3 Windows zip that holds `include/`, `bin/`, `lib/` and `cmake/`. A host that
 already has its own TBB package config can use that instead; any config that
 defines `TBB::tbb` works. Set `PRISM_TBB_REDIST` to the classic `bin/intel64/vc14`
 directory so the runtime is found.
