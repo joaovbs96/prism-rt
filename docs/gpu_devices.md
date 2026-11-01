@@ -666,6 +666,7 @@ called done there.
   `coat_roughness` 0 and `coat_ior` equal to `specular_ior` on Metal against
   `--device cpu` (`prism_compare_images`, noise floor), and
   `prism_dielectric_albedo_test` passes.
+- **Log text of the partial-repair warning** (`src/materialx/loader.cpp`, 2026-11-01): the `layered transmission only partly repaired` warning names the material path before the node name. Only a message changes; generated MDL and Metal programs are unchanged. Nothing to run on the Mac.
 - **Repairs for MaterialX 1.39.3/1.39.4 and the lost-diffuse check**
   (`src/materialx/`, `src/mdl_material.h`, 2026-11-01;
   [materialx_compatibility.md](materialx_compatibility.md#older-materialx-1393-and-1394)):

@@ -32,6 +32,8 @@ struct VerboseScope {
 // What the DocumentLoader::load running on this thread repaired, for its
 // one-line summary (the details are verbose output).
 thread_local DocumentLoader::RepairCounts tRepairs;
+// The material the load running on this thread belongs to, for its warnings.
+thread_local std::string tMaterialLabel;
 
 void AttachLibrary(const MaterialX::DocumentPtr& doc,
                    const MaterialX::DocumentPtr& library)
@@ -1156,8 +1158,8 @@ void ReportPartialRepair(const std::string& name, const DielectricPlan& plan)
     if (plan.partial.empty()) return;
     std::string reasons;
     for (auto const& reason : plan.partial) reasons += (reasons.empty() ? "" : ", ") + reason;
-    std::cerr << "[MaterialX] WARNING: " << name << ": layered transmission only partly repaired (not: " << reasons
-              << "); its glass may lose energy\n";
+    std::cerr << "[MaterialX] WARNING: " << (tMaterialLabel.empty() ? "" : tMaterialLabel + ": ") << name
+              << ": layered transmission only partly repaired (not: " << reasons << "); its glass may lose energy\n";
 }
 
 // Remove the nodes an expansion added that nothing reads (gltf_pbr's
@@ -2030,6 +2032,7 @@ MaterialX::DocumentPtr DocumentLoader::load(const std::string& filepath)
     warnOnceIfUntestedMaterialX();
     VerboseScope verbose(m_verbose);
     tRepairs = {};
+    tMaterialLabel = m_label.empty() ? filepath : m_label;
     m_repairs = {};
     m_baseAlbedos.clear();
     MaterialX::DocumentPtr doc = MaterialX::createDocument();

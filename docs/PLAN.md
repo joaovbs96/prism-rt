@@ -102,4 +102,4 @@ Detailed plan, file references and decisions (accepted 2026-10-30): [motion_blur
 
 ### Later (from the original plan; see docs/feature_roadmap.md)
 - Curves; volumes (`docs/volumes.md`); tile texture streaming; the ALab GPU work (parked branch).
-- Smaller: the OpenPBR wide-shot CPU/Vulkan brightness gap (~3–4%); coated OpenPBR glass reflecting twice (R 0.078 instead of 0.04); the repeated "approximate repair" log line; a glTF file-format plugin for usdview; MaterialX upstream reports (held back on purpose).
+- Smaller: a glTF file-format plugin for usdview; MaterialX upstream reports (held back on purpose); a nested-dielectric stack for touching glass and objects (the MaterialEggs clamshell's dark patches, docs/DECISIONS.md 2026-11-01); absorbing transmission 1.2–1.4x brighter than Typhoon in `volume_transmission_single_cube`; destroying the Vulkan device in the background so teardown never waits for driver compiles.
