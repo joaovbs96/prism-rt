@@ -114,6 +114,12 @@ On Windows, keep the install or extract folder short (such as `C:\PrismRT`) or e
 * Hydra and usdview open USD files only; glTF and OBJ load through the command line, the SDK and Python.
 
 
+🤝 Contributing
+---------------------------------------
+
+Bug reports, test scenes and pull requests are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md) for how to report a problem and the rules a change needs to follow.
+
+
 ⚖️ Licensing
 ---------------------------------------
 
