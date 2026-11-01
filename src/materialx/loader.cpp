@@ -1770,6 +1770,56 @@ void RepairForOldMdlLibrary(const MaterialX::DocumentPtr& doc, bool distribute, 
     }
 }
 
+// The diffuse albedo a material's surface clearly has: a constant base
+// colour times its weight, on a surface without metal, transmission,
+// subsurface, coat or cutout (whose reflection is then at least that colour
+// less its specular reflection). Empty when the surface is anything else or
+// the albedo is under 0.05.
+std::optional<std::array<float, 3>> ClearBaseAlbedo(const MaterialX::NodePtr& material)
+{
+    auto input = material->getInput("surfaceshader");
+    auto surface = input ? input->getConnectedNode() : nullptr;
+    if (!surface) return std::nullopt;
+    auto value = [&](const char* name) { return ConstantOrDefault(surface, name); };
+    auto zero = [&](std::initializer_list<const char*> names) {
+        for (const char* name : names)
+            if (!IsZero(value(name))) return false;
+        return true;
+    };
+    std::string color, weight = "1";
+    const std::string& category = surface->getCategory();
+    if (category == "open_pbr_surface") {
+        if (!zero({"base_metalness", "transmission_weight", "subsurface_weight", "coat_weight", "fuzz_weight"}) ||
+            !IsOne(value("geometry_opacity")))
+            return std::nullopt;
+        color = value("base_color");
+        weight = value("base_weight");
+    } else if (category == "standard_surface") {
+        if (!zero({"metalness", "transmission", "subsurface", "coat", "sheen"}) || !IsWhite(value("opacity")))
+            return std::nullopt;
+        color = value("base_color");
+        weight = value("base");
+    } else if (category == "gltf_pbr") {
+        if (!zero({"metallic", "transmission", "clearcoat"}) || !IsBlack(value("sheen_color")) || !IsOne(value("alpha")))
+            return std::nullopt;
+        color = value("base_color");
+    } else if (category == "UsdPreviewSurface") {
+        if (!zero({"metallic", "useSpecularWorkflow", "clearcoat"}) || !IsOne(value("opacity"))) return std::nullopt;
+        color = value("diffuseColor");
+    } else {
+        return std::nullopt;
+    }
+    try {
+        const auto c = MaterialX::fromValueString<MaterialX::Color3>(color);
+        const float w = std::stof(weight);
+        std::array<float, 3> albedo{c[0] * w, c[1] * w, c[2] * w};
+        if (std::max({albedo[0], albedo[1], albedo[2]}) < 0.05f) return std::nullopt;
+        return albedo;
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
 void NormalizeColorSpaces(const MaterialX::DocumentPtr& doc)
 {
     const std::string& attribute = MaterialX::Element::COLOR_SPACE_ATTRIBUTE;
@@ -1928,6 +1978,7 @@ MaterialX::DocumentPtr DocumentLoader::load(const std::string& filepath)
     VerboseScope verbose(m_verbose);
     tRepairs = {};
     m_repairs = {};
+    m_baseAlbedos.clear();
     MaterialX::DocumentPtr doc = MaterialX::createDocument();
 
     try {
@@ -2055,6 +2106,9 @@ MaterialX::DocumentPtr DocumentLoader::load(const std::string& filepath)
         // Attach after preprocessing so shared standard-library graphs retain
         // their original behavior. Validate the final document used for generation.
         AttachLibrary(doc, m_stdlib);
+        // Before the repairs rename the surfaces' categories.
+        for (auto const& material : doc->getMaterialNodes())
+            if (auto albedo = ClearBaseAlbedo(material)) m_baseAlbedos.emplace_back(material->getName(), *albedo);
         // These need the library (declared defaults, graph implementations).
         ConvertUniformColors(doc, m_uniformColors);
         RouteUncoatedTransmissionIor(doc);
@@ -2087,6 +2141,13 @@ MaterialX::DocumentPtr DocumentLoader::load(const std::string& filepath)
         std::cerr << "[ERROR] Failed to load '" << filepath << "': " << e.what() << "\n";
         return nullptr;
     }
+}
+
+std::optional<std::array<float, 3>> DocumentLoader::baseAlbedo(const std::string& material) const
+{
+    for (auto const& [name, albedo] : m_baseAlbedos)
+        if (name == material) return albedo;
+    return std::nullopt;
 }
 
 MaterialX::DocumentPtr DocumentLoader::create_empty()

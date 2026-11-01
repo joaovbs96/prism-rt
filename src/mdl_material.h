@@ -15,6 +15,9 @@
 #include "renderer/logger.h"
 
 #include <mi/mdl_sdk.h>
+#include <MaterialXCore/Util.h>
+#include <array>
+#include <format>
 #include <memory>
 #include <optional>
 #include <string>
@@ -159,6 +162,7 @@ public:
         // (Material_0, Material_1, ...), making equivalent standalone and
         // Hydra graphs compile as distinct MDL classes. Resolve the selected
         // node first, then give only that terminal wrapper a stable name.
+        const std::optional<std::array<float, 3>> baseAlbedo = doc_loader.baseAlbedo(mat_name);
         MaterialX::NodePtr selectedMaterial;
         for (const auto& material : doc->getMaterialNodes()) {
             if (material->getName() == mat_name) {
@@ -226,6 +230,8 @@ public:
         evaluateUniformEmission();
         if (m_varyingEmission && settings.varyingEmitters) settings.varyingEmitters->Note();
         evaluateTransmission();
+        if (baseAlbedo && gen.texture_paths.empty())
+            checkBaseAlbedo(*baseAlbedo, log_label.empty() ? mtlx_path : log_label);
         // NOTE: prints the *resolved* name (material_name may be empty)
         if (PrismMdlVerbose())
             std::cout << "[MDLMaterial] OK: " << m_target.program->target_code->get_callable_function_count()
@@ -276,6 +282,51 @@ public:
         auto* ss=context.owner==this&&context.valid
             ? reinterpret_cast<ShadingStateData*>(context.storage):nullptr;
         return sampleWithState(hit,seed,ss,context.hasXi?context.xi:nullptr);
+    }
+
+    // The reflection at normal incidence of a compiled surface whose document
+    // clearly has a diffuse albedo (DocumentLoader::baseAlbedo), from 64
+    // samples: under a fifth of that albedo, the code generation lost the
+    // diffuse lobe (MaterialX 1.39.3's MDL generator once dropped
+    // open_pbr_surface's), and the material is reported instead of rendering
+    // dark with no failure. Untextured materials only, so no texture loads.
+    // Returns the measured albedo.
+    Color3 checkBaseAlbedo(const std::array<float, 3>& expected, const std::string& label)
+    {
+        RTCRayHit raw{};
+        raw.ray.org_z = 1.0f;
+        raw.ray.dir_z = -1.0f;
+        raw.ray.tfar = 1.0f;
+        raw.hit.Ng_z = 1.0f;
+        raw.hit.instID[0] = RTC_INVALID_GEOMETRY_ID;
+        RayHit hit(raw, nullptr, RTC_GEOMETRY_TYPE_USER);
+        hit.n_s = hit.n;
+        hit.tangent = Float3(1.0f, 0.0f, 0.0f);
+        hit.u = hit.v = 0.5f;
+        Material::PreparedShadingContext context;
+        if (!prepare(hit, context)) return Color3(0.0f);
+        context.hasXi = true;
+        constexpr int kSamples = 64;
+        Color3 sum(0.0f);
+        unsigned seed = 1;
+        for (int i = 0; i < kSamples; ++i) {
+            // A rank-1 lattice over the four sample dimensions.
+            constexpr int kGenerator[4] = {1, 19, 27, 41};
+            for (int k = 0; k < 4; ++k)
+                context.xi[k] = (float((i * kGenerator[k]) % kSamples) + 0.5f) / float(kSamples);
+            const BRDFSample b = samplePrepared(hit, seed, context);
+            if (b.scattered && !b.null_event && b.wi.z() > 0.0f) sum = sum + b.color;
+        }
+        const Color3 albedo = sum / float(kSamples);
+        const float measured = std::max({albedo.x(), albedo.y(), albedo.z()});
+        const float authored = std::max({expected[0], expected[1], expected[2]});
+        if (measured < 0.2f * authored)
+            std::cerr << std::format("[MDLMaterial] WARNING: {} reflects {:.3f} at normal incidence although its "
+                                     "base colour is ({:.3f}, {:.3f}, {:.3f}): its diffuse lobe was lost in code "
+                                     "generation (MaterialX {})\n",
+                                     label, measured, expected[0], expected[1], expected[2],
+                                     MaterialX::getVersionString());
+        return albedo;
     }
 
 private:

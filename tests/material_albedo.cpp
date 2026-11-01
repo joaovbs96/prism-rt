@@ -19,7 +19,9 @@
 
 #include <MaterialXCore/Util.h>
 
+#include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -143,6 +145,16 @@ int main(int argc, char** argv)
         if (file && std::strcmp(argv[1], "-g") == 0) return PrintGenerated(libraries, mdlPath, file);
         const auto [major, minor, patch] = MaterialX::getVersionIntegers();
         std::printf("MaterialX %d.%d.%d\n", major, minor, patch);
+        {
+            // The generator check, once per process (the library is loaded first: materials share it).
+            MDLGenerator generator(libraries);
+            const auto start = std::chrono::steady_clock::now();
+            const bool drops = MDLGenerator::dropsLayerBaseUnderMix(libraries);
+            const bool reflects = MDLGenerator::reflectsAtUnitIor(mdlPath);
+            std::printf("generator drops a layer's base under a mix: %s; library reflects at IOR 1: %s (%.1f ms)\n",
+                        drops ? "yes" : "no", reflects ? "yes" : "no",
+                        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+        }
         mdl::Context context;
         require(context.is_valid(), "MDL context initialization failed");
         const auto dir = std::filesystem::temp_directory_path() / "prism-material-albedo";
@@ -189,6 +201,16 @@ int main(int argc, char** argv)
             { std::ofstream out(path); out << Document(test.surface); }
             MDLMaterial material(path.string(), context, libraries, mdlPath, Settings());
             require(material.is_valid(), std::string("compile failed: ") + test.name);
+            // The renderer's own check of the compiled lobe (no warning here).
+            const std::array<float, 3> base{float(test.base[0]), float(test.base[1]), float(test.base[2])};
+            const auto probeStart = std::chrono::steady_clock::now();
+            const Color3 probe = material.checkBaseAlbedo(base, test.name);
+            const double probeUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - probeStart).count();
+            const bool probeOk = std::max({probe.x(), probe.y(), probe.z()}) >= 0.2f * std::max({base[0], base[1], base[2]});
+            if (verbose || !probeOk)
+                std::printf("%-22s probe: albedo %.4f %.4f %.4f (%.0f us)%s\n", test.name, probe.x(), probe.y(), probe.z(), probeUs,
+                            probeOk ? "" : "  FAIL");
+            failures += !probeOk;
             for (double degrees : angles) {
                 const auto a = Albedo(material, degrees, count);
                 bool ok = true;

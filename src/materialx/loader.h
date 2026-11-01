@@ -4,7 +4,10 @@
 #include <MaterialXCore/Document.h>
 #include <array>
 #include <functional>
+#include <optional>
 #include <string>
+#include <utility>
+#include <vector>
 
 class PRISM_INTERNAL_API DocumentLoader
 {
@@ -75,6 +78,12 @@ public:
     static bool warnOnceIfUntestedMaterialX();
 
     MaterialX::DocumentPtr load(const std::string& filepath);
+    // The diffuse albedo the last load()'s material `material` clearly has
+    // (a constant base colour times its weight on an opaque dielectric
+    // open_pbr_surface, standard_surface, gltf_pbr or UsdPreviewSurface, at
+    // least 0.05), as authored; empty otherwise. The renderer checks the
+    // compiled material against it (a lost diffuse lobe).
+    std::optional<std::array<float, 3>> baseAlbedo(const std::string& material) const;
     MaterialX::DocumentPtr create_empty();
     MaterialX::DocumentPtr get_stdlib() const { return m_stdlib; }
 
@@ -87,5 +96,6 @@ private:
     bool m_zeroUnitIorReflections = false;
     std::string m_label;
     RepairCounts m_repairs;
+    std::vector<std::pair<std::string, std::array<float, 3>>> m_baseAlbedos;
     UniformColorConversion m_uniformColors;
 };
