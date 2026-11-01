@@ -1953,7 +1953,8 @@ std::string DocumentLoader::materialXVersionWarning(int major, int minor, int pa
     std::string range = text(lo);
     if (hi != lo) range += " to " + text(hi);
     return std::format("[MaterialX] WARNING: MaterialX {} is outside the tested range ({}); the compatibility "
-                       "repairs target that version's graphs and may not apply or may apply wrongly\n",
+                       "repairs target the graphs and MDL generators of those versions and may not apply or may apply "
+                       "wrongly (docs/deployment.md)\n",
                        text(version), range);
 }
 

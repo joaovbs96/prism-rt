@@ -17,12 +17,14 @@ int main() {
 
     require(L::materialXVersionWarning(lo[0], lo[1], lo[2]).empty(), "range minimum is accepted");
     require(L::materialXVersionWarning(hi[0], hi[1], hi[2]).empty(), "range maximum is accepted");
-    require(!L::materialXVersionWarning(1, 39, 3).empty(), "1.39.3 is outside the range");
+    require(L::materialXVersionWarning(1, 39, 3).empty(), "1.39.3 is inside the range");
+    require(L::materialXVersionWarning(1, 39, 4).empty(), "1.39.4 is inside the range");
+    require(!L::materialXVersionWarning(1, 39, 2).empty(), "1.39.2 is outside the range");
     require(!L::materialXVersionWarning(1, 38, 9).empty(), "1.38.9 is outside the range");
     require(!L::materialXVersionWarning(1, 40, 0).empty(), "1.40.0 is outside the range");
     require(!L::materialXVersionWarning(2, 0, 0).empty(), "2.0.0 is outside the range");
-    const std::string text = L::materialXVersionWarning(1, 39, 3);
-    require(text.find("1.39.3") != std::string::npos, "the warning names the version");
+    const std::string text = L::materialXVersionWarning(1, 39, 2);
+    require(text.find("1.39.2") != std::string::npos, "the warning names the version");
     require(text.find("[MaterialX] WARNING") != std::string::npos, "the warning has the usual prefix");
 
     // Once per process: the linked library either warns the first time and

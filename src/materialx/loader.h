@@ -67,9 +67,12 @@ public:
     RepairCounts const& repairs() const { return m_repairs; }
 
     // The MaterialX versions the repairs were written and tested against
-    // (inclusive, major.minor.patch). Their graph patterns follow 1.39.5's
-    // library; other versions may not match, or may match wrongly.
-    static constexpr int kTestedMaterialXMin[3] = {1, 39, 5};
+    // (inclusive, major.minor.patch): the standalone loader tests and the
+    // renderer's albedo tests pass on 1.39.3, 1.39.4 and 1.39.5
+    // (docs/deployment.md). Their graph patterns follow 1.39.5's library,
+    // with the older graphs and MDL generator repaired to match; other
+    // versions may not match, or may match wrongly.
+    static constexpr int kTestedMaterialXMin[3] = {1, 39, 3};
     static constexpr int kTestedMaterialXMax[3] = {1, 39, 5};
     // Empty when the version is inside the tested range, else the warning text.
     static std::string materialXVersionWarning(int major, int minor, int patch);
