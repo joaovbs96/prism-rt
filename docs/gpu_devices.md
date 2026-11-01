@@ -613,6 +613,17 @@ Changes to code the Metal device shares, to verify on a Mac (build, then the
 listed runs on `--device metal` against `--device cpu`) before the change is
 called done there.
 
+- **Repairs for MaterialX 1.39.3/1.39.4 and the lost-diffuse check**
+  (`src/materialx/`, `src/mdl_material.h`, 2026-11-01;
+  [materialx_compatibility.md](materialx_compatibility.md#older-materialx-1393-and-1394)):
+  on 1.39.5 nothing changes in the generated MDL (the generator and module
+  checks find nothing to repair), so Metal programs are unchanged. The
+  albedo check samples the native CPU target once per compiled material and
+  never touches the GPU. On the Mac: `prism_material_albedo_test` passes, and
+  a Metal render of `assets/scenes/CornellBox.usda` prints no
+  `[MDLMaterial] WARNING`. If the Mac's MaterialX is older than 1.39.5, also
+  compare that render against `--device cpu` (the repaired graphs go through
+  the same HLSL path).
 - **Cancelled preparation and the delegate's preparation worker**
   (`src/hydra/`, `src/device/`, 2026-10-31; [hydra.md](hydra.md#third-party-hosts)):
   `RenderDevice::CancelPreparation` is a no-op on Metal (the default); the

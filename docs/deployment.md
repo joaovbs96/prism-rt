@@ -348,7 +348,7 @@ CI.
 | OpenImageIO | the vcpkg version | 2.5.x (source compatible, gated on `OIIO_VERSION`) | every translation unit of the core library compiled (`/Zs`) against the 2.5.18 headers, before and after the change; the unchanged sources fail to compile there. Not linked or run: building OIIO 2.5 itself needs Boost, which this stack does not have. <!-- deps: historical --> |
 | oneTBB | the `deps.json` version | classic TBB 2020.x (headers) | every translation unit compiled against the official 2020.3 Windows release headers with no source change. Not linked, and not built against USD. <!-- deps: historical --> |
 | OpenColorIO | the vcpkg version | 2.2.x | `src/color/color_management.cpp` compiled against the 2.2.1 headers. <!-- deps: historical --> |
-| MaterialX | the `deps.json` version | none: other versions run with a warning | the `materialx_loader_*` tests pass on the tested version only (below). <!-- deps: historical --> |
+| MaterialX | the `deps.json` version | 1.39.3, 1.39.4 (others run with a warning) | the `materialx_loader_*` tests and the albedo tests pass on 1.39.3 to 1.39.5; no full render on the older ones (below). <!-- deps: historical --> |
 | Open Image Denoise | the `deps.json` version | 2.3.x | `src/device/denoiser.cpp` compiled against the 2.3.3 headers. The Vulkan denoiser carries its own weights and is independent. <!-- deps: historical --> |
 
 ### Older OpenImageIO (2.5)
@@ -396,9 +396,45 @@ library writes them. The range it was tested against is
 `DocumentLoader::kTestedMaterialXMin`/`kTestedMaterialXMax`, one place in
 `loader.h`. Outside it, the first load in the process prints one
 `[MaterialX] WARNING` saying the repairs may not apply or may apply wrongly;
-nothing else changes. The range is the single version 1.39.5: the standalone
-`tests/` project (the `materialx_loader_*` tests) was also built against
-1.39.3 and 1.39.4. On 1.39.3 `materialx_loader_dielectric` fails (no Fresnel
-layer found on glTF clearcoat) and on 1.39.4 `materialx_loader_dielectric`
-and `materialx_loader_eon` fail, so neither is in the range. Renders on those
-versions were not compared.
+nothing else changes. The range is 1.39.3 to 1.39.5: a host whose USD links
+MaterialX 1.39.3 gets that version's MDL generator, and 1.39.3 lost the
+diffuse lobe of every `open_pbr_surface` (the Cornell box rendered almost
+black) until the loader repaired its graphs
+([materialx_compatibility.md](materialx_compatibility.md#older-materialx-1393-and-1394)).
+Verified on 1.39.3, 1.39.4 and 1.39.5 (2026-11-01):
+
+- the standalone `tests/` project (the 12 `materialx_loader_*` tests) against
+  each version's MaterialX install;
+- the renderer's albedo tests (`prism_material_albedo_test`,
+  `prism_dielectric_albedo_test`, `prism_eon_albedo_test`) in harness builds
+  of the core library against MaterialX with MaterialXGenMdl, run with that
+  version's `libraries/` (the `.mtlx` graphs and the MDL modules), and on
+  1.39.3 also with 1.39.5's libraries (1.39.3 code, the library a PrismRT
+  package ships). They compile documents through the full MaterialX -> MDL ->
+  native pipeline and sample them per channel; the Cornell walls match 1.39.5
+  to four digits.
+
+Not verified: a full render on 1.39.3 or 1.39.4. The CLI and the delegate
+link USD, which here is built against 1.39.5, so they cannot load another
+MaterialX in-process; only `prism` (no USD) and the albedo tests are built
+against the older versions. A harness build:
+
+```text
+cmake -S <MaterialX 1.39.3 source> -B <build> -DMATERIALX_BUILD_GEN_MDL=ON -DMATERIALX_BUILD_SHARED_LIBS=OFF ^
+  -DMATERIALX_BUILD_TESTS=OFF -DMATERIALX_BUILD_PYTHON=OFF -DMATERIALX_BUILD_RENDER=OFF -DCMAKE_INSTALL_PREFIX=<mx>
+cmake --build <build> --config Release --target install
+cmake -B build_mx1393 -DCMAKE_TOOLCHAIN_FILE=<vcpkg.cmake> -DVCPKG_INSTALLED_DIR=<prism>/build/vcpkg_installed ^
+  -DVCPKG_MANIFEST_INSTALL=OFF -DPRISM_BUILD_HYDRA=ON -DPRISM_ENABLE_VULKAN=OFF ^
+  -DPRISM_STRICT_DEPENDENCY_VERSIONS=OFF -DMaterialX_DIR=<mx>/lib/cmake/MaterialX ^
+  -DPRISM_MATERIALX_LIBRARY_PATH=<mx>/libraries -DPRISM_MATERIALX_MDL=<mx>/libraries/mdl
+cmake --build build_mx1393 --config RelWithDebInfo --target prism_material_albedo_test ^
+  prism_dielectric_albedo_test prism_eon_albedo_test
+```
+
+Run them after `prism_env.ps1` with `PRISM_MATERIALX_LIBRARY_PATH` and
+`PRISM_MATERIALX_MDL` pointing at `<mx>/libraries` and `<mx>/libraries/mdl`
+(the build only targets those; `prism_usd` would link the 1.39.5 USD).
+Known difference there: coated glass with `coat_ior` other than
+`specular_ior` refracts with the coat's IOR (the older MDL modules'). A
+material that still loses its diffuse lobe prints `[MDLMaterial] WARNING:
+<material> reflects ... although its base colour is ...`.

@@ -650,8 +650,82 @@ Other inputs (e.g. `emission_color`) and other shading models are untouched.
 correctly without a clamp. The `base` and `specular` float weights are not
 clamped; authoring them above one can still reach the same failure.
 
+## Older MaterialX: 1.39.3 and 1.39.4
+
+The repairs above match 1.39.5's library graphs. A host whose process links
+an older MaterialX (a USD built against 1.39.3) gets that version's MDL
+generator, and usually its library graphs and MDL modules. Three
+differences changed renders there; each is repaired only where the linked
+code or the library on disk has it, so 1.39.5 renders bit-identically:
+
+- **The layer over a mix of reflections drops the substrate.**
+  `open_pbr_surface` layers its dielectric reflection, a mix of the
+  thin-film and plain lobes, over the whole substrate (diffuse, subsurface,
+  transmission): `layer(mix(tf, R, thin_film_weight), substrate)`. Neither
+  generator's layer node handles a mix ("Layers over mixes" above), yet
+  1.39.5 emits this library graph distributed (`dielectric_base_tf`,
+  `_notf`, `_mix` in its MDL; where it does so was not traced), while
+  1.39.3 drops the substrate: every OpenPBR surface only reflected, and the
+  Cornell box rendered almost black, the same mean in every channel, with 0
+  failed materials. 1.39.4 ships a genmdl-only graph that distributes it by
+  hand (`NG_open_pbr_surface_surfaceshader_limited_layers`). The renderer
+  checks the linked generator once per process (`MDLGenerator::
+  dropsLayerBaseUnderMix`: it generates `layer(mix(R, R), diffuse)` and
+  looks for the diffuse call, about 5 ms); where it drops the base, the
+  loader distributes the layers whose top is a mix of two lobes in the genmdl
+  graph of every node the document uses, through a private copy
+  (`DocumentLoader::setDistributeLibraryLayers`). It runs after the other
+  graph repairs, which match the undistributed graph.
+- **A reflection of IOR 1 still reflects.** The MDL modules before 1.39.5
+  (`pbrlib_1_9.mdl` `mx_dielectric_bsdf`) give the reflection-only lobe a
+  Schlick curve with grazing reflectivity `1 - roughness` whatever its IOR;
+  1.39.5's reflects nothing at IOR 1. `specular_weight = 0` modulates
+  OpenPBR's IOR to 1, so the walls kept a grey grazing highlight (0.23 at 80
+  degrees) and lost 4% of their diffuse light. Where the module under
+  `PRISM_MATERIALX_MDL` still has the old line (`MDLGenerator::
+  reflectsAtUnitIor`, read once per path), reflection-only `dielectric_bsdf`
+  nodes get `weight = ifequal(ior, 1, 0, weight)`, which is what 1.39.5's
+  curve computes (`DocumentLoader::setZeroUnitIorReflections`).
+- **gltf_pbr's dielectric is a mix of two layers over one base** in 1.39.3
+  (`mix(layer(R, base), layer(R_tf, base), iridescence)`, "the base layer
+  BSDF is duplicated"), as is 1.39.4's genmdl OpenPBR graph; 1.39.5 writes
+  `layer(mix(R_tf, R), base)`. The transmission coupling did not match the
+  older shape, so glTF and OpenPBR glass kept their exit loss there. The
+  coupling's private copy factors `mix(layer(a, X), layer(b, X), m)` into
+  `layer(mix(a, b, m), X)` first (1.39.5's graphs have no such mix, checked
+  over its whole library).
+
+The rewrites are equivalent, so 1.39.3 and 1.39.4 match 1.39.5:
+`prism_material_albedo_test` and `prism_eon_albedo_test` print the same
+albedos to four digits on all three (Cornell red wall 0.6500, 0.0500, 0.0500
+at every angle), and `prism_dielectric_albedo_test` passes on all three, its
+glTF lines within 0.0005 of 1.39.5's.
+
+Not repaired: the older MDL modules give a coated surface the coat's IOR
+(`ior: color(mxp_ior)`; 1.39.5 keeps the base's, `preserve_volume_ior`), so
+coated glass with `coat_ior` other than `specular_ior` refracts and totally
+reflects with the coat's IOR there (the survey case `open_pbr_coat`: inside at
+40 degrees R 0.76, T 0 on 1.39.3 and 1.39.4; R 0.05, T 0.71 on 1.39.5). The
+material IOR is not a MaterialX value, so a graph repair cannot reach it.
+
+A lost diffuse lobe no longer passes silently: after compiling a material
+whose document clearly has a diffuse albedo (a constant base colour times its
+weight of at least 0.05 on an opaque dielectric `open_pbr_surface`,
+`standard_surface`, `gltf_pbr` or `UsdPreviewSurface`, no textures;
+`DocumentLoader::baseAlbedo`), the renderer samples its reflection at normal
+incidence (64 samples, 10-35 us) and warns when it is under a fifth of that
+albedo: `[MDLMaterial] WARNING: <material> reflects 0.000 at normal incidence
+although its base colour is (...)`.
+
 ## Regression checks
 
+`prism_material_albedo_test` (main build) samples the Cornell box's walls (as
+the converter writes them and with hdMtlx's `nodedef`), a default
+`open_pbr_surface`, `standard_surface` and `gltf_pbr`: the walls must reflect
+their base colour per channel at every angle, the others must keep their
+colour, and the renderer's own probe must not warn (`-f file.mtlx` prints a
+document's albedo, `-g file.mtlx` its generated MDL). With the 1.39.3 and
+1.39.4 harness builds (docs/deployment.md) it is the check for those versions.
 `materialx_loader_sss` covers the SSS fallback, `materialx_loader_clamp` the
 conductor clamp, `materialx_loader_types` the color space names, input type
 repairs and layer distribution, and `materialx_loader_transmission` the
