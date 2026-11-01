@@ -674,6 +674,8 @@ void CreateDestroy(std::string const &scene, int cycles)
             if (cycle % 2) { host.Set("prism:samplesPerPixel", VtValue(1 << 20)); host.Execute(); }
         }
         memory.push_back(PrivateBytes());
+        if (std::getenv("PRISM_HOST_MEMORY_TRACE"))
+            std::cout << "cycle " << cycle + 1 << " private KiB " << memory.back() / 1024 << "\n";
     }
     const int warm = std::min(5, cycles - 1);
     const double perCycle = cycles - 1 > warm
@@ -1053,7 +1055,8 @@ int main(int argc, char **argv)
         else if (mode == "repeated-execute") RepeatedExecute(argv[2]);
         else if (mode == "two-delegates") TwoDelegates(argv[2]);
         else if (mode == "create-destroy")
-            CreateDestroy(argv[2], argc > 3 ? std::atoi(argv[3]) : 24);
+            CreateDestroy(argv[2], argc > 3 ? std::atoi(argv[3])
+                          : std::getenv("PRISM_HOST_CYCLES") ? std::atoi(std::getenv("PRISM_HOST_CYCLES")) : 24);
         else if (mode == "working-spaces") WorkingSpaces(argv[2]);
         else if (mode == "textures") Textures(argv[2]);
         else if (mode == "stop-latency") {
