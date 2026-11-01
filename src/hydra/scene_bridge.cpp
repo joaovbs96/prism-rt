@@ -115,6 +115,11 @@ void _WarnUnsupportedAov(TfToken const &name)
 // Nothing is displayed before the first snapshot, so the host has no
 // responsiveness to protect and capture can finish in far fewer frames.
 constexpr double kInitialCaptureBudgetMilliseconds = 50.0;
+// The delegate's very first capture slice (its first Execute): one longer
+// slice captures most scenes at once, so the conversion starts after one
+// Execute and the worker can publish without reading the host's scene.
+// Bounded: a host blocks for it once, at load.
+constexpr double kFirstCaptureBudgetMilliseconds = 250.0;
 constexpr double kSteadyCaptureBudgetMilliseconds = 3.0;
 
 bool _CapturePrimData(TfToken const &primType)
@@ -5333,9 +5338,14 @@ void SceneBridge::_PreparationWorker()
     prism::progress::Bind progressBinding(&_impl->progress);
     std::unique_lock lock(_impl->mutex);
     while (!_impl->workerStop) {
-        const bool pending = _impl->settings.backgroundPreparation && _impl->hostPrepared &&
-            !_impl->hostStopped &&
-            (_impl->sceneDirty || _impl->captureActive || _impl->buildFuture.valid());
+        // Publish: only once Execute has captured the scene (a job to
+        // consume, or a finished capture to launch); Full: any preparation.
+        using Mode = RenderSettings::BackgroundPreparation;
+        const Mode mode = _impl->settings.backgroundPreparation;
+        const bool pending = mode != Mode::Off && _impl->hostPrepared && !_impl->hostStopped &&
+            (mode == Mode::Full
+                ? (_impl->sceneDirty || _impl->captureActive || _impl->buildFuture.valid())
+                : (_impl->buildFuture.valid() || (_impl->captureActive && _impl->captureQueue.empty())));
         if (!pending) {
             _impl->workerWake.wait(lock);
             continue;
@@ -5369,7 +5379,7 @@ bool SceneBridge::_BackgroundStep()
     {
         std::lock_guard lock(_impl->mutex);
         if (_impl->workerStop || _impl->hostStopped || _impl->drive->HostWaiting() ||
-            !_impl->settings.backgroundPreparation)
+            _impl->settings.backgroundPreparation == RenderSettings::BackgroundPreparation::Off)
             return false;
         context = _impl->hostResolverContext;
     }
@@ -5421,6 +5431,10 @@ bool SceneBridge::_Prepare(CameraState const *cameraInput,
     }
     bool hasPreparationWork = false;
     bool spareOnly = false;
+    // Whether this call may read the host's scene index (capture): the
+    // host's own calls, and the worker only with prism:backgroundPreparation
+    // full. Otherwise the worker advances only what reads captured data.
+    bool readScene = !background;
     // Buffers that have not shown a frame still hold their zero allocation,
     // which the host blends as transparent black over its background.
     bool clearNeeded = false;
@@ -5443,6 +5457,8 @@ bool SceneBridge::_Prepare(CameraState const *cameraInput,
                 _impl->bindingAllocationRevisions != allocationRevisions;
             renderTagsChanged = _impl->renderTags != *renderTagsInput;
         }
+        if (background)
+            readScene = _impl->settings.backgroundPreparation == RenderSettings::BackgroundPreparation::Full;
         stateChanged = _impl->stateDirty;
         resumeRequested = _impl->resumeRequested;
         hasPreparationWork = _impl->sceneDirty || _impl->captureActive ||
@@ -5705,7 +5721,8 @@ bool SceneBridge::_Prepare(CameraState const *cameraInput,
     {
         std::lock_guard lock(_impl->mutex);
         if (!_impl->snapshot)
-            captureBudget = kInitialCaptureBudgetMilliseconds;
+            captureBudget = _impl->captureMilliseconds == 0.0 && _impl->firstPublishSeconds == 0.0
+                ? kFirstCaptureBudgetMilliseconds : kInitialCaptureBudgetMilliseconds;
         // Edits of lights alone wait while the camera moves. A host light
         // that follows the camera (usdview's default camera light) changes
         // with every camera move; converting and uploading each of those
@@ -5721,7 +5738,7 @@ bool SceneBridge::_Prepare(CameraState const *cameraInput,
             !_impl->buildFuture.valid())
             ++_impl->deferredEnvironmentCaptures;
         if (_impl->sceneDirty && !_impl->captureActive &&
-            !_impl->buildFuture.valid() && !deferLighting) {
+            !_impl->buildFuture.valid() && !deferLighting && readScene) {
             _impl->captureActive = true;
             _impl->captureGeneration = _impl->requestedGeneration;
             _impl->captureQueue.clear();
@@ -5797,7 +5814,7 @@ bool SceneBridge::_Prepare(CameraState const *cameraInput,
                 _impl->captureQueued.clear();
                 break;
             }
-            if (_impl->captureQueue.empty()) break;
+            if (_impl->captureQueue.empty() || !readScene) break;
             captureWorked = true;
             batch.clear();
             while (batch.size() < batchSize && !_impl->captureQueue.empty()) {

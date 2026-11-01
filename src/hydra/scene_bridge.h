@@ -100,11 +100,15 @@ struct RenderSettings {
     // While a GPU device prepares the scene (kernel compile, upload), render
     // progressively on the CPU device and hand over when the GPU is ready.
     bool gpuPreparationPreview = true;
-    // Scene preparation (capture, publishing the converted snapshot)
-    // continues on a worker of the delegate when the host has not called
-    // Execute for a while, so one Execute is enough to start the render
-    // (prism:backgroundPreparation; docs/hydra.md, "Third-party hosts").
-    bool backgroundPreparation = true;
+    // What the delegate's preparation worker may do while the host is quiet
+    // (prism:backgroundPreparation; docs/hydra.md, "Third-party hosts"):
+    // Off, nothing (only Execute prepares); Publish (default), the steps that
+    // read no host scene (the conversion job, publishing, starting the render)
+    // once Execute has captured the scene; Full, also the capture, which reads
+    // the host's scene index outside its calls (only for hosts that never edit
+    // their stage concurrently).
+    enum class BackgroundPreparation { Off, Publish, Full };
+    BackgroundPreparation backgroundPreparation = BackgroundPreparation::Publish;
     // The preview is skipped for scenes whose Embree memory exceeds this
     // many MiB (0 never skips).
     int gpuPreparationPreviewMaxMiB = 8192;

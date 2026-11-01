@@ -143,7 +143,7 @@ struct Options {
     double cameraZ = 4.0;
     std::string workingSpace;    // empty: the default
     bool settingsBeforeIndex = false;
-    bool backgroundPreparation = true;
+    std::string backgroundPreparation;   // empty: the default
     // The host applies the plugin's scene filters itself (filters mode).
     bool hostFilters = false;
 };
@@ -241,8 +241,8 @@ public:
         Set("domeLightCameraVisibility", VtValue(false));
         if (!_options.workingSpace.empty())
             Set("prism:colorManagement:workingSpace", VtValue(_options.workingSpace));
-        if (!_options.backgroundPreparation)
-            Set("prism:backgroundPreparation", VtValue(false));
+        if (!_options.backgroundPreparation.empty())
+            Set("prism:backgroundPreparation", VtValue(_options.backgroundPreparation));
     }
     void Set(char const *key, VtValue const &value)
     { _delegate->SetRenderSetting(TfToken(key), value); }
@@ -447,6 +447,32 @@ void PollToConvergence(Host &host, char const *what)
     }
 }
 
+// Executes, then waits; executes again only when the delegate reports that
+// nothing but an Execute can advance its preparation. The number of Execute
+// calls until the render started.
+bool WaitsForExecute(VtDictionary const &stats)
+{
+    auto it = stats.find("preparationWaitsForExecute");
+    return it != stats.end() && it->second.IsHolding<bool>() && it->second.UncheckedGet<bool>();
+}
+
+int ExecutesToStart(Host &host)
+{
+    const auto deadline = Clock::now() + std::chrono::seconds(300);
+    for (int executes = 1;; ++executes) {
+        host.Execute();
+        // Longer than the worker's quiet interval (100 ms).
+        auto waitingSince = Clock::time_point{};
+        for (;;) {
+            if (StatInt(host.Stats(), "completedSamples") > 0 || host.PassConverged()) return executes;
+            Require(Clock::now() < deadline, "The render did not start:" + Describe(host.Stats()));
+            if (!WaitsForExecute(host.Stats())) waitingSince = {};
+            else if (waitingSince == Clock::time_point{}) waitingSince = Clock::now();
+            else if (Clock::now() - waitingSince > std::chrono::milliseconds(150)) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    }
+}
 void ConvergeWithoutExecute(std::string const &scene)
 {
     Options options; options.width = options.height = 64; options.spp = 64;
@@ -456,40 +482,75 @@ void ConvergeWithoutExecute(std::string const &scene)
         host.RenderToConvergence();
         reference = host.Color();
     }
-    // A single Execute, then polling only.
+    // Defaults (prism:backgroundPreparation publish): Execute captures the
+    // scene, the delegate's worker converts, publishes and starts the render
+    // without reading the host's scene. A host that executes once, then
+    // waits, starts after ExecutesToStart calls.
+    {
+        Host host(Open(scene), options);
+        const int executes = ExecutesToStart(host);
+        const auto start = Clock::now();
+        PollToConvergence(host, "default background preparation");
+        const double ms = Milliseconds(Clock::now() - start);
+        Require(StatInt(host.Stats(), "numCompletedSamples") == options.spp,
+                "Converged before reaching the sample count");
+        const auto d = Compare(host.Color(), reference);
+        std::cout << "converge-without-execute: defaults, " << executes
+                  << " Execute call(s) to start, then converged after " << ms
+                  << " ms of polling (background steps " << StatInt(host.Stats(), "backgroundPreparationSteps")
+                  << ", render starts " << StatInt(host.Stats(), "backgroundRenderStarts")
+                  << "); differing values vs Execute-driven render " << d.differing << "\n";
+        Require(executes == 1, "The small fixture needs more than one Execute to start");
+        Require(d.differing == 0, "A defaults render differs from the Execute-driven render");
+    }
+    // Defaults, an edit right after the first Execute: the host re-syncs a
+    // prim and executes once more (Hydra delivers edits through Execute).
     {
         Host host(Open(scene), options);
         host.Execute();
+        host.Dirty(SdfPath("/World/Triangle"), HdDataSourceLocatorSet{HdDataSourceLocator::EmptyLocator()});
+        const int executes = ExecutesToStart(host);
+        PollToConvergence(host, "defaults, edit after the first Execute");
+        const auto d = Compare(host.Color(), reference);
+        std::cout << "converge-without-execute: defaults, edit after the first Execute, " << executes + 1
+                  << " Execute calls in all, differing values " << d.differing << "\n";
+        Require(d.differing == 0, "An edit after the first Execute changed the image");
+    }
+    // prism:backgroundPreparation full (hosts that never edit their stage
+    // concurrently): a single Execute, then polling only.
+    Options full = options;
+    full.backgroundPreparation = "full";
+    {
+        Host host(Open(scene), full);
+        host.Execute();
         const auto start = Clock::now();
-        PollToConvergence(host, "single Execute");
+        PollToConvergence(host, "single Execute (full)");
         const double ms = Milliseconds(Clock::now() - start);
         Require(StatInt(host.Stats(), "numCompletedSamples") == options.spp,
                 "Converged after a single Execute before reaching the sample count");
         const auto d = Compare(host.Color(), reference);
-        std::cout << "converge-without-execute: a single Execute, then converged after " << ms
-                  << " ms of polling (background preparation steps "
-                  << StatInt(host.Stats(), "backgroundPreparationSteps") << ", render starts "
-                  << StatInt(host.Stats(), "backgroundRenderStarts")
-                  << "); differing values vs Execute-driven render " << d.differing << "\n";
+        std::cout << "converge-without-execute: full, a single Execute, then converged after " << ms
+                  << " ms of polling (background steps " << StatInt(host.Stats(), "backgroundPreparationSteps")
+                  << "); differing values " << d.differing << "\n";
         Require(d.differing == 0, "A single-Execute render differs from the Execute-driven render");
     }
-    // An edit while the delegate prepares on its own: the host re-syncs a prim
-    // (a notice, no Execute), and polling still converges to the same image.
+    // Full: an edit while the delegate prepares on its own (a notice, no
+    // Execute); polling still converges to the same image.
     {
-        Host host(Open(scene), options);
+        Host host(Open(scene), full);
         host.Execute();
         std::this_thread::sleep_for(std::chrono::milliseconds(120));
         host.Dirty(SdfPath("/World/Triangle"), HdDataSourceLocatorSet{HdDataSourceLocator::EmptyLocator()});
         PollToConvergence(host, "edit during background preparation");
         const auto d = Compare(host.Color(), reference);
-        std::cout << "converge-without-execute: edit during background preparation, differing values "
+        std::cout << "converge-without-execute: full, edit during background preparation, differing values "
                   << d.differing << "\n";
         Require(d.differing == 0, "An edit during background preparation changed the image");
     }
     // With prism:backgroundPreparation off, a host executes until the first
     // samples (the earlier contract), and the image is the same.
     Options driven = options;
-    driven.backgroundPreparation = false;
+    driven.backgroundPreparation = "off";
     Host host(Open(scene), driven);
     const auto deadline = Clock::now() + std::chrono::seconds(120);
     int executes = 0;
@@ -905,8 +966,24 @@ void Filters(std::string const &scene, std::string const &camera)
 // 9. Deleting the delegate while it prepares the scene (materials, GPU
 // shaders) returns within MAX_MS. Run with an empty PRISM_CACHE_DIR, so the
 // preparation compiles: the test empties it first when its name says so.
-void TeardownPreparing(std::string const &scene, std::string const &camera, std::string const &device,
-                       int waitMs, double maxMs)
+// 10. Execute calls a host needs before the render starts (it executes once,
+// then waits up to 400 ms before executing again), per background mode.
+void StartCount(std::string const &scene, std::string const &camera, std::string const &device,
+                std::string const &mode)
+{
+    Options options; options.device = device; options.width = 640; options.height = 360;
+    options.spp = 1 << 20; options.camera = SdfPath(camera); options.backgroundPreparation = mode;
+    Host host(Open(scene), options);
+    const auto start = Clock::now();
+    const int executes = ExecutesToStart(host);
+    std::cout << "start-count (" << device << ", " << (mode.empty() ? "default" : mode) << "): "
+              << executes << " Execute call(s), first samples after " << Milliseconds(Clock::now() - start)
+              << " ms; last capture slice budget " << StatDouble(host.Stats(), "captureBudgetMilliseconds")
+              << " ms, capture " << StatDouble(host.Stats(), "captureMilliseconds") << " ms\n";
+}
+
+// Empties PRISM_CACHE_DIR when its name says it is the teardown test's.
+void EmptyTeardownCache()
 {
     if (const char *cache = std::getenv("PRISM_CACHE_DIR");
         cache && std::string(cache).find("teardown_cache") != std::string::npos) {
@@ -914,6 +991,12 @@ void TeardownPreparing(std::string const &scene, std::string const &camera, std:
         std::filesystem::remove_all(cache, ignored);
         std::filesystem::create_directories(cache, ignored);
     }
+}
+
+void TeardownPreparing(std::string const &scene, std::string const &camera, std::string const &device,
+                       int waitMs, double maxMs)
+{
+    EmptyTeardownCache();
     Options options; options.device = device; options.width = 320; options.height = 180;
     options.spp = 1 << 20; options.camera = SdfPath(camera);
     std::vector<double> teardowns;
@@ -931,6 +1014,29 @@ void TeardownPreparing(std::string const &scene, std::string const &camera, std:
         std::cout << "teardown-preparing (" << device << ") round " << round << ": teardown "
                   << teardowns.back() << " ms" << (samples > 0 ? " (the render had started)" : "") << "\n";
     }
+    // Conversion jobs a teardown left running finish on their own (the
+    // process survives them), and new delegates render.
+    Options check; check.device = device; check.width = check.height = 48; check.spp = 4;
+    check.camera = SdfPath(camera);
+    Host after(Open(scene), check);
+    const auto drainStart = Clock::now();
+    while (StatInt(after.Stats(), "detachedBuildJobsRunning") > 0) {
+        Require(Clock::now() - drainStart < std::chrono::seconds(300), "A detached conversion job never ended");
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    std::cout << "teardown-preparing (" << device << "): " << StatInt(after.Stats(), "detachedBuildJobs")
+              << " conversion job(s) left to finish on their own, all ended after "
+              << Milliseconds(Clock::now() - drainStart) << " ms\n";
+    after.RenderToConvergence();
+    const auto afterColor = after.Color();
+    size_t covered = 0;
+    for (size_t i = 3; i < afterColor.size(); i += 4) covered += afterColor[i] > 0.0f;
+    Require(covered > 0, "A delegate after the teardowns renders nothing");
+    // A second one, while the first lives, renders the same.
+    Host again(Open(scene), check);
+    again.RenderToConvergence();
+    Require(Compare(again.Color(), afterColor).differing == 0,
+            "Delegates after the teardowns render differently");
     const double worst = *std::max_element(teardowns.begin(), teardowns.end());
     Require(worst <= maxMs, "Teardown while preparing took " + std::to_string(worst) + " ms");
 }
@@ -960,6 +1066,9 @@ int main(int argc, char **argv)
         } else if (mode == "filters") {
             Require(argc >= 4, "filters SCENE CAMERA");
             Filters(argv[2], argv[3]);
+        } else if (mode == "start-count") {
+            Require(argc >= 5, "start-count SCENE CAMERA DEVICE [off|publish|full]");
+            StartCount(argv[2], argv[3], argv[4], argc > 5 ? argv[5] : "");
         } else if (mode == "teardown-preparing") {
             Require(argc >= 7, "teardown-preparing SCENE CAMERA DEVICE WAIT_MS MAX_MS");
             TeardownPreparing(argv[2], argv[3], argv[4], std::atoi(argv[5]), std::atof(argv[6]));

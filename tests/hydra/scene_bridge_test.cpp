@@ -2194,8 +2194,8 @@ int main(int argc, char **argv)
         bridge.SetSettings(settings);
         bridge.Prepare(camera, {}, geometryTags, 32, 32);
         ok &= Check(DoubleStat(bridge.GetStats(),
-                               "captureBudgetMilliseconds") == 50.0,
-                    "first-load capture did not use the long budget");
+                               "captureBudgetMilliseconds") == 250.0,
+                    "first-load capture did not use the long first-slice budget");
         ok &= Check(PumpPrepare(bridge, camera, {}, geometryTags, 32, 32),
                     "large scene initial prepare did not publish");
         VtDictionary stats = bridge.GetStats();

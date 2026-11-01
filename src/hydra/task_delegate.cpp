@@ -290,7 +290,7 @@ HdRenderSettingDescriptorList PrismTaskDelegate::GetRenderSettingDescriptors() c
              VtValue(std::string(prism::device::ToString(d.denoiseSettings.quality)))},
             {"Denoise the albedo and normal first", _denoisePrefilter, VtValue(d.denoiseSettings.prefilter)},
             {"CPU preview while the GPU prepares", _gpuPreparationPreview, VtValue(true)},
-            {"Prepare the scene without Execute calls", _backgroundPreparation, VtValue(true)},
+            {"Background preparation (off, publish, full)", _backgroundPreparation, VtValue(std::string("publish"))},
             {"CPU preview scene limit (MiB, 0 unlimited)", _gpuPreparationPreviewMaxMiB, VtValue(8192)},
             {"Resource revision", _resourceRevision, VtValue(0)},
             {"Selection outline", _selectionOutline, VtValue(true)},
@@ -344,7 +344,10 @@ VtValue PrismTaskDelegate::GetRenderSetting(TfToken const &key) const
     if (key == _textureStreaming) return VtValue(s.textureStreaming);
     if (key == _textureStreamingPrepass) return VtValue(s.textureStreamingPrepass);
     if (key == _gpuPreparationPreview) return VtValue(s.gpuPreparationPreview);
-    if (key == _backgroundPreparation) return VtValue(s.backgroundPreparation);
+    if (key == _backgroundPreparation)
+        return VtValue(std::string(s.backgroundPreparation == prism::hydra::RenderSettings::BackgroundPreparation::Off
+            ? "off" : s.backgroundPreparation == prism::hydra::RenderSettings::BackgroundPreparation::Full
+            ? "full" : "publish"));
     if (key == _gpuPreparationPreviewMaxMiB) return VtValue(s.gpuPreparationPreviewMaxMiB);
     if (key == _resourceRevision) return VtValue(s.resourceRevision);
     if (key == _device) return VtValue(std::string(prism::device::ToString(s.device)));
@@ -521,8 +524,24 @@ void PrismTaskDelegate::SetRenderSetting(TfToken const &key, VtValue const &valu
         s.textureStreamingPrepass = _Get(value, s.textureStreamingPrepass);
     else if (key == _gpuPreparationPreview)
         s.gpuPreparationPreview = _Get(value, s.gpuPreparationPreview);
-    else if (key == _backgroundPreparation)
-        s.backgroundPreparation = _Get(value, s.backgroundPreparation);
+    else if (key == _backgroundPreparation) {
+        // off | publish | full (a bool: false off, true full).
+        using Mode = prism::hydra::RenderSettings::BackgroundPreparation;
+        if (value.IsHolding<bool>()) {
+            s.backgroundPreparation = value.UncheckedGet<bool>() ? Mode::Full : Mode::Off;
+        } else if (value.IsHolding<std::string>() || value.IsHolding<TfToken>()) {
+            const std::string name = value.IsHolding<std::string>()
+                ? value.UncheckedGet<std::string>()
+                : value.UncheckedGet<TfToken>().GetString();
+            if (name == "off") s.backgroundPreparation = Mode::Off;
+            else if (name == "publish") s.backgroundPreparation = Mode::Publish;
+            else if (name == "full") s.backgroundPreparation = Mode::Full;
+            else {
+                TF_WARN("PrismRT: prism:backgroundPreparation must be off, publish or full; retaining the previous value");
+                return;
+            }
+        } else return;
+    }
     else if (key == _gpuPreparationPreviewMaxMiB)
         s.gpuPreparationPreviewMaxMiB = std::max(0, _Get(value, s.gpuPreparationPreviewMaxMiB));
     else if (key == _resourceRevision)
