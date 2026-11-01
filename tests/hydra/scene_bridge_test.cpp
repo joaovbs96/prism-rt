@@ -64,7 +64,8 @@ int RunB3FallbackOpacityIntegrationTests();
 int RunC2GeometricAovIntegrationTests();
 int RunSnapshotScalingTests();
 int RunCachedCountTests();
-int RunHashOrderTests();
+int RunHashOrderTests(std::string const &exe);
+int RunHashOrderMaterialChild(std::string const &prefix, std::string const &file);
 int RunTypeChangeTests(int rounds);
 
 namespace {
@@ -1171,7 +1172,10 @@ int main(int argc, char **argv)
         return RunProgressStatusTests();
     // `hash-order` runs only the hash-order checks (CPU device).
     if (argc == 2 && std::string(argv[1]) == "hash-order")
-        return RunHashOrderTests();
+        return RunHashOrderTests(argv[0]);
+    // `hash-order-materials NAME FILE` is the child process of that check.
+    if (argc == 4 && std::string(argv[1]) == "hash-order-materials")
+        return RunHashOrderMaterialChild(argv[2], argv[3]);
     // `type-change [rounds]` runs only the prim type change checks (CPU device).
     if ((argc == 2 || argc == 3) && std::string(argv[1]) == "type-change")
         return RunTypeChangeTests(argc == 3 ? std::max(1, std::atoi(argv[2])) : 3);
