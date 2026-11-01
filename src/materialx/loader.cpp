@@ -925,8 +925,12 @@ std::pair<MaterialX::NodePtr, std::string> SoleConsumer(const MaterialX::NodePtr
 // (OpenPBR's transmission_color at depth 0, glTF's base_color, a tinted
 // specular_color): RT stays untinted and prism_dielectric_split weights it by
 // both tints. Callers don't combine a split with a thin film.
+//
+// `coupled` (optional) receives the new mix and the input that reads the
+// glass ("fg" or "bg").
 bool CoupleTransmissionFresnel(const MaterialX::GraphElementPtr& graph, const MaterialX::NodePtr& transmission,
-                               const MaterialX::NodePtr& instance, bool split = false)
+                               const MaterialX::NodePtr& instance, bool split = false,
+                               std::pair<MaterialX::NodePtr, std::string>* coupled = nullptr)
 {
     auto mode = transmission->getInput("scatter_mode");
     if (!mode || IsBound(mode) || mode->getValueString() != "T") return false;
@@ -1008,6 +1012,7 @@ bool CoupleTransmissionFresnel(const MaterialX::GraphElementPtr& graph, const Ma
     if (auto weight = substrate->getInput("mix")) mix->addInput("mix", "float")->copyContentFrom(weight);
     RedirectConsumers(consumers, mix);
     graph->removeNode(substrate->getName());
+    if (coupled) *coupled = {mix, carrierSide};
     return true;
 }
 
@@ -1020,7 +1025,9 @@ bool CoupleTransmissionFresnel(const MaterialX::GraphElementPtr& graph, const Ma
 // curve(k2) - curve(k1) of it leaving the medium, R + T 0.78 at 41 degrees
 // inside). Rough coats or glass are left alone: the Fresnel layer's base
 // weighting gains or loses more there than the curve layer does.
-bool ReplaceSmoothCoat(const MaterialX::GraphElementPtr& graph, const MaterialX::NodePtr& surface)
+// `coatLobe` (optional) receives the coat's dielectric_bsdf.
+bool ReplaceSmoothCoat(const MaterialX::GraphElementPtr& graph, const MaterialX::NodePtr& surface,
+                       MaterialX::NodePtr* coatLobe = nullptr)
 {
     MaterialX::NodePtr node = Producer(surface, "bsdf");
     for (int depth = 0; node && node->getCategory() == "layer" && depth < 4; ++depth) {
@@ -1042,6 +1049,7 @@ bool ReplaceSmoothCoat(const MaterialX::GraphElementPtr& graph, const MaterialX:
         layer->addInput("coat", "BSDF")->setNodeName(BareReflection(graph, top, top->getName() + "_bare")->getName());
         layer->addInput("substrate", "BSDF")->copyContentFrom(base);
         RedirectConsumers(consumers, layer);
+        if (coatLobe) *coatLobe = top;
         return true;
     }
     return false;
@@ -1055,6 +1063,9 @@ bool ReplaceSmoothCoat(const MaterialX::GraphElementPtr& graph, const MaterialX:
 // Inputs that are bound count as non-zero (and non-white).
 struct DielectricPlan {
     bool transmissive = false, couple = false, split = false, coat = false;
+    // OpenPBR's smooth coat over glass of its IOR (and no thin film): the
+    // glass under it reflects nothing (RepairExpandedDielectric).
+    bool matchedCoat = false;
     std::vector<std::string> partial;
 };
 
@@ -1113,6 +1124,7 @@ DielectricPlan PlanDielectric(const MaterialX::NodePtr& node)
                             !(IsWhite(value("transmission_color")) || IsPositive(value("transmission_depth")));
         decide(nonzero("thin_film_weight"), tinted, "coat_weight", "coat_roughness", "specular_roughness",
                value("coat_ior"), value("specular_ior"), {"specular_color", "transmission_color"});
+        plan.matchedCoat = plan.coat && !nonzero("thin_film_weight");
         if (nonzero("coat_weight") && nonzero("coat_darkening")) plan.partial.push_back("coat darkening");
         if (nonzero("fuzz_weight")) plan.partial.push_back("fuzz");
     } else if (category == "standard_surface") {
@@ -1218,11 +1230,51 @@ bool RepairExpandedDielectric(const MaterialX::GraphElementPtr& graph, const Mat
                               const std::vector<MaterialX::NodePtr>& surfaces, const MaterialX::NodePtr& instance,
                               DielectricPlan& plan)
 {
-    if (!transmission || !CoupleTransmissionFresnel(graph, transmission, instance, plan.split)) return false;
+    if (!transmission) return false;
+    // OpenPBR layers its coat over glass with the IOR relative to the coat
+    // (eta_s = specular_ior / coat_ior, 1 when they match), but an RT lobe
+    // reflects with the material IOR: coupled, the glass under a coat of its
+    // own IOR reflected again (R 0.078 at normal incidence instead of 0.04).
+    // Under a matched coat the glass is a transmission-only lobe (the Fresnel
+    // layer above it keeps exactly 1 - F), copied here before the coupling
+    // makes it RT, and mixed with the RT glass by the coat's weight (the
+    // uncoated part reflects at the glass). Both refract with specular_ior,
+    // which the coat shares, for any coat weight (eta_s would make a partial
+    // coat refract with a mix of the two).
+    MaterialX::NodePtr bareCarrier;
+    if (plan.matchedCoat) {
+        auto ior = transmission->getInput("ior");
+        if (!ior) ior = transmission->addInput("ior", "float");
+        for (const char* attribute : {"nodename", "nodegraph", "output", "value"}) ior->removeAttribute(attribute);
+        ior->setInterfaceName("specular_ior");
+        auto bare = graph->addNode("dielectric_bsdf", graph->createValidChildName(transmission->getName() + "_coated"),
+                                   "BSDF");
+        bare->copyContentFrom(transmission);
+        bareCarrier = bare;
+        auto [carrier, port] = SoleConsumer(transmission);
+        if (carrier && carrier->getCategory() == "layer" && port == "top") {
+            bareCarrier = graph->addNode("layer", graph->createValidChildName(carrier->getName() + "_coated"), "BSDF");
+            bareCarrier->copyContentFrom(carrier);
+            bareCarrier->getInput("top")->setNodeName(bare->getName());
+        }
+    }
+    std::pair<MaterialX::NodePtr, std::string> coupled;
+    if (!CoupleTransmissionFresnel(graph, transmission, instance, plan.split, &coupled)) return false;
     if (plan.coat) {
         bool replaced = !surfaces.empty();
-        for (auto const& surface : surfaces) replaced = ReplaceSmoothCoat(graph, surface) && replaced;
+        MaterialX::NodePtr coat;
+        for (auto const& surface : surfaces) replaced = ReplaceSmoothCoat(graph, surface, &coat) && replaced;
         if (!replaced) plan.partial.push_back("coat");
+        auto glass = coupled.first ? coupled.first->getInput(coupled.second) : nullptr;
+        if (replaced && bareCarrier && coat && glass) {
+            auto mix = graph->addNode("mix", graph->createValidChildName(transmission->getName() + "_under_coat"), "BSDF");
+            mix->addInput("fg", "BSDF")->setNodeName(bareCarrier->getName());
+            mix->addInput("bg", "BSDF")->setNodeName(glass->getNodeName());
+            auto weight = mix->addInput("mix", "float");
+            if (auto coatWeight = coat->getInput("weight")) weight->copyContentFrom(coatWeight);
+            else weight->setValue(1.0f);
+            glass->setNodeName(mix->getName());
+        }
     }
     return true;
 }

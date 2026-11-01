@@ -658,6 +658,14 @@ called done there.
   sample 1"; if a timeout is wanted on Metal, wait with
   `addCompletedHandler` and a bounded condition wait instead.
 
+- **OpenPBR glass under a smooth coat of its IOR** (`src/materialx/loader.cpp`,
+  2026-11-01; [materialx_compatibility.md](materialx_compatibility.md)): a
+  graph repair only, so Metal compiles the repaired graph through the same
+  HLSL path; materials without such a coat generate the same MDL as before.
+  On the Mac: a `--material` render of an OpenPBR glass with `coat_weight` 1,
+  `coat_roughness` 0 and `coat_ior` equal to `specular_ior` on Metal against
+  `--device cpu` (`prism_compare_images`, noise floor), and
+  `prism_dielectric_albedo_test` passes.
 - **Repairs for MaterialX 1.39.3/1.39.4 and the lost-diffuse check**
   (`src/materialx/`, `src/mdl_material.h`, 2026-11-01;
   [materialx_compatibility.md](materialx_compatibility.md#older-materialx-1393-and-1394)):

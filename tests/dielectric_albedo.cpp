@@ -217,8 +217,9 @@ int main(int argc, char** argv)
              true, true},
             // Smooth: tinted (prism_dielectric_split), thin films, smooth
             // coats (prism_fresnel_layer), thin walls, UsdPreviewSurface and
-            // LamaDielectric. Thin walls and coats reflect more or other than
-            // Fresnel's R.
+            // LamaDielectric. Thin walls and the standard_surface and glTF
+            // coats reflect more or other than Fresnel's R; OpenPBR's coat of
+            // the glass's IOR reflects once (Fresnel's R).
             {"open_pbr_tint_depth0",
              Shader("open_pbr_surface", glass + Input("transmission_color", "color3", tint)), true, true, tintMean},
             {"open_pbr_specular_tint",
@@ -242,7 +243,7 @@ int main(int argc, char** argv)
             {"open_pbr_coat_no_darkening",
              Shader("open_pbr_surface", glass + coat + Input("coat_darkening", "float", "0") +
                                             Input("coat_ior", "float", "1.5")),
-             true, false},
+             true, true},
             {"standard_surface_coat",
              Shader("standard_surface", ssGlass + Input("coat", "float", "1") + Input("coat_roughness", "float", "0")),
              true, false},
@@ -288,6 +289,12 @@ int main(int argc, char** argv)
                                             Input("thin_film_thickness", "float", "0.5") +
                                             Input("transmission_color", "color3", tint)),
              false, false, tintMean},
+            // Half a coat of the glass's IOR: R + T 1, R near Fresnel's.
+            {"open_pbr_coat_half",
+             Shader("open_pbr_surface", glass + Input("coat_weight", "float", "0.5") +
+                                            Input("coat_roughness", "float", "0") +
+                                            Input("coat_darkening", "float", "0") + Input("coat_ior", "float", "1.5")),
+             false, false},
             // Coat IOR 1.6 (the default) over glass of 1.5: not repaired.
             {"open_pbr_coat_ior",
              Shader("open_pbr_surface", glass + coat + Input("coat_darkening", "float", "0")), false, false},

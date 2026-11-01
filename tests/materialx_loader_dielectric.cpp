@@ -181,6 +181,22 @@ void Coats()
     require(layer->getInput("ior") && layer->getInput("weight") && Upstream(layer, "coat") && Upstream(layer, "substrate"),
             "smooth coat: Fresnel layer not connected");
     require(!layer->getDownstreamPorts().empty(), "smooth coat: Fresnel layer unused");
+    // Under a coat of its IOR the glass reflects nothing: a transmission-only
+    // lobe mixed with the RT glass by the coat's weight, both refracting with
+    // specular_ior.
+    require(Dielectrics(doc, "T").size() == 1 && Dielectrics(doc, "RT").size() == 1,
+            "smooth coat: expected the coated T glass beside the RT glass");
+    for (auto const& glass : {Dielectrics(doc, "T").front(), Dielectrics(doc, "RT").front()}) {
+        auto ior = glass->getInput("ior");
+        require(ior && ior->getInterfaceName() == "specular_ior", "smooth coat: glass does not refract with specular_ior");
+    }
+    auto underCoat = Find(doc, [](const MaterialX::NodePtr& node) {
+        auto weight = node->getInput("mix");
+        return node->getCategory() == "mix" && weight && weight->getInterfaceName() == "coat_weight" &&
+               node->getType() == "BSDF";
+    });
+    require(underCoat.size() == 1 && !underCoat.front()->getDownstreamPorts().empty(),
+            "smooth coat: glass not mixed by the coat's weight");
     // The default coat_ior (1.6) differs from the glass's: not replaced.
     auto otherIor = Load("coat_ior", Shader("open_pbr_surface", kGlass + Input("coat_weight", "float", "1") +
                                                                    Input("coat_roughness", "float", "0")));
