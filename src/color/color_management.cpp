@@ -5,6 +5,7 @@
 #include <tbb/parallel_for.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cmath>
 #include <cstdint>
@@ -13,8 +14,10 @@
 #include <iostream>
 #include <map>
 #include <mutex>
+#include <set>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
 
 namespace OCIO = OCIO_NAMESPACE;
 
@@ -93,6 +96,33 @@ std::string LoadedConfig(std::string const &requested)
     return requested.empty() ? kDefaultConfig : requested;
 }
 
+std::atomic<bool> g_defaultConfigUnavailable{false};
+
+// Loads `path`. kDefaultConfig (ocio://studio-config-latest) is the one name
+// that falls back: an OpenColorIO without it (2.2 has only versioned names)
+// gets its newest built-in studio config, with a message in *note.
+OCIO::ConstConfigRcPtr LoadConfig(std::string const &path, std::string *resolved, std::string *note)
+{
+    if (resolved) *resolved = path;
+    const bool isDefault = path == kDefaultConfig;
+    try {
+        if (isDefault && g_defaultConfigUnavailable.load())
+            throw OCIO::Exception("Could not find 'studio-config-latest' in the built-in configurations (forced)");
+        return OCIO::Config::CreateFromFile(path.c_str());
+    } catch (OCIO::Exception const &) {
+        if (!isDefault) throw;
+        const std::string pick = SelectBuiltinStudioConfig(BuiltinConfigNames());
+        if (pick.empty()) throw;
+        const std::string uri = "ocio://" + pick;
+        auto config = OCIO::Config::CreateFromFile(uri.c_str());
+        if (resolved) *resolved = uri;
+        if (note)
+            *note = "OpenColorIO " + std::string(OCIO::GetVersion()) + " has no built-in config '" +
+                    std::string(kDefaultConfig) + "'; using its newest built-in studio config (" + uri + ")";
+        return config;
+    }
+}
+
 // Names configs give linear Rec.709 (the studio config's name and ASWF
 // interop alias, ACES 1.x and other configs' names); OCIO also resolves the
 // config's own aliases of each.
@@ -121,6 +151,40 @@ bool DataToken(std::string const &token)
     return token == "data" || token == "raw" || token == "identity";
 }
 
+// What pass-through colour management (no config, linear Rec.709 working
+// space) can do for a texture or value tagged with `space`: the transfer
+// functions of Rec.709-primaries spaces are analytic; other primaries need a
+// config.
+enum class PassThroughKind { None, Srgb, Gamma22, Unsupported };
+
+PassThroughKind ClassifyPassThrough(std::string const &space)
+{
+    static const char *const srgb[] = {"srgb_texture", "srgb_tx", "srgb_rec709", "srgb_rec709_scene", "srgb",
+                                       "srgb - texture", "utility - srgb - texture", "srgb encoded rec.709 (srgb)"};
+    static const char *const gamma22[] = {"g22_rec709", "gamma 2.2 rec.709 - texture",
+                                          "utility - gamma 2.2 - rec.709 - texture", "gamma22_rec709"};
+    if (space.empty() || DataToken(space) || IsRec709Name(space)) return PassThroughKind::None;
+    const std::string lower = Lower(space);
+    for (const char *name : srgb)
+        if (lower == name) return PassThroughKind::Srgb;
+    for (const char *name : gamma22)
+        if (lower == name) return PassThroughKind::Gamma22;
+    return PassThroughKind::Unsupported;
+}
+
+float DecodeSrgb(float v)
+{
+    const float a = std::abs(v);
+    const float linear = a <= 0.04045f ? a / 12.92f : std::pow((a + 0.055f) / 1.055f, 2.4f);
+    return v < 0.0f ? -linear : linear;
+}
+
+float DecodeGamma22(float v)
+{
+    const float linear = std::pow(std::abs(v), 2.2f);
+    return v < 0.0f ? -linear : linear;
+}
+
 std::string RenderingSpace(OCIO::ConstConfigRcPtr const &config, std::string const &token, std::string *warning)
 {
     if (warning) warning->clear();
@@ -140,11 +204,53 @@ std::string RenderingSpace(OCIO::ConstConfigRcPtr const &config, std::string con
 
 } // namespace
 
+std::vector<std::string> BuiltinConfigNames()
+{
+    std::vector<std::string> names;
+    try {
+        auto const &registry = OCIO::BuiltinConfigRegistry::Get();
+        for (size_t i = 0; i < registry.getNumBuiltinConfigs(); ++i) names.push_back(registry.getBuiltinConfigName(i));
+    } catch (std::exception const &) {
+    }
+    return names;
+}
+
+// "studio-config-v4.0.0_aces-v2.0_ocio-v2.5" -> (4,0,0,2,0,2,5): the numbers in
+// order, so a newer config (then ACES, then OpenColorIO) compares greater.
+std::string SelectBuiltinStudioConfig(std::vector<std::string> const &names)
+{
+    constexpr std::string_view prefix = "studio-config-v";
+    std::string best;
+    std::vector<long> bestKey;
+    for (auto const &name : names) {
+        if (name.compare(0, prefix.size(), prefix) != 0) continue;
+        std::vector<long> key;
+        for (size_t i = 0; i < name.size();) {
+            if (std::isdigit(static_cast<unsigned char>(name[i]))) {
+                long value = 0;
+                while (i < name.size() && std::isdigit(static_cast<unsigned char>(name[i])))
+                    value = value * 10 + (name[i++] - '0');
+                key.push_back(value);
+            } else {
+                ++i;
+            }
+        }
+        if (key.empty()) continue;
+        if (best.empty() || key > bestKey || (key == bestKey && name > best)) {
+            best = name;
+            bestKey = std::move(key);
+        }
+    }
+    return best;
+}
+
+void SetDefaultConfigUnavailableForTesting(bool unavailable) { g_defaultConfigUnavailable = unavailable; }
+
 std::string RenderingColorSpaceWorkingSpace(std::string const &token, std::string const &config, std::string *warning)
 {
     const std::string path = LoadedConfig(config);
     try {
-        return RenderingSpace(OCIO::Config::CreateFromFile(path.c_str()), token, warning);
+        return RenderingSpace(LoadConfig(path, nullptr, nullptr), token, warning);
     } catch (OCIO::Exception const &error) {
         throw std::runtime_error("cannot load the OpenColorIO config '" + path + "': " + error.what());
     }
@@ -158,10 +264,13 @@ struct ColorManagement::Impl {
     std::array<float, 3> luminance = kRec709Luminance;
     OCIO::ConstConfigRcPtr ocio;
     OCIO::ConstCPUProcessorRcPtr viewProcessor;
+    // What Build changed from the request (config, display, view), for the caller to report.
+    std::vector<std::string> notes;
     // The config's linear Rec.709.
     std::string rec709Name = kLightColorSpace;
     bool passThrough = false;
     mutable std::mutex mutex;
+    mutable std::set<std::string> warnedPassThrough;
     mutable std::map<std::string, OCIO::ConstCPUProcessorRcPtr> toWorking;
 };
 
@@ -175,7 +284,9 @@ std::shared_ptr<ColorManagement::Impl> Build(Options const &options, bool buildV
 
 std::shared_ptr<const ColorManagement> ColorManagement::Create(Options const &options, bool view)
 {
-    return std::make_shared<const ColorManagement>(Build(options, view));
+    auto impl = Build(options, view);
+    for (auto const &note : impl->notes) std::cerr << "PrismRT: " << note << std::endl;
+    return std::make_shared<const ColorManagement>(std::move(impl));
 }
 
 std::shared_ptr<const ColorManagement> ColorManagement::PassThrough(Options const &requested)
@@ -195,6 +306,12 @@ std::shared_ptr<const ColorManagement> ColorManagement::PassThrough(Options cons
 std::shared_ptr<const ColorManagement> ColorManagement::CreateOrFallback(
     Options const &options, bool view, std::function<void(std::string const &)> const &warn)
 {
+    // Diagnostic switch: the state a host without a usable OpenColorIO config
+    // is in (tests and renders of pass-through colour management).
+    if (const char *forced = std::getenv("PRISM_COLOR_PASS_THROUGH"); forced && std::string(forced) != "0") {
+        if (warn) warn("PRISM_COLOR_PASS_THROUGH is set; colour management is pass-through linear Rec.709");
+        return PassThrough(options);
+    }
     std::vector<Options> attempts{options};
     Options builtIn = options;
     builtIn.config = kDefaultConfig;
@@ -206,6 +323,8 @@ std::shared_ptr<const ColorManagement> ColorManagement::CreateOrFallback(
         try {
             auto impl = Build(attempts[i], view);
             impl->requested = options;
+            if (warn)
+                for (auto const &note : impl->notes) warn(note);
             return std::make_shared<const ColorManagement>(std::move(impl));
         } catch (std::exception const &error) {
             if (warn) {
@@ -231,7 +350,9 @@ try {
     impl->requested = options;
     impl->config = LoadedConfig(options.config);
     try {
-        impl->ocio = OCIO::Config::CreateFromFile(impl->config.c_str());
+        std::string note;
+        impl->ocio = LoadConfig(impl->config, &impl->config, &note);
+        if (!note.empty()) impl->notes.push_back(note);
     } catch (OCIO::Exception const &error) {
         throw std::runtime_error("cannot load the OpenColorIO config '" + impl->config + "': " + error.what());
     }
@@ -291,23 +412,35 @@ try {
         impl->view = options.view;
         return impl;
     }
+    // A display or view the loaded config lacks (the ACES 2.0 view in an
+    // older config, say) falls back to that config's default, with a note.
     impl->display = options.display.empty() ? config->getDefaultDisplay() : options.display;
     bool displayFound = false;
     for (int i = 0; i < config->getNumDisplays(); ++i) displayFound |= impl->display == config->getDisplay(i);
     if (!displayFound) {
+        if (config->getNumDisplays() == 0)
+            throw std::runtime_error("the OpenColorIO config '" + impl->config + "' has no displays");
         std::string names;
         for (int i = 0; i < config->getNumDisplays(); ++i) names += std::string(i ? ", " : "") + config->getDisplay(i);
-        throw std::runtime_error("unknown OpenColorIO display '" + impl->display + "' (" + names + ")");
+        const std::string requestedDisplay = impl->display;
+        impl->display = config->getDefaultDisplay();
+        impl->notes.push_back("unknown OpenColorIO display '" + requestedDisplay + "' (" + names +
+                              "); using the config's default display '" + impl->display + "'");
     }
     impl->view = options.view.empty() ? config->getDefaultView(impl->display.c_str()) : options.view;
     bool viewFound = false;
     for (int i = 0; i < config->getNumViews(impl->display.c_str()); ++i)
         viewFound |= impl->view == config->getView(impl->display.c_str(), i);
     if (!viewFound) {
+        if (config->getNumViews(impl->display.c_str()) == 0)
+            throw std::runtime_error("the OpenColorIO display '" + impl->display + "' has no views");
         std::string names;
         for (int i = 0; i < config->getNumViews(impl->display.c_str()); ++i)
             names += std::string(i ? ", " : "") + config->getView(impl->display.c_str(), i);
-        throw std::runtime_error("unknown view '" + impl->view + "' of display '" + impl->display + "' (" + names + ")");
+        const std::string requestedView = impl->view;
+        impl->view = config->getDefaultView(impl->display.c_str());
+        impl->notes.push_back("unknown view '" + requestedView + "' of display '" + impl->display + "' (" + names +
+                              "); using the display's default view '" + impl->view + "'");
     }
     auto transform = OCIO::DisplayViewTransform::Create();
     transform->setSrc(impl->workingSpace.c_str());
@@ -399,7 +532,22 @@ std::string ColorManagement::Resolve(std::string const &space) const
 
 bool ColorManagement::NeedsConversion(std::string const &space) const
 {
-    if (m_impl->passThrough) return false;
+    if (m_impl->passThrough) {
+        switch (ClassifyPassThrough(space)) {
+        case PassThroughKind::Srgb:
+        case PassThroughKind::Gamma22:
+            return true;
+        case PassThroughKind::Unsupported: {
+            std::lock_guard lock(m_impl->mutex);
+            if (m_impl->warnedPassThrough.insert(space).second)
+                std::cerr << "PrismRT: colour space '" << space << "' needs an OpenColorIO config; without one "
+                          << "(pass-through colour management) its values are used unconverted" << std::endl;
+            return false;
+        }
+        default:
+            return false;
+        }
+    }
     const std::string name = Resolve(space);
     if (name.empty() || name == m_impl->workingSpace) return false;
     return !m_impl->ocio->getColorSpace(name.c_str())->isData();
@@ -412,6 +560,17 @@ void ColorManagement::ToWorkingSpace(std::string const &space, float *pixels, si
         return;
     }
     if (channels < 3) return;
+    if (m_impl->passThrough) {
+        // Analytic decode to linear Rec.709, the pass-through working space.
+        float (*decode)(float) = ClassifyPassThrough(space) == PassThroughKind::Srgb ? DecodeSrgb : DecodeGamma22;
+        constexpr size_t kPassChunk = size_t(1) << 14;
+        tbb::parallel_for(size_t(0), (count + kPassChunk - 1) / kPassChunk, [&](size_t chunk) {
+            const size_t begin = chunk * kPassChunk, end = std::min(count, begin + kPassChunk);
+            for (size_t p = begin; p < end; ++p)
+                for (int c = 0; c < 3; ++c) pixels[p * channels + c] = decode(pixels[p * channels + c]);
+        });
+        return;
+    }
     OCIO::ConstCPUProcessorRcPtr processor;
     {
         std::lock_guard lock(m_impl->mutex);

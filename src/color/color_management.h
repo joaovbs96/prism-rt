@@ -47,8 +47,10 @@ class PRISM_INTERNAL_API ColorManagement {
 public:
     // Throws std::runtime_error for an unreadable config, an unknown or
     // non-linear working space, a config without linear Rec.709 (looked up
-    // by name and its usual aliases), or, with `view`, an unknown
-    // display/view. Without `view` no view processor is built: display() and
+    // by name and its usual aliases). kDefaultConfig where the linked
+    // OpenColorIO lacks it loads its newest built-in studio config, and with
+    // `view` a display or view the config lacks becomes its default; both
+    // are reported to standard error. Without `view` no view processor is built: display() and
     // view() are the requested names and ApplyView only clamps (hosts that
     // apply their own view, the Hydra delegate).
     static std::shared_ptr<const ColorManagement> Create(Options const &options, bool view = true);
@@ -117,6 +119,16 @@ private:
 // There is no process-wide colour management: each renderer context owns one
 // (renderer/renderer_context.h) and hands it to its loaders, materials,
 // textures and scenes (SceneManager::colorManagement), which devices read.
+
+// The newest built-in studio config of `names` (OpenColorIO's built-in config
+// names, e.g. studio-config-v4.0.0_aces-v2.0_ocio-v2.5), or empty when there is
+// none. kDefaultConfig falls back to it where an OpenColorIO has no
+// studio-config-latest (2.2).
+PRISM_INTERNAL_API std::string SelectBuiltinStudioConfig(std::vector<std::string> const &names);
+// The names in the linked OpenColorIO's built-in config registry.
+PRISM_INTERNAL_API std::vector<std::string> BuiltinConfigNames();
+// Makes kDefaultConfig fail to load as on an OpenColorIO without it (tests).
+PRISM_INTERNAL_API void SetDefaultConfigUnavailableForTesting(bool unavailable);
 
 // The working space that a UsdRenderSettings.renderingColorSpace token asks
 // for in the OpenColorIO config `config` (empty: the default config), as a

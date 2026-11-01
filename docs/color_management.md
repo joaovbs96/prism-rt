@@ -26,10 +26,27 @@ MaterialX generator and the render devices read their renderer's.
   others; views `ACES 2.0 - SDR 100 nits (Rec.709)` (default),
   `Un-tone-mapped`, `Video (colorimetric)` and `Raw`. The built-in configs are
   compiled into the OpenColorIO DLL, so nothing else ships.
+- **Older OpenColorIO.** `ocio://studio-config-latest` exists from
+  OpenColorIO 2.3 on; 2.2 has only versioned names
+  (`studio-config-v1.0.0_aces-v1.3_ocio-v2.1`). Where the default name is
+  missing, PrismRT takes the newest built-in *studio* config of the linked
+  OpenColorIO (`BuiltinConfigRegistry`; the version numbers in the names are
+  compared, no name is hard-coded), with a warning. Only the default name
+  falls back: a config the user names that fails to load is still an error
+  (the CLI) or goes through the fallbacks below (the delegate). A v1 config
+  has the views `ACES 1.0 - SDR Video`, `Un-tone-mapped` and `Raw`, not the
+  ACES 2.0 one.
+- **A display or view the loaded config lacks** (`--view "ACES 2.0 - SDR 100
+  nits (Rec.709)"` on a v1 config, or a config without the requested display)
+  falls back to that config's default display and view, with a warning naming
+  what was asked for and what exists. Before, `Create` threw and the CLI
+  stopped with the message; the SDK and Python `Renderer.color()` raised. An
+  empty display or view was always the config's default. The delegate records
+  the names and builds no view.
 - Names are OCIO colour space names or aliases, case-insensitive:
   `ACEScg`/`acescg`/`lin_ap1`, `lin_rec709` (`Linear Rec.709 (sRGB)`),
   `lin_displayp3`, `lin_adobergb`, `lin_rec2020`... The working space must be
-  scene-linear; `Create` refuses others, and an unknown display or view.
+  scene-linear; `Create` refuses others.
 - The CLI reads the stage's `prism:colorManagement:*` attributes on the
   RenderSettings prim named by `renderSettingsPrimPath`, as the Hydra delegate
   does; command-line options take precedence.
@@ -149,6 +166,20 @@ spaces never mix; textures that need no conversion keep their earlier keys.
 `ImageTexture(path, colorSpace)` and `Texture::convertToWorkingSpace` set it.
 MDL textures leave it empty.
 
+Pass-through colour management (no config; see below) has no processors, but
+it still decodes what needs no config, analytically, to its linear Rec.709
+working space: sRGB (`srgb_texture`, `sRGB - Texture`,
+`Utility - sRGB - Texture`, `srgb_tx`, `srgb_rec709_scene`, ...) and gamma 2.2
+Rec.709 (`g22_rec709`, `Gamma 2.2 Rec.709 - Texture`), in `ToWorkingSpace`
+(texture preparation, `ImageTexture`, the uniform colour conversion of the
+MDL loader). Linear Rec.709 and data spaces need nothing. Anything else
+(ACEScg and other primaries, Display P3, Adobe RGB, log encodings) cannot be
+converted without a config: its values are used as they are, with one warning
+per colour space. MaterialX values and images never depended on this: the
+generated MDL code converts them (its transforms are MaterialX's, with the
+working space `lin_rec709`), which `prism_hydra_color_pass_through_patches`
+checks on `color_management.usda`.
+
 Light textures are read as linear Rec.709, whatever `colorSpace` metadata
 their attribute has: the Hydra scene index does not carry attribute
 metadata, so the CLI does not read it either. 8-bit dome textures are not
@@ -245,14 +276,25 @@ colour management (linear Rec.709, nothing converts, no config), so an
 exception never reaches Hydra. Linear Rec.709 is found by name or alias
 (`lin_rec709`, `lin_rec709_scene`, `Linear Rec.709 (sRGB)`, `lin_srgb`,
 `srgb_linear`, `Utility - Linear - sRGB`, ...) before a config counts as
-lacking it; this applies to the CLI too. The delegate builds no view
+lacking it; this applies to the CLI too. Where the OpenColorIO has no
+`studio-config-latest` (2.2), the built-in attempts use its newest built-in
+studio config instead (above), so pass-through is the last resort only when
+no built-in studio config exists either. `PRISM_COLOR_PASS_THROUGH=1` forces
+pass-through (tests and diagnostics; the delegate warns). The delegate builds no view
 processor (`Create(options, false)`), so unknown display and view names are
 only recorded. A render setting that names an unusable config or working
 space later keeps the previous colour management, with a warning. Tests:
 `prism_hydra_color_fallback_*` (`$OCIO` naming a missing file or
 `tests/hydra/fixtures/ocio_no_rec709.ocio`: a warning and the same image as
 the built-in config; unknown display and view names) and
-`prism_color_management_test` (aliases, fallbacks, pass-through).
+`prism_color_management_test` (aliases, fallbacks, the studio config choice with a
+forced-missing `studio-config-latest`, a missing view or display, pass-through
+decoding), `prism_hydra_color_pass_through_*` (the fixture rendered in
+pass-through: the same patches). `tests/ocio22/` links `src/color/` alone
+against another OpenColorIO (2.2.1) with `$OCIO` unset and checks the
+fallback to `studio-config-v1.0.0_aces-v1.3_ocio-v2.1`, the working space,
+linear Rec.709, the default view and the sRGB decode
+([deployment.md](deployment.md#older-dependency-stacks-best-effort)).
 
 ### usdview
 

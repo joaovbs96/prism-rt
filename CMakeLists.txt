@@ -1379,6 +1379,20 @@ if(TARGET prism_hydra_render AND TARGET prism_compare_images AND TARGET prism_co
         set_tests_properties(prism_hydra_color_fallback_${_name}_test PROPERTIES
             FIXTURES_REQUIRED "prism_color_fallback_${_name};prism_color_output")
     endforeach()
+    # Pass-through colour management (what a host without a usable OpenColorIO
+    # config gets; PRISM_COLOR_PASS_THROUGH forces it): linear Rec.709 working
+    # space, and the tagged colours and the sRGB texture still decode.
+    add_test(NAME prism_hydra_color_pass_through_render
+        COMMAND prism_hydra_render "${_prism_color_fixture}" /World/Camera "${_prism_color}/pass_through.exr"
+            128 64 4 --max-depth 1 --adaptive-threshold 0 --seed 0)
+    set_tests_properties(prism_hydra_color_pass_through_render PROPERTIES
+        ENVIRONMENT "${_prism_color_env};PRISM_COLOR_PASS_THROUGH=1"
+        PASS_REGULAR_EXPRESSION "colour management is pass-through"
+        FIXTURES_SETUP prism_color_pass_through)
+    add_test(NAME prism_hydra_color_pass_through_patches
+        COMMAND prism_color_management_test --check-patches "${_prism_color}/pass_through.exr" lin_rec709)
+    set_tests_properties(prism_hydra_color_pass_through_patches PROPERTIES
+        ENVIRONMENT "${_prism_color_env}" FIXTURES_REQUIRED prism_color_pass_through)
     # Unknown display and view names are only recorded by the delegate.
     add_test(NAME prism_hydra_color_fallback_unknown_view
         COMMAND prism_hydra_render "${_prism_macbeth}" /World/Camera "${_prism_color}/macbeth_unknown_view.exr"

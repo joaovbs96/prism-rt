@@ -39,6 +39,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -124,9 +125,14 @@ void TestMatrices()
     bool threw = false;
     try { prism::color::ColorManagement::Create({"", "srgb_texture", "", ""}); } catch (std::exception const&) { threw = true; }
     Check(threw, "a non-linear working space is refused");
-    threw = false;
-    try { prism::color::ColorManagement::Create({"", "", "", "No such view"}); } catch (std::exception const&) { threw = true; }
-    Check(threw, "an unknown view is refused");
+    // An unknown view or display falls back to the config's default (with a
+    // message on standard error).
+    auto unknownView = prism::color::ColorManagement::Create({"", "", "", "No such view"});
+    Check(unknownView->view() == aces->view() && unknownView->display() == aces->display(),
+          "an unknown view becomes the display's default: " + unknownView->view());
+    auto unknownDisplay = prism::color::ColorManagement::Create({"", "", "No such display", "No such view"});
+    Check(unknownDisplay->view() == aces->view() && unknownDisplay->display() == aces->display(),
+          "an unknown display and view become the defaults: " + unknownDisplay->display());
 }
 
 // UsdRenderSettings.renderingColorSpace: the working space below
@@ -230,12 +236,93 @@ void TestOutputAndFallbacks(std::filesystem::path const& directory)
     // Nothing usable at all: the defaults' failure is reported too.
     auto pass = ColorManagement::PassThrough({});
     float same[] = {0.25f, -1.0f, 4.0f};
-    pass->ToWorkingSpace("srgb_texture", same, 1, 3);
-    Check(pass->passThrough() && pass->rec709() && !pass->NeedsConversion("srgb_texture") &&
+    pass->ToWorkingSpace("lin_rec709", same, 1, 3);
+    Check(pass->passThrough() && pass->rec709() && !pass->NeedsConversion("lin_rec709") && !pass->NeedsConversion("raw") &&
               same[0] == 0.25f && same[1] == -1.0f && pass->Resolve("anything") == "anything" &&
               pass->OutputMatrix("lin_rec709", &m, &name, &error) && m == prism::color::kIdentity &&
               !pass->OutputMatrix("acescg", &m, &name, &error),
-          "pass-through converts nothing");
+          "pass-through leaves linear Rec.709 and data alone");
+    // sRGB and its aliases still decode (analytically, no config); the
+    // gamma 2.2 Rec.709 aliases too; other primaries cannot (used unconverted).
+    for (const char* space : {"srgb_texture", "sRGB - Texture", "Utility - sRGB - Texture", "srgb_tx", "srgb_rec709_scene"}) {
+        float srgb[] = {0.5f, 0.2f, 0.1f, 1.0f, 0.04f, -0.5f};
+        pass->ToWorkingSpace(space, srgb, 2, 3);
+        const Float3 expected = SrgbDecode(Float3(0.5f, 0.2f, 0.1f));
+        Check(pass->NeedsConversion(space) && Near(Float3(srgb[0], srgb[1], srgb[2]), expected, 1e-5f) &&
+                  Near(srgb[3], 1.0f, 1e-6f) && Near(srgb[4], 0.04f / 12.92f, 1e-5f) && srgb[5] < 0.0f,
+              std::string("pass-through decodes sRGB as ") + space + ": " + Text(Float3(srgb[0], srgb[1], srgb[2])));
+    }
+    float gamma[] = {0.5f, 0.2f, 0.1f};
+    pass->ToWorkingSpace("g22_rec709", gamma, 1, 3);
+    Check(Near(gamma[0], std::pow(0.5f, 2.2f), 1e-5f), "pass-through decodes gamma 2.2 Rec.709");
+    float alpha[] = {0.5f, 0.2f, 0.1f, 0.7f};
+    pass->ToWorkingSpace("srgb_texture", alpha, 1, 4);
+    Check(alpha[3] == 0.7f, "pass-through keeps the alpha channel");
+    float acescg[] = {0.5f, 0.2f, 0.1f};
+    pass->ToWorkingSpace("ACEScg", acescg, 1, 3);
+    Check(!pass->NeedsConversion("ACEScg") && acescg[0] == 0.5f && acescg[1] == 0.2f && acescg[2] == 0.1f,
+          "pass-through cannot convert other primaries and leaves them as they are");
+}
+
+// kDefaultConfig on an OpenColorIO without studio-config-latest (2.2), the
+// built-in studio config choice, and a view or display the config lacks.
+void TestDefaultConfigFallback(std::filesystem::path const& directory)
+{
+    using prism::color::ColorManagement;
+    using prism::color::SelectBuiltinStudioConfig;
+    Check(SelectBuiltinStudioConfig({"cg-config-v0.1.0_aces-v1.3_ocio-v2.1", "studio-config-v1.0.0_aces-v1.3_ocio-v2.1"}) ==
+              "studio-config-v1.0.0_aces-v1.3_ocio-v2.1", "OpenColorIO 2.2's list: its studio config");
+    Check(SelectBuiltinStudioConfig({"studio-config-v1.0.0_aces-v1.3_ocio-v2.1", "studio-config-latest",
+                                     "cg-config-v4.0.0_aces-v2.0_ocio-v2.5", "studio-config-v4.0.0_aces-v2.0_ocio-v2.5",
+                                     "studio-config-v2.1.0_aces-v1.3_ocio-v2.3", "studio-config-v10.0.0_aces-v2.1_ocio-v2.6",
+                                     "studio-config-v5.0.0_aces-v2.1_ocio-v2.6"}) ==
+              "studio-config-v10.0.0_aces-v2.1_ocio-v2.6", "the newest studio config wins (numerically), not latest or cg");
+    Check(SelectBuiltinStudioConfig({"cg-config-v4.0.0_aces-v2.0_ocio-v2.5", "studio-config-latest"}).empty() &&
+              SelectBuiltinStudioConfig({}).empty(), "no versioned studio config: none");
+    Check(SelectBuiltinStudioConfig({"studio-config-v4.0.0_aces-v2.0_ocio-v2.5", "studio-config-v4.0.0_aces-v2.1_ocio-v2.5"}) ==
+              "studio-config-v4.0.0_aces-v2.1_ocio-v2.5", "the config version, then ACES, then OpenColorIO");
+
+    std::vector<std::string> warnings;
+    auto warn = [&](std::string const& message) { warnings.push_back(message); };
+    prism::color::SetDefaultConfigUnavailableForTesting(true);
+    auto fallback = ColorManagement::CreateOrFallback({}, true, warn);
+    prism::color::SetDefaultConfigUnavailableForTesting(false);
+    const auto names = prism::color::BuiltinConfigNames();
+    const std::string chosen = SelectBuiltinStudioConfig(names);
+    Check(!chosen.empty() && !fallback->passThrough() && fallback->config() == "ocio://" + chosen &&
+              fallback->workingSpace() == "ACEScg" && fallback->Resolve("lin_rec709") == fallback->rec709Space() &&
+              !fallback->view().empty() && !fallback->display().empty() && warnings.size() == 1,
+          "an unavailable default config loads the newest built-in studio config: " + fallback->config() +
+              (warnings.empty() ? "" : " / " + warnings[0]));
+
+    // A view (or display) the config lacks: the config's default, noted.
+    std::filesystem::create_directories(directory);
+    const auto simple = directory / "simple_views.ocio";
+    std::ofstream(simple) <<
+        "ocio_profile_version: 2\n\nname: prism-test-simple\nroles:\n  default: ACEScg\n"
+        "  scene_linear: ACEScg\n  data: Raw\n\ndisplays:\n  Display:\n    - !<View> {name: Standard, colorspace: sRGB}\n"
+        "    - !<View> {name: Raw, colorspace: Raw}\n\n"
+        "colorspaces:\n  - !<ColorSpace>\n    name: ACEScg\n    encoding: scene-linear\n    isdata: false\n"
+        "  - !<ColorSpace>\n    name: Linear Rec.709 (sRGB)\n    aliases: [lin_rec709]\n    encoding: scene-linear\n    isdata: false\n"
+        "    from_scene_reference: !<MatrixTransform> {matrix: [1.70505, -0.62179, -0.08326, 0, -0.13026, 1.1408, "
+        "-0.01055, 0, -0.024, -0.12897, 1.15297, 0, 0, 0, 0, 1]}\n"
+        "  - !<ColorSpace>\n    name: sRGB\n    encoding: sdr-video\n    isdata: false\n"
+        "    from_scene_reference: !<ExponentWithLinearTransform> {gamma: 2.4, offset: 0.055, direction: inverse}\n"
+        "  - !<ColorSpace>\n    name: Raw\n    encoding: data\n    isdata: true\n";
+    warnings.clear();
+    auto olderConfig = ColorManagement::CreateOrFallback(
+        {simple.string(), "", "", "ACES 2.0 - SDR 100 nits (Rec.709)"}, true, warn);
+    Check(olderConfig->config() == simple.string() && olderConfig->view() == "Standard" && olderConfig->display() == "Display" &&
+              warnings.size() == 1 && warnings[0].find("ACES 2.0") != std::string::npos,
+          "the ACES 2.0 view is missing: the config's default view, with a warning: " + olderConfig->view());
+    warnings.clear();
+    auto olderDisplay = ColorManagement::CreateOrFallback(
+        {simple.string(), "", "sRGB - Display", "ACES 2.0 - SDR 100 nits (Rec.709)"}, true, warn);
+    Check(olderDisplay->display() == "Display" && olderDisplay->view() == "Standard" && warnings.size() == 2,
+          "a missing display and view: the defaults, two warnings");
+    warnings.clear();
+    auto kept = ColorManagement::CreateOrFallback({simple.string(), "", "Display", "Raw"}, true, warn);
+    Check(kept->view() == "Raw" && warnings.empty(), "a view the config has is kept, silently");
 }
 
 void TestViews()
@@ -308,6 +395,11 @@ void TestTextures(std::filesystem::path const& directory)
     ImageTexture<Color3> legacyRaw(file, "lin_rec709", legacyColor);
     Check(legacyRaw.resource->preparedPath() == raw.resource->preparedPath(),
           "a texture already in the working space shares the unconverted entry");
+    // Pass-through colour management (no config) still decodes an sRGB texture.
+    ImageTexture<Color3> passSrgb(file, "srgb_texture", prism::color::ColorManagement::PassThrough({}));
+    Check(Near(sample(passSrgb), SrgbDecode(texel), 2e-4f), "an sRGB texture decodes without a config: " + Text(sample(passSrgb)));
+    Check(passSrgb.resource->preparedPath() != raw.resource->preparedPath(),
+          "pass-through's decoded texture is cached apart from the raw one");
 }
 
 // The MaterialX spike: MaterialX 1.39's default colour management only has
@@ -572,6 +664,8 @@ int main(int argc, char** argv)
             const char* cache = std::getenv("PRISM_CACHE_DIR");
             TestOutputAndFallbacks(std::filesystem::path(cache && *cache ? cache : std::filesystem::temp_directory_path().string()) /
                                    "color_management_configs");
+            TestDefaultConfigFallback(std::filesystem::path(cache && *cache ? cache : std::filesystem::temp_directory_path().string()) /
+                                      "color_default_config");
         }
         TestViews();
         TestConversions();
