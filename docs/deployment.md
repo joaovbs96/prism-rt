@@ -397,7 +397,7 @@ library writes them. The range it was tested against is
 `loader.h`. Outside it, the first load in the process prints one
 `[MaterialX] WARNING` saying the repairs may not apply or may apply wrongly;
 nothing else changes. The range is 1.39.3 to 1.39.5: a host whose USD links
-MaterialX 1.39.3 gets that version's MDL generator, and 1.39.3 lost the
+an older MaterialX (1.39.3) gets that version's MDL generator, and 1.39.3 lost the
 diffuse lobe of every `open_pbr_surface` (the Cornell box rendered almost
 black) until the loader repaired its graphs
 ([materialx_compatibility.md](materialx_compatibility.md#older-materialx-1393-and-1394)).
@@ -420,7 +420,7 @@ MaterialX in-process; only `prism` (no USD) and the albedo tests are built
 against the older versions. A harness build:
 
 ```text
-cmake -S <MaterialX 1.39.3 source> -B <build> -DMATERIALX_BUILD_GEN_MDL=ON -DMATERIALX_BUILD_SHARED_LIBS=OFF ^
+cmake -S <the 1.39.3 MaterialX source> -B <build> -DMATERIALX_BUILD_GEN_MDL=ON -DMATERIALX_BUILD_SHARED_LIBS=OFF ^
   -DMATERIALX_BUILD_TESTS=OFF -DMATERIALX_BUILD_PYTHON=OFF -DMATERIALX_BUILD_RENDER=OFF -DCMAKE_INSTALL_PREFIX=<mx>
 cmake --build <build> --config Release --target install
 cmake -B build_mx1393 -DCMAKE_TOOLCHAIN_FILE=<vcpkg.cmake> -DVCPKG_INSTALLED_DIR=<prism>/build/vcpkg_installed ^
