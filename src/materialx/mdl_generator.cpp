@@ -12,7 +12,9 @@
 #include <MaterialXGenShader/ShaderStage.h>
 #include <MaterialXGenShader/Util.h>
 #include <MaterialXGenMdl/MdlShaderGenerator.h>
+#include <fstream>
 #include <iostream>
+#include <iterator>
 #include <map>
 #include <cstdlib>
 #include <mutex>
@@ -556,6 +558,75 @@ private:
     std::string m_colorIdentity;
     std::unique_ptr<prism::materialx::GeneratedTemplateDiskCache> m_diskCache;
 };
+
+bool MDLGenerator::reflectsAtUnitIor(const std::string& mx_mdl_path) {
+    static std::mutex mutex;
+    static std::map<std::string, bool> results;
+    std::lock_guard lock(mutex);
+    if (auto found = results.find(mx_mdl_path); found != results.end()) return found->second;
+    // pbrlib_1_9's mx_dielectric_bsdf before 1.39.5 (later modules re-export
+    // it): its grazing reflectivity ignores the IOR. 1.39.5 writes
+    // `normal_refl <= 0.0 ? 0.0 : ...` instead.
+    bool reflects = false;
+    std::ifstream in(std::filesystem::path(mx_mdl_path) / "materialx" / "pbrlib_1_9.mdl", std::ios::binary);
+    if (in) {
+        const std::string source((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        reflects = source.find("float grazing_refl = math::max((1.0 - math::average(mxp_roughness)), 0.0);") !=
+                   std::string::npos;
+    }
+    if (reflects && VerboseMdl())
+        std::cout << "[MaterialX] the MaterialX MDL library reflects at IOR 1 (before 1.39.5); such "
+                     "reflections get weight 0\n";
+    results[mx_mdl_path] = reflects;
+    return reflects;
+}
+
+bool MDLGenerator::dropsLayerBaseUnderMix(const std::string& mx_libraries_path) {
+    static std::mutex mutex;
+    static std::map<std::string, bool> results;
+    std::lock_guard lock(mutex);
+    if (auto found = results.find(mx_libraries_path); found != results.end()) return found->second;
+    bool drops = false;
+    try {
+        // layer(mix(R, R), diffuse): the diffuse lobe is the base.
+        auto doc = MaterialX::createDocument();
+        doc->setDataLibrary(SharedStandardLibrary(mx_libraries_path));
+        auto reflection = [&](const char* name) {
+            auto node = doc->addNode("dielectric_bsdf", name, "BSDF");
+            node->setInputValue("scatter_mode", std::string("R"));
+            return node;
+        };
+        auto mix = doc->addNode("mix", "probe_mix", "BSDF");
+        mix->addInput("fg", "BSDF")->setConnectedNode(reflection("probe_fg"));
+        mix->addInput("bg", "BSDF")->setConnectedNode(reflection("probe_bg"));
+        mix->setInputValue("mix", 0.5f);
+        auto diffuse = doc->addNode("oren_nayar_diffuse_bsdf", "probe_diffuse", "BSDF");
+        auto layer = doc->addNode("layer", "probe_layer", "BSDF");
+        layer->addInput("top", "BSDF")->setConnectedNode(mix);
+        layer->addInput("base", "BSDF")->setConnectedNode(diffuse);
+        auto surface = doc->addNode("surface", "probe_surface", "surfaceshader");
+        surface->addInput("bsdf", "BSDF")->setConnectedNode(layer);
+        auto material = doc->addMaterialNode("probe_material", surface);
+        auto generator = MaterialX::MdlShaderGenerator::create();
+        MaterialX::GenContext context(generator);
+        const MaterialX::FilePath libraries(mx_libraries_path);
+        MaterialX::FileSearchPath search;
+        search.append(libraries);
+        search.append(libraries / MaterialX::FilePath("mdl/materialx"));
+        context.registerSourceCodeSearchPath(search);
+        auto shader = generator->generate("probe_material", material, context);
+        const std::string& source = shader->getStage(MaterialX::Stage::PIXEL).getSourceCode();
+        drops = source.find("mx_oren_nayar_diffuse_bsdf") == std::string::npos;
+    } catch (const std::exception& e) {
+        std::cerr << "[MaterialX] WARNING: cannot check how the MDL generator layers over a mix: " << e.what()
+                  << "\n";
+    }
+    if (drops && VerboseMdl())
+        std::cout << "[MaterialX] the MDL generator drops the base of a layer over a mix; library graphs "
+                     "get their layers distributed\n";
+    results[mx_libraries_path] = drops;
+    return drops;
+}
 
 MDLGenerator::MDLGenerator(const std::string& mx_libraries_path,
                            prism::color::ColorManagement const* color)

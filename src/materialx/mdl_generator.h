@@ -64,6 +64,17 @@ public:
     GeneratedMDL generate(MaterialX::OutputPtr output,
                           prism::color::ColorManagement const& color);
 
+    // Whether the linked MaterialX MDL generator drops the base of a layer
+    // whose top is a mix of BSDFs (MaterialX 1.39.3; 1.39.5 distributes the
+    // layer itself). Found once per libraries path by generating such a
+    // layer (DocumentLoader::setDistributeLibraryLayers).
+    static bool dropsLayerBaseUnderMix(const std::string& mx_libraries_path);
+    // Whether the MaterialX MDL library under mx_mdl_path (libraries/mdl)
+    // has the mx_dielectric_bsdf that reflects at grazing angles at IOR 1
+    // (before 1.39.5). Read once per path
+    // (DocumentLoader::setZeroUnitIorReflections).
+    static bool reflectsAtUnitIor(const std::string& mx_mdl_path);
+
     // Returns the stdlib document loaded by this generator.
     // Pass this to DocumentLoader so both share the same stdlib instance.
     MaterialX::DocumentPtr get_stdlib() const;

@@ -339,10 +339,10 @@ void FixConnectionTypes(const MaterialX::DocumentPtr& doc)
 // the top lobe; a mix as the top passes nothing on and the base is lost. A
 // layer distributes over a mix of its top:
 //   layer(mix(fg, bg, m), base) = mix(layer(fg, base), layer(bg, base), m).
-void DistributeLayersOverMixes(const MaterialX::DocumentPtr& doc)
+void DistributeLayersOverMixes(const MaterialX::ElementPtr& root)
 {
     std::vector<MaterialX::NodePtr> work;
-    for (auto element : doc->traverseTree())
+    for (auto element : root->traverseTree())
         if (auto node = element->asA<MaterialX::Node>(); node && node->getCategory() == "layer") work.push_back(node);
     size_t guard = 0;
     while (!work.empty() && ++guard < 4096) {
@@ -1630,6 +1630,110 @@ void CompensateOrenNayarEnergy(const MaterialX::DocumentPtr& doc)
     }
 }
 
+// A layer whose top is a mix of two BSDFs (both sides connected).
+bool LayersOverMix(const MaterialX::NodeGraphPtr& graph)
+{
+    for (auto const& node : graph->getNodes()) {
+        if (node->getCategory() != "layer") continue;
+        auto top = Producer(node, "top");
+        if (top && top->getCategory() == "mix" && top->getType() == "BSDF" && Producer(top, "fg") &&
+            Producer(top, "bg"))
+            return true;
+    }
+    return false;
+}
+
+// MaterialX's MDL generator layers a BSDF over a base by handing the base to
+// the top lobe (ClosureLayerNodeMdl); a mix of two lobes as the top has no
+// base input, so the generator emits the top alone and drops the base
+// ("MDL has no support for layering BSDF nodes without a base input"). The
+// generator of 1.39.5 distributes such layers itself; 1.39.3's does not, and
+// its open_pbr_surface graph layers the dielectric reflection (a mix of the
+// thin-film and plain lobes) over the whole substrate: diffuse, subsurface
+// and transmission were lost, and OpenPBR surfaces only reflected. Nodes
+// whose genmdl graph (the library's or a repair's private copy) has such a
+// layer get a private copy with the layers distributed over the mixes
+// (DistributeLayersOverMixes, as for the document's own layers). Runs after
+// the other graph repairs, which match the undistributed graphs, and only
+// when the caller found the generator dropping the base
+// (setDistributeLibraryLayers).
+//
+// MaterialX's MDL library before 1.39.5 (pbrlib_1_9 mx_dielectric_bsdf)
+// gives a reflection-only dielectric a Schlick curve with grazing
+// reflectivity 1 - roughness whatever its IOR, so a lobe of IOR 1 still
+// reflects at grazing angles and dims its base there; 1.39.5's curve
+// reflects nothing at IOR 1. open_pbr_surface's specular_weight 0 is such a
+// lobe (its IOR is modulated to 1): the Cornell box's walls kept a grey
+// grazing highlight and lost 4% of their diffuse light. Reflection-only
+// dielectric_bsdf nodes get weight 0 where their IOR is 1, which is what
+// 1.39.5's curve computes, when the caller found that library
+// (setZeroUnitIorReflections).
+//
+// Both rewrite the document's own nodes in place and the genmdl graph of a
+// node through a private copy.
+bool IsUnitIorReflection(const MaterialX::NodePtr& node)
+{
+    return node->getCategory() == "dielectric_bsdf" && ConstantOrDefault(node, "scatter_mode") == "R";
+}
+
+void ZeroUnitIorReflection(const MaterialX::GraphElementPtr& graph, const MaterialX::NodePtr& lobe)
+{
+    auto select = graph->addNode("ifequal", graph->createValidChildName(lobe->getName() + "_unit_ior_weight"),
+                                 "float");
+    auto ior = select->addInput("value1", "float");
+    if (auto source = lobe->getInput("ior")) ior->copyContentFrom(source);
+    else ior->setValueString(ConstantOrDefault(lobe, "ior"));
+    select->setInputValue("value2", 1.0f);
+    select->setInputValue("in1", 0.0f);
+    auto weight = select->addInput("in2", "float");
+    if (auto source = lobe->getInput("weight")) weight->copyContentFrom(source);
+    else weight->setValue(1.0f);
+    auto input = lobe->getInput("weight");
+    if (!input) input = lobe->addInput("weight", "float");
+    for (const char* attribute : {"value", "nodename", "nodegraph", "output", "interfacename"})
+        input->removeAttribute(attribute);
+    input->setNodeName(select->getName());
+}
+
+void RepairForOldMdlLibrary(const MaterialX::DocumentPtr& doc, bool distribute, bool unitIor)
+{
+    if (!distribute && !unitIor) return;
+    std::vector<MaterialX::NodePtr> nodes;
+    for (auto element : doc->traverseTree()) {
+        auto node = element->asA<MaterialX::Node>();
+        if (!node) continue;
+        auto parent = node->getParent() ? node->getParent()->asA<MaterialX::NodeGraph>() : nullptr;
+        if (parent && parent->hasNodeDefString()) continue;
+        nodes.push_back(node);
+    }
+    for (auto const& node : nodes) {
+        if (unitIor && IsUnitIorReflection(node)) {
+            if (auto parent = node->getParent() ? node->getParent()->asA<MaterialX::GraphElement>() : nullptr)
+                ZeroUnitIorReflection(parent, node);
+            continue;
+        }
+        auto implementation = node->getImplementation("genmdl");
+        auto graph = implementation ? implementation->asA<MaterialX::NodeGraph>() : nullptr;
+        if (!graph) continue;
+        const auto inner = graph->getNodes();
+        const bool layers = distribute && LayersOverMix(graph);
+        const bool reflections = unitIor && std::any_of(inner.begin(), inner.end(), IsUnitIorReflection);
+        if (!layers && !reflections) continue;
+        PrivateGraph clone = ClonePrivateGraph(node);
+        if (!clone) continue;
+        if (layers) DistributeLayersOverMixes(clone.graph);
+        if (reflections)
+            for (auto const& lobe : clone.graph->getNodes())
+                if (IsUnitIorReflection(lobe)) ZeroUnitIorReflection(clone.graph, lobe);
+        const std::string name = node->getNamePath();
+        PublishPrivateGraph(node, clone);
+        if (VerboseMdl())
+            std::cout << "[MaterialX] " << name << ": " << (layers ? "layers distributed over mixes" : "")
+                      << (layers && reflections ? ", " : "") << (reflections ? "no reflection at IOR 1" : "")
+                      << " (an older MaterialX MDL library), as " << node->getCategory() << "\n";
+    }
+}
+
 void NormalizeColorSpaces(const MaterialX::DocumentPtr& doc)
 {
     const std::string& attribute = MaterialX::Element::COLOR_SPACE_ATTRIBUTE;
@@ -1925,6 +2029,7 @@ MaterialX::DocumentPtr DocumentLoader::load(const std::string& filepath)
         CoupleLamaDielectric(doc);
         RepairLamaGeneralizedSchlick(doc);
         CompensateOrenNayarEnergy(doc);
+        RepairForOldMdlLibrary(doc, m_distributeLibraryLayers, m_zeroUnitIorReflections);
         std::string validation_errors;
         if (!doc->validate(&validation_errors)) {
             std::cerr << "[WARN] Document validation issues: " << validation_errors << "\n";

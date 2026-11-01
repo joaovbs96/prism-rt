@@ -38,6 +38,16 @@ public:
     // Prints what load() repairs (the renderer's "mdl" debug output,
     // PRISM_MDL_VERBOSE). Off by default.
     void setVerbose(bool verbose) { m_verbose = verbose; }
+    // Distribute the layers whose top is a mix of BSDFs in the graphs of the
+    // library nodes the document uses (open_pbr_surface's dielectric), for
+    // an MDL generator that drops the base of such a layer (MaterialX 1.39.3;
+    // MDLGenerator::dropsLayerBaseUnderMix). Off by default.
+    void setDistributeLibraryLayers(bool distribute) { m_distributeLibraryLayers = distribute; }
+    // Give reflection-only dielectric_bsdf lobes weight 0 where their IOR is
+    // 1, for a MaterialX MDL library whose mx_dielectric_bsdf still reflects
+    // there at grazing angles (before 1.39.5; MDLGenerator::reflectsAtUnitIor).
+    // Off by default.
+    void setZeroUnitIorReflections(bool zero) { m_zeroUnitIorReflections = zero; }
     // The material name load()'s summary line shows (default: the file).
     void setLabel(std::string label) { m_label = std::move(label); }
 
@@ -73,6 +83,8 @@ private:
     bool m_clamp;
     bool m_fallback_sss_to_diffuse;
     bool m_verbose = false;
+    bool m_distributeLibraryLayers = false;
+    bool m_zeroUnitIorReflections = false;
     std::string m_label;
     RepairCounts m_repairs;
     UniformColorConversion m_uniformColors;

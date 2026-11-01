@@ -112,6 +112,8 @@ public:
         MDLGenerator& generator = *MDLGenerator::workerLocal(mx_libraries_path, settings.color.get());
         DocumentLoader doc_loader(generator.get_stdlib(), true, settings.sssFallback);
         doc_loader.setVerbose(PrismMdlVerbose());
+        doc_loader.setDistributeLibraryLayers(MDLGenerator::dropsLayerBaseUnderMix(mx_libraries_path));
+        doc_loader.setZeroUnitIorReflections(MDLGenerator::reflectsAtUnitIor(mx_mdl_path));
         doc_loader.setLabel(log_label);
         {
             const auto color = settings.color;
